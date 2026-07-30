@@ -72,6 +72,14 @@ Update **ARCHITECTURE.md** whenever architectural decisions change.
 
 ## Commits
 
+The repository-level `git config` belongs to the project owner.
+
+Automated agents must author commits under their own identity by passing:
+
+```powershell
+GIT_AUTHOR_NAME=agent GIT_AUTHOR_EMAIL=agent@vmlord.local GIT_COMMITTER_NAME=agent GIT_COMMITTER_EMAIL=agent@vmlord.local
+```
+
 Prefix every commit subject with the task number when it is known.
 
 Format commit subjects as `TASK-<No>: comment`.
