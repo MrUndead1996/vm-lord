@@ -128,6 +128,7 @@ mod tests {
                 cpu_cores: 4,
                 gpu_mode: vmlord_core::GpuMode::None,
                 network_mode: vmlord_core::NetworkMode::Nat,
+                ip_address: None,
                 ssh_port: Some(22),
             }])
         }

@@ -21,6 +21,7 @@ pub fn run(application: WorkspaceApp) -> eframe::Result<()> {
             Ok(Box::new(VmlordUi {
                 application,
                 last_refresh: Instant::now(),
+                selected_vm_name: None,
             }))
         }),
     )
@@ -29,6 +30,7 @@ pub fn run(application: WorkspaceApp) -> eframe::Result<()> {
 struct VmlordUi {
     application: WorkspaceApp,
     last_refresh: Instant,
+    selected_vm_name: Option<String>,
 }
 
 impl eframe::App for VmlordUi {
@@ -61,7 +63,8 @@ impl eframe::App for VmlordUi {
             });
 
             ui.add_space(12.0);
-            render_vm_list(ui, self.application.vms());
+            render_vm_list(ui, self.application.vms(), &mut self.selected_vm_name);
+            render_selected_vm(ui, self.application.vms(), &self.selected_vm_name);
             ui.add_space(12.0);
             render_diagnostics(ui, self.application.diagnostics());
         });
@@ -79,11 +82,19 @@ fn render_backend_status(ui: &mut egui::Ui, status: &BackendStatus) {
     };
 }
 
-fn render_vm_list(ui: &mut egui::Ui, vms: &[VmSummary]) {
+fn render_vm_list(ui: &mut egui::Ui, vms: &[VmSummary], selected_vm_name: &mut Option<String>) {
     ui.heading("Workspaces");
     if vms.is_empty() {
+        *selected_vm_name = None;
         ui.weak("No virtual machines found.");
         return;
+    }
+
+    if selected_vm_name
+        .as_ref()
+        .is_some_and(|name| !vms.iter().any(|vm| &vm.name == name))
+    {
+        *selected_vm_name = None;
     }
 
     let column_spacing = ui.spacing().item_spacing.x;
@@ -106,7 +117,10 @@ fn render_vm_list(ui: &mut egui::Ui, vms: &[VmSummary]) {
             ui.strong("Network type");
             ui.end_row();
             for vm in vms {
-                ui.label(&vm.name);
+                let is_selected = selected_vm_name.as_deref() == Some(vm.name.as_str());
+                if ui.selectable_label(is_selected, &vm.name).clicked() {
+                    *selected_vm_name = Some(vm.name.clone());
+                }
                 ui.label(&vm.os_type);
                 ui.label(vm_state(vm.state));
                 render_agent_status(ui, agent_status(vm.state));
@@ -118,6 +132,71 @@ fn render_vm_list(ui: &mut egui::Ui, vms: &[VmSummary]) {
                 ui.end_row();
             }
         });
+}
+
+fn render_selected_vm(ui: &mut egui::Ui, vms: &[VmSummary], selected_vm_name: &Option<String>) {
+    let Some(name) = selected_vm_name else {
+        return;
+    };
+    let Some(vm) = vms.iter().find(|vm| vm.name == *name) else {
+        return;
+    };
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.heading(format!("Selected VM: {}", vm.name));
+
+    ui.horizontal_wrapped(|ui| {
+        for label in [
+            "Start",
+            "Stop",
+            "Force stop",
+            "Connect",
+            "SSH",
+            "Delete",
+            "Edit",
+        ] {
+            ui.add_enabled(false, egui::Button::new(label))
+                .on_disabled_hover_text("Not implemented yet");
+        }
+    });
+
+    ui.add_space(8.0);
+    egui::Grid::new("selected-vm-details")
+        .num_columns(2)
+        .spacing([24.0, 6.0])
+        .show(ui, |ui| {
+            detail_row(
+                ui,
+                "IP address",
+                vm.ip_address
+                    .map_or_else(|| "Unavailable".into(), |ip| ip.to_string()),
+            );
+            detail_row(ui, "Operating system", vm.os_type.clone());
+            detail_row(ui, "Status", vm_state(vm.state).into());
+            detail_row(
+                ui,
+                "Agent status",
+                agent_status_label(agent_status(vm.state)).into(),
+            );
+            detail_row(ui, "Network type", format!("{:?}", vm.network_mode));
+            detail_row(ui, "CPU", format!("{} cores", vm.cpu_cores));
+            detail_row(ui, "RAM", format!("{} MiB", vm.ram_mb));
+            detail_row(ui, "Disk", format!("{} GiB", vm.disk_gb));
+            detail_row(ui, "GPU", format!("{:?}", vm.gpu_mode));
+            detail_row(
+                ui,
+                "SSH port",
+                vm.ssh_port
+                    .map_or_else(|| "Disabled".into(), |port| port.to_string()),
+            );
+        });
+}
+
+fn detail_row(ui: &mut egui::Ui, label: &str, value: String) {
+    ui.strong(label);
+    ui.label(value);
+    ui.end_row();
 }
 
 fn render_diagnostics(ui: &mut egui::Ui, diagnostics: &[vmlord_core::Diagnostic]) {
@@ -151,6 +230,14 @@ fn agent_status(state: VmState) -> AgentStatus {
     match state {
         VmState::Running { agent_status } => agent_status,
         VmState::Stopped | VmState::Starting => AgentStatus::Unknown,
+    }
+}
+
+fn agent_status_label(status: AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Unknown => "Unknown",
+        AgentStatus::Offline => "Offline",
+        AgentStatus::Online => "Online",
     }
 }
 

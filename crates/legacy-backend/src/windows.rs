@@ -209,6 +209,8 @@ impl AppSandboxBackend {
                 cpu_cores: (self.api.vm_cpu_cores)(vm),
                 gpu_mode: gpu_mode((self.api.vm_gpu_mode)(vm)),
                 network_mode: network_mode((self.api.vm_network_mode)(vm)),
+                // The temporary AppSandbox FFI does not expose a guest IP address yet.
+                ip_address: None,
                 ssh_port,
             })
         }

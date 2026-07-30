@@ -12,6 +12,7 @@ pub struct VmSummary {
     pub cpu_cores: u32,
     pub gpu_mode: GpuMode,
     pub network_mode: NetworkMode,
+    pub ip_address: Option<std::net::IpAddr>,
     pub ssh_port: Option<u32>,
 }
 
