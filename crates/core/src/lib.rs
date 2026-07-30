@@ -2,7 +2,7 @@
 
 pub mod settings;
 
-pub use settings::{AppSettings, LogLevel, SettingsError, SettingsStore};
+pub use settings::{AppSettings, Language, LogLevel, SettingsError, SettingsStore};
 
 use std::fmt;
 

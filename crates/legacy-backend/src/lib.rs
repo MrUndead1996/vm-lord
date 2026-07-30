@@ -11,4 +11,4 @@ compile_error!("vmlord-legacy-backend supports Windows only");
 mod windows;
 
 #[cfg(windows)]
-pub use windows::{AppSandboxBackend, WindowsImagePicker};
+pub use windows::{AppSandboxBackend, WindowsImagePicker, WindowsSettingsPathPicker};

@@ -16,11 +16,18 @@ const DEFAULT_LOG_FILE_NAME: &str = "vmlord.log";
 pub struct AppSettings {
     /// Directory used to persist VM data.
     pub vm_storage_path: PathBuf,
-    /// BCP 47 language tag used by application clients.
-    pub language: String,
+    /// UI language.
+    pub language: Language,
     /// Destination for application log records.
     pub log_file_path: PathBuf,
     pub log_level: LogLevel,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Language {
+    #[serde(rename = "en-US")]
+    #[default]
+    EnUs,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,7 +130,7 @@ impl SettingsStore {
         let config_directory = self.config_directory()?;
         Ok(AppSettings {
             vm_storage_path: config_directory.join(DEFAULT_VM_DIRECTORY),
-            language: "en-US".into(),
+            language: Language::EnUs,
             log_file_path: config_directory
                 .join(DEFAULT_LOG_DIRECTORY)
                 .join(DEFAULT_LOG_FILE_NAME),
@@ -210,7 +217,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{AppSettings, LogLevel, SettingsStore};
+    use super::{AppSettings, Language, LogLevel, SettingsStore};
 
     fn temporary_directory() -> std::path::PathBuf {
         let unique_id = SystemTime::now()
@@ -229,7 +236,7 @@ mod tests {
         let settings = store.load_or_create().unwrap();
 
         assert_eq!(settings.vm_storage_path, directory.join("vms"));
-        assert_eq!(settings.language, "en-US");
+        assert_eq!(settings.language, Language::EnUs);
         assert_eq!(
             settings.log_file_path,
             directory.join("logs").join("vmlord.log")
@@ -249,7 +256,7 @@ mod tests {
         let store = SettingsStore::new(directory.join("settings.toml"));
         let settings = AppSettings {
             vm_storage_path: directory.join("virtual-machines"),
-            language: "ru-RU".into(),
+            language: Language::EnUs,
             log_file_path: directory.join("diagnostics").join("application.log"),
             log_level: LogLevel::Debug,
         };

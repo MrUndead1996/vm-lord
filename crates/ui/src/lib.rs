@@ -1,12 +1,15 @@
 //! Desktop shell for the first VMLord milestone.
 
-use std::time::{Duration, Instant};
+use std::{
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use eframe::egui;
 use vmlord_app::{BackendStatus, VmAction, WorkspaceApp};
 use vmlord_core::{
-    AgentStatus, DiagnosticLevel, GpuMode, NetworkMode, VmCreateRequest, VmState, VmSummary,
-    VmUpdateRequest,
+    AgentStatus, AppSettings, DiagnosticLevel, GpuMode, Language, LogLevel, NetworkMode,
+    VmCreateRequest, VmState, VmSummary, VmUpdateRequest,
 };
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -27,6 +30,7 @@ pub fn run(application: WorkspaceApp) -> eframe::Result<()> {
                 selected_vm_name: None,
                 create_vm_form: None,
                 edit_vm_form: None,
+                settings_form: None,
             }))
         }),
     )
@@ -38,6 +42,7 @@ struct VmlordUi {
     selected_vm_name: Option<String>,
     create_vm_form: Option<CreateVmForm>,
     edit_vm_form: Option<EditVmForm>,
+    settings_form: Option<SettingsForm>,
 }
 
 struct CreateVmForm {
@@ -54,6 +59,44 @@ struct CreateVmForm {
     ssh_enabled: bool,
     ssh_deploy_key: bool,
     error: Option<String>,
+}
+
+struct SettingsForm {
+    vm_storage_path: String,
+    language: Language,
+    log_file_path: String,
+    log_level: LogLevel,
+    error: Option<String>,
+}
+
+impl SettingsForm {
+    fn from_settings(settings: &AppSettings) -> Self {
+        Self {
+            vm_storage_path: settings.vm_storage_path.display().to_string(),
+            language: settings.language.clone(),
+            log_file_path: settings.log_file_path.display().to_string(),
+            log_level: settings.log_level,
+            error: None,
+        }
+    }
+
+    fn settings(&self) -> Result<AppSettings, String> {
+        let vm_storage_path = self.vm_storage_path.trim();
+        if vm_storage_path.is_empty() {
+            return Err("VM storage path is required.".into());
+        }
+        let log_file_path = self.log_file_path.trim();
+        if log_file_path.is_empty() {
+            return Err("Log file path is required.".into());
+        }
+
+        Ok(AppSettings {
+            vm_storage_path: PathBuf::from(vm_storage_path),
+            language: self.language,
+            log_file_path: PathBuf::from(log_file_path),
+            log_level: self.log_level,
+        })
+    }
 }
 
 struct EditVmForm {
@@ -109,6 +152,13 @@ enum EditVmDialogAction {
     Submit(VmUpdateRequest),
 }
 
+enum SettingsDialogAction {
+    BrowseVmStorage,
+    BrowseLogFile,
+    Cancel,
+    Submit(AppSettings),
+}
+
 impl eframe::App for VmlordUi {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         context.request_repaint_after(AUTO_REFRESH_INTERVAL);
@@ -159,6 +209,16 @@ impl eframe::App for VmlordUi {
                     }
                     if create.clicked() {
                         selected_action = Some(VmAction::Create);
+                    }
+
+                    let settings = ui.button("Settings");
+                    settings.clone().on_hover_text("Open application settings");
+                    if settings.clicked()
+                        && let Some(current) = self.application.settings()
+                    {
+                        self.settings_form = Some(SettingsForm::from_settings(current));
+                        self.create_vm_form = None;
+                        self.edit_vm_form = None;
                     }
                 });
             });
@@ -241,6 +301,54 @@ impl eframe::App for VmlordUi {
                 } else {
                     self.create_vm_form = None;
                     self.last_refresh = Instant::now();
+                }
+            }
+            None => {}
+        }
+
+        let settings_dialog_action = self
+            .settings_form
+            .as_mut()
+            .and_then(|form| render_settings_dialog(context, form));
+        match settings_dialog_action {
+            Some(SettingsDialogAction::BrowseVmStorage) => {
+                match self.application.pick_vm_storage_directory() {
+                    Ok(Some(path)) => {
+                        if let Some(form) = &mut self.settings_form {
+                            form.vm_storage_path = path;
+                            form.error = None;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if let Some(form) = &mut self.settings_form {
+                            form.error = Some(error.to_string());
+                        }
+                    }
+                }
+            }
+            Some(SettingsDialogAction::BrowseLogFile) => match self.application.pick_log_file() {
+                Ok(Some(path)) => {
+                    if let Some(form) = &mut self.settings_form {
+                        form.log_file_path = path;
+                        form.error = None;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if let Some(form) = &mut self.settings_form {
+                        form.error = Some(error.to_string());
+                    }
+                }
+            },
+            Some(SettingsDialogAction::Cancel) => self.settings_form = None,
+            Some(SettingsDialogAction::Submit(settings)) => {
+                if let Err(error) = self.application.update_settings(settings) {
+                    if let Some(form) = &mut self.settings_form {
+                        form.error = Some(error.to_string());
+                    }
+                } else {
+                    self.settings_form = None;
                 }
             }
             None => {}
@@ -395,6 +503,108 @@ fn render_create_vm_dialog(
 
     if !open && action.is_none() {
         action = Some(CreateVmDialogAction::Cancel);
+    }
+    action
+}
+
+fn render_settings_dialog(
+    context: &egui::Context,
+    form: &mut SettingsForm,
+) -> Option<SettingsDialogAction> {
+    let mut open = true;
+    let mut action = None;
+    egui::Window::new("Application settings")
+        .collapsible(false)
+        .resizable(false)
+        .default_width(600.0)
+        .open(&mut open)
+        .show(context, |ui| {
+            ui.label("Configure where VMLord stores VM data and diagnostic logs.");
+            ui.add_space(8.0);
+            egui::Grid::new("application-settings-form")
+                .num_columns(2)
+                .min_col_width(110.0)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.add_sized([110.0, 24.0], egui::Label::new("VM storage"));
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [310.0, 24.0],
+                            egui::TextEdit::singleline(&mut form.vm_storage_path)
+                                .hint_text("Directory for virtual machine data"),
+                        );
+                        if ui.button("Browse...").clicked() {
+                            action = Some(SettingsDialogAction::BrowseVmStorage);
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.add_sized([110.0, 24.0], egui::Label::new("Language"));
+                    egui::ComboBox::from_id_salt("settings-language")
+                        .width(310.0)
+                        .selected_text(language_label(form.language))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut form.language, Language::EnUs, "English (US)");
+                        });
+                    ui.end_row();
+
+                    ui.add_sized([110.0, 24.0], egui::Label::new("Log file"));
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [310.0, 24.0],
+                            egui::TextEdit::singleline(&mut form.log_file_path)
+                                .hint_text("Path to the log file"),
+                        );
+                        if ui.button("Browse...").clicked() {
+                            action = Some(SettingsDialogAction::BrowseLogFile);
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.add_sized([110.0, 24.0], egui::Label::new("Log level"));
+                    egui::ComboBox::from_id_salt("settings-log-level")
+                        .selected_text(log_level_label(form.log_level))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut form.log_level, LogLevel::Error, "Error");
+                            ui.selectable_value(&mut form.log_level, LogLevel::Warn, "Warning");
+                            ui.selectable_value(&mut form.log_level, LogLevel::Info, "Info");
+                            ui.selectable_value(&mut form.log_level, LogLevel::Debug, "Debug");
+                            ui.selectable_value(&mut form.log_level, LogLevel::Trace, "Trace");
+                        });
+                    ui.end_row();
+                });
+
+            if let Some(error) = &form.error {
+                ui.add_space(4.0);
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+            }
+
+            ui.separator();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let save = ui.add(
+                    egui::Button::new(egui::RichText::new("Save").color(egui::Color32::WHITE))
+                        .fill(egui::Color32::from_rgb(47, 158, 97))
+                        .min_size(egui::vec2(88.0, 30.0)),
+                );
+                if save.clicked() {
+                    match form.settings() {
+                        Ok(settings) => action = Some(SettingsDialogAction::Submit(settings)),
+                        Err(error) => form.error = Some(error),
+                    }
+                }
+                let cancel = ui.add(
+                    egui::Button::new(egui::RichText::new("Cancel").color(egui::Color32::WHITE))
+                        .fill(egui::Color32::from_rgb(100, 100, 100))
+                        .min_size(egui::vec2(88.0, 30.0)),
+                );
+                if cancel.clicked() {
+                    action = Some(SettingsDialogAction::Cancel);
+                }
+            });
+        });
+
+    if !open && action.is_none() {
+        action = Some(SettingsDialogAction::Cancel);
     }
     action
 }
@@ -577,6 +787,22 @@ fn edit_vm_request(form: &EditVmForm) -> Result<VmUpdateRequest, String> {
         gpu_mode: form.gpu_mode,
         network_mode: form.network_mode,
     })
+}
+
+fn log_level_label(level: LogLevel) -> &'static str {
+    match level {
+        LogLevel::Error => "Error",
+        LogLevel::Warn => "Warning",
+        LogLevel::Info => "Info",
+        LogLevel::Debug => "Debug",
+        LogLevel::Trace => "Trace",
+    }
+}
+
+fn language_label(language: Language) -> &'static str {
+    match language {
+        Language::EnUs => "English (US)",
+    }
 }
 
 fn gpu_mode_label(mode: GpuMode) -> &'static str {

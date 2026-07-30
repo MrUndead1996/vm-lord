@@ -63,9 +63,11 @@ Update **ARCHITECTURE.md** whenever architectural decisions change.
 
 ## Workflow
 
+* Move a task to `Doing` when starting work on it.
 * Complete each task in a dedicated branch.
 * Commit the completed work before pushing the branch to the remote repository.
 * Open a merge request only after receiving explicit user approval.
+* Move a task to `Review` after creating its merge request.
 * Assign every merge request to `mrundead` and request a review from `mrundead`.
 
 ## Commits

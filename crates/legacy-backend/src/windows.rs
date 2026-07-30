@@ -9,7 +9,7 @@ use std::{
 };
 
 use libloading::Library;
-use vmlord_app::ImagePicker;
+use vmlord_app::{ImagePicker, SettingsPathPicker};
 use vmlord_core::{
     AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError,
     VmCreateRequest, VmRepository, VmState, VmSummary, VmUpdateRequest,
@@ -112,6 +112,32 @@ impl ImagePicker for WindowsImagePicker {
             .set_title("Select Linux VM image")
             .add_filter("VM images", &["iso", "vhdx"])
             .pick_file()
+            .map(|path| path.to_string_lossy().into_owned()))
+    }
+}
+
+pub struct WindowsSettingsPathPicker;
+
+impl WindowsSettingsPathPicker {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl SettingsPathPicker for WindowsSettingsPathPicker {
+    fn pick_vm_storage_directory(&mut self) -> Result<Option<String>, RepositoryError> {
+        Ok(rfd::FileDialog::new()
+            .set_title("Select VM storage directory")
+            .pick_folder()
+            .map(|path| path.to_string_lossy().into_owned()))
+    }
+
+    fn pick_log_file(&mut self) -> Result<Option<String>, RepositoryError> {
+        Ok(rfd::FileDialog::new()
+            .set_title("Select log file")
+            .set_file_name("vmlord.log")
+            .save_file()
             .map(|path| path.to_string_lossy().into_owned()))
     }
 }

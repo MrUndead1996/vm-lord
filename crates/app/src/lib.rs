@@ -1,8 +1,10 @@
 //! Application workflows shared by desktop, CLI, and future automation clients.
 
+use std::fmt;
+
 use vmlord_core::{
-    Diagnostic, DiagnosticLevel, RepositoryError, VmCreateRequest, VmRepository, VmState,
-    VmSummary, VmUpdateRequest,
+    AppSettings, Diagnostic, DiagnosticLevel, RepositoryError, SettingsError, SettingsStore,
+    VmCreateRequest, VmRepository, VmState, VmSummary, VmUpdateRequest,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -10,6 +12,30 @@ pub enum BackendStatus {
     Starting,
     Ready,
     Unavailable(String),
+}
+
+#[derive(Debug)]
+pub enum SettingsUpdateError {
+    NotInitialized,
+    Save(SettingsError),
+}
+
+impl fmt::Display for SettingsUpdateError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotInitialized => formatter.write_str("application settings are not initialized"),
+            Self::Save(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for SettingsUpdateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NotInitialized => None,
+            Self::Save(error) => Some(error),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,12 +69,24 @@ pub trait ImagePicker {
     fn pick_iso_image(&mut self) -> Result<Option<String>, RepositoryError>;
 }
 
+pub trait SettingsPathPicker {
+    fn pick_vm_storage_directory(&mut self) -> Result<Option<String>, RepositoryError>;
+    fn pick_log_file(&mut self) -> Result<Option<String>, RepositoryError>;
+}
+
 pub struct WorkspaceApp {
     repository: Box<dyn VmRepository>,
     image_picker: Option<Box<dyn ImagePicker>>,
+    settings_path_picker: Option<Box<dyn SettingsPathPicker>>,
+    settings: Option<SettingsContext>,
     status: BackendStatus,
     vms: Vec<VmSummary>,
     diagnostics: Vec<Diagnostic>,
+}
+
+struct SettingsContext {
+    store: SettingsStore,
+    current: AppSettings,
 }
 
 impl WorkspaceApp {
@@ -57,6 +95,8 @@ impl WorkspaceApp {
         Self {
             repository,
             image_picker: None,
+            settings_path_picker: None,
+            settings: None,
             status: BackendStatus::Starting,
             vms: Vec::new(),
             diagnostics: Vec::new(),
@@ -67,6 +107,60 @@ impl WorkspaceApp {
     pub fn with_image_picker(mut self, image_picker: Box<dyn ImagePicker>) -> Self {
         self.image_picker = Some(image_picker);
         self
+    }
+
+    #[must_use]
+    pub fn with_settings_path_picker(mut self, picker: Box<dyn SettingsPathPicker>) -> Self {
+        self.settings_path_picker = Some(picker);
+        self
+    }
+
+    #[must_use]
+    pub fn with_settings(mut self, store: SettingsStore, settings: AppSettings) -> Self {
+        self.settings = Some(SettingsContext {
+            store,
+            current: settings,
+        });
+        self
+    }
+
+    #[must_use]
+    pub fn settings(&self) -> Option<&AppSettings> {
+        self.settings.as_ref().map(|settings| &settings.current)
+    }
+
+    pub fn update_settings(&mut self, settings: AppSettings) -> Result<(), SettingsUpdateError> {
+        let Some(context) = &mut self.settings else {
+            return Err(SettingsUpdateError::NotInitialized);
+        };
+        context
+            .store
+            .save(&settings)
+            .map_err(SettingsUpdateError::Save)?;
+        context.current = settings;
+        self.diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Info,
+            message: "Application settings saved".into(),
+        });
+        Ok(())
+    }
+
+    pub fn pick_vm_storage_directory(&mut self) -> Result<Option<String>, RepositoryError> {
+        let Some(picker) = &mut self.settings_path_picker else {
+            return Err(RepositoryError::new(
+                "the native directory picker is not available",
+            ));
+        };
+        picker.pick_vm_storage_directory()
+    }
+
+    pub fn pick_log_file(&mut self) -> Result<Option<String>, RepositoryError> {
+        let Some(picker) = &mut self.settings_path_picker else {
+            return Err(RepositoryError::new(
+                "the native log file picker is not available",
+            ));
+        };
+        picker.pick_log_file()
     }
 
     pub fn pick_iso_image(&mut self) -> Result<Option<String>, RepositoryError> {
@@ -364,8 +458,13 @@ impl VmRepository for UnavailableRepository {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use super::*;
-    use vmlord_core::{DiagnosticLevel, VmState};
+    use vmlord_core::{DiagnosticLevel, Language, LogLevel, VmState};
 
     struct FakeRepository {
         should_fail: bool,
@@ -553,6 +652,47 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.message == "SSH session for VM \"dev\" started")
         );
+    }
+
+    #[test]
+    fn updates_and_persists_application_settings() {
+        let directory = std::env::temp_dir().join(format!(
+            "vmlord-app-settings-test-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = SettingsStore::new(directory.join("settings.toml"));
+        let initial_settings = AppSettings {
+            vm_storage_path: directory.join("vms"),
+            language: Language::EnUs,
+            log_file_path: directory.join("logs").join("vmlord.log"),
+            log_level: LogLevel::Info,
+        };
+        let updated_settings = AppSettings {
+            vm_storage_path: directory.join("virtual-machines"),
+            language: Language::EnUs,
+            log_file_path: directory.join("diagnostics").join("application.log"),
+            log_level: LogLevel::Debug,
+        };
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            should_fail: false,
+            create_should_fail: false,
+            actions: Vec::new(),
+        }))
+        .with_settings(store.clone(), initial_settings);
+
+        app.update_settings(updated_settings.clone()).unwrap();
+
+        assert_eq!(app.settings(), Some(&updated_settings));
+        assert_eq!(store.load_or_create().unwrap(), updated_settings);
+        assert!(
+            app.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message == "Application settings saved")
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
