@@ -61,6 +61,13 @@ Keep documentation up to date.
 
 Update **ARCHITECTURE.md** whenever architectural decisions change.
 
+## Workflow
+
+* Complete each task in a dedicated branch.
+* Commit the completed work before pushing the branch to the remote repository.
+* Open a merge request only after receiving explicit user approval.
+* Assign every merge request to `mrundead` and request a review from `mrundead`.
+
 ## Commits
 
 Prefix every commit subject with the task number when it is known.

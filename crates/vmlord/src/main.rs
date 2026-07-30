@@ -4,9 +4,16 @@
 compile_error!("VMLord currently supports Windows only");
 
 fn main() {
-    let repository = match vmlord_legacy_backend::AppSandboxBackend::load_from_executable_dir() {
-        Ok(backend) => Box::new(backend),
-        Err(error) => vmlord_app::unavailable_repository(error.to_string()),
+    let repository = match vmlord_core::SettingsStore::for_current_user()
+        .and_then(|store| store.load_or_create())
+    {
+        Ok(_) => match vmlord_legacy_backend::AppSandboxBackend::load_from_executable_dir() {
+            Ok(backend) => Box::new(backend),
+            Err(error) => vmlord_app::unavailable_repository(error.to_string()),
+        },
+        Err(error) => {
+            vmlord_app::unavailable_repository(format!("failed to initialize settings: {error}"))
+        }
     };
     let mut application = vmlord_app::WorkspaceApp::new(repository)
         .with_image_picker(Box::new(vmlord_legacy_backend::WindowsImagePicker::new()));

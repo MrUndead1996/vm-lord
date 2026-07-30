@@ -184,6 +184,13 @@ pointers, or Windows DLL loading. It dynamically loads the prebuilt
 `appsandbox_core.dll` placed next to `vmlord.exe`; no C types cross into `core`,
 `app`, or `ui`.
 
+`core::settings` owns the UI-independent application settings model and TOML
+persistence. The composition root initializes it before the backend. Settings
+are stored per user at `%LOCALAPPDATA%\VMLord\settings.toml`; the initial file
+uses `%LOCALAPPDATA%\VMLord\vms` for VM data and
+`%LOCALAPPDATA%\VMLord\logs\vmlord.log` for logs. The configuration directory
+and the default VM and log directories are created on first launch.
+
 The current UI initializes the backend, shows availability and diagnostics,
 lists known VMs, can create Linux VMs from ISO images, and can edit stopped
 VMs. It submits safe requests through the application layer; only

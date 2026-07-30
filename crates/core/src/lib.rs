@@ -1,5 +1,9 @@
 //! UI-independent domain types and repository boundary for VMLord.
 
+pub mod settings;
+
+pub use settings::{AppSettings, LogLevel, SettingsError, SettingsStore};
+
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
