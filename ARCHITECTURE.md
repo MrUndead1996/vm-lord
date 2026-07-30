@@ -121,6 +121,7 @@ Examples:
 
 * Start VM
 * Stop VM
+* Update stopped VM configuration
 * Import image
 * Connect display
 * Open terminal
@@ -184,13 +185,30 @@ pointers, or Windows DLL loading. It dynamically loads the prebuilt
 `app`, or `ui`.
 
 The current UI initializes the backend, shows availability and diagnostics,
-lists known VMs, and can create Linux VMs from ISO images. It submits safe
-requests through the application layer; only `legacy-backend` maps them to
-AppSandbox's C API. The Start action invokes `asb_vm_start`; Stop invokes the
-graceful `asb_vm_shutdown`; Force stop invokes `asb_vm_stop`. Connect invokes
-`asb_vm_open_display`, which opens or focuses the temporary AppSandbox IDD
-window after the guest display driver is ready. It calls `asb_detach` on exit so
-it never stops VMs. Snapshots remain future application-layer work.
+lists known VMs, can create Linux VMs from ISO images, and can edit stopped
+VMs. It submits safe requests through the application layer; only
+`legacy-backend` maps them to AppSandbox's C API. The Start action invokes
+`asb_vm_start`; Stop invokes the graceful `asb_vm_shutdown`; Force stop invokes
+`asb_vm_stop`. Edit updates RAM, CPU, GPU mode, and network mode for stopped
+VMs through AppSandbox's configuration setters, then refreshes the VM list.
+Connect invokes `asb_vm_open_display`, which opens or focuses the temporary
+AppSandbox IDD window after the guest display driver is ready. It calls
+`asb_detach` on exit so it never stops VMs. Snapshots remain future
+application-layer work.
+
+### VM update contract
+
+The temporary AppSandbox-backed edit workflow currently follows these rules:
+
+* Running VMs cannot be edited; they must be stopped first.
+* VMs that are still building/staging also cannot be edited.
+* RAM, CPU, GPU mode, and network mode can be updated while the VM is stopped.
+* RAM must be at least 512 MiB and aligned to 2 MiB steps.
+* CPU core count must be at least 1.
+* Disk size is read-only in the current backend contract and requires recreating
+  the VM to change.
+* The VM name is treated as the guest hostname and also requires recreating the
+  VM to change safely from VMLord.
 
 ---
 

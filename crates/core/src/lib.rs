@@ -18,6 +18,15 @@ pub struct VmCreateRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmUpdateRequest {
+    pub name: String,
+    pub ram_mb: u32,
+    pub cpu_cores: u32,
+    pub gpu_mode: GpuMode,
+    pub network_mode: NetworkMode,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VmSummary {
     pub name: String,
     pub os_type: String,
@@ -49,6 +58,7 @@ pub enum AgentStatus {
 pub enum GpuMode {
     None,
     Default,
+    TryAll,
     Unknown(i32),
 }
 
@@ -99,6 +109,7 @@ impl std::error::Error for RepositoryError {}
 pub trait VmRepository {
     fn initialize(&mut self) -> Result<(), RepositoryError>;
     fn create_vm(&mut self, request: VmCreateRequest) -> Result<(), RepositoryError>;
+    fn update_vm(&mut self, request: VmUpdateRequest) -> Result<(), RepositoryError>;
     fn start_vm(&mut self, name: &str) -> Result<(), RepositoryError>;
     fn stop_vm(&mut self, name: &str) -> Result<(), RepositoryError>;
     fn force_stop_vm(&mut self, name: &str) -> Result<(), RepositoryError>;

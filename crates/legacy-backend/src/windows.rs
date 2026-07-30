@@ -12,7 +12,7 @@ use libloading::Library;
 use vmlord_app::ImagePicker;
 use vmlord_core::{
     AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError,
-    VmCreateRequest, VmRepository, VmState, VmSummary,
+    VmCreateRequest, VmRepository, VmState, VmSummary, VmUpdateRequest,
 };
 
 type AsbVm = *mut c_void;
@@ -22,6 +22,8 @@ type AsbVmStart = unsafe extern "system" fn(AsbVm, i32, i32, *const u16) -> i32;
 type AsbVmShutdown = unsafe extern "system" fn(AsbVm) -> i32;
 type AsbVmStop = unsafe extern "system" fn(AsbVm) -> i32;
 type AsbVmOpenDisplay = unsafe extern "system" fn(AsbVm) -> i32;
+type AsbVmSetDword = unsafe extern "system" fn(AsbVm, u32) -> i32;
+type AsbVmSetInt = unsafe extern "system" fn(AsbVm, i32) -> i32;
 
 #[repr(C)]
 struct AsbVmConfig {
@@ -60,6 +62,10 @@ type Callback = unsafe extern "system" fn(*const u16, *mut c_void);
 struct Api {
     init: AsbInit,
     vm_create: AsbVmCreate,
+    vm_set_ram: Option<AsbVmSetDword>,
+    vm_set_cpu: Option<AsbVmSetDword>,
+    vm_set_gpu: Option<AsbVmSetInt>,
+    vm_set_network: Option<AsbVmSetInt>,
     vm_start: AsbVmStart,
     vm_shutdown: AsbVmShutdown,
     vm_stop: AsbVmStop,
@@ -247,6 +253,61 @@ impl VmRepository for AppSandboxBackend {
                 "AppSandbox VM creation failed (HRESULT 0x{:08X})",
                 result as u32
             )));
+        }
+
+        Ok(())
+    }
+
+    fn update_vm(&mut self, request: VmUpdateRequest) -> Result<(), RepositoryError> {
+        let vm = self.vm_by_name(&request.name)?;
+        if unsafe { (self.api.vm_is_building)(vm) != 0 } {
+            return Err(RepositoryError::new(format!(
+                "VM \"{}\" is still building; wait for the build to finish before editing it",
+                request.name
+            )));
+        }
+        if unsafe { (self.api.vm_is_running)(vm) != 0 } {
+            return Err(RepositoryError::new(format!(
+                "VM \"{}\" is running; stop it before editing",
+                request.name
+            )));
+        }
+
+        if unsafe { (self.api.vm_ram_mb)(vm) } != request.ram_mb {
+            let set_ram = self.api.vm_set_ram.ok_or_else(|| {
+                RepositoryError::new(
+                    "the installed AppSandbox backend is too old for VM updates; update appsandbox_core.dll",
+                )
+            })?;
+            let result = unsafe { set_ram(vm, request.ram_mb) };
+            check_update_result("RAM", &request.name, result)?;
+        }
+        if unsafe { (self.api.vm_cpu_cores)(vm) } != request.cpu_cores {
+            let set_cpu = self.api.vm_set_cpu.ok_or_else(|| {
+                RepositoryError::new(
+                    "the installed AppSandbox backend is too old for VM updates; update appsandbox_core.dll",
+                )
+            })?;
+            let result = unsafe { set_cpu(vm, request.cpu_cores) };
+            check_update_result("CPU", &request.name, result)?;
+        }
+        if gpu_mode(unsafe { (self.api.vm_gpu_mode)(vm) }) != request.gpu_mode {
+            let set_gpu = self.api.vm_set_gpu.ok_or_else(|| {
+                RepositoryError::new(
+                    "the installed AppSandbox backend is too old for VM updates; update appsandbox_core.dll",
+                )
+            })?;
+            let result = unsafe { set_gpu(vm, gpu_mode_value(request.gpu_mode)?) };
+            check_update_result("GPU", &request.name, result)?;
+        }
+        if network_mode(unsafe { (self.api.vm_network_mode)(vm) }) != request.network_mode {
+            let set_network = self.api.vm_set_network.ok_or_else(|| {
+                RepositoryError::new(
+                    "the installed AppSandbox backend is too old for VM updates; update appsandbox_core.dll",
+                )
+            })?;
+            let result = unsafe { set_network(vm, network_mode_value(request.network_mode)?) };
+            check_update_result("network", &request.name, result)?;
         }
 
         Ok(())
@@ -464,6 +525,10 @@ impl Api {
         Ok(Self {
             init: export!(b"asb_init\0", AsbInit),
             vm_create: export!(b"asb_vm_create\0", AsbVmCreate),
+            vm_set_ram: optional_export!(b"asb_vm_set_ram\0", AsbVmSetDword),
+            vm_set_cpu: optional_export!(b"asb_vm_set_cpu\0", AsbVmSetDword),
+            vm_set_gpu: optional_export!(b"asb_vm_set_gpu\0", AsbVmSetInt),
+            vm_set_network: optional_export!(b"asb_vm_set_network\0", AsbVmSetInt),
             vm_start: export!(b"asb_vm_start\0", AsbVmStart),
             vm_shutdown: export!(b"asb_vm_shutdown\0", AsbVmShutdown),
             vm_stop: export!(b"asb_vm_stop\0", AsbVmStop),
@@ -609,6 +674,16 @@ fn check_lifecycle_result(action: &str, name: &str, result: i32) -> Result<(), R
     Ok(())
 }
 
+fn check_update_result(field: &str, name: &str, result: i32) -> Result<(), RepositoryError> {
+    if result < 0 {
+        return Err(RepositoryError::new(format!(
+            "AppSandbox failed to update {field} for VM \"{name}\" (HRESULT 0x{:08X})",
+            result as u32
+        )));
+    }
+    Ok(())
+}
+
 unsafe extern "system" fn log_callback(message: *const u16, user_data: *mut c_void) {
     push_callback_diagnostic(message, user_data, DiagnosticLevel::Info);
 }
@@ -669,6 +744,7 @@ fn gpu_mode_value(mode: GpuMode) -> Result<i32, RepositoryError> {
     match mode {
         GpuMode::None => Ok(0),
         GpuMode::Default => Ok(1),
+        GpuMode::TryAll => Ok(2),
         GpuMode::Unknown(value) => Err(RepositoryError::new(format!(
             "unsupported GPU mode: {value}"
         ))),
@@ -691,6 +767,7 @@ fn gpu_mode(value: i32) -> GpuMode {
     match value {
         0 => GpuMode::None,
         1 => GpuMode::Default,
+        2 => GpuMode::TryAll,
         other => GpuMode::Unknown(other),
     }
 }

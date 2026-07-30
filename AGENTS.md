@@ -61,6 +61,17 @@ Keep documentation up to date.
 
 Update **ARCHITECTURE.md** whenever architectural decisions change.
 
+## Commits
+
+Prefix every commit subject with the task number when it is known.
+
+Format commit subjects as `TASK-<No>: comment`.
+
+Examples:
+
+* `TASK-2: Add VM update workflow`
+* `TASK-15: Refine SSH connection errors`
+
 ## Decision Priority
 
 When multiple solutions are possible, prefer:

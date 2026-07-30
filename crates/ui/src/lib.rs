@@ -6,6 +6,7 @@ use eframe::egui;
 use vmlord_app::{BackendStatus, VmAction, WorkspaceApp};
 use vmlord_core::{
     AgentStatus, DiagnosticLevel, GpuMode, NetworkMode, VmCreateRequest, VmState, VmSummary,
+    VmUpdateRequest,
 };
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -25,6 +26,7 @@ pub fn run(application: WorkspaceApp) -> eframe::Result<()> {
                 last_refresh: Instant::now(),
                 selected_vm_name: None,
                 create_vm_form: None,
+                edit_vm_form: None,
             }))
         }),
     )
@@ -35,6 +37,7 @@ struct VmlordUi {
     last_refresh: Instant,
     selected_vm_name: Option<String>,
     create_vm_form: Option<CreateVmForm>,
+    edit_vm_form: Option<EditVmForm>,
 }
 
 struct CreateVmForm {
@@ -51,6 +54,28 @@ struct CreateVmForm {
     ssh_enabled: bool,
     ssh_deploy_key: bool,
     error: Option<String>,
+}
+
+struct EditVmForm {
+    name: String,
+    ram_mb: u32,
+    cpu_cores: u32,
+    gpu_mode: GpuMode,
+    network_mode: NetworkMode,
+    error: Option<String>,
+}
+
+impl EditVmForm {
+    fn from_vm(vm: &VmSummary) -> Self {
+        Self {
+            name: vm.name.clone(),
+            ram_mb: vm.ram_mb,
+            cpu_cores: vm.cpu_cores,
+            gpu_mode: vm.gpu_mode,
+            network_mode: vm.network_mode,
+            error: None,
+        }
+    }
 }
 
 impl Default for CreateVmForm {
@@ -77,6 +102,11 @@ enum CreateVmDialogAction {
     BrowseImage,
     Cancel,
     Submit(VmCreateRequest),
+}
+
+enum EditVmDialogAction {
+    Cancel,
+    Submit(VmUpdateRequest),
 }
 
 impl eframe::App for VmlordUi {
@@ -147,7 +177,18 @@ impl eframe::App for VmlordUi {
 
         if let Some(action) = action.inner {
             match action {
-                VmAction::Create => self.create_vm_form = Some(CreateVmForm::default()),
+                VmAction::Create => {
+                    self.create_vm_form = Some(CreateVmForm::default());
+                    self.edit_vm_form = None;
+                }
+                VmAction::Edit => {
+                    if let Some(name) = self.selected_vm_name.as_deref()
+                        && let Some(vm) = self.application.vms().iter().find(|vm| vm.name == name)
+                    {
+                        self.edit_vm_form = Some(EditVmForm::from_vm(vm));
+                        self.create_vm_form = None;
+                    }
+                }
                 VmAction::Start
                 | VmAction::Stop
                 | VmAction::ForceStop
@@ -172,11 +213,11 @@ impl eframe::App for VmlordUi {
             context.request_repaint();
         }
 
-        let dialog_action = self
+        let create_dialog_action = self
             .create_vm_form
             .as_mut()
             .and_then(|form| render_create_vm_dialog(context, form, self.application.vms()));
-        match dialog_action {
+        match create_dialog_action {
             Some(CreateVmDialogAction::BrowseImage) => match self.application.pick_iso_image() {
                 Ok(Some(path)) => {
                     if let Some(form) = &mut self.create_vm_form {
@@ -199,6 +240,25 @@ impl eframe::App for VmlordUi {
                     }
                 } else {
                     self.create_vm_form = None;
+                    self.last_refresh = Instant::now();
+                }
+            }
+            None => {}
+        }
+
+        let edit_dialog_action = self
+            .edit_vm_form
+            .as_mut()
+            .and_then(|form| render_edit_vm_dialog(context, form));
+        match edit_dialog_action {
+            Some(EditVmDialogAction::Cancel) => self.edit_vm_form = None,
+            Some(EditVmDialogAction::Submit(request)) => {
+                if let Err(error) = self.application.update_vm(request) {
+                    if let Some(form) = &mut self.edit_vm_form {
+                        form.error = Some(error.to_string());
+                    }
+                } else {
+                    self.edit_vm_form = None;
                     self.last_refresh = Instant::now();
                 }
             }
@@ -266,6 +326,7 @@ fn render_create_vm_dialog(
                         .selected_text(gpu_mode_label(form.gpu_mode))
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut form.gpu_mode, GpuMode::Default, "Default");
+                            ui.selectable_value(&mut form.gpu_mode, GpuMode::TryAll, "Try all");
                             ui.selectable_value(&mut form.gpu_mode, GpuMode::None, "None");
                         });
                     ui.end_row();
@@ -334,6 +395,94 @@ fn render_create_vm_dialog(
 
     if !open && action.is_none() {
         action = Some(CreateVmDialogAction::Cancel);
+    }
+    action
+}
+
+fn render_edit_vm_dialog(
+    context: &egui::Context,
+    form: &mut EditVmForm,
+) -> Option<EditVmDialogAction> {
+    let mut open = true;
+    let mut action = None;
+    egui::Window::new(format!("Edit VM: {}", form.name))
+        .collapsible(false)
+        .resizable(false)
+        .default_width(460.0)
+        .open(&mut open)
+        .show(context, |ui| {
+            ui.label("Only stopped VMs can be edited with the current AppSandbox backend.");
+            ui.small(
+                "RAM, CPU, GPU, and network are editable while stopped. Disk size and VM name stay fixed and currently require recreating the VM.",
+            );
+            ui.add_space(8.0);
+
+            egui::Grid::new("edit-vm-form")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("VM Name");
+                    ui.label(&form.name);
+                    ui.end_row();
+
+                    ui.label("RAM Size");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut form.ram_mb).range(512..=1_048_576).speed(2));
+                        ui.label("MiB");
+                    });
+                    ui.end_row();
+
+                    ui.label("CPU Cores");
+                    ui.add(egui::DragValue::new(&mut form.cpu_cores).range(1..=256));
+                    ui.end_row();
+
+                    ui.label("GPU");
+                    egui::ComboBox::from_id_salt("edit-vm-gpu")
+                        .selected_text(gpu_mode_label(form.gpu_mode))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut form.gpu_mode, GpuMode::Default, "Default");
+                            ui.selectable_value(&mut form.gpu_mode, GpuMode::TryAll, "Try all");
+                            ui.selectable_value(&mut form.gpu_mode, GpuMode::None, "None");
+                        });
+                    ui.end_row();
+
+                    ui.label("Network");
+                    egui::ComboBox::from_id_salt("edit-vm-network")
+                        .selected_text(network_mode_label(form.network_mode))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut form.network_mode, NetworkMode::Nat, "NAT");
+                            ui.selectable_value(&mut form.network_mode, NetworkMode::None, "None");
+                            ui.selectable_value(&mut form.network_mode, NetworkMode::External, "External");
+                            ui.selectable_value(&mut form.network_mode, NetworkMode::Internal, "Internal");
+                        });
+                    ui.end_row();
+                });
+
+            if let Some(error) = &form.error {
+                ui.add_space(4.0);
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+            }
+
+            ui.separator();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let save = ui.add(
+                    egui::Button::new(egui::RichText::new("Save changes").color(egui::Color32::WHITE))
+                        .fill(egui::Color32::from_rgb(235, 134, 58)),
+                );
+                if save.clicked() {
+                    match edit_vm_request(form) {
+                        Ok(request) => action = Some(EditVmDialogAction::Submit(request)),
+                        Err(error) => form.error = Some(error),
+                    }
+                }
+                if ui.button("Cancel").clicked() {
+                    action = Some(EditVmDialogAction::Cancel);
+                }
+            });
+        });
+
+    if !open && action.is_none() {
+        action = Some(EditVmDialogAction::Cancel);
     }
     action
 }
@@ -407,10 +556,34 @@ fn create_vm_request(
     })
 }
 
+fn edit_vm_request(form: &EditVmForm) -> Result<VmUpdateRequest, String> {
+    if form.ram_mb < 512 || form.ram_mb % 2 != 0 {
+        return Err("RAM must be an even number of MiB and at least 512 MiB.".into());
+    }
+    if form.cpu_cores == 0 {
+        return Err("CPU cores must be at least 1.".into());
+    }
+    if matches!(form.gpu_mode, GpuMode::Unknown(_)) {
+        return Err("The current GPU mode is not supported by the Rust UI yet.".into());
+    }
+    if matches!(form.network_mode, NetworkMode::Unknown(_)) {
+        return Err("The current network mode is not supported by the Rust UI yet.".into());
+    }
+
+    Ok(VmUpdateRequest {
+        name: form.name.clone(),
+        ram_mb: form.ram_mb,
+        cpu_cores: form.cpu_cores,
+        gpu_mode: form.gpu_mode,
+        network_mode: form.network_mode,
+    })
+}
+
 fn gpu_mode_label(mode: GpuMode) -> &'static str {
     match mode {
         GpuMode::None => "None",
         GpuMode::Default => "Default",
+        GpuMode::TryAll => "Try all",
         GpuMode::Unknown(_) => "Unsupported",
     }
 }
@@ -419,7 +592,9 @@ fn network_mode_label(mode: NetworkMode) -> &'static str {
     match mode {
         NetworkMode::None => "None",
         NetworkMode::Nat => "NAT",
-        NetworkMode::External | NetworkMode::Internal | NetworkMode::Unknown(_) => "Unsupported",
+        NetworkMode::External => "External",
+        NetworkMode::Internal => "Internal",
+        NetworkMode::Unknown(_) => "Unsupported",
     }
 }
 
@@ -512,8 +687,8 @@ fn render_vm_list(ui: &mut egui::Ui, vms: &[VmSummary], selected_vm_name: &mut O
                 ui.label(format!("{} cores", vm.cpu_cores));
                 ui.label(format!("{} MiB", vm.ram_mb));
                 ui.label(format!("{} GiB", vm.disk_gb));
-                ui.label(format!("{:?}", vm.gpu_mode));
-                ui.label(format!("{:?}", vm.network_mode));
+                ui.label(gpu_mode_label(vm.gpu_mode));
+                ui.label(network_mode_label(vm.network_mode));
                 ui.end_row();
             }
         });
@@ -540,6 +715,7 @@ fn render_selected_vm(
         VmState::Starting | VmState::Running { .. } => (VmAction::Stop, "Stop"),
     };
     let is_running = matches!(vm.state, VmState::Running { .. });
+    let can_modify_configuration = matches!(vm.state, VmState::Stopped);
     let mut action = None;
     ui.horizontal(|ui| {
         action = render_action_group(
@@ -570,8 +746,8 @@ fn render_selected_vm(
         if let Some(clicked_action) = render_action_group(
             ui,
             &[(VmAction::Edit, "Edit"), (VmAction::Delete, "Delete")],
-            !is_running,
-            Some("Unavailable while the VM is running"),
+            can_modify_configuration,
+            Some("Available only when the VM is stopped"),
         ) {
             action = Some(clicked_action);
         }
@@ -595,11 +771,15 @@ fn render_selected_vm(
                 "Agent status",
                 agent_status_label(agent_status(vm.state)).into(),
             );
-            detail_row(ui, "Network type", format!("{:?}", vm.network_mode));
+            detail_row(
+                ui,
+                "Network type",
+                network_mode_label(vm.network_mode).into(),
+            );
             detail_row(ui, "CPU", format!("{} cores", vm.cpu_cores));
             detail_row(ui, "RAM", format!("{} MiB", vm.ram_mb));
             detail_row(ui, "Disk", format!("{} GiB", vm.disk_gb));
-            detail_row(ui, "GPU", format!("{:?}", vm.gpu_mode));
+            detail_row(ui, "GPU", gpu_mode_label(vm.gpu_mode).into());
             detail_row(
                 ui,
                 "SSH port",
@@ -866,5 +1046,45 @@ fn vm_state(state: VmState) -> &'static str {
         VmState::Stopped => "Stopped",
         VmState::Starting => "Building",
         VmState::Running { .. } => "Running",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edit_vm_request_accepts_supported_modes() {
+        let request = edit_vm_request(&EditVmForm {
+            name: "dev".into(),
+            ram_mb: 8192,
+            cpu_cores: 8,
+            gpu_mode: GpuMode::TryAll,
+            network_mode: NetworkMode::External,
+            error: None,
+        })
+        .unwrap();
+
+        assert_eq!(request.name, "dev");
+        assert_eq!(request.gpu_mode, GpuMode::TryAll);
+        assert_eq!(request.network_mode, NetworkMode::External);
+    }
+
+    #[test]
+    fn edit_vm_request_rejects_odd_ram() {
+        let error = edit_vm_request(&EditVmForm {
+            name: "dev".into(),
+            ram_mb: 513,
+            cpu_cores: 4,
+            gpu_mode: GpuMode::Default,
+            network_mode: NetworkMode::Nat,
+            error: None,
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "RAM must be an even number of MiB and at least 512 MiB."
+        );
     }
 }

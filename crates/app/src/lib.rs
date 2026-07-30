@@ -1,7 +1,8 @@
 //! Application workflows shared by desktop, CLI, and future automation clients.
 
 use vmlord_core::{
-    Diagnostic, DiagnosticLevel, RepositoryError, VmCreateRequest, VmRepository, VmSummary,
+    Diagnostic, DiagnosticLevel, RepositoryError, VmCreateRequest, VmRepository, VmState,
+    VmSummary, VmUpdateRequest,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -117,6 +118,68 @@ impl WorkspaceApp {
                 self.diagnostics.push(Diagnostic {
                     level: DiagnosticLevel::Error,
                     message: format!("Failed to create VM: {error}"),
+                });
+                self.collect_diagnostics();
+                Err(error)
+            }
+        }
+    }
+
+    pub fn update_vm(&mut self, request: VmUpdateRequest) -> Result<(), RepositoryError> {
+        self.require_ready_backend("VM update")?;
+
+        let vm_state = self
+            .vms
+            .iter()
+            .find(|vm| vm.name == request.name)
+            .map(|vm| vm.state)
+            .ok_or_else(|| {
+                RepositoryError::new(format!("VM \"{}\" was not found", request.name))
+            })?;
+        if !matches!(vm_state, VmState::Stopped) {
+            let error = RepositoryError::new(format!(
+                "VM \"{}\" must be stopped before it can be edited",
+                request.name
+            ));
+            self.diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: error.to_string(),
+            });
+            return Err(error);
+        }
+        if request.ram_mb < 512 || request.ram_mb % 2 != 0 {
+            let error = RepositoryError::new(
+                "RAM must be 2 MiB-aligned and at least 512 MiB for VM updates",
+            );
+            self.diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: error.to_string(),
+            });
+            return Err(error);
+        }
+        if request.cpu_cores == 0 {
+            let error = RepositoryError::new("CPU cores must be at least 1 for VM updates");
+            self.diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: error.to_string(),
+            });
+            return Err(error);
+        }
+
+        let name = request.name.clone();
+        match self.repository.update_vm(request) {
+            Ok(()) => {
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Info,
+                    message: format!("VM \"{name}\" update accepted"),
+                });
+                self.refresh();
+                Ok(())
+            }
+            Err(error) => {
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Error,
+                    message: format!("Failed to update VM \"{name}\": {error}"),
                 });
                 self.collect_diagnostics();
                 Err(error)
@@ -278,6 +341,10 @@ impl VmRepository for UnavailableRepository {
         Err(RepositoryError::new(self.message.clone()))
     }
 
+    fn update_vm(&mut self, _request: VmUpdateRequest) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(self.message.clone()))
+    }
+
     fn start_vm(&mut self, _name: &str) -> Result<(), RepositoryError> {
         Err(RepositoryError::new(self.message.clone()))
     }
@@ -336,6 +403,18 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+
+        fn update_vm(&mut self, request: VmUpdateRequest) -> Result<(), RepositoryError> {
+            self.actions.push(format!(
+                "update:{}:{}:{}:{:?}:{:?}",
+                request.name,
+                request.ram_mb,
+                request.cpu_cores,
+                request.gpu_mode,
+                request.network_mode
+            ));
+            Ok(())
         }
 
         fn start_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
@@ -402,6 +481,12 @@ mod tests {
     fn create_vm_is_available_to_ui_clients() {
         let _: fn(&mut WorkspaceApp, VmCreateRequest) -> Result<(), RepositoryError> =
             WorkspaceApp::create_vm;
+    }
+
+    #[test]
+    fn update_vm_is_available_to_ui_clients() {
+        let _: fn(&mut WorkspaceApp, VmUpdateRequest) -> Result<(), RepositoryError> =
+            WorkspaceApp::update_vm;
     }
 
     #[test]
