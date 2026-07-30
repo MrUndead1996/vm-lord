@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "crates/core",
+    "crates/app",
+    "crates/legacy-backend",
+    "crates/ui",
+    "crates/vmlord",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["VMLord contributors"]
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
