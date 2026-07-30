@@ -19,7 +19,14 @@ pub struct VmSummary {
 pub enum VmState {
     Stopped,
     Starting,
-    Running { agent_online: bool },
+    Running { agent_status: AgentStatus },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentStatus {
+    Offline,
+    Online,
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

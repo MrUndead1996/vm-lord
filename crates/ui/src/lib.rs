@@ -1,8 +1,12 @@
 //! Read-only desktop shell for the first VMLord milestone.
 
+use std::time::{Duration, Instant};
+
 use eframe::egui;
 use vmlord_app::{BackendStatus, WorkspaceApp};
-use vmlord_core::{DiagnosticLevel, VmState, VmSummary};
+use vmlord_core::{AgentStatus, DiagnosticLevel, VmState, VmSummary};
+
+const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 pub fn run(application: WorkspaceApp) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -12,16 +16,30 @@ pub fn run(application: WorkspaceApp) -> eframe::Result<()> {
     eframe::run_native(
         "VMLord",
         options,
-        Box::new(move |_| Ok(Box::new(VmlordUi { application }))),
+        Box::new(move |_| {
+            Ok(Box::new(VmlordUi {
+                application,
+                last_refresh: Instant::now(),
+            }))
+        }),
     )
 }
 
 struct VmlordUi {
     application: WorkspaceApp,
+    last_refresh: Instant,
 }
 
 impl eframe::App for VmlordUi {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        context.request_repaint_after(AUTO_REFRESH_INTERVAL);
+        if matches!(self.application.status(), BackendStatus::Ready)
+            && self.last_refresh.elapsed() >= AUTO_REFRESH_INTERVAL
+        {
+            self.application.refresh();
+            self.last_refresh = Instant::now();
+        }
+
         egui::CentralPanel::default().show(context, |ui| {
             ui.heading("VMLord");
             ui.label("Linux workspaces on Windows");
@@ -37,6 +55,7 @@ impl eframe::App for VmlordUi {
                     .clicked()
                 {
                     self.application.refresh();
+                    self.last_refresh = Instant::now();
                 }
             });
 
@@ -107,9 +126,14 @@ fn vm_state(state: VmState) -> &'static str {
     match state {
         VmState::Stopped => "Stopped",
         VmState::Starting => "Building",
-        VmState::Running { agent_online: true } => "Running",
         VmState::Running {
-            agent_online: false,
+            agent_status: AgentStatus::Online,
+        } => "Running",
+        VmState::Running {
+            agent_status: AgentStatus::Offline,
         } => "Running (agent offline)",
+        VmState::Running {
+            agent_status: AgentStatus::Unknown,
+        } => "Running (agent status unavailable)",
     }
 }

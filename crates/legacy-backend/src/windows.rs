@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     ffi::c_void,
     path::Path,
     ptr, slice,
@@ -8,13 +8,14 @@ use std::{
 
 use libloading::Library;
 use vmlord_core::{
-    Diagnostic, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError, VmRepository, VmState,
-    VmSummary,
+    AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError, VmRepository,
+    VmState, VmSummary,
 };
 
 type AsbVm = *mut c_void;
 type AsbInit = unsafe extern "system" fn() -> i32;
 type AsbDetach = unsafe extern "system" fn();
+type AsbReconnectRunning = unsafe extern "system" fn();
 type AsbSetCallback = unsafe extern "system" fn(Option<Callback>, *mut c_void);
 type AsbVmCount = unsafe extern "system" fn() -> i32;
 type AsbVmGet = unsafe extern "system" fn(i32) -> AsbVm;
@@ -27,6 +28,7 @@ type Callback = unsafe extern "system" fn(*const u16, *mut c_void);
 struct Api {
     init: AsbInit,
     detach: AsbDetach,
+    reconnect_running: AsbReconnectRunning,
     set_log_callback: AsbSetCallback,
     set_alert_callback: AsbSetCallback,
     vm_count: AsbVmCount,
@@ -47,6 +49,7 @@ struct Api {
 
 struct CallbackContext {
     diagnostics: Mutex<VecDeque<Diagnostic>>,
+    running_without_handle: Mutex<HashSet<String>>,
 }
 
 pub struct AppSandboxBackend {
@@ -92,6 +95,7 @@ impl AppSandboxBackend {
             _library: library,
             callbacks: Box::new(CallbackContext {
                 diagnostics: Mutex::new(VecDeque::new()),
+                running_without_handle: Mutex::new(HashSet::new()),
             }),
             initialized: false,
         })
@@ -104,6 +108,13 @@ impl AppSandboxBackend {
     fn diagnostics_lock(&self) -> MutexGuard<'_, VecDeque<Diagnostic>> {
         self.callbacks
             .diagnostics
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn running_without_handle_lock(&self) -> MutexGuard<'_, HashSet<String>> {
+        self.callbacks
+            .running_without_handle
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -133,6 +144,9 @@ impl VmRepository for AppSandboxBackend {
             )));
         }
 
+        // `asb_init` restores persisted VM definitions but does not reconnect
+        // to VMs launched by an earlier process.
+        unsafe { (self.api.reconnect_running)() };
         self.initialized = true;
         Ok(())
     }
@@ -166,18 +180,27 @@ impl AppSandboxBackend {
     fn vm_summary(&self, vm: AsbVm) -> Result<VmSummary, RepositoryError> {
         // The handle and each returned string pointer originate from AppSandbox.
         unsafe {
+            let name = wide_ptr_to_string((self.api.vm_name)(vm))?;
             let running = (self.api.vm_is_running)(vm) != 0;
             let building = (self.api.vm_is_building)(vm) != 0;
             let agent_online = (self.api.vm_agent_online)(vm) != 0;
             let ssh_port = ((self.api.vm_ssh_enabled)(vm) != 0).then(|| (self.api.vm_ssh_port)(vm));
+            let running_without_handle = self.running_without_handle_lock().contains(&name);
 
             Ok(VmSummary {
-                name: wide_ptr_to_string((self.api.vm_name)(vm))?,
+                name,
                 os_type: wide_ptr_to_string((self.api.vm_os_type)(vm))?,
                 state: if building {
                     VmState::Starting
                 } else if running {
-                    VmState::Running { agent_online }
+                    let agent_status = if agent_online {
+                        AgentStatus::Online
+                    } else if running_without_handle {
+                        AgentStatus::Unknown
+                    } else {
+                        AgentStatus::Offline
+                    };
+                    VmState::Running { agent_status }
                 } else {
                     VmState::Stopped
                 },
@@ -220,6 +243,7 @@ impl Api {
         Ok(Self {
             init: export!(b"asb_init\0", AsbInit),
             detach: export!(b"asb_detach\0", AsbDetach),
+            reconnect_running: export!(b"asb_reconnect_running\0", AsbReconnectRunning),
             set_log_callback: export!(b"asb_set_log_callback\0", AsbSetCallback),
             set_alert_callback: export!(b"asb_set_alert_callback\0", AsbSetCallback),
             vm_count: export!(b"asb_vm_count\0", AsbVmCount),
@@ -255,11 +279,28 @@ fn push_callback_diagnostic(message: *const u16, user_data: *mut c_void, level: 
     let context = unsafe { &*(user_data as *const CallbackContext) };
     let message =
         wide_ptr_to_string(message).unwrap_or_else(|_| "invalid backend callback message".into());
+
+    if let Some(name) = reconnect_running_without_handle_vm_name(&message) {
+        let mut running_without_handle = context
+            .running_without_handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        running_without_handle.insert(name.to_owned());
+    }
+
     let mut diagnostics = context
         .diagnostics
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     diagnostics.push_back(Diagnostic { level, message });
+}
+
+fn reconnect_running_without_handle_vm_name(message: &str) -> Option<&str> {
+    let prefix = "Reconnect: \"";
+    let suffix = "\" is running (via enumeration, no handle).";
+    message
+        .strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(suffix))
 }
 
 fn wide_ptr_to_string(pointer: *const u16) -> Result<String, RepositoryError> {
@@ -290,5 +331,28 @@ fn network_mode(value: i32) -> NetworkMode {
         2 => NetworkMode::External,
         3 => NetworkMode::Internal,
         other => NetworkMode::Unknown(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reconnect_running_without_handle_vm_name;
+
+    #[test]
+    fn parses_reconnect_running_without_handle_message() {
+        assert_eq!(
+            reconnect_running_without_handle_vm_name(
+                "Reconnect: \"ubuntu\" is running (via enumeration, no handle)."
+            ),
+            Some("ubuntu")
+        );
+    }
+
+    #[test]
+    fn ignores_other_messages() {
+        assert_eq!(
+            reconnect_running_without_handle_vm_name("Reconnect: \"ubuntu\" is running."),
+            None
+        );
     }
 }
