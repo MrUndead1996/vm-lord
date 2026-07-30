@@ -132,6 +132,12 @@ impl WorkspaceApp {
         self.run_vm_lifecycle_action(name, "stop", |repository| repository.stop_vm(name))
     }
 
+    pub fn force_stop_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.run_vm_lifecycle_action(name, "force stop", |repository| {
+            repository.force_stop_vm(name)
+        })
+    }
+
     #[must_use]
     pub fn status(&self) -> &BackendStatus {
         &self.status
@@ -236,6 +242,10 @@ impl VmRepository for UnavailableRepository {
         Err(RepositoryError::new(self.message.clone()))
     }
 
+    fn force_stop_vm(&mut self, _name: &str) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(self.message.clone()))
+    }
+
     fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
         Vec::new()
     }
@@ -294,6 +304,11 @@ mod tests {
             Ok(())
         }
 
+        fn force_stop_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
+            self.actions.push(format!("force-stop:{name}"));
+            Ok(())
+        }
+
         fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
             vec![Diagnostic {
                 level: DiagnosticLevel::Info,
@@ -346,6 +361,7 @@ mod tests {
 
         app.start_vm("dev").unwrap();
         app.stop_vm("dev").unwrap();
+        app.force_stop_vm("dev").unwrap();
 
         assert!(
             app.diagnostics()
@@ -356,6 +372,11 @@ mod tests {
             app.diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic.message == "VM \"dev\" stop request accepted")
+        );
+        assert!(
+            app.diagnostics().iter().any(|diagnostic| {
+                diagnostic.message == "VM \"dev\" force stop request accepted"
+            })
         );
     }
 

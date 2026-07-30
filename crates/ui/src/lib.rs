@@ -148,12 +148,13 @@ impl eframe::App for VmlordUi {
         if let Some(action) = action.inner {
             match action {
                 VmAction::Create => self.create_vm_form = Some(CreateVmForm::default()),
-                VmAction::Start | VmAction::Stop => {
+                VmAction::Start | VmAction::Stop | VmAction::ForceStop => {
                     if let Some(name) = self.selected_vm_name.clone() {
-                        let result = if action == VmAction::Start {
-                            self.application.start_vm(&name)
-                        } else {
-                            self.application.stop_vm(&name)
+                        let result = match action {
+                            VmAction::Start => self.application.start_vm(&name),
+                            VmAction::Stop => self.application.stop_vm(&name),
+                            VmAction::ForceStop => self.application.force_stop_vm(&name),
+                            _ => unreachable!("only lifecycle actions reach this branch"),
                         };
                         if result.is_ok() {
                             self.last_refresh = Instant::now();
