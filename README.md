@@ -99,7 +99,14 @@ While AppSandbox focuses on isolated application environments across multiple pl
 temporary AppSandbox legacy backend, displays its initialization status, and
 lists persisted VMs in an egui desktop shell.
 
-Build and run with `cargo run -p vmlord`. The build stages the prebuilt
+Build with `cargo build -p vmlord`, then launch the elevated executable with:
+
+```powershell
+Start-Process -FilePath .\target\debug\vmlord.exe -Verb RunAs -Wait
+```
+
+The HCS backend requires elevation, so `cargo run` cannot launch the UAC-marked
+executable directly. The build stages the prebuilt
 `third_party/appsandbox/x64/appsandbox_core.dll` next to the executable. See
 `third_party/appsandbox/NOTICE.md` for the pinned artifact and license details.
 
