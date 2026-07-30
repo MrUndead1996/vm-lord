@@ -1,6 +1,8 @@
 //! Application workflows shared by desktop, CLI, and future automation clients.
 
-use vmlord_core::{Diagnostic, RepositoryError, VmRepository, VmSummary};
+use vmlord_core::{
+    Diagnostic, DiagnosticLevel, RepositoryError, VmCreateRequest, VmRepository, VmSummary,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BackendStatus {
@@ -11,6 +13,7 @@ pub enum BackendStatus {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VmAction {
+    Create,
     Start,
     Stop,
     ForceStop,
@@ -23,6 +26,7 @@ pub enum VmAction {
 impl VmAction {
     const fn label(self) -> &'static str {
         match self {
+            Self::Create => "Create VM",
             Self::Start => "Start",
             Self::Stop => "Stop",
             Self::ForceStop => "Force stop",
@@ -34,8 +38,13 @@ impl VmAction {
     }
 }
 
+pub trait ImagePicker {
+    fn pick_iso_image(&mut self) -> Result<Option<String>, RepositoryError>;
+}
+
 pub struct WorkspaceApp {
     repository: Box<dyn VmRepository>,
+    image_picker: Option<Box<dyn ImagePicker>>,
     status: BackendStatus,
     vms: Vec<VmSummary>,
     diagnostics: Vec<Diagnostic>,
@@ -46,10 +55,26 @@ impl WorkspaceApp {
     pub fn new(repository: Box<dyn VmRepository>) -> Self {
         Self {
             repository,
+            image_picker: None,
             status: BackendStatus::Starting,
             vms: Vec::new(),
             diagnostics: Vec::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_image_picker(mut self, image_picker: Box<dyn ImagePicker>) -> Self {
+        self.image_picker = Some(image_picker);
+        self
+    }
+
+    pub fn pick_iso_image(&mut self) -> Result<Option<String>, RepositoryError> {
+        let Some(image_picker) = &mut self.image_picker else {
+            return Err(RepositoryError::new(
+                "the native image picker is not available",
+            ));
+        };
+        image_picker.pick_iso_image()
     }
 
     pub fn start(&mut self) {
@@ -74,6 +99,36 @@ impl WorkspaceApp {
             Err(error) => self.status = BackendStatus::Unavailable(error.to_string()),
         }
         self.collect_diagnostics();
+    }
+
+    pub fn create_vm(&mut self, request: VmCreateRequest) -> Result<(), RepositoryError> {
+        if !matches!(self.status, BackendStatus::Ready) {
+            let error = RepositoryError::new("VM creation requires a ready backend");
+            self.diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: error.to_string(),
+            });
+            return Err(error);
+        }
+
+        match self.repository.create_vm(request) {
+            Ok(()) => {
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Info,
+                    message: "VM creation accepted".into(),
+                });
+                self.refresh();
+                Ok(())
+            }
+            Err(error) => {
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Error,
+                    message: format!("Failed to create VM: {error}"),
+                });
+                self.collect_diagnostics();
+                Err(error)
+            }
+        }
     }
 
     #[must_use]
@@ -127,6 +182,10 @@ impl VmRepository for UnavailableRepository {
         Err(RepositoryError::new(self.message.clone()))
     }
 
+    fn create_vm(&mut self, _request: VmCreateRequest) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(self.message.clone()))
+    }
+
     fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
         Vec::new()
     }
@@ -139,6 +198,7 @@ mod tests {
 
     struct FakeRepository {
         should_fail: bool,
+        create_should_fail: bool,
     }
 
     impl VmRepository for FakeRepository {
@@ -165,6 +225,14 @@ mod tests {
             }])
         }
 
+        fn create_vm(&mut self, _request: VmCreateRequest) -> Result<(), RepositoryError> {
+            if self.create_should_fail {
+                Err(RepositoryError::new("creation failed"))
+            } else {
+                Ok(())
+            }
+        }
+
         fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
             vec![Diagnostic {
                 level: DiagnosticLevel::Info,
@@ -175,7 +243,10 @@ mod tests {
 
     #[test]
     fn start_loads_vm_list() {
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository { should_fail: false }));
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            should_fail: false,
+            create_should_fail: false,
+        }));
         app.start();
         assert_eq!(app.status(), &BackendStatus::Ready);
         assert_eq!(app.vms().len(), 1);
@@ -184,7 +255,10 @@ mod tests {
 
     #[test]
     fn initialization_error_is_visible() {
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository { should_fail: true }));
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            should_fail: true,
+            create_should_fail: false,
+        }));
         app.start();
         assert_eq!(
             app.status(),
@@ -193,11 +267,20 @@ mod tests {
     }
 
     #[test]
+    fn create_vm_is_available_to_ui_clients() {
+        let _: fn(&mut WorkspaceApp, VmCreateRequest) -> Result<(), RepositoryError> =
+            WorkspaceApp::create_vm;
+    }
+
+    #[test]
     fn vm_action_is_logged() {
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository { should_fail: false }));
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            should_fail: false,
+            create_should_fail: false,
+        }));
 
-        app.log_vm_action(VmAction::Start);
+        app.log_vm_action(VmAction::Create);
 
-        assert_eq!(app.diagnostics()[0].message, "Start pressed");
+        assert_eq!(app.diagnostics()[0].message, "Create VM pressed");
     }
 }

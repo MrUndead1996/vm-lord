@@ -7,13 +7,39 @@ use std::{
 };
 
 use libloading::Library;
+use vmlord_app::ImagePicker;
 use vmlord_core::{
-    AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError, VmRepository,
-    VmState, VmSummary,
+    AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError,
+    VmCreateRequest, VmRepository, VmState, VmSummary,
 };
 
 type AsbVm = *mut c_void;
 type AsbInit = unsafe extern "system" fn() -> i32;
+type AsbVmCreate = unsafe extern "system" fn(*const AsbVmConfig) -> i32;
+
+#[repr(C)]
+struct AsbVmConfig {
+    name: *const u16,
+    os_type: *const u16,
+    image_path: *const u16,
+    template_name: *const u16,
+    ram_mb: u32,
+    hdd_gb: u32,
+    cpu_cores: u32,
+    gpu_mode: i32,
+    network_mode: i32,
+    net_adapter: *const u16,
+    username: *const u16,
+    password: *const u16,
+    test_mode: i32,
+    ssh_enabled: i32,
+    ssh_deploy_key: i32,
+    is_template: i32,
+    linux_source: *const u16,
+    locale: *const u16,
+    keyboard: *const u16,
+    timezone: *const u16,
+}
 type AsbDetach = unsafe extern "system" fn();
 type AsbReconnectRunning = unsafe extern "system" fn();
 type AsbSetCallback = unsafe extern "system" fn(Option<Callback>, *mut c_void);
@@ -27,6 +53,7 @@ type Callback = unsafe extern "system" fn(*const u16, *mut c_void);
 
 struct Api {
     init: AsbInit,
+    vm_create: AsbVmCreate,
     detach: AsbDetach,
     reconnect_running: AsbReconnectRunning,
     set_log_callback: AsbSetCallback,
@@ -50,6 +77,25 @@ struct Api {
 struct CallbackContext {
     diagnostics: Mutex<VecDeque<Diagnostic>>,
     running_without_handle: Mutex<HashSet<String>>,
+}
+
+pub struct WindowsImagePicker;
+
+impl WindowsImagePicker {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl ImagePicker for WindowsImagePicker {
+    fn pick_iso_image(&mut self) -> Result<Option<String>, RepositoryError> {
+        Ok(rfd::FileDialog::new()
+            .set_title("Select Linux VM image")
+            .add_filter("VM images", &["iso", "vhdx"])
+            .pick_file()
+            .map(|path| path.to_string_lossy().into_owned()))
+    }
 }
 
 pub struct AppSandboxBackend {
@@ -151,6 +197,49 @@ impl VmRepository for AppSandboxBackend {
         Ok(())
     }
 
+    fn create_vm(&mut self, request: VmCreateRequest) -> Result<(), RepositoryError> {
+        if !self.initialized {
+            return Err(RepositoryError::new("legacy backend is not initialized"));
+        }
+
+        let name = wide_string(&request.name);
+        let os_type = wide_string("Linux");
+        let image_path = wide_string(&request.image_path);
+        let username = wide_string(&request.username);
+        let password = wide_string(&request.password);
+        let config = AsbVmConfig {
+            name: name.as_ptr(),
+            os_type: os_type.as_ptr(),
+            image_path: image_path.as_ptr(),
+            template_name: ptr::null(),
+            ram_mb: request.ram_mb,
+            hdd_gb: request.disk_gb,
+            cpu_cores: request.cpu_cores,
+            gpu_mode: gpu_mode_value(request.gpu_mode)?,
+            network_mode: network_mode_value(request.network_mode)?,
+            net_adapter: ptr::null(),
+            username: username.as_ptr(),
+            password: password.as_ptr(),
+            test_mode: 1,
+            ssh_enabled: i32::from(request.ssh_enabled),
+            ssh_deploy_key: i32::from(request.ssh_deploy_key),
+            is_template: 0,
+            linux_source: ptr::null(),
+            locale: ptr::null(),
+            keyboard: ptr::null(),
+            timezone: ptr::null(),
+        };
+        let result = unsafe { (self.api.vm_create)(&config) };
+        if result < 0 {
+            return Err(RepositoryError::new(format!(
+                "AppSandbox VM creation failed (HRESULT 0x{:08X})",
+                result as u32
+            )));
+        }
+
+        Ok(())
+    }
+
     fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError> {
         if !self.initialized {
             return Err(RepositoryError::new("legacy backend is not initialized"));
@@ -244,6 +333,7 @@ impl Api {
 
         Ok(Self {
             init: export!(b"asb_init\0", AsbInit),
+            vm_create: export!(b"asb_vm_create\0", AsbVmCreate),
             detach: export!(b"asb_detach\0", AsbDetach),
             reconnect_running: export!(b"asb_reconnect_running\0", AsbReconnectRunning),
             set_log_callback: export!(b"asb_set_log_callback\0", AsbSetCallback),
@@ -316,6 +406,32 @@ fn wide_ptr_to_string(pointer: *const u16) -> Result<String, RepositoryError> {
     Ok(String::from_utf16_lossy(unsafe {
         slice::from_raw_parts(pointer, length)
     }))
+}
+
+fn wide_string(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
+}
+
+fn gpu_mode_value(mode: GpuMode) -> Result<i32, RepositoryError> {
+    match mode {
+        GpuMode::None => Ok(0),
+        GpuMode::Default => Ok(1),
+        GpuMode::Unknown(value) => Err(RepositoryError::new(format!(
+            "unsupported GPU mode: {value}"
+        ))),
+    }
+}
+
+fn network_mode_value(mode: NetworkMode) -> Result<i32, RepositoryError> {
+    match mode {
+        NetworkMode::None => Ok(0),
+        NetworkMode::Nat => Ok(1),
+        NetworkMode::External => Ok(2),
+        NetworkMode::Internal => Ok(3),
+        NetworkMode::Unknown(value) => Err(RepositoryError::new(format!(
+            "unsupported network mode: {value}"
+        ))),
+    }
 }
 
 fn gpu_mode(value: i32) -> GpuMode {

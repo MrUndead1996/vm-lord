@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use vmlord_app::{BackendStatus, VmAction, WorkspaceApp};
-use vmlord_core::{AgentStatus, DiagnosticLevel, VmState, VmSummary};
+use vmlord_core::{
+    AgentStatus, DiagnosticLevel, GpuMode, NetworkMode, VmCreateRequest, VmState, VmSummary,
+};
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const VM_TABLE_COLUMN_COUNT: f32 = 9.0;
@@ -22,6 +24,7 @@ pub fn run(application: WorkspaceApp) -> eframe::Result<()> {
                 application,
                 last_refresh: Instant::now(),
                 selected_vm_name: None,
+                create_vm_form: None,
             }))
         }),
     )
@@ -31,6 +34,49 @@ struct VmlordUi {
     application: WorkspaceApp,
     last_refresh: Instant,
     selected_vm_name: Option<String>,
+    create_vm_form: Option<CreateVmForm>,
+}
+
+struct CreateVmForm {
+    name: String,
+    image_path: String,
+    disk_gb: u32,
+    ram_mb: u32,
+    cpu_cores: u32,
+    gpu_mode: GpuMode,
+    network_mode: NetworkMode,
+    username: String,
+    password: String,
+    password_confirmation: String,
+    ssh_enabled: bool,
+    ssh_deploy_key: bool,
+    error: Option<String>,
+}
+
+impl Default for CreateVmForm {
+    fn default() -> Self {
+        Self {
+            name: "ubuntu".into(),
+            image_path: String::new(),
+            disk_gb: 64,
+            ram_mb: 4096,
+            cpu_cores: 4,
+            gpu_mode: GpuMode::Default,
+            network_mode: NetworkMode::Nat,
+            username: "user".into(),
+            password: String::new(),
+            password_confirmation: String::new(),
+            ssh_enabled: false,
+            ssh_deploy_key: false,
+            error: None,
+        }
+    }
+}
+
+enum CreateVmDialogAction {
+    BrowseImage,
+    Cancel,
+    Submit(VmCreateRequest),
 }
 
 impl eframe::App for VmlordUi {
@@ -44,6 +90,8 @@ impl eframe::App for VmlordUi {
         }
 
         let action = egui::CentralPanel::default().show(context, |ui| {
+            let mut selected_action = None;
+
             ui.heading("VMLord");
             ui.label("Linux workspaces on Windows");
             ui.separator();
@@ -63,20 +111,297 @@ impl eframe::App for VmlordUi {
                     self.application.refresh();
                     self.last_refresh = Instant::now();
                 }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let create = ui.add_enabled(
+                        can_refresh,
+                        egui::Button::new(
+                            egui::RichText::new("Create VM").color(egui::Color32::WHITE),
+                        )
+                        .fill(egui::Color32::from_rgb(47, 158, 97)),
+                    );
+                    if can_refresh {
+                        create.clone().on_hover_text("Create a virtual machine");
+                    } else {
+                        create
+                            .clone()
+                            .on_disabled_hover_text("Available when the backend is ready");
+                    }
+                    if create.clicked() {
+                        selected_action = Some(VmAction::Create);
+                    }
+                });
             });
 
             ui.add_space(12.0);
             render_vm_list(ui, self.application.vms(), &mut self.selected_vm_name);
-            let action = render_selected_vm(ui, self.application.vms(), &self.selected_vm_name);
+            if let Some(action) =
+                render_selected_vm(ui, self.application.vms(), &self.selected_vm_name)
+            {
+                selected_action = Some(action);
+            }
             ui.add_space(12.0);
             render_diagnostics(ui, self.application.diagnostics());
-            action
+            selected_action
         });
 
         if let Some(action) = action.inner {
-            self.application.log_vm_action(action);
+            if action == VmAction::Create {
+                self.create_vm_form = Some(CreateVmForm::default());
+            } else {
+                self.application.log_vm_action(action);
+            }
             context.request_repaint();
         }
+
+        let dialog_action = self
+            .create_vm_form
+            .as_mut()
+            .and_then(|form| render_create_vm_dialog(context, form, self.application.vms()));
+        match dialog_action {
+            Some(CreateVmDialogAction::BrowseImage) => match self.application.pick_iso_image() {
+                Ok(Some(path)) => {
+                    if let Some(form) = &mut self.create_vm_form {
+                        form.image_path = path;
+                        form.error = None;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    if let Some(form) = &mut self.create_vm_form {
+                        form.error = Some(error.to_string());
+                    }
+                }
+            },
+            Some(CreateVmDialogAction::Cancel) => self.create_vm_form = None,
+            Some(CreateVmDialogAction::Submit(request)) => {
+                if let Err(error) = self.application.create_vm(request) {
+                    if let Some(form) = &mut self.create_vm_form {
+                        form.error = Some(error.to_string());
+                    }
+                } else {
+                    self.create_vm_form = None;
+                    self.last_refresh = Instant::now();
+                }
+            }
+            None => {}
+        }
+    }
+}
+
+fn render_create_vm_dialog(
+    context: &egui::Context,
+    form: &mut CreateVmForm,
+    existing_vms: &[VmSummary],
+) -> Option<CreateVmDialogAction> {
+    let mut open = true;
+    let mut action = None;
+    egui::Window::new("New Linux VM")
+        .collapsible(false)
+        .resizable(false)
+        .default_width(620.0)
+        .open(&mut open)
+        .show(context, |ui| {
+            ui.label("Create a persistent Linux workspace from an ISO image.");
+            ui.add_space(4.0);
+            egui::Grid::new("create-vm-form")
+                .num_columns(2)
+                .spacing([12.0, 8.0])
+                .show(ui, |ui| {
+                    ui.label("VM Name");
+                    ui.add_sized([260.0, 0.0], egui::TextEdit::singleline(&mut form.name));
+                    ui.end_row();
+
+                    ui.label("OS Image");
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [300.0, 0.0],
+                            egui::TextEdit::singleline(&mut form.image_path)
+                                .hint_text("Path to ISO or VHDX..."),
+                        );
+                        if ui.button("Browse...").clicked() {
+                            action = Some(CreateVmDialogAction::BrowseImage);
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label("HDD Size");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut form.disk_gb).range(1..=16_384));
+                        ui.label("GiB");
+                    });
+                    ui.end_row();
+
+                    ui.label("RAM Size");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::DragValue::new(&mut form.ram_mb).range(512..=1_048_576));
+                        ui.label("MiB");
+                    });
+                    ui.end_row();
+
+                    ui.label("CPU Cores");
+                    ui.add(egui::DragValue::new(&mut form.cpu_cores).range(1..=256));
+                    ui.end_row();
+
+                    ui.label("GPU");
+                    egui::ComboBox::from_id_salt("create-vm-gpu")
+                        .selected_text(gpu_mode_label(form.gpu_mode))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut form.gpu_mode, GpuMode::Default, "Default");
+                            ui.selectable_value(&mut form.gpu_mode, GpuMode::None, "None");
+                        });
+                    ui.end_row();
+
+                    ui.label("Network");
+                    egui::ComboBox::from_id_salt("create-vm-network")
+                        .selected_text(network_mode_label(form.network_mode))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut form.network_mode, NetworkMode::Nat, "NAT");
+                            ui.selectable_value(&mut form.network_mode, NetworkMode::None, "None");
+                        });
+                    ui.end_row();
+
+                    ui.label("Username");
+                    ui.add_sized([260.0, 0.0], egui::TextEdit::singleline(&mut form.username));
+                    ui.end_row();
+
+                    ui.label("Password");
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [140.0, 0.0],
+                            egui::TextEdit::singleline(&mut form.password).password(true),
+                        );
+                        ui.label("Confirm");
+                        ui.add_sized(
+                            [140.0, 0.0],
+                            egui::TextEdit::singleline(&mut form.password_confirmation)
+                                .password(true),
+                        );
+                    });
+                    ui.end_row();
+                });
+
+            ui.horizontal(|ui| {
+                ui.label("Options");
+                ui.checkbox(&mut form.ssh_enabled, "SSH Server");
+                ui.add_enabled_ui(form.ssh_enabled, |ui| {
+                    ui.checkbox(&mut form.ssh_deploy_key, "Deploy SSH key");
+                });
+            });
+            if !form.ssh_enabled {
+                form.ssh_deploy_key = false;
+            }
+
+            if let Some(error) = &form.error {
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+            }
+
+            ui.separator();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let create = ui.add(
+                    egui::Button::new(egui::RichText::new("Create VM").color(egui::Color32::WHITE))
+                        .fill(egui::Color32::from_rgb(47, 158, 97)),
+                );
+                if create.clicked() {
+                    match create_vm_request(form, existing_vms) {
+                        Ok(request) => action = Some(CreateVmDialogAction::Submit(request)),
+                        Err(error) => form.error = Some(error),
+                    }
+                }
+                if ui.button("Cancel").clicked() {
+                    action = Some(CreateVmDialogAction::Cancel);
+                }
+            });
+        });
+
+    if !open && action.is_none() {
+        action = Some(CreateVmDialogAction::Cancel);
+    }
+    action
+}
+
+fn create_vm_request(
+    form: &CreateVmForm,
+    existing_vms: &[VmSummary],
+) -> Result<VmCreateRequest, String> {
+    let name = form.name.trim();
+    if name.is_empty() {
+        return Err("VM name is required.".into());
+    }
+    if name.len() > 63
+        || name.starts_with('-')
+        || name.ends_with('-')
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err("Use a lowercase Linux hostname of up to 63 characters.".into());
+    }
+    if existing_vms
+        .iter()
+        .any(|vm| vm.name.eq_ignore_ascii_case(name))
+    {
+        return Err("A VM with this name already exists.".into());
+    }
+    if form.image_path.trim().is_empty() {
+        return Err("A Linux ISO path is required.".into());
+    }
+    if form.disk_gb == 0 || form.ram_mb == 0 || form.cpu_cores == 0 {
+        return Err("Disk, RAM, and CPU values must be greater than zero.".into());
+    }
+
+    let username = form.username.trim();
+    if username.is_empty()
+        || username.len() > 32
+        || !username
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| match index {
+                0 => byte.is_ascii_lowercase() || byte == b'_',
+                _ => {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'_' | b'-')
+                }
+            })
+    {
+        return Err("Use a valid lowercase Linux username.".into());
+    }
+    if form.password.is_empty() {
+        return Err("Password is required.".into());
+    }
+    if form.password != form.password_confirmation {
+        return Err("Passwords do not match.".into());
+    }
+
+    Ok(VmCreateRequest {
+        name: name.into(),
+        image_path: form.image_path.trim().into(),
+        ram_mb: form.ram_mb,
+        disk_gb: form.disk_gb,
+        cpu_cores: form.cpu_cores,
+        gpu_mode: form.gpu_mode,
+        network_mode: form.network_mode,
+        username: username.into(),
+        password: form.password.clone(),
+        ssh_enabled: form.ssh_enabled,
+        ssh_deploy_key: form.ssh_deploy_key,
+    })
+}
+
+fn gpu_mode_label(mode: GpuMode) -> &'static str {
+    match mode {
+        GpuMode::None => "None",
+        GpuMode::Default => "Default",
+        GpuMode::Unknown(_) => "Unsupported",
+    }
+}
+
+fn network_mode_label(mode: NetworkMode) -> &'static str {
+    match mode {
+        NetworkMode::None => "None",
+        NetworkMode::Nat => "NAT",
+        NetworkMode::External | NetworkMode::Internal | NetworkMode::Unknown(_) => "Unsupported",
     }
 }
 
@@ -306,6 +631,28 @@ fn render_action_icon(ui: &mut egui::Ui, action: VmAction, enabled: bool) -> egu
     let center = rect.center();
 
     match action {
+        VmAction::Create => {
+            painter.rect_stroke(
+                egui::Rect::from_center_size(center, egui::vec2(12.0, 12.0)),
+                2.0,
+                stroke,
+                egui::StrokeKind::Inside,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x - 3.5, center.y),
+                    egui::pos2(center.x + 3.5, center.y),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x, center.y - 3.5),
+                    egui::pos2(center.x, center.y + 3.5),
+                ],
+                stroke,
+            );
+        }
         VmAction::Start => {
             painter.add(egui::Shape::convex_polygon(
                 vec![
@@ -428,7 +775,7 @@ fn render_action_icon(ui: &mut egui::Ui, action: VmAction, enabled: bool) -> egu
 
 fn action_color(action: VmAction) -> egui::Color32 {
     match action {
-        VmAction::Start => egui::Color32::from_rgb(84, 158, 230),
+        VmAction::Create | VmAction::Start => egui::Color32::from_rgb(84, 158, 230),
         VmAction::Stop => egui::Color32::from_rgb(235, 210, 64),
         VmAction::ForceStop => egui::Color32::from_rgb(225, 70, 70),
         VmAction::Connect | VmAction::Ssh => egui::Color32::from_rgb(85, 193, 233),

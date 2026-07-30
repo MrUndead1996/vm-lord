@@ -14,25 +14,28 @@ fn main() {
 
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("Cargo must set manifest directory"));
-    let source = manifest_dir.join("../../third_party/appsandbox/x64/appsandbox_core.dll");
-    println!("cargo:rerun-if-changed={}", source.display());
-
-    assert!(
-        source.is_file(),
-        "required legacy backend DLL is missing: {}",
-        source.display()
-    );
-
+    let runtime_directory = manifest_dir.join("../../third_party/appsandbox/x64");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("Cargo must set output directory"));
     let profile_dir = out_dir
         .ancestors()
         .nth(3)
         .expect("Cargo output directory must be nested below a profile directory");
-    let destination = profile_dir.join("appsandbox_core.dll");
-    fs::copy(&source, &destination).unwrap_or_else(|error| {
-        panic!(
-            "cannot stage legacy backend at {}: {error}",
-            destination.display()
-        )
-    });
+
+    for runtime_file in ["appsandbox_core.dll", "iso-patch.exe"] {
+        let source = runtime_directory.join(runtime_file);
+        println!("cargo:rerun-if-changed={}", source.display());
+        assert!(
+            source.is_file(),
+            "required AppSandbox runtime file is missing: {}",
+            source.display()
+        );
+
+        let destination = profile_dir.join(runtime_file);
+        fs::copy(&source, &destination).unwrap_or_else(|error| {
+            panic!(
+                "cannot stage AppSandbox runtime file at {}: {error}",
+                destination.display()
+            )
+        });
+    }
 }

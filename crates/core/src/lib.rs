@@ -3,6 +3,21 @@
 use std::fmt;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmCreateRequest {
+    pub name: String,
+    pub image_path: String,
+    pub ram_mb: u32,
+    pub disk_gb: u32,
+    pub cpu_cores: u32,
+    pub gpu_mode: GpuMode,
+    pub network_mode: NetworkMode,
+    pub username: String,
+    pub password: String,
+    pub ssh_enabled: bool,
+    pub ssh_deploy_key: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VmSummary {
     pub name: String,
     pub os_type: String,
@@ -83,6 +98,7 @@ impl std::error::Error for RepositoryError {}
 
 pub trait VmRepository {
     fn initialize(&mut self) -> Result<(), RepositoryError>;
+    fn create_vm(&mut self, request: VmCreateRequest) -> Result<(), RepositoryError>;
     fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError>;
     fn take_diagnostics(&mut self) -> Vec<Diagnostic>;
 }

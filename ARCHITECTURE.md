@@ -183,10 +183,12 @@ pointers, or Windows DLL loading. It dynamically loads the prebuilt
 `appsandbox_core.dll` placed next to `vmlord.exe`; no C types cross into `core`,
 `app`, or `ui`.
 
-The current UI is deliberately read-only: it initializes the backend, shows
-availability and diagnostics, and lists known VMs. It calls `asb_detach` on exit
-so it never stops VMs. Lifecycle, provisioning, display, and snapshots remain
-future application-layer work.
+The current UI initializes the backend, shows availability and diagnostics,
+lists known VMs, and can create Linux VMs from ISO images. It submits a safe
+`VmCreateRequest` through the application layer; only `legacy-backend` maps it
+to AppSandbox's C configuration and invokes `asb_vm_create`. It calls
+`asb_detach` on exit so it never stops VMs. Lifecycle controls, display, and
+snapshots remain future application-layer work.
 
 ---
 

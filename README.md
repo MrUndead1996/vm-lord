@@ -110,6 +110,8 @@ executable directly. The build stages the prebuilt
 `third_party/appsandbox/x64/appsandbox_core.dll` next to the executable. See
 `third_party/appsandbox/NOTICE.md` for the pinned artifact and license details.
 
-The initial shell is read-only and targets `x86_64-pc-windows-msvc`. AppSandbox
-macOS code, WebView UI, provisioning tools, and display resources are not
-included.
+The initial shell can create Linux workspaces from ISO images and targets
+`x86_64-pc-windows-msvc`. Creation currently uses the temporary AppSandbox
+backend; VM lifecycle, provisioning, display, and snapshots remain migration
+work. AppSandbox macOS code, WebView UI, provisioning tools, and display
+resources are not included.

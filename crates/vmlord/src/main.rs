@@ -8,7 +8,8 @@ fn main() {
         Ok(backend) => Box::new(backend),
         Err(error) => vmlord_app::unavailable_repository(error.to_string()),
     };
-    let mut application = vmlord_app::WorkspaceApp::new(repository);
+    let mut application = vmlord_app::WorkspaceApp::new(repository)
+        .with_image_picker(Box::new(vmlord_legacy_backend::WindowsImagePicker::new()));
     application.start();
     if let Err(error) = vmlord_ui::run(application) {
         panic!("failed to run VMLord UI: {error}");
