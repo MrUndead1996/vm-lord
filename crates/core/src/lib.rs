@@ -102,6 +102,11 @@ pub trait VmRepository {
     fn start_vm(&mut self, name: &str) -> Result<(), RepositoryError>;
     fn stop_vm(&mut self, name: &str) -> Result<(), RepositoryError>;
     fn force_stop_vm(&mut self, name: &str) -> Result<(), RepositoryError>;
+    fn open_display(&mut self, _name: &str) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(
+            "display connections are not supported by this backend",
+        ))
+    }
     fn open_ssh(&mut self, _name: &str) -> Result<(), RepositoryError> {
         Err(RepositoryError::new(
             "SSH connections are not supported by this backend",

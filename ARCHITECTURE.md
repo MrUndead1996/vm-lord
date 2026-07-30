@@ -187,9 +187,10 @@ The current UI initializes the backend, shows availability and diagnostics,
 lists known VMs, and can create Linux VMs from ISO images. It submits safe
 requests through the application layer; only `legacy-backend` maps them to
 AppSandbox's C API. The Start action invokes `asb_vm_start`; Stop invokes the
-graceful `asb_vm_shutdown`; Force stop invokes `asb_vm_stop`. It calls
-`asb_detach` on exit so it never stops VMs. Display and snapshots remain future
-application-layer work.
+graceful `asb_vm_shutdown`; Force stop invokes `asb_vm_stop`. Connect invokes
+`asb_vm_open_display`, which opens or focuses the temporary AppSandbox IDD
+window after the guest display driver is ready. It calls `asb_detach` on exit so
+it never stops VMs. Snapshots remain future application-layer work.
 
 ---
 

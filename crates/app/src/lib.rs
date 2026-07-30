@@ -138,6 +138,28 @@ impl WorkspaceApp {
         })
     }
 
+    pub fn connect_display(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.require_ready_backend("display connection")?;
+
+        match self.repository.open_display(name) {
+            Ok(()) => {
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Info,
+                    message: format!("Display for VM \"{name}\" opened"),
+                });
+                Ok(())
+            }
+            Err(error) => {
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Error,
+                    message: format!("Failed to open display for VM \"{name}\": {error}"),
+                });
+                self.collect_diagnostics();
+                Err(error)
+            }
+        }
+    }
+
     pub fn open_ssh(&mut self, name: &str) -> Result<(), RepositoryError> {
         self.require_ready_backend("SSH connection")?;
 
@@ -331,6 +353,11 @@ mod tests {
             Ok(())
         }
 
+        fn open_display(&mut self, name: &str) -> Result<(), RepositoryError> {
+            self.actions.push(format!("display:{name}"));
+            Ok(())
+        }
+
         fn open_ssh(&mut self, name: &str) -> Result<(), RepositoryError> {
             self.actions.push(format!("ssh:{name}"));
             Ok(())
@@ -404,6 +431,24 @@ mod tests {
             app.diagnostics().iter().any(|diagnostic| {
                 diagnostic.message == "VM \"dev\" force stop request accepted"
             })
+        );
+    }
+
+    #[test]
+    fn opens_display_through_repository() {
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            should_fail: false,
+            create_should_fail: false,
+            actions: Vec::new(),
+        }));
+        app.start();
+
+        app.connect_display("dev").unwrap();
+
+        assert!(
+            app.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message == "Display for VM \"dev\" opened")
         );
     }
 

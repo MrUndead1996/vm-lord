@@ -21,6 +21,7 @@ type AsbVmCreate = unsafe extern "system" fn(*const AsbVmConfig) -> i32;
 type AsbVmStart = unsafe extern "system" fn(AsbVm, i32, i32, *const u16) -> i32;
 type AsbVmShutdown = unsafe extern "system" fn(AsbVm) -> i32;
 type AsbVmStop = unsafe extern "system" fn(AsbVm) -> i32;
+type AsbVmOpenDisplay = unsafe extern "system" fn(AsbVm) -> i32;
 
 #[repr(C)]
 struct AsbVmConfig {
@@ -62,6 +63,7 @@ struct Api {
     vm_start: AsbVmStart,
     vm_shutdown: AsbVmShutdown,
     vm_stop: AsbVmStop,
+    vm_open_display: Option<AsbVmOpenDisplay>,
     detach: AsbDetach,
     reconnect_running: AsbReconnectRunning,
     set_log_callback: AsbSetCallback,
@@ -268,6 +270,29 @@ impl VmRepository for AppSandboxBackend {
         check_lifecycle_result("force stop", name, result)
     }
 
+    fn open_display(&mut self, name: &str) -> Result<(), RepositoryError> {
+        let vm = self.vm_by_name(name)?;
+        if unsafe { (self.api.vm_is_running)(vm) == 0 } {
+            return Err(RepositoryError::new(format!(
+                "VM \"{name}\" is not running"
+            )));
+        }
+        let open_display = self.api.vm_open_display.ok_or_else(|| {
+            RepositoryError::new(
+                "the installed AppSandbox backend is too old for display connections; update appsandbox_core.dll",
+            )
+        })?;
+        let result = unsafe { open_display(vm) };
+        if result < 0 {
+            return Err(RepositoryError::new(format!(
+                "AppSandbox failed to open the display for VM \"{name}\" (HRESULT 0x{:08X})",
+                result as u32
+            )));
+        }
+
+        Ok(())
+    }
+
     fn open_ssh(&mut self, name: &str) -> Result<(), RepositoryError> {
         let vm = self.vm_by_name(name)?;
         let is_running = unsafe { (self.api.vm_is_running)(vm) != 0 };
@@ -442,6 +467,7 @@ impl Api {
             vm_start: export!(b"asb_vm_start\0", AsbVmStart),
             vm_shutdown: export!(b"asb_vm_shutdown\0", AsbVmShutdown),
             vm_stop: export!(b"asb_vm_stop\0", AsbVmStop),
+            vm_open_display: optional_export!(b"asb_vm_open_display\0", AsbVmOpenDisplay),
             detach: export!(b"asb_detach\0", AsbDetach),
             reconnect_running: export!(b"asb_reconnect_running\0", AsbReconnectRunning),
             set_log_callback: export!(b"asb_set_log_callback\0", AsbSetCallback),
