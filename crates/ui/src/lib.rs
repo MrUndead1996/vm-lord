@@ -7,6 +7,7 @@ use vmlord_app::{BackendStatus, WorkspaceApp};
 use vmlord_core::{AgentStatus, DiagnosticLevel, VmState, VmSummary};
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const VM_TABLE_COLUMN_COUNT: f32 = 9.0;
 
 pub fn run(application: WorkspaceApp) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -85,25 +86,38 @@ fn render_vm_list(ui: &mut egui::Ui, vms: &[VmSummary]) {
         return;
     }
 
-    egui::Grid::new("vm-list").striped(true).show(ui, |ui| {
-        ui.strong("Name");
-        ui.strong("OS");
-        ui.strong("Status");
-        ui.strong("Resources");
-        ui.strong("Network");
-        ui.end_row();
-        for vm in vms {
-            ui.label(&vm.name);
-            ui.label(&vm.os_type);
-            ui.label(vm_state(vm.state));
-            ui.label(format!(
-                "{} CPU · {} MiB · {} GiB",
-                vm.cpu_cores, vm.ram_mb, vm.disk_gb
-            ));
-            ui.label(format!("{:?}", vm.network_mode));
+    let column_spacing = ui.spacing().item_spacing.x;
+    let min_column_width = (ui.available_width() - column_spacing * (VM_TABLE_COLUMN_COUNT - 1.0))
+        / VM_TABLE_COLUMN_COUNT;
+
+    egui::Grid::new("vm-list")
+        .striped(true)
+        .num_columns(VM_TABLE_COLUMN_COUNT as usize)
+        .min_col_width(min_column_width)
+        .show(ui, |ui| {
+            ui.strong("Name");
+            ui.strong("OS");
+            ui.strong("Status");
+            ui.strong("Agent status");
+            ui.strong("CPU");
+            ui.strong("RAM");
+            ui.strong("Disk");
+            ui.strong("GPU");
+            ui.strong("Network type");
             ui.end_row();
-        }
-    });
+            for vm in vms {
+                ui.label(&vm.name);
+                ui.label(&vm.os_type);
+                ui.label(vm_state(vm.state));
+                render_agent_status(ui, agent_status(vm.state));
+                ui.label(format!("{} cores", vm.cpu_cores));
+                ui.label(format!("{} MiB", vm.ram_mb));
+                ui.label(format!("{} GiB", vm.disk_gb));
+                ui.label(format!("{:?}", vm.gpu_mode));
+                ui.label(format!("{:?}", vm.network_mode));
+                ui.end_row();
+            }
+        });
 }
 
 fn render_diagnostics(ui: &mut egui::Ui, diagnostics: &[vmlord_core::Diagnostic]) {
@@ -122,18 +136,28 @@ fn render_diagnostics(ui: &mut egui::Ui, diagnostics: &[vmlord_core::Diagnostic]
     });
 }
 
+fn render_agent_status(ui: &mut egui::Ui, status: AgentStatus) {
+    let (color, label) = match status {
+        AgentStatus::Unknown => (egui::Color32::GRAY, "Unknown"),
+        AgentStatus::Offline => (egui::Color32::LIGHT_RED, "Offline"),
+        AgentStatus::Online => (egui::Color32::LIGHT_GREEN, "Online"),
+    };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 5.0, color);
+    response.on_hover_text(label);
+}
+
+fn agent_status(state: VmState) -> AgentStatus {
+    match state {
+        VmState::Running { agent_status } => agent_status,
+        VmState::Stopped | VmState::Starting => AgentStatus::Unknown,
+    }
+}
+
 fn vm_state(state: VmState) -> &'static str {
     match state {
         VmState::Stopped => "Stopped",
         VmState::Starting => "Building",
-        VmState::Running {
-            agent_status: AgentStatus::Online,
-        } => "Running",
-        VmState::Running {
-            agent_status: AgentStatus::Offline,
-        } => "Running (agent offline)",
-        VmState::Running {
-            agent_status: AgentStatus::Unknown,
-        } => "Running (agent status unavailable)",
+        VmState::Running { .. } => "Running",
     }
 }
