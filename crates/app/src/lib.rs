@@ -102,14 +102,7 @@ impl WorkspaceApp {
     }
 
     pub fn create_vm(&mut self, request: VmCreateRequest) -> Result<(), RepositoryError> {
-        if !matches!(self.status, BackendStatus::Ready) {
-            let error = RepositoryError::new("VM creation requires a ready backend");
-            self.diagnostics.push(Diagnostic {
-                level: DiagnosticLevel::Error,
-                message: error.to_string(),
-            });
-            return Err(error);
-        }
+        self.require_ready_backend("VM creation")?;
 
         match self.repository.create_vm(request) {
             Ok(()) => {
@@ -129,6 +122,14 @@ impl WorkspaceApp {
                 Err(error)
             }
         }
+    }
+
+    pub fn start_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.run_vm_lifecycle_action(name, "start", |repository| repository.start_vm(name))
+    }
+
+    pub fn stop_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.run_vm_lifecycle_action(name, "stop", |repository| repository.stop_vm(name))
     }
 
     #[must_use]
@@ -151,6 +152,47 @@ impl WorkspaceApp {
             level: vmlord_core::DiagnosticLevel::Info,
             message: format!("{} pressed", action.label()),
         });
+    }
+
+    fn require_ready_backend(&mut self, action: &str) -> Result<(), RepositoryError> {
+        if matches!(self.status, BackendStatus::Ready) {
+            return Ok(());
+        }
+
+        let error = RepositoryError::new(format!("{action} requires a ready backend"));
+        self.diagnostics.push(Diagnostic {
+            level: DiagnosticLevel::Error,
+            message: error.to_string(),
+        });
+        Err(error)
+    }
+
+    fn run_vm_lifecycle_action(
+        &mut self,
+        name: &str,
+        action: &str,
+        operation: impl FnOnce(&mut dyn VmRepository) -> Result<(), RepositoryError>,
+    ) -> Result<(), RepositoryError> {
+        self.require_ready_backend(&format!("VM {action}"))?;
+
+        match operation(self.repository.as_mut()) {
+            Ok(()) => {
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Info,
+                    message: format!("VM \"{name}\" {action} request accepted"),
+                });
+                self.refresh();
+                Ok(())
+            }
+            Err(error) => {
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Error,
+                    message: format!("Failed to {action} VM \"{name}\": {error}"),
+                });
+                self.collect_diagnostics();
+                Err(error)
+            }
+        }
     }
 
     fn collect_diagnostics(&mut self) {
@@ -186,6 +228,14 @@ impl VmRepository for UnavailableRepository {
         Err(RepositoryError::new(self.message.clone()))
     }
 
+    fn start_vm(&mut self, _name: &str) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(self.message.clone()))
+    }
+
+    fn stop_vm(&mut self, _name: &str) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(self.message.clone()))
+    }
+
     fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
         Vec::new()
     }
@@ -199,6 +249,7 @@ mod tests {
     struct FakeRepository {
         should_fail: bool,
         create_should_fail: bool,
+        actions: Vec<String>,
     }
 
     impl VmRepository for FakeRepository {
@@ -233,6 +284,16 @@ mod tests {
             }
         }
 
+        fn start_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
+            self.actions.push(format!("start:{name}"));
+            Ok(())
+        }
+
+        fn stop_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
+            self.actions.push(format!("stop:{name}"));
+            Ok(())
+        }
+
         fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
             vec![Diagnostic {
                 level: DiagnosticLevel::Info,
@@ -246,6 +307,7 @@ mod tests {
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             should_fail: false,
             create_should_fail: false,
+            actions: Vec::new(),
         }));
         app.start();
         assert_eq!(app.status(), &BackendStatus::Ready);
@@ -258,6 +320,7 @@ mod tests {
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             should_fail: true,
             create_should_fail: false,
+            actions: Vec::new(),
         }));
         app.start();
         assert_eq!(
@@ -273,10 +336,35 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_actions_are_available_to_ui_clients() {
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            should_fail: false,
+            create_should_fail: false,
+            actions: Vec::new(),
+        }));
+        app.start();
+
+        app.start_vm("dev").unwrap();
+        app.stop_vm("dev").unwrap();
+
+        assert!(
+            app.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message == "VM \"dev\" start request accepted")
+        );
+        assert!(
+            app.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message == "VM \"dev\" stop request accepted")
+        );
+    }
+
+    #[test]
     fn vm_action_is_logged() {
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             should_fail: false,
             create_should_fail: false,
+            actions: Vec::new(),
         }));
 
         app.log_vm_action(VmAction::Create);

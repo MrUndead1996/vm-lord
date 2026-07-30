@@ -16,6 +16,8 @@ use vmlord_core::{
 type AsbVm = *mut c_void;
 type AsbInit = unsafe extern "system" fn() -> i32;
 type AsbVmCreate = unsafe extern "system" fn(*const AsbVmConfig) -> i32;
+type AsbVmStart = unsafe extern "system" fn(AsbVm, i32, i32, *const u16) -> i32;
+type AsbVmShutdown = unsafe extern "system" fn(AsbVm) -> i32;
 
 #[repr(C)]
 struct AsbVmConfig {
@@ -54,6 +56,8 @@ type Callback = unsafe extern "system" fn(*const u16, *mut c_void);
 struct Api {
     init: AsbInit,
     vm_create: AsbVmCreate,
+    vm_start: AsbVmStart,
+    vm_shutdown: AsbVmShutdown,
     detach: AsbDetach,
     reconnect_running: AsbReconnectRunning,
     set_log_callback: AsbSetCallback,
@@ -240,6 +244,18 @@ impl VmRepository for AppSandboxBackend {
         Ok(())
     }
 
+    fn start_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
+        let vm = self.vm_by_name(name)?;
+        let result = unsafe { (self.api.vm_start)(vm, -1, -1, ptr::null()) };
+        check_lifecycle_result("start", name, result)
+    }
+
+    fn stop_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
+        let vm = self.vm_by_name(name)?;
+        let result = unsafe { (self.api.vm_shutdown)(vm) };
+        check_lifecycle_result("stop", name, result)
+    }
+
     fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError> {
         if !self.initialized {
             return Err(RepositoryError::new("legacy backend is not initialized"));
@@ -266,6 +282,32 @@ impl VmRepository for AppSandboxBackend {
 }
 
 impl AppSandboxBackend {
+    fn vm_by_name(&self, name: &str) -> Result<AsbVm, RepositoryError> {
+        if !self.initialized {
+            return Err(RepositoryError::new("legacy backend is not initialized"));
+        }
+
+        let count = unsafe { (self.api.vm_count)() };
+        if count < 0 {
+            return Err(RepositoryError::new(
+                "legacy backend returned an invalid VM count",
+            ));
+        }
+
+        for index in 0..count {
+            let vm = unsafe { (self.api.vm_get)(index) };
+            if vm.is_null() {
+                continue;
+            }
+            let vm_name = unsafe { wide_ptr_to_string((self.api.vm_name)(vm))? };
+            if vm_name == name {
+                return Ok(vm);
+            }
+        }
+
+        Err(RepositoryError::new(format!("VM \"{name}\" was not found")))
+    }
+
     fn vm_summary(&self, vm: AsbVm) -> Result<VmSummary, RepositoryError> {
         // The handle and each returned string pointer originate from AppSandbox.
         unsafe {
@@ -334,6 +376,8 @@ impl Api {
         Ok(Self {
             init: export!(b"asb_init\0", AsbInit),
             vm_create: export!(b"asb_vm_create\0", AsbVmCreate),
+            vm_start: export!(b"asb_vm_start\0", AsbVmStart),
+            vm_shutdown: export!(b"asb_vm_shutdown\0", AsbVmShutdown),
             detach: export!(b"asb_detach\0", AsbDetach),
             reconnect_running: export!(b"asb_reconnect_running\0", AsbReconnectRunning),
             set_log_callback: export!(b"asb_set_log_callback\0", AsbSetCallback),
@@ -354,6 +398,16 @@ impl Api {
             vm_ssh_port: export!(b"asb_vm_ssh_port\0", AsbVmDword),
         })
     }
+}
+
+fn check_lifecycle_result(action: &str, name: &str, result: i32) -> Result<(), RepositoryError> {
+    if result < 0 {
+        return Err(RepositoryError::new(format!(
+            "AppSandbox failed to {action} VM \"{name}\" (HRESULT 0x{:08X})",
+            result as u32
+        )));
+    }
+    Ok(())
 }
 
 unsafe extern "system" fn log_callback(message: *const u16, user_data: *mut c_void) {

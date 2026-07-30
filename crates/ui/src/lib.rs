@@ -1,4 +1,4 @@
-//! Read-only desktop shell for the first VMLord milestone.
+//! Desktop shell for the first VMLord milestone.
 
 use std::time::{Duration, Instant};
 
@@ -146,10 +146,21 @@ impl eframe::App for VmlordUi {
         });
 
         if let Some(action) = action.inner {
-            if action == VmAction::Create {
-                self.create_vm_form = Some(CreateVmForm::default());
-            } else {
-                self.application.log_vm_action(action);
+            match action {
+                VmAction::Create => self.create_vm_form = Some(CreateVmForm::default()),
+                VmAction::Start | VmAction::Stop => {
+                    if let Some(name) = self.selected_vm_name.clone() {
+                        let result = if action == VmAction::Start {
+                            self.application.start_vm(&name)
+                        } else {
+                            self.application.stop_vm(&name)
+                        };
+                        if result.is_ok() {
+                            self.last_refresh = Instant::now();
+                        }
+                    }
+                }
+                _ => self.application.log_vm_action(action),
             }
             context.request_repaint();
         }

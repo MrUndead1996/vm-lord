@@ -99,6 +99,8 @@ impl std::error::Error for RepositoryError {}
 pub trait VmRepository {
     fn initialize(&mut self) -> Result<(), RepositoryError>;
     fn create_vm(&mut self, request: VmCreateRequest) -> Result<(), RepositoryError>;
+    fn start_vm(&mut self, name: &str) -> Result<(), RepositoryError>;
+    fn stop_vm(&mut self, name: &str) -> Result<(), RepositoryError>;
     fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError>;
     fn take_diagnostics(&mut self) -> Vec<Diagnostic>;
 }
