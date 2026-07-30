@@ -9,6 +9,31 @@ pub enum BackendStatus {
     Unavailable(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VmAction {
+    Start,
+    Stop,
+    ForceStop,
+    Connect,
+    Ssh,
+    Edit,
+    Delete,
+}
+
+impl VmAction {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Start => "Start",
+            Self::Stop => "Stop",
+            Self::ForceStop => "Force stop",
+            Self::Connect => "Connect",
+            Self::Ssh => "SSH",
+            Self::Edit => "Edit",
+            Self::Delete => "Delete",
+        }
+    }
+}
+
 pub struct WorkspaceApp {
     repository: Box<dyn VmRepository>,
     status: BackendStatus,
@@ -64,6 +89,13 @@ impl WorkspaceApp {
     #[must_use]
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
+    }
+
+    pub fn log_vm_action(&mut self, action: VmAction) {
+        self.diagnostics.push(Diagnostic {
+            level: vmlord_core::DiagnosticLevel::Info,
+            message: format!("{} pressed", action.label()),
+        });
     }
 
     fn collect_diagnostics(&mut self) {
@@ -158,5 +190,14 @@ mod tests {
             app.status(),
             &BackendStatus::Unavailable("unavailable".into())
         );
+    }
+
+    #[test]
+    fn vm_action_is_logged() {
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository { should_fail: false }));
+
+        app.log_vm_action(VmAction::Start);
+
+        assert_eq!(app.diagnostics()[0].message, "Start pressed");
     }
 }
