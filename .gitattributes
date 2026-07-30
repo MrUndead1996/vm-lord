@@ -1,0 +1,2 @@
+# Store all text files in the repository with LF line endings.
+* text=auto eol=lf
