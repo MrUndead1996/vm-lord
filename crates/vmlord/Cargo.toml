@@ -12,6 +12,7 @@ bench = false
 
 [dependencies]
 vmlord-app = { path = "../app" }
+vmlord-core = { path = "../core" }
 vmlord-legacy-backend = { path = "../legacy-backend" }
 vmlord-ui = { path = "../ui" }
 
