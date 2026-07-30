@@ -1,7 +1,9 @@
 use std::{
     collections::{HashSet, VecDeque},
     ffi::c_void,
-    path::Path,
+    os::windows::process::CommandExt,
+    path::{Path, PathBuf},
+    process::Command,
     ptr, slice,
     sync::{Mutex, MutexGuard},
 };
@@ -76,7 +78,9 @@ struct Api {
     vm_cpu_cores: AsbVmDword,
     vm_gpu_mode: AsbVmInt,
     vm_network_mode: AsbVmInt,
+    vm_admin_user: Option<AsbVmString>,
     vm_ssh_enabled: AsbVmBool,
+    vm_ssh_deploy_key: Option<AsbVmBool>,
     vm_ssh_port: AsbVmDword,
 }
 
@@ -264,6 +268,50 @@ impl VmRepository for AppSandboxBackend {
         check_lifecycle_result("force stop", name, result)
     }
 
+    fn open_ssh(&mut self, name: &str) -> Result<(), RepositoryError> {
+        let vm = self.vm_by_name(name)?;
+        let is_running = unsafe { (self.api.vm_is_running)(vm) != 0 };
+        if !is_running {
+            return Err(RepositoryError::new(format!(
+                "VM \"{name}\" is not running"
+            )));
+        }
+        if unsafe { (self.api.vm_ssh_enabled)(vm) == 0 } {
+            return Err(RepositoryError::new(format!(
+                "SSH is disabled for VM \"{name}\""
+            )));
+        }
+
+        let port = unsafe { (self.api.vm_ssh_port)(vm) };
+        let port = u16::try_from(port)
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| {
+                RepositoryError::new(format!(
+                    "SSH is not ready for VM \"{name}\"; wait for the guest agent to finish setup"
+                ))
+            })?;
+        let admin_user = self.api.vm_admin_user.ok_or_else(|| {
+            RepositoryError::new(
+                "the installed AppSandbox backend is too old for SSH connections; update appsandbox_core.dll",
+            )
+        })?;
+        let deploy_key = self.api.vm_ssh_deploy_key.ok_or_else(|| {
+            RepositoryError::new(
+                "the installed AppSandbox backend is too old for SSH connections; update appsandbox_core.dll",
+            )
+        })?;
+        let username = unsafe { wide_ptr_to_string(admin_user(vm))? };
+        if username.is_empty() {
+            return Err(RepositoryError::new(format!(
+                "VM \"{name}\" has no SSH username"
+            )));
+        }
+        let use_deploy_key = unsafe { deploy_key(vm) != 0 };
+
+        launch_ssh_terminal(&username, port, use_deploy_key)
+    }
+
     fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError> {
         if !self.initialized {
             return Err(RepositoryError::new("legacy backend is not initialized"));
@@ -380,6 +428,13 @@ impl Api {
                 })?
             };
         }
+        macro_rules! optional_export {
+            ($name:literal, $type:ty) => {
+                unsafe { library.get::<$type>($name) }
+                    .ok()
+                    .map(|function| *function)
+            };
+        }
 
         Ok(Self {
             init: export!(b"asb_init\0", AsbInit),
@@ -403,10 +458,119 @@ impl Api {
             vm_cpu_cores: export!(b"asb_vm_cpu_cores\0", AsbVmDword),
             vm_gpu_mode: export!(b"asb_vm_gpu_mode\0", AsbVmInt),
             vm_network_mode: export!(b"asb_vm_network_mode\0", AsbVmInt),
+            vm_admin_user: optional_export!(b"asb_vm_admin_user\0", AsbVmString),
             vm_ssh_enabled: export!(b"asb_vm_ssh_enabled\0", AsbVmBool),
+            vm_ssh_deploy_key: optional_export!(b"asb_vm_ssh_deploy_key\0", AsbVmBool),
             vm_ssh_port: export!(b"asb_vm_ssh_port\0", AsbVmDword),
         })
     }
+}
+
+const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
+
+fn launch_ssh_terminal(
+    username: &str,
+    port: u16,
+    use_deploy_key: bool,
+) -> Result<(), RepositoryError> {
+    let ssh_executable = ssh_executable_path()?;
+    let mut ssh_arguments = vec![
+        "-p".into(),
+        port.to_string(),
+        format!("{username}@localhost"),
+    ];
+
+    if use_deploy_key {
+        let private_key = appsandbox_ssh_key_path();
+        if !private_key.is_file() {
+            return Err(RepositoryError::new(format!(
+                "AppSandbox SSH key was not found at {}",
+                private_key.display()
+            )));
+        }
+        let known_hosts = std::env::temp_dir().join("appsandbox_known_hosts");
+        ssh_arguments.splice(
+            0..0,
+            [
+                "-i".into(),
+                private_key.to_string_lossy().into_owned(),
+                "-o".into(),
+                "IdentitiesOnly=yes".into(),
+                "-o".into(),
+                "StrictHostKeyChecking=no".into(),
+                "-o".into(),
+                format!("UserKnownHostsFile={}", known_hosts.display()),
+            ],
+        );
+    }
+
+    let ssh_command = std::iter::once(powershell_literal(&ssh_executable.to_string_lossy()))
+        .chain(
+            ssh_arguments
+                .iter()
+                .map(|argument| powershell_literal(argument)),
+        )
+        .collect::<Vec<_>>()
+        .join(" ");
+    let powershell_command = format!("& {ssh_command}");
+    match Command::new("wt.exe")
+        .args([
+            "-w",
+            "0",
+            "new-tab",
+            "--title",
+            "VMLord SSH",
+            "powershell.exe",
+        ])
+        .args(["-NoExit", "-Command"])
+        .arg(&powershell_command)
+        .spawn()
+    {
+        Ok(_) => Ok(()),
+        Err(windows_terminal_error) => Command::new("powershell.exe")
+            .creation_flags(CREATE_NEW_CONSOLE)
+            .args(["-NoExit", "-Command"])
+            .arg(powershell_command)
+            .spawn()
+            .map(|_| ())
+            .map_err(|powershell_error| {
+                RepositoryError::new(format!(
+                    "cannot open Windows Terminal ({windows_terminal_error}) or PowerShell ({powershell_error})"
+                ))
+            }),
+    }
+}
+
+fn powershell_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn ssh_executable_path() -> Result<PathBuf, RepositoryError> {
+    let system_root = std::env::var_os("SystemRoot").ok_or_else(|| {
+        RepositoryError::new("the SystemRoot environment variable is unavailable")
+    })?;
+    let executable = PathBuf::from(system_root)
+        .join("System32")
+        .join("OpenSSH")
+        .join("ssh.exe");
+    if executable.is_file() {
+        Ok(executable)
+    } else {
+        Err(RepositoryError::new(format!(
+            "Windows OpenSSH client was not found at {}",
+            executable.display()
+        )))
+    }
+}
+
+fn appsandbox_ssh_key_path() -> PathBuf {
+    let program_data = std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
+    program_data
+        .join("AppSandbox")
+        .join("ssh")
+        .join("id_appsandbox")
 }
 
 fn check_lifecycle_result(action: &str, name: &str, result: i32) -> Result<(), RepositoryError> {

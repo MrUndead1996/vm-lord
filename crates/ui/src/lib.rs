@@ -148,13 +148,14 @@ impl eframe::App for VmlordUi {
         if let Some(action) = action.inner {
             match action {
                 VmAction::Create => self.create_vm_form = Some(CreateVmForm::default()),
-                VmAction::Start | VmAction::Stop | VmAction::ForceStop => {
+                VmAction::Start | VmAction::Stop | VmAction::ForceStop | VmAction::Ssh => {
                     if let Some(name) = self.selected_vm_name.clone() {
                         let result = match action {
                             VmAction::Start => self.application.start_vm(&name),
                             VmAction::Stop => self.application.stop_vm(&name),
                             VmAction::ForceStop => self.application.force_stop_vm(&name),
-                            _ => unreachable!("only lifecycle actions reach this branch"),
+                            VmAction::Ssh => self.application.open_ssh(&name),
+                            _ => unreachable!("only lifecycle and SSH actions reach this branch"),
                         };
                         if result.is_ok() {
                             self.last_refresh = Instant::now();
@@ -545,9 +546,18 @@ fn render_selected_vm(
         ui.separator();
         if let Some(clicked_action) = render_action_group(
             ui,
-            &[(VmAction::Connect, "Connect"), (VmAction::Ssh, "SSH")],
+            &[(VmAction::Connect, "Connect")],
             is_running,
             Some("Available only when the VM is running"),
+        ) {
+            action = Some(clicked_action);
+        }
+        let ssh_ready = is_running && vm.ssh_port.is_some();
+        if let Some(clicked_action) = render_action_group(
+            ui,
+            &[(VmAction::Ssh, "SSH")],
+            ssh_ready,
+            Some("Available when the SSH proxy is ready"),
         ) {
             action = Some(clicked_action);
         }

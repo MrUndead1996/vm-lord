@@ -138,6 +138,28 @@ impl WorkspaceApp {
         })
     }
 
+    pub fn open_ssh(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.require_ready_backend("SSH connection")?;
+
+        match self.repository.open_ssh(name) {
+            Ok(()) => {
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Info,
+                    message: format!("SSH session for VM \"{name}\" started"),
+                });
+                Ok(())
+            }
+            Err(error) => {
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Error,
+                    message: format!("Failed to open SSH session for VM \"{name}\": {error}"),
+                });
+                self.collect_diagnostics();
+                Err(error)
+            }
+        }
+    }
+
     #[must_use]
     pub fn status(&self) -> &BackendStatus {
         &self.status
@@ -309,6 +331,11 @@ mod tests {
             Ok(())
         }
 
+        fn open_ssh(&mut self, name: &str) -> Result<(), RepositoryError> {
+            self.actions.push(format!("ssh:{name}"));
+            Ok(())
+        }
+
         fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
             vec![Diagnostic {
                 level: DiagnosticLevel::Info,
@@ -377,6 +404,24 @@ mod tests {
             app.diagnostics().iter().any(|diagnostic| {
                 diagnostic.message == "VM \"dev\" force stop request accepted"
             })
+        );
+    }
+
+    #[test]
+    fn opens_ssh_session_through_repository() {
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            should_fail: false,
+            create_should_fail: false,
+            actions: Vec::new(),
+        }));
+        app.start();
+
+        app.open_ssh("dev").unwrap();
+
+        assert!(
+            app.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message == "SSH session for VM \"dev\" started")
         );
     }
 
