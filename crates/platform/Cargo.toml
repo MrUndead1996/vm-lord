@@ -1,0 +1,21 @@
+[package]
+name = "vmlord-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+vmlord-core = { path = "../core" }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_HostComputeNetwork",
+    "Win32_System_HostComputeSystem",
+    "Win32_System_Threading",
+] }
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -180,9 +180,19 @@ vmlord (composition root)
 ```
 
 `legacy-backend` is the only crate that may contain `unsafe` code, raw C
-pointers, or Windows DLL loading. It dynamically loads the prebuilt
-`appsandbox_core.dll` placed next to `vmlord.exe`; no C types cross into `core`,
-`app`, or `ui`.
+pointers, or Windows DLL loading for the temporary AppSandbox implementation.
+It dynamically loads the prebuilt `appsandbox_core.dll` placed next to
+`vmlord.exe`; no C types cross into `core`, `app`, or `ui`.
+
+`platform` is the Windows-native foundation for the incremental replacement.
+It depends only on `core`, never on `app` or `ui`, and contains all direct
+`windows-rs` calls. It owns HCS/HCN handles and Windows events through safe
+RAII wrappers, and converts Windows failures to `RepositoryError` values that
+include the operation, VM name when applicable, and HRESULT.
+
+Windows-only HCS integration tests are intentionally ignored by default. They
+require Hyper-V, the Host Compute Service, and a disposable existing HCS VM ID
+provided through `VMLORD_TEST_VM_ID`.
 
 `core::settings` owns the UI-independent application settings model and TOML
 persistence. The composition root initializes it before the backend. Settings
