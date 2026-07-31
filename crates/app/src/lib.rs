@@ -137,6 +137,11 @@ impl WorkspaceApp {
             .store
             .save(&settings)
             .map_err(SettingsUpdateError::Save)?;
+        log::info!(
+            "application settings saved; log file is {} and level is {:?}",
+            settings.log_file_path.display(),
+            settings.log_level
+        );
         context.current = settings;
         self.diagnostics.push(Diagnostic {
             level: DiagnosticLevel::Info,
@@ -173,13 +178,18 @@ impl WorkspaceApp {
     }
 
     pub fn start(&mut self) {
+        log::info!("initializing VM backend");
         match self.repository.initialize() {
             Ok(()) => {
+                log::info!("VM backend initialized");
                 self.status = BackendStatus::Ready;
                 self.refresh();
                 return;
             }
-            Err(error) => self.status = BackendStatus::Unavailable(error.to_string()),
+            Err(error) => {
+                log::error!("failed to initialize VM backend: {error}");
+                self.status = BackendStatus::Unavailable(error.to_string());
+            }
         }
         self.collect_diagnostics();
     }
@@ -381,6 +391,7 @@ impl WorkspaceApp {
         operation: impl FnOnce(&mut dyn VmRepository) -> Result<(), RepositoryError>,
     ) -> Result<(), RepositoryError> {
         self.require_ready_backend(&format!("VM {action}"))?;
+        log::info!("requesting VM {action} for {name}");
 
         match operation(self.repository.as_mut()) {
             Ok(()) => {
@@ -392,6 +403,7 @@ impl WorkspaceApp {
                 Ok(())
             }
             Err(error) => {
+                log::error!("failed to {action} VM {name}: {error}");
                 self.diagnostics.push(Diagnostic {
                     level: DiagnosticLevel::Error,
                     message: format!("Failed to {action} VM \"{name}\": {error}"),
