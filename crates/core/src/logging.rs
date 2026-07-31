@@ -136,7 +136,7 @@ impl std::error::Error for LoggingError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::AlreadyInitialized(source) => Some(source),
+            Self::AlreadyInitialized(_) => None,
             Self::MissingParent { .. } => None,
         }
     }
