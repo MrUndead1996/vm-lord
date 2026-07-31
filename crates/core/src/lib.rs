@@ -1,7 +1,9 @@
 //! UI-independent domain types and repository boundary for VMLord.
 
+pub mod logging;
 pub mod settings;
 
+pub use logging::{LoggingError, initialize as initialize_logging};
 pub use settings::{AppSettings, Language, LogLevel, SettingsError, SettingsStore};
 
 use std::fmt;

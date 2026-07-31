@@ -191,6 +191,11 @@ uses `%LOCALAPPDATA%\VMLord\vms` for VM data and
 `%LOCALAPPDATA%\VMLord\logs\vmlord.log` for logs. The configuration directory
 and the default VM and log directories are created on first launch.
 
+`core::logging` installs the shared `log` backend after settings are loaded and
+before the backend starts. It writes records at the configured `log_level` to
+both standard output and the append-only `log_file_path`; all Rust crates use
+the `log` facade to emit application records.
+
 The current UI initializes the backend, shows availability and diagnostics,
 lists known VMs, can create Linux VMs from ISO images, and can edit stopped
 VMs. It submits safe requests through the application layer; only

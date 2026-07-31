@@ -1,5 +1,3 @@
-#![cfg_attr(windows, windows_subsystem = "windows")]
-
 #[cfg(not(windows))]
 compile_error!("VMLord currently supports Windows only");
 
@@ -7,11 +5,28 @@ fn main() {
     let settings = vmlord_core::SettingsStore::for_current_user()
         .and_then(|store| store.load_or_create().map(|settings| (store, settings)));
     let repository = match &settings {
-        Ok(_) => match vmlord_legacy_backend::AppSandboxBackend::load_from_executable_dir() {
-            Ok(backend) => Box::new(backend),
-            Err(error) => vmlord_app::unavailable_repository(error.to_string()),
+        Ok((_, settings)) => match vmlord_core::initialize_logging(settings) {
+            Ok(()) => {
+                log::info!(
+                    "logging initialized at {} with {:?} level",
+                    settings.log_file_path.display(),
+                    settings.log_level
+                );
+                match vmlord_legacy_backend::AppSandboxBackend::load_from_executable_dir() {
+                    Ok(backend) => Box::new(backend),
+                    Err(error) => {
+                        log::error!("failed to load the legacy backend: {error}");
+                        vmlord_app::unavailable_repository(error.to_string())
+                    }
+                }
+            }
+            Err(error) => {
+                eprintln!("failed to initialize logging: {error}");
+                vmlord_app::unavailable_repository(format!("failed to initialize logging: {error}"))
+            }
         },
         Err(error) => {
+            eprintln!("failed to initialize settings: {error}");
             vmlord_app::unavailable_repository(format!("failed to initialize settings: {error}"))
         }
     };

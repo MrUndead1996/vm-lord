@@ -11,6 +11,7 @@ test = false
 bench = false
 
 [dependencies]
+log.workspace = true
 vmlord-app = { path = "../app" }
 vmlord-core = { path = "../core" }
 vmlord-legacy-backend = { path = "../legacy-backend" }

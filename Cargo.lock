@@ -3221,6 +3221,7 @@ name = "vmlord"
 version = "0.1.0"
 dependencies = [
  "embed-resource",
+ "log",
  "vmlord-app",
  "vmlord-core",
  "vmlord-legacy-backend",
@@ -3231,6 +3232,7 @@ dependencies = [
 name = "vmlord-app"
 version = "0.1.0"
 dependencies = [
+ "log",
  "vmlord-core",
 ]
 
@@ -3238,6 +3240,7 @@ dependencies = [
 name = "vmlord-core"
 version = "0.1.0"
 dependencies = [
+ "log",
  "serde",
  "toml 0.8.23",
 ]
