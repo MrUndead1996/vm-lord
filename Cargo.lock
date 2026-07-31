@@ -3256,6 +3256,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "vmlord-platform"
+version = "0.1.0"
+dependencies = [
+ "vmlord-core",
+ "windows 0.61.3",
+]
+
+[[package]]
 name = "vmlord-ui"
 version = "0.1.0"
 dependencies = [

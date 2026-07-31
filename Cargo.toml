@@ -3,6 +3,7 @@ members = [
     "crates/core",
     "crates/app",
     "crates/legacy-backend",
+    "crates/platform",
     "crates/ui",
     "crates/vmlord",
 ]
@@ -16,6 +17,7 @@ authors = ["VMLord contributors"]
 
 [workspace.dependencies]
 log = "0.4"
+windows = { version = "0.61", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
