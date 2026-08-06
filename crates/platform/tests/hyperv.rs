@@ -13,7 +13,11 @@ use std::{fs, time::Duration};
 use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest};
 use vmlord_platform::{HcsClient, HcsOperation, HcsSystem, MetadataStore, VmCreationPipeline};
 
-const HCS_ACCESS_ALL: u32 = 0x000F_FFFF;
+// `GENERIC_ALL`; matches the legacy AppSandbox backend's `hcs_vm.c` usage and
+// `vmlord_platform`'s own internal `HCS_ACCESS_ALL`. An earlier, unverified
+// value here (`0x000F_FFFF`) was invalid and made `HcsOpenComputeSystem` fail
+// with `E_INVALIDARG` rather than a meaningful not-found error.
+const HCS_ACCESS_ALL: u32 = 0x1000_0000;
 
 #[test]
 #[ignore = "requires Windows with Hyper-V/HCS"]
