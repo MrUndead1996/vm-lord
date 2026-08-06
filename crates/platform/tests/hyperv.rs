@@ -11,7 +11,10 @@
 use std::{fs, time::Duration};
 
 use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest};
-use vmlord_platform::{HcsClient, HcsOperation, HcsSystem, MetadataStore, VmCreationPipeline};
+use vmlord_platform::{
+    HcsClient, HcsOperation, HcsSystem, MetadataStore, VmCreationPipeline, list_known_vms,
+    open_by_vm_id, open_by_vm_name,
+};
 
 // `GENERIC_ALL`; matches the legacy AppSandbox backend's `hcs_vm.c` usage and
 // `vmlord_platform`'s own internal `HCS_ACCESS_ALL`. An earlier, unverified
@@ -102,4 +105,72 @@ fn creates_and_persists_a_compute_system_end_to_end() {
         "the compute system must still be open-able after create()'s handles closed \
          (ShouldTerminateOnLastHandleClosed must be false)",
     );
+}
+
+/// Exercises TASK-29's enumerate/open against the real Host Compute Service:
+/// creates a VM, confirms it is reported by `list_known_vms`, then reopens it
+/// by both VM id and VM name through the metadata mapping.
+///
+/// Run elevated with:
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact enumerates_and_reopens_a_created_vm --nocapture`
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS enabled"]
+fn enumerates_and_reopens_a_created_vm() {
+    let root =
+        std::env::temp_dir().join(format!("vmlord-hcs-enumerate-e2e-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+    let image_path = root.join("installer.iso");
+    fs::write(&image_path, b"placeholder installer media")
+        .expect("test image should be written");
+
+    let request = VmCreateRequest {
+        name: format!("vmlord-e2e-enum-test-{}", std::process::id()),
+        image_path: image_path.to_string_lossy().into_owned(),
+        ram_mb: 512,
+        disk_gb: 1,
+        cpu_cores: 1,
+        gpu_mode: GpuMode::None,
+        network_mode: NetworkMode::None,
+        username: "admin".into(),
+        password: "not used by create".into(),
+        ssh_enabled: false,
+        ssh_deploy_key: false,
+    };
+    let store = MetadataStore::new(root.join("vm-mapping.json"));
+    let vm_directory = root.join("vm");
+
+    let mapping = VmCreationPipeline::production()
+        .create(&store, &request, &vm_directory)
+        .expect("VM creation should succeed on an elevated Hyper-V host");
+
+    let mut client = HcsClient::new();
+    client
+        .initialize()
+        .expect("Host Compute Service should be available");
+
+    let known_vms =
+        list_known_vms(&client, &store).expect("enumeration should succeed against a live host");
+    let entry = known_vms
+        .iter()
+        .find(|vm| vm.mapping.vm_id == mapping.vm_id)
+        .expect("the just-created VM must appear in the enumeration");
+    assert!(
+        entry.present,
+        "HCS must report the compute system just created"
+    );
+
+    let by_id = open_by_vm_id(&store, mapping.vm_id, HCS_ACCESS_ALL);
+    let by_name = open_by_vm_name(&store, &mapping.vm_name, HCS_ACCESS_ALL);
+
+    // Best-effort cleanup regardless of the assertions below.
+    if let Ok(system) = &by_id {
+        let _ = system
+            .terminate()
+            .and_then(|operation| operation.wait_for_completion(Duration::from_secs(30)));
+    }
+    let _ = fs::remove_dir_all(&root);
+
+    by_id.expect("the compute system must be open-able by VM id through the metadata mapping");
+    by_name
+        .expect("the compute system must be open-able by VM name through the metadata mapping");
 }

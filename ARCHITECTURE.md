@@ -195,9 +195,17 @@ require Hyper-V, the Host Compute Service, and a disposable existing HCS VM ID
 provided through `VMLORD_TEST_VM_ID`.
 
 `platform::MetadataStore` persists the mapping between a VMLord VM id/name and
-its HCS compute-system id as a single JSON document. Later HCS lifecycle work
+its HCS compute-system id as a single JSON document. HCS lifecycle work
 (create, enumerate/open, reconnect, delete) resolves a VM to its compute
 system through this store instead of re-deriving the mapping.
+
+`platform::list_known_vms` enumerates every compute system HCS currently
+reports and reconciles it against `MetadataStore`'s persisted mappings,
+flagging mappings whose compute system HCS no longer reports rather than
+dropping them. `platform::open_by_vm_id`/`open_by_vm_name` resolve a known VM
+to its `HcsSystem` handle through the same store. Remaining HCS lifecycle work
+(reconnect, delete) still resolves a VM to its compute system through this
+store.
 
 `core::settings` owns the UI-independent application settings model and TOML
 persistence. The composition root initializes it before the backend. Settings
