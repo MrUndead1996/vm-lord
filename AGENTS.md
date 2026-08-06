@@ -89,6 +89,20 @@ Examples:
 * `TASK-2: Add VM update workflow`
 * `TASK-15: Refine SSH connection errors`
 
+## Delegation to the Local LLM (houtini/houtini-lm)
+
+Delegate bounded, self-contained side tasks to the local LLM via houtini instead of doing them directly:
+
+* drafting commit messages and merge-request descriptions;
+* drafting explanations, summaries, or documentation prose;
+* brainstorming approaches before committing to one.
+
+Do not delegate work that needs verification against the actual repository or toolchain, such as:
+
+* reading exact API signatures, dependency versions, or codebase conventions;
+* writing or editing code;
+* anything validated by `cargo build`/`test`/`clippy` or a live environment (e.g. Hyper-V).
+
 ## Decision Priority
 
 When multiple solutions are possible, prefer:
