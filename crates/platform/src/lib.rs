@@ -10,6 +10,7 @@
 compile_error!("vmlord-platform supports Windows only");
 
 mod create;
+mod enumerate;
 mod error;
 mod event;
 mod hcn;
@@ -19,6 +20,7 @@ mod metadata;
 mod vhd;
 
 pub use create::VmCreationPipeline;
+pub use enumerate::{KnownVm, list_known_vms, open_by_vm_id, open_by_vm_name};
 pub use error::hresult_to_repository_error;
 pub use event::{EventWaitResult, WindowsEvent};
 pub use hcn::HcnNetwork;

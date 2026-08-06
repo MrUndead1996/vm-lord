@@ -5,8 +5,9 @@ use windows::{
         Foundation::{ERROR_TIMEOUT, HLOCAL, LocalFree},
         System::HostComputeSystem::{
             HCS_OPERATION, HCS_SYSTEM, HcsCloseComputeSystem, HcsCloseOperation,
-            HcsCreateComputeSystem, HcsCreateOperation, HcsGetServiceProperties, HcsGrantVmAccess,
-            HcsOpenComputeSystem, HcsTerminateComputeSystem, HcsWaitForOperationResult,
+            HcsCreateComputeSystem, HcsCreateOperation, HcsEnumerateComputeSystems,
+            HcsGetServiceProperties, HcsGrantVmAccess, HcsOpenComputeSystem,
+            HcsTerminateComputeSystem, HcsWaitForOperationResult,
         },
     },
     core::{HSTRING, PCWSTR, PWSTR},
@@ -18,6 +19,8 @@ use vmlord_core::RepositoryError;
 /// Access mask granting full control over a compute system, used to reopen
 /// a system this process created in order to roll it back.
 pub(crate) const HCS_ACCESS_ALL: u32 = 0x1000_0000;
+
+const ENUMERATE_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn timeout_milliseconds(timeout: Duration) -> Result<u32, RepositoryError> {
     u32::try_from(timeout.as_millis()).map_err(|_| {
@@ -205,11 +208,55 @@ fn query_hcs_service_properties() -> Result<String, RepositoryError> {
     HcsAllocatedString::new(raw)?.into_string()
 }
 
+/// Enumerates every HCS compute system visible to this process.
+///
+/// A null query (as opposed to an empty JSON document, which HCS rejects)
+/// requests every compute system, matching the legacy AppSandbox backend's
+/// `hcs_vm.c` enumeration usage.
+fn query_hcs_enumerate_systems() -> Result<String, RepositoryError> {
+    let operation = HcsOperation::new();
+    // SAFETY: `operation.0` is a valid, owned operation handle for the
+    // duration of this call; the null query is a `PCWSTR`, satisfying
+    // `HcsEnumerateComputeSystems`'s `Param<PCWSTR>` bound.
+    unsafe { HcsEnumerateComputeSystems(PCWSTR::null(), operation.0) }
+        .map_err(|error| windows_error("enumerate compute systems", None, error))?;
+
+    operation.wait_for_completion(ENUMERATE_TIMEOUT)
+}
+
+/// Extracts each compute system's `Id` from an `HcsEnumerateComputeSystems`
+/// result document.
+///
+/// HCS's enumeration schema is not stable across versions beyond the `Id`
+/// field every entry carries, so entries without one are skipped rather than
+/// treated as a parse failure.
+fn parse_enumerate_result(document: &str) -> Result<Vec<String>, RepositoryError> {
+    if document.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let entries: Vec<serde_json::Value> = serde_json::from_str(document).map_err(|error| {
+        RepositoryError::new(format!("HCS enumeration returned malformed JSON: {error}"))
+    })?;
+
+    Ok(entries
+        .into_iter()
+        .filter_map(|entry| {
+            entry
+                .get("Id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect())
+}
+
 /// Safe, idempotent access to Host Compute Service availability.
 pub struct HcsClient {
     initialized: bool,
     #[cfg(test)]
     probe: Option<Box<dyn Fn() -> Result<String, RepositoryError>>>,
+    #[cfg(test)]
+    enumerate_probe: Option<Box<dyn Fn() -> Result<String, RepositoryError>>>,
 }
 
 impl HcsClient {
@@ -220,6 +267,8 @@ impl HcsClient {
             initialized: false,
             #[cfg(test)]
             probe: None,
+            #[cfg(test)]
+            enumerate_probe: None,
         }
     }
 
@@ -228,6 +277,18 @@ impl HcsClient {
         Self {
             initialized: false,
             probe: Some(Box::new(probe)),
+            enumerate_probe: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_enumerate_probe(
+        probe: impl Fn() -> Result<String, RepositoryError> + 'static,
+    ) -> Self {
+        Self {
+            initialized: false,
+            probe: None,
+            enumerate_probe: Some(Box::new(probe)),
         }
     }
 
@@ -321,6 +382,18 @@ impl HcsClient {
         })
     }
 
+    /// Lists the ids of every HCS compute system currently visible to this
+    /// process.
+    pub fn enumerate_system_ids(&self) -> Result<Vec<String>, RepositoryError> {
+        log::debug!("enumerating HCS compute systems");
+        let document = self.enumerate_document().inspect_err(|error| {
+            log::error!("failed to enumerate HCS compute systems: {error}");
+        })?;
+        let ids = parse_enumerate_result(&document)?;
+        log::debug!("enumerated {} HCS compute system(s)", ids.len());
+        Ok(ids)
+    }
+
     #[cfg(not(test))]
     fn probe_service_properties(&self) -> Result<String, RepositoryError> {
         query_hcs_service_properties()
@@ -331,6 +404,19 @@ impl HcsClient {
         match &self.probe {
             Some(probe) => probe(),
             None => query_hcs_service_properties(),
+        }
+    }
+
+    #[cfg(not(test))]
+    fn enumerate_document(&self) -> Result<String, RepositoryError> {
+        query_hcs_enumerate_systems()
+    }
+
+    #[cfg(test)]
+    fn enumerate_document(&self) -> Result<String, RepositoryError> {
+        match &self.enumerate_probe {
+            Some(probe) => probe(),
+            None => query_hcs_enumerate_systems(),
         }
     }
 }
@@ -345,7 +431,7 @@ impl Default for HcsClient {
 mod tests {
     use vmlord_core::RepositoryError;
 
-    use super::{HcsClient, hcs_service_properties_query, parse_service_result};
+    use super::{HcsClient, hcs_service_properties_query, parse_enumerate_result, parse_service_result};
 
     #[test]
     fn service_properties_query_is_null() {
@@ -403,6 +489,59 @@ mod tests {
 
         assert!(error.to_string().contains("boom"));
         assert!(!client.is_initialized());
+    }
+
+    #[test]
+    fn enumerate_result_is_empty_for_an_empty_document() {
+        assert_eq!(parse_enumerate_result("").unwrap(), Vec::<String>::new());
+        assert_eq!(parse_enumerate_result("[]").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn enumerate_result_extracts_every_id() {
+        let document = r#"[{"Id":"vmlord-1","State":"Running"},{"Id":"vmlord-2","State":"Off"}]"#;
+
+        assert_eq!(
+            parse_enumerate_result(document).unwrap(),
+            vec!["vmlord-1".to_string(), "vmlord-2".to_string()]
+        );
+    }
+
+    #[test]
+    fn enumerate_result_skips_entries_without_an_id() {
+        let document = r#"[{"State":"Running"},{"Id":"vmlord-2"}]"#;
+
+        assert_eq!(
+            parse_enumerate_result(document).unwrap(),
+            vec!["vmlord-2".to_string()]
+        );
+    }
+
+    #[test]
+    fn enumerate_result_rejects_malformed_json() {
+        assert!(parse_enumerate_result("not json").is_err());
+    }
+
+    #[test]
+    fn enumerate_system_ids_returns_the_probes_parsed_ids() {
+        let client = HcsClient::with_enumerate_probe(|| {
+            Ok(r#"[{"Id":"vmlord-1"},{"Id":"vmlord-2"}]"#.to_string())
+        });
+
+        assert_eq!(
+            client.enumerate_system_ids().unwrap(),
+            vec!["vmlord-1".to_string(), "vmlord-2".to_string()]
+        );
+    }
+
+    #[test]
+    fn enumerate_system_ids_propagates_a_probe_error() {
+        let client =
+            HcsClient::with_enumerate_probe(|| Err(RepositoryError::new("HCS unavailable")));
+
+        let error = client.enumerate_system_ids().unwrap_err();
+
+        assert!(error.to_string().contains("HCS unavailable"));
     }
 
     #[test]
