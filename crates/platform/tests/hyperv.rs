@@ -8,9 +8,21 @@
 
 #![cfg(windows)]
 
-use vmlord_platform::{HcsOperation, HcsSystem};
+use vmlord_platform::{HcsClient, HcsOperation, HcsSystem};
 
 const HCS_ACCESS_ALL: u32 = 0x000F_FFFF;
+
+#[test]
+#[ignore = "requires Windows with Hyper-V/HCS"]
+fn initializes_when_host_compute_service_is_available() {
+    let mut client = HcsClient::new();
+
+    client
+        .initialize()
+        .expect("Host Compute Service should accept a service-properties query");
+
+    assert!(client.is_initialized());
+}
 
 #[test]
 #[ignore = "requires Windows with Hyper-V/HCS and VMLORD_TEST_VM_ID set to a disposable VM"]
