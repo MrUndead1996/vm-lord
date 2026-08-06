@@ -1,9 +1,12 @@
+use std::{path::Path, time::Duration};
+
 use windows::{
     Win32::{
-        Foundation::{HLOCAL, LocalFree},
+        Foundation::{ERROR_TIMEOUT, HLOCAL, LocalFree},
         System::HostComputeSystem::{
             HCS_OPERATION, HCS_SYSTEM, HcsCloseComputeSystem, HcsCloseOperation,
-            HcsCreateOperation, HcsGetServiceProperties, HcsOpenComputeSystem,
+            HcsCreateComputeSystem, HcsCreateOperation, HcsGetServiceProperties, HcsGrantVmAccess,
+            HcsOpenComputeSystem, HcsTerminateComputeSystem, HcsWaitForOperationResult,
         },
     },
     core::{HSTRING, PCWSTR, PWSTR},
@@ -11,6 +14,16 @@ use windows::{
 
 use crate::error::windows_error;
 use vmlord_core::RepositoryError;
+
+/// Access mask granting full control over a compute system, used to reopen
+/// a system this process created in order to roll it back.
+pub(crate) const HCS_ACCESS_ALL: u32 = 0x1000_0000;
+
+fn timeout_milliseconds(timeout: Duration) -> Result<u32, RepositoryError> {
+    u32::try_from(timeout.as_millis()).map_err(|_| {
+        RepositoryError::new("HCS operation timeout exceeds the maximum supported duration")
+    })
+}
 
 /// An owned HCS asynchronous-operation handle.
 pub struct HcsOperation(HCS_OPERATION);
@@ -22,6 +35,35 @@ impl HcsOperation {
         // SAFETY: A null context and no callback are supported by HCS. The returned
         // handle is closed by this wrapper.
         Self(unsafe { HcsCreateOperation(None, None) })
+    }
+
+    /// Waits up to `timeout` for the operation to complete, returning its
+    /// result document (empty if HCS returned none).
+    pub fn wait_for_completion(self, timeout: Duration) -> Result<String, RepositoryError> {
+        let timeout_ms = timeout_milliseconds(timeout)?;
+        let mut result = PWSTR::null();
+        // SAFETY: `self.0` is an owned HCS operation handle valid for this call.
+        // On success HCS writes a possibly-null result pointer into `result`,
+        // which is immediately transferred to `HcsAllocatedString` for ownership.
+        let native_result =
+            unsafe { HcsWaitForOperationResult(self.0, timeout_ms, Some(&mut result)) };
+        let document = HcsAllocatedString::from_optional(result);
+
+        native_result.map_err(|error| {
+            if error.code() == ERROR_TIMEOUT.to_hresult() {
+                RepositoryError::new(format!(
+                    "HCS operation timed out after {} ms",
+                    timeout.as_millis()
+                ))
+            } else {
+                windows_error("wait for HCS operation result", None, error)
+            }
+        })?;
+
+        match document {
+            Some(document) => document.into_string(),
+            None => Ok(String::new()),
+        }
     }
 }
 
@@ -39,7 +81,10 @@ impl Drop for HcsOperation {
 }
 
 /// An owned HCS compute-system handle.
-pub struct HcsSystem(HCS_SYSTEM);
+pub struct HcsSystem {
+    handle: HCS_SYSTEM,
+    id: String,
+}
 
 impl HcsSystem {
     /// Opens an existing compute system by its stable VM identifier.
@@ -52,14 +97,35 @@ impl HcsSystem {
         // handle is transferred to this wrapper and closed by `Drop`.
         let handle = unsafe { HcsOpenComputeSystem(&hcs_name, requested_access) }
             .map_err(|error| windows_error("open compute system", Some(vm_name), error))?;
-        Ok(Self(handle))
+        Ok(Self {
+            handle,
+            id: vm_name.to_owned(),
+        })
+    }
+
+    /// Terminates the compute system, e.g. to roll back a failed creation.
+    pub fn terminate(&self) -> Result<HcsOperation, RepositoryError> {
+        log::debug!("terminating HCS compute system \"{}\"", self.id);
+        let operation = HcsOperation::new();
+        // SAFETY: `self.handle` and `operation.0` are valid owned handles for
+        // the duration of this call. Null options match
+        // `HcsTerminateComputeSystem`'s legacy AppSandbox usage; unlike
+        // `HcsShutDownComputeSystem`, it does not require a JSON options body.
+        unsafe { HcsTerminateComputeSystem(self.handle, operation.0, PCWSTR::null()) }.map_err(
+            |error| {
+                let error = windows_error("terminate compute system", Some(&self.id), error);
+                log::error!("{error}");
+                error
+            },
+        )?;
+        Ok(operation)
     }
 }
 
 impl Drop for HcsSystem {
     fn drop(&mut self) {
         // SAFETY: This wrapper exclusively owns the HCS system handle.
-        unsafe { HcsCloseComputeSystem(self.0) };
+        unsafe { HcsCloseComputeSystem(self.handle) };
     }
 }
 
@@ -72,6 +138,11 @@ impl HcsAllocatedString {
             return Err(RepositoryError::new("HCS returned a null result string"));
         }
         Ok(Self(raw))
+    }
+
+    /// Wraps `raw` for ownership if non-null, otherwise returns `None`.
+    fn from_optional(raw: PWSTR) -> Option<Self> {
+        (!raw.is_null()).then_some(Self(raw))
     }
 
     fn into_string(self) -> Result<String, RepositoryError> {
@@ -187,6 +258,67 @@ impl HcsClient {
     #[must_use]
     pub fn is_initialized(&self) -> bool {
         self.initialized
+    }
+
+    /// Creates a compute system from `configuration` and returns its owned
+    /// system and (not-yet-awaited) creation-operation handles.
+    ///
+    /// `configuration` must set `ShouldTerminateOnLastHandleClosed` to
+    /// `false` (see the HCS configuration builder); otherwise HCS destroys
+    /// even a never-started system as soon as the returned operation's
+    /// handle closes.
+    pub fn create_system(
+        &self,
+        id: &str,
+        configuration: &str,
+    ) -> Result<(HcsSystem, HcsOperation), RepositoryError> {
+        log::debug!("creating HCS compute system \"{id}\"");
+        let operation = HcsOperation::new();
+        let hcs_id = HSTRING::from(id);
+        let hcs_configuration = HSTRING::from(configuration);
+        // SAFETY: `hcs_id` and `hcs_configuration` remain valid for the duration
+        // of the call. On success the returned system handle is transferred to
+        // `HcsSystem` for ownership.
+        let handle =
+            unsafe { HcsCreateComputeSystem(&hcs_id, &hcs_configuration, operation.0, None) }
+                .map_err(|error| {
+                    let error = windows_error("create compute system", Some(id), error);
+                    log::error!("{error}");
+                    error
+                })?;
+
+        Ok((
+            HcsSystem {
+                handle,
+                id: id.to_owned(),
+            },
+            operation,
+        ))
+    }
+
+    /// Grants the VM's worker process access to a file (a VHD/VHDX or an
+    /// attached ISO) it must open when it starts.
+    ///
+    /// Hyper-V opens VM-owned files under the VM's own
+    /// `NT VIRTUAL MACHINE\<id>` security principal, not the creating user's
+    /// token: without this call, starting the VM fails with
+    /// `ERROR_ACCESS_DENIED` even though the file was just created
+    /// successfully by an elevated process.
+    pub fn grant_vm_access(&self, id: &str, path: &Path) -> Result<(), RepositoryError> {
+        log::debug!(
+            "granting HCS compute system \"{id}\" access to {}",
+            path.display()
+        );
+        let hcs_id = HSTRING::from(id);
+        // `HSTRING` has no `From<&OsStr>`; UTF-16 surrogates in paths are
+        // extremely rare, so a lossy conversion is acceptable here.
+        let wide_path = HSTRING::from(path.as_os_str().to_string_lossy().as_ref());
+        // SAFETY: `hcs_id` and `wide_path` remain valid for the duration of the call.
+        unsafe { HcsGrantVmAccess(&hcs_id, &wide_path) }.map_err(|error| {
+            let error = windows_error("grant VM access", Some(id), error);
+            log::error!("{error}");
+            error
+        })
     }
 
     #[cfg(not(test))]

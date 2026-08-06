@@ -9,12 +9,16 @@
 #[cfg(not(windows))]
 compile_error!("vmlord-platform supports Windows only");
 
+mod create;
 mod error;
 mod event;
 mod hcn;
 mod hcs;
+mod hcs_config;
 mod metadata;
+mod vhd;
 
+pub use create::VmCreationPipeline;
 pub use error::hresult_to_repository_error;
 pub use event::{EventWaitResult, WindowsEvent};
 pub use hcn::HcnNetwork;
