@@ -13,8 +13,10 @@ mod error;
 mod event;
 mod hcn;
 mod hcs;
+mod metadata;
 
 pub use error::hresult_to_repository_error;
 pub use event::{EventWaitResult, WindowsEvent};
 pub use hcn::HcnNetwork;
 pub use hcs::{HcsOperation, HcsSystem};
+pub use metadata::{MetadataStore, VmComputeSystemMapping};

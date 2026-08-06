@@ -6,6 +6,10 @@ license.workspace = true
 
 [dependencies]
 vmlord-core = { path = "../core" }
+log.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1", features = ["v4", "serde"] }
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",

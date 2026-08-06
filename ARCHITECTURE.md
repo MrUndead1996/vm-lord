@@ -194,6 +194,11 @@ Windows-only HCS integration tests are intentionally ignored by default. They
 require Hyper-V, the Host Compute Service, and a disposable existing HCS VM ID
 provided through `VMLORD_TEST_VM_ID`.
 
+`platform::MetadataStore` persists the mapping between a VMLord VM id/name and
+its HCS compute-system id as a single JSON document. Later HCS lifecycle work
+(create, enumerate/open, reconnect, delete) resolves a VM to its compute
+system through this store instead of re-deriving the mapping.
+
 `core::settings` owns the UI-independent application settings model and TOML
 persistence. The composition root initializes it before the backend. Settings
 are stored per user at `%LOCALAPPDATA%\VMLord\settings.toml`; the initial file
