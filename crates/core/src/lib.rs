@@ -23,6 +23,33 @@ pub struct VmCreateRequest {
     pub ssh_deploy_key: bool,
 }
 
+impl VmCreateRequest {
+    /// Validates the fields required to provision a VM, before any
+    /// filesystem or Windows API side effect is attempted.
+    pub fn validate(&self) -> Result<(), RepositoryError> {
+        if self.name.trim().is_empty() {
+            return Err(RepositoryError::new("VM name must not be empty"));
+        }
+        if self.image_path.trim().is_empty() {
+            return Err(RepositoryError::new("VM image path must not be empty"));
+        }
+        if self.ram_mb == 0 {
+            return Err(RepositoryError::new("VM RAM must be greater than zero"));
+        }
+        if self.disk_gb == 0 {
+            return Err(RepositoryError::new(
+                "VM disk size must be greater than zero",
+            ));
+        }
+        if self.cpu_cores == 0 {
+            return Err(RepositoryError::new(
+                "VM CPU core count must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VmUpdateRequest {
     pub name: String,
@@ -131,4 +158,82 @@ pub trait VmRepository {
     }
     fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError>;
     fn take_diagnostics(&mut self) -> Vec<Diagnostic>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GpuMode, NetworkMode, VmCreateRequest};
+
+    fn valid_request() -> VmCreateRequest {
+        VmCreateRequest {
+            name: "dev-linux".into(),
+            image_path: "C:\\images\\ubuntu.iso".into(),
+            ram_mb: 2048,
+            disk_gb: 20,
+            cpu_cores: 2,
+            gpu_mode: GpuMode::None,
+            network_mode: NetworkMode::None,
+            username: "admin".into(),
+            password: "secret".into(),
+            ssh_enabled: false,
+            ssh_deploy_key: false,
+        }
+    }
+
+    #[test]
+    fn accepts_a_fully_populated_request() {
+        assert!(valid_request().validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_an_empty_name() {
+        let request = VmCreateRequest {
+            name: "  ".into(),
+            ..valid_request()
+        };
+        assert!(request.validate().unwrap_err().to_string().contains("name"));
+    }
+
+    #[test]
+    fn rejects_an_empty_image_path() {
+        let request = VmCreateRequest {
+            image_path: String::new(),
+            ..valid_request()
+        };
+        assert!(
+            request
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("image path")
+        );
+    }
+
+    #[test]
+    fn rejects_zero_ram_disk_or_cpu_cores() {
+        assert!(
+            VmCreateRequest {
+                ram_mb: 0,
+                ..valid_request()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            VmCreateRequest {
+                disk_gb: 0,
+                ..valid_request()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            VmCreateRequest {
+                cpu_cores: 0,
+                ..valid_request()
+            }
+            .validate()
+            .is_err()
+        );
+    }
 }
