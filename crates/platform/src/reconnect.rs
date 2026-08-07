@@ -45,7 +45,10 @@ pub struct ReconnectedVm {
 ///
 /// Dropping this closes every handle it holds, so it is meant to live for as
 /// long as the VMLord process does.
-#[derive(Default)]
+///
+/// Deliberately without a `Default`: connections built around a sink nobody
+/// drains queue events forever and report none of them, so the only way to make
+/// them is [`VmConnections::with_events`], which names the sink.
 pub struct VmConnections {
     systems: HashMap<Uuid, WatchedSystem>,
     events: VmEventSink,
@@ -85,17 +88,6 @@ impl VmConnections {
     #[must_use]
     pub fn handle(&self, vm_id: Uuid) -> Option<&HcsSystem> {
         self.systems.get(&vm_id).map(|held| &*held.system)
-    }
-
-    /// Reports whether HCS events are actively watched for `vm_id`.
-    ///
-    /// `false` both for a VM that is not held and for one held but whose
-    /// registration failed -- [`VmConnections::insert`]'s `Err` case.
-    #[must_use]
-    pub fn is_watched(&self, vm_id: Uuid) -> bool {
-        self.systems
-            .get(&vm_id)
-            .is_some_and(|held| held.watch.is_some())
     }
 
     /// Whether an event queued by watch `generation` for `vm_id` describes a
@@ -167,8 +159,17 @@ impl VmConnections {
     /// HCS destroys a compute system as it stops, so a handle kept past a stop
     /// would refer to a system that no longer exists.
     pub fn remove(&mut self, vm_id: Uuid) {
-        if self.systems.remove(&vm_id).is_some() {
-            log::debug!("closed the compute-system handle held for VM {vm_id}");
+        if let Some(held) = self.systems.remove(&vm_id) {
+            match held.watch {
+                Some(_) => log::debug!(
+                    "closed the compute-system handle held for VM {vm_id} and removed \
+                     its HCS event watch (generation {})",
+                    held.generation
+                ),
+                None => {
+                    log::debug!("closed the unwatched compute-system handle held for VM {vm_id}")
+                }
+            }
         }
     }
 
