@@ -84,15 +84,36 @@ impl HcsVmRepository {
         })
     }
 
-    /// Reports whether HCS currently runs the VM behind `mapping`.
+    /// Refuses deletion unless HCS reports the VM as definitely not live.
     ///
     /// The application layer's cached list can be stale by the time the user
-    /// acts on it, so a destructive operation asks HCS itself.
-    fn is_running(&self, mapping: &VmComputeSystemMapping) -> Result<bool, RepositoryError> {
-        Ok(list_known_vms(&self.client, &self.store)?
+    /// acts on it, so a destructive operation asks HCS itself. This is an
+    /// allow-list rather than a deny-list: only a compute system HCS does not
+    /// report at all, or reports as `Created` or `Stopped`, is safe to tear
+    /// down. `Running`, `Paused`, and any state VMLord does not recognise are
+    /// refused, because a state this check gets wrong cannot be undone once
+    /// deletion runs.
+    fn refuse_if_live(&self, mapping: &VmComputeSystemMapping) -> Result<(), RepositoryError> {
+        let state = list_known_vms(&self.client, &self.store)?
             .into_iter()
             .find(|known| known.mapping.vm_id == mapping.vm_id)
-            .is_some_and(|known| matches!(known.state, Some(HcsSystemState::Running))))
+            .and_then(|known| known.state);
+
+        let description = match &state {
+            None | Some(HcsSystemState::Created) | Some(HcsSystemState::Stopped) => {
+                return Ok(());
+            }
+            Some(HcsSystemState::Running) => "running".to_string(),
+            Some(HcsSystemState::Paused) => "paused".to_string(),
+            Some(HcsSystemState::Other(other)) => format!("in state \"{other}\""),
+        };
+
+        let error = RepositoryError::new(format!(
+            "VM \"{}\" is {description}; stop it before deleting it",
+            mapping.vm_name
+        ));
+        log::error!("{error}");
+        Err(error)
     }
 
     fn push_diagnostic(&self, level: DiagnosticLevel, message: String) {
@@ -382,14 +403,7 @@ impl VmRepository for HcsVmRepository {
         self.require_initialized()?;
 
         let mapping = self.mapping(&request.name)?;
-        if self.is_running(&mapping)? {
-            let error = RepositoryError::new(format!(
-                "VM \"{}\" is running; stop it before deleting it",
-                request.name
-            ));
-            log::error!("{error}");
-            return Err(error);
-        }
+        self.refuse_if_live(&mapping)?;
 
         let vm_directory = layout::vm_directory(&self.storage_root, &request.name)?;
         self.delete.delete(
