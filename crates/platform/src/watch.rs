@@ -110,6 +110,119 @@ impl VmEventSink {
     }
 }
 
+use vmlord_core::{Diagnostic, DiagnosticLevel};
+
+/// The longest `EventData` excerpt a diagnostic carries.
+const DETAILS_LIMIT: usize = 200;
+
+impl HcsEventKind {
+    /// Whether this event means the compute-system handle VMLord holds is dead.
+    ///
+    /// HCS destroys a compute system as it exits, and a disconnected service
+    /// backs nothing at all, so in both cases the handle refers to nothing.
+    fn releases_handle(&self) -> bool {
+        matches!(self, Self::Exited | Self::ServiceDisconnect)
+    }
+}
+
+/// Drains `sink`, logging every event, and reports what the caller must act on:
+/// the diagnostics to surface and the VMs whose held handle is dead.
+///
+/// Releasing handles is left to the caller because `VmConnections` lives in the
+/// repository and is not `Sync`; an event only records a fact.
+pub(crate) fn drain_events(sink: &VmEventSink) -> (Vec<Diagnostic>, Vec<Uuid>) {
+    let (events, dropped) = sink.drain();
+    if dropped > 0 {
+        log::warn!(
+            "{dropped} HCS event(s) were discarded because VMLord's event queue was full"
+        );
+    }
+
+    let mut diagnostics = Vec::new();
+    let mut released = Vec::new();
+    for event in events {
+        if event.kind.releases_handle() {
+            released.push(event.vm_id);
+        }
+        if let Some(diagnostic) = report(&event) {
+            diagnostics.push(diagnostic);
+        }
+    }
+    (diagnostics, released)
+}
+
+/// Logs `event` and returns the diagnostic the user should see, if any.
+///
+/// Noise HCS reports but VMLord has nothing to do about stays in the log only:
+/// the diagnostics buffer holds 100 entries, and filling it with silo-job
+/// notifications would push out the crash report that matters.
+fn report(event: &HcsVmEvent) -> Option<Diagnostic> {
+    let name = &event.vm_name;
+    let vm_id = event.vm_id;
+    let details = event.details.as_deref().unwrap_or("");
+
+    match &event.kind {
+        HcsEventKind::Exited => {
+            log::info!("VM \"{name}\" ({vm_id}) exited; HCS reported: {details}");
+            Some(diagnostic(
+                DiagnosticLevel::Info,
+                format!("VM \"{name}\" stopped"),
+            ))
+        }
+        HcsEventKind::CrashInitiated => {
+            log::warn!("the guest of VM \"{name}\" ({vm_id}) is crashing; HCS reported: {details}");
+            Some(diagnostic(
+                DiagnosticLevel::Warning,
+                format!("The guest of VM \"{name}\" is crashing"),
+            ))
+        }
+        HcsEventKind::CrashReport => {
+            log::error!("the guest of VM \"{name}\" ({vm_id}) crashed; HCS reported: {details}");
+            Some(diagnostic(
+                DiagnosticLevel::Error,
+                format!(
+                    "The guest of VM \"{name}\" crashed; HCS reported: {}",
+                    excerpt(details)
+                ),
+            ))
+        }
+        HcsEventKind::ServiceDisconnect => {
+            log::error!(
+                "the Host Compute Service disconnected from VM \"{name}\" ({vm_id}); \
+                 HCS reported: {details}"
+            );
+            Some(diagnostic(
+                DiagnosticLevel::Error,
+                format!("The Host Compute Service disconnected from VM \"{name}\""),
+            ))
+        }
+        HcsEventKind::Ignored(event_type) => {
+            log::debug!(
+                "VM \"{name}\" ({vm_id}) reported HCS event type {event_type}, \
+                 which VMLord does not act on; HCS reported: {details}"
+            );
+            None
+        }
+    }
+}
+
+fn diagnostic(level: DiagnosticLevel, message: String) -> Diagnostic {
+    Diagnostic { level, message }
+}
+
+/// Shortens `details` to something a diagnostics line can hold.
+///
+/// Counts characters rather than bytes: `EventData` is arbitrary text, and
+/// slicing it by byte index would panic on a multi-byte boundary.
+fn excerpt(details: &str) -> String {
+    let trimmed = details.trim();
+    if trimmed.chars().count() <= DETAILS_LIMIT {
+        return trimmed.to_owned();
+    }
+    let head: String = trimmed.chars().take(DETAILS_LIMIT).collect();
+    format!("{head}...")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{EVENT_CAPACITY, HcsEventKind, HcsVmEvent, VmEventSink, classify};
@@ -216,5 +329,124 @@ mod tests {
     #[test]
     fn an_unknown_event_type_is_ignored_and_not_lost() {
         assert_eq!(classify(9_999), HcsEventKind::Ignored(9_999));
+    }
+
+    use super::{DETAILS_LIMIT, drain_events};
+    use vmlord_core::DiagnosticLevel;
+
+    fn event_of(kind: HcsEventKind, details: Option<&str>) -> HcsVmEvent {
+        HcsVmEvent {
+            vm_id: Uuid::new_v4(),
+            vm_name: "dev".into(),
+            kind,
+            details: details.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn an_exit_is_reported_and_releases_the_handle() {
+        let sink = VmEventSink::default();
+        let exited = event_of(HcsEventKind::Exited, Some("{\"ExitCode\":0}"));
+        let vm_id = exited.vm_id;
+        sink.push(exited);
+
+        let (diagnostics, released) = drain_events(&sink);
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, DiagnosticLevel::Info);
+        assert!(diagnostics[0].message.contains("dev"));
+        assert_eq!(released, vec![vm_id]);
+    }
+
+    #[test]
+    fn a_starting_crash_warns_and_keeps_the_handle() {
+        let sink = VmEventSink::default();
+        sink.push(event_of(HcsEventKind::CrashInitiated, None));
+
+        let (diagnostics, released) = drain_events(&sink);
+
+        assert_eq!(diagnostics[0].level, DiagnosticLevel::Warning);
+        assert!(released.is_empty());
+    }
+
+    #[test]
+    fn a_crash_report_is_an_error_carrying_what_hcs_said() {
+        let sink = VmEventSink::default();
+        sink.push(event_of(
+            HcsEventKind::CrashReport,
+            Some("{\"DumpFile\":\"C:\\\\dumps\\\\dev.dmp\"}"),
+        ));
+
+        let (diagnostics, released) = drain_events(&sink);
+
+        assert_eq!(diagnostics[0].level, DiagnosticLevel::Error);
+        assert!(diagnostics[0].message.contains("dev.dmp"));
+        assert!(
+            released.is_empty(),
+            "a crash report is written while the system still exists"
+        );
+    }
+
+    /// The disconnect releases the handle because the service that backed it is
+    /// gone. It deliberately does not touch `BackendStatus`: the next poll fails
+    /// on its own if the service is really dead, and `WorkspaceApp` has no way
+    /// back out of `Unavailable`.
+    #[test]
+    fn a_service_disconnect_is_an_error_and_releases_the_handle() {
+        let sink = VmEventSink::default();
+        let disconnected = event_of(HcsEventKind::ServiceDisconnect, None);
+        let vm_id = disconnected.vm_id;
+        sink.push(disconnected);
+
+        let (diagnostics, released) = drain_events(&sink);
+
+        assert_eq!(diagnostics[0].level, DiagnosticLevel::Error);
+        assert_eq!(released, vec![vm_id]);
+    }
+
+    #[test]
+    fn an_ignored_event_produces_no_diagnostic() {
+        let sink = VmEventSink::default();
+        sink.push(event_of(HcsEventKind::Ignored(4), Some("noise")));
+
+        let (diagnostics, released) = drain_events(&sink);
+
+        assert!(diagnostics.is_empty());
+        assert!(released.is_empty());
+    }
+
+    /// `EventData` has no documented length bound, and the diagnostics panel is
+    /// a few lines tall. Truncation counts characters, not bytes, so it cannot
+    /// split a UTF-8 sequence.
+    #[test]
+    fn a_long_detail_is_truncated_in_the_diagnostic() {
+        let sink = VmEventSink::default();
+        sink.push(event_of(
+            HcsEventKind::CrashReport,
+            Some(&"д".repeat(DETAILS_LIMIT * 2)),
+        ));
+
+        let (diagnostics, _released) = drain_events(&sink);
+
+        assert!(diagnostics[0].message.ends_with("..."));
+        assert!(diagnostics[0].message.chars().count() < DETAILS_LIMIT * 2);
+    }
+
+    #[test]
+    fn draining_reports_every_event_in_order() {
+        let sink = VmEventSink::default();
+        sink.push(event_of(HcsEventKind::CrashInitiated, None));
+        sink.push(event_of(HcsEventKind::Exited, None));
+
+        let (diagnostics, released) = drain_events(&sink);
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.level)
+                .collect::<Vec<_>>(),
+            vec![DiagnosticLevel::Warning, DiagnosticLevel::Info]
+        );
+        assert_eq!(released.len(), 1);
     }
 }
