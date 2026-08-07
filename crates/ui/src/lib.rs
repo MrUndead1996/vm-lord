@@ -9,7 +9,7 @@ use eframe::egui;
 use vmlord_app::{BackendStatus, VmAction, WorkspaceApp};
 use vmlord_core::{
     AgentStatus, AppSettings, DiagnosticLevel, GpuMode, Language, LogLevel, NetworkMode,
-    VmCreateRequest, VmState, VmSummary, VmUpdateRequest,
+    VmCreateRequest, VmDeleteRequest, VmState, VmSummary, VmUpdateRequest,
 };
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -30,6 +30,7 @@ pub fn run(application: WorkspaceApp) -> eframe::Result<()> {
                 selected_vm_name: None,
                 create_vm_form: None,
                 edit_vm_form: None,
+                delete_vm_form: None,
                 settings_form: None,
             }))
         }),
@@ -42,6 +43,7 @@ struct VmlordUi {
     selected_vm_name: Option<String>,
     create_vm_form: Option<CreateVmForm>,
     edit_vm_form: Option<EditVmForm>,
+    delete_vm_form: Option<DeleteVmForm>,
     settings_form: Option<SettingsForm>,
 }
 
@@ -121,6 +123,24 @@ impl EditVmForm {
     }
 }
 
+struct DeleteVmForm {
+    vm_name: String,
+    delete_disks: bool,
+    error: Option<String>,
+}
+
+impl DeleteVmForm {
+    fn for_vm(vm_name: &str) -> Self {
+        Self {
+            vm_name: vm_name.to_owned(),
+            // Deleting the disks is what "delete the VM" normally means;
+            // keeping them is the deliberate exception.
+            delete_disks: true,
+            error: None,
+        }
+    }
+}
+
 impl Default for CreateVmForm {
     fn default() -> Self {
         Self {
@@ -150,6 +170,11 @@ enum CreateVmDialogAction {
 enum EditVmDialogAction {
     Cancel,
     Submit(VmUpdateRequest),
+}
+
+enum DeleteVmDialogAction {
+    Cancel,
+    Submit,
 }
 
 enum SettingsDialogAction {
@@ -268,7 +293,13 @@ impl eframe::App for VmlordUi {
                         }
                     }
                 }
-                _ => self.application.log_vm_action(action),
+                VmAction::Delete => {
+                    if let Some(name) = self.selected_vm_name.clone() {
+                        self.delete_vm_form = Some(DeleteVmForm::for_vm(&name));
+                        self.create_vm_form = None;
+                        self.edit_vm_form = None;
+                    }
+                }
             }
             context.request_repaint();
         }
@@ -368,6 +399,35 @@ impl eframe::App for VmlordUi {
                 } else {
                     self.edit_vm_form = None;
                     self.last_refresh = Instant::now();
+                }
+            }
+            None => {}
+        }
+
+        let delete_dialog_action = self
+            .delete_vm_form
+            .as_mut()
+            .and_then(|form| render_delete_vm_dialog(context, form));
+        match delete_dialog_action {
+            Some(DeleteVmDialogAction::Cancel) => self.delete_vm_form = None,
+            Some(DeleteVmDialogAction::Submit) => {
+                let request = self.delete_vm_form.as_ref().map(|form| VmDeleteRequest {
+                    name: form.vm_name.clone(),
+                    delete_disks: form.delete_disks,
+                });
+                if let Some(request) = request {
+                    match self.application.delete_vm(request) {
+                        Ok(()) => {
+                            self.delete_vm_form = None;
+                            self.selected_vm_name = None;
+                            self.last_refresh = Instant::now();
+                        }
+                        Err(error) => {
+                            if let Some(form) = &mut self.delete_vm_form {
+                                form.error = Some(error.to_string());
+                            }
+                        }
+                    }
                 }
             }
             None => {}
@@ -693,6 +753,56 @@ fn render_edit_vm_dialog(
 
     if !open && action.is_none() {
         action = Some(EditVmDialogAction::Cancel);
+    }
+    action
+}
+
+fn render_delete_vm_dialog(
+    context: &egui::Context,
+    form: &mut DeleteVmForm,
+) -> Option<DeleteVmDialogAction> {
+    let mut open = true;
+    let mut action = None;
+    egui::Window::new(format!("Delete VM: {}", form.vm_name))
+        .collapsible(false)
+        .resizable(false)
+        .default_width(420.0)
+        .open(&mut open)
+        .show(context, |ui| {
+            ui.label(format!(
+                "VM \"{}\" and its stored configuration will be removed. This cannot be undone.",
+                form.vm_name
+            ));
+            ui.add_space(8.0);
+            ui.checkbox(&mut form.delete_disks, "Delete virtual disks");
+            if form.delete_disks {
+                ui.small("The VM's virtual disks are deleted with it. The image it was installed from is not touched.");
+            } else {
+                ui.small("The virtual disks are kept, so the VM's directory stays in place and a new VM cannot reuse that name.");
+            }
+
+            if let Some(error) = &form.error {
+                ui.add_space(4.0);
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+            }
+
+            ui.separator();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let delete = ui.add(
+                    egui::Button::new(egui::RichText::new("Delete").color(egui::Color32::WHITE))
+                        .fill(egui::Color32::from_rgb(192, 57, 43)),
+                );
+                if delete.clicked() {
+                    action = Some(DeleteVmDialogAction::Submit);
+                }
+                if ui.button("Cancel").clicked() {
+                    action = Some(DeleteVmDialogAction::Cancel);
+                }
+            });
+        });
+
+    if !open && action.is_none() {
+        action = Some(DeleteVmDialogAction::Cancel);
     }
     action
 }
