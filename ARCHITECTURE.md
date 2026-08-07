@@ -230,6 +230,24 @@ better is not yet established: the legacy AppSandbox backend resolved
 `HcsShutDownComputeSystem` but never called it, implementing graceful shutdown
 over its own in-guest agent instead, so VMLord may need the same.
 
+`platform::VmForceStopPipeline` is that remaining option: it stops a known VM
+through `HcsTerminateComputeSystem`, which needs nothing from the guest, so its
+completion means the VM really has stopped.
+
+An HCS compute system is a runtime object, not a registered machine: it exists
+only while it is created or running, and HCS destroys it as it exits -- whether
+the guest powered itself off or a forced stop terminated it. Reopening a stopped
+VM therefore fails with `HCS_E_SYSTEM_NOT_FOUND`, which is a statement about its
+state rather than an error, and `HcsSystem::open_if_present` reports it as
+`None`. `ShouldTerminateOnLastHandleClosed: false` does not change this; it only
+keeps a *created*, never-started system alive once VMLord's handles close.
+
+What survives a stop is everything the VM is made of: its disks, the
+`config.json` creation wrote, and its `MetadataStore` mapping. `VmStartPipeline`
+therefore re-creates the compute system from that stored configuration whenever
+HCS no longer knows it, under the same id, before starting it. Without that
+step a stop would silently become a delete.
+
 `core::settings` owns the UI-independent application settings model and TOML
 persistence. The composition root initializes it before the backend. Settings
 are stored per user at `%LOCALAPPDATA%\VMLord\settings.toml`; the initial file

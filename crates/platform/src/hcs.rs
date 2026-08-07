@@ -2,7 +2,9 @@ use std::{path::Path, time::Duration};
 
 use windows::{
     Win32::{
-        Foundation::{ERROR_NOT_SUPPORTED, ERROR_TIMEOUT, HLOCAL, LocalFree},
+        Foundation::{
+            ERROR_NOT_SUPPORTED, ERROR_TIMEOUT, HCS_E_SYSTEM_NOT_FOUND, HLOCAL, LocalFree,
+        },
         System::HostComputeSystem::{
             HCS_OPERATION, HCS_SYSTEM, HcsCloseComputeSystem, HcsCloseOperation,
             HcsCreateComputeSystem, HcsCreateOperation, HcsEnumerateComputeSystems,
@@ -120,11 +122,38 @@ impl HcsSystem {
         vm_name: &str,
         requested_access: u32,
     ) -> Result<Self, vmlord_core::RepositoryError> {
+        Self::try_open(vm_name, requested_access)
+            .map_err(|error| windows_error("open compute system", Some(vm_name), error))
+    }
+
+    /// Opens an existing compute system, reporting `Ok(None)` when HCS does not
+    /// know it.
+    ///
+    /// A compute system exists only while it is created or running: HCS
+    /// destroys it once it exits, whether the guest powered off or
+    /// [`HcsSystem::terminate`] stopped it. A VM that VMLord still knows is
+    /// therefore routinely absent here, which is a fact about its state rather
+    /// than an error; callers that can rebuild the system from its stored
+    /// configuration use this instead of [`HcsSystem::open`].
+    pub fn open_if_present(
+        vm_name: &str,
+        requested_access: u32,
+    ) -> Result<Option<Self>, RepositoryError> {
+        match Self::try_open(vm_name, requested_access) {
+            Ok(system) => Ok(Some(system)),
+            Err(error) if error.code() == HCS_E_SYSTEM_NOT_FOUND => {
+                log::debug!("HCS does not know compute system \"{vm_name}\"");
+                Ok(None)
+            }
+            Err(error) => Err(windows_error("open compute system", Some(vm_name), error)),
+        }
+    }
+
+    fn try_open(vm_name: &str, requested_access: u32) -> Result<Self, windows::core::Error> {
         let hcs_name = HSTRING::from(vm_name);
         // SAFETY: `hcs_name` remains valid for the duration of the call. A successful
         // handle is transferred to this wrapper and closed by `Drop`.
-        let handle = unsafe { HcsOpenComputeSystem(&hcs_name, requested_access) }
-            .map_err(|error| windows_error("open compute system", Some(vm_name), error))?;
+        let handle = unsafe { HcsOpenComputeSystem(&hcs_name, requested_access) }?;
         Ok(Self {
             handle,
             id: vm_name.to_owned(),
@@ -209,6 +238,13 @@ impl HcsSystem {
     }
 
     /// Terminates the compute system, e.g. to roll back a failed creation.
+    ///
+    /// Termination stops the VM's execution immediately, without involving the
+    /// guest, and HCS then destroys the compute system: a terminated system is
+    /// gone, and reopening it fails with `HCS_E_SYSTEM_NOT_FOUND`. Nothing on
+    /// disk is touched, so the VM can be re-created from its stored
+    /// configuration and started again -- which is what
+    /// [`crate::VmStartPipeline`] does.
     pub fn terminate(&self) -> Result<HcsOperation, RepositoryError> {
         log::debug!("terminating HCS compute system \"{}\"", self.id);
         let operation = HcsOperation::new();
@@ -224,6 +260,23 @@ impl HcsSystem {
             },
         )?;
         Ok(operation)
+    }
+
+    /// Terminates the compute system and waits up to `timeout` for HCS to
+    /// report the outcome.
+    ///
+    /// Unlike [`HcsSystem::shutdown_and_wait`], completion means the VM has
+    /// actually stopped: termination needs nothing from the guest.
+    pub fn terminate_and_wait(&self, timeout: Duration) -> Result<(), RepositoryError> {
+        self.terminate()?
+            .wait_for_completion(timeout)
+            .map(|_document| ())
+            .inspect_err(|error| {
+                log::error!(
+                    "the termination of HCS compute system \"{}\" failed: {error}",
+                    self.id
+                );
+            })
     }
 }
 

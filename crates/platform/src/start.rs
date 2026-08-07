@@ -19,11 +19,15 @@ use crate::{
 /// guards against a wedged Host Compute Service.
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Bounds the re-creation of a compute system HCS no longer knows; it is the
+/// same operation `VmCreationPipeline` waits on.
+const CREATE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The file `VmCreationPipeline` writes the compute system's configuration to.
 const CONFIGURATION_FILE_NAME: &str = "config.json";
 
 type AccessGranter = Box<dyn Fn(&str, &Path) -> Result<(), RepositoryError>>;
-type SystemStarter = Box<dyn Fn(&str) -> Result<(), RepositoryError>>;
+type SystemStarter = Box<dyn Fn(&str, &str) -> Result<(), RepositoryError>>;
 
 /// Starts VMs created by [`crate::VmCreationPipeline`].
 pub struct VmStartPipeline {
@@ -44,7 +48,7 @@ impl VmStartPipeline {
     #[cfg(test)]
     fn for_test(
         access_granter: impl Fn(&str, &Path) -> Result<(), RepositoryError> + 'static,
-        system_starter: impl Fn(&str) -> Result<(), RepositoryError> + 'static,
+        system_starter: impl Fn(&str, &str) -> Result<(), RepositoryError> + 'static,
     ) -> Self {
         Self {
             access_granter: Box::new(access_granter),
@@ -59,6 +63,10 @@ impl VmStartPipeline {
     /// security principal first: Hyper-V opens those files as the VM itself,
     /// so a start without the grant fails with `ERROR_ACCESS_DENIED` even
     /// when the calling (elevated) process can read them.
+    ///
+    /// The stored `config.json` is also what a VM whose compute system HCS no
+    /// longer knows is rebuilt from, so a start after a stop needs no other
+    /// state than what creation persisted.
     pub fn start(
         &self,
         store: &MetadataStore,
@@ -78,22 +86,25 @@ impl VmStartPipeline {
             mapping.hcs_compute_system_id
         );
 
-        self.grant_access_to_attachments(&mapping, vm_directory)?;
-        (self.system_starter)(&mapping.hcs_compute_system_id).inspect_err(|error| {
-            log::error!("failed to start VM \"{}\": {error}", mapping.vm_name);
-        })?;
+        let configuration = self.read_configuration(&mapping, vm_directory)?;
+        self.grant_access_to_attachments(&mapping, &configuration)?;
+        (self.system_starter)(&mapping.hcs_compute_system_id, &configuration).inspect_err(
+            |error| {
+                log::error!("failed to start VM \"{}\": {error}", mapping.vm_name);
+            },
+        )?;
 
         log::info!("started VM \"{}\" ({})", mapping.vm_name, mapping.vm_id);
         Ok(())
     }
 
-    fn grant_access_to_attachments(
+    fn read_configuration(
         &self,
         mapping: &VmComputeSystemMapping,
         vm_directory: &Path,
-    ) -> Result<(), RepositoryError> {
+    ) -> Result<String, RepositoryError> {
         let configuration_path = vm_directory.join(CONFIGURATION_FILE_NAME);
-        let document = fs::read_to_string(&configuration_path).map_err(|error| {
+        fs::read_to_string(&configuration_path).map_err(|error| {
             let error = RepositoryError::new(format!(
                 "failed to read the HCS configuration of VM \"{}\" from {}: {error}",
                 mapping.vm_name,
@@ -101,9 +112,15 @@ impl VmStartPipeline {
             ));
             log::error!("{error}");
             error
-        })?;
+        })
+    }
 
-        let paths = attachment_paths(&document)?;
+    fn grant_access_to_attachments(
+        &self,
+        mapping: &VmComputeSystemMapping,
+        document: &str,
+    ) -> Result<(), RepositoryError> {
+        let paths = attachment_paths(document)?;
         if paths.is_empty() {
             log::warn!(
                 "the HCS configuration of VM \"{}\" attaches no files; \
@@ -161,9 +178,28 @@ fn grant_vm_access(id: &str, path: &Path) -> Result<(), RepositoryError> {
     HcsClient::new().grant_vm_access(id, path)
 }
 
-fn start_hcs_system(id: &str) -> Result<(), RepositoryError> {
+/// Starts the compute system `id`, re-creating it from `configuration` first
+/// if HCS no longer knows it.
+///
+/// HCS destroys a compute system when it exits, so every VM that has been
+/// stopped -- by its guest or by a forced stop -- has to be rebuilt before it
+/// can run again. Re-creating from the stored configuration keeps the VM's id,
+/// disks and metadata mapping unchanged, so a stop stays a stop rather than
+/// becoming an implicit delete.
+fn start_hcs_system(id: &str, configuration: &str) -> Result<(), RepositoryError> {
     // The system handle must outlive the start operation it issued.
-    let system = HcsSystem::open(id, HCS_ACCESS_ALL)?;
+    let system = match HcsSystem::open_if_present(id, HCS_ACCESS_ALL)? {
+        Some(system) => system,
+        None => {
+            log::info!(
+                "HCS no longer knows compute system \"{id}\"; \
+                 re-creating it from the stored configuration before starting it"
+            );
+            let (system, creation) = HcsClient::new().create_system(id, configuration)?;
+            creation.wait_for_completion(CREATE_TIMEOUT)?;
+            system
+        }
+    };
     system
         .start()?
         .wait_for_completion(START_TIMEOUT)
@@ -223,7 +259,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct Calls {
         grant: Arc<Mutex<Vec<(String, PathBuf)>>>,
-        start: Arc<Mutex<Vec<String>>>,
+        start: Arc<Mutex<Vec<(String, String)>>>,
     }
 
     struct Fixture {
@@ -281,8 +317,12 @@ mod tests {
             },
             {
                 let calls = calls.clone();
-                move |id: &str| {
-                    calls.start.lock().unwrap().push(id.to_owned());
+                move |id: &str, configuration: &str| {
+                    calls
+                        .start
+                        .lock()
+                        .unwrap()
+                        .push((id.to_owned(), configuration.to_owned()));
                     if fail_start {
                         return Err(RepositoryError::new("injected start failure"));
                     }
@@ -316,9 +356,26 @@ mod tests {
                 ),
             ]
         );
+        let started = calls.start.lock().unwrap().clone();
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].0, fixture.mapping.hcs_compute_system_id);
+    }
+
+    #[test]
+    fn hands_the_stored_configuration_to_the_starter() {
+        // The starter re-creates a compute system HCS no longer knows, so it
+        // needs the very document creation persisted.
+        let fixture = fixture("configuration");
+        let calls = fixture.calls.clone();
+
+        pipeline(&calls, false)
+            .start(&fixture.store, "dev", &fixture.vm_directory)
+            .expect("start should succeed");
+
+        let started = calls.start.lock().unwrap().clone();
         assert_eq!(
-            calls.start.lock().unwrap().as_slice(),
-            std::slice::from_ref(&fixture.mapping.hcs_compute_system_id)
+            started[0].1,
+            fs::read_to_string(fixture.vm_directory.join("config.json")).unwrap()
         );
     }
 

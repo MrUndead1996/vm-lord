@@ -18,7 +18,8 @@ use uuid::Uuid;
 use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest};
 use vmlord_platform::{
     HcsClient, HcsOperation, HcsSystem, MetadataStore, VmComputeSystemMapping, VmCreationPipeline,
-    VmShutdownPipeline, VmStartPipeline, list_known_vms, open_by_vm_id, open_by_vm_name,
+    VmForceStopPipeline, VmShutdownPipeline, VmStartPipeline, list_known_vms, open_by_vm_id,
+    open_by_vm_name,
 };
 
 // `GENERIC_ALL`; matches the legacy AppSandbox backend's `hcs_vm.c` usage and
@@ -233,6 +234,75 @@ fn starts_a_created_vm() {
 
     started
         .expect("the created VM must start (HcsGrantVmAccess must precede HcsStartComputeSystem)");
+}
+
+/// Exercises TASK-25's forced stop against the real Host Compute Service:
+/// creates a VM, starts it, terminates it, and starts it a second time.
+///
+/// The second start is the actual assertion, and it is the regression check
+/// for what a first run of this test established on a live host: HCS destroys
+/// a compute system when it exits, so after a forced stop reopening it fails
+/// with `HCS_E_SYSTEM_NOT_FOUND` (0x8037010E). A forced stop must nevertheless
+/// leave the VM itself intact, which is why `VmStartPipeline` re-creates the
+/// compute system from the stored `config.json` rather than only opening it.
+/// Were it not to, a forced stop would silently be a delete.
+///
+/// A forced stop needs nothing from the guest, so installer media is enough
+/// here: set `VMLORD_TEST_IMAGE_PATH` to a real bootable ISO.
+///
+/// Run elevated with:
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact force_stopped_vm_can_be_started_again --nocapture`
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS and VMLORD_TEST_IMAGE_PATH set"]
+fn force_stopped_vm_can_be_started_again() {
+    let image_path = std::env::var("VMLORD_TEST_IMAGE_PATH")
+        .expect("VMLORD_TEST_IMAGE_PATH must point to a real ISO image");
+    let root =
+        std::env::temp_dir().join(format!("vmlord-hcs-force-stop-e2e-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+
+    let request = VmCreateRequest {
+        name: format!("vmlord-e2e-force-stop-test-{}", std::process::id()),
+        image_path,
+        ram_mb: 2048,
+        disk_gb: 8,
+        cpu_cores: 2,
+        gpu_mode: GpuMode::None,
+        network_mode: NetworkMode::None,
+        username: "admin".into(),
+        password: "not used by a forced stop".into(),
+        ssh_enabled: false,
+        ssh_deploy_key: false,
+    };
+    let store = MetadataStore::new(root.join("vm-mapping.json"));
+    let vm_directory = root.join("vm");
+
+    let mapping = VmCreationPipeline::production()
+        .create(&store, &request, &vm_directory)
+        .expect("VM creation should succeed on an elevated Hyper-V host");
+    VmStartPipeline::production()
+        .start(&store, &mapping.vm_name, &vm_directory)
+        .expect("the created VM must start before it can be forcibly stopped");
+
+    let force_stopped = VmForceStopPipeline::production().force_stop(&store, &mapping.vm_name);
+    let restarted = force_stopped
+        .as_ref()
+        .ok()
+        .map(|()| VmStartPipeline::production().start(&store, &mapping.vm_name, &vm_directory));
+
+    // Best-effort cleanup regardless of the assertions below: a successful
+    // restart leaves the VM running again.
+    let _ = VmForceStopPipeline::production().force_stop(&store, &mapping.vm_name);
+    let _ = fs::remove_dir_all(&root);
+
+    force_stopped.expect("a running VM must accept a forced stop");
+    restarted
+        .expect("the restart must have been attempted")
+        .expect(
+            "a forcibly stopped VM must stay start-able; HCS_E_SYSTEM_NOT_FOUND \
+             (0x8037010E) here means the start did not re-create the compute \
+             system HCS destroyed when it terminated",
+        );
 }
 
 /// Exercises TASK-31's options document against the real Host Compute
