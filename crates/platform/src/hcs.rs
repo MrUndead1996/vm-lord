@@ -2,12 +2,13 @@ use std::{path::Path, time::Duration};
 
 use windows::{
     Win32::{
-        Foundation::{ERROR_TIMEOUT, HLOCAL, LocalFree},
+        Foundation::{ERROR_NOT_SUPPORTED, ERROR_TIMEOUT, HLOCAL, LocalFree},
         System::HostComputeSystem::{
             HCS_OPERATION, HCS_SYSTEM, HcsCloseComputeSystem, HcsCloseOperation,
             HcsCreateComputeSystem, HcsCreateOperation, HcsEnumerateComputeSystems,
-            HcsGetServiceProperties, HcsGrantVmAccess, HcsOpenComputeSystem, HcsStartComputeSystem,
-            HcsTerminateComputeSystem, HcsWaitForOperationResult,
+            HcsGetServiceProperties, HcsGrantVmAccess, HcsOpenComputeSystem,
+            HcsShutDownComputeSystem, HcsStartComputeSystem, HcsTerminateComputeSystem,
+            HcsWaitForOperationResult,
         },
     },
     core::{HSTRING, PCWSTR, PWSTR},
@@ -43,7 +44,15 @@ impl HcsOperation {
     /// Waits up to `timeout` for the operation to complete, returning its
     /// result document (empty if HCS returned none).
     pub fn wait_for_completion(self, timeout: Duration) -> Result<String, RepositoryError> {
-        let timeout_ms = timeout_milliseconds(timeout)?;
+        self.wait(timeout)
+            .map_err(|error| wait_failure(timeout, error))
+    }
+
+    /// Waits like [`HcsOperation::wait_for_completion`], but surfaces the raw
+    /// Windows failure so callers can classify an operation-specific HRESULT
+    /// before it is flattened into a message.
+    fn wait(self, timeout: Duration) -> Result<String, WaitFailure> {
+        let timeout_ms = timeout_milliseconds(timeout).map_err(WaitFailure::Timeout)?;
         let mut result = PWSTR::null();
         // SAFETY: `self.0` is an owned HCS operation handle valid for this call.
         // On success HCS writes a possibly-null result pointer into `result`,
@@ -52,21 +61,37 @@ impl HcsOperation {
             unsafe { HcsWaitForOperationResult(self.0, timeout_ms, Some(&mut result)) };
         let document = HcsAllocatedString::from_optional(result);
 
-        native_result.map_err(|error| {
-            if error.code() == ERROR_TIMEOUT.to_hresult() {
-                RepositoryError::new(format!(
-                    "HCS operation timed out after {} ms",
-                    timeout.as_millis()
-                ))
-            } else {
-                windows_error("wait for HCS operation result", None, error)
-            }
-        })?;
+        native_result.map_err(WaitFailure::Windows)?;
 
         match document {
             Some(document) => document.into_string(),
             None => Ok(String::new()),
         }
+        .map_err(WaitFailure::Timeout)
+    }
+}
+
+/// A failure from [`HcsOperation::wait`], retaining the Windows error so a
+/// caller can match on its HRESULT.
+enum WaitFailure {
+    Windows(windows::core::Error),
+    /// A failure that never carries a meaningful HRESULT (an unrepresentable
+    /// timeout, or a malformed result document).
+    Timeout(RepositoryError),
+}
+
+/// Renders a wait failure the way every caller that does not classify the
+/// HRESULT itself reports it.
+fn wait_failure(timeout: Duration, failure: WaitFailure) -> RepositoryError {
+    match failure {
+        WaitFailure::Timeout(error) => error,
+        WaitFailure::Windows(error) if error.code() == ERROR_TIMEOUT.to_hresult() => {
+            RepositoryError::new(format!(
+                "HCS operation timed out after {} ms",
+                timeout.as_millis()
+            ))
+        }
+        WaitFailure::Windows(error) => windows_error("wait for HCS operation result", None, error),
     }
 }
 
@@ -128,6 +153,59 @@ impl HcsSystem {
             },
         )?;
         Ok(operation)
+    }
+
+    /// Asks the guest to shut down gracefully, returning the pending
+    /// shutdown operation.
+    ///
+    /// The operation completes once HCS has accepted and delivered the
+    /// request, not once the guest has finished powering off; callers that
+    /// need the latter must watch for the system's exit separately.
+    ///
+    /// A guest without integration services (or one refusing the request)
+    /// never powers off, so this is not a substitute for
+    /// [`HcsSystem::terminate`].
+    pub fn shutdown(&self) -> Result<HcsOperation, RepositoryError> {
+        log::debug!("shutting down HCS compute system \"{}\"", self.id);
+        let operation = HcsOperation::new();
+        let options = HSTRING::from(shutdown_options());
+        // SAFETY: `self.handle` and `operation.0` are valid owned handles for
+        // the duration of this call, and `options` outlives it.
+        unsafe { HcsShutDownComputeSystem(self.handle, operation.0, &options) }.map_err(
+            |error| {
+                let error = windows_error("shut down compute system", Some(&self.id), error);
+                log::error!("{error}");
+                error
+            },
+        )?;
+        Ok(operation)
+    }
+
+    /// Requests a graceful shutdown and waits up to `timeout` for HCS to
+    /// report the request's outcome.
+    ///
+    /// `ERROR_NOT_SUPPORTED` is reported as its own error: HCS accepted the
+    /// request but has no way to deliver it, which no retry fixes and which
+    /// only a forced stop can work around.
+    pub fn shutdown_and_wait(&self, timeout: Duration) -> Result<(), RepositoryError> {
+        match self.shutdown()?.wait(timeout) {
+            Ok(_document) => Ok(()),
+            Err(WaitFailure::Windows(error))
+                if error.code() == ERROR_NOT_SUPPORTED.to_hresult() =>
+            {
+                let error = unsupported_shutdown_error(&self.id, error.code().0 as u32);
+                log::error!("{error}");
+                Err(error)
+            }
+            Err(failure) => {
+                let error = wait_failure(timeout, failure);
+                log::error!(
+                    "the shutdown of HCS compute system \"{}\" failed: {error}",
+                    self.id
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Terminates the compute system, e.g. to roll back a failed creation.
@@ -196,6 +274,31 @@ impl Drop for HcsAllocatedString {
 /// pointer requests the default service properties instead.
 fn hcs_service_properties_query() -> PCWSTR {
     PCWSTR::null()
+}
+
+/// The options document passed to `HcsShutDownComputeSystem`.
+///
+/// HCS parses the options as JSON and rejects a null pointer with
+/// `HCS_E_INVALID_JSON` ("Invalid JSON document '$'"), unlike
+/// `HcsStartComputeSystem` and `HcsTerminateComputeSystem`, which accept one.
+/// An empty object requests the default shutdown behaviour.
+fn shutdown_options() -> &'static str {
+    "{}"
+}
+
+/// Reports a shutdown HCS accepted but cannot deliver.
+///
+/// A VM whose guest exposes no shutdown channel HCS can use -- one booted from
+/// installer media, for instance -- fails the shutdown *operation* with
+/// `ERROR_NOT_SUPPORTED` even though the call itself and its options document
+/// were accepted. No retry helps, so the message points at the only remaining
+/// way to stop the VM.
+fn unsupported_shutdown_error(id: &str, hresult: u32) -> RepositoryError {
+    RepositoryError::new(format!(
+        "HCS does not support a graceful shutdown of compute system \"{id}\" \
+         (HRESULT 0x{hresult:08X}, ERROR_NOT_SUPPORTED); the guest exposes no \
+         shutdown channel HCS can use, so only a forced stop can stop it"
+    ))
 }
 
 /// Validates an HCS service-properties result document.
@@ -455,11 +558,31 @@ mod tests {
 
     use super::{
         HcsClient, hcs_service_properties_query, parse_enumerate_result, parse_service_result,
+        shutdown_options, unsupported_shutdown_error,
     };
 
     #[test]
     fn service_properties_query_is_null() {
         assert!(hcs_service_properties_query().is_null());
+    }
+
+    #[test]
+    fn shutdown_options_are_a_valid_json_document() {
+        // A null options pointer makes `HcsShutDownComputeSystem` fail with
+        // `HCS_E_INVALID_JSON`, so the options must stay a parsable document.
+        let options = shutdown_options();
+
+        assert!(!options.is_empty());
+        assert!(serde_json::from_str::<serde_json::Value>(options).is_ok());
+    }
+
+    #[test]
+    fn an_unsupported_shutdown_names_the_system_and_points_at_a_forced_stop() {
+        let error = unsupported_shutdown_error("vmlord-dev", 0x8007_0032);
+
+        assert!(error.to_string().contains("vmlord-dev"));
+        assert!(error.to_string().contains("0x80070032"));
+        assert!(error.to_string().contains("forced stop"));
     }
 
     #[test]

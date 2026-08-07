@@ -8,12 +8,17 @@
 
 #![cfg(windows)]
 
-use std::{fs, time::Duration};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
+use uuid::Uuid;
 use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest};
 use vmlord_platform::{
-    HcsClient, HcsOperation, HcsSystem, MetadataStore, VmCreationPipeline, VmStartPipeline,
-    list_known_vms, open_by_vm_id, open_by_vm_name,
+    HcsClient, HcsOperation, HcsSystem, MetadataStore, VmComputeSystemMapping, VmCreationPipeline,
+    VmShutdownPipeline, VmStartPipeline, list_known_vms, open_by_vm_id, open_by_vm_name,
 };
 
 // `GENERIC_ALL`; matches the legacy AppSandbox backend's `hcs_vm.c` usage and
@@ -21,6 +26,10 @@ use vmlord_platform::{
 // value here (`0x000F_FFFF`) was invalid and made `HcsOpenComputeSystem` fail
 // with `E_INVALIDARG` rather than a meaningful not-found error.
 const HCS_ACCESS_ALL: u32 = 0x1000_0000;
+
+/// `HCS_E_INVALID_JSON`, as it appears in a `RepositoryError`'s message. HCS
+/// reports it when `HcsShutDownComputeSystem` receives null options.
+const HCS_E_INVALID_JSON: &str = "0x8037010D";
 
 #[test]
 #[ignore = "requires Windows with Hyper-V/HCS"]
@@ -224,4 +233,204 @@ fn starts_a_created_vm() {
 
     started
         .expect("the created VM must start (HcsGrantVmAccess must precede HcsStartComputeSystem)");
+}
+
+/// Exercises TASK-31's options document against the real Host Compute
+/// Service: creates a VM, starts it, then asks its guest to shut down.
+///
+/// This is the regression check for the options document alone --
+/// `HcsShutDownComputeSystem` rejects a null options pointer with
+/// `HCS_E_INVALID_JSON`, so the pipeline must pass `"{}"`. It deliberately
+/// does not assert that the shutdown succeeds: this VM boots installer media,
+/// so it runs no guest OS that could service the request, and HCS reports
+/// `ERROR_NOT_SUPPORTED`. `shuts_down_a_running_guest` is the test that
+/// asserts a shutdown actually works.
+///
+/// Set `VMLORD_TEST_IMAGE_PATH` to a real bootable ISO.
+///
+/// Run elevated with:
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact accepts_the_shutdown_options_document --nocapture`
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS and VMLORD_TEST_IMAGE_PATH set"]
+fn accepts_the_shutdown_options_document() {
+    let image_path = std::env::var("VMLORD_TEST_IMAGE_PATH")
+        .expect("VMLORD_TEST_IMAGE_PATH must point to a real ISO image");
+    let root = std::env::temp_dir().join(format!("vmlord-hcs-shutdown-e2e-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+
+    let request = VmCreateRequest {
+        name: format!("vmlord-e2e-shutdown-test-{}", std::process::id()),
+        image_path,
+        ram_mb: 2048,
+        disk_gb: 8,
+        cpu_cores: 2,
+        gpu_mode: GpuMode::None,
+        network_mode: NetworkMode::None,
+        username: "admin".into(),
+        password: "not used by shutdown".into(),
+        ssh_enabled: false,
+        ssh_deploy_key: false,
+    };
+    let store = MetadataStore::new(root.join("vm-mapping.json"));
+    let vm_directory = root.join("vm");
+
+    let mapping = VmCreationPipeline::production()
+        .create(&store, &request, &vm_directory)
+        .expect("VM creation should succeed on an elevated Hyper-V host");
+    VmStartPipeline::production()
+        .start(&store, &mapping.vm_name, &vm_directory)
+        .expect("the created VM must start before it can be shut down");
+
+    let shut_down = VmShutdownPipeline::production().shutdown(&store, &mapping.vm_name);
+
+    // Best-effort cleanup regardless of the assertion below: a guest that
+    // ignores the request is still running here.
+    if let Ok(system) = HcsSystem::open(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL) {
+        let _ = system
+            .terminate()
+            .and_then(|operation| operation.wait_for_completion(Duration::from_secs(30)));
+    }
+    let _ = fs::remove_dir_all(&root);
+
+    if let Err(error) = shut_down {
+        println!("shutdown of a guest-less VM reported: {error}");
+        assert!(
+            !error.to_string().contains(HCS_E_INVALID_JSON),
+            "HCS rejected the shutdown options document as invalid JSON; \
+             HcsShutDownComputeSystem must receive non-null JSON options: {error}"
+        );
+    }
+}
+
+/// Asserts that a graceful shutdown actually stops a VM whose guest OS is
+/// running and able to service the request.
+///
+/// This is the test that distinguishes "this particular guest cannot service a
+/// shutdown" from "HCS never delivers a shutdown to a plain Hyper-V VM": a
+/// guest-less VM reports `ERROR_NOT_SUPPORTED`, and if a fully booted guest
+/// reports it too, `HcsShutDownComputeSystem` is the wrong mechanism for
+/// VMLord's VMs and graceful shutdown needs an in-guest agent instead (which
+/// is how the legacy AppSandbox backend implemented it).
+///
+/// `VmCreationPipeline` always formats a fresh empty disk and attaches an
+/// installer ISO, so it cannot produce a VM with a booted guest. This test
+/// therefore assembles the compute system directly from an existing VHDX:
+///
+/// * `VMLORD_TEST_VHDX_PATH` -- a VHDX with an installed, UEFI-bootable guest.
+///   It is copied first, so the original is never written to or shut down.
+/// * `VMLORD_TEST_BOOT_SECONDS` -- how long to wait for the guest to boot far
+///   enough to run its shutdown integration service (default 90). On Linux
+///   that service is the kernel's `hv_utils` module.
+///
+/// Run elevated with:
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact shuts_down_a_running_guest --nocapture`
+#[test]
+#[ignore = "requires an elevated Windows host and a VHDX with an installed guest OS"]
+fn shuts_down_a_running_guest() {
+    let source_vhdx = PathBuf::from(
+        std::env::var("VMLORD_TEST_VHDX_PATH")
+            .expect("VMLORD_TEST_VHDX_PATH must point to a VHDX with an installed guest OS"),
+    );
+    let boot_wait = Duration::from_secs(
+        std::env::var("VMLORD_TEST_BOOT_SECONDS")
+            .ok()
+            .and_then(|seconds| seconds.parse().ok())
+            .unwrap_or(90),
+    );
+
+    let root = std::env::temp_dir().join(format!("vmlord-hcs-guest-e2e-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+    // A booted guest writes to its disk and this test powers it off, so the
+    // VHDX under test is always a throwaway copy.
+    let disk_path = root.join("system.vhdx");
+    println!(
+        "copying {} to {}",
+        source_vhdx.display(),
+        disk_path.display()
+    );
+    fs::copy(&source_vhdx, &disk_path).expect("the source VHDX should be copyable");
+
+    let vm_id = Uuid::new_v4();
+    let hcs_id = format!("vmlord-{}", vm_id.as_simple());
+    let store = MetadataStore::new(root.join("vm-mapping.json"));
+    store
+        .insert(VmComputeSystemMapping {
+            vm_id,
+            vm_name: "guest-shutdown-probe".into(),
+            hcs_compute_system_id: hcs_id.clone(),
+        })
+        .expect("mapping should be persisted");
+
+    let result = boot_and_shut_down(&hcs_id, &disk_path, &store, boot_wait);
+
+    // Best-effort cleanup regardless of the assertion below: a guest that
+    // ignored the request is still running here.
+    if let Ok(system) = HcsSystem::open(&hcs_id, HCS_ACCESS_ALL) {
+        let _ = system
+            .terminate()
+            .and_then(|operation| operation.wait_for_completion(Duration::from_secs(30)));
+    }
+    let _ = fs::remove_dir_all(&root);
+
+    result.expect(
+        "a running guest must accept a graceful shutdown; ERROR_NOT_SUPPORTED here means \
+         HcsShutDownComputeSystem cannot shut down VMLord's VMs at all",
+    );
+}
+
+/// Creates, starts and gracefully shuts down a compute system booting `disk_path`.
+///
+/// The configuration mirrors `HcsVmConfigBuilder`'s, minus the installer ISO
+/// that builder always attaches; that builder is crate-private, so this test
+/// spells the document out.
+fn boot_and_shut_down(
+    hcs_id: &str,
+    disk_path: &Path,
+    store: &MetadataStore,
+    boot_wait: Duration,
+) -> Result<(), vmlord_core::RepositoryError> {
+    let configuration = serde_json::json!({
+        "SchemaVersion": { "Major": 2, "Minor": 1 },
+        "Owner": "VMLord",
+        "ShouldTerminateOnLastHandleClosed": false,
+        "VirtualMachine": {
+            "Chipset": { "Uefi": { "Console": "Default" } },
+            "ComputeTopology": {
+                "Memory": {
+                    "SizeInMB": 2048,
+                    "AllowOvercommit": true,
+                    "EnableDeferredCommit": true,
+                    "EnableColdDiscardHint": true
+                },
+                "Processor": { "Count": 2 }
+            },
+            "Devices": {
+                "Scsi": { "Primary": { "Attachments": {
+                    "0": { "Type": "VirtualDisk", "Path": disk_path }
+                }}},
+                "HvSocket": { "HvSocketConfig": { "ServiceTable": {} } },
+                "Keyboard": {},
+                "Mouse": {}
+            }
+        }
+    })
+    .to_string();
+
+    let client = HcsClient::new();
+    // Hyper-V opens the disk as the VM's own security principal, so the grant
+    // must precede both create and start.
+    client.grant_vm_access(hcs_id, disk_path)?;
+    let (system, creation) = client.create_system(hcs_id, &configuration)?;
+    creation.wait_for_completion(Duration::from_secs(30))?;
+
+    system
+        .start()?
+        .wait_for_completion(Duration::from_secs(60))?;
+    println!(
+        "started \"{hcs_id}\"; waiting {}s for the guest to boot",
+        boot_wait.as_secs()
+    );
+    std::thread::sleep(boot_wait);
+
+    VmShutdownPipeline::production().shutdown(store, "guest-shutdown-probe")
 }

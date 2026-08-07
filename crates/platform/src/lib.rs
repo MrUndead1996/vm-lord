@@ -17,6 +17,7 @@ mod hcn;
 mod hcs;
 mod hcs_config;
 mod metadata;
+mod shutdown;
 mod start;
 mod vhd;
 
@@ -27,4 +28,5 @@ pub use event::{EventWaitResult, WindowsEvent};
 pub use hcn::HcnNetwork;
 pub use hcs::{HcsClient, HcsOperation, HcsSystem};
 pub use metadata::{MetadataStore, VmComputeSystemMapping};
+pub use shutdown::VmShutdownPipeline;
 pub use start::VmStartPipeline;
