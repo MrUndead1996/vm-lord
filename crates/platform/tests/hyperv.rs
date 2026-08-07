@@ -239,10 +239,13 @@ fn starts_a_created_vm() {
 /// Exercises TASK-25's forced stop against the real Host Compute Service:
 /// creates a VM, starts it, terminates it, and starts it a second time.
 ///
-/// The second start is the actual assertion. `HcsTerminateComputeSystem` stops
-/// the VM's execution, but it must not destroy the compute system object --
-/// were it to, a forced stop would leave a VM that VMLord can no longer open
-/// or start, and the mapping in the metadata store would dangle.
+/// The second start is the actual assertion, and it is the regression check
+/// for what a first run of this test established on a live host: HCS destroys
+/// a compute system when it exits, so after a forced stop reopening it fails
+/// with `HCS_E_SYSTEM_NOT_FOUND` (0x8037010E). A forced stop must nevertheless
+/// leave the VM itself intact, which is why `VmStartPipeline` re-creates the
+/// compute system from the stored `config.json` rather than only opening it.
+/// Were it not to, a forced stop would silently be a delete.
 ///
 /// A forced stop needs nothing from the guest, so installer media is enough
 /// here: set `VMLORD_TEST_IMAGE_PATH` to a real bootable ISO.
@@ -296,9 +299,9 @@ fn force_stopped_vm_can_be_started_again() {
     restarted
         .expect("the restart must have been attempted")
         .expect(
-            "a forcibly stopped VM must stay start-able; a failure here means \
-             HcsTerminateComputeSystem destroyed the compute system instead of \
-             only stopping it",
+            "a forcibly stopped VM must stay start-able; HCS_E_SYSTEM_NOT_FOUND \
+             (0x8037010E) here means the start did not re-create the compute \
+             system HCS destroyed when it terminated",
         );
 }
 

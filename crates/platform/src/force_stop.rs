@@ -7,8 +7,8 @@ use vmlord_core::RepositoryError;
 use crate::{HcsSystem, hcs::HCS_ACCESS_ALL, metadata::MetadataStore};
 
 /// A termination needs nothing from the guest, so it completes as soon as HCS
-/// has torn the VM's execution down; the generous bound only guards against a
-/// wedged Host Compute Service.
+/// has torn the VM down; the generous bound only guards against a wedged Host
+/// Compute Service.
 const FORCE_STOP_TIMEOUT: Duration = Duration::from_secs(60);
 
 type SystemTerminator = Box<dyn Fn(&str) -> Result<(), RepositoryError>>;
@@ -39,9 +39,13 @@ impl VmForceStopPipeline {
     ///
     /// This is the fallback for a guest that cannot or will not service a
     /// graceful shutdown (see [`crate::VmShutdownPipeline`]), so it discards
-    /// whatever the guest had not yet flushed to disk. It stops the VM's
-    /// execution only: the compute system itself survives and the VM can be
-    /// started again afterwards.
+    /// whatever the guest had not yet flushed to disk.
+    ///
+    /// HCS destroys the compute system as it stops, exactly as it does when a
+    /// guest powers itself off, but nothing the VM is made of is lost: its
+    /// disks, its stored configuration and its [`MetadataStore`] mapping all
+    /// survive, and [`crate::VmStartPipeline`] rebuilds the compute system from
+    /// them on the next start.
     pub fn force_stop(&self, store: &MetadataStore, vm_name: &str) -> Result<(), RepositoryError> {
         let mapping = store.find_by_vm_name(vm_name)?.ok_or_else(|| {
             let error = RepositoryError::new(format!("no HCS mapping found for VM \"{vm_name}\""));
