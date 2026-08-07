@@ -6,7 +6,7 @@ use windows::{
         System::HostComputeSystem::{
             HCS_OPERATION, HCS_SYSTEM, HcsCloseComputeSystem, HcsCloseOperation,
             HcsCreateComputeSystem, HcsCreateOperation, HcsEnumerateComputeSystems,
-            HcsGetServiceProperties, HcsGrantVmAccess, HcsOpenComputeSystem,
+            HcsGetServiceProperties, HcsGrantVmAccess, HcsOpenComputeSystem, HcsStartComputeSystem,
             HcsTerminateComputeSystem, HcsWaitForOperationResult,
         },
     },
@@ -104,6 +104,30 @@ impl HcsSystem {
             handle,
             id: vm_name.to_owned(),
         })
+    }
+
+    /// Starts the compute system, returning the pending start operation.
+    ///
+    /// The caller must keep this handle alive until the returned operation
+    /// completes, and must have granted the VM access to every file its
+    /// configuration attaches (see [`HcsClient::grant_vm_access`]); otherwise
+    /// the start fails with `ERROR_ACCESS_DENIED`.
+    pub fn start(&self) -> Result<HcsOperation, RepositoryError> {
+        log::debug!("starting HCS compute system \"{}\"", self.id);
+        let operation = HcsOperation::new();
+        // SAFETY: `self.handle` and `operation.0` are valid owned handles for
+        // the duration of this call. Null options are accepted here: a start
+        // takes its parameters from the compute system's own configuration,
+        // unlike `HcsShutDownComputeSystem`, which rejects null options with
+        // `HCS_E_INVALID_JSON`.
+        unsafe { HcsStartComputeSystem(self.handle, operation.0, PCWSTR::null()) }.map_err(
+            |error| {
+                let error = windows_error("start compute system", Some(&self.id), error);
+                log::error!("{error}");
+                error
+            },
+        )?;
+        Ok(operation)
     }
 
     /// Terminates the compute system, e.g. to roll back a failed creation.
@@ -282,9 +306,7 @@ impl HcsClient {
     }
 
     #[cfg(test)]
-    fn with_enumerate_probe(
-        probe: impl Fn() -> Result<String, RepositoryError> + 'static,
-    ) -> Self {
+    fn with_enumerate_probe(probe: impl Fn() -> Result<String, RepositoryError> + 'static) -> Self {
         Self {
             initialized: false,
             probe: None,
@@ -431,7 +453,9 @@ impl Default for HcsClient {
 mod tests {
     use vmlord_core::RepositoryError;
 
-    use super::{HcsClient, hcs_service_properties_query, parse_enumerate_result, parse_service_result};
+    use super::{
+        HcsClient, hcs_service_properties_query, parse_enumerate_result, parse_service_result,
+    };
 
     #[test]
     fn service_properties_query_is_null() {

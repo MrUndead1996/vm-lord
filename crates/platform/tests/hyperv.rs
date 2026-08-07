@@ -12,8 +12,8 @@ use std::{fs, time::Duration};
 
 use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest};
 use vmlord_platform::{
-    HcsClient, HcsOperation, HcsSystem, MetadataStore, VmCreationPipeline, list_known_vms,
-    open_by_vm_id, open_by_vm_name,
+    HcsClient, HcsOperation, HcsSystem, MetadataStore, VmCreationPipeline, VmStartPipeline,
+    list_known_vms, open_by_vm_id, open_by_vm_name,
 };
 
 // `GENERIC_ALL`; matches the legacy AppSandbox backend's `hcs_vm.c` usage and
@@ -60,12 +60,10 @@ fn opens_the_configured_hcs_compute_system() {
 #[test]
 #[ignore = "requires an elevated Windows host with Hyper-V/HCS enabled"]
 fn creates_and_persists_a_compute_system_end_to_end() {
-    let root =
-        std::env::temp_dir().join(format!("vmlord-hcs-create-e2e-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("vmlord-hcs-create-e2e-{}", std::process::id()));
     fs::create_dir_all(&root).expect("test root should be created");
     let image_path = root.join("installer.iso");
-    fs::write(&image_path, b"placeholder installer media")
-        .expect("test image should be written");
+    fs::write(&image_path, b"placeholder installer media").expect("test image should be written");
 
     let request = VmCreateRequest {
         name: format!("vmlord-e2e-test-{}", std::process::id()),
@@ -120,8 +118,7 @@ fn enumerates_and_reopens_a_created_vm() {
         std::env::temp_dir().join(format!("vmlord-hcs-enumerate-e2e-{}", std::process::id()));
     fs::create_dir_all(&root).expect("test root should be created");
     let image_path = root.join("installer.iso");
-    fs::write(&image_path, b"placeholder installer media")
-        .expect("test image should be written");
+    fs::write(&image_path, b"placeholder installer media").expect("test image should be written");
 
     let request = VmCreateRequest {
         name: format!("vmlord-e2e-enum-test-{}", std::process::id()),
@@ -171,6 +168,60 @@ fn enumerates_and_reopens_a_created_vm() {
     let _ = fs::remove_dir_all(&root);
 
     by_id.expect("the compute system must be open-able by VM id through the metadata mapping");
-    by_name
-        .expect("the compute system must be open-able by VM name through the metadata mapping");
+    by_name.expect("the compute system must be open-able by VM name through the metadata mapping");
+}
+
+/// Exercises TASK-30's start against the real Host Compute Service: creates a
+/// VM, starts it, then terminates it again.
+///
+/// The start is the regression check for `HcsGrantVmAccess` -- without the
+/// grants the pipeline issues before starting, Hyper-V opens the VHDX as the
+/// VM's own security principal and the start fails with
+/// `ERROR_ACCESS_DENIED`.
+///
+/// Set `VMLORD_TEST_IMAGE_PATH` to a real bootable ISO: HCS refuses to attach
+/// a placeholder file as installer media.
+///
+/// Run elevated with:
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact starts_a_created_vm --nocapture`
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS and VMLORD_TEST_IMAGE_PATH set"]
+fn starts_a_created_vm() {
+    let image_path = std::env::var("VMLORD_TEST_IMAGE_PATH")
+        .expect("VMLORD_TEST_IMAGE_PATH must point to a real ISO image");
+    let root = std::env::temp_dir().join(format!("vmlord-hcs-start-e2e-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+
+    let request = VmCreateRequest {
+        name: format!("vmlord-e2e-start-test-{}", std::process::id()),
+        image_path,
+        ram_mb: 2048,
+        disk_gb: 8,
+        cpu_cores: 2,
+        gpu_mode: GpuMode::None,
+        network_mode: NetworkMode::None,
+        username: "admin".into(),
+        password: "not used by start".into(),
+        ssh_enabled: false,
+        ssh_deploy_key: false,
+    };
+    let store = MetadataStore::new(root.join("vm-mapping.json"));
+    let vm_directory = root.join("vm");
+
+    let mapping = VmCreationPipeline::production()
+        .create(&store, &request, &vm_directory)
+        .expect("VM creation should succeed on an elevated Hyper-V host");
+
+    let started = VmStartPipeline::production().start(&store, &mapping.vm_name, &vm_directory);
+
+    // Best-effort cleanup regardless of the assertion below.
+    if let Ok(system) = HcsSystem::open(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL) {
+        let _ = system
+            .terminate()
+            .and_then(|operation| operation.wait_for_completion(Duration::from_secs(30)));
+    }
+    let _ = fs::remove_dir_all(&root);
+
+    started
+        .expect("the created VM must start (HcsGrantVmAccess must precede HcsStartComputeSystem)");
 }
