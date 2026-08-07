@@ -112,3 +112,6 @@ When multiple solutions are possible, prefer:
 3. Maintainability
 4. Native Windows integration
 5. Performance
+
+## Commands:
+- WSL build: ```cargo build --target=x86_64-pc-windows-gnu```
