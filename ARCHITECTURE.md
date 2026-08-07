@@ -306,7 +306,23 @@ disconnected. The callback runs on a thread HCS owns, so it only classifies the
 event and queues it; the repository drains that queue in `take_diagnostics` on
 every refresh, logs each event, surfaces the significant ones as diagnostics,
 and releases the handle of a VM that is gone. The enumeration remains the sole
-authority on VM state. Whether a running guest has finished booting is still
+authority on VM state.
+
+Each registration carries a generation, counted by `VmConnections`, and a drain
+drops any event whose generation is no longer the one held for its VM. HCS
+delivers asynchronously, so an exit can arrive after the enumeration has already
+reported the VM stopped and the user has started it again: without the
+generation, that stale event would release the handle of the VM now running and
+report that it had stopped. A generation is never reused, and an event for a VM
+no handle is held for at all is not stale -- there is simply nothing left to
+release.
+
+A `ServiceDisconnect` releases every handle it names, and nothing outside
+`initialize` reopens one or re-registers a callback, so a drain that released
+handles for that reason also warns -- once, however many VMs the service names
+-- that VMLord reports no further HCS events until it is restarted. The backend
+deliberately stays `Ready`: `list_known_vms` succeeds again as soon as the
+service is back, and `WorkspaceApp` has no way out of `Unavailable`. Whether a running guest has finished booting is still
 unobservable -- HCS reports nothing about it -- so `AgentStatus` stays
 `Unknown` until the guest agent lands.
 

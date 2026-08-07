@@ -19,6 +19,15 @@ use windows::Win32::System::HostComputeSystem::{
 pub struct HcsVmEvent {
     pub vm_id: Uuid,
     pub vm_name: String,
+    /// Which registration queued this, as counted by [`crate::VmConnections`].
+    ///
+    /// HCS delivers asynchronously, so an event can outlive the compute system
+    /// it describes: the enumeration can already report a VM stopped, the user
+    /// can start it again, and only then does the old `Exited` arrive. Acting on
+    /// it would release the handle of the VM that is now running and tell the
+    /// user it stopped. The generation is what makes the two incarnations
+    /// distinguishable, since they share a `vm_id`.
+    pub generation: u64,
     pub kind: HcsEventKind,
     /// The event's `EventData`, verbatim and unparsed, when HCS supplied one.
     ///
@@ -125,30 +134,65 @@ impl HcsEventKind {
     }
 }
 
-/// Drains `sink`, logging every event, and reports what the caller must act on:
-/// the diagnostics to surface and the VMs whose held handle is dead.
+/// What a drain leaves the caller to act on.
+pub(crate) struct DrainedEvents {
+    /// The diagnostics to surface, in arrival order.
+    pub diagnostics: Vec<Diagnostic>,
+    /// The VMs whose held handle the events proved dead.
+    pub released: Vec<Uuid>,
+    /// Whether a `ServiceDisconnect` released at least one handle.
+    ///
+    /// One flag rather than one entry per VM: the service disconnecting is a
+    /// single event that HCS happens to deliver once per compute system, and it
+    /// costs VMLord the same thing however many VMs it names.
+    pub service_disconnected: bool,
+}
+
+/// Drains `sink`, logging every event, and reports what the caller must act on.
+///
+/// `superseded` answers whether a `(vm_id, generation)` pair belongs to a watch
+/// the caller has already replaced. Such an event describes a compute system
+/// that no longer exists, while the `vm_id` it carries now names a different
+/// one, so it is logged at DEBUG and otherwise dropped: neither reported nor
+/// acted on. That is expected rather than an error -- HCS delivers
+/// asynchronously and a user may restart a VM in the meantime.
 ///
 /// Releasing handles is left to the caller because `VmConnections` lives in the
 /// repository and is not `Sync`; an event only records a fact.
-pub(crate) fn drain_events(sink: &VmEventSink) -> (Vec<Diagnostic>, Vec<Uuid>) {
+pub(crate) fn drain_events(
+    sink: &VmEventSink,
+    mut superseded: impl FnMut(Uuid, u64) -> bool,
+) -> DrainedEvents {
     let (events, dropped) = sink.drain();
     if dropped > 0 {
-        log::warn!(
-            "{dropped} HCS event(s) were discarded because VMLord's event queue was full"
-        );
+        log::warn!("{dropped} HCS event(s) were discarded because VMLord's event queue was full");
     }
 
-    let mut diagnostics = Vec::new();
-    let mut released = Vec::new();
+    let mut drained = DrainedEvents {
+        diagnostics: Vec::new(),
+        released: Vec::new(),
+        service_disconnected: false,
+    };
     for event in events {
+        if superseded(event.vm_id, event.generation) {
+            log::debug!(
+                "dropping a stale HCS event for VM \"{}\" ({}): it was queued by \
+                 watch generation {}, which VMLord has since replaced",
+                event.vm_name,
+                event.vm_id,
+                event.generation
+            );
+            continue;
+        }
         if event.kind.releases_handle() {
-            released.push(event.vm_id);
+            drained.released.push(event.vm_id);
+            drained.service_disconnected |= matches!(event.kind, HcsEventKind::ServiceDisconnect);
         }
         if let Some(diagnostic) = report(&event) {
-            diagnostics.push(diagnostic);
+            drained.diagnostics.push(diagnostic);
         }
     }
-    (diagnostics, released)
+    drained
 }
 
 /// Logs `event` and returns the diagnostic the user should see, if any.
@@ -237,6 +281,11 @@ use crate::{error::windows_error, hcs::HcsSystem};
 struct WatchContext {
     vm_id: Uuid,
     vm_name: String,
+    /// Which registration this is, so a drain can tell an event queued by a
+    /// replaced watch from one queued by the watch VMLord still holds. A plain
+    /// `Copy` value read and never written after registration, which is what
+    /// keeps the callback's shared borrow of this context sound.
+    generation: u64,
     sink: VmEventSink,
 }
 
@@ -271,12 +320,14 @@ impl SystemWatch {
         system: &Arc<HcsSystem>,
         vm_id: Uuid,
         vm_name: &str,
+        generation: u64,
         sink: &VmEventSink,
     ) -> Result<Self, RepositoryError> {
         let system = Arc::clone(system);
         let context = Arc::into_raw(Arc::new(WatchContext {
             vm_id,
             vm_name: vm_name.to_owned(),
+            generation,
             sink: sink.clone(),
         }));
 
@@ -307,7 +358,9 @@ impl SystemWatch {
             ));
         }
 
-        log::debug!("watching the HCS events of VM \"{vm_name}\" ({vm_id})");
+        log::debug!(
+            "watching the HCS events of VM \"{vm_name}\" ({vm_id}) as generation {generation}"
+        );
         Ok(Self { system, context })
     }
 }
@@ -318,12 +371,7 @@ impl Drop for SystemWatch {
         // compute system it did at registration, because this watch holds an
         // `Arc<HcsSystem>` keeping it from being closed and its value recycled.
         let cleared = unsafe {
-            HcsSetComputeSystemCallback(
-                self.system.raw_handle(),
-                HcsEventOptionNone,
-                None,
-                None,
-            )
+            HcsSetComputeSystemCallback(self.system.raw_handle(), HcsEventOptionNone, None, None)
         };
 
         match cleared {
@@ -390,6 +438,7 @@ unsafe extern "system" fn on_hcs_event(event: *const HCS_EVENT, context: *const 
         context.sink.push(HcsVmEvent {
             vm_id: context.vm_id,
             vm_name: context.vm_name.clone(),
+            generation: context.generation,
             kind: classify(event.Type.0),
             details,
         });
@@ -418,6 +467,7 @@ mod tests {
         HcsVmEvent {
             vm_id: Uuid::new_v4(),
             vm_name: vm_name.into(),
+            generation: 0,
             kind: HcsEventKind::Exited,
             details: None,
         }
@@ -517,16 +567,23 @@ mod tests {
         assert_eq!(classify(9_999), HcsEventKind::Ignored(9_999));
     }
 
-    use super::{DETAILS_LIMIT, drain_events};
+    use super::{DETAILS_LIMIT, DrainedEvents, drain_events};
     use vmlord_core::DiagnosticLevel;
 
     fn event_of(kind: HcsEventKind, details: Option<&str>) -> HcsVmEvent {
         HcsVmEvent {
             vm_id: Uuid::new_v4(),
             vm_name: "dev".into(),
+            generation: 0,
             kind,
             details: details.map(str::to_owned),
         }
+    }
+
+    /// Nothing supersedes an event: what every test that does not care about
+    /// generations wants.
+    fn nothing_superseded(_vm_id: Uuid, _generation: u64) -> bool {
+        false
     }
 
     #[test]
@@ -536,7 +593,11 @@ mod tests {
         let vm_id = exited.vm_id;
         sink.push(exited);
 
-        let (diagnostics, released) = drain_events(&sink);
+        let DrainedEvents {
+            diagnostics,
+            released,
+            ..
+        } = drain_events(&sink, nothing_superseded);
 
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].level, DiagnosticLevel::Info);
@@ -549,7 +610,11 @@ mod tests {
         let sink = VmEventSink::default();
         sink.push(event_of(HcsEventKind::CrashInitiated, None));
 
-        let (diagnostics, released) = drain_events(&sink);
+        let DrainedEvents {
+            diagnostics,
+            released,
+            ..
+        } = drain_events(&sink, nothing_superseded);
 
         assert_eq!(diagnostics[0].level, DiagnosticLevel::Warning);
         assert!(released.is_empty());
@@ -563,7 +628,11 @@ mod tests {
             Some("{\"DumpFile\":\"C:\\\\dumps\\\\dev.dmp\"}"),
         ));
 
-        let (diagnostics, released) = drain_events(&sink);
+        let DrainedEvents {
+            diagnostics,
+            released,
+            ..
+        } = drain_events(&sink, nothing_superseded);
 
         assert_eq!(diagnostics[0].level, DiagnosticLevel::Error);
         assert!(diagnostics[0].message.contains("dev.dmp"));
@@ -584,7 +653,11 @@ mod tests {
         let vm_id = disconnected.vm_id;
         sink.push(disconnected);
 
-        let (diagnostics, released) = drain_events(&sink);
+        let DrainedEvents {
+            diagnostics,
+            released,
+            ..
+        } = drain_events(&sink, nothing_superseded);
 
         assert_eq!(diagnostics[0].level, DiagnosticLevel::Error);
         assert_eq!(released, vec![vm_id]);
@@ -595,7 +668,11 @@ mod tests {
         let sink = VmEventSink::default();
         sink.push(event_of(HcsEventKind::Ignored(4), Some("noise")));
 
-        let (diagnostics, released) = drain_events(&sink);
+        let DrainedEvents {
+            diagnostics,
+            released,
+            ..
+        } = drain_events(&sink, nothing_superseded);
 
         assert!(diagnostics.is_empty());
         assert!(released.is_empty());
@@ -612,7 +689,7 @@ mod tests {
             Some(&"д".repeat(DETAILS_LIMIT * 2)),
         ));
 
-        let (diagnostics, _released) = drain_events(&sink);
+        let DrainedEvents { diagnostics, .. } = drain_events(&sink, nothing_superseded);
 
         assert!(diagnostics[0].message.ends_with("..."));
         assert!(diagnostics[0].message.chars().count() < DETAILS_LIMIT * 2);
@@ -624,7 +701,11 @@ mod tests {
         sink.push(event_of(HcsEventKind::CrashInitiated, None));
         sink.push(event_of(HcsEventKind::Exited, None));
 
-        let (diagnostics, released) = drain_events(&sink);
+        let DrainedEvents {
+            diagnostics,
+            released,
+            ..
+        } = drain_events(&sink, nothing_superseded);
 
         assert_eq!(
             diagnostics
@@ -647,6 +728,7 @@ mod tests {
         Arc::new(WatchContext {
             vm_id,
             vm_name: "dev".into(),
+            generation: 7,
             sink: sink.clone(),
         })
     }
@@ -731,5 +813,120 @@ mod tests {
         unsafe { on_hcs_event(&event, std::ptr::null()) };
 
         assert!(sink.drain().0.is_empty());
+    }
+
+    /// The scenario Finding 1 describes: a guest powers itself off, the poll
+    /// beats HCS's callback to it, the user restarts the VM, and only then does
+    /// the stale `Exited` arrive. The watch that queued it is gone, so the event
+    /// says nothing true about the compute system VMLord now holds: releasing
+    /// that handle would switch the feature off for a running VM, and reporting
+    /// it would tell the user a VM they just started has stopped.
+    #[test]
+    fn an_event_superseded_by_a_newer_watch_is_neither_reported_nor_released() {
+        let sink = VmEventSink::default();
+        let mut stale = event_of(HcsEventKind::Exited, None);
+        stale.generation = 4;
+        let vm_id = stale.vm_id;
+        sink.push(stale);
+
+        let drained = drain_events(&sink, |asked, generation| {
+            assert_eq!(asked, vm_id);
+            generation != 5
+        });
+
+        assert!(
+            drained.diagnostics.is_empty(),
+            "a superseded event must not tell the user a running VM stopped: {:?}",
+            drained.diagnostics
+        );
+        assert!(
+            drained.released.is_empty(),
+            "a superseded event must not release the handle of the watch that replaced it"
+        );
+        assert!(!drained.service_disconnected);
+    }
+
+    /// The check is per generation, not per VM: the event of the watch VMLord
+    /// still holds must go through even though an older one for the same VM
+    /// would not.
+    #[test]
+    fn an_event_from_the_watch_still_held_is_reported_and_released() {
+        let sink = VmEventSink::default();
+        let mut current = event_of(HcsEventKind::Exited, None);
+        current.generation = 5;
+        let vm_id = current.vm_id;
+        sink.push(current);
+
+        let drained = drain_events(&sink, |_vm_id, generation| generation != 5);
+
+        assert_eq!(drained.diagnostics.len(), 1);
+        assert_eq!(drained.released, vec![vm_id]);
+    }
+
+    /// Every kind is filtered, not just the ones that release a handle: a
+    /// superseded crash report describes a compute system VMLord has already
+    /// replaced.
+    #[test]
+    fn a_superseded_crash_report_is_not_reported_either() {
+        let sink = VmEventSink::default();
+        sink.push(event_of(HcsEventKind::CrashReport, Some("old dump")));
+
+        let drained = drain_events(&sink, |_vm_id, _generation| true);
+
+        assert!(drained.diagnostics.is_empty());
+    }
+
+    /// Finding 2: the disconnect releases every handle and nothing
+    /// re-registers a watch, so the drain has to report that event reporting is
+    /// over for this run. One flag rather than one per VM, because the service
+    /// disconnecting is a single event that happens to be delivered per system.
+    #[test]
+    fn a_service_disconnect_reports_that_event_reporting_stopped_once() {
+        let sink = VmEventSink::default();
+        sink.push(event_of(HcsEventKind::ServiceDisconnect, None));
+        sink.push(event_of(HcsEventKind::ServiceDisconnect, None));
+
+        let drained = drain_events(&sink, nothing_superseded);
+
+        assert!(drained.service_disconnected);
+        assert_eq!(drained.released.len(), 2);
+    }
+
+    #[test]
+    fn an_exit_alone_does_not_report_a_service_disconnect() {
+        let sink = VmEventSink::default();
+        sink.push(event_of(HcsEventKind::Exited, None));
+        sink.push(event_of(HcsEventKind::Ignored(5), None));
+
+        assert!(!drain_events(&sink, nothing_superseded).service_disconnected);
+    }
+
+    /// A superseded disconnect releases nothing, so it must not claim event
+    /// reporting stopped either.
+    #[test]
+    fn a_superseded_service_disconnect_reports_nothing() {
+        let sink = VmEventSink::default();
+        sink.push(event_of(HcsEventKind::ServiceDisconnect, None));
+
+        let drained = drain_events(&sink, |_vm_id, _generation| true);
+
+        assert!(!drained.service_disconnected);
+        assert!(drained.released.is_empty());
+        assert!(drained.diagnostics.is_empty());
+    }
+
+    /// The generation is what makes the staleness check possible at all, so the
+    /// callback has to carry it out of the context it was registered with.
+    #[test]
+    fn the_callback_carries_the_generation_of_its_watch() {
+        let sink = VmEventSink::default();
+        let context = context(&sink, Uuid::new_v4());
+        let event = hcs_event(HcsEventSystemExited, PCWSTR::null());
+
+        // SAFETY: both pointers are to live values owned by this test for the
+        // duration of the call, which is exactly HCS's own contract.
+        unsafe { on_hcs_event(&event, Arc::as_ptr(&context).cast()) };
+
+        assert_eq!(sink.drain().0[0].generation, 7);
     }
 }

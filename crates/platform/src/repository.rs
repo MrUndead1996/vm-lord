@@ -456,9 +456,29 @@ impl VmRepository for HcsVmRepository {
     /// after listing, so it is where a released handle can actually be
     /// released.
     fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
-        let (from_events, released) = watch::drain_events(&self.events);
-        for vm_id in released {
+        let events = self.events.clone();
+        let drained = watch::drain_events(&events, |vm_id, generation| {
+            self.connections.is_superseded(vm_id, generation)
+        });
+        for vm_id in drained.released {
             self.connections.remove(vm_id);
+        }
+        if drained.service_disconnected {
+            // Nothing reopens a handle or re-registers a callback outside
+            // `initialize`, so this run is over as far as HCS events go. Saying
+            // so is the honest minimum: silently losing the feature would leave
+            // the user believing a crash would still be reported.
+            log::warn!(
+                "the Host Compute Service disconnected, so every HCS event watch \
+                 was released; VMLord reports no further HCS events until it is \
+                 restarted"
+            );
+            self.push_diagnostic(
+                DiagnosticLevel::Warning,
+                "The Host Compute Service disconnected, so VMLord has stopped \
+                 reporting HCS events; restart VMLord to resume them."
+                    .to_string(),
+            );
         }
 
         let mut diagnostics: Vec<Diagnostic> = self
@@ -467,7 +487,7 @@ impl VmRepository for HcsVmRepository {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .drain(..)
             .collect();
-        diagnostics.extend(from_events);
+        diagnostics.extend(drained.diagnostics);
         diagnostics
     }
 }
@@ -556,6 +576,7 @@ mod tests {
         repository.events.push(HcsVmEvent {
             vm_id: Uuid::new_v4(),
             vm_name: "dev".into(),
+            generation: 0,
             kind: HcsEventKind::Exited,
             details: None,
         });
@@ -564,10 +585,45 @@ mod tests {
 
         assert!(
             diagnostics.iter().any(|diagnostic| {
-                diagnostic.level == DiagnosticLevel::Info
-                    && diagnostic.message.contains("dev")
+                diagnostic.level == DiagnosticLevel::Info && diagnostic.message.contains("dev")
             }),
             "a VM that stopped on its own must be reported: {diagnostics:?}"
+        );
+    }
+
+    /// The disconnect releases every handle VMLord holds and nothing
+    /// re-registers a watch afterwards, so the user has to be told that HCS
+    /// event reporting is over until VMLord restarts. The per-VM `Error` lines
+    /// say what happened; this says what it means.
+    #[test]
+    fn a_service_disconnect_warns_that_event_reporting_stopped_until_a_restart() {
+        let mut repository = repository();
+        for vm_name in ["dev", "build"] {
+            repository.events.push(HcsVmEvent {
+                vm_id: Uuid::new_v4(),
+                vm_name: vm_name.into(),
+                generation: 0,
+                kind: HcsEventKind::ServiceDisconnect,
+                details: None,
+            });
+        }
+
+        let diagnostics = repository.take_diagnostics();
+
+        let warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.level == DiagnosticLevel::Warning)
+            .collect();
+        assert_eq!(
+            warnings.len(),
+            1,
+            "the service disconnecting is one event, however many VMs it is \
+             delivered for: {diagnostics:?}"
+        );
+        assert!(
+            warnings[0].message.contains("restart"),
+            "the warning has to say how to get event reporting back: {:?}",
+            warnings[0].message
         );
     }
 
@@ -577,6 +633,7 @@ mod tests {
         repository.events.push(HcsVmEvent {
             vm_id: Uuid::new_v4(),
             vm_name: "dev".into(),
+            generation: 0,
             kind: HcsEventKind::Ignored(5),
             details: Some("silo job created".into()),
         });

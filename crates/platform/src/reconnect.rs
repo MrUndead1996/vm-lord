@@ -49,6 +49,14 @@ pub struct ReconnectedVm {
 pub struct VmConnections {
     systems: HashMap<Uuid, WatchedSystem>,
     events: VmEventSink,
+    /// The generation the next [`VmConnections::insert`] stamps on its watch.
+    ///
+    /// Only ever increases, and never on removal: a generation must not be
+    /// reused, because reuse is exactly what would let a stale event pass the
+    /// staleness check. This is the only thing that registers a watch, so a
+    /// counter per `VmConnections` is enough to keep the values unique among
+    /// every event that can reach a drain.
+    next_generation: u64,
 }
 
 /// A held compute system together with its event registration.
@@ -57,6 +65,9 @@ struct WatchedSystem {
     /// unwatched.
     watch: Option<SystemWatch>,
     system: Arc<HcsSystem>,
+    /// Which registration this is, matched against the generation an event
+    /// carries.
+    generation: u64,
 }
 
 impl VmConnections {
@@ -66,6 +77,7 @@ impl VmConnections {
         Self {
             systems: HashMap::new(),
             events,
+            next_generation: 0,
         }
     }
 
@@ -84,6 +96,21 @@ impl VmConnections {
         self.systems
             .get(&vm_id)
             .is_some_and(|held| held.watch.is_some())
+    }
+
+    /// Whether an event queued by watch `generation` for `vm_id` describes a
+    /// compute system VMLord has already replaced.
+    ///
+    /// `false` when no handle is held for `vm_id` at all: nothing superseded
+    /// such an event, and what it reports still stands -- the VM really did
+    /// exit -- there is simply no handle left to release. Only a *different*
+    /// generation means another `insert` has happened since, and that the
+    /// `vm_id` now names a compute system the event knows nothing about.
+    #[must_use]
+    pub fn is_superseded(&self, vm_id: Uuid, generation: u64) -> bool {
+        self.systems
+            .get(&vm_id)
+            .is_some_and(|held| held.generation != generation)
     }
 
     /// Starts holding `system` open for the VM in `mapping`, closing any handle
@@ -111,14 +138,22 @@ impl VmConnections {
         // this `Arc` or the `HcsSystem` it wraps.
         #[allow(clippy::arc_with_non_send_sync)]
         let system = Arc::new(system);
-        let registration =
-            SystemWatch::register(&system, mapping.vm_id, &mapping.vm_name, &self.events);
+        let generation = self.next_generation;
+        self.next_generation += 1;
+        let registration = SystemWatch::register(
+            &system,
+            mapping.vm_id,
+            &mapping.vm_name,
+            generation,
+            &self.events,
+        );
         let failure = registration.as_ref().err().cloned();
         self.systems.insert(
             mapping.vm_id,
             WatchedSystem {
                 watch: registration.ok(),
                 system,
+                generation,
             },
         );
         match failure {
@@ -341,11 +376,22 @@ mod tests {
         connections.events.push(HcsVmEvent {
             vm_id: Uuid::new_v4(),
             vm_name: "dev".into(),
+            generation: 0,
             kind: HcsEventKind::Exited,
             details: None,
         });
 
         assert_eq!(sink.drain().0.len(), 1);
+    }
+
+    /// An event about a VM no handle is held for is not superseded by anything:
+    /// its facts still stand, there is simply nothing left to release. Only a
+    /// *different* generation means a watch replaced the one that queued it.
+    #[test]
+    fn an_event_for_a_vm_no_longer_held_is_not_superseded() {
+        let connections = VmConnections::with_events(VmEventSink::default());
+
+        assert!(!connections.is_superseded(Uuid::new_v4(), 3));
     }
 
     #[test]
