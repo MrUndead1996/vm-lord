@@ -42,6 +42,10 @@ impl VmRepository for FakeRepository {
         Ok(())
     }
 
+    fn delete_vm(&mut self, _request: vmlord_core::VmDeleteRequest) -> Result<(), RepositoryError> {
+        Ok(())
+    }
+
     fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError> {
         Ok(vec![VmSummary {
             name: "dev".into(),

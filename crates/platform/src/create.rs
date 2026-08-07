@@ -6,8 +6,8 @@ use uuid::Uuid;
 use vmlord_core::{RepositoryError, VmCreateRequest};
 
 use crate::{
-    HcsClient, HcsSystem,
-    hcs::HCS_ACCESS_ALL,
+    HcsClient,
+    cleanup::{self, SystemTeardown},
     hcs_config::HcsVmConfigBuilder,
     layout,
     metadata::{MetadataStore, VmComputeSystemMapping},
@@ -20,7 +20,6 @@ const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
 type VhdCreator = Box<dyn Fn(&Path, u64) -> Result<(), RepositoryError>>;
 type AccessGranter = Box<dyn Fn(&str, &Path) -> Result<(), RepositoryError>>;
 type SystemCreator = Box<dyn Fn(&str, &str) -> Result<(), RepositoryError>>;
-type SystemTeardown = Box<dyn Fn(&str) -> Result<(), RepositoryError>>;
 
 /// Orchestrates the multi-step, transactional creation of an HCS-backed VM.
 ///
@@ -42,7 +41,7 @@ impl VmCreationPipeline {
             vhd_creator: Box::new(create_dynamic_vhdx),
             access_granter: Box::new(grant_vm_access),
             system_creator: Box::new(create_hcs_system),
-            system_teardown: Box::new(teardown_hcs_system),
+            system_teardown: Box::new(cleanup::teardown_compute_system),
         }
     }
 
@@ -163,31 +162,21 @@ impl VmCreationPipeline {
         system_created: bool,
         error: RepositoryError,
     ) -> RepositoryError {
-        let mut message = format!("creation of VM \"{}\" failed: {error}", mapping.vm_name);
-        log::error!("{message}");
+        let mut failures = vec![error.to_string()];
 
         if system_created
             && let Err(teardown_error) = (self.system_teardown)(&mapping.hcs_compute_system_id)
         {
-            log::error!("rollback teardown also failed: {teardown_error}");
-            message.push_str(&format!(
-                "; rollback teardown also failed: {teardown_error}"
-            ));
+            failures.push(format!("rollback teardown also failed: {teardown_error}"));
         }
-        if vm_directory.exists()
-            && let Err(remove_error) = fs::remove_dir_all(vm_directory)
-        {
-            log::error!(
-                "rollback could not remove {}: {remove_error}",
-                vm_directory.display()
-            );
-            message.push_str(&format!(
-                "; rollback could not remove {}: {remove_error}",
-                vm_directory.display()
-            ));
+        if let Err(remove_error) = cleanup::remove_vm_directory(vm_directory) {
+            failures.push(format!("rollback also failed: {remove_error}"));
         }
 
-        RepositoryError::new(message)
+        cleanup::combine_failures(
+            &format!("creation of VM \"{}\" failed", mapping.vm_name),
+            failures,
+        )
     }
 }
 
@@ -217,7 +206,7 @@ fn create_hcs_system(id: &str, configuration: &str) -> Result<(), RepositoryErro
             // metadata entry. It belongs to this operation; tear it down
             // best-effort before reporting the failure.
             let mut message = error.to_string();
-            if let Err(teardown_error) = teardown_hcs_system(id) {
+            if let Err(teardown_error) = cleanup::teardown_compute_system(id) {
                 message.push_str(&format!(
                     "; cleanup of the ambiguously-created compute system also failed: {teardown_error}"
                 ));
@@ -225,13 +214,6 @@ fn create_hcs_system(id: &str, configuration: &str) -> Result<(), RepositoryErro
             Err(RepositoryError::new(message))
         }
     }
-}
-
-fn teardown_hcs_system(id: &str) -> Result<(), RepositoryError> {
-    HcsSystem::open(id, HCS_ACCESS_ALL)?
-        .terminate()?
-        .wait_for_completion(CREATE_TIMEOUT)
-        .map(|_document| ())
 }
 
 #[cfg(test)]

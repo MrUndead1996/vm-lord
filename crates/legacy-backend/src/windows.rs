@@ -357,6 +357,14 @@ impl VmRepository for AppSandboxBackend {
         check_lifecycle_result("force stop", name, result)
     }
 
+    fn delete_vm(&mut self, request: vmlord_core::VmDeleteRequest) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(format!(
+            "the legacy AppSandbox backend cannot delete VM \"{}\"; \
+             run VMLord on the native HCS backend to delete VMs",
+            request.name
+        )))
+    }
+
     fn open_display(&mut self, name: &str) -> Result<(), RepositoryError> {
         let vm = self.vm_by_name(name)?;
         if unsafe { (self.api.vm_is_running)(vm) == 0 } {
