@@ -6,8 +6,9 @@ use windows::{
         System::HostComputeSystem::{
             HCS_OPERATION, HCS_SYSTEM, HcsCloseComputeSystem, HcsCloseOperation,
             HcsCreateComputeSystem, HcsCreateOperation, HcsEnumerateComputeSystems,
-            HcsGetServiceProperties, HcsGrantVmAccess, HcsOpenComputeSystem, HcsStartComputeSystem,
-            HcsTerminateComputeSystem, HcsWaitForOperationResult,
+            HcsGetServiceProperties, HcsGrantVmAccess, HcsOpenComputeSystem,
+            HcsShutDownComputeSystem, HcsStartComputeSystem, HcsTerminateComputeSystem,
+            HcsWaitForOperationResult,
         },
     },
     core::{HSTRING, PCWSTR, PWSTR},
@@ -130,6 +131,32 @@ impl HcsSystem {
         Ok(operation)
     }
 
+    /// Asks the guest to shut down gracefully, returning the pending
+    /// shutdown operation.
+    ///
+    /// The operation completes once HCS has accepted and delivered the
+    /// request, not once the guest has finished powering off; callers that
+    /// need the latter must watch for the system's exit separately.
+    ///
+    /// A guest without integration services (or one refusing the request)
+    /// never powers off, so this is not a substitute for
+    /// [`HcsSystem::terminate`].
+    pub fn shutdown(&self) -> Result<HcsOperation, RepositoryError> {
+        log::debug!("shutting down HCS compute system \"{}\"", self.id);
+        let operation = HcsOperation::new();
+        let options = HSTRING::from(shutdown_options());
+        // SAFETY: `self.handle` and `operation.0` are valid owned handles for
+        // the duration of this call, and `options` outlives it.
+        unsafe { HcsShutDownComputeSystem(self.handle, operation.0, &options) }.map_err(
+            |error| {
+                let error = windows_error("shut down compute system", Some(&self.id), error);
+                log::error!("{error}");
+                error
+            },
+        )?;
+        Ok(operation)
+    }
+
     /// Terminates the compute system, e.g. to roll back a failed creation.
     pub fn terminate(&self) -> Result<HcsOperation, RepositoryError> {
         log::debug!("terminating HCS compute system \"{}\"", self.id);
@@ -196,6 +223,16 @@ impl Drop for HcsAllocatedString {
 /// pointer requests the default service properties instead.
 fn hcs_service_properties_query() -> PCWSTR {
     PCWSTR::null()
+}
+
+/// The options document passed to `HcsShutDownComputeSystem`.
+///
+/// HCS parses the options as JSON and rejects a null pointer with
+/// `HCS_E_INVALID_JSON` ("Invalid JSON document '$'"), unlike
+/// `HcsStartComputeSystem` and `HcsTerminateComputeSystem`, which accept one.
+/// An empty object requests the default shutdown behaviour.
+fn shutdown_options() -> &'static str {
+    "{}"
 }
 
 /// Validates an HCS service-properties result document.
@@ -455,11 +492,22 @@ mod tests {
 
     use super::{
         HcsClient, hcs_service_properties_query, parse_enumerate_result, parse_service_result,
+        shutdown_options,
     };
 
     #[test]
     fn service_properties_query_is_null() {
         assert!(hcs_service_properties_query().is_null());
+    }
+
+    #[test]
+    fn shutdown_options_are_a_valid_json_document() {
+        // A null options pointer makes `HcsShutDownComputeSystem` fail with
+        // `HCS_E_INVALID_JSON`, so the options must stay a parsable document.
+        let options = shutdown_options();
+
+        assert!(!options.is_empty());
+        assert!(serde_json::from_str::<serde_json::Value>(options).is_ok());
     }
 
     #[test]

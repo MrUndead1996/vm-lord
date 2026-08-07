@@ -215,6 +215,13 @@ a start without the grants fails with `ERROR_ACCESS_DENIED`. The stored
 configuration, not a re-derived path list, is the source of truth for which
 files the VM will open.
 
+`platform::VmShutdownPipeline` asks the guest of a known VM to shut down
+through `HcsShutDownComputeSystem`. HCS parses that call's options as JSON and
+rejects a null pointer with `HCS_E_INVALID_JSON`, unlike start and terminate,
+so an empty JSON object is always passed. A successful shutdown means HCS
+delivered the request, not that the guest powered off: a guest without
+integration services keeps running, so forced stop remains a separate action.
+
 `core::settings` owns the UI-independent application settings model and TOML
 persistence. The composition root initializes it before the backend. Settings
 are stored per user at `%LOCALAPPDATA%\VMLord\settings.toml`; the initial file

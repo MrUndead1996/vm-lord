@@ -12,8 +12,8 @@ use std::{fs, time::Duration};
 
 use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest};
 use vmlord_platform::{
-    HcsClient, HcsOperation, HcsSystem, MetadataStore, VmCreationPipeline, VmStartPipeline,
-    list_known_vms, open_by_vm_id, open_by_vm_name,
+    HcsClient, HcsOperation, HcsSystem, MetadataStore, VmCreationPipeline, VmShutdownPipeline,
+    VmStartPipeline, list_known_vms, open_by_vm_id, open_by_vm_name,
 };
 
 // `GENERIC_ALL`; matches the legacy AppSandbox backend's `hcs_vm.c` usage and
@@ -224,4 +224,66 @@ fn starts_a_created_vm() {
 
     started
         .expect("the created VM must start (HcsGrantVmAccess must precede HcsStartComputeSystem)");
+}
+
+/// Exercises TASK-31's graceful shutdown against the real Host Compute
+/// Service: creates a VM, starts it, then asks its guest to shut down.
+///
+/// The shutdown is the regression check for the options document --
+/// `HcsShutDownComputeSystem` rejects a null options pointer with
+/// `HCS_E_INVALID_JSON`, so the pipeline must pass `"{}"`. The request
+/// succeeding does not mean the guest powered off: without integration
+/// services the VM keeps running, which is why the cleanup below still
+/// terminates it.
+///
+/// Set `VMLORD_TEST_IMAGE_PATH` to a real bootable ISO.
+///
+/// Run elevated with:
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact shuts_down_a_started_vm --nocapture`
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS and VMLORD_TEST_IMAGE_PATH set"]
+fn shuts_down_a_started_vm() {
+    let image_path = std::env::var("VMLORD_TEST_IMAGE_PATH")
+        .expect("VMLORD_TEST_IMAGE_PATH must point to a real ISO image");
+    let root = std::env::temp_dir().join(format!("vmlord-hcs-shutdown-e2e-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+
+    let request = VmCreateRequest {
+        name: format!("vmlord-e2e-shutdown-test-{}", std::process::id()),
+        image_path,
+        ram_mb: 2048,
+        disk_gb: 8,
+        cpu_cores: 2,
+        gpu_mode: GpuMode::None,
+        network_mode: NetworkMode::None,
+        username: "admin".into(),
+        password: "not used by shutdown".into(),
+        ssh_enabled: false,
+        ssh_deploy_key: false,
+    };
+    let store = MetadataStore::new(root.join("vm-mapping.json"));
+    let vm_directory = root.join("vm");
+
+    let mapping = VmCreationPipeline::production()
+        .create(&store, &request, &vm_directory)
+        .expect("VM creation should succeed on an elevated Hyper-V host");
+    VmStartPipeline::production()
+        .start(&store, &mapping.vm_name, &vm_directory)
+        .expect("the created VM must start before it can be shut down");
+
+    let shut_down = VmShutdownPipeline::production().shutdown(&store, &mapping.vm_name);
+
+    // Best-effort cleanup regardless of the assertion below: a guest that
+    // ignores the request is still running here.
+    if let Ok(system) = HcsSystem::open(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL) {
+        let _ = system
+            .terminate()
+            .and_then(|operation| operation.wait_for_completion(Duration::from_secs(30)));
+    }
+    let _ = fs::remove_dir_all(&root);
+
+    shut_down.expect(
+        "HCS must accept the shutdown request \
+         (HcsShutDownComputeSystem must receive non-null JSON options)",
+    );
 }
