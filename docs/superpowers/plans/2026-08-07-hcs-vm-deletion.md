@@ -1442,18 +1442,22 @@ fn deletes_a_created_vm_completely() {
     );
 
     let deleted = VmDeletionPipeline::production().delete(&store, &request.name, &vm_directory, true);
+    // Both observations are captured before the cleanup below, which would
+    // otherwise remove the very directory and mapping file they check and make
+    // the assertions pass no matter what deletion did.
+    let directory_survived = vm_directory.exists();
+    let remaining_mapping = store.find_by_vm_name(&request.name);
 
     // Best-effort cleanup regardless of the assertions below.
     let _ = fs::remove_dir_all(&root);
 
     deleted.expect("deletion should succeed on an elevated Hyper-V host");
     assert!(
-        !vm_directory.exists(),
+        !directory_survived,
         "the VM directory must be gone once the VM is deleted"
     );
     assert!(
-        store
-            .find_by_vm_name(&request.name)
+        remaining_mapping
             .expect("the store should be readable")
             .is_none(),
         "a deleted VM must no longer be known to VMLord"
