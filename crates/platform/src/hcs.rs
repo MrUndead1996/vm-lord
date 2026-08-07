@@ -8,7 +8,8 @@ use windows::{
         System::HostComputeSystem::{
             HCS_OPERATION, HCS_SYSTEM, HcsCloseComputeSystem, HcsCloseOperation,
             HcsCreateComputeSystem, HcsCreateOperation, HcsEnumerateComputeSystems,
-            HcsGetServiceProperties, HcsGrantVmAccess, HcsOpenComputeSystem,
+            HcsGetComputeSystemProperties, HcsGetServiceProperties, HcsGrantVmAccess,
+            HcsOpenComputeSystem,
             HcsShutDownComputeSystem, HcsStartComputeSystem, HcsTerminateComputeSystem,
             HcsWaitForOperationResult,
         },
@@ -278,6 +279,73 @@ impl HcsSystem {
                 );
             })
     }
+
+    /// Asks HCS what state the compute system is in.
+    ///
+    /// A compute system existing is not the same as its VM running: creation
+    /// leaves a `Created` system behind that has never executed anything, so
+    /// the state has to be asked for rather than inferred from the system's
+    /// presence.
+    pub fn state(&self, timeout: Duration) -> Result<HcsSystemState, RepositoryError> {
+        let operation = HcsOperation::new();
+        // SAFETY: `self.handle` and `operation.0` are valid owned handles for
+        // the duration of this call. A null query requests the default
+        // properties, which include the state; HCS parses a non-null pointer
+        // as a JSON query document and rejects an empty string.
+        unsafe { HcsGetComputeSystemProperties(self.handle, operation.0, PCWSTR::null()) }
+            .map_err(|error| {
+                let error = windows_error("get compute system properties", Some(&self.id), error);
+                log::error!("{error}");
+                error
+            })?;
+
+        let document = operation.wait_for_completion(timeout)?;
+        parse_system_state(&document).inspect(|state| {
+            log::debug!(
+                "HCS compute system \"{}\" is in state {state:?}",
+                self.id
+            );
+        })
+    }
+}
+
+/// The state HCS reports for a compute system.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HcsSystemState {
+    /// The system exists but has never been started.
+    Created,
+    /// The system is executing.
+    Running,
+    /// The system is paused.
+    Paused,
+    /// The system has stopped but has not been destroyed yet.
+    Stopped,
+    /// A state this VMLord does not know; carried verbatim so callers can log
+    /// it rather than silently treat it as one of the states above.
+    Other(String),
+}
+
+/// Reads the `State` field out of an HCS compute-system properties document.
+fn parse_system_state(document: &str) -> Result<HcsSystemState, RepositoryError> {
+    let value: serde_json::Value = serde_json::from_str(document).map_err(|error| {
+        RepositoryError::new(format!(
+            "HCS compute system properties are not valid JSON: {error}"
+        ))
+    })?;
+    let state = value
+        .get("State")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            RepositoryError::new("HCS compute system properties carry no \"State\"")
+        })?;
+
+    Ok(match state {
+        "Created" => HcsSystemState::Created,
+        "Running" => HcsSystemState::Running,
+        "Paused" => HcsSystemState::Paused,
+        "Stopped" => HcsSystemState::Stopped,
+        other => HcsSystemState::Other(other.to_owned()),
+    })
 }
 
 impl Drop for HcsSystem {
@@ -610,9 +678,33 @@ mod tests {
     use vmlord_core::RepositoryError;
 
     use super::{
-        HcsClient, hcs_service_properties_query, parse_enumerate_result, parse_service_result,
-        shutdown_options, unsupported_shutdown_error,
+        HcsClient, HcsSystemState, hcs_service_properties_query, parse_enumerate_result,
+        parse_service_result, parse_system_state, shutdown_options, unsupported_shutdown_error,
     };
+
+    #[test]
+    fn system_state_maps_every_state_hcs_reports() {
+        for (reported, expected) in [
+            ("Created", HcsSystemState::Created),
+            ("Running", HcsSystemState::Running),
+            ("Paused", HcsSystemState::Paused),
+            ("Stopped", HcsSystemState::Stopped),
+            (
+                "SavedAsTemplate",
+                HcsSystemState::Other("SavedAsTemplate".into()),
+            ),
+        ] {
+            let document = format!(r#"{{"Id":"vmlord-1","State":"{reported}"}}"#);
+
+            assert_eq!(parse_system_state(&document).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn system_state_rejects_a_document_without_a_state() {
+        assert!(parse_system_state(r#"{"Id":"vmlord-1"}"#).is_err());
+        assert!(parse_system_state("not json").is_err());
+    }
 
     #[test]
     fn service_properties_query_is_null() {

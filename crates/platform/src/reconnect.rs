@@ -55,6 +55,25 @@ impl VmConnections {
         self.systems.get(&vm_id)
     }
 
+    /// Starts holding `system` open for `vm_id`, closing any handle already
+    /// held for it.
+    ///
+    /// A VM started while VMLord runs needs the same handle a reconnected one
+    /// gets; without it, only VMs that survived a restart would be owned.
+    pub fn insert(&mut self, vm_id: Uuid, system: HcsSystem) {
+        self.systems.insert(vm_id, system);
+    }
+
+    /// Closes and forgets the handle held for `vm_id`, if any.
+    ///
+    /// HCS destroys a compute system as it stops, so a handle kept past a stop
+    /// would refer to a system that no longer exists.
+    pub fn remove(&mut self, vm_id: Uuid) {
+        if self.systems.remove(&vm_id).is_some() {
+            log::debug!("closed the compute-system handle held for VM {vm_id}");
+        }
+    }
+
     /// Reports whether a handle is held for `vm_id`.
     #[must_use]
     pub fn is_connected(&self, vm_id: Uuid) -> bool {

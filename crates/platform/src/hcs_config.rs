@@ -101,6 +101,83 @@ impl HcsVmConfigBuilder {
     }
 }
 
+/// The part of a stored configuration document VMLord lets users change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VmTopology {
+    pub(crate) ram_mb: u32,
+    pub(crate) cpu_cores: u32,
+}
+
+/// Reads the memory and processor topology out of a stored configuration.
+pub(crate) fn read_topology(document: &str) -> Result<VmTopology, RepositoryError> {
+    let configuration = parse(document)?;
+    Ok(VmTopology {
+        ram_mb: read_u32(&configuration, MEMORY_SIZE_POINTER)?,
+        cpu_cores: read_u32(&configuration, PROCESSOR_COUNT_POINTER)?,
+    })
+}
+
+/// Returns `document` with its memory and processor topology replaced.
+///
+/// The whole document is preserved apart from those two values: a VM's disks,
+/// its attachments and its HCS identity must survive an edit unchanged, and
+/// rebuilding the document from scratch would need state that only creation
+/// had.
+pub(crate) fn apply_topology(
+    document: &str,
+    topology: VmTopology,
+) -> Result<String, RepositoryError> {
+    let mut configuration = parse(document)?;
+    *write_target(&mut configuration, MEMORY_SIZE_POINTER)? = topology.ram_mb.into();
+    *write_target(&mut configuration, PROCESSOR_COUNT_POINTER)? = topology.cpu_cores.into();
+
+    serde_json::to_string(&configuration).map_err(|error| {
+        RepositoryError::new(format!(
+            "failed to serialize the updated HCS VM configuration: {error}"
+        ))
+    })
+}
+
+const MEMORY_SIZE_POINTER: &str = "/VirtualMachine/ComputeTopology/Memory/SizeInMB";
+const PROCESSOR_COUNT_POINTER: &str = "/VirtualMachine/ComputeTopology/Processor/Count";
+
+fn parse(document: &str) -> Result<serde_json::Value, RepositoryError> {
+    serde_json::from_str(document).map_err(|error| {
+        let error = RepositoryError::new(format!(
+            "the stored HCS configuration is not valid JSON: {error}"
+        ));
+        log::error!("{error}");
+        error
+    })
+}
+
+fn read_u32(configuration: &serde_json::Value, pointer: &str) -> Result<u32, RepositoryError> {
+    configuration
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            let error = RepositoryError::new(format!(
+                "the stored HCS configuration has no numeric \"{pointer}\""
+            ));
+            log::error!("{error}");
+            error
+        })
+}
+
+fn write_target<'a>(
+    configuration: &'a mut serde_json::Value,
+    pointer: &str,
+) -> Result<&'a mut serde_json::Value, RepositoryError> {
+    configuration.pointer_mut(pointer).ok_or_else(|| {
+        let error = RepositoryError::new(format!(
+            "the stored HCS configuration has no \"{pointer}\" to update"
+        ));
+        log::error!("{error}");
+        error
+    })
+}
+
 #[derive(Serialize)]
 struct HcsConfiguration {
     #[serde(rename = "SchemaVersion")]
@@ -223,7 +300,7 @@ mod tests {
     use serde_json::{Value, json};
     use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest};
 
-    use super::HcsVmConfigBuilder;
+    use super::{HcsVmConfigBuilder, VmTopology, apply_topology, read_topology};
 
     fn request() -> VmCreateRequest {
         VmCreateRequest {
@@ -370,5 +447,83 @@ mod tests {
         };
 
         assert!(HcsVmConfigBuilder::build(&request, &system_disk_path).is_err());
+    }
+
+    #[test]
+    fn reads_back_the_topology_it_built() {
+        let request = VmCreateRequest {
+            ram_mb: 4096,
+            cpu_cores: 4,
+            ..request()
+        };
+        let document =
+            HcsVmConfigBuilder::build(&request, &PathBuf::from("C:\\vms\\a\\disks\\system.vhdx"))
+                .unwrap();
+
+        assert_eq!(
+            read_topology(&document).unwrap(),
+            VmTopology {
+                ram_mb: 4096,
+                cpu_cores: 4
+            }
+        );
+    }
+
+    #[test]
+    fn applying_a_topology_changes_only_memory_and_processors() {
+        let system_disk_path = PathBuf::from("C:\\vms\\a\\disks\\system.vhdx");
+        let document = HcsVmConfigBuilder::build(&request(), &system_disk_path).unwrap();
+
+        let updated = apply_topology(
+            &document,
+            VmTopology {
+                ram_mb: 8192,
+                cpu_cores: 8,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_topology(&updated).unwrap(),
+            VmTopology {
+                ram_mb: 8192,
+                cpu_cores: 8
+            }
+        );
+        let before: Value = serde_json::from_str(&document).unwrap();
+        let mut after: Value = serde_json::from_str(&updated).unwrap();
+        *after
+            .pointer_mut("/VirtualMachine/ComputeTopology")
+            .unwrap() = before
+            .pointer("/VirtualMachine/ComputeTopology")
+            .unwrap()
+            .clone();
+        assert_eq!(after, before, "nothing outside the topology may change");
+        assert_eq!(
+            after.pointer("/VirtualMachine/Devices/Scsi/Primary/Attachments/0/Path"),
+            Some(&json!(system_disk_path))
+        );
+    }
+
+    #[test]
+    fn a_configuration_without_a_topology_is_rejected() {
+        let document = r#"{"VirtualMachine":{}}"#;
+
+        assert!(read_topology(document).is_err());
+        assert!(
+            apply_topology(
+                document,
+                VmTopology {
+                    ram_mb: 512,
+                    cpu_cores: 1
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn invalid_json_is_rejected() {
+        assert!(read_topology("not json").is_err());
     }
 }

@@ -11,6 +11,7 @@ use vmlord_core::RepositoryError;
 use crate::{
     HcsClient, HcsSystem,
     hcs::HCS_ACCESS_ALL,
+    layout,
     metadata::{MetadataStore, VmComputeSystemMapping},
 };
 
@@ -22,9 +23,6 @@ const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// Bounds the re-creation of a compute system HCS no longer knows; it is the
 /// same operation `VmCreationPipeline` waits on.
 const CREATE_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// The file `VmCreationPipeline` writes the compute system's configuration to.
-const CONFIGURATION_FILE_NAME: &str = "config.json";
 
 type AccessGranter = Box<dyn Fn(&str, &Path) -> Result<(), RepositoryError>>;
 type SystemStarter = Box<dyn Fn(&str, &str) -> Result<(), RepositoryError>>;
@@ -103,7 +101,7 @@ impl VmStartPipeline {
         mapping: &VmComputeSystemMapping,
         vm_directory: &Path,
     ) -> Result<String, RepositoryError> {
-        let configuration_path = vm_directory.join(CONFIGURATION_FILE_NAME);
+        let configuration_path = layout::configuration_path(vm_directory);
         fs::read_to_string(&configuration_path).map_err(|error| {
             let error = RepositoryError::new(format!(
                 "failed to read the HCS configuration of VM \"{}\" from {}: {error}",

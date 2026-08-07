@@ -3245,6 +3245,7 @@ dependencies = [
  "vmlord-app",
  "vmlord-core",
  "vmlord-legacy-backend",
+ "vmlord-platform",
  "vmlord-ui",
 ]
 

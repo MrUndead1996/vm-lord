@@ -9,7 +9,9 @@ use windows::{
         Storage::Vhd::{
             CREATE_VIRTUAL_DISK_FLAG_NONE, CREATE_VIRTUAL_DISK_PARAMETERS,
             CREATE_VIRTUAL_DISK_PARAMETERS_0, CREATE_VIRTUAL_DISK_PARAMETERS_0_1,
-            CREATE_VIRTUAL_DISK_VERSION_2, CreateVirtualDisk, VIRTUAL_DISK_ACCESS_NONE,
+            CREATE_VIRTUAL_DISK_VERSION_2, CreateVirtualDisk, GET_VIRTUAL_DISK_INFO,
+            GET_VIRTUAL_DISK_INFO_SIZE, GetVirtualDiskInformation, OPEN_VIRTUAL_DISK_FLAG_NONE,
+            OpenVirtualDisk, VIRTUAL_DISK_ACCESS_GET_INFO, VIRTUAL_DISK_ACCESS_NONE,
             VIRTUAL_STORAGE_TYPE, VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
             VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT,
         },
@@ -103,6 +105,69 @@ pub(crate) fn create_dynamic_vhdx(path: &Path, size_bytes: u64) -> Result<(), Re
 
     log::info!("created VHDX disk at {}", path.display());
     Ok(())
+}
+
+/// Reads the size the guest sees for the VHDX at `path`, in bytes.
+///
+/// A dynamically-expanding disk's file is far smaller than the disk it
+/// presents, so the file length cannot answer this; only the disk's own
+/// header can.
+pub(crate) fn virtual_size_bytes(path: &Path) -> Result<u64, RepositoryError> {
+    let storage_type = VIRTUAL_STORAGE_TYPE {
+        DeviceId: VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
+        VendorId: VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT,
+    };
+    let wide_path = HSTRING::from(path.as_os_str().to_string_lossy().as_ref());
+    let mut handle = HANDLE::default();
+    // SAFETY: `storage_type` and `wide_path` outlive the call, and `handle` is
+    // only read after the call reports success.
+    let result = unsafe {
+        OpenVirtualDisk(
+            &storage_type,
+            &wide_path,
+            VIRTUAL_DISK_ACCESS_GET_INFO,
+            OPEN_VIRTUAL_DISK_FLAG_NONE,
+            None,
+            &mut handle,
+        )
+    };
+    result.ok().map_err(|error| {
+        let error = windows_error("open virtual disk", None, error);
+        log::error!("{} for {}", error, path.display());
+        error
+    })?;
+
+    let mut information = GET_VIRTUAL_DISK_INFO {
+        Version: GET_VIRTUAL_DISK_INFO_SIZE,
+        ..Default::default()
+    };
+    let mut information_size = u32::try_from(size_of::<GET_VIRTUAL_DISK_INFO>())
+        .expect("GET_VIRTUAL_DISK_INFO always fits in a u32");
+    // SAFETY: `handle` is the disk opened above, and both out-parameters point
+    // at live locals for the duration of the call.
+    let result = unsafe {
+        GetVirtualDiskInformation(handle, &mut information_size, &mut information, None)
+    };
+    // SAFETY: `handle` came from the successful `OpenVirtualDisk` above and is
+    // closed exactly once here, after its last use.
+    let closed = unsafe { CloseHandle(handle) };
+
+    result.ok().map_err(|error| {
+        let error = windows_error("get virtual disk information", None, error);
+        log::error!("{} for {}", error, path.display());
+        error
+    })?;
+    closed.map_err(|error| {
+        let error = windows_error("close virtual disk handle", None, error);
+        log::error!("{error}");
+        error
+    })?;
+
+    // SAFETY: `GET_VIRTUAL_DISK_INFO_SIZE` is the version requested above, so
+    // HCS filled in the `Size` arm of the union.
+    let virtual_size = unsafe { information.Anonymous.Size.VirtualSize };
+    log::debug!("{} presents {virtual_size} bytes", path.display());
+    Ok(virtual_size)
 }
 
 #[cfg(test)]

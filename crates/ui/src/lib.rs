@@ -621,9 +621,9 @@ fn render_edit_vm_dialog(
         .default_width(460.0)
         .open(&mut open)
         .show(context, |ui| {
-            ui.label("Only stopped VMs can be edited with the current AppSandbox backend.");
+            ui.label("Changes are saved to the VM configuration and take effect the next time the VM starts.");
             ui.small(
-                "RAM, CPU, GPU, and network are editable while stopped. Disk size and VM name stay fixed and currently require recreating the VM.",
+                "RAM and CPU are editable. GPU and network are not wired to the native backend yet. Disk size and VM name stay fixed and currently require recreating the VM.",
             );
             ui.add_space(8.0);
 
@@ -941,7 +941,7 @@ fn render_selected_vm(
         VmState::Starting | VmState::Running { .. } => (VmAction::Stop, "Stop"),
     };
     let is_running = matches!(vm.state, VmState::Running { .. });
-    let can_modify_configuration = matches!(vm.state, VmState::Stopped);
+    let can_delete = matches!(vm.state, VmState::Stopped);
     let mut action = None;
     ui.horizontal(|ui| {
         action = render_action_group(
@@ -969,10 +969,20 @@ fn render_selected_vm(
             action = Some(clicked_action);
         }
         ui.separator();
+        // Editing a running VM is allowed; the change reaches it on its next
+        // start. Deleting one is not.
         if let Some(clicked_action) = render_action_group(
             ui,
-            &[(VmAction::Edit, "Edit"), (VmAction::Delete, "Delete")],
-            can_modify_configuration,
+            &[(VmAction::Edit, "Edit")],
+            true,
+            Some("Changes to a running VM apply after a restart"),
+        ) {
+            action = Some(clicked_action);
+        }
+        if let Some(clicked_action) = render_action_group(
+            ui,
+            &[(VmAction::Delete, "Delete")],
+            can_delete,
             Some("Available only when the VM is stopped"),
         ) {
             action = Some(clicked_action);
