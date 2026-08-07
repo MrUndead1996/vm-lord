@@ -14,13 +14,14 @@ use vmlord_core::{
 
 use crate::{
     HcsClient, HcsSystem, KnownVm, MetadataStore, VmComputeSystemMapping, VmConnections,
-    VmCreationPipeline, VmDeletionPipeline, VmEventSink, VmForceStopPipeline, VmShutdownPipeline,
+    VmCreationPipeline, VmDeletionPipeline, VmForceStopPipeline, VmShutdownPipeline,
     VmStartPipeline,
     hcs::{HCS_ACCESS_ALL, HcsSystemState},
     hcs_config::{self, VmTopology},
     layout, list_known_vms,
     reconnect::{ReconnectOutcome, reconnect_known_vms},
-    vhd,
+    vhd, watch,
+    watch::VmEventSink,
 };
 
 /// The metadata document, kept next to the VM directories it describes.
@@ -55,18 +56,19 @@ impl HcsVmRepository {
     #[must_use]
     pub fn new(storage_root: impl Into<PathBuf>) -> Self {
         let storage_root = storage_root.into();
+        let events = VmEventSink::default();
         Self {
             client: HcsClient::new(),
             store: MetadataStore::new(storage_root.join(MAPPING_FILE_NAME)),
             storage_root,
-            connections: VmConnections::default(),
-            events: VmEventSink::default(),
+            connections: VmConnections::with_events(events.clone()),
             creation: VmCreationPipeline::production(),
             start: VmStartPipeline::production(),
             shutdown: VmShutdownPipeline::production(),
             force_stop: VmForceStopPipeline::production(),
             delete: VmDeletionPipeline::production(),
             diagnostics: Mutex::new(Vec::new()),
+            events,
             initialized: false,
         }
     }
@@ -268,8 +270,9 @@ impl HcsVmRepository {
 /// `Paused` or already-`Stopped` system is not running either. Only `Running`
 /// is running.
 ///
-/// Whether a running guest has finished booting is not observable until the
-/// watch/event work lands, so the agent status stays unknown.
+/// Whether a running guest has finished booting is still not observable --
+/// HCS reports nothing about it, watch included -- so the agent status stays
+/// unknown until the guest agent lands.
 fn vm_state(mapping: &VmComputeSystemMapping, state: Option<HcsSystemState>) -> VmState {
     match state {
         Some(HcsSystemState::Running) => VmState::Running {
@@ -445,22 +448,40 @@ impl VmRepository for HcsVmRepository {
             .collect())
     }
 
+    /// Reports everything the repository has to say since the last call,
+    /// including the HCS events its watches queued.
+    ///
+    /// Draining here rather than in `list_vms` is deliberate: this is the
+    /// `&mut self` call the application already makes on every refresh, right
+    /// after listing, so it is where a released handle can actually be
+    /// released.
     fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
-        self.diagnostics
+        let (from_events, released) = watch::drain_events(&self.events);
+        for vm_id in released {
+            self.connections.remove(vm_id);
+        }
+
+        let mut diagnostics: Vec<Diagnostic> = self
+            .diagnostics
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .drain(..)
-            .collect()
+            .collect();
+        diagnostics.extend(from_events);
+        diagnostics
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use uuid::Uuid;
     use vmlord_core::{
-        GpuMode, NetworkMode, RepositoryError, VmDeleteRequest, VmRepository, VmUpdateRequest,
+        DiagnosticLevel, GpuMode, NetworkMode, RepositoryError, VmDeleteRequest, VmRepository,
+        VmUpdateRequest,
     };
 
     use super::HcsVmRepository;
+    use crate::watch::{HcsEventKind, HcsVmEvent};
 
     fn repository() -> HcsVmRepository {
         HcsVmRepository::new(std::env::temp_dir().join("vmlord-repository-test"))
@@ -520,5 +541,46 @@ mod tests {
                 .to_string()
                 .contains("not supported")
         );
+    }
+
+    /// The drain runs inside `take_diagnostics` because that is already called
+    /// on every refresh, right after `list_vms`, so an event reaches the user
+    /// within one refresh interval without any new machinery.
+    ///
+    /// Releasing the handle is asserted by `watch::drain_events`' own tests and
+    /// by the ignored Hyper-V test; it cannot be asserted here, because holding
+    /// a handle requires a live compute system.
+    #[test]
+    fn a_queued_exit_event_becomes_a_diagnostic() {
+        let mut repository = repository();
+        repository.events.push(HcsVmEvent {
+            vm_id: Uuid::new_v4(),
+            vm_name: "dev".into(),
+            kind: HcsEventKind::Exited,
+            details: None,
+        });
+
+        let diagnostics = repository.take_diagnostics();
+
+        assert!(
+            diagnostics.iter().any(|diagnostic| {
+                diagnostic.level == DiagnosticLevel::Info
+                    && diagnostic.message.contains("dev")
+            }),
+            "a VM that stopped on its own must be reported: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn a_queued_ignored_event_produces_no_diagnostic() {
+        let mut repository = repository();
+        repository.events.push(HcsVmEvent {
+            vm_id: Uuid::new_v4(),
+            vm_name: "dev".into(),
+            kind: HcsEventKind::Ignored(5),
+            details: Some("silo job created".into()),
+        });
+
+        assert!(repository.take_diagnostics().is_empty());
     }
 }

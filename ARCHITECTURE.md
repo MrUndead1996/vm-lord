@@ -297,8 +297,18 @@ HCS writes `State` into an enumeration entry only once its compute system has
 run: a VM created and never started is enumerated with an `Id`, a `SystemType`,
 an `Owner` and a `RuntimeId` and nothing else, while a running one carries
 `"State": "Running"`. A missing state therefore means `Created`, and that
-absence is the only signal separating the two. Whether a running guest has
-finished booting stays unobservable until the watch/event work lands.
+absence is the only signal separating the two.
+
+`platform::watch` registers an HCS event callback on every compute system
+VMLord holds, which is the only source for what the enumeration cannot say: why
+a VM stopped, that its guest crashed, and that the Host Compute Service
+disconnected. The callback runs on a thread HCS owns, so it only classifies the
+event and queues it; the repository drains that queue in `take_diagnostics` on
+every refresh, logs each event, surfaces the significant ones as diagnostics,
+and releases the handle of a VM that is gone. The enumeration remains the sole
+authority on VM state. Whether a running guest has finished booting is still
+unobservable -- HCS reports nothing about it -- so `AgentStatus` stays
+`Unknown` until the guest agent lands.
 
 `platform::layout` decides where a VM's `config.json` and disks live, so
 creation, start and the repository cannot disagree about it. A VM name is used
