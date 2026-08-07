@@ -18,6 +18,7 @@ mod hcn;
 mod hcs;
 mod hcs_config;
 mod metadata;
+mod reconnect;
 mod shutdown;
 mod start;
 mod vhd;
@@ -30,5 +31,8 @@ pub use force_stop::VmForceStopPipeline;
 pub use hcn::HcnNetwork;
 pub use hcs::{HcsClient, HcsOperation, HcsSystem};
 pub use metadata::{MetadataStore, VmComputeSystemMapping};
+pub use reconnect::{
+    ReconnectOutcome, ReconnectReport, ReconnectedVm, VmConnections, reconnect_known_vms,
+};
 pub use shutdown::VmShutdownPipeline;
 pub use start::VmStartPipeline;

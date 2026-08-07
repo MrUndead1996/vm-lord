@@ -204,8 +204,18 @@ reports and reconciles it against `MetadataStore`'s persisted mappings,
 flagging mappings whose compute system HCS no longer reports rather than
 dropping them. `platform::open_by_vm_id`/`open_by_vm_name` resolve a known VM
 to its `HcsSystem` handle through the same store. Remaining HCS lifecycle work
-(reconnect, delete) still resolves a VM to its compute system through this
-store.
+(delete) still resolves a VM to its compute system through this store.
+
+`platform::reconnect_known_vms` reopens one compute-system handle per VM in
+`MetadataStore` and hands them back in a `VmConnections` registry meant to live
+for as long as the VMLord process: handles do not survive a restart, so this is
+what makes a restarted VMLord the owner of its running VMs again rather than an
+observer of them. Reconnect never fails as a whole because one VM is in a bad
+state -- each VM is reported individually as `Reconnected`, `Absent` or
+`Failed` -- and only an unreadable store aborts it, because then nothing is
+known at all. A VM HCS does not report is `Absent` and keeps its mapping: a
+stopped VM looks exactly like one deleted outside VMLord, and dropping the
+mapping would turn every stop into a delete.
 
 `platform::VmStartPipeline` starts a VM the creation pipeline produced. It
 re-grants the VM access to every file its stored `config.json` attaches before
