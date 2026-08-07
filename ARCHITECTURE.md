@@ -175,7 +175,8 @@ vmlord (composition root)
   -> ui (egui/eframe)
   -> app (workflows)
   -> core (safe domain models)
-  -> legacy-backend (dynamic C FFI)
+  -> platform (native HCS backend, default)
+  -> legacy-backend (dynamic C FFI, transitional fallback)
   -> appsandbox_core.dll
 ```
 
@@ -200,9 +201,10 @@ its HCS compute-system id as a single JSON document. HCS lifecycle work
 system through this store instead of re-deriving the mapping.
 
 `platform::list_known_vms` enumerates every compute system HCS currently
-reports and reconciles it against `MetadataStore`'s persisted mappings,
-flagging mappings whose compute system HCS no longer reports rather than
-dropping them. `platform::open_by_vm_id`/`open_by_vm_name` resolve a known VM
+reports, with the state HCS gives for it, and reconciles that against
+`MetadataStore`'s persisted mappings. A mapping whose compute system HCS no
+longer reports keeps its place in the list with no state rather than being
+dropped. `platform::open_by_vm_id`/`open_by_vm_name` resolve a known VM
 to its `HcsSystem` handle through the same store. Remaining HCS lifecycle work
 (delete) still resolves a VM to its compute system through this store.
 
@@ -258,6 +260,60 @@ therefore re-creates the compute system from that stored configuration whenever
 HCS no longer knows it, under the same id, before starting it. Without that
 step a stop would silently become a delete.
 
+`platform::HcsVmRepository` is the `VmRepository` the composition root wires in
+by default. It owns the process-wide `HcsClient`, the `MetadataStore` under the
+configured VM storage directory, and the `VmConnections` registry, and maps each
+repository operation onto the pipeline that implements it. Setting
+`VMLORD_BACKEND=legacy` selects the AppSandbox backend instead, for as long as
+the migration leaves it something the native backend cannot do; any other value
+(including an unset one) selects the native backend, so a typo cannot silently
+keep VMLord on the backend being retired.
+
+The native backend deliberately reports less than AppSandbox did while the
+remaining migration tasks land: GPU mode, network mode, guest IP address and SSH
+port are `None`, guest agent status is `Unknown`, and display and SSH
+connections report that the backend does not support them.
+
+A VM's state comes from `HcsEnumerateComputeSystems`, not from the compute
+system's mere presence: creation leaves behind a system that has never executed
+anything, and only a `Running` one is running. The enumeration is the right
+source because it is the only one that answers for a created system at all --
+`HcsGetComputeSystemProperties` on one fails outright -- and because it is a
+single call VMLord already makes for the whole list.
+
+HCS writes `State` into an enumeration entry only once its compute system has
+run: a VM created and never started is enumerated with an `Id`, a `SystemType`,
+an `Owner` and a `RuntimeId` and nothing else, while a running one carries
+`"State": "Running"`. A missing state therefore means `Created`, and that
+absence is the only signal separating the two. Whether a running guest has
+finished booting stays unobservable until the watch/event work lands.
+
+`platform::layout` decides where a VM's `config.json` and disks live, so
+creation, start and the repository cannot disagree about it. A VM name is used
+as a directory name and is rejected unless it is a single plain path component,
+so it cannot escape the storage root.
+
+An edit rewrites `SizeInMB` and `Count` in the VM's stored `config.json` and
+changes nothing else, which is what editing a VM means once `VmStartPipeline`
+rebuilds the compute system from that document. A running VM keeps the topology
+it booted with, so the application layer accepts the edit and warns that it
+applies after a restart rather than refusing it. GPU and network modes other
+than `None` are rejected until their own tasks land.
+
+`VmSummary`'s memory and processor counts come from the same stored
+configuration. `disk_gb` comes from the `MetadataStore` mapping, where creation
+records it: the disk itself cannot be asked while its VM runs, because Hyper-V
+holds the VHDX open exclusively and `OpenVirtualDisk` then fails with
+`ERROR_ACCESS_DENIED` -- and a running VM is exactly what the VM list refreshes
+against most. A mapping written before that field existed falls back to
+`GetVirtualDiskInformation` once (a dynamically-expanding VHDX file is far
+smaller than the disk it presents, so its file length cannot answer this) and
+records the answer, so the fallback stops being needed.
+
+A VM whose configuration cannot be read is still listed, with the unreadable
+sizes zeroed and a warning diagnostic raised, because hiding a VM that exists
+is worse than reporting it incompletely.
+
 `core::settings` owns the UI-independent application settings model and TOML
 persistence. The composition root initializes it before the backend. Settings
 are stored per user at `%LOCALAPPDATA%\VMLord\settings.toml`; the initial file
@@ -271,26 +327,29 @@ both standard output and the append-only `log_file_path`; all Rust crates use
 the `log` facade to emit application records.
 
 The current UI initializes the backend, shows availability and diagnostics,
-lists known VMs, can create Linux VMs from ISO images, and can edit stopped
-VMs. It submits safe requests through the application layer; only
-`legacy-backend` maps them to AppSandbox's C API. The Start action invokes
-`asb_vm_start`; Stop invokes the graceful `asb_vm_shutdown`; Force stop invokes
-`asb_vm_stop`. Edit updates RAM, CPU, GPU mode, and network mode for stopped
-VMs through AppSandbox's configuration setters, then refreshes the VM list.
-Connect invokes `asb_vm_open_display`, which opens or focuses the temporary
-AppSandbox IDD window after the guest display driver is ready. It calls
-`asb_detach` on exit so it never stops VMs. Snapshots remain future
-application-layer work.
+lists known VMs, can create Linux VMs from ISO images, and can edit them. It
+submits safe requests through the application layer, which knows nothing about
+which backend serves them. Edit is available whichever state the VM is in;
+Delete stays limited to stopped VMs. Snapshots remain future application-layer
+work.
+
+Under `VMLORD_BACKEND=legacy`, the same actions reach AppSandbox's C API
+instead: Start invokes `asb_vm_start`; Stop invokes the graceful
+`asb_vm_shutdown`; Force stop invokes `asb_vm_stop`; Edit uses AppSandbox's
+configuration setters; Connect invokes `asb_vm_open_display`, which opens or
+focuses the temporary AppSandbox IDD window after the guest display driver is
+ready. It calls `asb_detach` on exit so it never stops VMs.
 
 ### VM update contract
 
-The temporary AppSandbox-backed edit workflow currently follows these rules:
+The edit workflow follows these rules:
 
-* Running VMs cannot be edited; they must be stopped first.
-* VMs that are still building/staging also cannot be edited.
-* RAM, CPU, GPU mode, and network mode can be updated while the VM is stopped.
+* A VM can be edited in any state; a running VM applies the change on its next
+  start, and the application layer says so.
 * RAM must be at least 512 MiB and aligned to 2 MiB steps.
 * CPU core count must be at least 1.
+* GPU and network modes are rejected by the native backend until their own
+  migration tasks land.
 * Disk size is read-only in the current backend contract and requires recreating
   the VM to change.
 * The VM name is treated as the guest hostname and also requires recreating the

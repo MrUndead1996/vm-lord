@@ -9,6 +9,7 @@ use crate::{
     HcsClient, HcsSystem,
     hcs::HCS_ACCESS_ALL,
     hcs_config::HcsVmConfigBuilder,
+    layout,
     metadata::{MetadataStore, VmComputeSystemMapping},
     vhd::create_dynamic_vhdx,
 };
@@ -85,7 +86,7 @@ impl VmCreationPipeline {
 
         let vm_id = Uuid::new_v4();
         let hcs_compute_system_id = format!("vmlord-{}", vm_id.as_simple());
-        let system_disk_path = vm_directory.join("disks").join("system.vhdx");
+        let system_disk_path = layout::system_disk_path(vm_directory);
         // Rejects an unsupported request (name, GPU/network mode, ...) before
         // any filesystem or HCS side effect.
         let configuration = HcsVmConfigBuilder::build(request, &system_disk_path)?;
@@ -111,6 +112,7 @@ impl VmCreationPipeline {
             vm_id,
             vm_name: request.name.clone(),
             hcs_compute_system_id: hcs_compute_system_id.clone(),
+            disk_gb: request.disk_gb,
         };
 
         let mut system_created = false;
@@ -127,7 +129,7 @@ impl VmCreationPipeline {
                 )));
             }
 
-            fs::write(vm_directory.join("config.json"), &configuration).map_err(|error| {
+            fs::write(layout::configuration_path(vm_directory), &configuration).map_err(|error| {
                 RepositoryError::new(format!("failed to write HCS configuration: {error}"))
             })?;
 

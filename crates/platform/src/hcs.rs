@@ -278,6 +278,61 @@ impl HcsSystem {
                 );
             })
     }
+
+}
+
+/// One compute system HCS currently reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HcsSystemSummary {
+    pub id: String,
+    /// The state HCS reported, or `None` when the entry carried none.
+    ///
+    /// HCS omits `State` for a compute system that has been created but never
+    /// started, and reports it for one that runs, so an entry without a state
+    /// is not an unknown -- see [`HcsSystemState::from_enumeration`].
+    pub state: Option<HcsSystemState>,
+}
+
+/// The state HCS reports for a compute system.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HcsSystemState {
+    /// The system exists but has never been started.
+    Created,
+    /// The system is executing.
+    Running,
+    /// The system is paused.
+    Paused,
+    /// The system has stopped but has not been destroyed yet.
+    Stopped,
+    /// A state this VMLord does not know; carried verbatim so callers can log
+    /// it rather than silently treat it as one of the states above.
+    Other(String),
+}
+
+impl HcsSystemState {
+    /// Interprets what an enumeration entry said about a compute system's
+    /// state.
+    ///
+    /// A missing state means [`HcsSystemState::Created`]. HCS writes `State`
+    /// only once a compute system has run: a VM created and never started is
+    /// enumerated with an `Id`, a `SystemType`, an `Owner` and a `RuntimeId`
+    /// and nothing else, while a running one carries `"State": "Running"`.
+    /// This is the only signal that separates the two, because a created
+    /// system also refuses `HcsGetComputeSystemProperties`.
+    #[must_use]
+    pub fn from_enumeration(reported: Option<Self>) -> Self {
+        reported.unwrap_or(Self::Created)
+    }
+}
+
+fn parse_system_state(state: &str) -> HcsSystemState {
+    match state {
+        "Created" => HcsSystemState::Created,
+        "Running" => HcsSystemState::Running,
+        "Paused" => HcsSystemState::Paused,
+        "Stopped" => HcsSystemState::Stopped,
+        other => HcsSystemState::Other(other.to_owned()),
+    }
 }
 
 impl Drop for HcsSystem {
@@ -410,7 +465,7 @@ fn query_hcs_enumerate_systems() -> Result<String, RepositoryError> {
 /// HCS's enumeration schema is not stable across versions beyond the `Id`
 /// field every entry carries, so entries without one are skipped rather than
 /// treated as a parse failure.
-fn parse_enumerate_result(document: &str) -> Result<Vec<String>, RepositoryError> {
+fn parse_enumerate_result(document: &str) -> Result<Vec<HcsSystemSummary>, RepositoryError> {
     if document.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -422,10 +477,15 @@ fn parse_enumerate_result(document: &str) -> Result<Vec<String>, RepositoryError
     Ok(entries
         .into_iter()
         .filter_map(|entry| {
-            entry
+            let id = entry
                 .get("Id")
+                .and_then(serde_json::Value::as_str)?
+                .to_owned();
+            let state = entry
+                .get("State")
                 .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
+                .map(parse_system_state);
+            Some(HcsSystemSummary { id, state })
         })
         .collect())
 }
@@ -560,16 +620,22 @@ impl HcsClient {
         })
     }
 
-    /// Lists the ids of every HCS compute system currently visible to this
-    /// process.
-    pub fn enumerate_system_ids(&self) -> Result<Vec<String>, RepositoryError> {
+    /// Lists every HCS compute system currently visible to this process,
+    /// with the state HCS reports for it.
+    ///
+    /// The enumeration carries the state, which is why VMLord reads it from
+    /// here rather than querying each system's properties: a compute system
+    /// that has been created but never started refuses a property query
+    /// outright, and that is precisely the state worth distinguishing.
+    pub fn enumerate_systems(&self) -> Result<Vec<HcsSystemSummary>, RepositoryError> {
         log::debug!("enumerating HCS compute systems");
         let document = self.enumerate_document().inspect_err(|error| {
             log::error!("failed to enumerate HCS compute systems: {error}");
         })?;
-        let ids = parse_enumerate_result(&document)?;
-        log::debug!("enumerated {} HCS compute system(s)", ids.len());
-        Ok(ids)
+        log::debug!("HCS enumeration returned: {document}");
+        let systems = parse_enumerate_result(&document)?;
+        log::debug!("enumerated {} HCS compute system(s)", systems.len());
+        Ok(systems)
     }
 
     #[cfg(not(test))]
@@ -610,9 +676,67 @@ mod tests {
     use vmlord_core::RepositoryError;
 
     use super::{
-        HcsClient, hcs_service_properties_query, parse_enumerate_result, parse_service_result,
-        shutdown_options, unsupported_shutdown_error,
+        HcsClient, HcsSystemState, HcsSystemSummary, hcs_service_properties_query,
+        parse_enumerate_result, parse_service_result, parse_system_state, shutdown_options,
+        unsupported_shutdown_error,
     };
+
+    #[test]
+    fn system_state_maps_every_state_hcs_reports() {
+        for (reported, expected) in [
+            ("Created", HcsSystemState::Created),
+            ("Running", HcsSystemState::Running),
+            ("Paused", HcsSystemState::Paused),
+            ("Stopped", HcsSystemState::Stopped),
+            (
+                "SavedAsTemplate",
+                HcsSystemState::Other("SavedAsTemplate".into()),
+            ),
+        ] {
+            assert_eq!(parse_system_state(reported), expected);
+        }
+    }
+
+    /// Verbatim output of a live Hyper-V host running one started VM (WSL) and
+    /// one VMLord VM that had just been created and never started. It is the
+    /// evidence that HCS writes `State` only once a compute system has run.
+    const LIVE_ENUMERATION: &str = r#"[
+        {"Id":"8636363D-C5F9-49AA-B507-3B83F98C0D14","SystemType":"VirtualMachine",
+         "Owner":"WSL","RuntimeId":"8636363d-c5f9-49aa-b507-3b83f98c0d14","State":"Running"},
+        {"Id":"vmlord-b961b64484554b6289e8e70d6e38f181","SystemType":"VirtualMachine",
+         "Owner":"VMLord","RuntimeId":"a811a3d9-78e5-5a7d-ba56-4b799c99f150"}
+    ]"#;
+
+    #[test]
+    fn a_live_enumeration_states_the_running_system_and_omits_the_created_one() {
+        let systems = parse_enumerate_result(LIVE_ENUMERATION).unwrap();
+
+        assert_eq!(
+            systems,
+            vec![
+                HcsSystemSummary {
+                    id: "8636363D-C5F9-49AA-B507-3B83F98C0D14".into(),
+                    state: Some(HcsSystemState::Running),
+                },
+                HcsSystemSummary {
+                    id: "vmlord-b961b64484554b6289e8e70d6e38f181".into(),
+                    state: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_system_enumerated_without_a_state_has_never_started() {
+        assert_eq!(
+            HcsSystemState::from_enumeration(None),
+            HcsSystemState::Created
+        );
+        assert_eq!(
+            HcsSystemState::from_enumeration(Some(HcsSystemState::Running)),
+            HcsSystemState::Running
+        );
+    }
 
     #[test]
     fn service_properties_query_is_null() {
@@ -693,27 +817,26 @@ mod tests {
 
     #[test]
     fn enumerate_result_is_empty_for_an_empty_document() {
-        assert_eq!(parse_enumerate_result("").unwrap(), Vec::<String>::new());
-        assert_eq!(parse_enumerate_result("[]").unwrap(), Vec::<String>::new());
-    }
-
-    #[test]
-    fn enumerate_result_extracts_every_id() {
-        let document = r#"[{"Id":"vmlord-1","State":"Running"},{"Id":"vmlord-2","State":"Off"}]"#;
-
         assert_eq!(
-            parse_enumerate_result(document).unwrap(),
-            vec!["vmlord-1".to_string(), "vmlord-2".to_string()]
+            parse_enumerate_result("").unwrap(),
+            Vec::<HcsSystemSummary>::new()
+        );
+        assert_eq!(
+            parse_enumerate_result("[]").unwrap(),
+            Vec::<HcsSystemSummary>::new()
         );
     }
 
     #[test]
     fn enumerate_result_skips_entries_without_an_id() {
-        let document = r#"[{"State":"Running"},{"Id":"vmlord-2"}]"#;
+        let document = r#"[{"State":"Running"},{"Id":"vmlord-2","State":"Running"}]"#;
 
         assert_eq!(
             parse_enumerate_result(document).unwrap(),
-            vec!["vmlord-2".to_string()]
+            vec![HcsSystemSummary {
+                id: "vmlord-2".into(),
+                state: Some(HcsSystemState::Running),
+            }]
         );
     }
 
@@ -723,23 +846,26 @@ mod tests {
     }
 
     #[test]
-    fn enumerate_system_ids_returns_the_probes_parsed_ids() {
+    fn enumerate_systems_returns_the_probes_parsed_systems() {
         let client = HcsClient::with_enumerate_probe(|| {
-            Ok(r#"[{"Id":"vmlord-1"},{"Id":"vmlord-2"}]"#.to_string())
+            Ok(r#"[{"Id":"vmlord-1","State":"Running"}]"#.to_string())
         });
 
         assert_eq!(
-            client.enumerate_system_ids().unwrap(),
-            vec!["vmlord-1".to_string(), "vmlord-2".to_string()]
+            client.enumerate_systems().unwrap(),
+            vec![HcsSystemSummary {
+                id: "vmlord-1".into(),
+                state: Some(HcsSystemState::Running),
+            }]
         );
     }
 
     #[test]
-    fn enumerate_system_ids_propagates_a_probe_error() {
+    fn enumerate_systems_propagates_a_probe_error() {
         let client =
             HcsClient::with_enumerate_probe(|| Err(RepositoryError::new("HCS unavailable")));
 
-        let error = client.enumerate_system_ids().unwrap_err();
+        let error = client.enumerate_systems().unwrap_err();
 
         assert!(error.to_string().contains("HCS unavailable"));
     }

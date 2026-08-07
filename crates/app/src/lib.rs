@@ -240,17 +240,6 @@ impl WorkspaceApp {
             .ok_or_else(|| {
                 RepositoryError::new(format!("VM \"{}\" was not found", request.name))
             })?;
-        if !matches!(vm_state, VmState::Stopped) {
-            let error = RepositoryError::new(format!(
-                "VM \"{}\" must be stopped before it can be edited",
-                request.name
-            ));
-            self.diagnostics.push(Diagnostic {
-                level: DiagnosticLevel::Error,
-                message: error.to_string(),
-            });
-            return Err(error);
-        }
         if request.ram_mb < 512 || request.ram_mb % 2 != 0 {
             let error = RepositoryError::new(
                 "RAM must be 2 MiB-aligned and at least 512 MiB for VM updates",
@@ -270,6 +259,11 @@ impl WorkspaceApp {
             return Err(error);
         }
 
+        // A VM keeps the configuration it booted with, so an edit made while
+        // it runs only takes effect on its next start. The edit itself is
+        // allowed: refusing it would force a stop just to change a setting.
+        let applies_after_restart = !matches!(vm_state, VmState::Stopped);
+
         let name = request.name.clone();
         match self.repository.update_vm(request) {
             Ok(()) => {
@@ -277,6 +271,14 @@ impl WorkspaceApp {
                     level: DiagnosticLevel::Info,
                     message: format!("VM \"{name}\" update accepted"),
                 });
+                if applies_after_restart {
+                    self.diagnostics.push(Diagnostic {
+                        level: DiagnosticLevel::Warning,
+                        message: format!(
+                            "VM \"{name}\" is running; the new configuration applies after a restart"
+                        ),
+                    });
+                }
                 self.refresh();
                 Ok(())
             }

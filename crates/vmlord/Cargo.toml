@@ -15,6 +15,7 @@ log.workspace = true
 vmlord-app = { path = "../app" }
 vmlord-core = { path = "../core" }
 vmlord-legacy-backend = { path = "../legacy-backend" }
+vmlord-platform = { path = "../platform" }
 vmlord-ui = { path = "../ui" }
 
 [build-dependencies]

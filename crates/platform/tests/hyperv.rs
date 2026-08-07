@@ -17,7 +17,8 @@ use std::{
 use uuid::Uuid;
 use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest};
 use vmlord_platform::{
-    HcsClient, HcsOperation, HcsSystem, MetadataStore, ReconnectOutcome, VmComputeSystemMapping,
+    HcsClient, HcsOperation, HcsSystem, HcsSystemState, MetadataStore, ReconnectOutcome,
+    VmComputeSystemMapping,
     VmCreationPipeline, VmForceStopPipeline, VmShutdownPipeline, VmStartPipeline, list_known_vms,
     open_by_vm_id, open_by_vm_name, reconnect_known_vms,
 };
@@ -162,8 +163,13 @@ fn enumerates_and_reopens_a_created_vm() {
         .find(|vm| vm.mapping.vm_id == mapping.vm_id)
         .expect("the just-created VM must appear in the enumeration");
     assert!(
-        entry.present,
+        entry.is_present(),
         "HCS must report the compute system just created"
+    );
+    assert_eq!(
+        entry.state,
+        Some(HcsSystemState::Created),
+        "a VM that was created but never started must not look like a running one"
     );
 
     let by_id = open_by_vm_id(&store, mapping.vm_id, HCS_ACCESS_ALL);
@@ -581,6 +587,7 @@ fn shuts_down_a_running_guest() {
             vm_id,
             vm_name: "guest-shutdown-probe".into(),
             hcs_compute_system_id: hcs_id.clone(),
+            disk_gb: 20,
         })
         .expect("mapping should be persisted");
 

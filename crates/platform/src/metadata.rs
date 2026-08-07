@@ -21,6 +21,17 @@ pub struct VmComputeSystemMapping {
     pub vm_id: Uuid,
     pub vm_name: String,
     pub hcs_compute_system_id: String,
+    /// The size the VM's system disk presents to its guest, in GiB.
+    ///
+    /// It is recorded here because the disk itself cannot be asked while the
+    /// VM runs: Hyper-V holds the VHDX open exclusively, so `OpenVirtualDisk`
+    /// fails with `ERROR_ACCESS_DENIED` for exactly the VMs whose size the VM
+    /// list is most often refreshing.
+    ///
+    /// Zero means "not recorded" -- a mapping written before this field
+    /// existed -- and callers fall back to reading the disk.
+    #[serde(default)]
+    pub disk_gb: u32,
 }
 
 impl VmComputeSystemMapping {
@@ -228,6 +239,7 @@ mod tests {
             vm_id,
             vm_name: vm_name.into(),
             hcs_compute_system_id: hcs_id.into(),
+            disk_gb: 20,
         }
     }
 
@@ -336,6 +348,30 @@ mod tests {
         let store = MetadataStore::new(temporary_mapping_file());
 
         assert!(store.remove(Uuid::new_v4()).is_ok());
+    }
+
+    #[test]
+    fn a_mapping_written_before_disk_sizes_existed_still_loads() {
+        let path = temporary_mapping_file();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let vm_id = Uuid::new_v4();
+        fs::write(
+            &path,
+            format!(
+                r#"[{{"vm_id":"{vm_id}","vm_name":"legacy","hcs_compute_system_id":"vmlord-1"}}]"#
+            ),
+        )
+        .unwrap();
+
+        let loaded = MetadataStore::new(&path).find_by_vm_id(vm_id).unwrap();
+
+        assert_eq!(loaded, Some(mapping(vm_id, "legacy", "vmlord-1")).map(
+            |mapping| VmComputeSystemMapping {
+                disk_gb: 0,
+                ..mapping
+            }
+        ));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

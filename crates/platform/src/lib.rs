@@ -17,8 +17,10 @@ mod force_stop;
 mod hcn;
 mod hcs;
 mod hcs_config;
+mod layout;
 mod metadata;
 mod reconnect;
+mod repository;
 mod shutdown;
 mod start;
 mod vhd;
@@ -29,10 +31,11 @@ pub use error::hresult_to_repository_error;
 pub use event::{EventWaitResult, WindowsEvent};
 pub use force_stop::VmForceStopPipeline;
 pub use hcn::HcnNetwork;
-pub use hcs::{HcsClient, HcsOperation, HcsSystem};
+pub use hcs::{HcsClient, HcsOperation, HcsSystem, HcsSystemState, HcsSystemSummary};
 pub use metadata::{MetadataStore, VmComputeSystemMapping};
 pub use reconnect::{
     ReconnectOutcome, ReconnectReport, ReconnectedVm, VmConnections, reconnect_known_vms,
 };
+pub use repository::HcsVmRepository;
 pub use shutdown::VmShutdownPipeline;
 pub use start::VmStartPipeline;
