@@ -72,15 +72,12 @@ fn reconcile(live: &[HcsSystemSummary], mappings: Vec<VmComputeSystemMapping>) -
             // listed without one is taken to be running, because a running VM
             // the user cannot stop is worse than a stopped one shown as
             // running.
-            // `HcsClient::enumerate_systems` already reports the document a
-            // missing state came from, so this only records the consequence.
-            let state = system.state.clone().unwrap_or_else(|| {
-                log::debug!(
-                    "assuming VM \"{}\" runs; HCS listed its compute system without a state",
-                    mapping.vm_name
-                );
-                HcsSystemState::Running
-            });
+            let state = HcsSystemState::from_enumeration(system.state.clone());
+            log::debug!(
+                "HCS reports VM \"{}\" ({}) as {state:?}",
+                mapping.vm_name,
+                mapping.vm_id
+            );
             KnownVm {
                 mapping,
                 state: Some(state),
@@ -204,7 +201,9 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_assumes_a_system_listed_without_a_state_runs() {
+    fn a_system_listed_without_a_state_has_never_started() {
+        // HCS writes `State` only once a compute system has run, so this is
+        // how a created-but-never-started VM appears.
         let dev = mapping(Uuid::new_v4(), "dev-linux", "vmlord-1");
         let live = vec![HcsSystemSummary {
             id: "vmlord-1".into(),
@@ -213,7 +212,7 @@ mod tests {
 
         let result = reconcile(&live, vec![dev]);
 
-        assert_eq!(result[0].state, Some(HcsSystemState::Running));
+        assert_eq!(result[0].state, Some(HcsSystemState::Created));
     }
 
     #[test]

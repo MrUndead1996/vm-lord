@@ -274,16 +274,19 @@ remaining migration tasks land: GPU mode, network mode, guest IP address and SSH
 port are `None`, guest agent status is `Unknown`, and display and SSH
 connections report that the backend does not support them.
 
-A VM's state comes from the state HCS reports for each compute system in
-`HcsEnumerateComputeSystems`, not from the compute system's mere presence:
-creation leaves behind a `Created` system that has never executed anything, so
-only `Running` is reported as running. The enumeration is the right source
-because it is the only one that answers for a `Created` system at all --
+A VM's state comes from `HcsEnumerateComputeSystems`, not from the compute
+system's mere presence: creation leaves behind a system that has never executed
+anything, and only a `Running` one is running. The enumeration is the right
+source because it is the only one that answers for a created system at all --
 `HcsGetComputeSystemProperties` on one fails outright -- and because it is a
-single call VMLord already makes for the whole list. A system listed without a
-state is assumed to be running, since a running VM the user cannot stop is
-worse than a stopped one shown as running. Whether a running guest has finished
-booting stays unobservable until the watch/event work lands.
+single call VMLord already makes for the whole list.
+
+HCS writes `State` into an enumeration entry only once its compute system has
+run: a VM created and never started is enumerated with an `Id`, a `SystemType`,
+an `Owner` and a `RuntimeId` and nothing else, while a running one carries
+`"State": "Running"`. A missing state therefore means `Created`, and that
+absence is the only signal separating the two. Whether a running guest has
+finished booting stays unobservable until the watch/event work lands.
 
 `platform::layout` decides where a VM's `config.json` and disks live, so
 creation, start and the repository cannot disagree about it. A VM name is used

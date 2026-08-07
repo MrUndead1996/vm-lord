@@ -286,6 +286,10 @@ impl HcsSystem {
 pub struct HcsSystemSummary {
     pub id: String,
     /// The state HCS reported, or `None` when the entry carried none.
+    ///
+    /// HCS omits `State` for a compute system that has been created but never
+    /// started, and reports it for one that runs, so an entry without a state
+    /// is not an unknown -- see [`HcsSystemState::from_enumeration`].
     pub state: Option<HcsSystemState>,
 }
 
@@ -303,6 +307,22 @@ pub enum HcsSystemState {
     /// A state this VMLord does not know; carried verbatim so callers can log
     /// it rather than silently treat it as one of the states above.
     Other(String),
+}
+
+impl HcsSystemState {
+    /// Interprets what an enumeration entry said about a compute system's
+    /// state.
+    ///
+    /// A missing state means [`HcsSystemState::Created`]. HCS writes `State`
+    /// only once a compute system has run: a VM created and never started is
+    /// enumerated with an `Id`, a `SystemType`, an `Owner` and a `RuntimeId`
+    /// and nothing else, while a running one carries `"State": "Running"`.
+    /// This is the only signal that separates the two, because a created
+    /// system also refuses `HcsGetComputeSystemProperties`.
+    #[must_use]
+    pub fn from_enumeration(reported: Option<Self>) -> Self {
+        reported.unwrap_or(Self::Created)
+    }
 }
 
 fn parse_system_state(state: &str) -> HcsSystemState {
@@ -614,14 +634,6 @@ impl HcsClient {
         })?;
         log::debug!("HCS enumeration returned: {document}");
         let systems = parse_enumerate_result(&document)?;
-        if systems.iter().any(|system| system.state.is_none()) {
-            // The state is what tells a created VM from a running one, so a
-            // document without it is worth showing in full rather than
-            // reporting as a bare "no state".
-            log::warn!(
-                "HCS enumerated a compute system without a state; the document was: {document}"
-            );
-        }
         log::debug!("enumerated {} HCS compute system(s)", systems.len());
         Ok(systems)
     }
@@ -685,36 +697,44 @@ mod tests {
         }
     }
 
+    /// Verbatim output of a live Hyper-V host running one started VM (WSL) and
+    /// one VMLord VM that had just been created and never started. It is the
+    /// evidence that HCS writes `State` only once a compute system has run.
+    const LIVE_ENUMERATION: &str = r#"[
+        {"Id":"8636363D-C5F9-49AA-B507-3B83F98C0D14","SystemType":"VirtualMachine",
+         "Owner":"WSL","RuntimeId":"8636363d-c5f9-49aa-b507-3b83f98c0d14","State":"Running"},
+        {"Id":"vmlord-b961b64484554b6289e8e70d6e38f181","SystemType":"VirtualMachine",
+         "Owner":"VMLord","RuntimeId":"a811a3d9-78e5-5a7d-ba56-4b799c99f150"}
+    ]"#;
+
     #[test]
-    fn enumerate_result_carries_the_state_of_each_system() {
-        // The shape `hcsdiag list` prints: HCS reports the state alongside
-        // the id, which is why no per-system property query is needed.
-        let document = r#"[{"Id":"vmlord-1","State":"Created","Owner":"VMLord"},
-                           {"Id":"vmlord-2","State":"Running"}]"#;
+    fn a_live_enumeration_states_the_running_system_and_omits_the_created_one() {
+        let systems = parse_enumerate_result(LIVE_ENUMERATION).unwrap();
 
         assert_eq!(
-            parse_enumerate_result(document).unwrap(),
+            systems,
             vec![
                 HcsSystemSummary {
-                    id: "vmlord-1".into(),
-                    state: Some(HcsSystemState::Created),
+                    id: "8636363D-C5F9-49AA-B507-3B83F98C0D14".into(),
+                    state: Some(HcsSystemState::Running),
                 },
                 HcsSystemSummary {
-                    id: "vmlord-2".into(),
-                    state: Some(HcsSystemState::Running),
+                    id: "vmlord-b961b64484554b6289e8e70d6e38f181".into(),
+                    state: None,
                 },
             ]
         );
     }
 
     #[test]
-    fn enumerate_result_reports_no_state_when_an_entry_carries_none() {
+    fn a_system_enumerated_without_a_state_has_never_started() {
         assert_eq!(
-            parse_enumerate_result(r#"[{"Id":"vmlord-1"}]"#).unwrap(),
-            vec![HcsSystemSummary {
-                id: "vmlord-1".into(),
-                state: None,
-            }]
+            HcsSystemState::from_enumeration(None),
+            HcsSystemState::Created
+        );
+        assert_eq!(
+            HcsSystemState::from_enumeration(Some(HcsSystemState::Running)),
+            HcsSystemState::Running
         );
     }
 
