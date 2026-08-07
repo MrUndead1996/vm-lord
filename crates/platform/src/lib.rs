@@ -11,6 +11,7 @@ compile_error!("vmlord-platform supports Windows only");
 
 mod cleanup;
 mod create;
+mod delete;
 mod enumerate;
 mod error;
 mod event;
@@ -27,6 +28,7 @@ mod start;
 mod vhd;
 
 pub use create::VmCreationPipeline;
+pub use delete::VmDeletionPipeline;
 pub use enumerate::{KnownVm, list_known_vms, open_by_vm_id, open_by_vm_name};
 pub use error::hresult_to_repository_error;
 pub use event::{EventWaitResult, WindowsEvent};
