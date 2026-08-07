@@ -72,11 +72,11 @@ fn reconcile(live: &[HcsSystemSummary], mappings: Vec<VmComputeSystemMapping>) -
             // listed without one is taken to be running, because a running VM
             // the user cannot stop is worse than a stopped one shown as
             // running.
+            // `HcsClient::enumerate_systems` already reports the document a
+            // missing state came from, so this only records the consequence.
             let state = system.state.clone().unwrap_or_else(|| {
-                log::warn!(
-                    "HCS reports compute system \"{}\" of VM \"{}\" without a state; \
-                     assuming it runs",
-                    mapping.hcs_compute_system_id,
+                log::debug!(
+                    "assuming VM \"{}\" runs; HCS listed its compute system without a state",
                     mapping.vm_name
                 );
                 HcsSystemState::Running

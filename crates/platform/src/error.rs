@@ -19,13 +19,22 @@ pub fn hresult_to_repository_error(
 }
 
 /// Converts a `windows-rs` error while retaining the failed operation and VM.
+///
+/// Windows' own description of the HRESULT is included: an HCS error code
+/// alone ("0x8037010D") names nothing a reader can act on, and looking one up
+/// takes a table that is not in this repository.
 #[must_use]
 pub(crate) fn windows_error(
     operation: &str,
     vm_name: Option<&str>,
     error: Error,
 ) -> RepositoryError {
-    hresult_to_repository_error(operation, vm_name, error.code().0)
+    let described = hresult_to_repository_error(operation, vm_name, error.code().0);
+    let message = error.message();
+    if message.is_empty() {
+        return described;
+    }
+    RepositoryError::new(format!("{described}: {message}"))
 }
 
 #[cfg(test)]
@@ -44,6 +53,22 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Windows API operation \"open compute system\" for VM \"dev-linux\" failed (HRESULT 0x80070005)"
+        );
+    }
+
+    #[test]
+    fn a_windows_error_carries_the_systems_own_description() {
+        let error = super::windows_error(
+            "open compute system",
+            Some("dev-linux"),
+            windows::core::Error::from_hresult(windows::core::HRESULT(0x8007_0005_u32 as i32)),
+        );
+
+        let message = error.to_string();
+        assert!(message.contains("0x80070005"), "{message}");
+        assert!(
+            message.len() > "Windows API operation \"open compute system\" for VM \"dev-linux\" failed (HRESULT 0x80070005)".len(),
+            "the HRESULT alone names nothing actionable; Windows' description must be appended: {message}"
         );
     }
 }

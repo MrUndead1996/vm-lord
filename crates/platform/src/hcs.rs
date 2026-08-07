@@ -614,6 +614,14 @@ impl HcsClient {
         })?;
         log::debug!("HCS enumeration returned: {document}");
         let systems = parse_enumerate_result(&document)?;
+        if systems.iter().any(|system| system.state.is_none()) {
+            // The state is what tells a created VM from a running one, so a
+            // document without it is worth showing in full rather than
+            // reporting as a bare "no state".
+            log::warn!(
+                "HCS enumerated a compute system without a state; the document was: {document}"
+            );
+        }
         log::debug!("enumerated {} HCS compute system(s)", systems.len());
         Ok(systems)
     }
