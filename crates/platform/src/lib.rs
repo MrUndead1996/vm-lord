@@ -26,6 +26,7 @@ mod repository;
 mod shutdown;
 mod start;
 mod vhd;
+mod watch;
 
 pub use create::VmCreationPipeline;
 pub use delete::VmDeletionPipeline;
