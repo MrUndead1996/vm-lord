@@ -4,7 +4,7 @@ use std::fmt;
 
 use vmlord_core::{
     AppSettings, Diagnostic, DiagnosticLevel, RepositoryError, SettingsError, SettingsStore,
-    VmCreateRequest, VmRepository, VmState, VmSummary, VmUpdateRequest,
+    VmCreateRequest, VmDeleteRequest, VmRepository, VmState, VmSummary, VmUpdateRequest,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -465,6 +465,10 @@ impl VmRepository for UnavailableRepository {
         Err(RepositoryError::new(self.message.clone()))
     }
 
+    fn delete_vm(&mut self, _request: VmDeleteRequest) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(self.message.clone()))
+    }
+
     fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
         Vec::new()
     }
@@ -542,6 +546,12 @@ mod tests {
 
         fn force_stop_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
             self.actions.push(format!("force-stop:{name}"));
+            Ok(())
+        }
+
+        fn delete_vm(&mut self, request: VmDeleteRequest) -> Result<(), RepositoryError> {
+            self.actions
+                .push(format!("delete:{}:{}", request.name, request.delete_disks));
             Ok(())
         }
 

@@ -60,6 +60,16 @@ pub struct VmUpdateRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmDeleteRequest {
+    pub name: String,
+    /// Whether the VM's virtual disks are removed along with it.
+    ///
+    /// Keeping them leaves the VM's directory in place, so a later VM of the
+    /// same name cannot reuse that directory.
+    pub delete_disks: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VmSummary {
     pub name: String,
     pub os_type: String,
@@ -146,6 +156,11 @@ pub trait VmRepository {
     fn start_vm(&mut self, name: &str) -> Result<(), RepositoryError>;
     fn stop_vm(&mut self, name: &str) -> Result<(), RepositoryError>;
     fn force_stop_vm(&mut self, name: &str) -> Result<(), RepositoryError>;
+    /// Removes the VM and every resource VMLord created for it.
+    ///
+    /// Required rather than defaulted: a backend that cannot delete VMs has to
+    /// say so, not inherit silence.
+    fn delete_vm(&mut self, request: VmDeleteRequest) -> Result<(), RepositoryError>;
     fn open_display(&mut self, _name: &str) -> Result<(), RepositoryError> {
         Err(RepositoryError::new(
             "display connections are not supported by this backend",

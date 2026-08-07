@@ -9,12 +9,13 @@ use std::{fs, path::PathBuf, sync::Mutex};
 
 use vmlord_core::{
     AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError,
-    VmCreateRequest, VmRepository, VmState, VmSummary, VmUpdateRequest,
+    VmCreateRequest, VmDeleteRequest, VmRepository, VmState, VmSummary, VmUpdateRequest,
 };
 
 use crate::{
     HcsClient, HcsSystem, KnownVm, MetadataStore, VmComputeSystemMapping, VmConnections,
-    VmCreationPipeline, VmForceStopPipeline, VmShutdownPipeline, VmStartPipeline,
+    VmCreationPipeline, VmDeletionPipeline, VmForceStopPipeline, VmShutdownPipeline,
+    VmStartPipeline,
     hcs::{HCS_ACCESS_ALL, HcsSystemState},
     hcs_config::{self, VmTopology},
     layout, list_known_vms,
@@ -41,6 +42,7 @@ pub struct HcsVmRepository {
     start: VmStartPipeline,
     shutdown: VmShutdownPipeline,
     force_stop: VmForceStopPipeline,
+    delete: VmDeletionPipeline,
     // `list_vms` takes `&self` but still has findings worth surfacing, so the
     // diagnostics buffer needs interior mutability.
     diagnostics: Mutex<Vec<Diagnostic>>,
@@ -61,6 +63,7 @@ impl HcsVmRepository {
             start: VmStartPipeline::production(),
             shutdown: VmShutdownPipeline::production(),
             force_stop: VmForceStopPipeline::production(),
+            delete: VmDeletionPipeline::production(),
             diagnostics: Mutex::new(Vec::new()),
             initialized: false,
         }
@@ -79,6 +82,17 @@ impl HcsVmRepository {
             log::error!("{error}");
             error
         })
+    }
+
+    /// Reports whether HCS currently runs the VM behind `mapping`.
+    ///
+    /// The application layer's cached list can be stale by the time the user
+    /// acts on it, so a destructive operation asks HCS itself.
+    fn is_running(&self, mapping: &VmComputeSystemMapping) -> Result<bool, RepositoryError> {
+        Ok(list_known_vms(&self.client, &self.store)?
+            .into_iter()
+            .find(|known| known.mapping.vm_id == mapping.vm_id)
+            .is_some_and(|known| matches!(known.state, Some(HcsSystemState::Running))))
     }
 
     fn push_diagnostic(&self, level: DiagnosticLevel, message: String) {
@@ -359,6 +373,36 @@ impl VmRepository for HcsVmRepository {
         Ok(())
     }
 
+    /// Deletes the VM and everything VMLord created for it.
+    ///
+    /// A running VM is refused rather than torn down under its guest: deletion
+    /// is irreversible, and stopping is the user's decision to make
+    /// deliberately.
+    fn delete_vm(&mut self, request: VmDeleteRequest) -> Result<(), RepositoryError> {
+        self.require_initialized()?;
+
+        let mapping = self.mapping(&request.name)?;
+        if self.is_running(&mapping)? {
+            let error = RepositoryError::new(format!(
+                "VM \"{}\" is running; stop it before deleting it",
+                request.name
+            ));
+            log::error!("{error}");
+            return Err(error);
+        }
+
+        let vm_directory = layout::vm_directory(&self.storage_root, &request.name)?;
+        self.delete.delete(
+            &self.store,
+            &request.name,
+            &vm_directory,
+            request.delete_disks,
+        )?;
+        // The VM is gone, so any handle still held for it refers to nothing.
+        self.connections.remove(mapping.vm_id);
+        Ok(())
+    }
+
     fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError> {
         self.require_initialized()?;
 
@@ -379,7 +423,9 @@ impl VmRepository for HcsVmRepository {
 
 #[cfg(test)]
 mod tests {
-    use vmlord_core::{GpuMode, NetworkMode, RepositoryError, VmRepository, VmUpdateRequest};
+    use vmlord_core::{
+        GpuMode, NetworkMode, RepositoryError, VmDeleteRequest, VmRepository, VmUpdateRequest,
+    };
 
     use super::HcsVmRepository;
 
@@ -394,6 +440,13 @@ mod tests {
             cpu_cores: 2,
             gpu_mode: GpuMode::None,
             network_mode: NetworkMode::None,
+        }
+    }
+
+    fn delete_request() -> VmDeleteRequest {
+        VmDeleteRequest {
+            name: "dev".into(),
+            delete_disks: true,
         }
     }
 
@@ -412,6 +465,7 @@ mod tests {
         assert_not_initialized(repository.stop_vm("dev"));
         assert_not_initialized(repository.force_stop_vm("dev"));
         assert_not_initialized(repository.update_vm(update_request()));
+        assert_not_initialized(repository.delete_vm(delete_request()));
         assert_not_initialized(repository.list_vms().map(|_| ()));
     }
 
