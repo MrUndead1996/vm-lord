@@ -292,7 +292,9 @@ Replace the body of `rollback` (`crates/platform/src/create.rs:159-191`) with:
         system_created: bool,
         error: RepositoryError,
     ) -> RepositoryError {
-        log::error!("creation of VM \"{}\" failed: {error}", mapping.vm_name);
+        // `combine_failures` logs the whole message at ERROR, and `failures`
+        // starts with this error, so logging it separately here would emit the
+        // same content twice on every rollback.
         let mut failures = vec![error.to_string()];
 
         if system_created
