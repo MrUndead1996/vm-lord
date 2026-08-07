@@ -581,6 +581,7 @@ fn shuts_down_a_running_guest() {
             vm_id,
             vm_name: "guest-shutdown-probe".into(),
             hcs_compute_system_id: hcs_id.clone(),
+            disk_gb: 20,
         })
         .expect("mapping should be persisted");
 

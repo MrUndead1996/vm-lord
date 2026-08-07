@@ -112,6 +112,7 @@ impl VmCreationPipeline {
             vm_id,
             vm_name: request.name.clone(),
             hcs_compute_system_id: hcs_compute_system_id.clone(),
+            disk_gb: request.disk_gb,
         };
 
         let mut system_created = false;

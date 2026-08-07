@@ -118,7 +118,7 @@ impl HcsVmRepository {
             ram_mb: 0,
             cpu_cores: 0,
         });
-        let disk_gb = self.disk_gb(&mapping.vm_name);
+        let disk_gb = self.disk_gb(&mapping);
 
         let state = self.state(&mapping, present);
 
@@ -208,20 +208,43 @@ impl HcsVmRepository {
             .ok()
     }
 
-    fn disk_gb(&self, vm_name: &str) -> u32 {
-        let size = layout::vm_directory(&self.storage_root, vm_name)
+    /// Returns the size of a VM's system disk, in GiB.
+    ///
+    /// Creation records it, so the disk itself only has to be read for a
+    /// mapping written before it did. That read fails while the VM runs --
+    /// Hyper-V holds the VHDX open exclusively -- so a failure is logged at
+    /// debug level and reported as an unknown size rather than raised as a
+    /// diagnostic the user would see on every refresh.
+    fn disk_gb(&self, mapping: &VmComputeSystemMapping) -> u32 {
+        if mapping.disk_gb > 0 {
+            return mapping.disk_gb;
+        }
+
+        let size = layout::vm_directory(&self.storage_root, &mapping.vm_name)
             .map(|directory| layout::system_disk_path(&directory))
             .and_then(|path| vhd::virtual_size_bytes(&path));
-        match size {
-            Ok(bytes) => u32::try_from(bytes / BYTES_PER_GIB).unwrap_or(u32::MAX),
-            Err(error) => {
-                self.push_diagnostic(
-                    DiagnosticLevel::Warning,
-                    format!("Cannot read the system disk of VM \"{vm_name}\": {error}"),
-                );
-                0
-            }
+        let Ok(bytes) = size.inspect_err(|error| {
+            log::debug!(
+                "cannot read the system disk of VM \"{}\": {error}",
+                mapping.vm_name
+            );
+        }) else {
+            return 0;
+        };
+
+        let disk_gb = u32::try_from(bytes / BYTES_PER_GIB).unwrap_or(u32::MAX);
+        // Record it so the next refresh needs no disk access at all, and so
+        // the size survives the VM being started.
+        if let Err(error) = self.store.insert(VmComputeSystemMapping {
+            disk_gb,
+            ..mapping.clone()
+        }) {
+            log::warn!(
+                "could not record the disk size of VM \"{}\": {error}",
+                mapping.vm_name
+            );
         }
+        disk_gb
     }
 
     fn read_configuration(&self, vm_name: &str) -> Result<String, RepositoryError> {

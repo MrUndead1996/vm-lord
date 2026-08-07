@@ -291,12 +291,19 @@ it booted with, so the application layer accepts the edit and warns that it
 applies after a restart rather than refusing it. GPU and network modes other
 than `None` are rejected until their own tasks land.
 
-`VmSummary` sizes come from the same stored configuration, and `disk_gb` from
-`GetVirtualDiskInformation` on the system disk: a dynamically-expanding VHDX
-file is far smaller than the disk it presents, so its file length cannot answer
-this. A VM whose configuration or disk cannot be read is still listed, with the
-unreadable field zeroed and a warning diagnostic raised, because hiding a VM
-that exists is worse than reporting it incompletely.
+`VmSummary`'s memory and processor counts come from the same stored
+configuration. `disk_gb` comes from the `MetadataStore` mapping, where creation
+records it: the disk itself cannot be asked while its VM runs, because Hyper-V
+holds the VHDX open exclusively and `OpenVirtualDisk` then fails with
+`ERROR_ACCESS_DENIED` -- and a running VM is exactly what the VM list refreshes
+against most. A mapping written before that field existed falls back to
+`GetVirtualDiskInformation` once (a dynamically-expanding VHDX file is far
+smaller than the disk it presents, so its file length cannot answer this) and
+records the answer, so the fallback stops being needed.
+
+A VM whose configuration cannot be read is still listed, with the unreadable
+sizes zeroed and a warning diagnostic raised, because hiding a VM that exists
+is worse than reporting it incompletely.
 
 `core::settings` owns the UI-independent application settings model and TOML
 persistence. The composition root initializes it before the backend. Settings

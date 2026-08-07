@@ -21,8 +21,9 @@ pub struct KnownVm {
 /// HCS currently reports.
 ///
 /// A mapping whose compute system HCS no longer reports is still returned
-/// (with `present: false`) rather than dropped, so callers can surface the
-/// discrepancy instead of silently losing track of the VM.
+/// (with `present: false`) rather than dropped: HCS destroys a compute system
+/// as it stops, so that is the normal state of every stopped VM, not a
+/// discrepancy.
 pub fn list_known_vms(
     client: &HcsClient,
     store: &MetadataStore,
@@ -40,12 +41,15 @@ fn reconcile(live_ids: &[String], mappings: Vec<VmComputeSystemMapping>) -> Vec<
                 .iter()
                 .any(|id| id == &mapping.hcs_compute_system_id);
             if !present {
-                log::warn!(
-                    "VM \"{}\" ({}) is mapped to HCS compute system \"{}\", \
-                     but HCS does not currently report it",
+                // Every listing of a stopped VM lands here, so this stays at
+                // debug: HCS destroying a compute system as it stops is the
+                // expected outcome, not something to warn about.
+                log::debug!(
+                    "HCS does not report compute system \"{}\" of VM \"{}\" ({}); \
+                     it is stopped",
+                    mapping.hcs_compute_system_id,
                     mapping.vm_name,
-                    mapping.vm_id,
-                    mapping.hcs_compute_system_id
+                    mapping.vm_id
                 );
             }
             KnownVm { mapping, present }
@@ -118,6 +122,7 @@ mod tests {
             vm_id,
             vm_name: vm_name.into(),
             hcs_compute_system_id: hcs_id.into(),
+            disk_gb: 20,
         }
     }
 
