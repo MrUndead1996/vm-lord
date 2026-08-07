@@ -223,12 +223,11 @@ fn excerpt(details: &str) -> String {
     format!("{head}...")
 }
 
-use std::{ffi::c_void, panic};
+use std::{ffi::c_void, mem, panic};
 
 use vmlord_core::RepositoryError;
 use windows::Win32::System::HostComputeSystem::{
-    HCS_EVENT, HCS_SYSTEM, HcsEventOptionEnableVmLifecycle, HcsEventOptionNone,
-    HcsSetComputeSystemCallback,
+    HCS_EVENT, HcsEventOptionEnableVmLifecycle, HcsEventOptionNone, HcsSetComputeSystemCallback,
 };
 
 use crate::{error::windows_error, hcs::HcsSystem};
@@ -241,13 +240,27 @@ struct WatchContext {
     sink: VmEventSink,
 }
 
+/// [`on_hcs_event`] reaches a `WatchContext` through a raw pointer, on a thread
+/// HCS owns. That dereference erases the `Sync` check the compiler would apply
+/// to a shared reference, so a future `Cell`, `Rc` or `RefCell` field here would
+/// be a cross-thread data race with nothing to catch it. This makes it a build
+/// error instead.
+const _: () = {
+    fn assert_sync<T: Sync>() {}
+    let _ = assert_sync::<WatchContext>;
+};
+
 /// An active `HcsSetComputeSystemCallback` registration, removed on drop.
 pub struct SystemWatch {
     /// The system the callback is registered on.
     ///
-    /// A non-owning copy: the [`HcsSystem`] this was registered against still
-    /// owns and closes the handle, and must outlive this watch.
-    system: HCS_SYSTEM,
+    /// Shared ownership rather than a bare `HCS_SYSTEM` copy, so the handle
+    /// cannot be closed while this watch is alive. That matters beyond leaking:
+    /// [`HcsSystem::drop`] closes the handle unconditionally, and HCS may then
+    /// reuse that value for a different compute system, so clearing a
+    /// registration on a stale handle could silently unregister another VM's
+    /// callback. Holding the `Arc` makes the drop order of the two irrelevant.
+    system: Arc<HcsSystem>,
     /// The `Arc<WatchContext>` handed to HCS, as the raw pointer HCS holds.
     context: *const WatchContext,
 }
@@ -255,26 +268,27 @@ pub struct SystemWatch {
 impl SystemWatch {
     /// Asks HCS to report `system`'s lifecycle events into `sink`.
     pub fn register(
-        system: &HcsSystem,
+        system: &Arc<HcsSystem>,
         vm_id: Uuid,
         vm_name: &str,
         sink: &VmEventSink,
     ) -> Result<Self, RepositoryError> {
-        let handle = system.raw_handle();
+        let system = Arc::clone(system);
         let context = Arc::into_raw(Arc::new(WatchContext {
             vm_id,
             vm_name: vm_name.to_owned(),
             sink: sink.clone(),
         }));
 
-        // SAFETY: `handle` is owned by `system`, which outlives this watch;
+        // SAFETY: the handle is kept open by the `Arc<HcsSystem>` this watch
+        // holds, so it stays valid for as long as the registration does;
         // `context` is a live allocation this watch owns until it clears the
         // registration in `Drop`. `HcsEventOptionEnableVmLifecycle` is what
         // makes HCS deliver VM lifecycle events rather than only operation
         // callbacks.
         let registered = unsafe {
             HcsSetComputeSystemCallback(
-                handle,
+                system.raw_handle(),
                 HcsEventOptionEnableVmLifecycle,
                 Some(context.cast()),
                 Some(on_hcs_event),
@@ -294,19 +308,23 @@ impl SystemWatch {
         }
 
         log::debug!("watching the HCS events of VM \"{vm_name}\" ({vm_id})");
-        Ok(Self {
-            system: handle,
-            context,
-        })
+        Ok(Self { system, context })
     }
 }
 
 impl Drop for SystemWatch {
     fn drop(&mut self) {
-        // SAFETY: `self.system` is still open here, because the `HcsSystem`
-        // that owns it is dropped only after this watch.
-        let cleared =
-            unsafe { HcsSetComputeSystemCallback(self.system, HcsEventOptionNone, None, None) };
+        // SAFETY: the handle is still open, and still refers to the same
+        // compute system it did at registration, because this watch holds an
+        // `Arc<HcsSystem>` keeping it from being closed and its value recycled.
+        let cleared = unsafe {
+            HcsSetComputeSystemCallback(
+                self.system.raw_handle(),
+                HcsEventOptionNone,
+                None,
+                None,
+            )
+        };
 
         match cleared {
             Ok(()) => {
@@ -380,7 +398,15 @@ unsafe extern "system" fn on_hcs_event(event: *const HCS_EVENT, context: *const 
     // A panic here cannot be reported: logging is not allowed on this thread and
     // the queue is what panicked. Swallowing it is the only sound option, and
     // the loss shows up as an event that never arrives.
-    let _ = queued;
+    //
+    // The payload is forgotten rather than dropped, because dropping it happens
+    // outside the barrier: a payload whose own `Drop` panicked would unwind
+    // across `extern "system"`, which is the undefined behaviour the barrier
+    // exists to prevent. Leaking one payload on a path that has already lost the
+    // event costs nothing by comparison.
+    if queued.is_err() {
+        mem::forget(queued);
+    }
 }
 
 #[cfg(test)]
@@ -613,7 +639,7 @@ mod tests {
     use super::{WatchContext, on_hcs_event};
     use std::{mem, sync::Arc};
     use windows::{
-        Win32::System::HostComputeSystem::{HCS_EVENT, HcsEventSystemExited},
+        Win32::System::HostComputeSystem::{HCS_EVENT, HCS_EVENT_TYPE, HcsEventSystemExited},
         core::{HSTRING, PCWSTR},
     };
 
@@ -628,11 +654,11 @@ mod tests {
     /// `HCS_EVENT` is zeroed rather than built field by field: only `Type` and
     /// `EventData` are read, and zeroing avoids depending on how the `windows`
     /// crate spells an idle `HCS_OPERATION`.
-    fn hcs_event(event_data: PCWSTR) -> HCS_EVENT {
+    fn hcs_event(event_type: HCS_EVENT_TYPE, event_data: PCWSTR) -> HCS_EVENT {
         // SAFETY: `HCS_EVENT` is a plain `#[repr(C)]` struct of a wrapped i32
         // and two pointers, for which an all-zero value is valid.
         let mut event: HCS_EVENT = unsafe { mem::zeroed() };
-        event.Type = HcsEventSystemExited;
+        event.Type = event_type;
         event.EventData = event_data;
         event
     }
@@ -643,7 +669,7 @@ mod tests {
         let vm_id = Uuid::new_v4();
         let context = context(&sink, vm_id);
         let data = HSTRING::from("{\"ExitCode\":0}");
-        let event = hcs_event(PCWSTR(data.as_ptr()));
+        let event = hcs_event(HcsEventSystemExited, PCWSTR(data.as_ptr()));
 
         // SAFETY: both pointers are to live values owned by this test for the
         // duration of the call, which is exactly HCS's own contract.
@@ -662,7 +688,7 @@ mod tests {
     fn the_callback_accepts_an_event_without_data() {
         let sink = VmEventSink::default();
         let context = context(&sink, Uuid::new_v4());
-        let event = hcs_event(PCWSTR::null());
+        let event = hcs_event(HcsEventSystemExited, PCWSTR::null());
 
         // SAFETY: as above; a null `EventData` is what HCS sends for an event
         // that carries no document.
@@ -673,13 +699,30 @@ mod tests {
         assert_eq!(events[0].details, None);
     }
 
+    /// HCS delivers more event types than VMLord acts on, and the callback must
+    /// queue those too rather than filter them out: dropping them on this thread
+    /// would lose the DEBUG line the drain logs for an unrecognized type.
+    #[test]
+    fn the_callback_queues_an_event_type_vmlord_does_not_act_on() {
+        let sink = VmEventSink::default();
+        let context = context(&sink, Uuid::new_v4());
+        let event = hcs_event(HCS_EVENT_TYPE(9_999), PCWSTR::null());
+
+        // SAFETY: as above; only the event type differs.
+        unsafe { on_hcs_event(&event, Arc::as_ptr(&context).cast()) };
+
+        let (events, _dropped) = sink.drain();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, HcsEventKind::Ignored(9_999));
+    }
+
     /// Nothing documents that HCS never passes a null, and dereferencing one
     /// would take the whole process down from a thread VMLord does not own.
     #[test]
     fn the_callback_ignores_null_arguments() {
         let sink = VmEventSink::default();
         let context = context(&sink, Uuid::new_v4());
-        let event = hcs_event(PCWSTR::null());
+        let event = hcs_event(HcsEventSystemExited, PCWSTR::null());
 
         // SAFETY: passing null is the case under test; the callback must return
         // without dereferencing either pointer.
