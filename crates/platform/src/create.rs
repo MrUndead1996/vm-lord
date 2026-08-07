@@ -162,7 +162,6 @@ impl VmCreationPipeline {
         system_created: bool,
         error: RepositoryError,
     ) -> RepositoryError {
-        log::error!("creation of VM \"{}\" failed: {error}", mapping.vm_name);
         let mut failures = vec![error.to_string()];
 
         if system_created
