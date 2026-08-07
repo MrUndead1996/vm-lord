@@ -207,6 +207,14 @@ to its `HcsSystem` handle through the same store. Remaining HCS lifecycle work
 (reconnect, delete) still resolves a VM to its compute system through this
 store.
 
+`platform::VmStartPipeline` starts a VM the creation pipeline produced. It
+re-grants the VM access to every file its stored `config.json` attaches before
+issuing `HcsStartComputeSystem`: Hyper-V opens those files under the VM's own
+`NT VIRTUAL MACHINE\<id>` security principal rather than the caller's token, so
+a start without the grants fails with `ERROR_ACCESS_DENIED`. The stored
+configuration, not a re-derived path list, is the source of truth for which
+files the VM will open.
+
 `core::settings` owns the UI-independent application settings model and TOML
 persistence. The composition root initializes it before the backend. Settings
 are stored per user at `%LOCALAPPDATA%\VMLord\settings.toml`; the initial file
