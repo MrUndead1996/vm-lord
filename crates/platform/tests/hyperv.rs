@@ -8,7 +8,7 @@
 
 #![cfg(windows)]
 
-use std::{fs, time::Duration};
+use std::{fs, path::PathBuf, time::Duration};
 
 use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest};
 use vmlord_platform::{
@@ -21,6 +21,10 @@ use vmlord_platform::{
 // value here (`0x000F_FFFF`) was invalid and made `HcsOpenComputeSystem` fail
 // with `E_INVALIDARG` rather than a meaningful not-found error.
 const HCS_ACCESS_ALL: u32 = 0x1000_0000;
+
+/// `HCS_E_INVALID_JSON`, as it appears in a `RepositoryError`'s message. HCS
+/// reports it when `HcsShutDownComputeSystem` receives null options.
+const HCS_E_INVALID_JSON: &str = "0x8037010D";
 
 #[test]
 #[ignore = "requires Windows with Hyper-V/HCS"]
@@ -226,23 +230,24 @@ fn starts_a_created_vm() {
         .expect("the created VM must start (HcsGrantVmAccess must precede HcsStartComputeSystem)");
 }
 
-/// Exercises TASK-31's graceful shutdown against the real Host Compute
+/// Exercises TASK-31's options document against the real Host Compute
 /// Service: creates a VM, starts it, then asks its guest to shut down.
 ///
-/// The shutdown is the regression check for the options document --
+/// This is the regression check for the options document alone --
 /// `HcsShutDownComputeSystem` rejects a null options pointer with
-/// `HCS_E_INVALID_JSON`, so the pipeline must pass `"{}"`. The request
-/// succeeding does not mean the guest powered off: without integration
-/// services the VM keeps running, which is why the cleanup below still
-/// terminates it.
+/// `HCS_E_INVALID_JSON`, so the pipeline must pass `"{}"`. It deliberately
+/// does not assert that the shutdown succeeds: this VM boots installer media,
+/// so it runs no guest OS that could service the request, and HCS reports
+/// `ERROR_NOT_SUPPORTED`. `shuts_down_a_running_guest` is the test that
+/// asserts a shutdown actually works.
 ///
 /// Set `VMLORD_TEST_IMAGE_PATH` to a real bootable ISO.
 ///
 /// Run elevated with:
-/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact shuts_down_a_started_vm --nocapture`
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact accepts_the_shutdown_options_document --nocapture`
 #[test]
 #[ignore = "requires an elevated Windows host with Hyper-V/HCS and VMLORD_TEST_IMAGE_PATH set"]
-fn shuts_down_a_started_vm() {
+fn accepts_the_shutdown_options_document() {
     let image_path = std::env::var("VMLORD_TEST_IMAGE_PATH")
         .expect("VMLORD_TEST_IMAGE_PATH must point to a real ISO image");
     let root = std::env::temp_dir().join(format!("vmlord-hcs-shutdown-e2e-{}", std::process::id()));
@@ -282,8 +287,45 @@ fn shuts_down_a_started_vm() {
     }
     let _ = fs::remove_dir_all(&root);
 
-    shut_down.expect(
-        "HCS must accept the shutdown request \
-         (HcsShutDownComputeSystem must receive non-null JSON options)",
-    );
+    if let Err(error) = shut_down {
+        println!("shutdown of a guest-less VM reported: {error}");
+        assert!(
+            !error.to_string().contains(HCS_E_INVALID_JSON),
+            "HCS rejected the shutdown options document as invalid JSON; \
+             HcsShutDownComputeSystem must receive non-null JSON options: {error}"
+        );
+    }
+}
+
+/// Asserts that a graceful shutdown actually stops a VM whose guest OS is
+/// running and able to service the request.
+///
+/// Set `VMLORD_TEST_VM_ID` to the compute-system id of a *running, disposable*
+/// VM with an installed guest OS, and `VMLORD_TEST_VM_NAME` to the VM name it
+/// is mapped to in `VMLORD_TEST_MAPPING_PATH`'s metadata store.
+///
+/// This is the test that distinguishes "this particular guest cannot service a
+/// shutdown" from "HCS never delivers a shutdown to a plain Hyper-V VM": a
+/// guest-less VM reports `ERROR_NOT_SUPPORTED`, and if a fully booted guest
+/// reports it too, `HcsShutDownComputeSystem` is the wrong mechanism for
+/// VMLord's VMs and graceful shutdown needs an in-guest agent instead (which
+/// is how the legacy AppSandbox backend implemented it).
+///
+/// Run elevated with:
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact shuts_down_a_running_guest --nocapture`
+#[test]
+#[ignore = "requires an elevated Windows host and a running disposable VM with a guest OS"]
+fn shuts_down_a_running_guest() {
+    let vm_name = std::env::var("VMLORD_TEST_VM_NAME")
+        .expect("VMLORD_TEST_VM_NAME must name a running disposable VM");
+    let mapping_path = std::env::var("VMLORD_TEST_MAPPING_PATH")
+        .expect("VMLORD_TEST_MAPPING_PATH must point to the metadata store mapping that VM");
+    let store = MetadataStore::new(PathBuf::from(mapping_path));
+
+    VmShutdownPipeline::production()
+        .shutdown(&store, &vm_name)
+        .expect(
+            "a running guest must accept a graceful shutdown; ERROR_NOT_SUPPORTED here means \
+             HcsShutDownComputeSystem cannot shut down VMLord's VMs at all",
+        );
 }

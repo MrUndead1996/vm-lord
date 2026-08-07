@@ -76,10 +76,7 @@ impl Default for VmShutdownPipeline {
 fn shut_down_hcs_system(id: &str) -> Result<(), RepositoryError> {
     // The system handle must outlive the shutdown operation it issued.
     let system = HcsSystem::open(id, HCS_ACCESS_ALL)?;
-    system
-        .shutdown()?
-        .wait_for_completion(SHUTDOWN_TIMEOUT)
-        .map(|_document| ())
+    system.shutdown_and_wait(SHUTDOWN_TIMEOUT)
 }
 
 #[cfg(test)]
