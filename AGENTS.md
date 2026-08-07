@@ -55,6 +55,54 @@ When porting functionality from AppSandbox:
 * design clean Rust APIs;
 * treat the C backend as an implementation detail.
 
+## Agent Tooling
+
+Use specialized context tools before broad manual repository inspection when they fit the task.
+
+### Serena
+
+Use Serena as the default tool for code navigation and symbol-aware changes:
+
+* locate symbols, definitions, references, callers, and implementations;
+* inspect relationships between types, functions, and modules;
+* prefer symbol-aware edits and refactors over broad text replacement;
+* use Serena before repeated `grep`/`rg` + file reads when the question is about code structure.
+
+Fall back to normal file search/read tools when Serena cannot resolve generated code, build artifacts, configuration, scripts, documentation, or unsupported language constructs.
+
+### Context7
+
+Use Context7 for authoritative, up-to-date documentation about external libraries, frameworks, SDKs, and APIs.
+
+* use it to verify current API signatures, behavior, configuration, and version-specific details;
+* prefer primary/upstream documentation returned through Context7;
+* do not use Context7 as evidence for facts about this repository; inspect the repository itself for local behavior and conventions;
+* when local code and current upstream documentation differ, preserve existing project behavior unless the task explicitly requires migration.
+
+### Repomix
+
+Use Repomix when a task needs compact context across a large subsystem or many related files, especially for:
+
+* architecture review and planning;
+* cross-module changes;
+* code review and migration analysis;
+* preparing a bounded repository snapshot for another agent/model.
+
+Keep Repomix output focused. Include only relevant paths and exclude secrets, credentials, generated output, dependency/vendor directories, build artifacts, and other high-volume irrelevant files.
+
+Do not use Repomix as a substitute for precise symbol navigation when Serena can answer the question directly.
+
+### Tool Priority
+
+For repository work, prefer this order when applicable:
+
+1. Serena for symbols, references, code structure, and targeted edits.
+2. Context7 for external API/library documentation and version-specific behavior.
+3. Repomix for large, bounded repository context and cross-cutting analysis.
+4. Normal file search/read (`rg`, `grep`, direct reads) as a fallback or for non-code text.
+
+Do not call tools mechanically. Use the smallest amount of context needed to make and verify the change.
+
 ## Documentation
 
 Keep documentation up to date.
