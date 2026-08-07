@@ -307,6 +307,76 @@ impl WorkspaceApp {
         })
     }
 
+    /// Deletes a VM and every resource VMLord created for it.
+    ///
+    /// A VM that is not stopped is refused here rather than stopped
+    /// automatically: deletion cannot be undone, so ending a running guest is a
+    /// decision the user makes on purpose. The repository checks this again
+    /// against HCS itself, because this list is a cache and can be stale.
+    pub fn delete_vm(&mut self, request: VmDeleteRequest) -> Result<(), RepositoryError> {
+        self.require_ready_backend("VM deletion")?;
+
+        let vm_state = self
+            .vms
+            .iter()
+            .find(|vm| vm.name == request.name)
+            .map(|vm| vm.state)
+            .ok_or_else(|| {
+                let error =
+                    RepositoryError::new(format!("VM \"{}\" was not found", request.name));
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Error,
+                    message: error.to_string(),
+                });
+                error
+            })?;
+        if !matches!(vm_state, VmState::Stopped) {
+            let error = RepositoryError::new(format!(
+                "VM \"{}\" is running; stop it before deleting it",
+                request.name
+            ));
+            log::error!("{error}");
+            self.diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Error,
+                message: error.to_string(),
+            });
+            return Err(error);
+        }
+
+        let name = request.name.clone();
+        let kept_disks = !request.delete_disks;
+        log::info!("requesting deletion of VM {name}");
+
+        match self.repository.delete_vm(request) {
+            Ok(()) => {
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Info,
+                    message: format!("VM \"{name}\" deleted"),
+                });
+                if kept_disks {
+                    self.diagnostics.push(Diagnostic {
+                        level: DiagnosticLevel::Warning,
+                        message: format!(
+                            "The disks of VM \"{name}\" were kept; its directory still exists \
+                             and a new VM cannot reuse that name until it is removed"
+                        ),
+                    });
+                }
+                self.refresh();
+                Ok(())
+            }
+            Err(error) => {
+                log::error!("failed to delete VM {name}: {error}");
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Error,
+                    message: format!("Failed to delete VM \"{name}\": {error}"),
+                });
+                self.collect_diagnostics();
+                Err(error)
+            }
+        }
+    }
+
     pub fn connect_display(&mut self, name: &str) -> Result<(), RepositoryError> {
         self.require_ready_backend("display connection")?;
 
@@ -487,6 +557,7 @@ mod tests {
     struct FakeRepository {
         should_fail: bool,
         create_should_fail: bool,
+        vm_is_running: bool,
         actions: Vec<String>,
     }
 
@@ -503,7 +574,13 @@ mod tests {
             Ok(vec![VmSummary {
                 name: "dev".into(),
                 os_type: "Linux".into(),
-                state: VmState::Stopped,
+                state: if self.vm_is_running {
+                    VmState::Running {
+                        agent_status: vmlord_core::AgentStatus::Unknown,
+                    }
+                } else {
+                    VmState::Stopped
+                },
                 ram_mb: 4096,
                 disk_gb: 64,
                 cpu_cores: 4,
@@ -578,6 +655,7 @@ mod tests {
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             should_fail: false,
             create_should_fail: false,
+            vm_is_running: false,
             actions: Vec::new(),
         }));
         app.start();
@@ -591,6 +669,7 @@ mod tests {
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             should_fail: true,
             create_should_fail: false,
+            vm_is_running: false,
             actions: Vec::new(),
         }));
         app.start();
@@ -617,6 +696,7 @@ mod tests {
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             should_fail: false,
             create_should_fail: false,
+            vm_is_running: false,
             actions: Vec::new(),
         }));
         app.start();
@@ -647,6 +727,7 @@ mod tests {
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             should_fail: false,
             create_should_fail: false,
+            vm_is_running: false,
             actions: Vec::new(),
         }));
         app.start();
@@ -665,6 +746,7 @@ mod tests {
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             should_fail: false,
             create_should_fail: false,
+            vm_is_running: false,
             actions: Vec::new(),
         }));
         app.start();
@@ -703,6 +785,7 @@ mod tests {
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             should_fail: false,
             create_should_fail: false,
+            vm_is_running: false,
             actions: Vec::new(),
         }))
         .with_settings(store.clone(), initial_settings);
@@ -724,11 +807,116 @@ mod tests {
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             should_fail: false,
             create_should_fail: false,
+            vm_is_running: false,
             actions: Vec::new(),
         }));
 
         app.log_vm_action(VmAction::Create);
 
         assert_eq!(app.diagnostics()[0].message, "Create VM pressed");
+    }
+
+    fn app_with(vm_is_running: bool) -> WorkspaceApp {
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            should_fail: false,
+            create_should_fail: false,
+            vm_is_running,
+            actions: Vec::new(),
+        }));
+        app.start();
+        app
+    }
+
+    fn delete_request(delete_disks: bool) -> VmDeleteRequest {
+        VmDeleteRequest {
+            name: "dev".into(),
+            delete_disks,
+        }
+    }
+
+    #[test]
+    fn deletes_a_stopped_vm_through_the_repository() {
+        let mut app = app_with(false);
+
+        app.delete_vm(delete_request(true)).unwrap();
+
+        assert!(
+            app.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message == "VM \"dev\" deleted")
+        );
+    }
+
+    #[test]
+    fn refuses_to_delete_a_running_vm() {
+        let mut app = app_with(true);
+
+        let error = app
+            .delete_vm(delete_request(true))
+            .expect_err("a running VM must not be deleted");
+
+        assert!(error.to_string().contains("running"));
+        assert!(
+            app.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.level == DiagnosticLevel::Error)
+        );
+    }
+
+    #[test]
+    fn refuses_to_delete_an_unknown_vm() {
+        let mut app = app_with(false);
+
+        let error = app
+            .delete_vm(VmDeleteRequest {
+                name: "missing-vm".into(),
+                delete_disks: true,
+            })
+            .expect_err("an unknown VM must not be deleted");
+
+        assert!(error.to_string().contains("missing-vm"));
+    }
+
+    #[test]
+    fn refuses_to_delete_without_a_ready_backend() {
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            should_fail: true,
+            create_should_fail: false,
+            vm_is_running: false,
+            actions: Vec::new(),
+        }));
+        app.start();
+
+        let error = app
+            .delete_vm(delete_request(true))
+            .expect_err("deletion needs a ready backend");
+
+        assert!(error.to_string().contains("ready backend"));
+    }
+
+    #[test]
+    fn warns_when_the_disks_are_kept() {
+        let mut app = app_with(false);
+
+        app.delete_vm(delete_request(false)).unwrap();
+
+        assert!(
+            app.diagnostics().iter().any(|diagnostic| {
+                diagnostic.level == DiagnosticLevel::Warning
+                    && diagnostic.message.contains("disks")
+            }),
+            "keeping the disks leaves the VM directory behind and the user must be told"
+        );
+    }
+
+    #[test]
+    fn deleting_with_the_disks_does_not_warn_about_them() {
+        let mut app = app_with(false);
+
+        app.delete_vm(delete_request(true)).unwrap();
+
+        assert!(!app.diagnostics().iter().any(|diagnostic| {
+            diagnostic.level == DiagnosticLevel::Warning && diagnostic.message.contains("disks")
+        }));
     }
 }
