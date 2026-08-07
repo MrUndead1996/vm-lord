@@ -17,9 +17,9 @@ use std::{
 use uuid::Uuid;
 use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest};
 use vmlord_platform::{
-    HcsClient, HcsOperation, HcsSystem, MetadataStore, VmComputeSystemMapping, VmCreationPipeline,
-    VmForceStopPipeline, VmShutdownPipeline, VmStartPipeline, list_known_vms, open_by_vm_id,
-    open_by_vm_name,
+    HcsClient, HcsOperation, HcsSystem, MetadataStore, ReconnectOutcome, VmComputeSystemMapping,
+    VmCreationPipeline, VmForceStopPipeline, VmShutdownPipeline, VmStartPipeline, list_known_vms,
+    open_by_vm_id, open_by_vm_name, reconnect_known_vms,
 };
 
 // `GENERIC_ALL`; matches the legacy AppSandbox backend's `hcs_vm.c` usage and
@@ -370,6 +370,159 @@ fn accepts_the_shutdown_options_document() {
              HcsShutDownComputeSystem must receive non-null JSON options: {error}"
         );
     }
+}
+
+/// Exercises TASK-34's reconnect against the real Host Compute Service:
+/// creates a VM, reconnects to it from the metadata mapping alone -- every
+/// handle `create` held is closed by then, exactly as after a VMLord restart
+/// -- then terminates it and reconnects a second time.
+///
+/// The second reconnect is what pins the contract for a VM HCS no longer
+/// reports: it must be reported `Absent` and keep its mapping, because a
+/// stopped VM looks the same and dropping the mapping would delete it.
+///
+/// Run elevated with:
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact reconnects_to_a_created_vm --nocapture`
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS enabled"]
+fn reconnects_to_a_created_vm() {
+    let root =
+        std::env::temp_dir().join(format!("vmlord-hcs-reconnect-e2e-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+    let image_path = root.join("installer.iso");
+    fs::write(&image_path, b"placeholder installer media").expect("test image should be written");
+
+    let request = VmCreateRequest {
+        name: format!("vmlord-e2e-reconnect-test-{}", std::process::id()),
+        image_path: image_path.to_string_lossy().into_owned(),
+        ram_mb: 512,
+        disk_gb: 1,
+        cpu_cores: 1,
+        gpu_mode: GpuMode::None,
+        network_mode: NetworkMode::None,
+        username: "admin".into(),
+        password: "not used by reconnect".into(),
+        ssh_enabled: false,
+        ssh_deploy_key: false,
+    };
+    let store = MetadataStore::new(root.join("vm-mapping.json"));
+    let vm_directory = root.join("vm");
+
+    let mapping = VmCreationPipeline::production()
+        .create(&store, &request, &vm_directory)
+        .expect("VM creation should succeed on an elevated Hyper-V host");
+
+    let first = reconnect_known_vms(&store);
+    let first_report = first.as_ref().ok().map(|report| {
+        (
+            report.connections.is_connected(mapping.vm_id),
+            report.outcomes.len(),
+            report.outcomes.first().map(|vm| vm.outcome.clone()),
+        )
+    });
+    // Every handle the reconnect took must be closed before the compute system
+    // is terminated, so the second reconnect observes HCS's view of the VM
+    // rather than this test's.
+    drop(first);
+
+    if let Ok(system) = HcsSystem::open(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL) {
+        let _ = system
+            .terminate()
+            .and_then(|operation| operation.wait_for_completion(Duration::from_secs(30)));
+    }
+
+    let second = reconnect_known_vms(&store);
+    let stored = store.find_by_vm_id(mapping.vm_id);
+    let _ = fs::remove_dir_all(&root);
+
+    assert_eq!(
+        first_report,
+        Some((true, 1, Some(ReconnectOutcome::Reconnected))),
+        "a reconnect must hold an open handle to every VM HCS still reports"
+    );
+    let report = second.expect("a reconnect must succeed even when HCS knows none of the VMs");
+    assert_eq!(report.outcomes[0].outcome, ReconnectOutcome::Absent);
+    assert!(
+        report.connections.is_empty(),
+        "no handle may be held for a compute system HCS no longer reports"
+    );
+    assert_eq!(
+        stored.unwrap().as_ref(),
+        Some(&report.outcomes[0].mapping),
+        "an absent VM must keep its mapping; a stopped VM is absent too"
+    );
+}
+
+/// Asserts that a running VM survives a VMLord restart and stays manageable:
+/// creates and starts a VM, reconnects to it from the metadata mapping, then
+/// forcibly stops it through the reconnected VMLord's own pipeline.
+///
+/// This is the acceptance check TASK-34 calls for. The reconnect is what makes
+/// a restarted VMLord the VM's owner again; the forced stop afterwards is what
+/// proves the VM is still controllable rather than merely visible.
+///
+/// Set `VMLORD_TEST_IMAGE_PATH` to a real bootable ISO: HCS refuses to attach
+/// a placeholder file as installer media.
+///
+/// Run elevated with:
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact reconnects_to_a_running_vm --nocapture`
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS and VMLORD_TEST_IMAGE_PATH set"]
+fn reconnects_to_a_running_vm() {
+    let image_path = std::env::var("VMLORD_TEST_IMAGE_PATH")
+        .expect("VMLORD_TEST_IMAGE_PATH must point to a real ISO image");
+    let root = std::env::temp_dir().join(format!(
+        "vmlord-hcs-reconnect-running-e2e-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&root).expect("test root should be created");
+
+    let request = VmCreateRequest {
+        name: format!("vmlord-e2e-reconnect-running-test-{}", std::process::id()),
+        image_path,
+        ram_mb: 2048,
+        disk_gb: 8,
+        cpu_cores: 2,
+        gpu_mode: GpuMode::None,
+        network_mode: NetworkMode::None,
+        username: "admin".into(),
+        password: "not used by reconnect".into(),
+        ssh_enabled: false,
+        ssh_deploy_key: false,
+    };
+    let store = MetadataStore::new(root.join("vm-mapping.json"));
+    let vm_directory = root.join("vm");
+
+    let mapping = VmCreationPipeline::production()
+        .create(&store, &request, &vm_directory)
+        .expect("VM creation should succeed on an elevated Hyper-V host");
+    VmStartPipeline::production()
+        .start(&store, &mapping.vm_name, &vm_directory)
+        .expect("the created VM must start before a reconnect can be observed");
+
+    let reconnected = reconnect_known_vms(&store);
+    // The handle the reconnect holds must not stand in the way of the actions
+    // a reconnected VMLord performs on the VM, so the forced stop is issued
+    // while that handle is still open.
+    let stopped = reconnected
+        .as_ref()
+        .ok()
+        .map(|_report| VmForceStopPipeline::production().force_stop(&store, &mapping.vm_name));
+
+    // Best-effort cleanup regardless of the assertions below.
+    let _ = VmForceStopPipeline::production().force_stop(&store, &mapping.vm_name);
+    let _ = fs::remove_dir_all(&root);
+
+    let report = reconnected.expect("the reconnect must succeed against a live host");
+    assert_eq!(
+        report.outcomes[0].outcome,
+        ReconnectOutcome::Reconnected,
+        "a running VM must be reconnected after every creating handle has closed"
+    );
+    assert!(report.connections.is_connected(mapping.vm_id));
+    stopped
+        .expect("the forced stop must have been attempted")
+        .expect("a reconnected VM must still be controllable");
 }
 
 /// Asserts that a graceful shutdown actually stops a VM whose guest OS is

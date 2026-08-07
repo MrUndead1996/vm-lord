@@ -1,0 +1,330 @@
+//! Reopening the compute systems of known VMs after a VMLord restart.
+//!
+//! VMLord's handles do not survive its process, so a restart leaves every VM it
+//! created running without an open handle. Reconnecting reopens one handle per
+//! known VM and keeps it for as long as VMLord runs, which is what makes a
+//! restarted VMLord the owner of its VMs again rather than an observer of them.
+
+use std::collections::HashMap;
+
+use uuid::Uuid;
+use vmlord_core::RepositoryError;
+
+use crate::{
+    HcsSystem,
+    hcs::HCS_ACCESS_ALL,
+    metadata::{MetadataStore, VmComputeSystemMapping},
+};
+
+/// What reconnecting to a single known VM produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReconnectOutcome {
+    /// HCS still knows the VM's compute system and VMLord now holds a handle
+    /// to it.
+    Reconnected,
+    /// HCS does not know the VM's compute system.
+    ///
+    /// This is the normal state of a stopped VM -- HCS destroys a compute
+    /// system as it exits -- and it is also how a VM deleted outside VMLord
+    /// looks, because nothing distinguishes the two through HCS alone.
+    Absent,
+    /// HCS knows the compute system but refused to open it.
+    Failed(String),
+}
+
+/// One known VM's reconnect result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconnectedVm {
+    pub mapping: VmComputeSystemMapping,
+    pub outcome: ReconnectOutcome,
+}
+
+/// The compute-system handles VMLord holds for the VMs it knows.
+///
+/// Dropping this closes every handle it holds, so it is meant to live for as
+/// long as the VMLord process does.
+#[derive(Default)]
+pub struct VmConnections {
+    systems: HashMap<Uuid, HcsSystem>,
+}
+
+impl VmConnections {
+    /// Returns the open compute system of `vm_id`, if one is held.
+    #[must_use]
+    pub fn handle(&self, vm_id: Uuid) -> Option<&HcsSystem> {
+        self.systems.get(&vm_id)
+    }
+
+    /// Reports whether a handle is held for `vm_id`.
+    #[must_use]
+    pub fn is_connected(&self, vm_id: Uuid) -> bool {
+        self.systems.contains_key(&vm_id)
+    }
+
+    /// Returns how many compute systems are currently held open.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.systems.len()
+    }
+
+    /// Reports whether no compute system is held open.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.systems.is_empty()
+    }
+}
+
+/// The outcome of a startup reconnect: the handles that were reopened, and
+/// what happened to every known VM.
+pub struct ReconnectReport {
+    pub connections: VmConnections,
+    pub outcomes: Vec<ReconnectedVm>,
+}
+
+/// Reopens a compute-system handle for every VM in `store`.
+///
+/// A VM that cannot be reconnected does not abort the others: reconnect runs
+/// at startup, where losing every VM because one of them is in a bad state
+/// would be worse than reporting that one. Only a failure to read the store
+/// itself is fatal, because then nothing is known at all.
+///
+/// Mappings whose compute system HCS does not report are kept: everything a VM
+/// is made of -- its disks, its stored `config.json` and this mapping --
+/// survives a stop, and [`crate::VmStartPipeline`] rebuilds the compute system
+/// from them. Dropping the mapping here would turn every stopped VM into a
+/// deleted one.
+pub fn reconnect_known_vms(store: &MetadataStore) -> Result<ReconnectReport, RepositoryError> {
+    reconnect_with(store, |mapping| {
+        HcsSystem::open_if_present(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL)
+    })
+}
+
+fn reconnect_with(
+    store: &MetadataStore,
+    open: impl Fn(&VmComputeSystemMapping) -> Result<Option<HcsSystem>, RepositoryError>,
+) -> Result<ReconnectReport, RepositoryError> {
+    let mappings = store.list().inspect_err(|error| {
+        log::error!("cannot reconnect to any VM: {error}");
+    })?;
+    log::info!("reconnecting to {} known VM(s)", mappings.len());
+
+    let mut connections = VmConnections::default();
+    let mut outcomes = Vec::with_capacity(mappings.len());
+
+    for mapping in mappings {
+        log::debug!(
+            "reconnecting to VM \"{}\" ({}) through HCS compute system \"{}\"",
+            mapping.vm_name,
+            mapping.vm_id,
+            mapping.hcs_compute_system_id
+        );
+        let outcome = match open(&mapping) {
+            Ok(Some(system)) => {
+                log::info!(
+                    "reconnected to VM \"{}\" ({})",
+                    mapping.vm_name,
+                    mapping.vm_id
+                );
+                connections.systems.insert(mapping.vm_id, system);
+                ReconnectOutcome::Reconnected
+            }
+            Ok(None) => {
+                log::warn!(
+                    "HCS does not report a compute system for VM \"{}\" ({}); \
+                     it is stopped or was deleted outside VMLord",
+                    mapping.vm_name,
+                    mapping.vm_id
+                );
+                ReconnectOutcome::Absent
+            }
+            Err(error) => {
+                log::error!(
+                    "failed to reconnect to VM \"{}\" ({}): {error}",
+                    mapping.vm_name,
+                    mapping.vm_id
+                );
+                ReconnectOutcome::Failed(error.to_string())
+            }
+        };
+        outcomes.push(ReconnectedVm { mapping, outcome });
+    }
+
+    log::info!(
+        "reconnected to {} of {} known VM(s); {} absent, {} failed",
+        connections.len(),
+        outcomes.len(),
+        count(&outcomes, &ReconnectOutcome::Absent),
+        outcomes
+            .iter()
+            .filter(|vm| matches!(vm.outcome, ReconnectOutcome::Failed(_)))
+            .count()
+    );
+
+    Ok(ReconnectReport {
+        connections,
+        outcomes,
+    })
+}
+
+fn count(outcomes: &[ReconnectedVm], outcome: &ReconnectOutcome) -> usize {
+    outcomes.iter().filter(|vm| &vm.outcome == outcome).count()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicU64, Ordering},
+        },
+    };
+
+    use uuid::Uuid;
+    use vmlord_core::RepositoryError;
+
+    use super::{ReconnectOutcome, reconnect_known_vms, reconnect_with};
+    use crate::metadata::{MetadataStore, VmComputeSystemMapping};
+
+    struct TempRoot(PathBuf);
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_root(label: &str) -> TempRoot {
+        static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "vmlord-reconnect-test-{label}-{}-{}",
+            std::process::id(),
+            NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&path).expect("test root should be created");
+        TempRoot(path)
+    }
+
+    fn mapping(vm_name: &str) -> VmComputeSystemMapping {
+        let vm_id = Uuid::new_v4();
+        VmComputeSystemMapping {
+            vm_id,
+            vm_name: vm_name.into(),
+            hcs_compute_system_id: format!("vmlord-{}", vm_id.as_simple()),
+        }
+    }
+
+    struct Fixture {
+        _root: TempRoot,
+        store: MetadataStore,
+        opened: Arc<Mutex<Vec<String>>>,
+    }
+
+    fn fixture(label: &str, mappings: &[VmComputeSystemMapping]) -> Fixture {
+        let root = temp_root(label);
+        let store = MetadataStore::new(root.0.join("vm-mapping.json"));
+        for mapping in mappings {
+            store
+                .insert(mapping.clone())
+                .expect("mapping should be persisted");
+        }
+        Fixture {
+            store,
+            opened: Arc::new(Mutex::new(Vec::new())),
+            _root: root,
+        }
+    }
+
+    #[test]
+    fn an_empty_store_reconnects_to_nothing() {
+        let fixture = fixture("empty", &[]);
+
+        let report = reconnect_with(&fixture.store, |_| Ok(None))
+            .expect("an empty store should reconnect successfully");
+
+        assert!(report.outcomes.is_empty());
+        assert!(report.connections.is_empty());
+    }
+
+    #[test]
+    fn a_vm_hcs_no_longer_knows_is_reported_absent_and_stays_mapped() {
+        let dev = mapping("dev");
+        let fixture = fixture("absent", std::slice::from_ref(&dev));
+        let opened = Arc::clone(&fixture.opened);
+
+        let report = reconnect_with(&fixture.store, move |mapping| {
+            opened
+                .lock()
+                .unwrap()
+                .push(mapping.hcs_compute_system_id.clone());
+            Ok(None)
+        })
+        .expect("an absent compute system must not fail the reconnect");
+
+        assert_eq!(report.outcomes.len(), 1);
+        assert_eq!(report.outcomes[0].mapping, dev);
+        assert_eq!(report.outcomes[0].outcome, ReconnectOutcome::Absent);
+        assert!(!report.connections.is_connected(dev.vm_id));
+        assert_eq!(
+            fixture.opened.lock().unwrap().as_slice(),
+            std::slice::from_ref(&dev.hcs_compute_system_id)
+        );
+        assert_eq!(
+            fixture.store.find_by_vm_id(dev.vm_id).unwrap(),
+            Some(dev),
+            "a stopped VM is absent from HCS too, so its mapping must survive"
+        );
+    }
+
+    #[test]
+    fn a_failure_to_open_one_vm_does_not_abort_the_others() {
+        let broken = mapping("broken");
+        let healthy = mapping("healthy");
+        let fixture = fixture("failure", &[broken.clone(), healthy.clone()]);
+        let opened = Arc::clone(&fixture.opened);
+        let broken_id = broken.hcs_compute_system_id.clone();
+
+        let report = reconnect_with(&fixture.store, move |mapping| {
+            opened
+                .lock()
+                .unwrap()
+                .push(mapping.hcs_compute_system_id.clone());
+            if mapping.hcs_compute_system_id == broken_id {
+                return Err(RepositoryError::new("injected open failure"));
+            }
+            Ok(None)
+        })
+        .expect("a single failing VM must not fail the reconnect");
+
+        let outcomes: Vec<_> = report
+            .outcomes
+            .iter()
+            .map(|vm| (vm.mapping.vm_name.clone(), vm.outcome.clone()))
+            .collect();
+        assert_eq!(
+            outcomes,
+            vec![
+                (
+                    broken.vm_name,
+                    ReconnectOutcome::Failed("injected open failure".into())
+                ),
+                (healthy.vm_name, ReconnectOutcome::Absent),
+            ]
+        );
+        assert_eq!(fixture.opened.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn an_unreadable_store_fails_the_reconnect() {
+        let root = temp_root("corrupt");
+        let path = root.0.join("vm-mapping.json");
+        fs::write(&path, b"not json").unwrap();
+
+        let error = reconnect_known_vms(&MetadataStore::new(&path))
+            .err()
+            .expect("a corrupt store must fail the reconnect");
+
+        assert!(error.to_string().contains("parse metadata mapping"));
+    }
+}
