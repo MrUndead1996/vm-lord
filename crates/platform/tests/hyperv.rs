@@ -11,14 +11,14 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use uuid::Uuid;
-use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest};
+use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest, VmRepository};
 use vmlord_platform::{
-    HcsClient, HcsOperation, HcsSystem, HcsSystemState, MetadataStore, ReconnectOutcome,
-    VmComputeSystemMapping,
+    HcsClient, HcsOperation, HcsSystem, HcsSystemState, HcsVmRepository, MetadataStore,
+    ReconnectOutcome, VmComputeSystemMapping,
     VmCreationPipeline, VmDeletionPipeline, VmEventSink, VmForceStopPipeline, VmShutdownPipeline,
     VmStartPipeline, list_known_vms, open_by_vm_id, open_by_vm_name, reconnect_known_vms,
 };
@@ -54,6 +54,96 @@ fn opens_the_configured_hcs_compute_system() {
     let _operation = HcsOperation::new();
     let _system = HcsSystem::open(&vm_id, HCS_ACCESS_ALL)
         .expect("configured HCS compute system should be openable");
+}
+
+/// Exercises TASK-33's watch against the real Host Compute Service: creates a
+/// VM and starts it through the repository -- which holds its handle and
+/// registers its watch, exactly as production does -- then terminates it
+/// behind the repository's back and waits for the resulting exit diagnostic.
+///
+/// This is the only check that proves HCS calls back into VMLord at all --
+/// every other watch test exercises code that runs after the callback. The
+/// termination goes through `VmForceStopPipeline` directly rather than
+/// `HcsVmRepository::force_stop_vm`, because that method releases the
+/// repository's own handle -- and clears its watch's HCS callback
+/// registration -- synchronously on its own operation outcome, before HCS's
+/// asynchronous exit notification could ever arrive. That is correct
+/// production behaviour, not something to route around: a stop VMLord itself
+/// commanded needs no event to explain it. The watcher exists for exits
+/// VMLord did not command -- a guest powering itself off, with nothing to
+/// tell the repository to release its handle -- and terminating behind the
+/// repository's back is exactly that scenario. This test asserts only that
+/// the resulting diagnostic surfaces, not that the handle is released:
+/// releasing it is asserted by `watch::drain_events`'s own unit tests.
+///
+/// Set `VMLORD_TEST_IMAGE_PATH` to a real bootable ISO.
+///
+/// Run elevated with:
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact a_terminated_vm_reports_its_exit --nocapture`
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS and VMLORD_TEST_IMAGE_PATH set"]
+fn a_terminated_vm_reports_its_exit() {
+    let image_path = std::env::var("VMLORD_TEST_IMAGE_PATH")
+        .expect("VMLORD_TEST_IMAGE_PATH must point to a real ISO image");
+    let root = std::env::temp_dir().join(format!("vmlord-hcs-watch-e2e-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+
+    let request = VmCreateRequest {
+        name: format!("vmlord-e2e-watch-test-{}", std::process::id()),
+        image_path,
+        ram_mb: 2048,
+        disk_gb: 8,
+        cpu_cores: 2,
+        gpu_mode: GpuMode::None,
+        network_mode: NetworkMode::None,
+        username: "admin".into(),
+        password: "not used by a watch".into(),
+        ssh_enabled: false,
+        ssh_deploy_key: false,
+    };
+    let vm_name = request.name.clone();
+    // The same mapping file `HcsVmRepository::new` builds its own store from,
+    // so a termination issued through it is invisible to the repository.
+    let store = MetadataStore::new(root.join("vm-mapping.json"));
+
+    let mut repository = HcsVmRepository::new(root.clone());
+    repository
+        .initialize()
+        .expect("the HCS backend should initialize on a live host");
+    repository
+        .create_vm(request)
+        .expect("VM creation should succeed on an elevated Hyper-V host");
+    repository
+        .start_vm(&vm_name)
+        .expect("the created VM must start before its exit can be watched");
+
+    let terminated = VmForceStopPipeline::production().force_stop(&store, &vm_name);
+
+    // HCS delivers the exit asynchronously, on a thread of its own, after the
+    // termination operation has already completed.
+    let expected = format!("VM \"{vm_name}\" stopped");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut diagnostics = Vec::new();
+    while Instant::now() < deadline {
+        diagnostics.extend(repository.take_diagnostics());
+        if diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message == expected)
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let _ = fs::remove_dir_all(&root);
+
+    terminated.expect("a running VM must accept a forced stop");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message == expected),
+        "HCS must report the exit of a terminated compute system as a diagnostic; got {diagnostics:?}"
+    );
 }
 
 /// Exercises TASK-28's create pipeline end to end against the real Host
