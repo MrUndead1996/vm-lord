@@ -209,6 +209,12 @@ impl HcsSystem {
     }
 
     /// Terminates the compute system, e.g. to roll back a failed creation.
+    ///
+    /// Termination stops the VM's execution immediately, without involving the
+    /// guest. It does not destroy the compute system itself as long as the
+    /// system was created with `ShouldTerminateOnLastHandleClosed` set to
+    /// `false` (see the HCS configuration builder), so a terminated system
+    /// stays open-able and start-able.
     pub fn terminate(&self) -> Result<HcsOperation, RepositoryError> {
         log::debug!("terminating HCS compute system \"{}\"", self.id);
         let operation = HcsOperation::new();
@@ -224,6 +230,23 @@ impl HcsSystem {
             },
         )?;
         Ok(operation)
+    }
+
+    /// Terminates the compute system and waits up to `timeout` for HCS to
+    /// report the outcome.
+    ///
+    /// Unlike [`HcsSystem::shutdown_and_wait`], completion means the VM has
+    /// actually stopped: termination needs nothing from the guest.
+    pub fn terminate_and_wait(&self, timeout: Duration) -> Result<(), RepositoryError> {
+        self.terminate()?
+            .wait_for_completion(timeout)
+            .map(|_document| ())
+            .inspect_err(|error| {
+                log::error!(
+                    "the termination of HCS compute system \"{}\" failed: {error}",
+                    self.id
+                );
+            })
     }
 }
 
