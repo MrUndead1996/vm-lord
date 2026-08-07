@@ -122,9 +122,15 @@ letting the user discover it later.
 
 1. `require_initialized`.
 2. Resolve the mapping and read the VM's current state from `list_known_vms` —
-   the authoritative source, unlike the application layer's cached list. A VM
-   HCS reports as `Running` is refused: "VM \"x\" is running; stop it before
-   deleting it."
+   the authoritative source, unlike the application layer's cached list.
+
+   The check is an allow-list, not a deny-list: deletion proceeds only when HCS
+   reports no compute system at all (it destroys one as the VM stops, so a
+   stopped VM routinely has none), `Created`, or `Stopped`. `Running`, `Paused`
+   and any state this VMLord does not recognise are refused, and the refusal
+   names the state HCS reported. A paused or saved VM holds live guest state
+   just as a running one does, and an unrecognised state is exactly the case
+   that must fail closed, because deletion cannot be undone.
 3. Run the pipeline against `layout::vm_directory(&self.storage_root, name)`.
 4. On success, drop any held compute-system handle with
    `self.connections.remove(mapping.vm_id)`.
