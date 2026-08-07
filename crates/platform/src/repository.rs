@@ -14,7 +14,7 @@ use vmlord_core::{
 
 use crate::{
     HcsClient, HcsSystem, KnownVm, MetadataStore, VmComputeSystemMapping, VmConnections,
-    VmCreationPipeline, VmDeletionPipeline, VmForceStopPipeline, VmShutdownPipeline,
+    VmCreationPipeline, VmDeletionPipeline, VmEventSink, VmForceStopPipeline, VmShutdownPipeline,
     VmStartPipeline,
     hcs::{HCS_ACCESS_ALL, HcsSystemState},
     hcs_config::{self, VmTopology},
@@ -38,6 +38,7 @@ pub struct HcsVmRepository {
     store: MetadataStore,
     storage_root: PathBuf,
     connections: VmConnections,
+    events: VmEventSink,
     creation: VmCreationPipeline,
     start: VmStartPipeline,
     shutdown: VmShutdownPipeline,
@@ -59,6 +60,7 @@ impl HcsVmRepository {
             store: MetadataStore::new(storage_root.join(MAPPING_FILE_NAME)),
             storage_root,
             connections: VmConnections::default(),
+            events: VmEventSink::default(),
             creation: VmCreationPipeline::production(),
             start: VmStartPipeline::production(),
             shutdown: VmShutdownPipeline::production(),
@@ -123,13 +125,30 @@ impl HcsVmRepository {
             .push(Diagnostic { level, message });
     }
 
-    /// Reopens and holds the compute system of a VM that has just started.
+    /// Reopens and holds the compute system of a VM that has just started, and
+    /// starts watching its HCS events.
     ///
-    /// A start that HCS accepted is not undone by a failure to hold its
-    /// handle, so this only warns: the VM runs either way.
+    /// A start that HCS accepted is not undone by a failure to hold or watch
+    /// its handle, so this only warns: the VM runs either way.
     fn hold_started_system(&mut self, mapping: &VmComputeSystemMapping) {
         match HcsSystem::open_if_present(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL) {
-            Ok(Some(system)) => self.connections.insert(mapping.vm_id, system),
+            Ok(Some(system)) => {
+                if let Err(error) = self.connections.insert(mapping, system) {
+                    log::warn!(
+                        "VM \"{}\" ({}) started and is held, but VMLord cannot watch \
+                         its HCS events: {error}",
+                        mapping.vm_name,
+                        mapping.vm_id
+                    );
+                    self.push_diagnostic(
+                        DiagnosticLevel::Warning,
+                        format!(
+                            "VM \"{}\" started, but VMLord cannot report its HCS events",
+                            mapping.vm_name
+                        ),
+                    );
+                }
+            }
             Ok(None) => log::warn!(
                 "VM \"{}\" ({}) started, but HCS no longer reports its compute system",
                 mapping.vm_name,
@@ -277,7 +296,7 @@ impl VmRepository for HcsVmRepository {
         }
 
         self.client.initialize()?;
-        let report = reconnect_known_vms(&self.store)?;
+        let report = reconnect_known_vms(&self.store, &self.events)?;
         for reconnected in &report.outcomes {
             if let ReconnectOutcome::Failed(error) = &reconnected.outcome {
                 self.push_diagnostic(

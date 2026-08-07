@@ -19,7 +19,7 @@ use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest};
 use vmlord_platform::{
     HcsClient, HcsOperation, HcsSystem, HcsSystemState, MetadataStore, ReconnectOutcome,
     VmComputeSystemMapping,
-    VmCreationPipeline, VmDeletionPipeline, VmForceStopPipeline, VmShutdownPipeline,
+    VmCreationPipeline, VmDeletionPipeline, VmEventSink, VmForceStopPipeline, VmShutdownPipeline,
     VmStartPipeline, list_known_vms, open_by_vm_id, open_by_vm_name, reconnect_known_vms,
 };
 
@@ -418,7 +418,7 @@ fn reconnects_to_a_created_vm() {
         .create(&store, &request, &vm_directory)
         .expect("VM creation should succeed on an elevated Hyper-V host");
 
-    let first = reconnect_known_vms(&store);
+    let first = reconnect_known_vms(&store, &VmEventSink::default());
     let first_report = first.as_ref().ok().map(|report| {
         (
             report.connections.is_connected(mapping.vm_id),
@@ -437,7 +437,7 @@ fn reconnects_to_a_created_vm() {
             .and_then(|operation| operation.wait_for_completion(Duration::from_secs(30)));
     }
 
-    let second = reconnect_known_vms(&store);
+    let second = reconnect_known_vms(&store, &VmEventSink::default());
     let stored = store.find_by_vm_id(mapping.vm_id);
     let _ = fs::remove_dir_all(&root);
 
@@ -506,7 +506,7 @@ fn reconnects_to_a_running_vm() {
         .start(&store, &mapping.vm_name, &vm_directory)
         .expect("the created VM must start before a reconnect can be observed");
 
-    let reconnected = reconnect_known_vms(&store);
+    let reconnected = reconnect_known_vms(&store, &VmEventSink::default());
     // The handle the reconnect holds must not stand in the way of the actions
     // a reconnected VMLord performs on the VM, so the forced stop is issued
     // while that handle is still open.

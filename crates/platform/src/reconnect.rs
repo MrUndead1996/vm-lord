@@ -5,7 +5,7 @@
 //! known VM and keeps it for as long as VMLord runs, which is what makes a
 //! restarted VMLord the owner of its VMs again rather than an observer of them.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use uuid::Uuid;
 use vmlord_core::RepositoryError;
@@ -14,6 +14,7 @@ use crate::{
     HcsSystem,
     hcs::HCS_ACCESS_ALL,
     metadata::{MetadataStore, VmComputeSystemMapping},
+    watch::{SystemWatch, VmEventSink},
 };
 
 /// What reconnecting to a single known VM produced.
@@ -39,29 +40,91 @@ pub struct ReconnectedVm {
     pub outcome: ReconnectOutcome,
 }
 
-/// The compute-system handles VMLord holds for the VMs it knows.
+/// The compute-system handles VMLord holds for the VMs it knows, each watched
+/// for HCS events.
 ///
 /// Dropping this closes every handle it holds, so it is meant to live for as
 /// long as the VMLord process does.
 #[derive(Default)]
 pub struct VmConnections {
-    systems: HashMap<Uuid, HcsSystem>,
+    systems: HashMap<Uuid, WatchedSystem>,
+    events: VmEventSink,
+}
+
+/// A held compute system together with its event registration.
+struct WatchedSystem {
+    /// `None` when registration failed: the VM stays held and usable, just
+    /// unwatched.
+    watch: Option<SystemWatch>,
+    system: Arc<HcsSystem>,
 }
 
 impl VmConnections {
+    /// Creates connections that report their HCS events into `events`.
+    #[must_use]
+    pub fn with_events(events: VmEventSink) -> Self {
+        Self {
+            systems: HashMap::new(),
+            events,
+        }
+    }
+
     /// Returns the open compute system of `vm_id`, if one is held.
     #[must_use]
     pub fn handle(&self, vm_id: Uuid) -> Option<&HcsSystem> {
-        self.systems.get(&vm_id)
+        self.systems.get(&vm_id).map(|held| &*held.system)
     }
 
-    /// Starts holding `system` open for `vm_id`, closing any handle already
-    /// held for it.
+    /// Reports whether HCS events are actively watched for `vm_id`.
     ///
-    /// A VM started while VMLord runs needs the same handle a reconnected one
-    /// gets; without it, only VMs that survived a restart would be owned.
-    pub fn insert(&mut self, vm_id: Uuid, system: HcsSystem) {
-        self.systems.insert(vm_id, system);
+    /// `false` both for a VM that is not held and for one held but whose
+    /// registration failed -- [`VmConnections::insert`]'s `Err` case.
+    #[must_use]
+    pub fn is_watched(&self, vm_id: Uuid) -> bool {
+        self.systems
+            .get(&vm_id)
+            .is_some_and(|held| held.watch.is_some())
+    }
+
+    /// Starts holding `system` open for the VM in `mapping`, closing any handle
+    /// already held for it, and asks HCS to report its events.
+    ///
+    /// The system is held either way. `Err` means it is held but unwatched: a
+    /// running VM VMLord cannot watch is still a running VM VMLord owns, so
+    /// refusing to hold it would turn lost observability into lost control. The
+    /// caller reports the loss.
+    pub fn insert(
+        &mut self,
+        mapping: &VmComputeSystemMapping,
+        system: HcsSystem,
+    ) -> Result<(), RepositoryError> {
+        // Drop any watch already held for this VM before registering the new
+        // one: HCS has a single callback slot per compute system, so a guard
+        // dropped afterwards would clear the registration made here.
+        self.systems.remove(&mapping.vm_id);
+
+        // `HcsSystem` is neither `Send` nor `Sync`, so clippy's default lint
+        // suspects this `Arc` of crossing threads unsafely. It never does: the
+        // `Arc` only lets `VmConnections` and its `SystemWatch` share ownership
+        // of the same handle on this thread, per the amendment in Task 5's
+        // brief -- the HCS callback thread only touches `WatchContext`, never
+        // this `Arc` or the `HcsSystem` it wraps.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let system = Arc::new(system);
+        let registration =
+            SystemWatch::register(&system, mapping.vm_id, &mapping.vm_name, &self.events);
+        let failure = registration.as_ref().err().cloned();
+        self.systems.insert(
+            mapping.vm_id,
+            WatchedSystem {
+                watch: registration.ok(),
+                system,
+            },
+        );
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Closes and forgets the handle held for `vm_id`, if any.
@@ -112,14 +175,18 @@ pub struct ReconnectReport {
 /// survives a stop, and [`crate::VmStartPipeline`] rebuilds the compute system
 /// from them. Dropping the mapping here would turn every stopped VM into a
 /// deleted one.
-pub fn reconnect_known_vms(store: &MetadataStore) -> Result<ReconnectReport, RepositoryError> {
-    reconnect_with(store, |mapping| {
+pub fn reconnect_known_vms(
+    store: &MetadataStore,
+    events: &VmEventSink,
+) -> Result<ReconnectReport, RepositoryError> {
+    reconnect_with(store, events, |mapping| {
         HcsSystem::open_if_present(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL)
     })
 }
 
 fn reconnect_with(
     store: &MetadataStore,
+    events: &VmEventSink,
     open: impl Fn(&VmComputeSystemMapping) -> Result<Option<HcsSystem>, RepositoryError>,
 ) -> Result<ReconnectReport, RepositoryError> {
     let mappings = store.list().inspect_err(|error| {
@@ -127,7 +194,7 @@ fn reconnect_with(
     })?;
     log::info!("reconnecting to {} known VM(s)", mappings.len());
 
-    let mut connections = VmConnections::default();
+    let mut connections = VmConnections::with_events(events.clone());
     let mut outcomes = Vec::with_capacity(mappings.len());
 
     for mapping in mappings {
@@ -144,7 +211,13 @@ fn reconnect_with(
                     mapping.vm_name,
                     mapping.vm_id
                 );
-                connections.systems.insert(mapping.vm_id, system);
+                if let Err(error) = connections.insert(&mapping, system) {
+                    log::warn!(
+                        "reconnected to VM \"{}\" ({}) but cannot watch its HCS events: {error}",
+                        mapping.vm_name,
+                        mapping.vm_id
+                    );
+                }
                 ReconnectOutcome::Reconnected
             }
             Ok(None) => {
@@ -203,8 +276,9 @@ mod tests {
     use uuid::Uuid;
     use vmlord_core::RepositoryError;
 
-    use super::{ReconnectOutcome, reconnect_known_vms, reconnect_with};
+    use super::{ReconnectOutcome, VmConnections, reconnect_known_vms, reconnect_with};
     use crate::metadata::{MetadataStore, VmComputeSystemMapping};
+    use crate::watch::{HcsEventKind, HcsVmEvent, VmEventSink};
 
     struct TempRoot(PathBuf);
 
@@ -256,11 +330,42 @@ mod tests {
         }
     }
 
+    /// Registration writes into whichever sink the connections were built with,
+    /// so that sharing must be real rather than a copy. The registration itself
+    /// needs a live HCS handle and is covered by the ignored Hyper-V test.
+    #[test]
+    fn connections_queue_their_events_into_the_sink_they_were_given() {
+        let sink = VmEventSink::default();
+        let connections = VmConnections::with_events(sink.clone());
+
+        connections.events.push(HcsVmEvent {
+            vm_id: Uuid::new_v4(),
+            vm_name: "dev".into(),
+            kind: HcsEventKind::Exited,
+            details: None,
+        });
+
+        assert_eq!(sink.drain().0.len(), 1);
+    }
+
+    #[test]
+    fn a_reconnect_reports_through_the_sink_it_was_given() {
+        let dev = mapping("dev");
+        let fixture = fixture("sink", std::slice::from_ref(&dev));
+        let sink = VmEventSink::default();
+
+        let report = reconnect_known_vms(&fixture.store, &sink)
+            .expect("a reconnect with no live systems should succeed");
+
+        assert_eq!(report.outcomes.len(), 1);
+        assert!(report.connections.is_empty());
+    }
+
     #[test]
     fn an_empty_store_reconnects_to_nothing() {
         let fixture = fixture("empty", &[]);
 
-        let report = reconnect_with(&fixture.store, |_| Ok(None))
+        let report = reconnect_with(&fixture.store, &VmEventSink::default(), |_| Ok(None))
             .expect("an empty store should reconnect successfully");
 
         assert!(report.outcomes.is_empty());
@@ -273,7 +378,7 @@ mod tests {
         let fixture = fixture("absent", std::slice::from_ref(&dev));
         let opened = Arc::clone(&fixture.opened);
 
-        let report = reconnect_with(&fixture.store, move |mapping| {
+        let report = reconnect_with(&fixture.store, &VmEventSink::default(), move |mapping| {
             opened
                 .lock()
                 .unwrap()
@@ -305,7 +410,7 @@ mod tests {
         let opened = Arc::clone(&fixture.opened);
         let broken_id = broken.hcs_compute_system_id.clone();
 
-        let report = reconnect_with(&fixture.store, move |mapping| {
+        let report = reconnect_with(&fixture.store, &VmEventSink::default(), move |mapping| {
             opened
                 .lock()
                 .unwrap()
@@ -341,7 +446,7 @@ mod tests {
         let path = root.0.join("vm-mapping.json");
         fs::write(&path, b"not json").unwrap();
 
-        let error = reconnect_known_vms(&MetadataStore::new(&path))
+        let error = reconnect_known_vms(&MetadataStore::new(&path), &VmEventSink::default())
             .err()
             .expect("a corrupt store must fail the reconnect");
 
