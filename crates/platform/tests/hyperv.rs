@@ -19,8 +19,8 @@ use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest};
 use vmlord_platform::{
     HcsClient, HcsOperation, HcsSystem, HcsSystemState, MetadataStore, ReconnectOutcome,
     VmComputeSystemMapping,
-    VmCreationPipeline, VmForceStopPipeline, VmShutdownPipeline, VmStartPipeline, list_known_vms,
-    open_by_vm_id, open_by_vm_name, reconnect_known_vms,
+    VmCreationPipeline, VmDeletionPipeline, VmForceStopPipeline, VmShutdownPipeline,
+    VmStartPipeline, list_known_vms, open_by_vm_id, open_by_vm_name, reconnect_known_vms,
 };
 
 // `GENERIC_ALL`; matches the legacy AppSandbox backend's `hcs_vm.c` usage and
@@ -663,4 +663,67 @@ fn boot_and_shut_down(
     std::thread::sleep(boot_wait);
 
     VmShutdownPipeline::production().shutdown(store, "guest-shutdown-probe")
+}
+
+/// Exercises TASK-32's deletion against the real Host Compute Service: creates
+/// a VM, deletes it, and confirms nothing it was made of is left behind --
+/// neither the compute system, nor its directory, nor its metadata mapping.
+///
+/// Run elevated with:
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact deletes_a_created_vm_completely --nocapture`
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS enabled"]
+fn deletes_a_created_vm_completely() {
+    let root = std::env::temp_dir().join(format!("vmlord-hcs-delete-e2e-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+    let image_path = root.join("installer.iso");
+    fs::write(&image_path, b"placeholder installer media").expect("test image should be written");
+
+    let request = VmCreateRequest {
+        name: format!("vmlord-e2e-delete-test-{}", std::process::id()),
+        image_path: image_path.to_string_lossy().into_owned(),
+        ram_mb: 512,
+        disk_gb: 1,
+        cpu_cores: 1,
+        gpu_mode: GpuMode::None,
+        network_mode: NetworkMode::None,
+        username: "admin".into(),
+        password: "not used by create".into(),
+        ssh_enabled: false,
+        ssh_deploy_key: false,
+    };
+    let store = MetadataStore::new(root.join("vm-mapping.json"));
+    let vm_directory = root.join("vm");
+
+    let mapping = VmCreationPipeline::production()
+        .create(&store, &request, &vm_directory)
+        .expect("VM creation should succeed on an elevated Hyper-V host");
+    println!(
+        "created HCS compute system \"{}\" for VM {}",
+        mapping.hcs_compute_system_id, mapping.vm_id
+    );
+
+    let deleted = VmDeletionPipeline::production().delete(&store, &request.name, &vm_directory, true);
+
+    // Best-effort cleanup regardless of the assertions below.
+    let _ = fs::remove_dir_all(&root);
+
+    deleted.expect("deletion should succeed on an elevated Hyper-V host");
+    assert!(
+        !vm_directory.exists(),
+        "the VM directory must be gone once the VM is deleted"
+    );
+    assert!(
+        store
+            .find_by_vm_name(&request.name)
+            .expect("the store should be readable")
+            .is_none(),
+        "a deleted VM must no longer be known to VMLord"
+    );
+    assert!(
+        HcsSystem::open_if_present(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL)
+            .expect("HCS should answer whether it still knows the compute system")
+            .is_none(),
+        "HCS must no longer know the compute system of a deleted VM"
+    );
 }

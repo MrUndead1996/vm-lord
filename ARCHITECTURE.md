@@ -205,8 +205,7 @@ reports, with the state HCS gives for it, and reconciles that against
 `MetadataStore`'s persisted mappings. A mapping whose compute system HCS no
 longer reports keeps its place in the list with no state rather than being
 dropped. `platform::open_by_vm_id`/`open_by_vm_name` resolve a known VM
-to its `HcsSystem` handle through the same store. Remaining HCS lifecycle work
-(delete) still resolves a VM to its compute system through this store.
+to its `HcsSystem` handle through the same store.
 
 `platform::reconnect_known_vms` reopens one compute-system handle per VM in
 `MetadataStore` and hands them back in a `VmConnections` registry meant to live
@@ -245,6 +244,19 @@ over its own in-guest agent instead, so VMLord may need the same.
 `platform::VmForceStopPipeline` is that remaining option: it stops a known VM
 through `HcsTerminateComputeSystem`, which needs nothing from the guest, so its
 completion means the VM really has stopped.
+
+`platform::VmDeletionPipeline` removes everything a VM is made of: its compute
+system, the `config.json` creation wrote, its disks, and its `MetadataStore`
+mapping. Each step runs even if an earlier one failed -- a resource left behind
+is no reason to leave the others -- and the mapping is dropped last and only
+when nothing failed. That order is what keeps a partial failure recoverable: a
+VM whose resources are still partly present stays known to VMLord, stays listed,
+and can be deleted again, whereas dropping the mapping first would orphan files
+and compute systems the application can no longer reach. A running VM is refused
+rather than terminated under its guest, because deletion cannot be undone. The
+disks can be kept at the user's request, which leaves the VM's directory in
+place and therefore reserves its name; the image the VM was installed from is
+never touched.
 
 An HCS compute system is a runtime object, not a registered machine: it exists
 only while it is created or running, and HCS destroys it as it exits -- whether
