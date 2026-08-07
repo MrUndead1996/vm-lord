@@ -175,15 +175,20 @@ impl HcsVmRepository {
                 VmState::Stopped
             }
             Ok(None) => VmState::Stopped,
+            // Falling back to the compute system's presence keeps a running VM
+            // controllable when HCS will not say what state it is in; only a
+            // created-but-never-started VM is then misreported as running.
+            // This is logged rather than raised as a diagnostic because the
+            // VM list refreshes on a timer and would flood it.
             Err(error) => {
-                self.push_diagnostic(
-                    DiagnosticLevel::Warning,
-                    format!(
-                        "Cannot read the state of VM \"{}\": {error}",
-                        mapping.vm_name
-                    ),
+                log::warn!(
+                    "cannot read the state of VM \"{}\", assuming it runs \
+                     because HCS reports its compute system: {error}",
+                    mapping.vm_name
                 );
-                VmState::Stopped
+                VmState::Running {
+                    agent_status: AgentStatus::Unknown,
+                }
             }
         }
     }

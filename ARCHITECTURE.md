@@ -276,8 +276,12 @@ connections report that the backend does not support them.
 A VM's state comes from `HcsGetComputeSystemProperties`, not from the compute
 system's mere presence: creation leaves behind a `Created` system that has
 never executed anything, so a present system is asked what state it is in and
-only `Running` is reported as running. Whether a running guest has finished
-booting stays unobservable until the watch/event work lands.
+only `Running` is reported as running. The query must ask for
+`{"PropertyTypes":["Basic"]}`; a null query is accepted but answers with a
+document that carries no `State`. Should the state be unreadable anyway, the
+VM falls back to being reported as running, because a running VM the user
+cannot stop is worse than a stopped one shown as running. Whether a running
+guest has finished booting stays unobservable until the watch/event work lands.
 
 `platform::layout` decides where a VM's `config.json` and disks live, so
 creation, start and the repository cannot disagree about it. A VM name is used

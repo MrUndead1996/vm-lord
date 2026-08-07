@@ -288,24 +288,24 @@ impl HcsSystem {
     /// presence.
     pub fn state(&self, timeout: Duration) -> Result<HcsSystemState, RepositoryError> {
         let operation = HcsOperation::new();
-        // SAFETY: `self.handle` and `operation.0` are valid owned handles for
-        // the duration of this call. A null query requests the default
-        // properties, which include the state; HCS parses a non-null pointer
-        // as a JSON query document and rejects an empty string.
-        unsafe { HcsGetComputeSystemProperties(self.handle, operation.0, PCWSTR::null()) }
-            .map_err(|error| {
+        let query = HSTRING::from(basic_properties_query());
+        // SAFETY: `self.handle` and `operation.0` are valid owned handles, and
+        // `query` outlives the call.
+        unsafe { HcsGetComputeSystemProperties(self.handle, operation.0, &query) }.map_err(
+            |error| {
                 let error = windows_error("get compute system properties", Some(&self.id), error);
                 log::error!("{error}");
                 error
-            })?;
+            },
+        )?;
 
         let document = operation.wait_for_completion(timeout)?;
-        parse_system_state(&document).inspect(|state| {
-            log::debug!(
-                "HCS compute system \"{}\" is in state {state:?}",
-                self.id
-            );
-        })
+        log::debug!(
+            "HCS reports these properties for compute system \"{}\": {document}",
+            self.id
+        );
+        parse_system_state(&document)
+            .inspect(|state| log::debug!("HCS compute system \"{}\" is {state:?}", self.id))
     }
 }
 
@@ -326,6 +326,9 @@ pub enum HcsSystemState {
 }
 
 /// Reads the `State` field out of an HCS compute-system properties document.
+///
+/// HCS nests the properties of some system kinds under `Properties`, so both
+/// shapes are accepted before the document is declared stateless.
 fn parse_system_state(document: &str) -> Result<HcsSystemState, RepositoryError> {
     let value: serde_json::Value = serde_json::from_str(document).map_err(|error| {
         RepositoryError::new(format!(
@@ -333,10 +336,13 @@ fn parse_system_state(document: &str) -> Result<HcsSystemState, RepositoryError>
         ))
     })?;
     let state = value
-        .get("State")
+        .pointer("/State")
+        .or_else(|| value.pointer("/Properties/State"))
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| {
-            RepositoryError::new("HCS compute system properties carry no \"State\"")
+            RepositoryError::new(format!(
+                "HCS compute system properties carry no \"State\": {document}"
+            ))
         })?;
 
     Ok(match state {
@@ -395,6 +401,16 @@ impl Drop for HcsAllocatedString {
 /// pointer requests the default service properties instead.
 fn hcs_service_properties_query() -> PCWSTR {
     PCWSTR::null()
+}
+
+/// The property query passed to `HcsGetComputeSystemProperties`.
+///
+/// A null query does return a document, but one without a `State` field, so
+/// the basic property set has to be asked for explicitly. This is what the
+/// legacy AppSandbox backend queried too (`hcs_vm.c`), which is the only
+/// available statement of what HCS actually answers here.
+fn basic_properties_query() -> &'static str {
+    r#"{"PropertyTypes":["Basic"]}"#
 }
 
 /// The options document passed to `HcsShutDownComputeSystem`.
@@ -678,9 +694,20 @@ mod tests {
     use vmlord_core::RepositoryError;
 
     use super::{
-        HcsClient, HcsSystemState, hcs_service_properties_query, parse_enumerate_result,
-        parse_service_result, parse_system_state, shutdown_options, unsupported_shutdown_error,
+        HcsClient, HcsSystemState, basic_properties_query, hcs_service_properties_query,
+        parse_enumerate_result, parse_service_result, parse_system_state, shutdown_options,
+        unsupported_shutdown_error,
     };
+
+    #[test]
+    fn the_basic_property_query_is_a_valid_json_document() {
+        // A null query answers without a "State" field, so this document is
+        // what makes the state readable at all; it must stay parsable.
+        let query: serde_json::Value = serde_json::from_str(basic_properties_query())
+            .expect("the property query must be valid JSON");
+
+        assert_eq!(query["PropertyTypes"], serde_json::json!(["Basic"]));
+    }
 
     #[test]
     fn system_state_maps_every_state_hcs_reports() {
