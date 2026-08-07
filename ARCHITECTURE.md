@@ -201,9 +201,10 @@ its HCS compute-system id as a single JSON document. HCS lifecycle work
 system through this store instead of re-deriving the mapping.
 
 `platform::list_known_vms` enumerates every compute system HCS currently
-reports and reconciles it against `MetadataStore`'s persisted mappings,
-flagging mappings whose compute system HCS no longer reports rather than
-dropping them. `platform::open_by_vm_id`/`open_by_vm_name` resolve a known VM
+reports, with the state HCS gives for it, and reconciles that against
+`MetadataStore`'s persisted mappings. A mapping whose compute system HCS no
+longer reports keeps its place in the list with no state rather than being
+dropped. `platform::open_by_vm_id`/`open_by_vm_name` resolve a known VM
 to its `HcsSystem` handle through the same store. Remaining HCS lifecycle work
 (delete) still resolves a VM to its compute system through this store.
 
@@ -273,15 +274,16 @@ remaining migration tasks land: GPU mode, network mode, guest IP address and SSH
 port are `None`, guest agent status is `Unknown`, and display and SSH
 connections report that the backend does not support them.
 
-A VM's state comes from `HcsGetComputeSystemProperties`, not from the compute
-system's mere presence: creation leaves behind a `Created` system that has
-never executed anything, so a present system is asked what state it is in and
-only `Running` is reported as running. The query must ask for
-`{"PropertyTypes":["Basic"]}`; a null query is accepted but answers with a
-document that carries no `State`. Should the state be unreadable anyway, the
-VM falls back to being reported as running, because a running VM the user
-cannot stop is worse than a stopped one shown as running. Whether a running
-guest has finished booting stays unobservable until the watch/event work lands.
+A VM's state comes from the state HCS reports for each compute system in
+`HcsEnumerateComputeSystems`, not from the compute system's mere presence:
+creation leaves behind a `Created` system that has never executed anything, so
+only `Running` is reported as running. The enumeration is the right source
+because it is the only one that answers for a `Created` system at all --
+`HcsGetComputeSystemProperties` on one fails outright -- and because it is a
+single call VMLord already makes for the whole list. A system listed without a
+state is assumed to be running, since a running VM the user cannot stop is
+worse than a stopped one shown as running. Whether a running guest has finished
+booting stays unobservable until the watch/event work lands.
 
 `platform::layout` decides where a VM's `config.json` and disks live, so
 creation, start and the repository cannot disagree about it. A VM name is used

@@ -5,7 +5,7 @@
 //! compute-system handles, and maps each repository operation onto the
 //! pipeline that already implements it.
 
-use std::{fs, path::PathBuf, sync::Mutex, time::Duration};
+use std::{fs, path::PathBuf, sync::Mutex};
 
 use vmlord_core::{
     AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError,
@@ -26,10 +26,6 @@ use crate::{
 const MAPPING_FILE_NAME: &str = "vm-mapping.json";
 
 const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
-
-/// A property query is answered from HCS's own bookkeeping, so it returns
-/// promptly; the bound only guards against a wedged Host Compute Service.
-const STATE_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Every VM VMLord creates today is a Linux guest; the native backend has no
 /// other guest kind to report yet.
@@ -113,14 +109,14 @@ impl HcsVmRepository {
     }
 
     fn summary(&self, known: KnownVm) -> VmSummary {
-        let KnownVm { mapping, present } = known;
+        let KnownVm { mapping, state } = known;
         let topology = self.topology(&mapping).unwrap_or(VmTopology {
             ram_mb: 0,
             cpu_cores: 0,
         });
         let disk_gb = self.disk_gb(&mapping);
 
-        let state = self.state(&mapping, present);
+        let state = vm_state(&mapping, state);
 
         VmSummary {
             name: mapping.vm_name,
@@ -135,61 +131,6 @@ impl HcsVmRepository {
             network_mode: NetworkMode::None,
             ip_address: None,
             ssh_port: None,
-        }
-    }
-
-    /// Reports the state of a VM whose compute system HCS does or does not
-    /// currently know.
-    ///
-    /// A compute system existing is not the same as its VM running: creation
-    /// leaves behind a `Created` system that has never executed anything, so a
-    /// present system is asked what state it is in. An absent one needs no
-    /// question -- HCS destroys a compute system as it stops.
-    ///
-    /// Whether a running guest has finished booting is not observable until the
-    /// watch/event work lands, so the agent status stays unknown.
-    fn state(&self, mapping: &VmComputeSystemMapping, present: bool) -> VmState {
-        if !present {
-            return VmState::Stopped;
-        }
-
-        let state = HcsSystem::open_if_present(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL)
-            .and_then(|system| {
-                system.map_or(Ok(None), |system| {
-                    system.state(STATE_QUERY_TIMEOUT).map(Some)
-                })
-            });
-        match state {
-            Ok(Some(HcsSystemState::Running)) => VmState::Running {
-                agent_status: AgentStatus::Unknown,
-            },
-            // A created-but-never-started system, a paused one, and one that
-            // has stopped without being destroyed yet are all "not running" as
-            // far as the VM list is concerned.
-            Ok(Some(state)) => {
-                log::debug!(
-                    "VM \"{}\" ({}) is listed as stopped because HCS reports {state:?}",
-                    mapping.vm_name,
-                    mapping.vm_id
-                );
-                VmState::Stopped
-            }
-            Ok(None) => VmState::Stopped,
-            // Falling back to the compute system's presence keeps a running VM
-            // controllable when HCS will not say what state it is in; only a
-            // created-but-never-started VM is then misreported as running.
-            // This is logged rather than raised as a diagnostic because the
-            // VM list refreshes on a timer and would flood it.
-            Err(error) => {
-                log::warn!(
-                    "cannot read the state of VM \"{}\", assuming it runs \
-                     because HCS reports its compute system: {error}",
-                    mapping.vm_name
-                );
-                VmState::Running {
-                    agent_status: AgentStatus::Unknown,
-                }
-            }
         }
     }
 
@@ -262,6 +203,33 @@ impl HcsVmRepository {
             log::error!("{error}");
             error
         })
+    }
+}
+
+/// Maps what HCS reports about a compute system onto the VM state the
+/// application layer works with.
+///
+/// A compute system existing is not the same as its VM running: creation
+/// leaves behind a `Created` system that has never executed anything, and a
+/// `Paused` or already-`Stopped` system is not running either. Only `Running`
+/// is running.
+///
+/// Whether a running guest has finished booting is not observable until the
+/// watch/event work lands, so the agent status stays unknown.
+fn vm_state(mapping: &VmComputeSystemMapping, state: Option<HcsSystemState>) -> VmState {
+    match state {
+        Some(HcsSystemState::Running) => VmState::Running {
+            agent_status: AgentStatus::Unknown,
+        },
+        Some(other) => {
+            log::debug!(
+                "VM \"{}\" ({}) is listed as stopped because HCS reports {other:?}",
+                mapping.vm_name,
+                mapping.vm_id
+            );
+            VmState::Stopped
+        }
+        None => VmState::Stopped,
     }
 }
 

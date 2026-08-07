@@ -5,42 +5,53 @@ use uuid::Uuid;
 use vmlord_core::RepositoryError;
 
 use crate::{
-    hcs::{HcsClient, HcsSystem},
+    hcs::{HcsClient, HcsSystem, HcsSystemState, HcsSystemSummary},
     metadata::{MetadataStore, VmComputeSystemMapping},
 };
 
-/// A VMLord VM mapping together with whether HCS currently reports a live
-/// compute system for it.
+/// A VMLord VM mapping together with what HCS currently reports about it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KnownVm {
     pub mapping: VmComputeSystemMapping,
-    pub present: bool,
+    /// The state HCS reports for the VM's compute system.
+    ///
+    /// `None` means HCS does not report the compute system at all, which is
+    /// the normal state of every stopped VM: HCS destroys a compute system as
+    /// it stops.
+    pub state: Option<HcsSystemState>,
+}
+
+impl KnownVm {
+    /// Reports whether HCS currently knows the VM's compute system.
+    #[must_use]
+    pub fn is_present(&self) -> bool {
+        self.state.is_some()
+    }
 }
 
 /// Lists every VM known to `store`, reconciled against the compute systems
 /// HCS currently reports.
 ///
 /// A mapping whose compute system HCS no longer reports is still returned
-/// (with `present: false`) rather than dropped: HCS destroys a compute system
-/// as it stops, so that is the normal state of every stopped VM, not a
-/// discrepancy.
+/// (with no state) rather than dropped: HCS destroys a compute system as it
+/// stops, so that is the normal state of every stopped VM, not a discrepancy.
 pub fn list_known_vms(
     client: &HcsClient,
     store: &MetadataStore,
 ) -> Result<Vec<KnownVm>, RepositoryError> {
-    let live_ids = client.enumerate_system_ids()?;
+    let live = client.enumerate_systems()?;
     let mappings = store.list()?;
-    Ok(reconcile(&live_ids, mappings))
+    Ok(reconcile(&live, mappings))
 }
 
-fn reconcile(live_ids: &[String], mappings: Vec<VmComputeSystemMapping>) -> Vec<KnownVm> {
+fn reconcile(live: &[HcsSystemSummary], mappings: Vec<VmComputeSystemMapping>) -> Vec<KnownVm> {
     mappings
         .into_iter()
         .map(|mapping| {
-            let present = live_ids
+            let Some(system) = live
                 .iter()
-                .any(|id| id == &mapping.hcs_compute_system_id);
-            if !present {
+                .find(|system| system.id == mapping.hcs_compute_system_id)
+            else {
                 // Every listing of a stopped VM lands here, so this stays at
                 // debug: HCS destroying a compute system as it stops is the
                 // expected outcome, not something to warn about.
@@ -51,8 +62,29 @@ fn reconcile(live_ids: &[String], mappings: Vec<VmComputeSystemMapping>) -> Vec<
                     mapping.vm_name,
                     mapping.vm_id
                 );
+                return KnownVm {
+                    mapping,
+                    state: None,
+                };
+            };
+
+            // HCS has always reported a state alongside the id; a system
+            // listed without one is taken to be running, because a running VM
+            // the user cannot stop is worse than a stopped one shown as
+            // running.
+            let state = system.state.clone().unwrap_or_else(|| {
+                log::warn!(
+                    "HCS reports compute system \"{}\" of VM \"{}\" without a state; \
+                     assuming it runs",
+                    mapping.hcs_compute_system_id,
+                    mapping.vm_name
+                );
+                HcsSystemState::Running
+            });
+            KnownVm {
+                mapping,
+                state: Some(state),
             }
-            KnownVm { mapping, present }
         })
         .collect()
 }
@@ -104,7 +136,7 @@ mod tests {
 
     use uuid::Uuid;
 
-    use super::{KnownVm, open_by_vm_id, open_by_vm_name, reconcile};
+    use super::{HcsSystemState, HcsSystemSummary, KnownVm, open_by_vm_id, open_by_vm_name, reconcile};
     use crate::metadata::{MetadataStore, VmComputeSystemMapping};
 
     fn temporary_mapping_file() -> std::path::PathBuf {
@@ -126,32 +158,70 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reconcile_marks_mappings_present_when_hcs_reports_them() {
-        let present = mapping(Uuid::new_v4(), "dev-linux", "vmlord-1");
-        let missing = mapping(Uuid::new_v4(), "dev-other", "vmlord-2");
-        let live_ids = vec!["vmlord-1".to_string()];
+    fn live(id: &str, state: HcsSystemState) -> HcsSystemSummary {
+        HcsSystemSummary {
+            id: id.into(),
+            state: Some(state),
+        }
+    }
 
-        let result = reconcile(&live_ids, vec![present.clone(), missing.clone()]);
+    #[test]
+    fn reconcile_carries_the_state_hcs_reports_for_each_mapping() {
+        let running = mapping(Uuid::new_v4(), "dev-linux", "vmlord-1");
+        // A created-but-never-started VM is reported by HCS just like a
+        // running one; only its state tells them apart.
+        let created = mapping(Uuid::new_v4(), "dev-fresh", "vmlord-2");
+        let missing = mapping(Uuid::new_v4(), "dev-other", "vmlord-3");
+        let live = vec![
+            live("vmlord-1", HcsSystemState::Running),
+            live("vmlord-2", HcsSystemState::Created),
+        ];
+
+        let result = reconcile(
+            &live,
+            vec![running.clone(), created.clone(), missing.clone()],
+        );
 
         assert_eq!(
             result,
             vec![
                 KnownVm {
-                    mapping: present,
-                    present: true
+                    mapping: running,
+                    state: Some(HcsSystemState::Running),
+                },
+                KnownVm {
+                    mapping: created,
+                    state: Some(HcsSystemState::Created),
                 },
                 KnownVm {
                     mapping: missing,
-                    present: false
+                    state: None,
                 },
             ]
         );
+        assert!(result[0].is_present());
+        assert!(!result[2].is_present());
+    }
+
+    #[test]
+    fn reconcile_assumes_a_system_listed_without_a_state_runs() {
+        let dev = mapping(Uuid::new_v4(), "dev-linux", "vmlord-1");
+        let live = vec![HcsSystemSummary {
+            id: "vmlord-1".into(),
+            state: None,
+        }];
+
+        let result = reconcile(&live, vec![dev]);
+
+        assert_eq!(result[0].state, Some(HcsSystemState::Running));
     }
 
     #[test]
     fn reconcile_is_empty_for_no_mappings() {
-        assert_eq!(reconcile(&["vmlord-1".to_string()], Vec::new()), Vec::new());
+        assert_eq!(
+            reconcile(&[live("vmlord-1", HcsSystemState::Running)], Vec::new()),
+            Vec::new()
+        );
     }
 
     #[test]

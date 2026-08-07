@@ -31,7 +31,7 @@ pub use error::hresult_to_repository_error;
 pub use event::{EventWaitResult, WindowsEvent};
 pub use force_stop::VmForceStopPipeline;
 pub use hcn::HcnNetwork;
-pub use hcs::{HcsClient, HcsOperation, HcsSystem, HcsSystemState};
+pub use hcs::{HcsClient, HcsOperation, HcsSystem, HcsSystemState, HcsSystemSummary};
 pub use metadata::{MetadataStore, VmComputeSystemMapping};
 pub use reconnect::{
     ReconnectOutcome, ReconnectReport, ReconnectedVm, VmConnections, reconnect_known_vms,

@@ -8,8 +8,7 @@ use windows::{
         System::HostComputeSystem::{
             HCS_OPERATION, HCS_SYSTEM, HcsCloseComputeSystem, HcsCloseOperation,
             HcsCreateComputeSystem, HcsCreateOperation, HcsEnumerateComputeSystems,
-            HcsGetComputeSystemProperties, HcsGetServiceProperties, HcsGrantVmAccess,
-            HcsOpenComputeSystem,
+            HcsGetServiceProperties, HcsGrantVmAccess, HcsOpenComputeSystem,
             HcsShutDownComputeSystem, HcsStartComputeSystem, HcsTerminateComputeSystem,
             HcsWaitForOperationResult,
         },
@@ -280,33 +279,14 @@ impl HcsSystem {
             })
     }
 
-    /// Asks HCS what state the compute system is in.
-    ///
-    /// A compute system existing is not the same as its VM running: creation
-    /// leaves a `Created` system behind that has never executed anything, so
-    /// the state has to be asked for rather than inferred from the system's
-    /// presence.
-    pub fn state(&self, timeout: Duration) -> Result<HcsSystemState, RepositoryError> {
-        let operation = HcsOperation::new();
-        let query = HSTRING::from(basic_properties_query());
-        // SAFETY: `self.handle` and `operation.0` are valid owned handles, and
-        // `query` outlives the call.
-        unsafe { HcsGetComputeSystemProperties(self.handle, operation.0, &query) }.map_err(
-            |error| {
-                let error = windows_error("get compute system properties", Some(&self.id), error);
-                log::error!("{error}");
-                error
-            },
-        )?;
+}
 
-        let document = operation.wait_for_completion(timeout)?;
-        log::debug!(
-            "HCS reports these properties for compute system \"{}\": {document}",
-            self.id
-        );
-        parse_system_state(&document)
-            .inspect(|state| log::debug!("HCS compute system \"{}\" is {state:?}", self.id))
-    }
+/// One compute system HCS currently reports.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HcsSystemSummary {
+    pub id: String,
+    /// The state HCS reported, or `None` when the entry carried none.
+    pub state: Option<HcsSystemState>,
 }
 
 /// The state HCS reports for a compute system.
@@ -325,33 +305,14 @@ pub enum HcsSystemState {
     Other(String),
 }
 
-/// Reads the `State` field out of an HCS compute-system properties document.
-///
-/// HCS nests the properties of some system kinds under `Properties`, so both
-/// shapes are accepted before the document is declared stateless.
-fn parse_system_state(document: &str) -> Result<HcsSystemState, RepositoryError> {
-    let value: serde_json::Value = serde_json::from_str(document).map_err(|error| {
-        RepositoryError::new(format!(
-            "HCS compute system properties are not valid JSON: {error}"
-        ))
-    })?;
-    let state = value
-        .pointer("/State")
-        .or_else(|| value.pointer("/Properties/State"))
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| {
-            RepositoryError::new(format!(
-                "HCS compute system properties carry no \"State\": {document}"
-            ))
-        })?;
-
-    Ok(match state {
+fn parse_system_state(state: &str) -> HcsSystemState {
+    match state {
         "Created" => HcsSystemState::Created,
         "Running" => HcsSystemState::Running,
         "Paused" => HcsSystemState::Paused,
         "Stopped" => HcsSystemState::Stopped,
         other => HcsSystemState::Other(other.to_owned()),
-    })
+    }
 }
 
 impl Drop for HcsSystem {
@@ -401,16 +362,6 @@ impl Drop for HcsAllocatedString {
 /// pointer requests the default service properties instead.
 fn hcs_service_properties_query() -> PCWSTR {
     PCWSTR::null()
-}
-
-/// The property query passed to `HcsGetComputeSystemProperties`.
-///
-/// A null query does return a document, but one without a `State` field, so
-/// the basic property set has to be asked for explicitly. This is what the
-/// legacy AppSandbox backend queried too (`hcs_vm.c`), which is the only
-/// available statement of what HCS actually answers here.
-fn basic_properties_query() -> &'static str {
-    r#"{"PropertyTypes":["Basic"]}"#
 }
 
 /// The options document passed to `HcsShutDownComputeSystem`.
@@ -494,7 +445,7 @@ fn query_hcs_enumerate_systems() -> Result<String, RepositoryError> {
 /// HCS's enumeration schema is not stable across versions beyond the `Id`
 /// field every entry carries, so entries without one are skipped rather than
 /// treated as a parse failure.
-fn parse_enumerate_result(document: &str) -> Result<Vec<String>, RepositoryError> {
+fn parse_enumerate_result(document: &str) -> Result<Vec<HcsSystemSummary>, RepositoryError> {
     if document.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -506,10 +457,15 @@ fn parse_enumerate_result(document: &str) -> Result<Vec<String>, RepositoryError
     Ok(entries
         .into_iter()
         .filter_map(|entry| {
-            entry
+            let id = entry
                 .get("Id")
+                .and_then(serde_json::Value::as_str)?
+                .to_owned();
+            let state = entry
+                .get("State")
                 .and_then(serde_json::Value::as_str)
-                .map(str::to_owned)
+                .map(parse_system_state);
+            Some(HcsSystemSummary { id, state })
         })
         .collect())
 }
@@ -644,16 +600,22 @@ impl HcsClient {
         })
     }
 
-    /// Lists the ids of every HCS compute system currently visible to this
-    /// process.
-    pub fn enumerate_system_ids(&self) -> Result<Vec<String>, RepositoryError> {
+    /// Lists every HCS compute system currently visible to this process,
+    /// with the state HCS reports for it.
+    ///
+    /// The enumeration carries the state, which is why VMLord reads it from
+    /// here rather than querying each system's properties: a compute system
+    /// that has been created but never started refuses a property query
+    /// outright, and that is precisely the state worth distinguishing.
+    pub fn enumerate_systems(&self) -> Result<Vec<HcsSystemSummary>, RepositoryError> {
         log::debug!("enumerating HCS compute systems");
         let document = self.enumerate_document().inspect_err(|error| {
             log::error!("failed to enumerate HCS compute systems: {error}");
         })?;
-        let ids = parse_enumerate_result(&document)?;
-        log::debug!("enumerated {} HCS compute system(s)", ids.len());
-        Ok(ids)
+        log::debug!("HCS enumeration returned: {document}");
+        let systems = parse_enumerate_result(&document)?;
+        log::debug!("enumerated {} HCS compute system(s)", systems.len());
+        Ok(systems)
     }
 
     #[cfg(not(test))]
@@ -694,20 +656,10 @@ mod tests {
     use vmlord_core::RepositoryError;
 
     use super::{
-        HcsClient, HcsSystemState, basic_properties_query, hcs_service_properties_query,
+        HcsClient, HcsSystemState, HcsSystemSummary, hcs_service_properties_query,
         parse_enumerate_result, parse_service_result, parse_system_state, shutdown_options,
         unsupported_shutdown_error,
     };
-
-    #[test]
-    fn the_basic_property_query_is_a_valid_json_document() {
-        // A null query answers without a "State" field, so this document is
-        // what makes the state readable at all; it must stay parsable.
-        let query: serde_json::Value = serde_json::from_str(basic_properties_query())
-            .expect("the property query must be valid JSON");
-
-        assert_eq!(query["PropertyTypes"], serde_json::json!(["Basic"]));
-    }
 
     #[test]
     fn system_state_maps_every_state_hcs_reports() {
@@ -721,16 +673,41 @@ mod tests {
                 HcsSystemState::Other("SavedAsTemplate".into()),
             ),
         ] {
-            let document = format!(r#"{{"Id":"vmlord-1","State":"{reported}"}}"#);
-
-            assert_eq!(parse_system_state(&document).unwrap(), expected);
+            assert_eq!(parse_system_state(reported), expected);
         }
     }
 
     #[test]
-    fn system_state_rejects_a_document_without_a_state() {
-        assert!(parse_system_state(r#"{"Id":"vmlord-1"}"#).is_err());
-        assert!(parse_system_state("not json").is_err());
+    fn enumerate_result_carries_the_state_of_each_system() {
+        // The shape `hcsdiag list` prints: HCS reports the state alongside
+        // the id, which is why no per-system property query is needed.
+        let document = r#"[{"Id":"vmlord-1","State":"Created","Owner":"VMLord"},
+                           {"Id":"vmlord-2","State":"Running"}]"#;
+
+        assert_eq!(
+            parse_enumerate_result(document).unwrap(),
+            vec![
+                HcsSystemSummary {
+                    id: "vmlord-1".into(),
+                    state: Some(HcsSystemState::Created),
+                },
+                HcsSystemSummary {
+                    id: "vmlord-2".into(),
+                    state: Some(HcsSystemState::Running),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn enumerate_result_reports_no_state_when_an_entry_carries_none() {
+        assert_eq!(
+            parse_enumerate_result(r#"[{"Id":"vmlord-1"}]"#).unwrap(),
+            vec![HcsSystemSummary {
+                id: "vmlord-1".into(),
+                state: None,
+            }]
+        );
     }
 
     #[test]
@@ -812,27 +789,26 @@ mod tests {
 
     #[test]
     fn enumerate_result_is_empty_for_an_empty_document() {
-        assert_eq!(parse_enumerate_result("").unwrap(), Vec::<String>::new());
-        assert_eq!(parse_enumerate_result("[]").unwrap(), Vec::<String>::new());
-    }
-
-    #[test]
-    fn enumerate_result_extracts_every_id() {
-        let document = r#"[{"Id":"vmlord-1","State":"Running"},{"Id":"vmlord-2","State":"Off"}]"#;
-
         assert_eq!(
-            parse_enumerate_result(document).unwrap(),
-            vec!["vmlord-1".to_string(), "vmlord-2".to_string()]
+            parse_enumerate_result("").unwrap(),
+            Vec::<HcsSystemSummary>::new()
+        );
+        assert_eq!(
+            parse_enumerate_result("[]").unwrap(),
+            Vec::<HcsSystemSummary>::new()
         );
     }
 
     #[test]
     fn enumerate_result_skips_entries_without_an_id() {
-        let document = r#"[{"State":"Running"},{"Id":"vmlord-2"}]"#;
+        let document = r#"[{"State":"Running"},{"Id":"vmlord-2","State":"Running"}]"#;
 
         assert_eq!(
             parse_enumerate_result(document).unwrap(),
-            vec!["vmlord-2".to_string()]
+            vec![HcsSystemSummary {
+                id: "vmlord-2".into(),
+                state: Some(HcsSystemState::Running),
+            }]
         );
     }
 
@@ -842,23 +818,26 @@ mod tests {
     }
 
     #[test]
-    fn enumerate_system_ids_returns_the_probes_parsed_ids() {
+    fn enumerate_systems_returns_the_probes_parsed_systems() {
         let client = HcsClient::with_enumerate_probe(|| {
-            Ok(r#"[{"Id":"vmlord-1"},{"Id":"vmlord-2"}]"#.to_string())
+            Ok(r#"[{"Id":"vmlord-1","State":"Running"}]"#.to_string())
         });
 
         assert_eq!(
-            client.enumerate_system_ids().unwrap(),
-            vec!["vmlord-1".to_string(), "vmlord-2".to_string()]
+            client.enumerate_systems().unwrap(),
+            vec![HcsSystemSummary {
+                id: "vmlord-1".into(),
+                state: Some(HcsSystemState::Running),
+            }]
         );
     }
 
     #[test]
-    fn enumerate_system_ids_propagates_a_probe_error() {
+    fn enumerate_systems_propagates_a_probe_error() {
         let client =
             HcsClient::with_enumerate_probe(|| Err(RepositoryError::new("HCS unavailable")));
 
-        let error = client.enumerate_system_ids().unwrap_err();
+        let error = client.enumerate_systems().unwrap_err();
 
         assert!(error.to_string().contains("HCS unavailable"));
     }
