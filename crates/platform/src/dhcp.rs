@@ -19,9 +19,15 @@ use std::{
 };
 
 use arcbox_dhcp::{DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DhcpConfig, DhcpPacket, DhcpServer};
+use uuid::Uuid;
 use vmlord_core::RepositoryError;
 
-use crate::{hcn_endpoint::EndpointAddress, host_dns, subnet::Ipv4Subnet};
+use crate::{
+    hcn_endpoint::{EndpointAddress, HcnEndpoint},
+    host_dns,
+    metadata::MetadataStore,
+    subnet::Ipv4Subnet,
+};
 
 /// How long a guest may keep its address.
 ///
@@ -283,6 +289,89 @@ impl Drop for DhcpService {
         }
         log::info!("the VMLord DHCP server stopped");
     }
+}
+
+/// How a start tells the DHCP server which address to serve the guest.
+///
+/// The store is passed because the first call of the process also has to seed
+/// the server with the endpoints of every VM already recorded.
+pub(crate) type DhcpRegistrar =
+    Box<dyn Fn(&MetadataStore, &str, &EndpointAddress) -> Result<(), RepositoryError>>;
+
+/// The production registrar: it starts the server on the first NAT VM and
+/// reserves the guest's address on every start after that.
+///
+/// The service is held by the closure rather than by a global: one
+/// [`crate::VmStartPipeline`] exists per process, which is exactly the lifetime
+/// the server is meant to have.
+pub(crate) fn registrar() -> DhcpRegistrar {
+    let service: Arc<Mutex<Option<DhcpService>>> = Arc::new(Mutex::new(None));
+    Box::new(move |store, mac, address| register(&service, store, mac, address))
+}
+
+fn register(
+    service: &Mutex<Option<DhcpService>>,
+    store: &MetadataStore,
+    mac: &str,
+    address: &EndpointAddress,
+) -> Result<(), RepositoryError> {
+    let mut service = service
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    if service.is_none() {
+        let started = DhcpService::start(address)?;
+        // A VMLord that was restarted while its VMs kept running has to know
+        // their addresses too: a guest renewing its lease is answered only if
+        // its MAC is reserved, and it never asks again if it is not.
+        seed(&started, store);
+        *service = Some(started);
+    }
+
+    service
+        .as_ref()
+        .expect("the service was started above")
+        .reserve(mac, address)
+}
+
+/// Reserves the address of every endpoint VMLord has recorded.
+///
+/// Best effort by design: an endpoint HNS no longer has, or one it reports
+/// nothing usable for, costs that VM its lease renewal -- it must not cost the
+/// VM being started its start.
+fn seed(service: &DhcpService, store: &MetadataStore) {
+    let mappings = match store.list() {
+        Ok(mappings) => mappings,
+        Err(error) => {
+            log::warn!(
+                "the recorded VMs could not be read, so only the VM being started is served \
+                 by DHCP: {error}"
+            );
+            return;
+        }
+    };
+
+    for mapping in mappings {
+        let Some(endpoint_id) = mapping.endpoint_id else {
+            continue;
+        };
+        if let Err(error) = seed_one(service, endpoint_id) {
+            log::warn!(
+                "the endpoint of VM \"{}\" could not be served by DHCP: {error}",
+                mapping.vm_name
+            );
+        }
+    }
+}
+
+fn seed_one(service: &DhcpService, endpoint_id: Uuid) -> Result<(), RepositoryError> {
+    let Some(endpoint) = HcnEndpoint::open_if_present(endpoint_id)? else {
+        return Ok(());
+    };
+    let Some(address) = endpoint.address()? else {
+        return Ok(());
+    };
+    service.reserve(&endpoint.mac_address()?, &address)
 }
 
 /// Binds the DHCP port.

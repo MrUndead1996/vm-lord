@@ -11,6 +11,7 @@ use vmlord_core::{NetworkMode, RepositoryError};
 
 use crate::{
     HcsClient, HcsSystem,
+    dhcp::{self, DhcpRegistrar},
     hcn::HcnNetwork,
     hcn_endpoint::{EndpointAddress, HcnEndpoint},
     cleanup,
@@ -32,6 +33,9 @@ const CREATE_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) struct VmNetworkAdapter {
     pub(crate) endpoint_id: Uuid,
     pub(crate) mac_address: String,
+    /// The address HNS assigned to the endpoint, which the DHCP server is what
+    /// actually delivers to the guest.
+    pub(crate) address: Option<EndpointAddress>,
 }
 
 /// Whether a start may reuse the endpoint the VM already has.
@@ -54,6 +58,7 @@ pub struct VmStartPipeline {
     access_granter: AccessGranter,
     system_starter: SystemStarter,
     endpoint_provider: EndpointProvider,
+    dhcp_registrar: DhcpRegistrar,
 }
 
 impl VmStartPipeline {
@@ -64,6 +69,7 @@ impl VmStartPipeline {
             access_granter: Box::new(grant_vm_access),
             system_starter: Box::new(start_hcs_system),
             endpoint_provider: Box::new(ensure_endpoint),
+            dhcp_registrar: dhcp::registrar(),
         }
     }
 
@@ -77,11 +83,14 @@ impl VmStartPipeline {
             EndpointPolicy,
         ) -> Result<VmNetworkAdapter, RepositoryError>
         + 'static,
+        dhcp_registrar: impl Fn(&MetadataStore, &str, &EndpointAddress) -> Result<(), RepositoryError>
+        + 'static,
     ) -> Self {
         Self {
             access_granter: Box::new(access_granter),
             system_starter: Box::new(system_starter),
             endpoint_provider: Box::new(endpoint_provider),
+            dhcp_registrar: Box::new(dhcp_registrar),
         }
     }
 
@@ -245,6 +254,21 @@ impl VmStartPipeline {
         if updated != configuration {
             self.write_configuration(mapping, vm_directory, &updated)?;
         }
+
+        // HNS NAT does not answer the guest's DHCP, so an endpoint whose
+        // address nothing serves leaves the guest with an adapter and no
+        // configuration at all -- which is exactly what asking for a network
+        // was meant to avoid.
+        let Some(address) = adapter.address.as_ref() else {
+            let error = RepositoryError::new(format!(
+                "HNS reports no address for endpoint {} of VM \"{}\", so the guest cannot be \
+                 told one over DHCP",
+                adapter.endpoint_id, mapping.vm_name
+            ));
+            log::error!("{error}");
+            return Err(error);
+        };
+        (self.dhcp_registrar)(store, &adapter.mac_address, address)?;
 
         log::info!(
             "VM \"{}\" ({}) starts on endpoint {}",
@@ -425,6 +449,7 @@ fn ensure_endpoint(
     Ok(VmNetworkAdapter {
         endpoint_id,
         mac_address: endpoint.mac_address()?,
+        address: endpoint.address()?,
     })
 }
 
@@ -514,6 +539,7 @@ mod tests {
 
     use super::{EndpointPolicy, VmNetworkAdapter, VmStartPipeline, attachment_paths};
     use crate::{
+        hcn_endpoint::EndpointAddress,
         hcs::HcsStartFailure,
         metadata::{MetadataStore, VmComputeSystemMapping},
     };
@@ -556,6 +582,14 @@ mod tests {
     const NEW_ENDPOINT_GUID: &str = "3F2B0C11-5C78-4C1B-9E2F-3A8B7D4C6E50";
     const MAC_ADDRESS: &str = "00-15-5D-01-02-03";
 
+    /// The address the test endpoint provider reports for its endpoint.
+    fn endpoint_address() -> EndpointAddress {
+        EndpointAddress {
+            ip_address: "172.22.42.5".to_owned(),
+            prefix_length: 24,
+        }
+    }
+
     /// The endpoint the test provider hands out when it replaces an occupied one.
     const REPLACEMENT_ENDPOINT_ID: Uuid =
         Uuid::from_u128(0x7a1c_44e0_5c78_4c1b_9e2f_3a8b_7d4c_6e50);
@@ -569,6 +603,7 @@ mod tests {
         grant: Arc<Mutex<Vec<(String, PathBuf)>>>,
         start: Arc<Mutex<Vec<(String, String)>>>,
         endpoint: Arc<Mutex<Vec<EndpointRequest>>>,
+        dhcp: Arc<Mutex<Vec<(String, EndpointAddress)>>>,
     }
 
     /// One call into the endpoint provider: the identifier it was offered and
@@ -580,6 +615,7 @@ mod tests {
     struct Behavior {
         fail_start: bool,
         fail_endpoint: bool,
+        fail_dhcp: bool,
         /// How many leading starts fail with an occupied endpoint before the
         /// starter accepts one.
         busy_starts: usize,
@@ -699,7 +735,23 @@ mod tests {
                     Ok(VmNetworkAdapter {
                         endpoint_id,
                         mac_address: MAC_ADDRESS.to_owned(),
+                        address: Some(endpoint_address()),
                     })
+                }
+            },
+            {
+                let calls = calls.clone();
+                move |_store: &MetadataStore, mac: &str, address: &EndpointAddress| {
+                    calls.steps.lock().unwrap().push("dhcp");
+                    calls
+                        .dhcp
+                        .lock()
+                        .unwrap()
+                        .push((mac.to_owned(), address.clone()));
+                    if behavior.fail_dhcp {
+                        return Err(RepositoryError::new("injected DHCP failure"));
+                    }
+                    Ok(())
                 }
             },
         )
@@ -879,7 +931,7 @@ mod tests {
 
         assert_eq!(
             calls.steps.lock().unwrap().clone(),
-            vec!["endpoint", "grant", "grant", "start"]
+            vec!["endpoint", "dhcp", "grant", "grant", "start"]
         );
     }
 
@@ -1024,7 +1076,10 @@ mod tests {
         );
         assert_eq!(
             calls.steps.lock().unwrap().clone(),
-            vec!["endpoint", "grant", "grant", "start", "endpoint", "grant", "grant", "start"]
+            vec![
+                "endpoint", "dhcp", "grant", "grant", "start", "endpoint", "dhcp", "grant",
+                "grant", "start"
+            ]
         );
     }
 
@@ -1153,5 +1208,99 @@ mod tests {
     #[test]
     fn attachment_paths_reject_malformed_json() {
         assert!(attachment_paths("not json").is_err());
+    }
+
+    #[test]
+    fn a_nat_vm_is_registered_with_dhcp_before_it_starts() {
+        let fixture = fixture_with("dhcp-registers", NetworkMode::Nat, None);
+        let calls = fixture.calls.clone();
+
+        pipeline(&calls, Behavior::default())
+            .start(&fixture.store, "dev", &fixture.vm_directory)
+            .expect("start should succeed");
+
+        assert_eq!(
+            *calls.dhcp.lock().unwrap(),
+            vec![(MAC_ADDRESS.to_owned(), endpoint_address())]
+        );
+        let steps = calls.steps.lock().unwrap().clone();
+        let dhcp = steps.iter().position(|step| *step == "dhcp").unwrap();
+        let start = steps.iter().position(|step| *step == "start").unwrap();
+        assert!(
+            dhcp < start,
+            "the guest must be able to get its address the moment it boots: {steps:?}"
+        );
+    }
+
+    #[test]
+    fn a_vm_without_a_network_is_not_registered_with_dhcp() {
+        let fixture = fixture("dhcp-none");
+        let calls = fixture.calls.clone();
+
+        pipeline(&calls, Behavior::default())
+            .start(&fixture.store, "dev", &fixture.vm_directory)
+            .expect("start should succeed");
+
+        assert!(calls.dhcp.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_dhcp_failure_fails_the_start() {
+        // A VM that asked for a network and cannot be told its address would
+        // come up with an adapter and no configuration at all.
+        let fixture = fixture_with("dhcp-fails", NetworkMode::Nat, None);
+        let calls = fixture.calls.clone();
+
+        let error = pipeline(
+            &calls,
+            Behavior {
+                fail_dhcp: true,
+                ..Behavior::default()
+            },
+        )
+        .start(&fixture.store, "dev", &fixture.vm_directory)
+        .expect_err("a start that cannot serve the guest its address must fail");
+
+        assert!(error.to_string().contains("injected DHCP failure"), "{error}");
+        assert!(calls.start.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_endpoint_without_an_address_fails_the_start() {
+        let fixture = fixture_with("dhcp-no-address", NetworkMode::Nat, None);
+        let calls = fixture.calls.clone();
+
+        let pipeline = VmStartPipeline::for_test(
+            |_id: &str, _path: &Path| Ok(()),
+            |_id: &str, _configuration: &str| Ok(()),
+            |_vm_name: &str, _recorded: Option<Uuid>, _policy: EndpointPolicy| {
+                Ok(VmNetworkAdapter {
+                    endpoint_id: NEW_ENDPOINT_ID,
+                    mac_address: MAC_ADDRESS.to_owned(),
+                    address: None,
+                })
+            },
+            {
+                let calls = calls.clone();
+                move |_store: &MetadataStore, mac: &str, address: &EndpointAddress| {
+                    calls
+                        .dhcp
+                        .lock()
+                        .unwrap()
+                        .push((mac.to_owned(), address.clone()));
+                    Ok(())
+                }
+            },
+        );
+
+        let error = pipeline
+            .start(&fixture.store, "dev", &fixture.vm_directory)
+            .expect_err("an endpoint HNS reports no address for must fail the start");
+
+        assert!(
+            error.to_string().contains(&NEW_ENDPOINT_ID.to_string()),
+            "{error}"
+        );
+        assert!(calls.dhcp.lock().unwrap().is_empty());
     }
 }
