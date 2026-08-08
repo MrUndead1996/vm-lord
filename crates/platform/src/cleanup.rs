@@ -27,6 +27,12 @@ const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 /// a Hyper-V host.
 pub(crate) type SystemTeardown = Box<dyn Fn(&str) -> Result<(), RepositoryError>>;
 
+/// How a pipeline reaches HNS to delete a VM's endpoint.
+///
+/// Injected for the same reason as [`SystemTeardown`]: a deletion has to be
+/// testable without a Hyper-V host.
+pub(crate) type EndpointTeardown = Box<dyn Fn(Uuid) -> Result<(), RepositoryError>>;
+
 /// Terminates the compute system `id`, treating one HCS does not know as
 /// already gone.
 ///
