@@ -19,7 +19,7 @@ use windows::Win32::System::HostComputeSystem::{
 pub struct HcsVmEvent {
     pub vm_id: Uuid,
     pub vm_name: String,
-    /// Which registration queued this, as counted by [`crate::VmConnections`].
+    /// Which registration queued this, as counted by the sink it was queued in.
     ///
     /// HCS delivers asynchronously, so an event can outlive the compute system
     /// it describes: the enumeration can already report a VM stopped, the user
@@ -67,7 +67,10 @@ fn classify(event_type: i32) -> HcsEventKind {
 
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 /// How many events are kept before the oldest are discarded.
@@ -79,7 +82,22 @@ const EVENT_CAPACITY: usize = 256;
 /// Cloning shares the queue: the callback holds one clone on HCS's thread while
 /// the repository drains through another on the main thread.
 #[derive(Clone, Default)]
-pub struct VmEventSink(Arc<Mutex<EventQueue>>);
+pub struct VmEventSink(Arc<SharedQueue>);
+
+#[derive(Default)]
+struct SharedQueue {
+    queue: Mutex<EventQueue>,
+    /// The generation the next [`VmEventSink::next_generation`] hands out.
+    ///
+    /// The counter belongs to the sink rather than to the connections that
+    /// stamp watches with it, because the sink is what mixes the events: every
+    /// event a single drain sees was queued into this one queue, so a counter
+    /// per queue is what makes the generations unique among exactly the events
+    /// that are ever compared. Two `VmConnections` sharing a sink -- which is
+    /// what a second `reconnect_known_vms` against the same sink builds --
+    /// therefore cannot hand out the same generation twice.
+    next_generation: AtomicU64,
+}
 
 #[derive(Default)]
 struct EventQueue {
@@ -107,6 +125,16 @@ impl VmEventSink {
         (queue.events.drain(..).collect(), dropped)
     }
 
+    /// Hands out a generation no other watch reporting into this sink has had.
+    ///
+    /// Only ever increases, and never on removal: a generation must not be
+    /// reused, because reuse is exactly what would let a stale event pass the
+    /// staleness check. `Relaxed` is enough -- the value is only ever compared
+    /// for equality, and nothing is published through it.
+    pub(crate) fn next_generation(&self) -> u64 {
+        self.0.next_generation.fetch_add(1, Ordering::Relaxed)
+    }
+
     /// Recovers a poisoned lock rather than propagating the panic.
     ///
     /// The queue holds plain owned data that a panic elsewhere cannot leave
@@ -114,6 +142,7 @@ impl VmEventSink {
     /// panicked would be worse than reading it.
     fn lock(&self) -> MutexGuard<'_, EventQueue> {
         self.0
+            .queue
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -140,7 +169,7 @@ pub(crate) struct DrainedEvents {
     pub diagnostics: Vec<Diagnostic>,
     /// The VMs whose held handle the events proved dead.
     pub released: Vec<Uuid>,
-    /// Whether a `ServiceDisconnect` released at least one handle.
+    /// Whether this drain saw a `ServiceDisconnect` it did not drop as stale.
     ///
     /// One flag rather than one entry per VM: the service disconnecting is a
     /// single event that HCS happens to deliver once per compute system, and it
@@ -186,8 +215,11 @@ pub(crate) fn drain_events(
         }
         if event.kind.releases_handle() {
             drained.released.push(event.vm_id);
-            drained.service_disconnected |= matches!(event.kind, HcsEventKind::ServiceDisconnect);
         }
+        // Outside the branch above on purpose: a disconnect happens to release
+        // the handle too, but what makes it worth reporting is the service being
+        // gone, which is true whether or not the handle went with it.
+        drained.service_disconnected |= matches!(event.kind, HcsEventKind::ServiceDisconnect);
         if let Some(diagnostic) = report(&event) {
             drained.diagnostics.push(diagnostic);
         }
@@ -527,6 +559,23 @@ mod tests {
 
         sink.push(event("later"));
         assert_eq!(sink.drain().1, 0);
+    }
+
+    /// The generations belong to the sink, so every clone of it counts from the
+    /// same place: that is what keeps two `VmConnections` around one queue from
+    /// stamping two watches with the same generation.
+    #[test]
+    fn a_sink_never_hands_out_the_same_generation_twice() {
+        let sink = VmEventSink::default();
+        let clone = sink.clone();
+
+        let generations = [
+            sink.next_generation(),
+            clone.next_generation(),
+            sink.next_generation(),
+        ];
+
+        assert_eq!(generations, [0, 1, 2]);
     }
 
     /// The callback and the drain hold the same sink from different threads;

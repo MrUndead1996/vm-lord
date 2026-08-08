@@ -51,15 +51,22 @@ pub struct ReconnectedVm {
 /// them is [`VmConnections::with_events`], which names the sink.
 pub struct VmConnections {
     systems: HashMap<Uuid, WatchedSystem>,
+    /// Both where the watches report and where their generations come from, so
+    /// that generations are unique per queue rather than per `VmConnections`.
     events: VmEventSink,
-    /// The generation the next [`VmConnections::insert`] stamps on its watch.
-    ///
-    /// Only ever increases, and never on removal: a generation must not be
-    /// reused, because reuse is exactly what would let a stale event pass the
-    /// staleness check. This is the only thing that registers a watch, so a
-    /// counter per `VmConnections` is enough to keep the values unique among
-    /// every event that can reach a drain.
-    next_generation: u64,
+}
+
+/// Whether an event carrying `event` was queued by a watch that the generation
+/// now `held` for its VM has replaced.
+///
+/// Split out of [`VmConnections::is_superseded`] so the comparison itself can be
+/// tested: holding a watch needs a live `HcsSystem`, which only Hyper-V hands
+/// out, so a test cannot reach a mismatch through the map. Getting this
+/// comparison backwards inverts the whole feature -- current events would be
+/// dropped and stale ones acted on -- which is exactly why it is worth a test of
+/// its own.
+fn supersedes(held: Option<u64>, event: u64) -> bool {
+    held.is_some_and(|held| held != event)
 }
 
 /// A held compute system together with its event registration.
@@ -80,7 +87,6 @@ impl VmConnections {
         Self {
             systems: HashMap::new(),
             events,
-            next_generation: 0,
         }
     }
 
@@ -100,9 +106,10 @@ impl VmConnections {
     /// `vm_id` now names a compute system the event knows nothing about.
     #[must_use]
     pub fn is_superseded(&self, vm_id: Uuid, generation: u64) -> bool {
-        self.systems
-            .get(&vm_id)
-            .is_some_and(|held| held.generation != generation)
+        supersedes(
+            self.systems.get(&vm_id).map(|held| held.generation),
+            generation,
+        )
     }
 
     /// Starts holding `system` open for the VM in `mapping`, closing any handle
@@ -130,8 +137,7 @@ impl VmConnections {
         // this `Arc` or the `HcsSystem` it wraps.
         #[allow(clippy::arc_with_non_send_sync)]
         let system = Arc::new(system);
-        let generation = self.next_generation;
-        self.next_generation += 1;
+        let generation = self.events.next_generation();
         let registration = SystemWatch::register(
             &system,
             mapping.vm_id,
@@ -312,7 +318,7 @@ mod tests {
     use uuid::Uuid;
     use vmlord_core::RepositoryError;
 
-    use super::{ReconnectOutcome, VmConnections, reconnect_known_vms, reconnect_with};
+    use super::{ReconnectOutcome, VmConnections, reconnect_known_vms, reconnect_with, supersedes};
     use crate::metadata::{MetadataStore, VmComputeSystemMapping};
     use crate::watch::{HcsEventKind, HcsVmEvent, VmEventSink};
 
@@ -393,6 +399,34 @@ mod tests {
         let connections = VmConnections::with_events(VmEventSink::default());
 
         assert!(!connections.is_superseded(Uuid::new_v4(), 3));
+    }
+
+    /// The comparison the whole staleness check rests on, exercised on all three
+    /// of its branches. An older generation is superseded, the generation still
+    /// held is not, and an id nothing is held for is not either -- inverting the
+    /// comparison has to fail here rather than ship green.
+    #[test]
+    fn only_a_generation_other_than_the_one_held_is_superseded() {
+        let sink = VmEventSink::default();
+        let older = sink.next_generation();
+        let current = sink.next_generation();
+
+        assert_ne!(
+            older, current,
+            "a sink must never hand out the same generation twice"
+        );
+        assert!(
+            supersedes(Some(current), older),
+            "an event from the replaced watch describes a compute system that is gone"
+        );
+        assert!(
+            !supersedes(Some(current), current),
+            "the event of the watch VMLord still holds must go through"
+        );
+        assert!(
+            !supersedes(None, older),
+            "nothing superseded an event for a VM no handle is held for"
+        );
     }
 
     #[test]
