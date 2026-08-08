@@ -18,8 +18,8 @@ use windows::{
     Win32::System::{
         Com::CoTaskMemFree,
         HostComputeNetwork::{
-            HcnCloseEndpoint, HcnCreateEndpoint, HcnDeleteEndpoint, HcnOpenEndpoint,
-            HcnQueryEndpointProperties,
+            HcnCloseEndpoint, HcnCreateEndpoint, HcnDeleteEndpoint, HcnEnumerateEndpoints,
+            HcnOpenEndpoint, HcnQueryEndpointProperties,
         },
     },
     core::{GUID, HRESULT, HSTRING, PWSTR},
@@ -66,6 +66,15 @@ fn is_endpoint_absent(error: &windows::core::Error) -> bool {
 /// HCN treats the query as a JSON document and rejects an empty string, so the
 /// schema version has to be spelled out even when nothing is being filtered.
 const PROPERTIES_QUERY: &str = r#"{"SchemaVersion":{"Major":2,"Minor":0}}"#;
+
+/// Asks HNS for every endpoint it has, in the same shape as
+/// [`PROPERTIES_QUERY`].
+///
+/// Unfiltered on purpose: HNS spells a query filter as a JSON document inside a
+/// JSON string, and which network an endpoint is in is readable from the
+/// endpoint's own properties -- the same ones every other read here uses. One
+/// spelling to get wrong is better than two.
+const ENUMERATE_QUERY: &str = PROPERTIES_QUERY;
 
 /// An owned HCN endpoint handle used by the Windows Host Network Service.
 pub struct HcnEndpoint(*mut core::ffi::c_void);
@@ -212,6 +221,31 @@ impl HcnEndpoint {
         HcnAllocatedString::new(properties)?.into_string()
     }
 
+    /// Lists the endpoints HNS has in VMLord's shared NAT network.
+    ///
+    /// Every endpoint on the host is enumerated and then asked which network it
+    /// is in: HNS lists containers', WSL's and every other client's endpoints on
+    /// the same list, and only the ones in VMLord's own network are VMLord's to
+    /// reason about at all.
+    ///
+    /// An endpoint that cannot be read is left out with a warning rather than
+    /// failing the listing. The caller deletes what this returns, so an
+    /// unreadable endpoint has to be omitted, not guessed at.
+    pub fn list_in_vmlord_network() -> Result<Vec<Uuid>, RepositoryError> {
+        let mut in_network = Vec::new();
+        for id in enumerate_ids()? {
+            match endpoint_network(id) {
+                Ok(Some(network)) if network == VMLORD_NETWORK_ID => in_network.push(id),
+                Ok(_) => {}
+                Err(error) => log::warn!(
+                    "HNS endpoint {id} is left alone because the network it is in \
+                     could not be read: {error}"
+                ),
+            }
+        }
+        Ok(in_network)
+    }
+
     /// Deletes an HCN endpoint, treating one HNS does not have as deleted.
     ///
     /// Deleting takes an identifier rather than an open handle, so this is an
@@ -244,6 +278,87 @@ impl Drop for HcnEndpoint {
         // SAFETY: This wrapper exclusively owns a handle returned by HCN.
         let _ = unsafe { HcnCloseEndpoint(self.0) };
     }
+}
+
+/// Asks HNS for the identifier of every endpoint it has.
+fn enumerate_ids() -> Result<Vec<Uuid>, RepositoryError> {
+    let query = HSTRING::from(ENUMERATE_QUERY);
+    let mut endpoints = PWSTR::null();
+    // SAFETY: `query` outlives the call and the output pointer is valid for it.
+    // On success HCN transfers ownership of the returned string to this process.
+    unsafe { HcnEnumerateEndpoints(&query, &mut endpoints, None) }.map_err(|error| {
+        let error = windows_error("enumerate HCN endpoints", None, error);
+        log::error!("{error}");
+        error
+    })?;
+
+    let document = HcnAllocatedString::new(endpoints)?.into_string()?;
+    endpoint_ids(&document)
+}
+
+/// The network an endpoint is in, or `None` when HNS no longer has it.
+///
+/// An endpoint can be deleted between being enumerated and being opened -- by
+/// another VMLord process, or by whoever else created it -- and one that is
+/// already gone is in no network rather than a failure to read.
+fn endpoint_network(id: Uuid) -> Result<Option<u128>, RepositoryError> {
+    let Some(endpoint) = HcnEndpoint::open_if_present(id)? else {
+        return Ok(None);
+    };
+    let properties: serde_json::Value =
+        serde_json::from_str(&endpoint.properties()?).map_err(|error| {
+            let error = RepositoryError::new(format!(
+                "the properties HNS reported for endpoint {id} are not valid JSON: {error}"
+            ));
+            log::error!("{error}");
+            error
+        })?;
+
+    Ok(network(&properties))
+}
+
+/// Reads the endpoint identifiers out of what `HcnEnumerateEndpoints` answers.
+///
+/// HNS answers with a JSON array of identifiers and nothing else -- the
+/// properties of each endpoint are a separate query. One entry that is not an
+/// identifier is skipped rather than failing the enumeration: the callers act on
+/// the endpoints they could read, and an unreadable one is exactly the endpoint
+/// to leave alone.
+fn endpoint_ids(document: &str) -> Result<Vec<Uuid>, RepositoryError> {
+    let listed: Vec<String> = serde_json::from_str(document).map_err(|error| {
+        let error = RepositoryError::new(format!(
+            "the endpoint list HNS reported is not a JSON array of identifiers: {error}"
+        ));
+        log::error!("{error}");
+        error
+    })?;
+
+    Ok(listed
+        .iter()
+        .filter_map(|id| {
+            Uuid::parse_str(id)
+                .inspect_err(|error| {
+                    log::debug!(
+                        "HNS listed \"{id}\", which is not an endpoint identifier: {error}"
+                    );
+                })
+                .ok()
+        })
+        .collect())
+}
+
+/// Reads the network out of the properties HNS reports for an endpoint.
+///
+/// `None` when the field is missing or is not an identifier: an endpoint whose
+/// network cannot be established is not established to be VMLord's.
+fn network(properties: &serde_json::Value) -> Option<u128> {
+    let network = properties.get("HostComputeNetwork")?.as_str()?;
+    Uuid::parse_str(network)
+        .inspect_err(|error| {
+            log::debug!("HNS reported \"{network}\" as an endpoint's network: {error}");
+        })
+        .ok()
+        .map(|network| network.as_u128())
 }
 
 /// Reads the MAC address out of the properties HNS reports for an endpoint.
@@ -375,7 +490,12 @@ fn serialize_guid<S: serde::Serializer>(guid: &GUID, serializer: S) -> Result<S:
 
 #[cfg(test)]
 mod tests {
-    use super::{EndpointAddress, address, endpoint_settings, mac_address};
+    use uuid::Uuid;
+
+    use super::{
+        EndpointAddress, VMLORD_NETWORK_ID, address, endpoint_ids, endpoint_settings, mac_address,
+        network,
+    };
 
     fn settings(vm_name: &str) -> serde_json::Value {
         serde_json::from_str(&endpoint_settings(vm_name, None).unwrap())
@@ -457,6 +577,70 @@ mod tests {
             document["IpConfigurations"],
             serde_json::json!([{ "IpAddress": "172.22.42.7", "PrefixLength": 24 }])
         );
+    }
+
+    #[test]
+    fn the_enumerated_identifiers_are_read_from_the_listed_array() {
+        let document = r#"["3F2B0C11-0000-0000-0000-000000000000",
+                           "{7A1E5D22-0000-0000-0000-000000000001}"]"#;
+
+        assert_eq!(
+            endpoint_ids(document).unwrap(),
+            vec![
+                Uuid::parse_str("3F2B0C11-0000-0000-0000-000000000000").unwrap(),
+                Uuid::parse_str("7A1E5D22-0000-0000-0000-000000000001").unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_endpoint_list_reads_as_no_endpoints() {
+        // A host that has never run a container or a VM has none, and that is
+        // an answer rather than a failure.
+        assert_eq!(endpoint_ids("[]").unwrap(), Vec::<Uuid>::new());
+    }
+
+    #[test]
+    fn a_listed_entry_that_is_not_an_identifier_is_skipped() {
+        // The caller deletes the endpoints it cannot account for, so an entry
+        // that cannot be turned into an identifier must drop out of the list
+        // rather than take the readable ones down with it.
+        let document = r#"["not-a-guid", "3F2B0C11-0000-0000-0000-000000000000"]"#;
+
+        assert_eq!(
+            endpoint_ids(document).unwrap(),
+            vec![Uuid::parse_str("3F2B0C11-0000-0000-0000-000000000000").unwrap()]
+        );
+    }
+
+    #[test]
+    fn an_endpoint_list_that_is_not_a_list_is_an_error() {
+        assert!(endpoint_ids("not json").is_err());
+        assert!(endpoint_ids(r#"{"Endpoints":[]}"#).is_err());
+    }
+
+    #[test]
+    fn the_network_is_read_from_the_reported_properties() {
+        let properties = serde_json::json!({
+            "HostComputeNetwork": "1D6FAE4A-5C78-4C1B-9E2F-3A8B7D4C6E50"
+        });
+
+        assert_eq!(network(&properties), Some(VMLORD_NETWORK_ID));
+    }
+
+    #[test]
+    fn properties_without_a_usable_network_report_none() {
+        // Every endpoint on the host is enumerated, VMLord's and everyone
+        // else's, and one whose network cannot be established is not
+        // established to be VMLord's.
+        for properties in [
+            serde_json::json!({}),
+            serde_json::json!({ "HostComputeNetwork": "" }),
+            serde_json::json!({ "HostComputeNetwork": "not-a-guid" }),
+            serde_json::json!({ "HostComputeNetwork": 42 }),
+        ] {
+            assert_eq!(network(&properties), None, "{properties}");
+        }
     }
 
     #[test]

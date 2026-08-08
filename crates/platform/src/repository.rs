@@ -15,7 +15,8 @@ use vmlord_core::{
 use crate::{
     HcsClient, HcsSystem, KnownVm, MetadataStore, VmComputeSystemMapping, VmConnections,
     VmCreationPipeline, VmDeletionPipeline, VmForceStopPipeline, VmShutdownPipeline,
-    VmStartPipeline,
+    VmStartPipeline, cleanup,
+    hcn::HcnNetwork,
     hcn_endpoint::{EndpointAddress, HcnEndpoint},
     hcs::{HCS_ACCESS_ALL, HcsSystemState},
     hcs_config::{self, VmTopology},
@@ -333,6 +334,33 @@ impl HcsVmRepository {
         disk_gb
     }
 
+    /// Brings up VMLord's shared NAT network and collects the endpoints in it
+    /// that no VM owns.
+    ///
+    /// Neither step can fail the initialization. The network is ensured again by
+    /// every start that needs one, and that is where a host whose HNS is broken
+    /// has to be told about it -- refusing to initialize would take away the
+    /// VMs, the list and the deletions too, over a service only the networked
+    /// ones need. Collecting orphans is housekeeping by definition: nothing
+    /// waits on it, and an endpoint left behind for another run costs an address
+    /// out of the subnet, not a VM.
+    ///
+    /// Ensuring the network here rather than leaving it to the first start is
+    /// what makes it exist -- with its host adapter, its subnet and its NAT --
+    /// from the moment VMLord runs, so the first VM to start meets a network
+    /// that is already there.
+    fn ensure_network(&self) {
+        if let Err(error) = HcnNetwork::ensure() {
+            log::warn!(
+                "the VMLord network is not available; VMs that ask for one cannot start \
+                 until it is: {error}"
+            );
+        }
+        if let Err(error) = cleanup::remove_orphan_endpoints(&self.store) {
+            log::warn!("the VMLord network was not tidied up: {error}");
+        }
+    }
+
     fn read_configuration(&self, vm_name: &str) -> Result<String, RepositoryError> {
         let path = layout::configuration_path(&layout::vm_directory(&self.storage_root, vm_name)?);
         fs::read_to_string(&path).map_err(|error| {
@@ -423,8 +451,8 @@ fn record_network_mode(
 }
 
 impl VmRepository for HcsVmRepository {
-    /// Brings up the Host Compute Service and reclaims the VMs a previous
-    /// VMLord process left running.
+    /// Brings up the Host Compute Service and the shared network, and reclaims
+    /// the VMs a previous VMLord process left running.
     fn initialize(&mut self) -> Result<(), RepositoryError> {
         if self.initialized {
             return Ok(());
@@ -444,6 +472,9 @@ impl VmRepository for HcsVmRepository {
             }
         }
         self.connections = report.connections;
+        // Before `initialized`, so no start of this process can have created an
+        // endpoint the cleanup would then collect as one nobody owns.
+        self.ensure_network();
         self.initialized = true;
         log::info!(
             "the HCS backend is ready with {} reconnected VM(s) under {}",
