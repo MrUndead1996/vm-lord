@@ -297,8 +297,40 @@ HCS writes `State` into an enumeration entry only once its compute system has
 run: a VM created and never started is enumerated with an `Id`, a `SystemType`,
 an `Owner` and a `RuntimeId` and nothing else, while a running one carries
 `"State": "Running"`. A missing state therefore means `Created`, and that
-absence is the only signal separating the two. Whether a running guest has
-finished booting stays unobservable until the watch/event work lands.
+absence is the only signal separating the two.
+
+`platform::watch` registers an HCS event callback on every compute system
+VMLord holds, which is the only source for what the enumeration cannot say: why
+a VM stopped, that its guest crashed, and that the Host Compute Service
+disconnected. The callback runs on a thread HCS owns, so it only classifies the
+event and queues it; the repository drains that queue in `take_diagnostics` on
+every refresh, logs each event, surfaces the significant ones as diagnostics,
+and releases the handle of a VM that is gone. The enumeration remains the sole
+authority on VM state.
+
+Each registration carries a generation, counted by the event sink the watches
+report into, and a drain drops any event whose generation is no longer the one
+held for its VM. Counting per sink rather than per `VmConnections` is what keeps
+the generations unique among exactly the events one drain compares. HCS
+delivers asynchronously, so an exit can arrive after the enumeration has already
+reported the VM stopped and the user has started it again: without the
+generation, that stale event would release the handle of the VM now running and
+report that it had stopped. A generation is never reused, and an event for a VM
+no handle is held for at all is not stale -- there is simply nothing left to
+release.
+
+A `ServiceDisconnect` releases every handle it names, and nothing outside
+`initialize` reopens one or re-registers a callback, so a drain that saw one
+also warns that VMLord reports no further HCS events until it is restarted.
+HCS delivers the disconnect once per compute system and those deliveries can
+fall on either side of a refresh, so the repository remembers having warned and
+warns once per run rather than once per drain. The backend deliberately stays
+`Ready`: `list_known_vms` succeeds again as soon as the service is back, and
+`WorkspaceApp` has no way out of `Unavailable`.
+
+Whether a running guest has finished booting is still unobservable -- HCS
+reports nothing about it -- so `AgentStatus` stays `Unknown` until the guest
+agent lands.
 
 `platform::layout` decides where a VM's `config.json` and disks live, so
 creation, start and the repository cannot disagree about it. A VM name is used

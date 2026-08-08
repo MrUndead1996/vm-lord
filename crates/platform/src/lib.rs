@@ -26,6 +26,7 @@ mod repository;
 mod shutdown;
 mod start;
 mod vhd;
+mod watch;
 
 pub use create::VmCreationPipeline;
 pub use delete::VmDeletionPipeline;
@@ -42,3 +43,4 @@ pub use reconnect::{
 pub use repository::HcsVmRepository;
 pub use shutdown::VmShutdownPipeline;
 pub use start::VmStartPipeline;
+pub use watch::{HcsEventKind, HcsVmEvent, SystemWatch, VmEventSink};

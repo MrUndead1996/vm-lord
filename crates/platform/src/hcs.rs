@@ -279,6 +279,13 @@ impl HcsSystem {
             })
     }
 
+    /// The raw compute-system handle, for registering an event callback on it.
+    ///
+    /// Non-owning: this `HcsSystem` still closes the handle in `Drop`, so
+    /// anything holding the returned value must not outlive it.
+    pub(crate) fn raw_handle(&self) -> HCS_SYSTEM {
+        self.handle
+    }
 }
 
 /// One compute system HCS currently reports.
