@@ -288,11 +288,45 @@ already has, not the mode it was created with, and mappings written before the
 field existed read as `None` -- which is what every VM created so far asked for.
 Its variant names are therefore an on-disk format.
 
-Whether HCS still delivers `SystemExited` for a VM with an attached adapter is
-unresolved: AppSandbox hot-detached the adapter from a running VM for exactly
-that reason (`hcs_detach_network`). Until that is checked on a live host, VMLord
-attaches the adapter and does not detach it -- adding a second state for a
-running VM on an unconfirmed quirk would cost more than it is known to buy.
+The endpoint has to come off the VM before the VM is destroyed.
+`platform::VmForceStopPipeline` therefore hot-detaches the adapter through
+`HcsModifyComputeSystem` -- `RequestType: "Remove"` against
+`VirtualMachine/Devices/NetworkAdapters/<endpoint id>` -- before it terminates
+the compute system. HNS keeps an endpoint attached to the compute system it was
+handed to even after HCS has destroyed that system, so a termination with the
+adapter in place leaves the endpoint occupied and the next start fails with
+`HCN_E_ENDPOINT_ALREADY_ATTACHED` (0x803B0014). The resource path is built from
+`hcs_config::adapter_key`, the same function that keys the section in
+`config.json`: a spelling that drifted between them would detach nothing while
+HCS still reported success.
+
+A detach that fails does not keep the VM running. A forced stop is the last way
+to stop a wedged VM, so it terminates anyway and reports the failed detach as a
+warning naming its consequence. `platform::VmShutdownPipeline` detaches nothing
+at all: `HcsShutDownComputeSystem` returns once the request reaches the guest,
+not once the guest is down, so there is no moment at which the guest is still
+running and no longer needs its network -- and a guest that refuses to shut down
+would be left running without one. The legacy AppSandbox backend made the same
+choice for the same reason.
+
+What is left over is recovered on the next start. A guest that powers itself
+off, a crash, or a VMLord restart leaves no compute system to detach from, so
+`platform::VmStartPipeline` recognises `HCN_E_ENDPOINT_ALREADY_ATTACHED` -- from
+either the re-creation or the start -- and retries exactly once with a replaced
+endpoint: it reads the occupied endpoint's address, deletes it, and creates a
+new one asking for that same address. This is the one place VMLord names a guest
+address, and it names one HNS assigned rather than one it chose, so HNS's IPAM
+remains the sole allocator. A second occupied endpoint fails the start: one
+replacement is a recovery, a loop of them would create an endpoint per attempt.
+When the old address cannot be read, the replacement is created without one and
+the guest is warned that its address changed.
+
+AppSandbox's `hcs_detach_network` is not the precedent it looks like: the
+function exists but is never called, and its comment -- that a detach is what
+lets HCS deliver `SystemExited` -- is an untested hypothesis. AppSandbox avoids
+the collision by never reusing an endpoint at all: it creates one per start,
+deletes it on every stop, and keeps addresses stable by requesting a static IP.
+VMLord keeps its endpoints instead, so it has to release them explicitly.
 
 `platform::VmShutdownPipeline` asks the guest of a known VM to shut down
 through `HcsShutDownComputeSystem`. HCS parses that call's options as JSON and

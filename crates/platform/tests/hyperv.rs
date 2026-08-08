@@ -17,10 +17,10 @@ use std::{
 use uuid::Uuid;
 use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest, VmRepository};
 use vmlord_platform::{
-    HcnEndpoint, HcnNetwork, HcsClient, HcsOperation, HcsSystem, HcsSystemState, HcsVmRepository,
-    MetadataStore, ReconnectOutcome, VMLORD_NETWORK_ID, VmComputeSystemMapping, VmCreationPipeline,
-    VmDeletionPipeline, VmEventSink, VmForceStopPipeline, VmShutdownPipeline, VmStartPipeline,
-    list_known_vms, open_by_vm_id, open_by_vm_name, reconnect_known_vms,
+    EndpointAddress, HcnEndpoint, HcnNetwork, HcsClient, HcsOperation, HcsSystem, HcsSystemState,
+    HcsVmRepository, MetadataStore, ReconnectOutcome, VMLORD_NETWORK_ID, VmComputeSystemMapping,
+    VmCreationPipeline, VmDeletionPipeline, VmEventSink, VmForceStopPipeline, VmShutdownPipeline,
+    VmStartPipeline, list_known_vms, open_by_vm_id, open_by_vm_name, reconnect_known_vms,
 };
 
 // `GENERIC_ALL`; matches the legacy AppSandbox backend's `hcs_vm.c` usage and
@@ -1024,4 +1024,125 @@ fn starts_a_nat_vm_on_its_endpoint() {
     let _ = fs::remove_dir_all(&root);
 
     outcome.expect("the NAT start path must work end to end");
+}
+
+/// Exercises TASK-46 against a real Hyper-V host: the cycle that used to fail.
+///
+/// Before this task a forced stop destroyed the compute system with the adapter
+/// still attached, HNS kept the endpoint bound to it, and the next start failed
+/// with `HCN_E_ENDPOINT_ALREADY_ATTACHED` (0x803B0014). The detach before the
+/// termination is what makes the second start work; the endpoint and its
+/// address surviving it is what keeps the guest reachable where it was.
+///
+/// The stop goes through `VmForceStopPipeline` rather than
+/// `HcsSystem::terminate` -- unlike `starts_a_nat_vm_on_its_endpoint`, which
+/// terminates behind the pipeline's back -- because the detach is the
+/// pipeline's, and terminating around it is precisely the case this test exists
+/// to distinguish.
+///
+/// Set `VMLORD_TEST_IMAGE_PATH` to a real bootable ISO.
+///
+/// Run elevated with:
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact a_forcibly_stopped_nat_vm_starts_again_on_the_same_endpoint --nocapture`
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS, HNS and VMLORD_TEST_IMAGE_PATH set"]
+fn a_forcibly_stopped_nat_vm_starts_again_on_the_same_endpoint() {
+    let image_path = std::env::var("VMLORD_TEST_IMAGE_PATH")
+        .expect("VMLORD_TEST_IMAGE_PATH must point to a real ISO image");
+    let root = std::env::temp_dir().join(format!("vmlord-hns-restart-e2e-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+
+    let request = VmCreateRequest {
+        name: format!("vmlord-e2e-restart-test-{}", std::process::id()),
+        image_path,
+        ram_mb: 2048,
+        disk_gb: 8,
+        cpu_cores: 2,
+        gpu_mode: GpuMode::None,
+        network_mode: NetworkMode::Nat,
+        username: "admin".into(),
+        password: "not used by a forced stop".into(),
+        ssh_enabled: false,
+        ssh_deploy_key: false,
+    };
+    let store = MetadataStore::new(root.join("vm-mapping.json"));
+    let vm_directory = root.join("vm");
+
+    let mapping = VmCreationPipeline::production()
+        .create(&store, &request, &vm_directory)
+        .expect("VM creation should succeed on an elevated Hyper-V host");
+
+    let outcome = (|| -> Result<(), String> {
+        VmStartPipeline::production()
+            .start(&store, &mapping.vm_name, &vm_directory)
+            .map_err(|error| format!("the NAT VM must start: {error}"))?;
+
+        let first = recorded_endpoint(&store, &mapping.vm_name)?;
+        let first_address = endpoint_address(first)?;
+
+        VmForceStopPipeline::production()
+            .force_stop(&store, &mapping.vm_name)
+            .map_err(|error| format!("a running VM must accept a forced stop: {error}"))?;
+
+        VmStartPipeline::production()
+            .start(&store, &mapping.vm_name, &vm_directory)
+            .map_err(|error| {
+                format!(
+                    "a forcibly stopped NAT VM must start again; \
+                     HCN_E_ENDPOINT_ALREADY_ATTACHED (0x803B0014) here means the adapter was \
+                     not detached before the compute system was destroyed: {error}"
+                )
+            })?;
+
+        let second = recorded_endpoint(&store, &mapping.vm_name)?;
+        if second != first {
+            return Err(format!(
+                "a forced stop must leave endpoint {first} in place for the next start, \
+                 which instead ran on {second}"
+            ));
+        }
+
+        let second_address = endpoint_address(second)?;
+        if second_address != first_address {
+            return Err(format!(
+                "the guest must keep the address it had before the forced stop: \
+                 {first_address:?} became {second_address:?}"
+            ));
+        }
+
+        Ok(())
+    })();
+
+    // Best-effort cleanup regardless of the assertion below. The shared network
+    // is left in place: it belongs to the installation, not to this VM.
+    if let Ok(system) = HcsSystem::open(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL) {
+        let _ = system
+            .terminate()
+            .and_then(|operation| operation.wait_for_completion(Duration::from_secs(30)));
+    }
+    if let Ok(Some(mapping)) = store.find_by_vm_name(&mapping.vm_name)
+        && let Some(endpoint_id) = mapping.endpoint_id
+    {
+        let _ = HcnEndpoint::delete(endpoint_id);
+    }
+    let _ = fs::remove_dir_all(&root);
+
+    outcome.expect("a forced stop must release the endpoint for the next start");
+}
+
+/// The endpoint the store records for `vm_name`, which a started NAT VM has.
+fn recorded_endpoint(store: &MetadataStore, vm_name: &str) -> Result<Uuid, String> {
+    store
+        .find_by_vm_name(vm_name)
+        .map_err(|error| error.to_string())?
+        .and_then(|mapping| mapping.endpoint_id)
+        .ok_or_else(|| "a started NAT VM must have a recorded endpoint".to_owned())
+}
+
+/// The address HNS reports for `endpoint`.
+fn endpoint_address(endpoint: Uuid) -> Result<Option<EndpointAddress>, String> {
+    HcnEndpoint::open(endpoint)
+        .map_err(|error| format!("HNS should still have endpoint {endpoint}: {error}"))?
+        .address()
+        .map_err(|error| format!("HNS should report the properties of {endpoint}: {error}"))
 }

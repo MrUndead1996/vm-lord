@@ -158,6 +158,20 @@ pub(crate) fn apply_topology(
     })
 }
 
+/// The key HCS's `NetworkAdapters` section uses for a VM's adapter.
+///
+/// HCS keys each adapter by a device identifier of the caller's choosing. The
+/// endpoint's own id serves: it is unique, it is stable across starts, and
+/// using it means nothing further has to be remembered to find the adapter
+/// again.
+///
+/// Both the section a start writes and the resource path a detach names are
+/// built from here. A spelling that drifted between them would detach nothing
+/// while HCS still reported success.
+pub(crate) fn adapter_key(endpoint_id: Uuid) -> String {
+    format!("{:?}", GUID::from_u128(endpoint_id.as_u128()))
+}
+
 /// Returns `document` with the VM attached to `endpoint_id` through `mac_address`.
 ///
 /// The same point edit as [`apply_topology`], with one difference: creation
@@ -184,11 +198,7 @@ pub(crate) fn apply_network_adapter(
             error
         })?;
 
-    // HCS keys each adapter by a device identifier of the caller's choosing.
-    // The endpoint's own id serves: it is unique, it is stable across starts,
-    // and using it means nothing further has to be remembered to find the
-    // adapter again.
-    let id = format!("{:?}", GUID::from_u128(endpoint_id.as_u128()));
+    let id = adapter_key(endpoint_id);
     devices.insert(
         NETWORK_ADAPTERS_KEY.to_owned(),
         serde_json::json!({
@@ -394,7 +404,7 @@ mod tests {
     use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest};
 
     use super::{
-        HcsVmConfigBuilder, VmTopology, apply_network_adapter, apply_topology,
+        HcsVmConfigBuilder, VmTopology, adapter_key, apply_network_adapter, apply_topology,
         ensure_supported_network_mode, read_topology, remove_network_adapter,
     };
 
@@ -753,6 +763,27 @@ mod tests {
         let once = with_adapter(&document);
 
         assert_eq!(with_adapter(&once), once);
+    }
+
+    #[test]
+    fn the_adapter_key_is_how_the_section_names_the_adapter() {
+        // A detach names the adapter by this key in its resource path. A
+        // spelling that drifts from the one the section uses detaches nothing
+        // and still reports success, so both sides read it from here.
+        let document =
+            HcsVmConfigBuilder::build(&request(), &PathBuf::from("C:\\vms\\a\\disks\\system.vhdx"))
+                .unwrap();
+        let updated: Value = serde_json::from_str(&with_adapter(&document)).unwrap();
+
+        let key = adapter_key(ENDPOINT_ID);
+        let adapters = updated
+            .pointer("/VirtualMachine/Devices/NetworkAdapters")
+            .and_then(Value::as_object)
+            .unwrap();
+
+        assert_eq!(key, ENDPOINT_GUID);
+        assert_eq!(adapters.keys().collect::<Vec<_>>(), vec![&key]);
+        assert_eq!(adapters[&key]["EndpointId"], key);
     }
 
     #[test]

@@ -36,6 +36,26 @@ use crate::{
 /// spelled out here.
 const HCN_E_ENDPOINT_NOT_FOUND: HRESULT = HRESULT(0x803B_0002_u32 as i32);
 
+/// `HCN_E_ENDPOINT_ALREADY_ATTACHED` from `computenetwork.h` (facility 0x3B).
+///
+/// Reported through HCS rather than through an HCN call: a compute system whose
+/// configuration names an endpoint HNS still has attached elsewhere fails to be
+/// created or started with this code. HNS holds that attachment even after HCS
+/// has destroyed the compute system it points at, which is what a VM stopped
+/// without a detach leaves behind.
+pub(crate) const HCN_E_ENDPOINT_ALREADY_ATTACHED: HRESULT = HRESULT(0x803B_0014_u32 as i32);
+
+/// An address HNS assigned to an endpoint.
+///
+/// Read back rather than chosen: the network's IPAM allocates it, and VMLord
+/// only ever repeats it when it has to recreate an endpoint that already had
+/// one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EndpointAddress {
+    pub ip_address: String,
+    pub prefix_length: u8,
+}
+
 /// Whether HNS is reporting that it does not have the endpoint.
 fn is_endpoint_absent(error: &windows::core::Error) -> bool {
     is_absent(error, HCN_E_ENDPOINT_NOT_FOUND)
@@ -58,7 +78,22 @@ impl HcnEndpoint {
     /// between this call and that write leaves an orphan behind, which is what
     /// the cleanup on `initialize` exists to collect.
     pub fn create(network: &HcnNetwork, id: Uuid, vm_name: &str) -> Result<Self, RepositoryError> {
-        let settings = endpoint_settings(vm_name)?;
+        Self::create_with_address(network, id, vm_name, None)
+    }
+
+    /// Creates the endpoint `id`, asking HNS for `address` when one is given.
+    ///
+    /// Only the recovery path passes an address, and only one HNS itself
+    /// assigned to the endpoint being replaced: repeating it is what keeps the
+    /// guest reachable where it was. VMLord never invents an address, so it
+    /// does not become a second allocator beside HNS's IPAM.
+    pub fn create_with_address(
+        network: &HcnNetwork,
+        id: Uuid,
+        vm_name: &str,
+        address: Option<&EndpointAddress>,
+    ) -> Result<Self, RepositoryError> {
+        let settings = endpoint_settings(vm_name, address)?;
         log::debug!("creating HCN endpoint {id} for VM \"{vm_name}\"");
 
         let guid = GUID::from_u128(id.as_u128());
@@ -141,6 +176,24 @@ impl HcnEndpoint {
         })
     }
 
+    /// The address HNS assigned to this endpoint, if it reports one.
+    ///
+    /// `Ok(None)` rather than an error when there is none: the only caller is
+    /// the recovery that recreates an occupied endpoint, and a missing address
+    /// costs the guest its old one but must not cost it the start.
+    pub fn address(&self) -> Result<Option<EndpointAddress>, RepositoryError> {
+        let properties = self.properties()?;
+        let properties: serde_json::Value = serde_json::from_str(&properties).map_err(|error| {
+            let error = RepositoryError::new(format!(
+                "the properties HNS reported for the endpoint are not valid JSON: {error}"
+            ));
+            log::error!("{error}");
+            error
+        })?;
+
+        Ok(address(&properties))
+    }
+
     /// Asks HNS for this endpoint's properties as a JSON document.
     fn properties(&self) -> Result<String, RepositoryError> {
         let query = HSTRING::from(PROPERTIES_QUERY);
@@ -202,6 +255,24 @@ fn mac_address(properties: &serde_json::Value) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// Reads the first address out of the properties HNS reports for an endpoint.
+///
+/// One address: VMLord's endpoints are created with none of their own, so HNS's
+/// IPAM assigns exactly one out of the network's subnet.
+fn address(properties: &serde_json::Value) -> Option<EndpointAddress> {
+    let configuration = properties.get("IpConfigurations")?.as_array()?.first()?;
+    let ip_address = configuration.get("IpAddress")?.as_str()?;
+    if ip_address.is_empty() {
+        return None;
+    }
+    let prefix_length = u8::try_from(configuration.get("PrefixLength")?.as_u64()?).ok()?;
+
+    Some(EndpointAddress {
+        ip_address: ip_address.to_owned(),
+        prefix_length,
+    })
+}
+
 /// An owned, HCN-allocated wide string, freed with `CoTaskMemFree` on drop.
 ///
 /// Not the same allocator as the one behind HCS's result documents: the HCN
@@ -236,11 +307,15 @@ impl Drop for HcnAllocatedString {
 
 /// Builds the settings document for the endpoint of VM `vm_name`.
 ///
-/// No address is asked for: the network's own IPAM assigns one out of the
-/// subnet the network was created with, and that address -- not one VMLord
-/// picked -- is what the guest is offered and what
-/// `HcnQueryEndpointProperties` later reports.
-fn endpoint_settings(vm_name: &str) -> Result<String, RepositoryError> {
+/// Without `address`, no address is asked for: the network's own IPAM assigns
+/// one out of the subnet the network was created with, and that address -- not
+/// one VMLord picked -- is what the guest is offered and what
+/// `HcnQueryEndpointProperties` later reports. `address` is only ever an
+/// address HNS assigned to an earlier endpoint of the same VM.
+fn endpoint_settings(
+    vm_name: &str,
+    address: Option<&EndpointAddress>,
+) -> Result<String, RepositoryError> {
     let settings = EndpointSettings {
         schema_version: SchemaVersion::V2,
         name: endpoint_name(vm_name),
@@ -248,6 +323,13 @@ fn endpoint_settings(vm_name: &str) -> Result<String, RepositoryError> {
         // network the endpoint joins is named only here.
         host_compute_network: GUID::from_u128(VMLORD_NETWORK_ID),
         flags: 0,
+        ip_configurations: address
+            .map(|address| IpConfiguration {
+                ip_address: address.ip_address.clone(),
+                prefix_length: address.prefix_length,
+            })
+            .into_iter()
+            .collect(),
     };
 
     serde_json::to_string(&settings).map_err(|error| {
@@ -273,6 +355,17 @@ struct EndpointSettings {
     #[serde(serialize_with = "serialize_guid")]
     host_compute_network: GUID,
     flags: u32,
+    /// Omitted entirely when empty: an `IpConfigurations: []` would be VMLord
+    /// asking HNS for no address rather than leaving the choice to its IPAM.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    ip_configurations: Vec<IpConfiguration>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "PascalCase")]
+struct IpConfiguration {
+    ip_address: String,
+    prefix_length: u8,
 }
 
 /// Writes a GUID the way HNS spells identifiers in a settings document.
@@ -282,10 +375,10 @@ fn serialize_guid<S: serde::Serializer>(guid: &GUID, serializer: S) -> Result<S:
 
 #[cfg(test)]
 mod tests {
-    use super::{endpoint_settings, mac_address};
+    use super::{EndpointAddress, address, endpoint_settings, mac_address};
 
     fn settings(vm_name: &str) -> serde_json::Value {
-        serde_json::from_str(&endpoint_settings(vm_name).unwrap())
+        serde_json::from_str(&endpoint_settings(vm_name, None).unwrap())
             .expect("the settings document should be valid JSON")
     }
 
@@ -343,6 +436,58 @@ mod tests {
             serde_json::json!({ "MacAddress": 42 }),
         ] {
             assert_eq!(mac_address(&properties), None, "{properties}");
+        }
+    }
+
+    #[test]
+    fn requested_settings_name_the_address_the_endpoint_must_take() {
+        // The recovery path recreates an endpoint that HNS still considers
+        // attached. Asking for the address the old one held is what keeps the
+        // guest reachable at the same place afterwards.
+        let requested = EndpointAddress {
+            ip_address: "172.22.42.7".into(),
+            prefix_length: 24,
+        };
+
+        let document: serde_json::Value =
+            serde_json::from_str(&endpoint_settings("dev-linux", Some(&requested)).unwrap())
+                .unwrap();
+
+        assert_eq!(
+            document["IpConfigurations"],
+            serde_json::json!([{ "IpAddress": "172.22.42.7", "PrefixLength": 24 }])
+        );
+    }
+
+    #[test]
+    fn the_address_is_read_from_the_reported_properties() {
+        let properties = serde_json::json!({
+            "MacAddress": "00-15-5D-01-02-03",
+            "IpConfigurations": [{ "IpAddress": "172.22.42.7", "PrefixLength": 24 }]
+        });
+
+        assert_eq!(
+            address(&properties),
+            Some(EndpointAddress {
+                ip_address: "172.22.42.7".into(),
+                prefix_length: 24,
+            })
+        );
+    }
+
+    #[test]
+    fn properties_without_a_usable_address_report_none() {
+        // An endpoint HNS has not finished setting up, or one whose properties
+        // it no longer reports, leaves the recovery with no address to hold on
+        // to; that is a warning, not a parse failure.
+        for properties in [
+            serde_json::json!({}),
+            serde_json::json!({ "IpConfigurations": [] }),
+            serde_json::json!({ "IpConfigurations": [{ "PrefixLength": 24 }] }),
+            serde_json::json!({ "IpConfigurations": [{ "IpAddress": "", "PrefixLength": 24 }] }),
+            serde_json::json!({ "IpConfigurations": [{ "IpAddress": "172.22.42.7" }] }),
+        ] {
+            assert_eq!(address(&properties), None, "{properties}");
         }
     }
 }

@@ -8,15 +8,19 @@ use windows::{
         System::HostComputeSystem::{
             HCS_OPERATION, HCS_SYSTEM, HcsCloseComputeSystem, HcsCloseOperation,
             HcsCreateComputeSystem, HcsCreateOperation, HcsEnumerateComputeSystems,
-            HcsGetServiceProperties, HcsGrantVmAccess, HcsOpenComputeSystem,
-            HcsShutDownComputeSystem, HcsStartComputeSystem, HcsTerminateComputeSystem,
-            HcsWaitForOperationResult,
+            HcsGetServiceProperties, HcsGrantVmAccess, HcsModifyComputeSystem,
+            HcsOpenComputeSystem, HcsShutDownComputeSystem, HcsStartComputeSystem,
+            HcsTerminateComputeSystem, HcsWaitForOperationResult,
         },
     },
     core::{HSTRING, PCWSTR, PWSTR},
 };
 
-use crate::error::windows_error;
+use uuid::Uuid;
+
+use crate::{
+    error::windows_error, hcn_endpoint::HCN_E_ENDPOINT_ALREADY_ATTACHED, hcs_config::adapter_key,
+};
 use vmlord_core::RepositoryError;
 
 /// Access mask granting full control over a compute system, used to reopen
@@ -24,6 +28,10 @@ use vmlord_core::RepositoryError;
 pub(crate) const HCS_ACCESS_ALL: u32 = 0x1000_0000;
 
 const ENUMERATE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A hot-detach needs nothing from the guest -- HCS removes the device itself
+/// -- so the bound only guards against a wedged Host Compute Service.
+const DETACH_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn timeout_milliseconds(timeout: Duration) -> Result<u32, RepositoryError> {
     u32::try_from(timeout.as_millis()).map_err(|_| {
@@ -94,6 +102,60 @@ fn wait_failure(timeout: Duration, failure: WaitFailure) -> RepositoryError {
             ))
         }
         WaitFailure::Windows(error) => windows_error("wait for HCS operation result", None, error),
+    }
+}
+
+/// Why a compute system could not be created or started.
+///
+/// One cause is worth separating from every other: an endpoint HNS still has
+/// attached to a compute system that no longer exists cannot be attached again,
+/// and no retry of the same start fixes it -- only replacing the endpoint does.
+pub enum HcsStartFailure {
+    /// HNS reported `HCN_E_ENDPOINT_ALREADY_ATTACHED`.
+    EndpointBusy(RepositoryError),
+    Failed(RepositoryError),
+}
+
+impl HcsStartFailure {
+    /// The failure as the repository boundary reports it, whatever its cause.
+    #[must_use]
+    pub fn into_error(self) -> RepositoryError {
+        match self {
+            Self::EndpointBusy(error) | Self::Failed(error) => error,
+        }
+    }
+}
+
+/// Classifies a call HCS refused outright.
+fn call_failure(operation: &str, id: &str, error: windows::core::Error) -> HcsStartFailure {
+    let endpoint_busy = error.code() == HCN_E_ENDPOINT_ALREADY_ATTACHED;
+    let error = windows_error(operation, Some(id), error);
+    log::error!("{error}");
+    if endpoint_busy {
+        HcsStartFailure::EndpointBusy(error)
+    } else {
+        HcsStartFailure::Failed(error)
+    }
+}
+
+/// Classifies an operation HCS accepted and then failed.
+fn operation_failure(
+    operation: &str,
+    id: &str,
+    timeout: Duration,
+    failure: WaitFailure,
+) -> HcsStartFailure {
+    match failure {
+        WaitFailure::Windows(error) if error.code() == HCN_E_ENDPOINT_ALREADY_ATTACHED => {
+            let error = windows_error(operation, Some(id), error);
+            log::error!("{error}");
+            HcsStartFailure::EndpointBusy(error)
+        }
+        failure => {
+            let error = wait_failure(timeout, failure);
+            log::error!("the {operation} of \"{id}\" failed: {error}");
+            HcsStartFailure::Failed(error)
+        }
     }
 }
 
@@ -182,6 +244,29 @@ impl HcsSystem {
             },
         )?;
         Ok(operation)
+    }
+
+    /// Starts the compute system and waits up to `timeout`, saying whether the
+    /// start failed because the VM's endpoint is still attached elsewhere.
+    ///
+    /// This is what [`crate::VmStartPipeline`] uses: an occupied endpoint is
+    /// the one failure it can recover from, and it can only recognise it here,
+    /// where the raw HRESULT is still available.
+    pub fn start_and_wait(&self, timeout: Duration) -> Result<(), HcsStartFailure> {
+        log::debug!("starting HCS compute system \"{}\"", self.id);
+        let operation = HcsOperation::new();
+        // SAFETY: `self.handle` and `operation.0` are valid owned handles for
+        // the duration of this call. Null options are accepted here: a start
+        // takes its parameters from the compute system's own configuration.
+        unsafe { HcsStartComputeSystem(self.handle, operation.0, PCWSTR::null()) }
+            .map_err(|error| call_failure("start compute system", &self.id, error))?;
+
+        operation
+            .wait(timeout)
+            .map(|_document| ())
+            .map_err(|failure| {
+                operation_failure("start compute system", &self.id, timeout, failure)
+            })
     }
 
     /// Asks the guest to shut down gracefully, returning the pending
@@ -274,6 +359,44 @@ impl HcsSystem {
             .inspect_err(|error| {
                 log::error!(
                     "the termination of HCS compute system \"{}\" failed: {error}",
+                    self.id
+                );
+            })
+    }
+
+    /// Hot-detaches the network adapter keyed by `endpoint_id` from this
+    /// running compute system and waits for HCS to report the outcome.
+    ///
+    /// HNS keeps an endpoint attached to the compute system it was handed to
+    /// even after HCS destroys that system, so a VM terminated with its adapter
+    /// still in place leaves the endpoint occupied: the next start fails with
+    /// `HCN_E_ENDPOINT_ALREADY_ATTACHED`. Detaching before the VM stops is what
+    /// keeps the endpoint -- and therefore the guest's address -- reusable.
+    pub fn remove_network_adapter(&self, endpoint_id: Uuid) -> Result<(), RepositoryError> {
+        log::debug!(
+            "detaching the adapter of endpoint {endpoint_id} from HCS compute system \"{}\"",
+            self.id
+        );
+        let operation = HcsOperation::new();
+        let document = HSTRING::from(detach_adapter_document(endpoint_id));
+        // SAFETY: `self.handle` and `operation.0` are valid owned handles for
+        // the duration of this call, and `document` outlives it. A null
+        // identity asks HCS to act as the calling process, which is what every
+        // other call in this module does.
+        unsafe { HcsModifyComputeSystem(self.handle, operation.0, &document, None) }.map_err(
+            |error| {
+                let error = windows_error("modify compute system", Some(&self.id), error);
+                log::error!("{error}");
+                error
+            },
+        )?;
+
+        operation
+            .wait_for_completion(DETACH_TIMEOUT)
+            .map(|_document| ())
+            .inspect_err(|error| {
+                log::error!(
+                    "detaching the adapter of HCS compute system \"{}\" failed: {error}",
                     self.id
                 );
             })
@@ -399,6 +522,18 @@ fn hcs_service_properties_query() -> PCWSTR {
 /// An empty object requests the default shutdown behaviour.
 fn shutdown_options() -> &'static str {
     "{}"
+}
+
+/// The document asking HCS to hot-detach the adapter keyed by `endpoint_id`.
+///
+/// `RequestType: "Remove"` against the adapter's own resource path: HCS takes
+/// the device out of the running VM, and HNS releases the endpoint it was
+/// attached to.
+fn detach_adapter_document(endpoint_id: Uuid) -> String {
+    format!(
+        r#"{{"ResourcePath":"VirtualMachine/Devices/NetworkAdapters/{}","RequestType":"Remove"}}"#,
+        adapter_key(endpoint_id)
+    )
 }
 
 /// Reports a shutdown HCS accepted but cannot deliver.
@@ -602,6 +737,41 @@ impl HcsClient {
         ))
     }
 
+    /// Creates a compute system and waits up to `timeout` for the creation to
+    /// complete, saying whether it failed because the VM's endpoint is still
+    /// attached elsewhere.
+    ///
+    /// Unlike [`HcsClient::create_system`], the creation is awaited here rather
+    /// than handed back: the returned system is one the caller can start, and
+    /// keeping the handle alive across the wait is this method's business.
+    pub fn create_system_and_wait(
+        &self,
+        id: &str,
+        configuration: &str,
+        timeout: Duration,
+    ) -> Result<HcsSystem, HcsStartFailure> {
+        log::debug!("creating HCS compute system \"{id}\"");
+        let operation = HcsOperation::new();
+        let hcs_id = HSTRING::from(id);
+        let hcs_configuration = HSTRING::from(configuration);
+        // SAFETY: `hcs_id` and `hcs_configuration` remain valid for the
+        // duration of the call. On success the returned system handle is
+        // transferred to `HcsSystem` for ownership.
+        let handle =
+            unsafe { HcsCreateComputeSystem(&hcs_id, &hcs_configuration, operation.0, None) }
+                .map_err(|error| call_failure("create compute system", id, error))?;
+        let system = HcsSystem {
+            handle,
+            id: id.to_owned(),
+        };
+
+        operation
+            .wait(timeout)
+            .map_err(|failure| operation_failure("create compute system", id, timeout, failure))?;
+
+        Ok(system)
+    }
+
     /// Grants the VM's worker process access to a file (a VHD/VHDX or an
     /// attached ISO) it must open when it starts.
     ///
@@ -683,10 +853,70 @@ mod tests {
     use vmlord_core::RepositoryError;
 
     use super::{
-        HcsClient, HcsSystemState, HcsSystemSummary, hcs_service_properties_query,
-        parse_enumerate_result, parse_service_result, parse_system_state, shutdown_options,
-        unsupported_shutdown_error,
+        HcsClient, HcsStartFailure, HcsSystemState, HcsSystemSummary, call_failure,
+        detach_adapter_document, hcs_service_properties_query, parse_enumerate_result,
+        parse_service_result, parse_system_state, shutdown_options, unsupported_shutdown_error,
     };
+
+    #[test]
+    fn an_occupied_endpoint_is_classified_apart_from_every_other_failure() {
+        // The start retries only this one code; misclassifying it either loses
+        // the recovery or retries a start that will never succeed.
+        let busy = call_failure(
+            "start compute system",
+            "vmlord-dev",
+            windows::core::Error::from_hresult(windows::core::HRESULT(0x803B_0014_u32 as i32)),
+        );
+
+        assert!(matches!(busy, HcsStartFailure::EndpointBusy(_)));
+        let message = busy.into_error().to_string();
+        assert!(message.contains("0x803B0014"), "{message}");
+        assert!(message.contains("vmlord-dev"), "{message}");
+    }
+
+    #[test]
+    fn any_other_hresult_is_an_ordinary_failure() {
+        let denied = call_failure(
+            "start compute system",
+            "vmlord-dev",
+            windows::core::Error::from_hresult(windows::core::HRESULT(0x8007_0005_u32 as i32)),
+        );
+
+        assert!(matches!(denied, HcsStartFailure::Failed(_)));
+        assert!(denied.into_error().to_string().contains("0x80070005"));
+    }
+
+    #[test]
+    fn the_detach_document_removes_the_adapter_keyed_by_the_endpoint() {
+        // The resource path has to spell the adapter exactly the way the stored
+        // configuration keys it, or HCS removes nothing and reports success.
+        let endpoint_id = uuid::Uuid::from_u128(0x3f2b_0c11_5c78_4c1b_9e2f_3a8b_7d4c_6e50);
+
+        let document: serde_json::Value =
+            serde_json::from_str(&detach_adapter_document(endpoint_id)).unwrap();
+
+        assert_eq!(
+            document["ResourcePath"],
+            "VirtualMachine/Devices/NetworkAdapters/3F2B0C11-5C78-4C1B-9E2F-3A8B7D4C6E50"
+        );
+        assert_eq!(document["RequestType"], "Remove");
+    }
+
+    #[test]
+    fn the_detach_path_uses_the_configurations_own_adapter_key() {
+        let endpoint_id = uuid::Uuid::new_v4();
+
+        let document: serde_json::Value =
+            serde_json::from_str(&detach_adapter_document(endpoint_id)).unwrap();
+
+        assert!(
+            document["ResourcePath"]
+                .as_str()
+                .unwrap()
+                .ends_with(&crate::hcs_config::adapter_key(endpoint_id)),
+            "{document}"
+        );
+    }
 
     #[test]
     fn system_state_maps_every_state_hcs_reports() {
