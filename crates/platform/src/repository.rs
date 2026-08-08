@@ -5,7 +5,7 @@
 //! compute-system handles, and maps each repository operation onto the
 //! pipeline that already implements it.
 
-use std::{fs, path::PathBuf, sync::Mutex};
+use std::{fs, net::IpAddr, path::PathBuf, sync::Mutex};
 
 use vmlord_core::{
     AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError,
@@ -16,6 +16,7 @@ use crate::{
     HcsClient, HcsSystem, KnownVm, MetadataStore, VmComputeSystemMapping, VmConnections,
     VmCreationPipeline, VmDeletionPipeline, VmForceStopPipeline, VmShutdownPipeline,
     VmStartPipeline,
+    hcn_endpoint::{EndpointAddress, HcnEndpoint},
     hcs::{HCS_ACCESS_ALL, HcsSystemState},
     hcs_config::{self, VmTopology},
     layout, list_known_vms,
@@ -189,6 +190,7 @@ impl HcsVmRepository {
         let disk_gb = self.disk_gb(&mapping);
 
         let state = vm_state(&mapping, state);
+        let ip_address = self.guest_address(&mapping, state);
 
         VmSummary {
             name: mapping.vm_name,
@@ -197,13 +199,79 @@ impl HcsVmRepository {
             ram_mb: topology.ram_mb,
             disk_gb,
             cpu_cores: topology.cpu_cores,
-            // GPU, the guest's address and SSH are not wired to the native
-            // backend yet and are reported as absent rather than guessed at.
+            // GPU and SSH are not wired to the native backend yet and are
+            // reported as absent rather than guessed at.
             gpu_mode: GpuMode::None,
             network_mode,
-            ip_address: None,
+            ip_address,
             ssh_port: None,
         }
+    }
+
+    /// The address the guest of `mapping` is expected to answer at.
+    ///
+    /// Read from the VM's HNS endpoint, not from the guest. HNS assigns the
+    /// address on the host side and VMLord's DHCP server offers the guest that
+    /// one and no other, so the endpoint is where it is known; nothing here
+    /// observes whether the guest took the lease, and until it has, this is the
+    /// address the guest is *going* to have rather than one it answers at.
+    ///
+    /// Only a running VM reports one. The endpoint keeps its address across
+    /// stops -- that is the point of keeping the endpoint -- but a stopped
+    /// guest answers nowhere, and an address shown beside a stopped VM would
+    /// read as somewhere to connect.
+    ///
+    /// No absence here is an error: a VM with no endpoint yet, an endpoint HNS
+    /// no longer has or reports no address for, and an address that does not
+    /// parse all report `None`. Losing a VM from the list over its address
+    /// would be far worse than listing it without one.
+    fn guest_address(&self, mapping: &VmComputeSystemMapping, state: VmState) -> Option<IpAddr> {
+        if !matches!(state, VmState::Running { .. }) {
+            return None;
+        }
+        let endpoint_id = mapping.endpoint_id?;
+
+        // Every log here stays at debug: this runs for every running VM on
+        // every refresh, a second apart, so anything louder would repeat one
+        // unreadable endpoint into the log forever.
+        let endpoint = match HcnEndpoint::open_if_present(endpoint_id) {
+            Ok(Some(endpoint)) => endpoint,
+            Ok(None) => {
+                log::debug!(
+                    "HNS no longer knows endpoint {endpoint_id} of running VM \"{}\", \
+                     so it is listed without an address",
+                    mapping.vm_name
+                );
+                return None;
+            }
+            Err(error) => {
+                log::debug!(
+                    "cannot open endpoint {endpoint_id} of VM \"{}\": {error}",
+                    mapping.vm_name
+                );
+                return None;
+            }
+        };
+
+        let address = match endpoint.address() {
+            Ok(Some(address)) => address,
+            Ok(None) => {
+                log::debug!(
+                    "HNS reports no address for endpoint {endpoint_id} of VM \"{}\"",
+                    mapping.vm_name
+                );
+                return None;
+            }
+            Err(error) => {
+                log::debug!(
+                    "cannot read the address of endpoint {endpoint_id} of VM \"{}\": {error}",
+                    mapping.vm_name
+                );
+                return None;
+            }
+        };
+
+        guest_ip(&mapping.vm_name, &address)
     }
 
     /// Reads a VM's memory and processor counts from its stored configuration.
@@ -304,6 +372,27 @@ fn vm_state(mapping: &VmComputeSystemMapping, state: Option<HcsSystemState>) -> 
         }
         None => VmState::Stopped,
     }
+}
+
+/// Turns the address HNS reported for an endpoint into one a summary carries.
+///
+/// HNS spells its addresses in a JSON document, so the text is only known to be
+/// an address once it parses. One that does not is reported as no address at
+/// all rather than passed on: `VmSummary::ip_address` is what the rest of
+/// VMLord connects to, and a string that is not an address is not somewhere to
+/// connect.
+fn guest_ip(vm_name: &str, address: &EndpointAddress) -> Option<IpAddr> {
+    address
+        .ip_address
+        .parse()
+        .inspect_err(|error| {
+            log::debug!(
+                "HNS reported \"{}\" as the address of VM \"{vm_name}\", \
+                 which is not an IP address: {error}",
+                address.ip_address
+            );
+        })
+        .ok()
 }
 
 /// Records a VM's network mode in its mapping, if it changed.
@@ -542,9 +631,10 @@ mod tests {
         VmState, VmUpdateRequest,
     };
 
-    use super::{HcsVmRepository, record_network_mode};
+    use super::{HcsSystemState, HcsVmRepository, guest_ip, record_network_mode};
     use crate::{
         KnownVm, MetadataStore, VmComputeSystemMapping,
+        hcn_endpoint::EndpointAddress,
         watch::{HcsEventKind, HcsVmEvent},
     };
 
@@ -634,6 +724,70 @@ mod tests {
 
         assert_eq!(summary.network_mode, NetworkMode::Nat);
         assert_eq!(summary.state, VmState::Stopped);
+    }
+
+    #[test]
+    fn the_address_hns_assigned_becomes_the_summarys_address() {
+        let address = EndpointAddress {
+            ip_address: "172.22.42.7".into(),
+            prefix_length: 24,
+        };
+
+        assert_eq!(
+            guest_ip("dev", &address),
+            Some("172.22.42.7".parse::<std::net::IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn an_address_that_is_not_an_address_is_reported_as_none() {
+        // HNS answers with a JSON document, so nothing but a successful parse
+        // says the text really is an address. A VM has to stay listed either
+        // way, so this is an absent address rather than a failed listing.
+        for text in ["", "dhcp", "172.22.42.7/24", "172.22.42.256"] {
+            let address = EndpointAddress {
+                ip_address: text.into(),
+                prefix_length: 24,
+            };
+
+            assert_eq!(guest_ip("dev", &address), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_stopped_vm_is_listed_without_an_address() {
+        // The endpoint keeps its address while the VM is stopped, but the guest
+        // is not there to answer at it, and a listed address reads as somewhere
+        // to connect. This also keeps the listing of a stopped VM from asking
+        // HNS anything at all.
+        let repository = repository();
+        let mapping = VmComputeSystemMapping {
+            endpoint_id: Some(Uuid::new_v4()),
+            ..mapping(NetworkMode::Nat)
+        };
+
+        let summary = repository.summary(KnownVm {
+            mapping,
+            state: None,
+        });
+
+        assert_eq!(summary.state, VmState::Stopped);
+        assert_eq!(summary.ip_address, None);
+    }
+
+    #[test]
+    fn a_running_vm_without_an_endpoint_is_listed_without_an_address() {
+        // A VM that has never started on the shared network has no endpoint to
+        // read an address from, and one that asked for no network never will.
+        let repository = repository();
+
+        let summary = repository.summary(KnownVm {
+            mapping: mapping(NetworkMode::None),
+            state: Some(HcsSystemState::Running),
+        });
+
+        assert!(matches!(summary.state, VmState::Running { .. }));
+        assert_eq!(summary.ip_address, None);
     }
 
     fn assert_not_initialized(result: Result<(), RepositoryError>) {
