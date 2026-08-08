@@ -180,6 +180,8 @@ impl HcsVmRepository {
 
     fn summary(&self, known: KnownVm) -> VmSummary {
         let KnownVm { mapping, state } = known;
+        // Read before `mapping.vm_name` is moved into the summary below.
+        let network_mode = mapping.network_mode;
         let topology = self.topology(&mapping).unwrap_or(VmTopology {
             ram_mb: 0,
             cpu_cores: 0,
@@ -195,10 +197,10 @@ impl HcsVmRepository {
             ram_mb: topology.ram_mb,
             disk_gb,
             cpu_cores: topology.cpu_cores,
-            // GPU, networking and SSH are not wired to the native backend yet
-            // and are reported as absent rather than guessed at.
+            // GPU, the guest's address and SSH are not wired to the native
+            // backend yet and are reported as absent rather than guessed at.
             gpu_mode: GpuMode::None,
-            network_mode: NetworkMode::None,
+            network_mode,
             ip_address: None,
             ssh_port: None,
         }
@@ -304,6 +306,33 @@ fn vm_state(mapping: &VmComputeSystemMapping, state: Option<HcsSystemState>) -> 
     }
 }
 
+/// Records a VM's network mode in its mapping, if it changed.
+///
+/// The mapping, not `config.json`, is where the mode lives: the document
+/// describes the adapter a VM already has, while the mode is what the next
+/// start reads to decide whether it should have one at all.
+fn record_network_mode(
+    store: &MetadataStore,
+    mapping: &VmComputeSystemMapping,
+    network_mode: NetworkMode,
+) -> Result<(), RepositoryError> {
+    if mapping.network_mode == network_mode {
+        return Ok(());
+    }
+
+    store.insert(VmComputeSystemMapping {
+        network_mode,
+        ..mapping.clone()
+    })?;
+    log::info!(
+        "VM \"{}\" ({}) now asks for {:?} networking; the change applies the next time it starts",
+        mapping.vm_name,
+        mapping.vm_id,
+        network_mode
+    );
+    Ok(())
+}
+
 impl VmRepository for HcsVmRepository {
     /// Brings up the Host Compute Service and reclaims the VMs a previous
     /// VMLord process left running.
@@ -382,6 +411,8 @@ impl VmRepository for HcsVmRepository {
             log::error!("{error}");
             error
         })?;
+
+        record_network_mode(&self.store, &mapping, request.network_mode)?;
 
         log::info!(
             "VM \"{}\" ({}) now requests {} MiB and {} CPU core(s); \
@@ -503,14 +534,19 @@ impl VmRepository for HcsVmRepository {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use uuid::Uuid;
     use vmlord_core::{
         DiagnosticLevel, GpuMode, NetworkMode, RepositoryError, VmDeleteRequest, VmRepository,
-        VmUpdateRequest,
+        VmState, VmUpdateRequest,
     };
 
-    use super::HcsVmRepository;
-    use crate::watch::{HcsEventKind, HcsVmEvent};
+    use super::{HcsVmRepository, record_network_mode};
+    use crate::{
+        KnownVm, MetadataStore, VmComputeSystemMapping,
+        watch::{HcsEventKind, HcsVmEvent},
+    };
 
     fn repository() -> HcsVmRepository {
         HcsVmRepository::new(std::env::temp_dir().join("vmlord-repository-test"))
@@ -531,6 +567,73 @@ mod tests {
             name: "dev".into(),
             delete_disks: true,
         }
+    }
+
+    /// A store under a directory of this test's own, removed by the test that
+    /// created it. The repository tests never share one.
+    fn temp_store(label: &str) -> (std::path::PathBuf, MetadataStore) {
+        let root = std::env::temp_dir().join(format!(
+            "vmlord-repository-{label}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("test root should be created");
+        let store = MetadataStore::new(root.join("vm-mapping.json"));
+        (root, store)
+    }
+
+    fn mapping(network_mode: NetworkMode) -> VmComputeSystemMapping {
+        VmComputeSystemMapping {
+            vm_id: Uuid::new_v4(),
+            vm_name: "dev".into(),
+            hcs_compute_system_id: "vmlord-dev".into(),
+            disk_gb: 20,
+            endpoint_id: None,
+            network_mode,
+        }
+    }
+
+    #[test]
+    fn a_changed_network_mode_is_recorded_in_the_mapping() {
+        let (root, store) = temp_store("mode-changed");
+        let mapping = mapping(NetworkMode::None);
+        store.insert(mapping.clone()).unwrap();
+
+        record_network_mode(&store, &mapping, NetworkMode::Nat).unwrap();
+
+        let stored = store.find_by_vm_name("dev").unwrap().unwrap();
+        assert_eq!(stored.network_mode, NetworkMode::Nat);
+        // Nothing else about the VM may move with its network mode.
+        assert_eq!(stored.vm_id, mapping.vm_id);
+        assert_eq!(stored.disk_gb, mapping.disk_gb);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_unchanged_network_mode_leaves_the_mapping_alone() {
+        let (root, store) = temp_store("mode-unchanged");
+        let mapping = mapping(NetworkMode::Nat);
+        store.insert(mapping.clone()).unwrap();
+
+        record_network_mode(&store, &mapping, NetworkMode::Nat).unwrap();
+
+        assert_eq!(store.find_by_vm_name("dev").unwrap().unwrap(), mapping);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_summary_reports_the_network_mode_the_mapping_records() {
+        // The edit form is filled from `VmSummary`, so a summary that always
+        // said `None` would make an unrelated edit switch NAT off.
+        let repository = repository();
+
+        let summary = repository.summary(KnownVm {
+            mapping: mapping(NetworkMode::Nat),
+            state: None,
+        });
+
+        assert_eq!(summary.network_mode, NetworkMode::Nat);
+        assert_eq!(summary.state, VmState::Stopped);
     }
 
     fn assert_not_initialized(result: Result<(), RepositoryError>) {
