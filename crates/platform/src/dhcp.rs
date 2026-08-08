@@ -10,6 +10,7 @@ use std::{
     collections::HashMap,
     io,
     net::{Ipv4Addr, SocketAddrV4, UdpSocket},
+    os::windows::io::AsRawSocket,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -21,12 +22,16 @@ use std::{
 use arcbox_dhcp::{DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DhcpConfig, DhcpPacket, DhcpServer};
 use uuid::Uuid;
 use vmlord_core::RepositoryError;
+use windows::Win32::Networking::WinSock::{
+    IP_UNICAST_IF, IPPROTO_IP, SOCKET, WSAGetLastError, setsockopt,
+};
 
 use crate::{
+    error::hresult_to_repository_error,
     hcn_endpoint::{EndpointAddress, HcnEndpoint},
     host_dns,
     metadata::MetadataStore,
-    subnet::Ipv4Subnet,
+    subnet::{self, Ipv4Subnet},
 };
 
 /// How long a guest may keep its address.
@@ -169,17 +174,33 @@ impl State {
         };
 
         let mac = packet.client_mac();
+        log::debug!(
+            "a DHCP {:?} arrived from {mac:02x?} ({} bytes)",
+            packet.message_type,
+            datagram.len()
+        );
+
         if !self.reserved.contains_key(&mac) {
             log::debug!(
-                "a DHCP request from {mac:02x?} is not from a guest of the VMLord network; \
+                "the DHCP request from {mac:02x?} is not from a guest of the VMLord network; \
                  it is left unanswered"
             );
             return None;
         }
 
         match self.server.handle_packet(datagram) {
-            Ok(Some(reply)) => Some((reply, reply_target(&packet))),
-            Ok(None) => None,
+            Ok(Some(reply)) => {
+                let target = reply_target(&packet);
+                log::info!(
+                    "answering the guest at {mac:02x?} with a DHCP {:?} to {target}",
+                    DhcpPacket::parse(&reply).ok().and_then(|reply| reply.message_type)
+                );
+                Some((reply, target))
+            }
+            Ok(None) => {
+                log::debug!("the DHCP {:?} from {mac:02x?} needs no reply", packet.message_type);
+                None
+            }
             Err(error) => {
                 log::warn!("the DHCP request from {mac:02x?} could not be answered: {error}");
                 None
@@ -223,7 +244,7 @@ impl DhcpService {
     /// Binds the server to the subnet `address` belongs to and starts serving.
     pub(crate) fn start(address: &EndpointAddress) -> Result<Self, RepositoryError> {
         let subnet = endpoint_subnet(address)?;
-        let socket = bind()?;
+        let socket = bind(subnet.gateway())?;
         let state = Arc::new(Mutex::new(State::new(dhcp_config(
             subnet,
             host_dns::dns_servers(subnet),
@@ -379,12 +400,13 @@ fn seed_one(service: &DhcpService, endpoint_id: Uuid) -> Result<(), RepositoryEr
 /// `SO_REUSEADDR` is deliberately not set: on Windows it lets a second server
 /// take over a port that is already served, and two DHCP servers answering the
 /// same guests is worse than a start that fails with a diagnosis.
-fn bind() -> Result<UdpSocket, RepositoryError> {
+fn bind(gateway: Ipv4Addr) -> Result<UdpSocket, RepositoryError> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, DHCP_SERVER_PORT)).map_err(|error| {
         let error = bind_error(&error);
         log::error!("{error}");
         error
     })?;
+    send_through(&socket, subnet::interface_index(gateway)?)?;
     socket.set_broadcast(true).map_err(|error| {
         let error = RepositoryError::new(format!(
             "the DHCP socket could not be made broadcast: {error}"
@@ -402,6 +424,44 @@ fn bind() -> Result<UdpSocket, RepositoryError> {
             error
         })?;
     Ok(socket)
+}
+
+/// Pins the socket's outgoing traffic to the interface `index` names.
+///
+/// Without this the replies never reach the guests. Every DHCP reply to a guest
+/// that has no address yet is sent to the limited broadcast `255.255.255.255`,
+/// and a socket bound to `0.0.0.0` sends that through whichever interface the
+/// routing table prefers -- on an ordinary host the physical adapter, not
+/// `vEthernet (VMLord)`. The offer then leaves on the wrong network entirely,
+/// which looks exactly like a guest that never asked.
+fn send_through(socket: &UdpSocket, index: u32) -> Result<(), RepositoryError> {
+    // `IP_UNICAST_IF` takes the interface index in network byte order, unlike
+    // every other index Windows hands out.
+    let index = index.to_be_bytes();
+    // SAFETY: The socket outlives the call, and `index` is a four-byte buffer
+    // of exactly the size `IP_UNICAST_IF` expects.
+    let result = unsafe {
+        setsockopt(
+            SOCKET(socket.as_raw_socket() as usize),
+            IPPROTO_IP.0,
+            IP_UNICAST_IF,
+            Some(&index),
+        )
+    };
+
+    if result != 0 {
+        // SAFETY: Reads the calling thread's last Winsock error.
+        let code = unsafe { WSAGetLastError() };
+        let error = hresult_to_repository_error(
+            "pin the DHCP socket to the VMLord network adapter",
+            None,
+            code.0,
+        );
+        log::error!("{error}");
+        return Err(error);
+    }
+
+    Ok(())
 }
 
 /// Turns a failure to bind UDP 67 into something a user can act on.
@@ -448,10 +508,11 @@ fn serve(socket: &UdpSocket, state: &Mutex<State>, running: &AtomicBool) {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .handle(&buffer[..received]);
 
-        if let Some((reply, target)) = reply
-            && let Err(error) = socket.send_to(&reply, target)
-        {
-            log::warn!("a DHCP reply to {target} could not be sent: {error}");
+        if let Some((reply, target)) = reply {
+            match socket.send_to(&reply, target) {
+                Ok(sent) => log::debug!("sent {sent} bytes of DHCP reply to {target}"),
+                Err(error) => log::warn!("a DHCP reply to {target} could not be sent: {error}"),
+            }
         }
     }
 }
@@ -798,6 +859,43 @@ mod tests {
         .expect("the test datagram should parse");
 
         assert_eq!(super::reply_target(&packet), SocketAddrV4::new(ip(5), 68));
+    }
+
+    /// Guards the defect that made the whole server useless on a real host: a
+    /// socket bound to `0.0.0.0` sends the limited broadcast every offer uses
+    /// through the interface the routing table prefers -- the physical adapter
+    /// -- so the offers left on the wrong network and the guest saw nothing.
+    ///
+    /// Run on a host that has the VMLord network:
+    /// `cargo test -p vmlord-platform --target=x86_64-pc-windows-gnu -- --ignored --exact dhcp::tests::a_broadcast_reply_leaves_through_the_vmlord_adapter --nocapture`
+    #[test]
+    #[ignore = "requires a host carrying the VMLord NAT network"]
+    fn a_broadcast_reply_leaves_through_the_vmlord_adapter() {
+        let gateway = Ipv4Addr::new(172, 22, 42, 1);
+        let index = crate::subnet::interface_index(gateway)
+            .expect("the host should carry the VMLord network");
+
+        let socket = TestSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .expect("an ephemeral socket should bind");
+        socket
+            .set_broadcast(true)
+            .expect("the socket should take the broadcast option");
+        super::send_through(&socket, index).expect("the socket should be pinned to the adapter");
+
+        // Connecting picks the source address by the same routing decision a
+        // send would make, which is what makes the choice observable at all.
+        socket
+            .connect((Ipv4Addr::BROADCAST, 68))
+            .expect("a broadcast destination should be routable");
+
+        assert_eq!(
+            socket
+                .local_addr()
+                .expect("the socket should report its address")
+                .ip(),
+            gateway,
+            "a broadcast reply must leave through the VMLord adapter, not the host's own"
+        );
     }
 
     /// Run elevated, with nothing else serving DHCP on this host:
