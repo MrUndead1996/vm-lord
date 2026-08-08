@@ -15,7 +15,9 @@ use std::{
 };
 
 use uuid::Uuid;
-use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest, VmRepository};
+use vmlord_core::{
+    GpuMode, NetworkMode, VmCreateRequest, VmDeleteRequest, VmRepository, VmState, VmSummary,
+};
 use vmlord_platform::{
     EndpointAddress, HcnEndpoint, HcnNetwork, HcsClient, HcsOperation, HcsSystem, HcsSystemState,
     HcsVmRepository, MetadataStore, ReconnectOutcome, VMLORD_NETWORK_ID, VmComputeSystemMapping,
@@ -1239,4 +1241,134 @@ fn a_started_nat_vm_is_served_the_address_hns_assigned() {
     let _ = fs::remove_dir_all(&root);
 
     outcome.expect("a NAT VM must start with the DHCP server serving the address HNS assigned");
+}
+
+/// The summary `repository` lists for `vm_name`.
+fn listed_summary(repository: &HcsVmRepository, vm_name: &str) -> Result<VmSummary, String> {
+    repository
+        .list_vms()
+        .map_err(|error| format!("the repository should list its VMs: {error}"))?
+        .into_iter()
+        .find(|summary| summary.name == vm_name)
+        .ok_or_else(|| format!("VM \"{vm_name}\" should be listed"))
+}
+
+/// Exercises TASK-37 against a real host: the address a listing reports for a
+/// running NAT VM is the one HNS assigned to that VM's endpoint, and a stopped
+/// VM is listed without one even though its endpoint kept its address.
+///
+/// What this test cannot assert is the guest's own view -- that its interface
+/// really came up on that address once it accepted the lease. That is the
+/// manual parity check, run with a VHDX carrying an installed Linux; installer
+/// media is enough for everything asserted here.
+///
+/// Set `VMLORD_TEST_IMAGE_PATH` to a real bootable ISO.
+///
+/// Run elevated with:
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact a_running_nat_vm_is_listed_with_the_address_hns_assigned --nocapture`
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS, HNS, a free UDP 67 and VMLORD_TEST_IMAGE_PATH set"]
+fn a_running_nat_vm_is_listed_with_the_address_hns_assigned() {
+    let image_path = std::env::var("VMLORD_TEST_IMAGE_PATH")
+        .expect("VMLORD_TEST_IMAGE_PATH must point to a real ISO image");
+    let root = std::env::temp_dir().join(format!("vmlord-ip-e2e-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+
+    let vm_name = format!("vmlord-e2e-ip-test-{}", std::process::id());
+    let request = VmCreateRequest {
+        name: vm_name.clone(),
+        image_path,
+        ram_mb: 2048,
+        disk_gb: 8,
+        cpu_cores: 2,
+        gpu_mode: GpuMode::None,
+        network_mode: NetworkMode::Nat,
+        username: "admin".into(),
+        password: "not used by start".into(),
+        ssh_enabled: false,
+        ssh_deploy_key: false,
+    };
+
+    let mut repository = HcsVmRepository::new(&root);
+    repository
+        .initialize()
+        .expect("the native backend should initialize on a Hyper-V host");
+    repository
+        .create_vm(request)
+        .expect("VM creation should succeed on an elevated Hyper-V host");
+    // The repository keeps its mapping under its own storage root, and the
+    // endpoint identifier has to be read from there to compare the listed
+    // address against HNS's own answer.
+    let store = MetadataStore::new(root.join("vm-mapping.json"));
+
+    let outcome = (|| -> Result<(), String> {
+        // A VM that has never started has no endpoint, so there is nothing to
+        // report and nothing to ask HNS about.
+        if let Some(address) = listed_summary(&repository, &vm_name)?.ip_address {
+            return Err(format!(
+                "a created VM must be listed without an address, got {address}"
+            ));
+        }
+
+        repository
+            .start_vm(&vm_name)
+            .map_err(|error| format!("the NAT VM must start: {error}"))?;
+
+        let endpoint = recorded_endpoint(&store, &vm_name)?;
+        let assigned = endpoint_address(endpoint)?
+            .ok_or("HNS must assign the endpoint an address for the guest to be served")?;
+
+        let running = listed_summary(&repository, &vm_name)?;
+        if !matches!(running.state, VmState::Running { .. }) {
+            return Err(format!(
+                "the started VM must be listed as running, got {:?}",
+                running.state
+            ));
+        }
+        let reported = running
+            .ip_address
+            .ok_or("a running NAT VM must be listed with the address of its endpoint")?;
+        if reported.to_string() != assigned.ip_address {
+            return Err(format!(
+                "the listing reports {reported}, but HNS assigned {} to endpoint {endpoint}",
+                assigned.ip_address
+            ));
+        }
+
+        repository
+            .force_stop_vm(&vm_name)
+            .map_err(|error| format!("the VM must stop: {error}"))?;
+
+        // The endpoint outlives the stop with its address intact, but the guest
+        // is no longer there to answer at it.
+        if endpoint_address(endpoint)?.as_ref() != Some(&assigned) {
+            return Err(format!(
+                "endpoint {endpoint} must keep {} across a stop",
+                assigned.ip_address
+            ));
+        }
+        if let Some(address) = listed_summary(&repository, &vm_name)?.ip_address {
+            return Err(format!(
+                "a stopped VM must be listed without an address, got {address}"
+            ));
+        }
+
+        Ok(())
+    })();
+
+    // Best-effort cleanup regardless of the assertion below. Deletion does not
+    // remove the endpoint yet (TASK-42), so it goes first, while the mapping
+    // still names it.
+    let _ = repository.force_stop_vm(&vm_name);
+    let endpoint = recorded_endpoint(&store, &vm_name);
+    let _ = repository.delete_vm(VmDeleteRequest {
+        name: vm_name,
+        delete_disks: true,
+    });
+    if let Ok(endpoint) = endpoint {
+        let _ = HcnEndpoint::delete(endpoint);
+    }
+    let _ = fs::remove_dir_all(&root);
+
+    outcome.expect("a running NAT VM must be listed with the address HNS assigned to its endpoint");
 }

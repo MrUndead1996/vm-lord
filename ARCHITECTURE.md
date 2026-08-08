@@ -371,6 +371,26 @@ Connection Sharing, the Hyper-V Default Switch and third-party DHCP servers.
 a port another server is answering on, and two servers answering the same guests
 is worse than a start that says why it failed.
 
+The address a listing reports for a VM is that same one, read back from the VM's
+endpoint with `HcnQueryEndpointProperties` rather than from the guest. The host
+assigns it: HNS's IPAM picks it and the DHCP server offers the guest that address
+and no other, so the endpoint is where it is known. It becomes the guest's own
+address only once the guest has taken it in a DHCP ACK, and nothing in VMLord
+observes that acknowledgement -- so `VmSummary::ip_address` is where the guest is
+expected to answer, not proof that it does.
+
+Only a running VM is listed with one. The endpoint keeps its address across stops
+-- that is the point of keeping the endpoint -- but a stopped guest answers
+nowhere, and an address shown beside a stopped VM would read as somewhere to
+connect. Gating on the state also keeps a list of stopped VMs from asking HNS
+anything at all.
+
+No absence is an error. A VM with no endpoint yet, an endpoint HNS no longer has
+or reports no address for, and text that does not parse as an IP address all list
+the VM without an address, each logged at debug: dropping a VM from the list over
+its address would be far worse than listing it without one, and a listing runs
+once a second, so a louder log would repeat one unreadable endpoint forever.
+
 `platform::VmShutdownPipeline` asks the guest of a known VM to shut down
 through `HcsShutDownComputeSystem`. HCS parses that call's options as JSON and
 rejects a null pointer with `HCS_E_INVALID_JSON`, unlike start and terminate,
@@ -427,11 +447,12 @@ the migration leaves it something the native backend cannot do; any other value
 keep VMLord on the backend being retired.
 
 The native backend deliberately reports less than AppSandbox did while the
-remaining migration tasks land: GPU mode, guest IP address and SSH port are
-`None`, guest agent status is `Unknown`, and display and SSH connections report
-that the backend does not support them. Network mode is reported from the VM's
-mapping, because the edit form is filled from `VmSummary`: a summary that always
-said `None` would make an unrelated edit switch a NAT VM off the network.
+remaining migration tasks land: GPU mode and SSH port are `None`, guest agent
+status is `Unknown`, and display and SSH connections report that the backend does
+not support them. Network mode is reported from the VM's mapping, because the
+edit form is filled from `VmSummary`: a summary that always said `None` would
+make an unrelated edit switch a NAT VM off the network. The guest's address comes
+from the VM's HNS endpoint, as above.
 
 A VM's state comes from `HcsEnumerateComputeSystems`, not from the compute
 system's mere presence: creation leaves behind a system that has never executed
