@@ -234,6 +234,23 @@ VM on a contested subnet, and the warning is the only thing that connects the
 resulting routing failure (a corporate VPN losing its route, typically) to
 VMLord.
 
+`platform::HcnEndpoint` is the per-VM half of that network: one endpoint per
+VM, created lazily on the VM's first start and kept until the VM is deleted --
+across stops and across VMLord restarts. Re-creating it per start would hand
+the guest a new address every time and break everything that remembered the
+old one (SSH, display). Its settings name the shared network and ask for no
+address of their own: the network's IPAM assigns one, so VMLord never becomes
+a second allocator of guest addresses beside HNS.
+
+An endpoint's identifier is not derivable from anything else, so it is
+remembered in `VmComputeSystemMapping::endpoint_id`, a `#[serde(default)]`
+field -- mappings written before endpoints existed read back as "no endpoint
+yet", which is exactly how a never-started VM reads, and need no migration.
+The identifier is allocated by the caller and recorded after the endpoint
+exists, so a VMLord that dies in between leaves an orphan endpoint behind;
+collecting those is the cleanup on `initialize`, not something the creating
+path tries to make atomic.
+
 `platform::VmStartPipeline` starts a VM the creation pipeline produced. It
 re-grants the VM access to every file its stored `config.json` attaches before
 issuing `HcsStartComputeSystem`: Hyper-V opens those files under the VM's own

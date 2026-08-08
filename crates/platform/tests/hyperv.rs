@@ -17,8 +17,8 @@ use std::{
 use uuid::Uuid;
 use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest, VmRepository};
 use vmlord_platform::{
-    HcnNetwork, HcsClient, HcsOperation, HcsSystem, HcsSystemState, HcsVmRepository, MetadataStore,
-    ReconnectOutcome, VMLORD_NETWORK_ID, VmComputeSystemMapping, VmCreationPipeline,
+    HcnEndpoint, HcnNetwork, HcsClient, HcsOperation, HcsSystem, HcsSystemState, HcsVmRepository,
+    MetadataStore, ReconnectOutcome, VMLORD_NETWORK_ID, VmComputeSystemMapping, VmCreationPipeline,
     VmDeletionPipeline, VmEventSink, VmForceStopPipeline, VmShutdownPipeline, VmStartPipeline,
     list_known_vms, open_by_vm_id, open_by_vm_name, reconnect_known_vms,
 };
@@ -678,6 +678,7 @@ fn shuts_down_a_running_guest() {
             vm_name: "guest-shutdown-probe".into(),
             hcs_compute_system_id: hcs_id.clone(),
             disk_gb: 20,
+            endpoint_id: None,
         })
         .expect("mapping should be persisted");
 
@@ -860,5 +861,48 @@ fn ensures_the_shared_vmlord_nat_network() {
             .expect("HNS should answer whether it still has the network")
             .is_none(),
         "HNS must no longer know a deleted network"
+    );
+}
+
+/// Exercises TASK-41's per-VM endpoint against the real Host Network Service:
+/// creates one in the shared NAT network, confirms that it can be reopened by
+/// its identifier alone -- which is what makes a recorded `endpoint_id` worth
+/// recording -- and that deleting it is idempotent.
+///
+/// The endpoint outlives its handle here on purpose: production creates it
+/// during a start and closes the handle at the end of that start, then finds
+/// it again on the next one. A test that only used the handle it was given
+/// would never show that.
+///
+/// The shared network is left in place either way: it is the installation's
+/// network, and endpoints of real VMs may live in it.
+///
+/// Run elevated with:
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact creates_opens_and_deletes_a_vm_endpoint --nocapture`
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HNS enabled"]
+fn creates_opens_and_deletes_a_vm_endpoint() {
+    let network = HcnNetwork::ensure().expect("HNS should provide the VMLord NAT network");
+    let endpoint_id = Uuid::new_v4();
+
+    let created = HcnEndpoint::create(&network, endpoint_id, "vmlord-endpoint-probe")
+        .expect("HNS should create an endpoint in the VMLord NAT network");
+    drop(created);
+
+    assert!(
+        HcnEndpoint::open_if_present(endpoint_id)
+            .expect("HNS should answer whether it has the endpoint")
+            .is_some(),
+        "an endpoint must outlive the handle its creation returned"
+    );
+    HcnEndpoint::open(endpoint_id).expect("the endpoint must be openable by its identifier");
+
+    HcnEndpoint::delete(endpoint_id).expect("HNS should delete the endpoint");
+    HcnEndpoint::delete(endpoint_id).expect("deleting an endpoint HNS no longer has must succeed");
+    assert!(
+        HcnEndpoint::open_if_present(endpoint_id)
+            .expect("HNS should answer whether it still has the endpoint")
+            .is_none(),
+        "HNS must no longer know a deleted endpoint"
     );
 }

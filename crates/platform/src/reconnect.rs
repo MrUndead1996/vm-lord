@@ -348,6 +348,7 @@ mod tests {
             vm_name: vm_name.into(),
             hcs_compute_system_id: format!("vmlord-{}", vm_id.as_simple()),
             disk_gb: 20,
+            endpoint_id: None,
         }
     }
 

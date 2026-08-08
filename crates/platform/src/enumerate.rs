@@ -152,6 +152,7 @@ mod tests {
             vm_name: vm_name.into(),
             hcs_compute_system_id: hcs_id.into(),
             disk_gb: 20,
+            endpoint_id: None,
         }
     }
 
