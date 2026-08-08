@@ -12,7 +12,7 @@ use vmlord_core::{NetworkMode, RepositoryError};
 use crate::{
     HcsClient, HcsSystem,
     hcn::HcnNetwork,
-    hcn_endpoint::HcnEndpoint,
+    hcn_endpoint::{EndpointAddress, HcnEndpoint},
     cleanup,
     hcs::{HCS_ACCESS_ALL, HcsStartFailure},
     hcs_config, layout,
@@ -34,10 +34,20 @@ pub(crate) struct VmNetworkAdapter {
     pub(crate) mac_address: String,
 }
 
+/// Whether a start may reuse the endpoint the VM already has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EndpointPolicy {
+    /// Reuse the recorded endpoint, creating one only when the VM has none.
+    Reuse,
+    /// Replace the recorded endpoint: HNS still has it attached to a compute
+    /// system that no longer exists, so nothing can attach to it again.
+    Replace,
+}
+
 type AccessGranter = Box<dyn Fn(&str, &Path) -> Result<(), RepositoryError>>;
 type SystemStarter = Box<dyn Fn(&str, &str) -> Result<(), HcsStartFailure>>;
 type EndpointProvider =
-    Box<dyn Fn(&str, Option<Uuid>) -> Result<VmNetworkAdapter, RepositoryError>>;
+    Box<dyn Fn(&str, Option<Uuid>, EndpointPolicy) -> Result<VmNetworkAdapter, RepositoryError>>;
 
 /// Starts VMs created by [`crate::VmCreationPipeline`].
 pub struct VmStartPipeline {
@@ -61,7 +71,11 @@ impl VmStartPipeline {
     fn for_test(
         access_granter: impl Fn(&str, &Path) -> Result<(), RepositoryError> + 'static,
         system_starter: impl Fn(&str, &str) -> Result<(), HcsStartFailure> + 'static,
-        endpoint_provider: impl Fn(&str, Option<Uuid>) -> Result<VmNetworkAdapter, RepositoryError>
+        endpoint_provider: impl Fn(
+            &str,
+            Option<Uuid>,
+            EndpointPolicy,
+        ) -> Result<VmNetworkAdapter, RepositoryError>
         + 'static,
     ) -> Self {
         Self {
@@ -107,8 +121,54 @@ impl VmStartPipeline {
             mapping.hcs_compute_system_id
         );
 
-        let configuration = self.read_configuration(&mapping, vm_directory)?;
-        let configuration = self.attach_network(store, &mapping, vm_directory, configuration)?;
+        let stored = self.read_configuration(&mapping, vm_directory)?;
+        let (configuration, endpoint) = self.attach_network(
+            store,
+            &mapping,
+            vm_directory,
+            stored.clone(),
+            mapping.endpoint_id,
+            EndpointPolicy::Reuse,
+        )?;
+        self.grant_access_to_attachments(&mapping, &configuration)?;
+
+        let failure = match (self.system_starter)(&mapping.hcs_compute_system_id, &configuration) {
+            Ok(()) => {
+                log::info!("started VM \"{}\" ({})", mapping.vm_name, mapping.vm_id);
+                return Ok(());
+            }
+            Err(failure) => failure,
+        };
+
+        // Only one failure is recoverable, and only for a VM that has an
+        // endpoint to replace.
+        let busy = match failure {
+            HcsStartFailure::EndpointBusy(error) => error,
+            HcsStartFailure::Failed(error) => {
+                log::error!("failed to start VM \"{}\": {error}", mapping.vm_name);
+                return Err(error);
+            }
+        };
+        let Some(endpoint) = endpoint else {
+            log::error!("failed to start VM \"{}\": {busy}", mapping.vm_name);
+            return Err(busy);
+        };
+
+        log::warn!(
+            "VM \"{}\" could not start because HNS still has endpoint {endpoint} attached to a \
+             compute system that no longer exists: {busy}; replacing the endpoint and retrying \
+             the start once",
+            mapping.vm_name
+        );
+
+        let (configuration, _) = self.attach_network(
+            store,
+            &mapping,
+            vm_directory,
+            stored,
+            Some(endpoint),
+            EndpointPolicy::Replace,
+        )?;
         self.grant_access_to_attachments(&mapping, &configuration)?;
         (self.system_starter)(&mapping.hcs_compute_system_id, &configuration).map_err(
             |failure| {
@@ -122,10 +182,16 @@ impl VmStartPipeline {
         Ok(())
     }
 
-    /// Gives the VM its endpoint and writes the adapter into `configuration`.
+    /// Gives the VM its endpoint and writes the adapter into `configuration`,
+    /// returning the updated document and the endpoint the VM will start on.
     ///
-    /// A VM that asked for no network is left off HNS entirely; the adapter an
-    /// earlier start may have written is removed from its configuration.
+    /// A VM that asked for no network is left off HNS entirely and reports no
+    /// endpoint; the adapter an earlier start may have written is removed from
+    /// its configuration.
+    ///
+    /// `recorded` is the endpoint to reuse or replace, which is not always the
+    /// one the mapping was read with: a retry replaces the endpoint the failed
+    /// attempt actually used.
     ///
     /// Neither the endpoint nor the recorded `endpoint_id` is undone when a
     /// later step fails: the endpoint outlives stops and lives until the VM is
@@ -137,7 +203,9 @@ impl VmStartPipeline {
         mapping: &VmComputeSystemMapping,
         vm_directory: &Path,
         configuration: String,
-    ) -> Result<String, RepositoryError> {
+        recorded: Option<Uuid>,
+        policy: EndpointPolicy,
+    ) -> Result<(String, Option<Uuid>), RepositoryError> {
         if mapping.network_mode != NetworkMode::Nat {
             log::debug!(
                 "VM \"{}\" asks for {:?} networking; starting it without an endpoint",
@@ -158,11 +226,11 @@ impl VmStartPipeline {
                     mapping.vm_id
                 );
             }
-            return Ok(updated);
+            return Ok((updated, None));
         }
 
-        let adapter = (self.endpoint_provider)(&mapping.vm_name, mapping.endpoint_id)?;
-        if mapping.endpoint_id != Some(adapter.endpoint_id) {
+        let adapter = (self.endpoint_provider)(&mapping.vm_name, recorded, policy)?;
+        if recorded != Some(adapter.endpoint_id) {
             store.insert(VmComputeSystemMapping {
                 endpoint_id: Some(adapter.endpoint_id),
                 ..mapping.clone()
@@ -184,7 +252,7 @@ impl VmStartPipeline {
             mapping.vm_id,
             adapter.endpoint_id
         );
-        Ok(updated)
+        Ok((updated, Some(adapter.endpoint_id)))
     }
 
     fn read_configuration(
@@ -290,16 +358,23 @@ fn grant_vm_access(id: &str, path: &Path) -> Result<(), RepositoryError> {
     HcsClient::new().grant_vm_access(id, path)
 }
 
-/// Resolves the endpoint VM `vm_name` starts on, creating it if it has none.
+/// Resolves the endpoint VM `vm_name` starts on.
 ///
-/// `recorded` is the identifier the VM's mapping remembers, if any. It is
-/// opened rather than trusted: an endpoint deleted outside VMLord, or lost to
-/// an HNS reset, is replaced by a new one instead of failing the start. That
-/// hands the guest a different address, but the alternative is a VM that can no
-/// longer start at all.
+/// `recorded` is the identifier the VM's mapping remembers, if any.
+///
+/// Under [`EndpointPolicy::Reuse`] the recorded endpoint is opened rather than
+/// trusted: one deleted outside VMLord, or lost to an HNS reset, is replaced by
+/// a new one instead of failing the start. That hands the guest a different
+/// address, but the alternative is a VM that can no longer start at all.
+///
+/// Under [`EndpointPolicy::Replace`] the recorded endpoint is deleted and a new
+/// one created in its place, because HNS still has it attached to a compute
+/// system that no longer exists. The address of the old endpoint is read first
+/// and asked for again, so the guest keeps the address it had.
 fn ensure_endpoint(
     vm_name: &str,
     recorded: Option<Uuid>,
+    policy: EndpointPolicy,
 ) -> Result<VmNetworkAdapter, RepositoryError> {
     // The network first: an endpoint cannot be created outside one, and an
     // installation that has never had a VM on the network has none yet.
@@ -309,9 +384,10 @@ fn ensure_endpoint(
         Some(id) => HcnEndpoint::open_if_present(id)?.map(|endpoint| (id, endpoint)),
         None => None,
     };
-    let (endpoint_id, endpoint) = match existing {
-        Some(existing) => existing,
-        None => {
+
+    let (endpoint_id, endpoint) = match (policy, existing) {
+        (EndpointPolicy::Reuse, Some(existing)) => existing,
+        (EndpointPolicy::Reuse, None) => {
             if let Some(id) = recorded {
                 log::warn!(
                     "HNS no longer knows endpoint {id} of VM \"{vm_name}\"; \
@@ -321,12 +397,62 @@ fn ensure_endpoint(
             let id = Uuid::new_v4();
             (id, HcnEndpoint::create(&network, id, vm_name)?)
         }
+        (EndpointPolicy::Replace, existing) => {
+            let address = replaced_address(vm_name, existing.as_ref())?;
+            if let Some(id) = recorded {
+                // The handle has to close before HNS will delete what it points
+                // at.
+                drop(existing);
+                HcnEndpoint::delete(id)?;
+            }
+            let id = Uuid::new_v4();
+            match &address {
+                Some(address) => log::info!(
+                    "replacing the occupied endpoint of VM \"{vm_name}\" with {id} on {}",
+                    address.ip_address
+                ),
+                None => log::info!(
+                    "replacing the occupied endpoint of VM \"{vm_name}\" with {id}"
+                ),
+            }
+            (
+                id,
+                HcnEndpoint::create_with_address(&network, id, vm_name, address.as_ref())?,
+            )
+        }
     };
 
     Ok(VmNetworkAdapter {
         endpoint_id,
         mac_address: endpoint.mac_address()?,
     })
+}
+
+/// The address a replacement endpoint should ask for.
+///
+/// `None` when HNS no longer has the old endpoint or reports no address for it:
+/// the guest then gets whatever the network's IPAM assigns, which is worse than
+/// keeping its address but far better than not starting.
+fn replaced_address(
+    vm_name: &str,
+    existing: Option<&(Uuid, HcnEndpoint)>,
+) -> Result<Option<EndpointAddress>, RepositoryError> {
+    let Some((id, endpoint)) = existing else {
+        log::warn!(
+            "HNS no longer knows the occupied endpoint of VM \"{vm_name}\"; \
+             its replacement is created without an address of its own"
+        );
+        return Ok(None);
+    };
+
+    let address = endpoint.address()?;
+    if address.is_none() {
+        log::warn!(
+            "HNS reports no address for endpoint {id} of VM \"{vm_name}\"; \
+             its replacement cannot ask for the old one, so the guest is offered a new address"
+        );
+    }
+    Ok(address)
 }
 
 /// Starts the compute system `id`, re-creating it from `configuration` first
@@ -386,7 +512,7 @@ mod tests {
     use uuid::Uuid;
     use vmlord_core::{NetworkMode, RepositoryError};
 
-    use super::{VmNetworkAdapter, VmStartPipeline, attachment_paths};
+    use super::{EndpointPolicy, VmNetworkAdapter, VmStartPipeline, attachment_paths};
     use crate::{
         hcs::HcsStartFailure,
         metadata::{MetadataStore, VmComputeSystemMapping},
@@ -430,6 +556,11 @@ mod tests {
     const NEW_ENDPOINT_GUID: &str = "3F2B0C11-5C78-4C1B-9E2F-3A8B7D4C6E50";
     const MAC_ADDRESS: &str = "00-15-5D-01-02-03";
 
+    /// The endpoint the test provider hands out when it replaces an occupied one.
+    const REPLACEMENT_ENDPOINT_ID: Uuid =
+        Uuid::from_u128(0x7a1c_44e0_5c78_4c1b_9e2f_3a8b_7d4c_6e50);
+    const REPLACEMENT_ENDPOINT_GUID: &str = "7A1C44E0-5C78-4C1B-9E2F-3A8B7D4C6E50";
+
     #[derive(Clone, Default)]
     struct Calls {
         /// Every step in the order it ran, so a test can assert on ordering
@@ -437,14 +568,21 @@ mod tests {
         steps: Arc<Mutex<Vec<&'static str>>>,
         grant: Arc<Mutex<Vec<(String, PathBuf)>>>,
         start: Arc<Mutex<Vec<(String, String)>>>,
-        endpoint: Arc<Mutex<Vec<Option<Uuid>>>>,
+        endpoint: Arc<Mutex<Vec<EndpointRequest>>>,
     }
+
+    /// One call into the endpoint provider: the identifier it was offered and
+    /// what it was asked to do with it.
+    type EndpointRequest = (Option<Uuid>, EndpointPolicy);
 
     /// Which collaborators fail; by default none of them do.
     #[derive(Clone, Copy, Default)]
     struct Behavior {
         fail_start: bool,
         fail_endpoint: bool,
+        /// How many leading starts fail with an occupied endpoint before the
+        /// starter accepts one.
+        busy_starts: usize,
     }
 
     struct Fixture {
@@ -529,11 +667,13 @@ mod tests {
                 let calls = calls.clone();
                 move |id: &str, configuration: &str| {
                     calls.steps.lock().unwrap().push("start");
-                    calls
-                        .start
-                        .lock()
-                        .unwrap()
-                        .push((id.to_owned(), configuration.to_owned()));
+                    let mut started = calls.start.lock().unwrap();
+                    started.push((id.to_owned(), configuration.to_owned()));
+                    if started.len() <= behavior.busy_starts {
+                        return Err(HcsStartFailure::EndpointBusy(RepositoryError::new(
+                            "injected endpoint-busy failure",
+                        )));
+                    }
                     if behavior.fail_start {
                         return Err(HcsStartFailure::Failed(RepositoryError::new(
                             "injected start failure",
@@ -544,16 +684,20 @@ mod tests {
             },
             {
                 let calls = calls.clone();
-                move |_vm_name: &str, recorded: Option<Uuid>| {
+                move |_vm_name: &str, recorded: Option<Uuid>, policy: EndpointPolicy| {
                     calls.steps.lock().unwrap().push("endpoint");
-                    calls.endpoint.lock().unwrap().push(recorded);
+                    calls.endpoint.lock().unwrap().push((recorded, policy));
                     if behavior.fail_endpoint {
                         return Err(RepositoryError::new("injected endpoint failure"));
                     }
-                    // A recorded endpoint is the one that gets reused; only a
-                    // VM without one is handed a freshly created endpoint.
+                    // A recorded endpoint is the one that gets reused; a VM
+                    // without one, and a replacement, are handed a fresh id.
+                    let endpoint_id = match policy {
+                        EndpointPolicy::Reuse => recorded.unwrap_or(NEW_ENDPOINT_ID),
+                        EndpointPolicy::Replace => REPLACEMENT_ENDPOINT_ID,
+                    };
                     Ok(VmNetworkAdapter {
-                        endpoint_id: recorded.unwrap_or(NEW_ENDPOINT_ID),
+                        endpoint_id,
                         mac_address: MAC_ADDRESS.to_owned(),
                     })
                 }
@@ -748,7 +892,10 @@ mod tests {
             .start(&fixture.store, "dev", &fixture.vm_directory)
             .expect("start should succeed");
 
-        assert_eq!(calls.endpoint.lock().unwrap().clone(), vec![None]);
+        assert_eq!(
+            calls.endpoint.lock().unwrap().clone(),
+            vec![(None, EndpointPolicy::Reuse)]
+        );
         assert_eq!(fixture.recorded_endpoint(), Some(NEW_ENDPOINT_ID));
     }
 
@@ -764,7 +911,10 @@ mod tests {
             .start(&fixture.store, "dev", &fixture.vm_directory)
             .expect("start should succeed");
 
-        assert_eq!(calls.endpoint.lock().unwrap().clone(), vec![Some(recorded)]);
+        assert_eq!(
+            calls.endpoint.lock().unwrap().clone(),
+            vec![(Some(recorded), EndpointPolicy::Reuse)]
+        );
         assert_eq!(fixture.recorded_endpoint(), Some(recorded));
     }
 
@@ -844,6 +994,136 @@ mod tests {
                 .pointer("/VirtualMachine/Devices/NetworkAdapters")
                 .is_some()
         );
+    }
+
+    #[test]
+    fn an_occupied_endpoint_is_replaced_and_the_start_retried_once() {
+        // A VM stopped without a detach leaves HNS holding its endpoint against
+        // a compute system that no longer exists. Nothing can attach to it
+        // again, so the only way back is a different endpoint.
+        let recorded = Uuid::new_v4();
+        let fixture = fixture_with("busy-retry", NetworkMode::Nat, Some(recorded));
+        let calls = fixture.calls.clone();
+
+        pipeline(
+            &calls,
+            Behavior {
+                busy_starts: 1,
+                ..Behavior::default()
+            },
+        )
+        .start(&fixture.store, "dev", &fixture.vm_directory)
+        .expect("a start blocked by an occupied endpoint must recover");
+
+        assert_eq!(
+            calls.endpoint.lock().unwrap().clone(),
+            vec![
+                (Some(recorded), EndpointPolicy::Reuse),
+                (Some(recorded), EndpointPolicy::Replace),
+            ]
+        );
+        assert_eq!(
+            calls.steps.lock().unwrap().clone(),
+            vec!["endpoint", "grant", "grant", "start", "endpoint", "grant", "grant", "start"]
+        );
+    }
+
+    #[test]
+    fn the_replacement_endpoint_reaches_the_mapping_and_the_configuration() {
+        let recorded = Uuid::new_v4();
+        let fixture = fixture_with("busy-recorded", NetworkMode::Nat, Some(recorded));
+        let calls = fixture.calls.clone();
+
+        pipeline(
+            &calls,
+            Behavior {
+                busy_starts: 1,
+                ..Behavior::default()
+            },
+        )
+        .start(&fixture.store, "dev", &fixture.vm_directory)
+        .expect("a start blocked by an occupied endpoint must recover");
+
+        assert_eq!(fixture.recorded_endpoint(), Some(REPLACEMENT_ENDPOINT_ID));
+        assert_eq!(
+            fixture
+                .configuration()
+                .pointer("/VirtualMachine/Devices/NetworkAdapters"),
+            Some(&serde_json::json!({
+                REPLACEMENT_ENDPOINT_GUID: {
+                    "EndpointId": REPLACEMENT_ENDPOINT_GUID,
+                    "MacAddress": MAC_ADDRESS
+                }
+            }))
+        );
+        let started = calls.start.lock().unwrap().clone();
+        assert_eq!(
+            started[1].1,
+            fs::read_to_string(fixture.vm_directory.join("config.json")).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_second_occupied_endpoint_is_not_retried_again() {
+        // One replacement is a recovery; a second means something other than a
+        // stale attachment is wrong, and retrying forever would create an
+        // endpoint per attempt.
+        let fixture = fixture_with("busy-twice", NetworkMode::Nat, Some(Uuid::new_v4()));
+        let calls = fixture.calls.clone();
+
+        let error = pipeline(
+            &calls,
+            Behavior {
+                busy_starts: 2,
+                ..Behavior::default()
+            },
+        )
+        .start(&fixture.store, "dev", &fixture.vm_directory)
+        .expect_err("a second occupied endpoint must fail the start");
+
+        assert!(error.to_string().contains("injected endpoint-busy failure"));
+        assert_eq!(calls.start.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_vm_without_networking_never_replaces_an_endpoint() {
+        // Without NAT there is no endpoint to blame, so the failure is reported
+        // as it came rather than retried.
+        let fixture = fixture("busy-no-network");
+        let calls = fixture.calls.clone();
+
+        let error = pipeline(
+            &calls,
+            Behavior {
+                busy_starts: 1,
+                ..Behavior::default()
+            },
+        )
+        .start(&fixture.store, "dev", &fixture.vm_directory)
+        .expect_err("a VM without an endpoint has no recovery");
+
+        assert!(error.to_string().contains("injected endpoint-busy failure"));
+        assert!(calls.endpoint.lock().unwrap().is_empty());
+        assert_eq!(calls.start.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_ordinary_start_failure_is_not_retried() {
+        let fixture = fixture_with("plain-failure", NetworkMode::Nat, Some(Uuid::new_v4()));
+        let calls = fixture.calls.clone();
+
+        let error = pipeline(
+            &calls,
+            Behavior {
+                fail_start: true,
+                ..Behavior::default()
+            },
+        )
+        .start(&fixture.store, "dev", &fixture.vm_directory)
+        .expect_err("a failed start must be reported");
+
+        assert!(error.to_string().contains("injected start failure"));
+        assert_eq!(calls.start.lock().unwrap().len(), 1);
     }
 
     #[test]
