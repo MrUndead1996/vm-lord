@@ -218,6 +218,22 @@ known at all. A VM HCS does not report is `Absent` and keeps its mapping: a
 stopped VM looks exactly like one deleted outside VMLord, and dropping the
 mapping would turn every stop into a delete.
 
+`platform::HcnNetwork::ensure` opens the one NAT network VMLord shares across
+the whole installation, creating it when the Host Network Service does not have
+it. The network has no owner among the VMs -- the per-VM object is the endpoint
+-- so nothing about it is written to `MetadataStore`: a constant identifier
+(`platform::VMLORD_NETWORK_ID`) is the whole of what VMLord remembers, which is
+what makes "open it, create it if missing" idempotent without reading a file.
+
+Its subnet is picked from `172.22.42.0/24` and then `172.22.142.0/24`, skipping
+any candidate that overlaps a subnet the host's own adapters are on, and is
+fixed at creation: guest addresses come out of it, so re-picking it would move
+every address anything already remembers. When both candidates are occupied the
+first is used anyway, with a warning -- a VM without a network is worse than a
+VM on a contested subnet, and the warning is the only thing that connects the
+resulting routing failure (a corporate VPN losing its route, typically) to
+VMLord.
+
 `platform::VmStartPipeline` starts a VM the creation pipeline produced. It
 re-grants the VM access to every file its stored `config.json` attaches before
 issuing `HcsStartComputeSystem`: Hyper-V opens those files under the VM's own

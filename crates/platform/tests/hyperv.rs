@@ -17,10 +17,10 @@ use std::{
 use uuid::Uuid;
 use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest, VmRepository};
 use vmlord_platform::{
-    HcsClient, HcsOperation, HcsSystem, HcsSystemState, HcsVmRepository, MetadataStore,
-    ReconnectOutcome, VmComputeSystemMapping,
-    VmCreationPipeline, VmDeletionPipeline, VmEventSink, VmForceStopPipeline, VmShutdownPipeline,
-    VmStartPipeline, list_known_vms, open_by_vm_id, open_by_vm_name, reconnect_known_vms,
+    HcnNetwork, HcsClient, HcsOperation, HcsSystem, HcsSystemState, HcsVmRepository, MetadataStore,
+    ReconnectOutcome, VMLORD_NETWORK_ID, VmComputeSystemMapping, VmCreationPipeline,
+    VmDeletionPipeline, VmEventSink, VmForceStopPipeline, VmShutdownPipeline, VmStartPipeline,
+    list_known_vms, open_by_vm_id, open_by_vm_name, reconnect_known_vms,
 };
 
 // `GENERIC_ALL`; matches the legacy AppSandbox backend's `hcs_vm.c` usage and
@@ -793,7 +793,8 @@ fn deletes_a_created_vm_completely() {
         mapping.hcs_compute_system_id, mapping.vm_id
     );
 
-    let deleted = VmDeletionPipeline::production().delete(&store, &request.name, &vm_directory, true);
+    let deleted =
+        VmDeletionPipeline::production().delete(&store, &request.name, &vm_directory, true);
     let directory_survived = vm_directory.exists();
     let remaining_mapping = store.find_by_vm_name(&request.name);
 
@@ -816,5 +817,48 @@ fn deletes_a_created_vm_completely() {
             .expect("HCS should answer whether it still knows the compute system")
             .is_none(),
         "HCS must no longer know the compute system of a deleted VM"
+    );
+}
+
+/// Exercises TASK-43's shared NAT network against the real Host Network
+/// Service: creates the network from its constant identifier, confirms that a
+/// second `ensure` opens the same one instead of failing, and -- only when the
+/// host did not already have the network -- deletes it twice to confirm the
+/// deletion is idempotent.
+///
+/// A network that already existed is left alone: it is the installation's
+/// network, and endpoints of real VMs may live in it.
+///
+/// Run elevated with:
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact ensures_the_shared_vmlord_nat_network --nocapture`
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HNS enabled"]
+fn ensures_the_shared_vmlord_nat_network() {
+    let preexisting = HcnNetwork::open_if_present(VMLORD_NETWORK_ID)
+        .expect("HNS should answer whether the VMLord network exists")
+        .is_some();
+
+    let created = HcnNetwork::ensure().expect("HNS should create the VMLord NAT network");
+    drop(created);
+
+    let reopened =
+        HcnNetwork::ensure().expect("a second ensure must open the network, not fail on it");
+    drop(reopened);
+
+    HcnNetwork::open(VMLORD_NETWORK_ID)
+        .expect("the network must be openable by its constant identifier");
+
+    if preexisting {
+        return;
+    }
+
+    HcnNetwork::delete(VMLORD_NETWORK_ID).expect("HNS should delete the VMLord NAT network");
+    HcnNetwork::delete(VMLORD_NETWORK_ID)
+        .expect("deleting a network HNS no longer has must succeed");
+    assert!(
+        HcnNetwork::open_if_present(VMLORD_NETWORK_ID)
+            .expect("HNS should answer whether it still has the network")
+            .is_none(),
+        "HNS must no longer know a deleted network"
     );
 }

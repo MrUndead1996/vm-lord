@@ -25,6 +25,7 @@ mod reconnect;
 mod repository;
 mod shutdown;
 mod start;
+mod subnet;
 mod vhd;
 mod watch;
 
@@ -34,7 +35,7 @@ pub use enumerate::{KnownVm, list_known_vms, open_by_vm_id, open_by_vm_name};
 pub use error::hresult_to_repository_error;
 pub use event::{EventWaitResult, WindowsEvent};
 pub use force_stop::VmForceStopPipeline;
-pub use hcn::HcnNetwork;
+pub use hcn::{HcnNetwork, VMLORD_NETWORK_ID};
 pub use hcs::{HcsClient, HcsOperation, HcsSystem, HcsSystemState, HcsSystemSummary};
 pub use metadata::{MetadataStore, VmComputeSystemMapping};
 pub use reconnect::{
