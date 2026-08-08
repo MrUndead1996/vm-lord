@@ -1356,9 +1356,9 @@ fn a_running_nat_vm_is_listed_with_the_address_hns_assigned() {
         Ok(())
     })();
 
-    // Best-effort cleanup regardless of the assertion below. Deletion does not
-    // remove the endpoint yet (TASK-42), so it goes first, while the mapping
-    // still names it.
+    // Best-effort cleanup regardless of the assertion below. Deletion removes
+    // the endpoint with the VM; the explicit delete afterwards only covers a
+    // deletion that did not get that far.
     let _ = repository.force_stop_vm(&vm_name);
     let endpoint = recorded_endpoint(&store, &vm_name);
     let _ = repository.delete_vm(VmDeleteRequest {
@@ -1371,4 +1371,171 @@ fn a_running_nat_vm_is_listed_with_the_address_hns_assigned() {
     let _ = fs::remove_dir_all(&root);
 
     outcome.expect("a running NAT VM must be listed with the address HNS assigned to its endpoint");
+}
+
+/// Exercises TASK-42's deletion of a VM's endpoint against the real Host
+/// Network Service: gives a created VM the endpoint its first start would have
+/// recorded, deletes the VM, and confirms HNS no longer has the endpoint while
+/// the shared network is still there.
+///
+/// The VM is never started, so no ISO is needed: what is under test is that
+/// deletion removes the endpoint the mapping names, not what the guest does
+/// with it. The network surviving is the other half -- it belongs to the
+/// installation, and re-creating it would re-pick the subnet and move every
+/// remaining guest's address.
+///
+/// Run elevated with:
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact deletes_the_endpoint_of_a_deleted_vm --nocapture`
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS and HNS enabled"]
+fn deletes_the_endpoint_of_a_deleted_vm() {
+    let root =
+        std::env::temp_dir().join(format!("vmlord-endpoint-delete-e2e-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+    let image_path = root.join("installer.iso");
+    fs::write(&image_path, b"placeholder installer media").expect("test image should be written");
+
+    let vm_name = format!("vmlord-e2e-endpoint-delete-{}", std::process::id());
+    let request = VmCreateRequest {
+        name: vm_name.clone(),
+        image_path: image_path.to_string_lossy().into_owned(),
+        ram_mb: 512,
+        disk_gb: 1,
+        cpu_cores: 1,
+        gpu_mode: GpuMode::None,
+        network_mode: NetworkMode::Nat,
+        username: "admin".into(),
+        password: "not used by create".into(),
+        ssh_enabled: false,
+        ssh_deploy_key: false,
+    };
+    let store = MetadataStore::new(root.join("vm-mapping.json"));
+    let vm_directory = root.join("vm");
+
+    let mapping = VmCreationPipeline::production()
+        .create(&store, &request, &vm_directory)
+        .expect("VM creation should succeed on an elevated Hyper-V host");
+
+    let network = HcnNetwork::ensure().expect("HNS should provide the VMLord NAT network");
+    let endpoint_id = Uuid::new_v4();
+    HcnEndpoint::create(&network, endpoint_id, &vm_name)
+        .expect("HNS should create the VM's endpoint");
+    drop(network);
+    store
+        .insert(VmComputeSystemMapping {
+            endpoint_id: Some(endpoint_id),
+            ..mapping
+        })
+        .expect("the endpoint should be recorded the way a start records it");
+
+    let deleted = VmDeletionPipeline::production().delete(&store, &vm_name, &vm_directory, true);
+    let endpoint_survived = HcnEndpoint::open_if_present(endpoint_id)
+        .expect("HNS should answer whether it still has the endpoint")
+        .is_some();
+    let network_survived = HcnNetwork::open_if_present(VMLORD_NETWORK_ID)
+        .expect("HNS should answer whether it still has the network")
+        .is_some();
+
+    // Best-effort cleanup regardless of the assertions below.
+    let _ = HcnEndpoint::delete(endpoint_id);
+    let _ = fs::remove_dir_all(&root);
+
+    deleted.expect("deletion should succeed on an elevated Hyper-V host");
+    assert!(
+        !endpoint_survived,
+        "an endpoint left in HNS holds an address of the network's subnet forever"
+    );
+    assert!(
+        network_survived,
+        "the shared network must outlive the VMs in it, including the last one"
+    );
+}
+
+/// Exercises TASK-42's cleanup on `initialize` against the real Host Network
+/// Service: puts an endpoint no mapping names into the shared network, brings a
+/// repository up, and confirms the orphan is gone while the endpoint a mapping
+/// does name is untouched.
+///
+/// The endpoints the host already had are recorded in the test's own store
+/// first, so this collects nothing but the orphan it created: run on a
+/// developer's machine, the VMs in a real VMLord's storage directory are not
+/// known to a store under a temporary root, and their endpoints would otherwise
+/// be collected as orphans -- which is the behaviour under test, not something
+/// to inflict on the host.
+///
+/// Run elevated with:
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact initialize_collects_the_endpoints_no_vm_owns --nocapture`
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS and HNS enabled"]
+fn initialize_collects_the_endpoints_no_vm_owns() {
+    let root = std::env::temp_dir().join(format!("vmlord-orphan-e2e-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+    let store = MetadataStore::new(root.join("vm-mapping.json"));
+
+    let network = HcnNetwork::ensure().expect("HNS should provide the VMLord NAT network");
+    for (index, id) in HcnEndpoint::list_in_vmlord_network()
+        .expect("HNS should list the endpoints in the VMLord network")
+        .into_iter()
+        .enumerate()
+    {
+        store
+            .insert(mapping_owning(&format!("preexisting-{index}"), id))
+            .expect("the host's own endpoints should be claimed before the cleanup runs");
+    }
+
+    let owned_id = Uuid::new_v4();
+    let orphan_id = Uuid::new_v4();
+    HcnEndpoint::create(&network, owned_id, "vmlord-orphan-probe-owned")
+        .expect("HNS should create the owned endpoint");
+    HcnEndpoint::create(&network, orphan_id, "vmlord-orphan-probe-orphan")
+        .expect("HNS should create the orphaned endpoint");
+    drop(network);
+    store
+        .insert(mapping_owning("vmlord-orphan-probe-owned", owned_id))
+        .expect("the owned endpoint should be recorded the way a start records it");
+
+    let initialized = HcsVmRepository::new(&root).initialize();
+    let owned_survived = HcnEndpoint::open_if_present(owned_id)
+        .expect("HNS should answer whether it still has the owned endpoint")
+        .is_some();
+    let orphan_survived = HcnEndpoint::open_if_present(orphan_id)
+        .expect("HNS should answer whether it still has the orphaned endpoint")
+        .is_some();
+    let network_survived = HcnNetwork::open_if_present(VMLORD_NETWORK_ID)
+        .expect("HNS should answer whether it still has the network")
+        .is_some();
+
+    // Best-effort cleanup regardless of the assertions below.
+    let _ = HcnEndpoint::delete(owned_id);
+    let _ = HcnEndpoint::delete(orphan_id);
+    let _ = fs::remove_dir_all(&root);
+
+    initialized.expect("the native backend should initialize on a Hyper-V host");
+    assert!(
+        !orphan_survived,
+        "an endpoint no VM owns is one nothing can ever find again"
+    );
+    assert!(
+        owned_survived,
+        "the endpoint of a VM VMLord knows must survive the cleanup"
+    );
+    assert!(
+        network_survived,
+        "the cleanup must collect endpoints, never the network they are in"
+    );
+}
+
+/// A mapping for a VM that owns `endpoint_id`, as a first start would leave it.
+///
+/// The compute system is named rather than created: the cleanup reads mappings
+/// and never asks HCS about them.
+fn mapping_owning(vm_name: &str, endpoint_id: Uuid) -> VmComputeSystemMapping {
+    VmComputeSystemMapping {
+        vm_id: Uuid::new_v4(),
+        vm_name: vm_name.to_owned(),
+        hcs_compute_system_id: format!("vmlord-{vm_name}-{endpoint_id}"),
+        disk_gb: 1,
+        endpoint_id: Some(endpoint_id),
+        network_mode: NetworkMode::Nat,
+    }
 }

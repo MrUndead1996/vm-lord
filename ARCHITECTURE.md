@@ -251,6 +251,27 @@ exists, so a VMLord that dies in between leaves an orphan endpoint behind;
 collecting those is the cleanup on `initialize`, not something the creating
 path tries to make atomic.
 
+`cleanup::remove_orphan_endpoints` is that collection. It enumerates every
+endpoint HNS has -- containers', WSL's and everyone else's are on the same list
+-- keeps the ones whose `HostComputeNetwork` is `VMLORD_NETWORK_ID`, and deletes
+those that no `MetadataStore` mapping names. The mappings are the whole of what
+VMLord knows about its endpoints, so one no mapping names is one no VM can ever
+use again, holding an address out of the subnet for as long as HNS has it. It is
+logged at info: routine housekeeping over VMs that no longer exist, with nothing
+for the user to do about it.
+
+The network is never deleted in return, not even when its last endpoint is gone.
+Re-creating it would re-pick the subnet and move every guest's address, which is
+the whole thing a long-lived endpoint exists to avoid; an empty network costs a
+host adapter and nothing else.
+
+Two cases can still put a live VM's endpoint on that list: a second VMLord
+process creating one at that exact moment, and a store that is not the one the
+endpoint was recorded in -- the VM storage directory is the user's to change, and
+the mappings live under it. Both cost the same and no more, because a VM whose
+recorded endpoint is gone gets a new one on its next start: the guest changes
+address rather than losing its VM.
+
 `platform::VmStartPipeline` starts a VM the creation pipeline produced. It
 re-grants the VM access to every file its stored `config.json` attaches before
 issuing `HcsStartComputeSystem`: Hyper-V opens those files under the VM's own
@@ -411,10 +432,13 @@ through `HcsTerminateComputeSystem`, which needs nothing from the guest, so its
 completion means the VM really has stopped.
 
 `platform::VmDeletionPipeline` removes everything a VM is made of: its compute
-system, the `config.json` creation wrote, its disks, and its `MetadataStore`
-mapping. Each step runs even if an earlier one failed -- a resource left behind
-is no reason to leave the others -- and the mapping is dropped last and only
-when nothing failed. That order is what keeps a partial failure recoverable: a
+system, its endpoint in the shared network, the `config.json` creation wrote,
+its disks, and its `MetadataStore` mapping. Each step runs even if an earlier
+one failed -- a resource left behind is no reason to leave the others -- and the
+mapping is dropped last and only when nothing failed. The endpoint goes after
+the compute system it may still be attached to, and it is the only network
+resource a deletion touches: the network stays, whether or not this was the last
+VM in it. That order is what keeps a partial failure recoverable: a
 VM whose resources are still partly present stays known to VMLord, stays listed,
 and can be deleted again, whereas dropping the mapping first would orphan files
 and compute systems the application can no longer reach. A running VM is refused
@@ -440,7 +464,13 @@ step a stop would silently become a delete.
 `platform::HcsVmRepository` is the `VmRepository` the composition root wires in
 by default. It owns the process-wide `HcsClient`, the `MetadataStore` under the
 configured VM storage directory, and the `VmConnections` registry, and maps each
-repository operation onto the pipeline that implements it. Setting
+repository operation onto the pipeline that implements it. Its `initialize` also
+brings the shared NAT network up and runs the orphan-endpoint cleanup, so the
+network exists -- with its host adapter, its subnet and its NAT -- from the
+moment VMLord runs rather than from the first start that needs one. Neither can
+fail the initialization: every start ensures the network again, and that is where
+a host whose HNS is broken has to be told about it, rather than losing the VM
+list and its deletions too over a service only the networked VMs need. Setting
 `VMLORD_BACKEND=legacy` selects the AppSandbox backend instead, for as long as
 the migration leaves it something the native backend cannot do; any other value
 (including an unset one) selects the native backend, so a typo cannot silently
