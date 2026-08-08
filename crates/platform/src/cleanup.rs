@@ -6,9 +6,15 @@
 
 use std::{fs, path::Path, time::Duration};
 
+use uuid::Uuid;
 use vmlord_core::RepositoryError;
 
-use crate::{HcsSystem, hcs::HCS_ACCESS_ALL};
+use crate::{
+    HcsSystem,
+    hcn_endpoint::HcnEndpoint,
+    hcs::HCS_ACCESS_ALL,
+    metadata::{MetadataStore, VmComputeSystemMapping},
+};
 
 /// A teardown needs nothing from the guest, so it completes as soon as HCS has
 /// torn the compute system down; the bound only guards against a wedged Host
@@ -33,6 +39,74 @@ pub(crate) fn teardown_compute_system(id: &str) -> Result<(), RepositoryError> {
         return Ok(());
     };
     system.terminate_and_wait(TEARDOWN_TIMEOUT)
+}
+
+/// Removes the endpoints in VMLord's network that no recorded VM owns.
+///
+/// Orphans accumulate for real: an endpoint's identifier is allocated by the
+/// caller and written to [`MetadataStore`] only after HNS has created the
+/// endpoint, so a VMLord that dies in between leaves behind an endpoint nothing
+/// will ever find again. It holds an address out of the network's subnet for as
+/// long as HNS has it.
+///
+/// Only the endpoints in VMLord's own network are considered at all, and among
+/// those only the ones no mapping names. The network itself is never deleted --
+/// not even when the last VM is gone -- because re-creating it would re-pick the
+/// subnet and move every guest's address, which is the whole thing a long-lived
+/// endpoint exists to avoid.
+///
+/// This runs from `initialize`, before this process has started any VM, so it
+/// cannot collect an endpoint of its own. Two cases can still put a live VM's
+/// endpoint on the list: a second VMLord process creating one at that exact
+/// moment, and a store that is not the one the endpoint was recorded in --
+/// VMLord's VM storage directory is the user's to change, and the mappings live
+/// under it. Both cost the same and no more: that VM's next start finds its
+/// recorded endpoint gone and creates another, so the guest changes address
+/// rather than losing its VM.
+pub(crate) fn remove_orphan_endpoints(store: &MetadataStore) -> Result<(), RepositoryError> {
+    let orphans = orphan_endpoints(&HcnEndpoint::list_in_vmlord_network()?, &store.list()?);
+    if orphans.is_empty() {
+        log::debug!("every endpoint in the VMLord network belongs to a VM VMLord knows");
+        return Ok(());
+    }
+
+    // Info rather than a diagnostic: collecting these is routine housekeeping
+    // with nothing for the user to do about it, and the endpoints belong to VMs
+    // that no longer exist.
+    log::info!(
+        "removing {} endpoint(s) in the VMLord network that no VM owns",
+        orphans.len()
+    );
+    let mut failures = Vec::new();
+    for id in orphans {
+        if let Err(error) = HcnEndpoint::delete(id) {
+            failures.push(format!("{id}: {error}"));
+        }
+    }
+
+    if !failures.is_empty() {
+        return Err(combine_failures(
+            "some endpoints that no VM owns were not removed",
+            failures,
+        ));
+    }
+    Ok(())
+}
+
+/// The listed endpoints that no mapping names.
+///
+/// The mappings are the whole of what VMLord knows about its endpoints, so an
+/// endpoint no mapping names is one no VM can ever use again.
+fn orphan_endpoints(listed: &[Uuid], mappings: &[VmComputeSystemMapping]) -> Vec<Uuid> {
+    listed
+        .iter()
+        .filter(|id| {
+            !mappings
+                .iter()
+                .any(|mapping| mapping.endpoint_id == Some(**id))
+        })
+        .copied()
+        .collect()
 }
 
 /// Removes `vm_directory` and everything under it, treating an absent directory
@@ -70,7 +144,22 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::{combine_failures, remove_vm_directory};
+    use uuid::Uuid;
+    use vmlord_core::NetworkMode;
+
+    use super::{combine_failures, orphan_endpoints, remove_vm_directory};
+    use crate::metadata::VmComputeSystemMapping;
+
+    fn mapping(vm_name: &str, endpoint_id: Option<Uuid>) -> VmComputeSystemMapping {
+        VmComputeSystemMapping {
+            vm_id: Uuid::new_v4(),
+            vm_name: vm_name.into(),
+            hcs_compute_system_id: format!("vmlord-{vm_name}"),
+            disk_gb: 20,
+            endpoint_id,
+            network_mode: NetworkMode::Nat,
+        }
+    }
 
     struct TempRoot(PathBuf);
 
@@ -111,6 +200,54 @@ mod tests {
 
         remove_vm_directory(&root.0.join("never-created"))
             .expect("an absent VM directory must not be reported as a failure");
+    }
+
+    #[test]
+    fn an_endpoint_no_mapping_names_is_an_orphan() {
+        let owned = Uuid::new_v4();
+        let orphan = Uuid::new_v4();
+
+        assert_eq!(
+            orphan_endpoints(&[owned, orphan], &[mapping("dev", Some(owned))]),
+            vec![orphan]
+        );
+    }
+
+    #[test]
+    fn every_endpoint_a_mapping_names_is_kept() {
+        // These are the endpoints of live VMs, including stopped ones: an
+        // endpoint outlives its VM's stops, and collecting it would hand the
+        // guest a new address on its next start.
+        let dev = Uuid::new_v4();
+        let build = Uuid::new_v4();
+
+        assert_eq!(
+            orphan_endpoints(
+                &[dev, build],
+                &[mapping("dev", Some(dev)), mapping("build", Some(build))]
+            ),
+            Vec::<Uuid>::new()
+        );
+    }
+
+    #[test]
+    fn a_vm_that_has_never_started_orphans_nothing() {
+        // A VM with no endpoint recorded owns no endpoint, so it neither keeps
+        // one alive nor makes one an orphan.
+        let orphan = Uuid::new_v4();
+
+        assert_eq!(
+            orphan_endpoints(&[orphan], &[mapping("never-started", None)]),
+            vec![orphan]
+        );
+    }
+
+    #[test]
+    fn nothing_listed_leaves_nothing_to_remove() {
+        assert_eq!(
+            orphan_endpoints(&[], &[mapping("dev", None)]),
+            Vec::<Uuid>::new()
+        );
     }
 
     #[test]
