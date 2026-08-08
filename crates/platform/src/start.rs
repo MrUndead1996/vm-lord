@@ -121,7 +121,8 @@ impl VmStartPipeline {
 
     /// Gives the VM its endpoint and writes the adapter into `configuration`.
     ///
-    /// A VM that asked for no network is left exactly as it was, HNS untouched.
+    /// A VM that asked for no network is left off HNS entirely; the adapter an
+    /// earlier start may have written is removed from its configuration.
     ///
     /// Neither the endpoint nor the recorded `endpoint_id` is undone when a
     /// later step fails: the endpoint outlives stops and lives until the VM is
@@ -140,7 +141,21 @@ impl VmStartPipeline {
                 mapping.vm_name,
                 mapping.network_mode
             );
-            return Ok(configuration);
+            // A VM edited off the network still has the adapter an earlier
+            // start wrote; without this it would come up on the network it was
+            // just taken off. The endpoint itself stays in HNS until the VM is
+            // deleted, so switching back to NAT keeps the guest's address.
+            let updated = hcs_config::remove_network_adapter(&configuration)?;
+            if updated != configuration {
+                self.write_configuration(mapping, vm_directory, &updated)?;
+                log::info!(
+                    "VM \"{}\" ({}) no longer asks for a network; its adapter was removed \
+                     from the stored configuration",
+                    mapping.vm_name,
+                    mapping.vm_id
+                );
+            }
+            return Ok(updated);
         }
 
         let adapter = (self.endpoint_provider)(&mapping.vm_name, mapping.endpoint_id)?;
@@ -649,6 +664,39 @@ mod tests {
                 .is_none()
         );
         assert_eq!(fixture.recorded_endpoint(), None);
+    }
+
+    #[test]
+    fn a_vm_switched_off_the_network_loses_the_adapter_it_used_to_have() {
+        // The VM ran with NAT, then its mode was edited back to `None`: the
+        // section a previous start wrote must not survive into this one.
+        let fixture = fixture("network-removed");
+        let calls = fixture.calls.clone();
+        let stale = crate::hcs_config::apply_network_adapter(
+            &fs::read_to_string(fixture.vm_directory.join("config.json")).unwrap(),
+            NEW_ENDPOINT_ID,
+            MAC_ADDRESS,
+        )
+        .unwrap();
+        fs::write(fixture.vm_directory.join("config.json"), &stale).unwrap();
+
+        pipeline(&calls, Behavior::default())
+            .start(&fixture.store, "dev", &fixture.vm_directory)
+            .expect("start should succeed");
+
+        assert!(calls.endpoint.lock().unwrap().is_empty());
+        assert!(
+            fixture
+                .configuration()
+                .pointer("/VirtualMachine/Devices/NetworkAdapters")
+                .is_none(),
+            "the stale adapter must be gone from the stored configuration"
+        );
+        let started = calls.start.lock().unwrap().clone();
+        assert!(
+            !started[0].1.contains("NetworkAdapters"),
+            "the starter must be handed the document without the adapter"
+        );
     }
 
     #[test]

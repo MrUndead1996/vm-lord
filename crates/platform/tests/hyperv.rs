@@ -945,21 +945,18 @@ fn starts_a_nat_vm_on_its_endpoint() {
     let store = MetadataStore::new(root.join("vm-mapping.json"));
     let vm_directory = root.join("vm");
 
-    // Creation still rejects every mode but `None` until TASK-44 lifts that,
-    // so the NAT mode is written into the mapping directly here.
-    let created_request = VmCreateRequest {
-        network_mode: NetworkMode::None,
-        ..request.clone()
-    };
     let mapping = VmCreationPipeline::production()
-        .create(&store, &created_request, &vm_directory)
+        .create(&store, &request, &vm_directory)
         .expect("VM creation should succeed on an elevated Hyper-V host");
-    store
-        .insert(VmComputeSystemMapping {
-            network_mode: NetworkMode::Nat,
-            ..mapping.clone()
-        })
-        .expect("the NAT mode should be recorded");
+    assert_eq!(
+        store
+            .find_by_vm_name(&mapping.vm_name)
+            .expect("the mapping should be readable")
+            .expect("creation should register the VM")
+            .network_mode,
+        NetworkMode::Nat,
+        "creation must record the NAT mode the request asked for"
+    );
 
     let outcome = (|| -> Result<(), String> {
         VmStartPipeline::production()

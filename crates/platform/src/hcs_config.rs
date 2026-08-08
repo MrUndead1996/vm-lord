@@ -19,8 +19,10 @@ impl HcsVmConfigBuilder {
     /// `system_disk_path` as the VM's boot disk and `request.image_path` as
     /// its installer ISO.
     ///
-    /// GPU and network configuration are not yet implemented (deferred to
-    /// their own tasks); any mode other than `None` is rejected.
+    /// GPU configuration is not yet implemented; any mode other than `None` is
+    /// rejected. Networking accepts `None` and `NetworkMode::Nat`; a NAT VM
+    /// gets no adapter here, because `VmStartPipeline` writes the
+    /// `NetworkAdapters` section once its endpoint exists.
     pub(crate) fn build(
         request: &VmCreateRequest,
         system_disk_path: &Path,
@@ -33,12 +35,7 @@ impl HcsVmConfigBuilder {
                 request.gpu_mode
             )));
         }
-        if request.network_mode != NetworkMode::None {
-            return Err(RepositoryError::new(format!(
-                "HCS configuration does not support network mode: {:?}",
-                request.network_mode
-            )));
-        }
+        ensure_supported_network_mode(request.network_mode)?;
 
         let attachments = BTreeMap::from([
             (
@@ -100,6 +97,27 @@ impl HcsVmConfigBuilder {
         serde_json::to_string(&configuration).map_err(|error| {
             RepositoryError::new(format!("failed to serialize HCS VM configuration: {error}"))
         })
+    }
+}
+
+/// Checks the network mode against what the native backend implements today.
+///
+/// Both entry points into the domain -- creation through
+/// [`HcsVmConfigBuilder::build`] and editing through `HcsVmRepository::update_vm`
+/// -- ask this, so a mode is refused in one place and with one message. The
+/// message names the task that will lift the refusal: an HRESULT from HNS,
+/// raised much deeper, tells the user nothing about why the mode is missing.
+pub(crate) fn ensure_supported_network_mode(mode: NetworkMode) -> Result<(), RepositoryError> {
+    match mode {
+        NetworkMode::None | NetworkMode::Nat => Ok(()),
+        other => {
+            let error = RepositoryError::new(format!(
+                "the HCS backend does not support network mode {other:?} yet; \
+                 External and Internal networking arrive with #10"
+            ));
+            log::error!("{error}");
+            Err(error)
+        }
     }
 }
 
@@ -181,6 +199,31 @@ pub(crate) fn apply_network_adapter(
     serde_json::to_string(&configuration).map_err(|error| {
         RepositoryError::new(format!(
             "failed to serialize the HCS VM configuration with its network adapter: {error}"
+        ))
+    })
+}
+
+/// Returns `document` without its `NetworkAdapters` section.
+///
+/// This is what a VM that no longer asks for a network needs: the stored
+/// document describes the adapter a previous start gave it, and leaving the
+/// section in place would bring the VM up on the network it just gave up.
+///
+/// A document that has no such section -- or no `Devices` object to hold one --
+/// is returned byte for byte, so a start that changes nothing writes nothing.
+pub(crate) fn remove_network_adapter(document: &str) -> Result<String, RepositoryError> {
+    let mut configuration = parse(document)?;
+    let removed = configuration
+        .pointer_mut(DEVICES_POINTER)
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|devices| devices.remove(NETWORK_ADAPTERS_KEY));
+    if removed.is_none() {
+        return Ok(document.to_owned());
+    }
+
+    serde_json::to_string(&configuration).map_err(|error| {
+        RepositoryError::new(format!(
+            "failed to serialize the HCS VM configuration without its network adapter: {error}"
         ))
     })
 }
@@ -351,7 +394,8 @@ mod tests {
     use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest};
 
     use super::{
-        HcsVmConfigBuilder, VmTopology, apply_network_adapter, apply_topology, read_topology,
+        HcsVmConfigBuilder, VmTopology, apply_network_adapter, apply_topology,
+        ensure_supported_network_mode, read_topology, remove_network_adapter,
     };
 
     fn request() -> VmCreateRequest {
@@ -469,10 +513,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_each_unsupported_network_mode() {
+    fn accepts_nat_without_writing_a_network_adapter() {
+        // Creation writes no adapter: the endpoint and its MAC only exist once
+        // `VmStartPipeline` has run, so the section is the start's to write.
+        let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
+        let request = VmCreateRequest {
+            network_mode: NetworkMode::Nat,
+            ..request()
+        };
+
+        let document = HcsVmConfigBuilder::build(&request, &system_disk_path).unwrap();
+
+        let json: Value = serde_json::from_str(&document).unwrap();
+        assert!(
+            json.pointer("/VirtualMachine/Devices/NetworkAdapters")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_each_network_mode_that_waits_for_its_own_task() {
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
         for mode in [
-            NetworkMode::Nat,
             NetworkMode::External,
             NetworkMode::Internal,
             NetworkMode::Unknown(7),
@@ -481,13 +543,71 @@ mod tests {
                 network_mode: mode,
                 ..request()
             };
-            assert!(
-                HcsVmConfigBuilder::build(&request, &system_disk_path)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("network mode")
-            );
+
+            let message = HcsVmConfigBuilder::build(&request, &system_disk_path)
+                .unwrap_err()
+                .to_string();
+
+            assert!(message.contains("network mode"), "got: {message}");
+            assert!(message.contains("#10"), "got: {message}");
         }
+    }
+
+    #[test]
+    fn removes_the_network_adapter_section_and_nothing_else() {
+        let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
+        let created = HcsVmConfigBuilder::build(&request(), &system_disk_path).unwrap();
+        let attached = apply_network_adapter(
+            &created,
+            Uuid::from_u128(0x3f2b_0c11_5c78_4c1b_9e2f_3a8b_7d4c_6e50),
+            "00-15-5D-01-02-03",
+        )
+        .unwrap();
+
+        let removed = remove_network_adapter(&attached).unwrap();
+
+        let before: Value = serde_json::from_str(&created).unwrap();
+        let after: Value = serde_json::from_str(&removed).unwrap();
+        assert!(
+            after
+                .pointer("/VirtualMachine/Devices/NetworkAdapters")
+                .is_none()
+        );
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn removing_an_absent_network_adapter_returns_the_document_unchanged() {
+        // Byte-identical, not merely equivalent: `VmStartPipeline` decides
+        // whether to rewrite `config.json` by comparing the two strings.
+        let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
+        let created = HcsVmConfigBuilder::build(&request(), &system_disk_path).unwrap();
+
+        let removed = remove_network_adapter(&created).unwrap();
+
+        assert_eq!(removed, created);
+    }
+
+    #[test]
+    fn removing_a_network_adapter_from_a_document_without_devices_changes_nothing() {
+        let document = json!({ "VirtualMachine": {} }).to_string();
+
+        let removed = remove_network_adapter(&document).unwrap();
+
+        assert_eq!(removed, document);
+    }
+
+    #[test]
+    fn removing_a_network_adapter_rejects_invalid_json() {
+        let error = remove_network_adapter("not json").unwrap_err().to_string();
+
+        assert!(error.contains("not valid JSON"), "got: {error}");
+    }
+
+    #[test]
+    fn ensure_supported_network_mode_accepts_none_and_nat() {
+        assert!(ensure_supported_network_mode(NetworkMode::None).is_ok());
+        assert!(ensure_supported_network_mode(NetworkMode::Nat).is_ok());
     }
 
     #[test]

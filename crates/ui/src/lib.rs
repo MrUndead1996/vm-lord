@@ -720,10 +720,11 @@ fn render_edit_vm_dialog(
                     egui::ComboBox::from_id_salt("edit-vm-network")
                         .selected_text(network_mode_label(form.network_mode))
                         .show_ui(ui, |ui| {
+                            // The same two modes the create form offers: the
+                            // native backend refuses the rest until #10, and an
+                            // option that always fails is a poor way to say so.
                             ui.selectable_value(&mut form.network_mode, NetworkMode::Nat, "NAT");
                             ui.selectable_value(&mut form.network_mode, NetworkMode::None, "None");
-                            ui.selectable_value(&mut form.network_mode, NetworkMode::External, "External");
-                            ui.selectable_value(&mut form.network_mode, NetworkMode::Internal, "Internal");
                         });
                     ui.end_row();
                 });
@@ -1406,14 +1407,14 @@ mod tests {
             ram_mb: 8192,
             cpu_cores: 8,
             gpu_mode: GpuMode::TryAll,
-            network_mode: NetworkMode::External,
+            network_mode: NetworkMode::Nat,
             error: None,
         })
         .unwrap();
 
         assert_eq!(request.name, "dev");
         assert_eq!(request.gpu_mode, GpuMode::TryAll);
-        assert_eq!(request.network_mode, NetworkMode::External);
+        assert_eq!(request.network_mode, NetworkMode::Nat);
     }
 
     #[test]
