@@ -64,6 +64,12 @@ impl Ipv4Subnet {
         Ipv4Addr::from(u32::from(self.network_address()) + 1)
     }
 
+    /// The number of bits the subnet's prefix fixes.
+    #[must_use]
+    pub fn prefix_length(self) -> u8 {
+        self.prefix_length
+    }
+
     /// Whether the two subnets share any address.
     ///
     /// Two networks overlap exactly when the wider one contains the narrower,
@@ -140,6 +146,24 @@ pub(crate) fn host_subnets() -> Result<Vec<Ipv4Subnet>, RepositoryError> {
     Ok(subnets)
 }
 
+/// The index of the host interface that carries `address`.
+///
+/// The DHCP server needs it to name the adapter its replies leave through: a
+/// socket bound to `0.0.0.0` sends the limited broadcast every DHCP offer uses
+/// through whichever interface the routing table prefers, which on an ordinary
+/// host is the physical one rather than VMLord's.
+pub(crate) fn interface_index(address: Ipv4Addr) -> Result<u32, RepositoryError> {
+    let table = UnicastAddressTable::query()?;
+    table.interface_index(address).ok_or_else(|| {
+        let error = RepositoryError::new(format!(
+            "no host adapter carries {address}, so the interface serving the VMLord network \
+             could not be identified"
+        ));
+        log::error!("{error}");
+        error
+    })
+}
+
 /// An owned unicast IP address table, freed with `FreeMibTable` on drop.
 struct UnicastAddressTable(*mut MIB_UNICASTIPADDRESS_TABLE);
 
@@ -160,6 +184,30 @@ impl UnicastAddressTable {
             return Err(error);
         }
         Ok(Self(table))
+    }
+
+    /// The interface index of the row holding `address`.
+    fn interface_index(&self, address: Ipv4Addr) -> Option<u32> {
+        // SAFETY: `self.0` is a table Windows filled in and this wrapper owns.
+        let table = unsafe { &*self.0 };
+        // SAFETY: `Table` is a flexible array of `NumEntries` rows; the
+        // declared length of 1 is the C convention, not the real count.
+        let rows =
+            unsafe { std::slice::from_raw_parts(table.Table.as_ptr(), table.NumEntries as usize) };
+
+        rows.iter().find_map(|row| {
+            // SAFETY: `Address` is a `SOCKADDR_INET` union whose active member
+            // the family field names; `Ipv4` is read only after `AF_INET`.
+            let family = unsafe { row.Address.si_family };
+            if family == AF_INET6 {
+                return None;
+            }
+            // SAFETY: See above -- the family is `AF_INET` here.
+            let raw = unsafe { row.Address.Ipv4.sin_addr.S_un.S_addr };
+            // `S_addr` is in network byte order, which is what `Ipv4Addr::from`
+            // a big-endian byte array expects.
+            (Ipv4Addr::from(raw.to_ne_bytes()) == address).then_some(row.InterfaceIndex)
+        })
     }
 
     fn ipv4_subnets(&self) -> Vec<Ipv4Subnet> {

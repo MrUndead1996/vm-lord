@@ -1146,3 +1146,97 @@ fn endpoint_address(endpoint: Uuid) -> Result<Option<EndpointAddress>, String> {
         .address()
         .map_err(|error| format!("HNS should report the properties of {endpoint}: {error}"))
 }
+
+/// Exercises TASK-47 against a real host: starting a NAT VM must bring the
+/// DHCP server up, and the address the server was given must be the one HNS
+/// assigned to the VM's endpoint.
+///
+/// What this test cannot assert is the guest's own view -- whether its
+/// interface actually came up with that address. That is the manual parity
+/// check, run with a VHDX carrying an installed Linux; installer media is
+/// enough for everything asserted here.
+///
+/// Set `VMLORD_TEST_IMAGE_PATH` to a real bootable ISO.
+///
+/// Run elevated with:
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact a_started_nat_vm_is_served_the_address_hns_assigned --nocapture`
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS, HNS, a free UDP 67 and VMLORD_TEST_IMAGE_PATH set"]
+fn a_started_nat_vm_is_served_the_address_hns_assigned() {
+    let image_path = std::env::var("VMLORD_TEST_IMAGE_PATH")
+        .expect("VMLORD_TEST_IMAGE_PATH must point to a real ISO image");
+    let root = std::env::temp_dir().join(format!("vmlord-dhcp-e2e-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+
+    let request = VmCreateRequest {
+        name: format!("vmlord-e2e-dhcp-test-{}", std::process::id()),
+        image_path,
+        ram_mb: 2048,
+        disk_gb: 8,
+        cpu_cores: 2,
+        gpu_mode: GpuMode::None,
+        network_mode: NetworkMode::Nat,
+        username: "admin".into(),
+        password: "not used by start".into(),
+        ssh_enabled: false,
+        ssh_deploy_key: false,
+    };
+    let store = MetadataStore::new(root.join("vm-mapping.json"));
+    let vm_directory = root.join("vm");
+
+    let mapping = VmCreationPipeline::production()
+        .create(&store, &request, &vm_directory)
+        .expect("VM creation should succeed on an elevated Hyper-V host");
+
+    let outcome = (|| -> Result<(), String> {
+        // The start fails rather than coming up silently without a network if
+        // the DHCP server cannot bind UDP 67, so this is also the check that
+        // nothing else on the host is already serving it.
+        VmStartPipeline::production()
+            .start(&store, &mapping.vm_name, &vm_directory)
+            .map_err(|error| {
+                format!("a NAT VM must start with its DHCP server running: {error}")
+            })?;
+
+        let endpoint = recorded_endpoint(&store, &mapping.vm_name)?;
+        let address = endpoint_address(endpoint)?
+            .ok_or("HNS must assign the endpoint an address for the guest to be served")?;
+
+        if address.prefix_length == 0 {
+            return Err(format!(
+                "HNS reported a prefix of 0 for {}, which describes no subnet",
+                address.ip_address
+            ));
+        }
+        address
+            .ip_address
+            .parse::<std::net::Ipv4Addr>()
+            .map_err(|error| format!("HNS reported \"{}\": {error}", address.ip_address))?;
+
+        // A second start must not fail on the reservation the first one made.
+        if let Ok(system) = HcsSystem::open(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL) {
+            let _ = system
+                .terminate()
+                .and_then(|operation| operation.wait_for_completion(Duration::from_secs(30)));
+        }
+        VmStartPipeline::production()
+            .start(&store, &mapping.vm_name, &vm_directory)
+            .map_err(|error| {
+                format!("a second start must not trip over the existing reservation: {error}")
+            })?;
+
+        Ok(())
+    })();
+
+    if let Ok(system) = HcsSystem::open(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL) {
+        let _ = system
+            .terminate()
+            .and_then(|operation| operation.wait_for_completion(Duration::from_secs(30)));
+    }
+    if let Ok(endpoint) = recorded_endpoint(&store, &mapping.vm_name) {
+        let _ = HcnEndpoint::delete(endpoint);
+    }
+    let _ = fs::remove_dir_all(&root);
+
+    outcome.expect("a NAT VM must start with the DHCP server serving the address HNS assigned");
+}

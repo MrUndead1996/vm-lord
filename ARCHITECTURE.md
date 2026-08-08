@@ -328,6 +328,49 @@ the collision by never reusing an endpoint at all: it creates one per start,
 deletes it on every stop, and keeps addresses stable by requesting a static IP.
 VMLord keeps its endpoints instead, so it has to release them explicitly.
 
+An endpoint alone does not give a Linux guest an address. HNS NAT does not
+answer the guest's DHCP Discover, and this network's `EnableDhcpServer` is
+rejected as unsupported, so `platform::dhcp` answers instead: a UDP socket on
+`0.0.0.0:67` and a worker thread, started with the first NAT VM and stopped with
+the process. The protocol itself is `arcbox-dhcp`'s -- it takes a datagram and
+returns the reply -- while VMLord owns the socket, the thread and the
+reservations.
+
+VMLord is not an allocator here either. Every address it offers is one HNS
+assigned to an endpoint and reserved to that endpoint's MAC, and a packet from a
+MAC that has no reservation is dropped before the server sees it. That check is
+also what keeps the host's own LAN out: the socket has to be bound to `0.0.0.0`,
+because a socket bound to the vNIC's unicast address receives no broadcast
+Discover, so DHCP broadcasts from every host interface arrive at it. A stranger
+is sent nothing at all -- not even a NAK, which would break its configuration --
+and the server's pool never holds an address HNS did not hand out, which is what
+keeps `reserve_ip` from panicking on an address already taken.
+
+A start reserves the address of the VM it is starting, and the first start of
+the process also reserves the address of every endpoint already recorded: a
+VMLord that was restarted while its VMs kept running would otherwise drop their
+renewals, and a guest that is not answered does not ask again. An endpoint HNS
+reports no address for fails the start -- a VM that asked for a network must not
+come up with an adapter nothing will configure.
+
+The subnet, gateway and mask come from the endpoint's own address rather than
+from a second query to HNS. The DNS servers do not: WinNAT runs no DNS proxy on
+the gateway, so a guest pointed at it would resolve nothing. `platform::host_dns`
+offers the host's own IPv4 resolvers instead, minus loopback, link-local and
+anything inside the VMLord subnet, and falls back to 1.1.1.1 and 8.8.8.8 when
+nothing usable is left.
+
+The lease is a day long, and it outlives VMLord: the server stops with the
+process, so a guest keeps its address after the application is closed but has
+nothing to renew against. Moving the server into a Windows service, or keeping
+VMLord in the tray, is left for later.
+
+UDP 67 being served already fails the start with a diagnosis naming Internet
+Connection Sharing, the Hyper-V Default Switch and third-party DHCP servers.
+`SO_REUSEADDR` is deliberately not set: on Windows it would let VMLord take over
+a port another server is answering on, and two servers answering the same guests
+is worse than a start that says why it failed.
+
 `platform::VmShutdownPipeline` asks the guest of a known VM to shut down
 through `HcsShutDownComputeSystem`. HCS parses that call's options as JSON and
 rejects a null pointer with `HCS_E_INVALID_JSON`, unlike start and terminate,
