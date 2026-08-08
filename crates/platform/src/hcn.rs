@@ -10,8 +10,11 @@ use std::ptr;
 use serde::Serialize;
 use vmlord_core::RepositoryError;
 use windows::{
-    Win32::System::HostComputeNetwork::{
-        HcnCloseNetwork, HcnCreateNetwork, HcnDeleteNetwork, HcnOpenNetwork,
+    Win32::{
+        Foundation::ERROR_NOT_FOUND,
+        System::HostComputeNetwork::{
+            HcnCloseNetwork, HcnCreateNetwork, HcnDeleteNetwork, HcnOpenNetwork,
+        },
     },
     core::{GUID, HRESULT, HSTRING},
 };
@@ -33,9 +36,20 @@ const VMLORD_NETWORK_NAME: &str = "VMLord";
 /// `HCN_E_NETWORK_NOT_FOUND` from `computenetwork.h` (facility 0x3B).
 ///
 /// `windows-rs` does not surface the HCN error constants, so the value is
-/// spelled out here; [`HcnNetwork::ensure`] does not depend on it being the
-/// only not-found code, because it re-opens the network after a failed create.
+/// spelled out here.
 const HCN_E_NETWORK_NOT_FOUND: HRESULT = HRESULT(0x803B_0001_u32 as i32);
+
+/// Whether HNS is reporting that it does not have the network.
+///
+/// Two codes, because HNS answers with a different one per call: a live host
+/// fails `HcnOpenNetwork` with `HCN_E_NETWORK_NOT_FOUND` but
+/// `HcnDeleteNetwork` with `ERROR_NOT_FOUND` (0x80070490, "Element not
+/// found"). Both mean the same thing to a caller, and either one alone leaves
+/// the other call reporting an absent network as a failure.
+fn is_network_absent(error: &windows::core::Error) -> bool {
+    let code = error.code();
+    code == HCN_E_NETWORK_NOT_FOUND || code == ERROR_NOT_FOUND.to_hresult()
+}
 
 /// An owned HCN network handle used by the Windows Host Network Service.
 pub struct HcnNetwork(*mut core::ffi::c_void);
@@ -91,7 +105,7 @@ impl HcnNetwork {
     pub fn open_if_present(id: u128) -> Result<Option<Self>, RepositoryError> {
         match Self::try_open(id) {
             Ok(network) => Ok(Some(network)),
-            Err(error) if error.code() == HCN_E_NETWORK_NOT_FOUND => {
+            Err(error) if is_network_absent(&error) => {
                 log::debug!("HNS does not know network {:?}", GUID::from_u128(id));
                 Ok(None)
             }
@@ -142,7 +156,7 @@ impl HcnNetwork {
                 log::info!("deleted HCN network {guid:?}");
                 Ok(())
             }
-            Err(error) if error.code() == HCN_E_NETWORK_NOT_FOUND => {
+            Err(error) if is_network_absent(&error) => {
                 log::debug!("HCN network {guid:?} was already gone");
                 Ok(())
             }
