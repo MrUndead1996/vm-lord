@@ -38,7 +38,9 @@ pub use event::{EventWaitResult, WindowsEvent};
 pub use force_stop::VmForceStopPipeline;
 pub use hcn::{HcnNetwork, VMLORD_NETWORK_ID};
 pub use hcn_endpoint::{EndpointAddress, HcnEndpoint};
-pub use hcs::{HcsClient, HcsOperation, HcsSystem, HcsSystemState, HcsSystemSummary};
+pub use hcs::{
+    HcsClient, HcsOperation, HcsStartFailure, HcsSystem, HcsSystemState, HcsSystemSummary,
+};
 pub use metadata::{MetadataStore, VmComputeSystemMapping};
 pub use reconnect::{
     ReconnectOutcome, ReconnectReport, ReconnectedVm, VmConnections, reconnect_known_vms,

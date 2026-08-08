@@ -13,7 +13,8 @@ use crate::{
     HcsClient, HcsSystem,
     hcn::HcnNetwork,
     hcn_endpoint::HcnEndpoint,
-    hcs::HCS_ACCESS_ALL,
+    cleanup,
+    hcs::{HCS_ACCESS_ALL, HcsStartFailure},
     hcs_config, layout,
     metadata::{MetadataStore, VmComputeSystemMapping},
 };
@@ -34,7 +35,7 @@ pub(crate) struct VmNetworkAdapter {
 }
 
 type AccessGranter = Box<dyn Fn(&str, &Path) -> Result<(), RepositoryError>>;
-type SystemStarter = Box<dyn Fn(&str, &str) -> Result<(), RepositoryError>>;
+type SystemStarter = Box<dyn Fn(&str, &str) -> Result<(), HcsStartFailure>>;
 type EndpointProvider =
     Box<dyn Fn(&str, Option<Uuid>) -> Result<VmNetworkAdapter, RepositoryError>>;
 
@@ -59,7 +60,7 @@ impl VmStartPipeline {
     #[cfg(test)]
     fn for_test(
         access_granter: impl Fn(&str, &Path) -> Result<(), RepositoryError> + 'static,
-        system_starter: impl Fn(&str, &str) -> Result<(), RepositoryError> + 'static,
+        system_starter: impl Fn(&str, &str) -> Result<(), HcsStartFailure> + 'static,
         endpoint_provider: impl Fn(&str, Option<Uuid>) -> Result<VmNetworkAdapter, RepositoryError>
         + 'static,
     ) -> Self {
@@ -109,9 +110,11 @@ impl VmStartPipeline {
         let configuration = self.read_configuration(&mapping, vm_directory)?;
         let configuration = self.attach_network(store, &mapping, vm_directory, configuration)?;
         self.grant_access_to_attachments(&mapping, &configuration)?;
-        (self.system_starter)(&mapping.hcs_compute_system_id, &configuration).inspect_err(
-            |error| {
+        (self.system_starter)(&mapping.hcs_compute_system_id, &configuration).map_err(
+            |failure| {
+                let error = failure.into_error();
                 log::error!("failed to start VM \"{}\": {error}", mapping.vm_name);
+                error
             },
         )?;
 
@@ -334,24 +337,39 @@ fn ensure_endpoint(
 /// can run again. Re-creating from the stored configuration keeps the VM's id,
 /// disks and metadata mapping unchanged, so a stop stays a stop rather than
 /// becoming an implicit delete.
-fn start_hcs_system(id: &str, configuration: &str) -> Result<(), RepositoryError> {
+fn start_hcs_system(id: &str, configuration: &str) -> Result<(), HcsStartFailure> {
     // The system handle must outlive the start operation it issued.
-    let system = match HcsSystem::open_if_present(id, HCS_ACCESS_ALL)? {
+    let existing =
+        HcsSystem::open_if_present(id, HCS_ACCESS_ALL).map_err(HcsStartFailure::Failed)?;
+    let system = match existing {
         Some(system) => system,
         None => {
             log::info!(
                 "HCS no longer knows compute system \"{id}\"; \
                  re-creating it from the stored configuration before starting it"
             );
-            let (system, creation) = HcsClient::new().create_system(id, configuration)?;
-            creation.wait_for_completion(CREATE_TIMEOUT)?;
-            system
+            HcsClient::new()
+                .create_system_and_wait(id, configuration, CREATE_TIMEOUT)
+                .map_err(|failure| tear_down_after_a_failed_creation(id, failure))?
         }
     };
-    system
-        .start()?
-        .wait_for_completion(START_TIMEOUT)
-        .map(|_document| ())
+
+    system.start_and_wait(START_TIMEOUT)
+}
+
+/// Removes a compute system HCS may have created before the creation failed.
+///
+/// `HcsCreateComputeSystem` can succeed while its operation fails, leaving a
+/// system that holds the very configuration -- and therefore the very endpoint
+/// -- the failed attempt named. A retry with a replaced endpoint would find
+/// that system through `open_if_present` and start it with the stale adapter,
+/// so it has to go first. The teardown is best-effort: it explains a start that
+/// failed, it does not decide it.
+fn tear_down_after_a_failed_creation(id: &str, failure: HcsStartFailure) -> HcsStartFailure {
+    if let Err(error) = cleanup::teardown_compute_system(id) {
+        log::warn!("cleanup of the ambiguously-created compute system \"{id}\" also failed: {error}");
+    }
+    failure
 }
 
 #[cfg(test)]
@@ -369,7 +387,10 @@ mod tests {
     use vmlord_core::{NetworkMode, RepositoryError};
 
     use super::{VmNetworkAdapter, VmStartPipeline, attachment_paths};
-    use crate::metadata::{MetadataStore, VmComputeSystemMapping};
+    use crate::{
+        hcs::HcsStartFailure,
+        metadata::{MetadataStore, VmComputeSystemMapping},
+    };
 
     struct TempRoot(PathBuf);
 
@@ -514,7 +535,9 @@ mod tests {
                         .unwrap()
                         .push((id.to_owned(), configuration.to_owned()));
                     if behavior.fail_start {
-                        return Err(RepositoryError::new("injected start failure"));
+                        return Err(HcsStartFailure::Failed(RepositoryError::new(
+                            "injected start failure",
+                        )));
                     }
                     Ok(())
                 }

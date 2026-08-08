@@ -36,6 +36,15 @@ use crate::{
 /// spelled out here.
 const HCN_E_ENDPOINT_NOT_FOUND: HRESULT = HRESULT(0x803B_0002_u32 as i32);
 
+/// `HCN_E_ENDPOINT_ALREADY_ATTACHED` from `computenetwork.h` (facility 0x3B).
+///
+/// Reported through HCS rather than through an HCN call: a compute system whose
+/// configuration names an endpoint HNS still has attached elsewhere fails to be
+/// created or started with this code. HNS holds that attachment even after HCS
+/// has destroyed the compute system it points at, which is what a VM stopped
+/// without a detach leaves behind.
+pub(crate) const HCN_E_ENDPOINT_ALREADY_ATTACHED: HRESULT = HRESULT(0x803B_0014_u32 as i32);
+
 /// An address HNS assigned to an endpoint.
 ///
 /// Read back rather than chosen: the network's IPAM allocates it, and VMLord
