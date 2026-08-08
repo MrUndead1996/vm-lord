@@ -16,7 +16,7 @@
 * Каждый коммит: `TASK-44: <comment>`, автор — агент:
   `GIT_AUTHOR_NAME=agent GIT_AUTHOR_EMAIL=agent@vmlord.local GIT_COMMITTER_NAME=agent GIT_COMMITTER_EMAIL=agent@vmlord.local git commit -m "..."`
 * Сборка только под Windows-таргет: `cargo build --target=x86_64-pc-windows-gnu`.
-* **Тесты в этой среде (WSL) не запускаются: wine нет, бинарники под Windows.** Проверка = компиляция тестов: `cargo test --no-run --target x86_64-pc-windows-gnu`. Прогон unit-тестов — за владельцем на Windows. Ни один шаг плана не должен утверждать, что тесты «прошли»; фиксируется только то, что они собрались.
+* Unit-тесты запускаются прямо здесь: `cargo test --target x86_64-pc-windows-gnu` — WSL исполняет Windows-бинарники через interop. `#[ignore]`-тесты в `crates/platform/tests/hyperv.rs` требуют настоящего Hyper-V и остаются за владельцем.
 * Clippy без предупреждений: `cargo clippy --target=x86_64-pc-windows-gnu --all-targets`.
 * `External`, `Internal` и `Unknown(_)` остаются отклонёнными, сообщение называет #10.
 * Endpoint'ы в HNS этой задачей не удаляются никогда — очистка это #42.
@@ -345,8 +345,8 @@ Expected: собирается без ошибок.
 
 - [ ] **Step 6: Убедиться, что тест падает по существу**
 
-Run: `cargo test --no-run --target x86_64-pc-windows-gnu -p vmlord-platform`
-Expected: собирается. Тест здесь не запускается (см. Global Constraints); он фиксирует поведение, которого в `attach_network` ещё нет — ветка «не Nat» возвращает документ как есть.
+Run: `cargo test --target x86_64-pc-windows-gnu -p vmlord-platform a_vm_switched_off_the_network`
+Expected: FAIL — ветка «не Nat» возвращает документ как есть, устаревшая секция остаётся на месте.
 
 - [ ] **Step 7: Снести секцию в ветке «не Nat»**
 
@@ -812,6 +812,6 @@ GIT_AUTHOR_NAME=agent GIT_AUTHOR_EMAIL=agent@vmlord.local GIT_COMMITTER_NAME=age
 
 - [ ] `cargo build --target=x86_64-pc-windows-gnu` — успешно
 - [ ] `cargo clippy --target=x86_64-pc-windows-gnu --all-targets` — без предупреждений
-- [ ] `cargo test --no-run --target x86_64-pc-windows-gnu` — все тесты собираются
-- [ ] В отчёте владельцу прямо сказано: unit-тесты **не запускались** (в WSL нет wine), их прогон и ручная parity-проверка на Hyper-V — за владельцем
+- [ ] `cargo test --target x86_64-pc-windows-gnu` — все тесты проходят
+- [ ] Ручная parity-проверка на Hyper-V и `#[ignore]`-тесты — за владельцем
 - [ ] Merge request не открывается без явного разрешения владельца
