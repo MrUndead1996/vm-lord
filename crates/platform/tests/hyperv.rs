@@ -679,6 +679,7 @@ fn shuts_down_a_running_guest() {
             hcs_compute_system_id: hcs_id.clone(),
             disk_gb: 20,
             endpoint_id: None,
+            network_mode: NetworkMode::None,
         })
         .expect("mapping should be persisted");
 
@@ -905,4 +906,125 @@ fn creates_opens_and_deletes_a_vm_endpoint() {
             .is_none(),
         "HNS must no longer know a deleted endpoint"
     );
+}
+
+/// Exercises TASK-38's start-time networking against the real Host Network
+/// Service and Host Compute Service: creates a NAT VM, starts it, and confirms
+/// that the start gave it an endpoint, recorded it, and wrote the adapter into
+/// the stored configuration.
+///
+/// The second start is what makes this more than a smoke test: the endpoint
+/// must be reused rather than re-created, because a new one would hand the
+/// guest a different address every time the VM came up.
+///
+/// Set `VMLORD_TEST_IMAGE_PATH` to a real bootable ISO.
+///
+/// Run elevated with:
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact starts_a_nat_vm_on_its_endpoint --nocapture`
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS, HNS and VMLORD_TEST_IMAGE_PATH set"]
+fn starts_a_nat_vm_on_its_endpoint() {
+    let image_path = std::env::var("VMLORD_TEST_IMAGE_PATH")
+        .expect("VMLORD_TEST_IMAGE_PATH must point to a real ISO image");
+    let root = std::env::temp_dir().join(format!("vmlord-hns-start-e2e-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+
+    let request = VmCreateRequest {
+        name: format!("vmlord-e2e-nat-test-{}", std::process::id()),
+        image_path,
+        ram_mb: 2048,
+        disk_gb: 8,
+        cpu_cores: 2,
+        gpu_mode: GpuMode::None,
+        network_mode: NetworkMode::Nat,
+        username: "admin".into(),
+        password: "not used by start".into(),
+        ssh_enabled: false,
+        ssh_deploy_key: false,
+    };
+    let store = MetadataStore::new(root.join("vm-mapping.json"));
+    let vm_directory = root.join("vm");
+
+    // Creation still rejects every mode but `None` until TASK-44 lifts that,
+    // so the NAT mode is written into the mapping directly here.
+    let created_request = VmCreateRequest {
+        network_mode: NetworkMode::None,
+        ..request.clone()
+    };
+    let mapping = VmCreationPipeline::production()
+        .create(&store, &created_request, &vm_directory)
+        .expect("VM creation should succeed on an elevated Hyper-V host");
+    store
+        .insert(VmComputeSystemMapping {
+            network_mode: NetworkMode::Nat,
+            ..mapping.clone()
+        })
+        .expect("the NAT mode should be recorded");
+
+    let outcome = (|| -> Result<(), String> {
+        VmStartPipeline::production()
+            .start(&store, &mapping.vm_name, &vm_directory)
+            .map_err(|error| format!("the NAT VM must start: {error}"))?;
+
+        let endpoint_id = store
+            .find_by_vm_name(&mapping.vm_name)
+            .map_err(|error| error.to_string())?
+            .and_then(|mapping| mapping.endpoint_id)
+            .ok_or("the start must record the endpoint it created")?;
+
+        let configuration: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(vm_directory.join("config.json"))
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let adapters = configuration
+            .pointer("/VirtualMachine/Devices/NetworkAdapters")
+            .ok_or("the start must write the adapter into the stored configuration")?;
+        if adapters
+            .as_object()
+            .is_none_or(|adapters| adapters.len() != 1)
+        {
+            return Err(format!(
+                "expected exactly one network adapter, got {adapters}"
+            ));
+        }
+
+        // A stop destroys the compute system; the endpoint must survive it.
+        if let Ok(system) = HcsSystem::open(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL) {
+            let _ = system
+                .terminate()
+                .and_then(|operation| operation.wait_for_completion(Duration::from_secs(30)));
+        }
+        VmStartPipeline::production()
+            .start(&store, &mapping.vm_name, &vm_directory)
+            .map_err(|error| format!("the NAT VM must start a second time: {error}"))?;
+
+        let reused = store
+            .find_by_vm_name(&mapping.vm_name)
+            .map_err(|error| error.to_string())?
+            .and_then(|mapping| mapping.endpoint_id);
+        if reused != Some(endpoint_id) {
+            return Err(format!(
+                "the second start must reuse endpoint {endpoint_id}, not {reused:?}"
+            ));
+        }
+
+        Ok(())
+    })();
+
+    // Best-effort cleanup regardless of the assertion below. The shared network
+    // is left in place: it belongs to the installation, not to this VM.
+    if let Ok(system) = HcsSystem::open(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL) {
+        let _ = system
+            .terminate()
+            .and_then(|operation| operation.wait_for_completion(Duration::from_secs(30)));
+    }
+    if let Ok(Some(mapping)) = store.find_by_vm_name(&mapping.vm_name)
+        && let Some(endpoint_id) = mapping.endpoint_id
+    {
+        let _ = HcnEndpoint::delete(endpoint_id);
+    }
+    let _ = fs::remove_dir_all(&root);
+
+    outcome.expect("the NAT start path must work end to end");
 }

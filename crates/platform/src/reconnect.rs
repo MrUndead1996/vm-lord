@@ -316,7 +316,7 @@ mod tests {
     };
 
     use uuid::Uuid;
-    use vmlord_core::RepositoryError;
+    use vmlord_core::{NetworkMode, RepositoryError};
 
     use super::{ReconnectOutcome, VmConnections, reconnect_known_vms, reconnect_with, supersedes};
     use crate::metadata::{MetadataStore, VmComputeSystemMapping};
@@ -349,6 +349,7 @@ mod tests {
             hcs_compute_system_id: format!("vmlord-{}", vm_id.as_simple()),
             disk_gb: 20,
             endpoint_id: None,
+            network_mode: NetworkMode::None,
         }
     }
 

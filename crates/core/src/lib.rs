@@ -8,6 +8,8 @@ pub use settings::{AppSettings, Language, LogLevel, SettingsError, SettingsStore
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VmCreateRequest {
     pub name: String,
@@ -105,8 +107,15 @@ pub enum GpuMode {
     Unknown(i32),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How a VM is attached to the network.
+///
+/// Serializable because the platform layer records the mode a VM was created
+/// with, and a start has to know whether to give the VM an endpoint. The
+/// variant names are therefore an on-disk format: renaming one changes what
+/// already-stored VMs read back as.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkMode {
+    #[default]
     None,
     Nat,
     External,

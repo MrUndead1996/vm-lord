@@ -259,6 +259,41 @@ a start without the grants fails with `ERROR_ACCESS_DENIED`. The stored
 configuration, not a re-derived path list, is the source of truth for which
 files the VM will open.
 
+The start is also where a VM gets on the network. A VM whose mapping records
+`NetworkMode::Nat` is given its endpoint before anything is granted or started:
+`HcnNetwork::ensure`, then the recorded endpoint or a freshly created one, then
+`HcnQueryEndpointProperties` for the MAC address HNS assigned. Failing any of
+those fails `start_vm` -- a VM that asked for a network and did not get one must
+not come up silently without it.
+
+The recorded `endpoint_id` is opened rather than trusted, the same way
+`HcsSystem::open_if_present` treats a compute system id: an endpoint deleted
+outside VMLord or lost to an HNS reset is replaced instead of failing the start.
+That changes the guest's address, but a VM that can no longer start is worse.
+Nothing is undone when a later step fails -- the endpoint outlives stops and
+lives until the VM is deleted, and dropping it after a failed start would hand
+the guest a new address on the next attempt.
+
+The endpoint and its MAC are then written into the stored `config.json` as a
+`Devices/NetworkAdapters` entry keyed by the endpoint's own identifier, using
+the same point-edit `update_vm` applies to `SizeInMB`/`Count`. The document on
+disk is what a compute system HCS has forgotten is rebuilt from, so an adapter
+that lived only in memory would be lost the first time that happened. The
+section is replaced whole, which makes every start after the first converge on
+the same document.
+
+`VmComputeSystemMapping::network_mode` is what that decision reads, another
+`#[serde(default)]` field: the stored `config.json` describes the adapter a VM
+already has, not the mode it was created with, and mappings written before the
+field existed read as `None` -- which is what every VM created so far asked for.
+Its variant names are therefore an on-disk format.
+
+Whether HCS still delivers `SystemExited` for a VM with an attached adapter is
+unresolved: AppSandbox hot-detached the adapter from a running VM for exactly
+that reason (`hcs_detach_network`). Until that is checked on a live host, VMLord
+attaches the adapter and does not detach it -- adding a second state for a
+running VM on an unconfirmed quirk would cost more than it is known to buy.
+
 `platform::VmShutdownPipeline` asks the guest of a known VM to shut down
 through `HcsShutDownComputeSystem`. HCS parses that call's options as JSON and
 rejects a null pointer with `HCS_E_INVALID_JSON`, unlike start and terminate,

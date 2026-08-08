@@ -148,7 +148,7 @@ mod tests {
     };
 
     use uuid::Uuid;
-    use vmlord_core::RepositoryError;
+    use vmlord_core::{NetworkMode, RepositoryError};
 
     use super::VmDeletionPipeline;
     use crate::metadata::{MetadataStore, VmComputeSystemMapping};
@@ -196,6 +196,7 @@ mod tests {
             hcs_compute_system_id: "vmlord-dev".into(),
             disk_gb: 20,
             endpoint_id: None,
+            network_mode: NetworkMode::None,
         };
         let store = MetadataStore::new(root.0.join("vm-mapping.json"));
         store

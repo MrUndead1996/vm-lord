@@ -15,10 +15,14 @@ use serde::Serialize;
 use uuid::Uuid;
 use vmlord_core::RepositoryError;
 use windows::{
-    Win32::System::HostComputeNetwork::{
-        HcnCloseEndpoint, HcnCreateEndpoint, HcnDeleteEndpoint, HcnOpenEndpoint,
+    Win32::System::{
+        Com::CoTaskMemFree,
+        HostComputeNetwork::{
+            HcnCloseEndpoint, HcnCreateEndpoint, HcnDeleteEndpoint, HcnOpenEndpoint,
+            HcnQueryEndpointProperties,
+        },
     },
-    core::{GUID, HRESULT, HSTRING},
+    core::{GUID, HRESULT, HSTRING, PWSTR},
 };
 
 use crate::{
@@ -36,6 +40,12 @@ const HCN_E_ENDPOINT_NOT_FOUND: HRESULT = HRESULT(0x803B_0002_u32 as i32);
 fn is_endpoint_absent(error: &windows::core::Error) -> bool {
     is_absent(error, HCN_E_ENDPOINT_NOT_FOUND)
 }
+
+/// Asks for an endpoint's properties in the schema every VMLord document uses.
+///
+/// HCN treats the query as a JSON document and rejects an empty string, so the
+/// schema version has to be spelled out even when nothing is being filtered.
+const PROPERTIES_QUERY: &str = r#"{"SchemaVersion":{"Major":2,"Minor":0}}"#;
 
 /// An owned HCN endpoint handle used by the Windows Host Network Service.
 pub struct HcnEndpoint(*mut core::ffi::c_void);
@@ -108,6 +118,47 @@ impl HcnEndpoint {
         Ok(Self(endpoint))
     }
 
+    /// The MAC address HNS assigned to this endpoint.
+    ///
+    /// HNS picks the address when the endpoint is created; VMLord reads it
+    /// rather than choosing one, and writes it into the VM's `NetworkAdapters`
+    /// section beside the endpoint id.
+    pub fn mac_address(&self) -> Result<String, RepositoryError> {
+        let properties = self.properties()?;
+        let properties: serde_json::Value = serde_json::from_str(&properties).map_err(|error| {
+            let error = RepositoryError::new(format!(
+                "the properties HNS reported for the endpoint are not valid JSON: {error}"
+            ));
+            log::error!("{error}");
+            error
+        })?;
+
+        mac_address(&properties).ok_or_else(|| {
+            let error =
+                RepositoryError::new("HNS reported no MAC address for the endpoint".to_owned());
+            log::error!("{error}");
+            error
+        })
+    }
+
+    /// Asks HNS for this endpoint's properties as a JSON document.
+    fn properties(&self) -> Result<String, RepositoryError> {
+        let query = HSTRING::from(PROPERTIES_QUERY);
+        let mut properties = PWSTR::null();
+        // SAFETY: The endpoint handle is owned by `self` and outlives the call,
+        // as does `query`, and the output pointer is valid for it. On success
+        // HCN transfers ownership of the returned string to this process.
+        unsafe { HcnQueryEndpointProperties(self.0, &query, &mut properties, None) }.map_err(
+            |error| {
+                let error = windows_error("query HCN endpoint properties", None, error);
+                log::error!("{error}");
+                error
+            },
+        )?;
+
+        HcnAllocatedString::new(properties)?.into_string()
+    }
+
     /// Deletes an HCN endpoint, treating one HNS does not have as deleted.
     ///
     /// Deleting takes an identifier rather than an open handle, so this is an
@@ -139,6 +190,47 @@ impl Drop for HcnEndpoint {
     fn drop(&mut self) {
         // SAFETY: This wrapper exclusively owns a handle returned by HCN.
         let _ = unsafe { HcnCloseEndpoint(self.0) };
+    }
+}
+
+/// Reads the MAC address out of the properties HNS reports for an endpoint.
+fn mac_address(properties: &serde_json::Value) -> Option<String> {
+    properties
+        .get("MacAddress")
+        .and_then(serde_json::Value::as_str)
+        .filter(|address| !address.is_empty())
+        .map(str::to_owned)
+}
+
+/// An owned, HCN-allocated wide string, freed with `CoTaskMemFree` on drop.
+///
+/// Not the same allocator as the one behind HCS's result documents: the HCN
+/// functions hand back COM task memory, so freeing one of these with
+/// `LocalFree` -- what [`crate::hcs`] uses -- would corrupt the heap.
+struct HcnAllocatedString(PWSTR);
+
+impl HcnAllocatedString {
+    fn new(raw: PWSTR) -> Result<Self, RepositoryError> {
+        if raw.is_null() {
+            return Err(RepositoryError::new("HCN returned a null result string"));
+        }
+        Ok(Self(raw))
+    }
+
+    fn into_string(self) -> Result<String, RepositoryError> {
+        // SAFETY: `self.0` is a non-null pointer to a null-terminated UTF-16
+        // buffer exclusively owned by this wrapper for the duration of the call.
+        unsafe { self.0.to_string() }.map_err(|error| {
+            RepositoryError::new(format!("the HCN result was not valid UTF-16: {error}"))
+        })
+    }
+}
+
+impl Drop for HcnAllocatedString {
+    fn drop(&mut self) {
+        // SAFETY: `self.0` originates from an HCN allocation exclusively owned
+        // by this wrapper and is freed exactly once here.
+        unsafe { CoTaskMemFree(Some(self.0.as_ptr().cast())) };
     }
 }
 
@@ -190,7 +282,7 @@ fn serialize_guid<S: serde::Serializer>(guid: &GUID, serializer: S) -> Result<S:
 
 #[cfg(test)]
 mod tests {
-    use super::endpoint_settings;
+    use super::{endpoint_settings, mac_address};
 
     fn settings(vm_name: &str) -> serde_json::Value {
         serde_json::from_str(&endpoint_settings(vm_name).unwrap())
@@ -225,5 +317,32 @@ mod tests {
 
         assert!(document.get("IpConfigurations").is_none(), "{document}");
         assert!(document.get("Routes").is_none(), "{document}");
+    }
+
+    #[test]
+    fn the_mac_address_is_read_from_the_reported_properties() {
+        let properties = serde_json::json!({
+            "ID": "3F2B0C11-0000-0000-0000-000000000000",
+            "MacAddress": "00-15-5D-01-02-03"
+        });
+
+        assert_eq!(
+            mac_address(&properties).as_deref(),
+            Some("00-15-5D-01-02-03")
+        );
+    }
+
+    #[test]
+    fn properties_without_a_usable_mac_address_report_none() {
+        // An endpoint HNS has not finished setting up answers with the field
+        // missing or empty; either way there is no address to configure the
+        // adapter with, and a start must say so rather than write a blank one.
+        for properties in [
+            serde_json::json!({}),
+            serde_json::json!({ "MacAddress": "" }),
+            serde_json::json!({ "MacAddress": 42 }),
+        ] {
+            assert_eq!(mac_address(&properties), None, "{properties}");
+        }
     }
 }

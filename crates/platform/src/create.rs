@@ -112,7 +112,10 @@ impl VmCreationPipeline {
             vm_name: request.name.clone(),
             hcs_compute_system_id: hcs_compute_system_id.clone(),
             disk_gb: request.disk_gb,
+            // No endpoint yet: it is created on the first start, so that a VM
+            // that is never started never takes an address.
             endpoint_id: None,
+            network_mode: request.network_mode,
         };
 
         let mut system_created = false;
