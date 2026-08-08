@@ -6,9 +6,9 @@
 //! ever repeats what HNS's IPAM already decided, so it does not become a second
 //! allocator of guest addresses.
 
-use std::{net::Ipv4Addr, time::Duration};
+use std::{collections::HashMap, net::Ipv4Addr, time::Duration};
 
-use arcbox_dhcp::DhcpConfig;
+use arcbox_dhcp::{DhcpConfig, DhcpServer};
 use vmlord_core::RepositoryError;
 
 use crate::{hcn_endpoint::EndpointAddress, subnet::Ipv4Subnet};
@@ -71,12 +71,91 @@ fn dhcp_config(subnet: Ipv4Subnet, dns_servers: Vec<Ipv4Addr>) -> DhcpConfig {
         .with_lease_duration(LEASE_DURATION)
 }
 
+/// Everything the DHCP worker mutates while it serves a packet.
+///
+/// The reservation map is not a cache of `DhcpServer`'s own: that one is
+/// private, and `reserve_ip` panics both on an address outside its pool and on
+/// one already allocated. Knowing what has been reserved is what makes both
+/// panics unreachable.
+struct State {
+    server: DhcpServer,
+    reserved: HashMap<[u8; 6], Ipv4Addr>,
+}
+
+impl State {
+    fn new(config: DhcpConfig) -> Self {
+        Self {
+            server: DhcpServer::new(config),
+            reserved: HashMap::new(),
+        }
+    }
+
+    /// Makes `ip` the address served to `mac`, and only to `mac`.
+    ///
+    /// Idempotent, and the only caller of `reserve_ip`: an address is released
+    /// from whoever held it before it is handed to its new owner, whether that
+    /// was the same MAC under a different address or another MAC entirely.
+    fn reserve(&mut self, mac: [u8; 6], ip: Ipv4Addr) -> Result<(), RepositoryError> {
+        let config = self.server.config();
+        let pool = u32::from(config.pool_start)..=u32::from(config.pool_end);
+        if !pool.contains(&u32::from(ip)) {
+            let error = RepositoryError::new(format!(
+                "HNS assigned {ip} to a guest, but the VMLord network serves {}-{}; \
+                 the guest cannot be offered its address",
+                config.pool_start, config.pool_end
+            ));
+            log::error!("{error}");
+            return Err(error);
+        }
+
+        if self.reserved.get(&mac) == Some(&ip) {
+            return Ok(());
+        }
+
+        if let Some(previous) = self.reserved.remove(&mac) {
+            self.server.remove_reservation(&mac);
+            log::debug!("the guest at {mac:02x?} moved from {previous} to {ip}");
+        }
+
+        let holder = self
+            .reserved
+            .iter()
+            .find(|(_, held)| **held == ip)
+            .map(|(holder, _)| *holder);
+        if let Some(holder) = holder {
+            self.reserved.remove(&holder);
+            self.server.remove_reservation(&holder);
+            log::info!("HNS moved {ip} from the guest at {holder:02x?} to the one at {mac:02x?}");
+        }
+
+        self.server.reserve_ip(mac, ip);
+        self.reserved.insert(mac, ip);
+        log::debug!("the guest at {mac:02x?} is served {ip}");
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::{collections::HashMap, net::Ipv4Addr};
 
-    use super::{dhcp_config, endpoint_subnet, netmask, parse_mac};
+    use super::{State, dhcp_config, endpoint_subnet, netmask, parse_mac};
     use crate::{hcn_endpoint::EndpointAddress, subnet::Ipv4Subnet};
+
+    /// A state serving 172.22.42.0/24, the first candidate subnet.
+    fn state() -> State {
+        State::new(dhcp_config(
+            Ipv4Subnet::new(Ipv4Addr::new(172, 22, 42, 0), 24),
+            vec![Ipv4Addr::new(1, 1, 1, 1)],
+        ))
+    }
+
+    const GUEST_MAC: [u8; 6] = [0x00, 0x15, 0x5d, 0x01, 0x02, 0x03];
+    const OTHER_MAC: [u8; 6] = [0x00, 0x15, 0x5d, 0x0a, 0x0b, 0x0c];
+
+    fn ip(last: u8) -> Ipv4Addr {
+        Ipv4Addr::new(172, 22, 42, last)
+    }
 
     fn address(ip: &str, prefix_length: u8) -> EndpointAddress {
         EndpointAddress {
@@ -144,5 +223,70 @@ mod tests {
         assert_eq!(config.pool_end, Ipv4Addr::new(172, 22, 42, 254));
         assert_eq!(config.dns_servers, vec![Ipv4Addr::new(1, 1, 1, 1)]);
         assert_eq!(config.lease_duration.as_secs(), 24 * 60 * 60);
+    }
+
+    #[test]
+    fn reserving_the_same_pair_twice_changes_nothing() {
+        let mut state = state();
+
+        state.reserve(GUEST_MAC, ip(5)).expect("first reservation");
+        state
+            .reserve(GUEST_MAC, ip(5))
+            .expect("a repeated reservation must not fail");
+
+        assert_eq!(state.reserved, HashMap::from([(GUEST_MAC, ip(5))]));
+    }
+
+    #[test]
+    fn a_guest_whose_address_changed_keeps_only_the_new_one() {
+        let mut state = state();
+
+        state.reserve(GUEST_MAC, ip(5)).expect("first reservation");
+        state
+            .reserve(GUEST_MAC, ip(9))
+            .expect("a new address for the same MAC must replace the old one");
+
+        assert_eq!(state.reserved, HashMap::from([(GUEST_MAC, ip(9))]));
+    }
+
+    #[test]
+    fn an_address_that_moved_to_another_guest_follows_it() {
+        // A VM is deleted and HNS gives its address to another VM's new
+        // endpoint. Reserving it for the new MAC must not fail.
+        let mut state = state();
+        state.reserve(GUEST_MAC, ip(5)).expect("first reservation");
+
+        state
+            .reserve(OTHER_MAC, ip(5))
+            .expect("an address HNS moved to another endpoint must be reservable");
+
+        assert_eq!(state.reserved, HashMap::from([(OTHER_MAC, ip(5))]));
+    }
+
+    #[test]
+    fn two_guests_keep_their_own_addresses() {
+        let mut state = state();
+
+        state.reserve(GUEST_MAC, ip(5)).expect("first reservation");
+        state.reserve(OTHER_MAC, ip(6)).expect("second reservation");
+
+        assert_eq!(
+            state.reserved,
+            HashMap::from([(GUEST_MAC, ip(5)), (OTHER_MAC, ip(6))])
+        );
+    }
+
+    #[test]
+    fn an_address_outside_the_subnet_is_refused_rather_than_reserved() {
+        // `DhcpServer::reserve_ip` panics on an address outside its pool, and
+        // its allocator cannot be asked beforehand, so the check lives here.
+        let mut state = state();
+
+        let error = state
+            .reserve(GUEST_MAC, Ipv4Addr::new(10, 0, 0, 5))
+            .expect_err("an address outside the subnet must be refused");
+
+        assert!(error.to_string().contains("10.0.0.5"), "{error}");
+        assert!(state.reserved.is_empty());
     }
 }
