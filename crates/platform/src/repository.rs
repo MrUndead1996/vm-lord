@@ -361,12 +361,7 @@ impl VmRepository for HcsVmRepository {
                 request.gpu_mode
             )));
         }
-        if request.network_mode != NetworkMode::None {
-            return Err(RepositoryError::new(format!(
-                "the HCS backend does not support network mode {:?} yet",
-                request.network_mode
-            )));
-        }
+        hcs_config::ensure_supported_network_mode(request.network_mode)?;
 
         let document = self.read_configuration(&mapping.vm_name)?;
         let updated = hcs_config::apply_topology(

@@ -19,8 +19,10 @@ impl HcsVmConfigBuilder {
     /// `system_disk_path` as the VM's boot disk and `request.image_path` as
     /// its installer ISO.
     ///
-    /// GPU and network configuration are not yet implemented (deferred to
-    /// their own tasks); any mode other than `None` is rejected.
+    /// GPU configuration is not yet implemented; any mode other than `None` is
+    /// rejected. Networking accepts `None` and `NetworkMode::Nat`; a NAT VM
+    /// gets no adapter here, because `VmStartPipeline` writes the
+    /// `NetworkAdapters` section once its endpoint exists.
     pub(crate) fn build(
         request: &VmCreateRequest,
         system_disk_path: &Path,
@@ -33,12 +35,7 @@ impl HcsVmConfigBuilder {
                 request.gpu_mode
             )));
         }
-        if request.network_mode != NetworkMode::None {
-            return Err(RepositoryError::new(format!(
-                "HCS configuration does not support network mode: {:?}",
-                request.network_mode
-            )));
-        }
+        ensure_supported_network_mode(request.network_mode)?;
 
         let attachments = BTreeMap::from([
             (
@@ -100,6 +97,27 @@ impl HcsVmConfigBuilder {
         serde_json::to_string(&configuration).map_err(|error| {
             RepositoryError::new(format!("failed to serialize HCS VM configuration: {error}"))
         })
+    }
+}
+
+/// Checks the network mode against what the native backend implements today.
+///
+/// Both entry points into the domain -- creation through
+/// [`HcsVmConfigBuilder::build`] and editing through `HcsVmRepository::update_vm`
+/// -- ask this, so a mode is refused in one place and with one message. The
+/// message names the task that will lift the refusal: an HRESULT from HNS,
+/// raised much deeper, tells the user nothing about why the mode is missing.
+pub(crate) fn ensure_supported_network_mode(mode: NetworkMode) -> Result<(), RepositoryError> {
+    match mode {
+        NetworkMode::None | NetworkMode::Nat => Ok(()),
+        other => {
+            let error = RepositoryError::new(format!(
+                "the HCS backend does not support network mode {other:?} yet; \
+                 External and Internal networking arrive with #10"
+            ));
+            log::error!("{error}");
+            Err(error)
+        }
     }
 }
 
@@ -351,7 +369,8 @@ mod tests {
     use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest};
 
     use super::{
-        HcsVmConfigBuilder, VmTopology, apply_network_adapter, apply_topology, read_topology,
+        HcsVmConfigBuilder, VmTopology, apply_network_adapter, apply_topology,
+        ensure_supported_network_mode, read_topology,
     };
 
     fn request() -> VmCreateRequest {
@@ -469,10 +488,28 @@ mod tests {
     }
 
     #[test]
-    fn rejects_each_unsupported_network_mode() {
+    fn accepts_nat_without_writing_a_network_adapter() {
+        // Creation writes no adapter: the endpoint and its MAC only exist once
+        // `VmStartPipeline` has run, so the section is the start's to write.
+        let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
+        let request = VmCreateRequest {
+            network_mode: NetworkMode::Nat,
+            ..request()
+        };
+
+        let document = HcsVmConfigBuilder::build(&request, &system_disk_path).unwrap();
+
+        let json: Value = serde_json::from_str(&document).unwrap();
+        assert!(
+            json.pointer("/VirtualMachine/Devices/NetworkAdapters")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn rejects_each_network_mode_that_waits_for_its_own_task() {
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
         for mode in [
-            NetworkMode::Nat,
             NetworkMode::External,
             NetworkMode::Internal,
             NetworkMode::Unknown(7),
@@ -481,13 +518,20 @@ mod tests {
                 network_mode: mode,
                 ..request()
             };
-            assert!(
-                HcsVmConfigBuilder::build(&request, &system_disk_path)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("network mode")
-            );
+
+            let message = HcsVmConfigBuilder::build(&request, &system_disk_path)
+                .unwrap_err()
+                .to_string();
+
+            assert!(message.contains("network mode"), "got: {message}");
+            assert!(message.contains("#10"), "got: {message}");
         }
+    }
+
+    #[test]
+    fn ensure_supported_network_mode_accepts_none_and_nat() {
+        assert!(ensure_supported_network_mode(NetworkMode::None).is_ok());
+        assert!(ensure_supported_network_mode(NetworkMode::Nat).is_ok());
     }
 
     #[test]
