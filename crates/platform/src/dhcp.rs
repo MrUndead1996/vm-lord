@@ -461,12 +461,15 @@ mod tests {
     use std::{
         collections::HashMap,
         io,
-        net::{Ipv4Addr, SocketAddrV4},
+        net::{Ipv4Addr, SocketAddrV4, UdpSocket as TestSocket},
+        time::Duration,
     };
 
     use arcbox_dhcp::{DhcpMessageType, DhcpPacket};
 
-    use super::{State, bind_error, dhcp_config, endpoint_subnet, netmask, parse_mac};
+    use super::{
+        DhcpService, State, bind_error, dhcp_config, endpoint_subnet, netmask, parse_mac,
+    };
     use crate::{hcn_endpoint::EndpointAddress, subnet::Ipv4Subnet};
 
     /// A state serving 172.22.42.0/24, the first candidate subnet.
@@ -795,6 +798,55 @@ mod tests {
         .expect("the test datagram should parse");
 
         assert_eq!(super::reply_target(&packet), SocketAddrV4::new(ip(5), 68));
+    }
+
+    /// Run elevated, with nothing else serving DHCP on this host:
+    /// `cargo test -p vmlord-platform --target=x86_64-pc-windows-gnu -- --ignored --exact dhcp::tests::the_server_answers_a_reserved_guest_over_a_real_socket --nocapture`
+    #[test]
+    #[ignore = "binds UDP 67 and 68 on the host"]
+    fn the_server_answers_a_reserved_guest_over_a_real_socket() {
+        let assigned = EndpointAddress {
+            ip_address: "172.22.42.5".to_owned(),
+            prefix_length: 24,
+        };
+
+        // The client half must be listening before the request goes out: the
+        // reply is a broadcast to port 68, not an answer to the sender's port.
+        let client = TestSocket::bind((Ipv4Addr::UNSPECIFIED, 68))
+            .expect("UDP port 68 should be free on the test host");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("the client socket should take a read timeout");
+        client
+            .set_broadcast(true)
+            .expect("the client socket should take the broadcast option");
+
+        let service = DhcpService::start(&assigned).expect("the DHCP server should start");
+        service
+            .reserve("00-15-5D-01-02-03", &assigned)
+            .expect("the guest should be reservable");
+
+        client
+            .send_to(
+                &datagram(
+                    DhcpMessageType::Discover,
+                    GUEST_MAC,
+                    None,
+                    Ipv4Addr::UNSPECIFIED,
+                ),
+                (Ipv4Addr::LOCALHOST, 67),
+            )
+            .expect("the Discover should be sent");
+
+        let mut buffer = [0u8; 1500];
+        let (length, _) = client
+            .recv_from(&mut buffer)
+            .expect("the server should answer a reserved guest within five seconds");
+        let offer =
+            DhcpPacket::parse(&buffer[..length]).expect("the reply should be a DHCP packet");
+
+        assert_eq!(offer.message_type, Some(DhcpMessageType::Offer));
+        assert_eq!(offer.yiaddr, Ipv4Addr::new(172, 22, 42, 5));
     }
 
     #[test]
