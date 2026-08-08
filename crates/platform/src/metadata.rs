@@ -32,6 +32,15 @@ pub struct VmComputeSystemMapping {
     /// existed -- and callers fall back to reading the disk.
     #[serde(default)]
     pub disk_gb: u32,
+    /// The VM's endpoint in VMLord's shared NAT network, once it has one.
+    ///
+    /// `None` means the VM has never been started -- or was created before
+    /// this field existed, which reads the same way and needs no migration.
+    /// The endpoint is created on the first start and kept until the VM is
+    /// deleted: re-creating it per start would hand the guest a new address
+    /// every time and break everything that remembered the old one.
+    #[serde(default)]
+    pub endpoint_id: Option<Uuid>,
 }
 
 impl VmComputeSystemMapping {
@@ -240,6 +249,7 @@ mod tests {
             vm_name: vm_name.into(),
             hcs_compute_system_id: hcs_id.into(),
             disk_gb: 20,
+            endpoint_id: None,
         }
     }
 
@@ -371,6 +381,48 @@ mod tests {
                 ..mapping
             }
         ));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn a_mapping_written_before_endpoints_existed_still_loads() {
+        let path = temporary_mapping_file();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let vm_id = Uuid::new_v4();
+        fs::write(
+            &path,
+            format!(
+                r#"[{{"vm_id":"{vm_id}","vm_name":"legacy","hcs_compute_system_id":"vmlord-1","disk_gb":20}}]"#
+            ),
+        )
+        .unwrap();
+
+        let loaded = MetadataStore::new(&path).find_by_vm_id(vm_id).unwrap();
+
+        // No endpoint recorded reads the same as never started: the next start
+        // creates one, which is what a VM from before endpoints existed needs.
+        assert_eq!(loaded, Some(mapping(vm_id, "legacy", "vmlord-1")));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn an_endpoint_id_survives_being_written_and_read_back() {
+        let path = temporary_mapping_file();
+        let store = MetadataStore::new(&path);
+        let vm_id = Uuid::new_v4();
+        let endpoint_id = Uuid::new_v4();
+
+        store
+            .insert(VmComputeSystemMapping {
+                endpoint_id: Some(endpoint_id),
+                ..mapping(vm_id, "dev-linux", "vmlord-1")
+            })
+            .unwrap();
+
+        assert_eq!(
+            store.find_by_vm_id(vm_id).unwrap().unwrap().endpoint_id,
+            Some(endpoint_id)
+        );
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

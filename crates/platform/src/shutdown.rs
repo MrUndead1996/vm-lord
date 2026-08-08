@@ -129,6 +129,7 @@ mod tests {
             vm_name: "dev".into(),
             hcs_compute_system_id: "vmlord-dev".into(),
             disk_gb: 20,
+            endpoint_id: None,
         };
         let store = MetadataStore::new(root.0.join("vm-mapping.json"));
         store

@@ -39,16 +39,21 @@ const VMLORD_NETWORK_NAME: &str = "VMLord";
 /// spelled out here.
 const HCN_E_NETWORK_NOT_FOUND: HRESULT = HRESULT(0x803B_0001_u32 as i32);
 
-/// Whether HNS is reporting that it does not have the network.
+/// Whether HNS is reporting that it does not have the object asked for.
 ///
 /// Two codes, because HNS answers with a different one per call: a live host
-/// fails `HcnOpenNetwork` with `HCN_E_NETWORK_NOT_FOUND` but
-/// `HcnDeleteNetwork` with `ERROR_NOT_FOUND` (0x80070490, "Element not
-/// found"). Both mean the same thing to a caller, and either one alone leaves
-/// the other call reporting an absent network as a failure.
-fn is_network_absent(error: &windows::core::Error) -> bool {
+/// fails `HcnOpenNetwork` with the facility-0x3B "not found" of the object's
+/// own kind, but `HcnDeleteNetwork` with `ERROR_NOT_FOUND` (0x80070490,
+/// "Element not found"). Both mean the same thing to a caller, and either one
+/// alone leaves the other call reporting an absent object as a failure.
+pub(crate) fn is_absent(error: &windows::core::Error, not_found: HRESULT) -> bool {
     let code = error.code();
-    code == HCN_E_NETWORK_NOT_FOUND || code == ERROR_NOT_FOUND.to_hresult()
+    code == not_found || code == ERROR_NOT_FOUND.to_hresult()
+}
+
+/// Whether HNS is reporting that it does not have the network.
+fn is_network_absent(error: &windows::core::Error) -> bool {
+    is_absent(error, HCN_E_NETWORK_NOT_FOUND)
 }
 
 /// An owned HCN network handle used by the Windows Host Network Service.
@@ -142,6 +147,11 @@ impl HcnNetwork {
         Ok(Self(network))
     }
 
+    /// The raw handle, for the HCN calls that take a network to act within.
+    pub(crate) fn handle(&self) -> *mut core::ffi::c_void {
+        self.0
+    }
+
     /// Deletes an HCN network, treating one HNS does not have as deleted.
     ///
     /// Deleting a network takes its identifier rather than an open handle, so
@@ -179,7 +189,7 @@ impl Drop for HcnNetwork {
 /// Builds the settings document for VMLord's NAT network on `subnet`.
 fn nat_network_settings(subnet: Ipv4Subnet) -> Result<String, RepositoryError> {
     let settings = NetworkSettings {
-        schema_version: SchemaVersion { major: 2, minor: 0 },
+        schema_version: SchemaVersion::V2,
         name: VMLORD_NETWORK_NAME,
         network_type: "NAT",
         ipams: vec![Ipam {
@@ -214,11 +224,17 @@ struct NetworkSettings {
     flags: u32,
 }
 
+/// The HNS schema a settings document is written in.
 #[derive(Serialize)]
 #[serde(rename_all = "PascalCase")]
-struct SchemaVersion {
+pub(crate) struct SchemaVersion {
     major: u32,
     minor: u32,
+}
+
+impl SchemaVersion {
+    /// Schema 2.0, the one every HCN settings document VMLord writes uses.
+    pub(crate) const V2: Self = Self { major: 2, minor: 0 };
 }
 
 #[derive(Serialize)]
