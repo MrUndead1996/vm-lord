@@ -8,14 +8,20 @@
 
 use std::{
     collections::HashMap,
-    net::{Ipv4Addr, SocketAddrV4},
+    io,
+    net::{Ipv4Addr, SocketAddrV4, UdpSocket},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread::{self, JoinHandle},
     time::Duration,
 };
 
-use arcbox_dhcp::{DHCP_CLIENT_PORT, DhcpConfig, DhcpPacket, DhcpServer};
+use arcbox_dhcp::{DHCP_CLIENT_PORT, DHCP_SERVER_PORT, DhcpConfig, DhcpPacket, DhcpServer};
 use vmlord_core::RepositoryError;
 
-use crate::{hcn_endpoint::EndpointAddress, subnet::Ipv4Subnet};
+use crate::{hcn_endpoint::EndpointAddress, host_dns, subnet::Ipv4Subnet};
 
 /// How long a guest may keep its address.
 ///
@@ -188,16 +194,190 @@ fn reply_target(packet: &DhcpPacket) -> SocketAddrV4 {
     }
 }
 
+/// How long the worker waits for a packet before it re-checks whether it should
+/// still be running.
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// The largest datagram the server reads; a DHCP packet is far smaller.
+const RECEIVE_BUFFER: usize = 1500;
+
+/// VMLord's DHCP server: a socket, a worker thread and what they serve.
+///
+/// One per process, started with the first NAT VM and stopped when the process
+/// ends. A guest therefore keeps its address after VMLord is closed but has
+/// nothing to renew against; moving the server into a Windows service or a tray
+/// application is deliberately left out of this change.
+pub(crate) struct DhcpService {
+    state: Arc<Mutex<State>>,
+    running: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl DhcpService {
+    /// Binds the server to the subnet `address` belongs to and starts serving.
+    pub(crate) fn start(address: &EndpointAddress) -> Result<Self, RepositoryError> {
+        let subnet = endpoint_subnet(address)?;
+        let socket = bind()?;
+        let state = Arc::new(Mutex::new(State::new(dhcp_config(
+            subnet,
+            host_dns::dns_servers(subnet),
+        ))));
+
+        let running = Arc::new(AtomicBool::new(true));
+        let worker = thread::Builder::new()
+            .name("vmlord-dhcp".to_owned())
+            .spawn({
+                let state = Arc::clone(&state);
+                let running = Arc::clone(&running);
+                move || serve(&socket, &state, &running)
+            })
+            .map_err(|error| {
+                let error = RepositoryError::new(format!(
+                    "the DHCP server thread could not be started: {error}"
+                ));
+                log::error!("{error}");
+                error
+            })?;
+
+        log::info!(
+            "the VMLord DHCP server is serving {subnet} from {}",
+            subnet.gateway()
+        );
+        Ok(Self {
+            state,
+            running,
+            worker: Some(worker),
+        })
+    }
+
+    /// Serves `ip` to the guest at `mac`.
+    pub(crate) fn reserve(&self, mac: &str, ip: &EndpointAddress) -> Result<(), RepositoryError> {
+        let parsed = parse_mac(mac).ok_or_else(|| {
+            let error = RepositoryError::new(format!(
+                "HNS reported \"{mac}\" as an endpoint's MAC address, which cannot be parsed"
+            ));
+            log::error!("{error}");
+            error
+        })?;
+        let address: Ipv4Addr = ip.ip_address.parse().map_err(|_| {
+            let error = RepositoryError::new(format!(
+                "HNS reported \"{}\" as an endpoint address, which is not an IPv4 address",
+                ip.ip_address
+            ));
+            log::error!("{error}");
+            error
+        })?;
+
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reserve(parsed, address)
+    }
+}
+
+impl Drop for DhcpService {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        log::info!("the VMLord DHCP server stopped");
+    }
+}
+
+/// Binds the DHCP port.
+///
+/// `SO_REUSEADDR` is deliberately not set: on Windows it lets a second server
+/// take over a port that is already served, and two DHCP servers answering the
+/// same guests is worse than a start that fails with a diagnosis.
+fn bind() -> Result<UdpSocket, RepositoryError> {
+    let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, DHCP_SERVER_PORT)).map_err(|error| {
+        let error = bind_error(&error);
+        log::error!("{error}");
+        error
+    })?;
+    socket.set_broadcast(true).map_err(|error| {
+        let error = RepositoryError::new(format!(
+            "the DHCP socket could not be made broadcast: {error}"
+        ));
+        log::error!("{error}");
+        error
+    })?;
+    socket
+        .set_read_timeout(Some(POLL_INTERVAL))
+        .map_err(|error| {
+            let error = RepositoryError::new(format!(
+                "the DHCP socket could not be given a read timeout: {error}"
+            ));
+            log::error!("{error}");
+            error
+        })?;
+    Ok(socket)
+}
+
+/// Turns a failure to bind UDP 67 into something a user can act on.
+fn bind_error(error: &io::Error) -> RepositoryError {
+    match error.kind() {
+        io::ErrorKind::AddrInUse => RepositoryError::new(format!(
+            "UDP port 67 is already served on this host, so VMLord cannot answer its guests: \
+             {error}. Internet Connection Sharing, the Hyper-V Default Switch or a third-party \
+             DHCP server typically holds it"
+        )),
+        io::ErrorKind::PermissionDenied => RepositoryError::new(format!(
+            "VMLord was not allowed to serve DHCP on UDP port 67: {error}. \
+             Run VMLord elevated and allow it through the firewall"
+        )),
+        _ => RepositoryError::new(format!("the DHCP server could not bind UDP port 67: {error}")),
+    }
+}
+
+/// Serves packets until the service is dropped.
+fn serve(socket: &UdpSocket, state: &Mutex<State>, running: &AtomicBool) {
+    let mut buffer = [0u8; RECEIVE_BUFFER];
+
+    while running.load(Ordering::Relaxed) {
+        let received = match socket.recv_from(&mut buffer) {
+            Ok((length, _)) => length,
+            // The read timeout is what lets the loop notice it should stop;
+            // Windows reports it as `TimedOut` rather than `WouldBlock`.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                log::warn!("the DHCP server could not read from its socket: {error}");
+                continue;
+            }
+        };
+
+        let reply = state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .handle(&buffer[..received]);
+
+        if let Some((reply, target)) = reply
+            && let Err(error) = socket.send_to(&reply, target)
+        {
+            log::warn!("a DHCP reply to {target} could not be sent: {error}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         collections::HashMap,
+        io,
         net::{Ipv4Addr, SocketAddrV4},
     };
 
     use arcbox_dhcp::{DhcpMessageType, DhcpPacket};
 
-    use super::{State, dhcp_config, endpoint_subnet, netmask, parse_mac};
+    use super::{State, bind_error, dhcp_config, endpoint_subnet, netmask, parse_mac};
     use crate::{hcn_endpoint::EndpointAddress, subnet::Ipv4Subnet};
 
     /// A state serving 172.22.42.0/24, the first candidate subnet.
@@ -526,5 +706,33 @@ mod tests {
         .expect("the test datagram should parse");
 
         assert_eq!(super::reply_target(&packet), SocketAddrV4::new(ip(5), 68));
+    }
+
+    #[test]
+    fn an_occupied_port_names_what_could_be_holding_it() {
+        let error = bind_error(&io::Error::from(io::ErrorKind::AddrInUse));
+
+        let message = error.to_string();
+        assert!(message.contains("67"), "{message}");
+        assert!(message.contains("Internet Connection Sharing"), "{message}");
+    }
+
+    #[test]
+    fn a_refused_bind_names_privileges_and_the_firewall() {
+        let error = bind_error(&io::Error::from(io::ErrorKind::PermissionDenied));
+
+        let message = error.to_string();
+        assert!(message.contains("firewall"), "{message}");
+        assert!(message.contains("elevated"), "{message}");
+    }
+
+    #[test]
+    fn any_other_failure_is_reported_as_it_came() {
+        let error = bind_error(&io::Error::other("something else entirely"));
+
+        assert!(
+            error.to_string().contains("something else entirely"),
+            "{error}"
+        );
     }
 }
