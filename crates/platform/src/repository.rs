@@ -49,6 +49,13 @@ pub struct HcsVmRepository {
     // diagnostics buffer needs interior mutability.
     diagnostics: Mutex<Vec<Diagnostic>>,
     initialized: bool,
+    /// Whether the user has already been told that HCS event reporting stopped.
+    ///
+    /// HCS delivers `ServiceDisconnect` once per compute system, and those
+    /// deliveries can straddle a refresh boundary, so the flag has to outlive a
+    /// single drain: the service disconnecting is one event to report, however
+    /// many drains its per-VM deliveries are spread over.
+    service_disconnect_reported: bool,
 }
 
 impl HcsVmRepository {
@@ -70,6 +77,7 @@ impl HcsVmRepository {
             diagnostics: Mutex::new(Vec::new()),
             events,
             initialized: false,
+            service_disconnect_reported: false,
         }
     }
 
@@ -132,6 +140,12 @@ impl HcsVmRepository {
     ///
     /// A start that HCS accepted is not undone by a failure to hold or watch
     /// its handle, so this only warns: the VM runs either way.
+    ///
+    /// Failing here leaves the previous watch and its generation in place, so a
+    /// stale event queued before the restart still passes the staleness check
+    /// and can be reported once. That residue is deliberate for now: the entry
+    /// it comes from is the same one a working reopen would have replaced, and
+    /// clearing it belongs with re-registering watches rather than here.
     fn hold_started_system(&mut self, mapping: &VmComputeSystemMapping) {
         match HcsSystem::open_if_present(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL) {
             Ok(Some(system)) => {
@@ -456,14 +470,14 @@ impl VmRepository for HcsVmRepository {
     /// after listing, so it is where a released handle can actually be
     /// released.
     fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
-        let events = self.events.clone();
-        let drained = watch::drain_events(&events, |vm_id, generation| {
+        let drained = watch::drain_events(&self.events, |vm_id, generation| {
             self.connections.is_superseded(vm_id, generation)
         });
         for vm_id in drained.released {
             self.connections.remove(vm_id);
         }
-        if drained.service_disconnected {
+        if drained.service_disconnected && !self.service_disconnect_reported {
+            self.service_disconnect_reported = true;
             // Nothing reopens a handle or re-registers a callback outside
             // `initialize`, so this run is over as far as HCS events go. Saying
             // so is the honest minimum: silently losing the feature would leave
@@ -624,6 +638,35 @@ mod tests {
             warnings[0].message.contains("restart"),
             "the warning has to say how to get event reporting back: {:?}",
             warnings[0].message
+        );
+    }
+
+    /// HCS delivers the disconnect once per compute system, and those deliveries
+    /// need not land in the same drain: a refresh can fall between them. The
+    /// warning still belongs to the service, not to the drain that saw it.
+    #[test]
+    fn a_service_disconnect_split_across_two_drains_still_warns_only_once() {
+        let mut repository = repository();
+
+        let mut warnings = 0;
+        for vm_name in ["dev", "build"] {
+            repository.events.push(HcsVmEvent {
+                vm_id: Uuid::new_v4(),
+                vm_name: vm_name.into(),
+                generation: 0,
+                kind: HcsEventKind::ServiceDisconnect,
+                details: None,
+            });
+            warnings += repository
+                .take_diagnostics()
+                .iter()
+                .filter(|diagnostic| diagnostic.level == DiagnosticLevel::Warning)
+                .count();
+        }
+
+        assert_eq!(
+            warnings, 1,
+            "the second drain must not repeat a warning the user has already seen"
         );
     }
 
