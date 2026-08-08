@@ -72,7 +72,7 @@ fn update_request() -> VmUpdateRequest {
         ram_mb: 8192,
         cpu_cores: 8,
         gpu_mode: GpuMode::TryAll,
-        network_mode: NetworkMode::Internal,
+        network_mode: NetworkMode::Nat,
     }
 }
 

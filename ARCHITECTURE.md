@@ -350,9 +350,11 @@ the migration leaves it something the native backend cannot do; any other value
 keep VMLord on the backend being retired.
 
 The native backend deliberately reports less than AppSandbox did while the
-remaining migration tasks land: GPU mode, network mode, guest IP address and SSH
-port are `None`, guest agent status is `Unknown`, and display and SSH
-connections report that the backend does not support them.
+remaining migration tasks land: GPU mode, guest IP address and SSH port are
+`None`, guest agent status is `Unknown`, and display and SSH connections report
+that the backend does not support them. Network mode is reported from the VM's
+mapping, because the edit form is filled from `VmSummary`: a summary that always
+said `None` would make an unrelated edit switch a NAT VM off the network.
 
 A VM's state comes from `HcsEnumerateComputeSystems`, not from the compute
 system's mere presence: creation leaves behind a system that has never executed
@@ -409,8 +411,12 @@ An edit rewrites `SizeInMB` and `Count` in the VM's stored `config.json` and
 changes nothing else, which is what editing a VM means once `VmStartPipeline`
 rebuilds the compute system from that document. A running VM keeps the topology
 it booted with, so the application layer accepts the edit and warns that it
-applies after a restart rather than refusing it. GPU and network modes other
-than `None` are rejected until their own tasks land.
+applies after a restart rather than refusing it. An edit also carries the
+network mode, which is recorded in the VM's mapping rather than in its
+`config.json` and reaches the VM the same way: the next start writes or removes
+the `NetworkAdapters` section to match. GPU modes other than `None` are
+rejected until their own task lands, as are the `External` and `Internal`
+network modes.
 
 `VmSummary`'s memory and processor counts come from the same stored
 configuration. `disk_gb` comes from the `MetadataStore` mapping, where creation
@@ -460,8 +466,10 @@ The edit workflow follows these rules:
   start, and the application layer says so.
 * RAM must be at least 512 MiB and aligned to 2 MiB steps.
 * CPU core count must be at least 1.
-* GPU and network modes are rejected by the native backend until their own
-  migration tasks land.
+* GPU modes other than `None` are rejected by the native backend until their own
+  migration task lands.
+* Network mode accepts `None` and `Nat`; `External` and `Internal` are rejected
+  with a message naming the task that will add them.
 * Disk size is read-only in the current backend contract and requires recreating
   the VM to change.
 * The VM name is treated as the guest hostname and also requires recreating the
