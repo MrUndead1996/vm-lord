@@ -308,8 +308,10 @@ every refresh, logs each event, surfaces the significant ones as diagnostics,
 and releases the handle of a VM that is gone. The enumeration remains the sole
 authority on VM state.
 
-Each registration carries a generation, counted by `VmConnections`, and a drain
-drops any event whose generation is no longer the one held for its VM. HCS
+Each registration carries a generation, counted by the event sink the watches
+report into, and a drain drops any event whose generation is no longer the one
+held for its VM. Counting per sink rather than per `VmConnections` is what keeps
+the generations unique among exactly the events one drain compares. HCS
 delivers asynchronously, so an exit can arrive after the enumeration has already
 reported the VM stopped and the user has started it again: without the
 generation, that stale event would release the handle of the VM now running and
@@ -318,13 +320,17 @@ no handle is held for at all is not stale -- there is simply nothing left to
 release.
 
 A `ServiceDisconnect` releases every handle it names, and nothing outside
-`initialize` reopens one or re-registers a callback, so a drain that released
-handles for that reason also warns -- once, however many VMs the service names
--- that VMLord reports no further HCS events until it is restarted. The backend
-deliberately stays `Ready`: `list_known_vms` succeeds again as soon as the
-service is back, and `WorkspaceApp` has no way out of `Unavailable`. Whether a running guest has finished booting is still
-unobservable -- HCS reports nothing about it -- so `AgentStatus` stays
-`Unknown` until the guest agent lands.
+`initialize` reopens one or re-registers a callback, so a drain that saw one
+also warns that VMLord reports no further HCS events until it is restarted.
+HCS delivers the disconnect once per compute system and those deliveries can
+fall on either side of a refresh, so the repository remembers having warned and
+warns once per run rather than once per drain. The backend deliberately stays
+`Ready`: `list_known_vms` succeeds again as soon as the service is back, and
+`WorkspaceApp` has no way out of `Unavailable`.
+
+Whether a running guest has finished booting is still unobservable -- HCS
+reports nothing about it -- so `AgentStatus` stays `Unknown` until the guest
+agent lands.
 
 `platform::layout` decides where a VM's `config.json` and disks live, so
 creation, start and the repository cannot disagree about it. A VM name is used
