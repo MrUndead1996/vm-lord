@@ -21,6 +21,7 @@ mod hcn;
 mod hcn_endpoint;
 mod hcs;
 mod hcs_config;
+mod host_dns;
 mod layout;
 mod metadata;
 mod reconnect;
