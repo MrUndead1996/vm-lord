@@ -132,6 +132,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use uuid::Uuid;
+    use vmlord_core::NetworkMode;
 
     use super::{HcsSystemState, HcsSystemSummary, KnownVm, open_by_vm_id, open_by_vm_name, reconcile};
     use crate::metadata::{MetadataStore, VmComputeSystemMapping};
@@ -153,6 +154,7 @@ mod tests {
             hcs_compute_system_id: hcs_id.into(),
             disk_gb: 20,
             endpoint_id: None,
+            network_mode: NetworkMode::None,
         }
     }
 

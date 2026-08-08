@@ -6,7 +6,9 @@ use std::{
 };
 
 use serde::Serialize;
+use uuid::Uuid;
 use vmlord_core::{GpuMode, NetworkMode, RepositoryError, VmCreateRequest};
+use windows::core::GUID;
 
 /// Builds HCS compute-system configuration documents from a validated
 /// [`VmCreateRequest`].
@@ -138,8 +140,55 @@ pub(crate) fn apply_topology(
     })
 }
 
+/// Returns `document` with the VM attached to `endpoint_id` through `mac_address`.
+///
+/// The same point edit as [`apply_topology`], with one difference: creation
+/// writes no `NetworkAdapters` section at all, so this inserts the key into
+/// `Devices` instead of replacing a value that is already there. A document
+/// without a `Devices` object is not one this can attach an adapter to.
+///
+/// The section is replaced whole rather than merged, which makes a second start
+/// produce the same document as the first.
+pub(crate) fn apply_network_adapter(
+    document: &str,
+    endpoint_id: Uuid,
+    mac_address: &str,
+) -> Result<String, RepositoryError> {
+    let mut configuration = parse(document)?;
+    let devices = write_target(&mut configuration, DEVICES_POINTER)?
+        .as_object_mut()
+        .ok_or_else(|| {
+            let error = RepositoryError::new(format!(
+                "the stored HCS configuration has no \"{DEVICES_POINTER}\" object to attach a \
+                 network adapter to"
+            ));
+            log::error!("{error}");
+            error
+        })?;
+
+    // HCS keys each adapter by a device identifier of the caller's choosing.
+    // The endpoint's own id serves: it is unique, it is stable across starts,
+    // and using it means nothing further has to be remembered to find the
+    // adapter again.
+    let id = format!("{:?}", GUID::from_u128(endpoint_id.as_u128()));
+    devices.insert(
+        NETWORK_ADAPTERS_KEY.to_owned(),
+        serde_json::json!({
+            &id: { "EndpointId": &id, "MacAddress": mac_address }
+        }),
+    );
+
+    serde_json::to_string(&configuration).map_err(|error| {
+        RepositoryError::new(format!(
+            "failed to serialize the HCS VM configuration with its network adapter: {error}"
+        ))
+    })
+}
+
 const MEMORY_SIZE_POINTER: &str = "/VirtualMachine/ComputeTopology/Memory/SizeInMB";
 const PROCESSOR_COUNT_POINTER: &str = "/VirtualMachine/ComputeTopology/Processor/Count";
+const DEVICES_POINTER: &str = "/VirtualMachine/Devices";
+const NETWORK_ADAPTERS_KEY: &str = "NetworkAdapters";
 
 fn parse(document: &str) -> Result<serde_json::Value, RepositoryError> {
     serde_json::from_str(document).map_err(|error| {
@@ -298,9 +347,12 @@ mod tests {
     use std::path::PathBuf;
 
     use serde_json::{Value, json};
+    use uuid::Uuid;
     use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest};
 
-    use super::{HcsVmConfigBuilder, VmTopology, apply_topology, read_topology};
+    use super::{
+        HcsVmConfigBuilder, VmTopology, apply_network_adapter, apply_topology, read_topology,
+    };
 
     fn request() -> VmCreateRequest {
         VmCreateRequest {
@@ -525,5 +577,75 @@ mod tests {
     #[test]
     fn invalid_json_is_rejected() {
         assert!(read_topology("not json").is_err());
+    }
+
+    const ENDPOINT_ID: Uuid = Uuid::from_u128(0x3f2b_0c11_5c78_4c1b_9e2f_3a8b_7d4c_6e50);
+    const ENDPOINT_GUID: &str = "3F2B0C11-5C78-4C1B-9E2F-3A8B7D4C6E50";
+
+    fn with_adapter(document: &str) -> String {
+        apply_network_adapter(document, ENDPOINT_ID, "00-15-5D-01-02-03").unwrap()
+    }
+
+    #[test]
+    fn attaching_an_adapter_names_the_endpoint_and_its_mac_address() {
+        let document =
+            HcsVmConfigBuilder::build(&request(), &PathBuf::from("C:\\vms\\a\\disks\\system.vhdx"))
+                .unwrap();
+
+        let updated: Value = serde_json::from_str(&with_adapter(&document)).unwrap();
+
+        assert_eq!(
+            updated.pointer("/VirtualMachine/Devices/NetworkAdapters"),
+            Some(&json!({
+                ENDPOINT_GUID: {
+                    "EndpointId": ENDPOINT_GUID,
+                    "MacAddress": "00-15-5D-01-02-03"
+                }
+            }))
+        );
+    }
+
+    #[test]
+    fn attaching_an_adapter_changes_nothing_else() {
+        let system_disk_path = PathBuf::from("C:\\vms\\a\\disks\\system.vhdx");
+        let document = HcsVmConfigBuilder::build(&request(), &system_disk_path).unwrap();
+
+        let before: Value = serde_json::from_str(&document).unwrap();
+        let mut after: Value = serde_json::from_str(&with_adapter(&document)).unwrap();
+        after
+            .pointer_mut("/VirtualMachine/Devices")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("NetworkAdapters");
+
+        assert_eq!(after, before, "nothing outside the adapter may change");
+    }
+
+    #[test]
+    fn attaching_the_same_adapter_twice_yields_the_same_document() {
+        // Every start rewrites the section, so a VM that has already been
+        // started must not accumulate adapters or churn its configuration file.
+        let document =
+            HcsVmConfigBuilder::build(&request(), &PathBuf::from("C:\\vms\\a\\disks\\system.vhdx"))
+                .unwrap();
+
+        let once = with_adapter(&document);
+
+        assert_eq!(with_adapter(&once), once);
+    }
+
+    #[test]
+    fn a_configuration_without_devices_cannot_take_an_adapter() {
+        for document in [
+            r#"{"VirtualMachine":{}}"#,
+            r#"{"VirtualMachine":{"Devices":[]}}"#,
+            "not json",
+        ] {
+            assert!(
+                apply_network_adapter(document, ENDPOINT_ID, "00-15-5D-01-02-03").is_err(),
+                "{document}"
+            );
+        }
     }
 }

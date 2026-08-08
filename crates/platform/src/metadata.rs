@@ -13,7 +13,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use vmlord_core::RepositoryError;
+use vmlord_core::{NetworkMode, RepositoryError};
 
 /// A persisted link between a VMLord VM and the HCS compute system that backs it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +41,17 @@ pub struct VmComputeSystemMapping {
     /// every time and break everything that remembered the old one.
     #[serde(default)]
     pub endpoint_id: Option<Uuid>,
+    /// How the VM was asked to be attached to the network.
+    ///
+    /// Recorded because a start has to decide whether to give the VM an
+    /// endpoint, and the stored `config.json` cannot answer that: it describes
+    /// the adapter a VM already has, not the mode it was created with.
+    ///
+    /// A mapping written before this field existed reads as
+    /// [`NetworkMode::None`] -- which is what every VM created so far asked
+    /// for, since the HCS backend still rejects every other mode.
+    #[serde(default)]
+    pub network_mode: NetworkMode,
 }
 
 impl VmComputeSystemMapping {
@@ -230,6 +241,7 @@ mod tests {
     };
 
     use uuid::Uuid;
+    use vmlord_core::NetworkMode;
 
     use super::{MetadataStore, VmComputeSystemMapping};
 
@@ -250,6 +262,7 @@ mod tests {
             hcs_compute_system_id: hcs_id.into(),
             disk_gb: 20,
             endpoint_id: None,
+            network_mode: NetworkMode::None,
         }
     }
 
@@ -401,7 +414,31 @@ mod tests {
 
         // No endpoint recorded reads the same as never started: the next start
         // creates one, which is what a VM from before endpoints existed needs.
+        // No network mode recorded reads as `None`, which is what every VM
+        // created before the field existed asked for.
         assert_eq!(loaded, Some(mapping(vm_id, "legacy", "vmlord-1")));
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn the_network_mode_survives_being_written_and_read_back() {
+        // The variant name is an on-disk format: renaming it in the domain
+        // would silently change what already-stored VMs read back as.
+        let path = temporary_mapping_file();
+        let vm_id = Uuid::new_v4();
+        let store = MetadataStore::new(&path);
+        store
+            .insert(VmComputeSystemMapping {
+                network_mode: NetworkMode::Nat,
+                ..mapping(vm_id, "nat", "vmlord-1")
+            })
+            .unwrap();
+
+        assert!(fs::read_to_string(&path).unwrap().contains(r#""Nat""#));
+        assert_eq!(
+            store.find_by_vm_id(vm_id).unwrap().unwrap().network_mode,
+            NetworkMode::Nat
+        );
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
