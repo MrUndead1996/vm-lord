@@ -203,6 +203,31 @@ pub(crate) fn apply_network_adapter(
     })
 }
 
+/// Returns `document` without its `NetworkAdapters` section.
+///
+/// This is what a VM that no longer asks for a network needs: the stored
+/// document describes the adapter a previous start gave it, and leaving the
+/// section in place would bring the VM up on the network it just gave up.
+///
+/// A document that has no such section -- or no `Devices` object to hold one --
+/// is returned byte for byte, so a start that changes nothing writes nothing.
+pub(crate) fn remove_network_adapter(document: &str) -> Result<String, RepositoryError> {
+    let mut configuration = parse(document)?;
+    let removed = configuration
+        .pointer_mut(DEVICES_POINTER)
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|devices| devices.remove(NETWORK_ADAPTERS_KEY));
+    if removed.is_none() {
+        return Ok(document.to_owned());
+    }
+
+    serde_json::to_string(&configuration).map_err(|error| {
+        RepositoryError::new(format!(
+            "failed to serialize the HCS VM configuration without its network adapter: {error}"
+        ))
+    })
+}
+
 const MEMORY_SIZE_POINTER: &str = "/VirtualMachine/ComputeTopology/Memory/SizeInMB";
 const PROCESSOR_COUNT_POINTER: &str = "/VirtualMachine/ComputeTopology/Processor/Count";
 const DEVICES_POINTER: &str = "/VirtualMachine/Devices";
@@ -370,7 +395,7 @@ mod tests {
 
     use super::{
         HcsVmConfigBuilder, VmTopology, apply_network_adapter, apply_topology,
-        ensure_supported_network_mode, read_topology,
+        ensure_supported_network_mode, read_topology, remove_network_adapter,
     };
 
     fn request() -> VmCreateRequest {
@@ -526,6 +551,57 @@ mod tests {
             assert!(message.contains("network mode"), "got: {message}");
             assert!(message.contains("#10"), "got: {message}");
         }
+    }
+
+    #[test]
+    fn removes_the_network_adapter_section_and_nothing_else() {
+        let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
+        let created = HcsVmConfigBuilder::build(&request(), &system_disk_path).unwrap();
+        let attached = apply_network_adapter(
+            &created,
+            Uuid::from_u128(0x3f2b_0c11_5c78_4c1b_9e2f_3a8b_7d4c_6e50),
+            "00-15-5D-01-02-03",
+        )
+        .unwrap();
+
+        let removed = remove_network_adapter(&attached).unwrap();
+
+        let before: Value = serde_json::from_str(&created).unwrap();
+        let after: Value = serde_json::from_str(&removed).unwrap();
+        assert!(
+            after
+                .pointer("/VirtualMachine/Devices/NetworkAdapters")
+                .is_none()
+        );
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn removing_an_absent_network_adapter_returns_the_document_unchanged() {
+        // Byte-identical, not merely equivalent: `VmStartPipeline` decides
+        // whether to rewrite `config.json` by comparing the two strings.
+        let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
+        let created = HcsVmConfigBuilder::build(&request(), &system_disk_path).unwrap();
+
+        let removed = remove_network_adapter(&created).unwrap();
+
+        assert_eq!(removed, created);
+    }
+
+    #[test]
+    fn removing_a_network_adapter_from_a_document_without_devices_changes_nothing() {
+        let document = json!({ "VirtualMachine": {} }).to_string();
+
+        let removed = remove_network_adapter(&document).unwrap();
+
+        assert_eq!(removed, document);
+    }
+
+    #[test]
+    fn removing_a_network_adapter_rejects_invalid_json() {
+        let error = remove_network_adapter("not json").unwrap_err().to_string();
+
+        assert!(error.contains("not valid JSON"), "got: {error}");
     }
 
     #[test]
