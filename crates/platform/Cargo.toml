@@ -12,6 +12,9 @@ serde_json = "1.0"
 uuid = { version = "1", features = ["v4", "serde"] }
 windows = { workspace = true, features = [
     "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Storage_Vhd",
     "Win32_System_HostComputeNetwork",
