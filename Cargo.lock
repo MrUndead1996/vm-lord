@@ -182,6 +182,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcbox-dhcp"
+version = "0.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4c979b632eb7080fe5b2471b88c506ad1fd4ab374b62ff52c8644865424a4392"
+dependencies = [
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
 name = "arrayref"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3280,6 +3290,7 @@ dependencies = [
 name = "vmlord-platform"
 version = "0.1.0"
 dependencies = [
+ "arcbox-dhcp",
  "log",
  "serde",
  "serde_json",

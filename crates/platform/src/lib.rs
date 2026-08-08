@@ -12,6 +12,7 @@ compile_error!("vmlord-platform supports Windows only");
 mod cleanup;
 mod create;
 mod delete;
+mod dhcp;
 mod enumerate;
 mod error;
 mod event;

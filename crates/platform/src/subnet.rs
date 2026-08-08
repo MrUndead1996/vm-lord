@@ -64,6 +64,12 @@ impl Ipv4Subnet {
         Ipv4Addr::from(u32::from(self.network_address()) + 1)
     }
 
+    /// The number of bits the subnet's prefix fixes.
+    #[must_use]
+    pub fn prefix_length(self) -> u8 {
+        self.prefix_length
+    }
+
     /// Whether the two subnets share any address.
     ///
     /// Two networks overlap exactly when the wider one contains the narrower,
