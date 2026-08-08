@@ -6,9 +6,13 @@
 //! ever repeats what HNS's IPAM already decided, so it does not become a second
 //! allocator of guest addresses.
 
-use std::{collections::HashMap, net::Ipv4Addr, time::Duration};
+use std::{
+    collections::HashMap,
+    net::{Ipv4Addr, SocketAddrV4},
+    time::Duration,
+};
 
-use arcbox_dhcp::{DhcpConfig, DhcpServer};
+use arcbox_dhcp::{DHCP_CLIENT_PORT, DhcpConfig, DhcpPacket, DhcpServer};
 use vmlord_core::RepositoryError;
 
 use crate::{hcn_endpoint::EndpointAddress, subnet::Ipv4Subnet};
@@ -133,11 +137,65 @@ impl State {
         log::debug!("the guest at {mac:02x?} is served {ip}");
         Ok(())
     }
+
+    /// The reply to `datagram`, and where it has to go.
+    ///
+    /// The MAC is checked before `handle_packet` rather than before the reply
+    /// is sent. The socket is bound to `0.0.0.0:67` -- on Windows a socket
+    /// bound to a vNIC's unicast address does not receive broadcast Discovers
+    /// -- so DHCP broadcasts from every host interface arrive here, including
+    /// the host's own LAN. Dropping them early keeps a stranger from being sent
+    /// a NAK that would break its configuration, and keeps the server's pool
+    /// and lease table free of addresses HNS never assigned.
+    fn handle(&mut self, datagram: &[u8]) -> Option<(Vec<u8>, SocketAddrV4)> {
+        let packet = match DhcpPacket::parse(datagram) {
+            Ok(packet) => packet,
+            Err(error) => {
+                log::debug!("a datagram on the DHCP port was not a DHCP packet: {error}");
+                return None;
+            }
+        };
+
+        let mac = packet.client_mac();
+        if !self.reserved.contains_key(&mac) {
+            log::debug!(
+                "a DHCP request from {mac:02x?} is not from a guest of the VMLord network; \
+                 it is left unanswered"
+            );
+            return None;
+        }
+
+        match self.server.handle_packet(datagram) {
+            Ok(Some(reply)) => Some((reply, reply_target(&packet))),
+            Ok(None) => None,
+            Err(error) => {
+                log::warn!("the DHCP request from {mac:02x?} could not be answered: {error}");
+                None
+            }
+        }
+    }
+}
+
+/// Where the reply to `packet` goes.
+///
+/// A guest that already has an address is renewing and can be answered where it
+/// asked from; one that has none can only be reached by broadcast.
+fn reply_target(packet: &DhcpPacket) -> SocketAddrV4 {
+    if packet.ciaddr.is_unspecified() {
+        SocketAddrV4::new(Ipv4Addr::BROADCAST, DHCP_CLIENT_PORT)
+    } else {
+        SocketAddrV4::new(packet.ciaddr, DHCP_CLIENT_PORT)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, net::Ipv4Addr};
+    use std::{
+        collections::HashMap,
+        net::{Ipv4Addr, SocketAddrV4},
+    };
+
+    use arcbox_dhcp::{DhcpMessageType, DhcpPacket};
 
     use super::{State, dhcp_config, endpoint_subnet, netmask, parse_mac};
     use crate::{hcn_endpoint::EndpointAddress, subnet::Ipv4Subnet};
@@ -288,5 +346,185 @@ mod tests {
 
         assert!(error.to_string().contains("10.0.0.5"), "{error}");
         assert!(state.reserved.is_empty());
+    }
+
+    /// Builds a client datagram: `arcbox`'s own `serialize` writes server
+    /// options and never option 50, so a Request has to be built by hand.
+    fn datagram(
+        message_type: DhcpMessageType,
+        mac: [u8; 6],
+        requested: Option<Ipv4Addr>,
+        ciaddr: Ipv4Addr,
+    ) -> Vec<u8> {
+        let mut data = vec![0u8; 240];
+        data[0] = 1; // BOOTREQUEST
+        data[1] = 1; // Ethernet
+        data[2] = 6; // MAC length
+        data[4..8].copy_from_slice(&0x1234_5678_u32.to_be_bytes()); // xid
+        data[12..16].copy_from_slice(&ciaddr.octets());
+        data[28..34].copy_from_slice(&mac);
+        data[236..240].copy_from_slice(&[99, 130, 83, 99]); // magic cookie
+        data.extend_from_slice(&[53, 1, message_type as u8]);
+        if let Some(requested) = requested {
+            data.push(50);
+            data.push(4);
+            data.extend_from_slice(&requested.octets());
+        }
+        data.push(255);
+        data
+    }
+
+    fn reply(state: &mut State, datagram: &[u8]) -> Option<DhcpPacket> {
+        state
+            .handle(datagram)
+            .map(|(bytes, _)| DhcpPacket::parse(&bytes).expect("a reply should be a DHCP packet"))
+    }
+
+    #[test]
+    fn a_discover_is_offered_the_address_hns_assigned() {
+        let mut state = state();
+        state.reserve(GUEST_MAC, ip(5)).expect("reservation");
+
+        let offer = reply(
+            &mut state,
+            &datagram(
+                DhcpMessageType::Discover,
+                GUEST_MAC,
+                None,
+                Ipv4Addr::UNSPECIFIED,
+            ),
+        )
+        .expect("a guest of the VMLord network should be answered");
+
+        assert_eq!(offer.message_type, Some(DhcpMessageType::Offer));
+        assert_eq!(offer.yiaddr, ip(5));
+    }
+
+    #[test]
+    fn a_request_for_the_assigned_address_is_acknowledged() {
+        let mut state = state();
+        state.reserve(GUEST_MAC, ip(5)).expect("reservation");
+
+        let ack = reply(
+            &mut state,
+            &datagram(
+                DhcpMessageType::Request,
+                GUEST_MAC,
+                Some(ip(5)),
+                Ipv4Addr::UNSPECIFIED,
+            ),
+        )
+        .expect("a guest asking for its own address should be answered");
+
+        assert_eq!(ack.message_type, Some(DhcpMessageType::Ack));
+        assert_eq!(ack.yiaddr, ip(5));
+    }
+
+    #[test]
+    fn a_request_for_a_stale_address_is_refused() {
+        // The endpoint was replaced and HNS assigned a different address; the
+        // guest still asks for the one it remembers.
+        let mut state = state();
+        state.reserve(GUEST_MAC, ip(9)).expect("reservation");
+
+        let nak = reply(
+            &mut state,
+            &datagram(
+                DhcpMessageType::Request,
+                GUEST_MAC,
+                Some(ip(5)),
+                Ipv4Addr::UNSPECIFIED,
+            ),
+        )
+        .expect("a guest asking for a stale address should be told to stop using it");
+
+        assert_eq!(nak.message_type, Some(DhcpMessageType::Nak));
+    }
+
+    #[test]
+    fn a_guest_of_another_network_is_not_answered_at_all() {
+        // The socket is bound to 0.0.0.0:67 and sees DHCP broadcasts from every
+        // host interface. Answering one -- even with a NAK -- would break a
+        // machine that has nothing to do with VMLord.
+        let mut state = state();
+        state.reserve(GUEST_MAC, ip(5)).expect("reservation");
+
+        assert!(
+            state
+                .handle(&datagram(
+                    DhcpMessageType::Discover,
+                    OTHER_MAC,
+                    None,
+                    Ipv4Addr::UNSPECIFIED,
+                ))
+                .is_none()
+        );
+        assert!(
+            state
+                .handle(&datagram(
+                    DhcpMessageType::Request,
+                    OTHER_MAC,
+                    Some(ip(6)),
+                    Ipv4Addr::UNSPECIFIED,
+                ))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_foreign_guest_never_takes_an_address_out_of_the_pool() {
+        // The reason the check stands before `handle_packet`: an address the
+        // server handed to a stranger would later make `reserve_ip` panic.
+        let mut state = state();
+        state.reserve(GUEST_MAC, ip(5)).expect("reservation");
+
+        state.handle(&datagram(
+            DhcpMessageType::Discover,
+            OTHER_MAC,
+            None,
+            Ipv4Addr::UNSPECIFIED,
+        ));
+
+        assert_eq!(state.reserved, HashMap::from([(GUEST_MAC, ip(5))]));
+        assert!(state.server.leases().is_empty());
+    }
+
+    #[test]
+    fn a_malformed_datagram_is_dropped() {
+        let mut state = state();
+        state.reserve(GUEST_MAC, ip(5)).expect("reservation");
+
+        assert!(state.handle(b"not a dhcp packet").is_none());
+    }
+
+    #[test]
+    fn a_guest_without_an_address_is_answered_by_broadcast() {
+        // Nothing can deliver a unicast reply to a guest that has no address:
+        // no ARP entry for it exists and VMLord cannot create one.
+        let packet = DhcpPacket::parse(&datagram(
+            DhcpMessageType::Discover,
+            GUEST_MAC,
+            None,
+            Ipv4Addr::UNSPECIFIED,
+        ))
+        .expect("the test datagram should parse");
+
+        assert_eq!(
+            super::reply_target(&packet),
+            SocketAddrV4::new(Ipv4Addr::BROADCAST, 68)
+        );
+    }
+
+    #[test]
+    fn a_renewing_guest_is_answered_where_it_asked_from() {
+        let packet = DhcpPacket::parse(&datagram(
+            DhcpMessageType::Request,
+            GUEST_MAC,
+            None,
+            ip(5),
+        ))
+        .expect("the test datagram should parse");
+
+        assert_eq!(super::reply_target(&packet), SocketAddrV4::new(ip(5), 68));
     }
 }
