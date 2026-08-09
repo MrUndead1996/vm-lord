@@ -11,8 +11,10 @@
 //! by an interrupted download.
 
 mod cache;
+mod download;
 mod error;
 mod http;
 mod part;
 
+pub use download::{ImageDownloadRequest, fetch_image};
 pub use error::DownloadError;
