@@ -4,9 +4,15 @@ use std::{
     fs::{File, TryLockError},
     io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::atomic::AtomicBool,
 };
 
-use crate::error::{DownloadError, io_error};
+use vmlord_core::ProgressThrottle;
+
+use crate::{
+    cache::checksum_reader,
+    error::{DownloadError, io_error},
+};
 
 /// A `.part` file held under an exclusive OS lock for as long as it exists.
 ///
@@ -99,6 +105,24 @@ impl PartFile {
             .map_err(io_error("write the partial download", &self.path))
     }
 
+    /// Hashes what the file holds, reading through the handle that locks it.
+    ///
+    /// Reopening the path instead would fail on Windows: `LockFileEx` locks are
+    /// mandatory, so a second handle reading a locked range gets
+    /// `ERROR_LOCK_VIOLATION`. On Linux `flock` is advisory and the second read
+    /// would quietly succeed, which is exactly why this has to be deliberate.
+    pub(crate) fn checksum(
+        &mut self,
+        progress: &mut ProgressThrottle,
+        cancel: &AtomicBool,
+    ) -> Result<String, DownloadError> {
+        let total = self.len()?;
+        self.file
+            .seek(SeekFrom::Start(0))
+            .map_err(io_error("rewind the partial download", &self.path))?;
+        checksum_reader(&mut self.file, total, &self.path, progress, cancel)
+    }
+
     pub(crate) fn sync(&self) -> Result<(), DownloadError> {
         self.file
             .sync_all()
@@ -135,9 +159,12 @@ mod tests {
         part.sync().unwrap();
 
         assert_eq!(part.len().unwrap(), 12);
-        assert_eq!(fs::read(part.path()).unwrap(), b"first-second");
 
+        // Read only after the lock is gone: on Windows the lock is mandatory,
+        // so a second handle reading the range would fail rather than observe.
+        let path = part.path().to_path_buf();
         drop(part);
+        assert_eq!(fs::read(&path).unwrap(), b"first-second");
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -161,9 +188,10 @@ mod tests {
         second.seek_to_end().unwrap();
         second.write_all(b"-rest").unwrap();
         second.sync().unwrap();
-        assert_eq!(fs::read(second.path()).unwrap(), b"half-rest");
 
+        let path = second.path().to_path_buf();
         drop(second);
+        assert_eq!(fs::read(&path).unwrap(), b"half-rest");
         fs::remove_dir_all(directory).unwrap();
     }
 
@@ -180,7 +208,37 @@ mod tests {
         part.seek_to_end().unwrap();
         part.write_all(b"fresh").unwrap();
         part.sync().unwrap();
-        assert_eq!(fs::read(part.path()).unwrap(), b"fresh");
+
+        let path = part.path().to_path_buf();
+        drop(part);
+        assert_eq!(fs::read(&path).unwrap(), b"fresh");
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_partial_file_can_be_hashed_while_it_is_still_locked() {
+        use std::{sync::atomic::AtomicBool, time::Duration};
+
+        use vmlord_core::{ProgressPublisher, ProgressThrottle};
+
+        let directory = temporary_directory("checksum");
+        let mut part = PartFile::open_locked(directory.join("image.part")).unwrap();
+        part.seek_to_end().unwrap();
+        part.write_all(b"vmlord").unwrap();
+        part.sync().unwrap();
+        let mut throttle =
+            ProgressThrottle::with_interval(ProgressPublisher::default(), Duration::ZERO);
+
+        let sum = part
+            .checksum(&mut throttle, &AtomicBool::new(false))
+            .unwrap();
+
+        assert_eq!(
+            sum, "c423e3a9d7b4a6f1f03492cfded44b0b9c00c4c63f1ef3c410368e8a9ad3bcd2",
+            "verification happens with the lock still held, so it must read through \
+             the locking handle; reopening the path fails on Windows, where the lock \
+             is mandatory rather than advisory"
+        );
 
         drop(part);
         fs::remove_dir_all(directory).unwrap();

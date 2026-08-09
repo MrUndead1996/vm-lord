@@ -80,6 +80,25 @@ pub(crate) fn file_checksum(
         .metadata()
         .map_err(io_error("measure the image", path))?
         .len();
+    checksum_reader(&mut file, total, path, progress, cancel)
+}
+
+/// Hashes `total` bytes out of `reader`, reporting progress and honouring
+/// cancellation. `path` names the file only so failures can say which one.
+///
+/// Taken as a reader rather than a path because the partial download must be
+/// hashed through the very handle that holds its lock. On Windows `LockFileEx`
+/// is mandatory rather than advisory, so opening the same file a second time
+/// and reading it fails with `ERROR_LOCK_VIOLATION` -- something no amount of
+/// testing on Linux, where `flock` is advisory and the second read simply
+/// succeeds, would ever reveal.
+pub(crate) fn checksum_reader(
+    reader: &mut impl Read,
+    total: u64,
+    path: &Path,
+    progress: &mut ProgressThrottle,
+    cancel: &AtomicBool,
+) -> Result<String, DownloadError> {
     log::debug!("hashing {} ({total} bytes)", path.display());
 
     let mut hasher = Sha256::new();
@@ -91,7 +110,7 @@ pub(crate) fn file_checksum(
             log::debug!("hashing {} was cancelled", path.display());
             return Err(DownloadError::Cancelled);
         }
-        let read = file
+        let read = reader
             .read(&mut buffer)
             .map_err(io_error("read the image for hashing", path))?;
         if read == 0 {

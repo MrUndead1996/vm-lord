@@ -63,7 +63,7 @@ pub fn fetch_image(
     download_into(&mut part, request.url, &mut throttle, cancel)
         .inspect_err(|error| log::error!("failed to download {}: {error}", request.url))?;
 
-    let actual = file_checksum(part.path(), &mut throttle, cancel)?;
+    let actual = part.checksum(&mut throttle, cancel)?;
     if actual != expected {
         // Truncate rather than delete: the file is open and holds the lock, and
         // its name is worth keeping for the next attempt.

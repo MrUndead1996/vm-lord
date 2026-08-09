@@ -629,6 +629,17 @@ download is the caller's policy, and a wait buried in the fetch would need a
 timeout invented out of nothing. Cancellation leaves the partial file intact so
 the next attempt resumes it.
 
+That lock behaves differently on the two platforms, and the difference is not
+cosmetic. On Windows `LockFileEx` is **mandatory**: a second handle reading the
+locked range fails with `ERROR_LOCK_VIOLATION`. On Linux `flock` is advisory and
+the same read quietly succeeds. So the partial file is hashed through the very
+handle that holds its lock, never by reopening the path -- reopening passes
+every test on Linux and fails every download on Windows. Renaming the locked
+file into its final name does work on Windows, which is verified rather than
+assumed. Anything else added here must be exercised with
+`cargo test --target=x86_64-pc-windows-gnu`, because a native Linux run cannot
+see this class of bug at all.
+
 Progress is published as a `core::progress::DownloadPhase` snapshot that a UI
 thread can poll. It is a level rather than a queue of events, so only the latest
 value is kept -- the opposite choice from `VmEventSink`, where each HCS event is
