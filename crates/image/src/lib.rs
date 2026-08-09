@@ -17,7 +17,9 @@ mod download;
 mod error;
 mod http;
 mod part;
+mod resolve;
 
 pub use distro::{DistroProfile, UBUNTU};
 pub use download::{ImageDownloadRequest, fetch_image};
 pub use error::{DownloadError, ResolveError};
+pub use resolve::{ResolvedImage, resolve_image};

@@ -3,7 +3,6 @@
 use crate::error::ResolveError;
 
 /// The number of hex characters in a SHA256.
-#[allow(dead_code)]
 const CHECKSUM_LENGTH: usize = 64;
 
 /// Finds the checksum `file_name` is published with. `url` names the file only
@@ -14,7 +13,6 @@ const CHECKSUM_LENGTH: usize = 64;
 /// 200. Lines parsed but none of them ours means the distribution does not
 /// publish that image. To the user these are different pieces of news, and
 /// merging them would throw away the only useful half of the diagnosis.
-#[allow(dead_code)]
 pub(crate) fn parse_sha256sums(
     text: &str,
     file_name: &str,
@@ -58,7 +56,6 @@ pub(crate) fn parse_sha256sums(
 /// space in it survives; a leading `*` marks binary mode and is not part of the
 /// name. The checksum must be 64 hex characters, which is what tells a checksum
 /// line from a line of prose.
-#[allow(dead_code)]
 fn parse_line(line: &str) -> Option<(&str, &str)> {
     let (checksum, rest) = line.split_once(char::is_whitespace)?;
     if checksum.len() != CHECKSUM_LENGTH || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()) {

@@ -10,7 +10,6 @@
 use crate::error::ResolveError;
 
 /// The placeholder both templates carry.
-#[allow(dead_code)]
 const RELEASE_PLACEHOLDER: &str = "{release}";
 
 /// Where a distribution publishes its cloud images, and what the guest inside
@@ -51,24 +50,20 @@ pub const UBUNTU: DistroProfile = DistroProfile {
 
 impl DistroProfile {
     /// The URL of the image itself.
-    #[allow(dead_code)]
     pub(crate) fn image_url(&self, release: &str) -> String {
         format!("{}{}", self.directory(release), self.file_name(release))
     }
 
     /// The URL of the checksum file published beside it.
-    #[allow(dead_code)]
     pub(crate) fn checksums_url(&self, release: &str) -> String {
         format!("{}{}", self.directory(release), self.checksum_file)
     }
 
     /// The name the image carries inside the checksum file.
-    #[allow(dead_code)]
     pub(crate) fn file_name(&self, release: &str) -> String {
         self.file_name_template.replace(RELEASE_PLACEHOLDER, release)
     }
 
-    #[allow(dead_code)]
     fn directory(&self, release: &str) -> String {
         let directory = self.directory_template.replace(RELEASE_PLACEHOLDER, release);
         if directory.ends_with('/') {
@@ -88,7 +83,6 @@ impl DistroProfile {
 /// directory of the same server. Codenames are refused on purpose -- the server
 /// redirects a version number to its codename by itself, and accepting both
 /// would give one release two spellings that resolve to different file names.
-#[allow(dead_code)]
 pub(crate) fn validated_release(release: &str) -> Result<&str, ResolveError> {
     let (year, month) = release
         .split_once('.')

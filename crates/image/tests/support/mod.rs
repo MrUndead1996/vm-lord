@@ -33,6 +33,7 @@ pub enum Behaviour {
 
 pub struct TestServer {
     url: String,
+    base_url: String,
     ranges: Arc<Mutex<Vec<Option<String>>>>,
 }
 
@@ -43,6 +44,7 @@ impl TestServer {
             "http://{}/noble-cloudimg-amd64.img",
             listener.local_addr().unwrap()
         );
+        let base_url = format!("http://{}/", listener.local_addr().unwrap());
         let ranges = Arc::new(Mutex::new(Vec::new()));
 
         let recorded = Arc::clone(&ranges);
@@ -56,11 +58,23 @@ impl TestServer {
             }
         });
 
-        Self { url, ranges }
+        Self {
+            url,
+            base_url,
+            ranges,
+        }
     }
 
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// The server's root, ending in a slash: the directory a profile points at.
+    ///
+    /// The server answers every path the same way, so a resolver asking for
+    /// `<base>/SHA256SUMS` gets the body the test handed in.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
     }
 
     /// The `range` header of every request served so far, in order.
