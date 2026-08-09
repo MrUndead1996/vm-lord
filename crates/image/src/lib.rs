@@ -12,6 +12,7 @@
 
 mod cache;
 mod error;
+mod http;
 mod part;
 
 pub use error::DownloadError;
