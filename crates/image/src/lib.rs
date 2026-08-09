@@ -9,6 +9,10 @@
 //! whoever could swap the image could swap the list. The checksum is an
 //! integrity check, and above all the one defence against a file left truncated
 //! by an interrupted download.
+//!
+//! Which image a release means is worked out here too: a `DistroProfile` says
+//! where a distribution publishes its images, and `resolve_image` reads the
+//! checksum file published beside one to learn what it must hash to.
 
 mod cache;
 mod checksums;
