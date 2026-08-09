@@ -177,6 +177,111 @@ fn a_checksum_that_is_not_one_is_refused_before_any_request() {
 }
 
 #[test]
+fn a_cancelled_download_stops_and_keeps_what_it_had() {
+    let directory = cache_directory("cancel");
+    let sum = image_sum();
+    let server = TestServer::start(image_body(), Behaviour::Ranged);
+    // Bytes an earlier attempt had already fetched. Cancelling must leave them
+    // alone; truncating here is what would make cancel-then-retry re-download
+    // the whole image.
+    let part_path = directory.join(format!("{sum}.img.part"));
+    fs::write(&part_path, &image_body()[..1000]).unwrap();
+    let cancel = AtomicBool::new(true);
+
+    let error = fetch_image(
+        ImageDownloadRequest {
+            url: server.url(),
+            expected_sha256: &sum,
+            cache_directory: &directory,
+        },
+        &ProgressPublisher::default(),
+        &cancel,
+    )
+    .expect_err("a cancelled download must not report success");
+
+    assert!(matches!(error, DownloadError::Cancelled), "got {error:?}");
+    assert_eq!(
+        fs::read(&part_path).unwrap(),
+        image_body()[..1000],
+        "the partial file survives cancellation intact so the next run can resume it"
+    );
+    assert!(!directory.join(format!("{sum}.img")).exists());
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn a_second_download_of_the_same_image_is_refused_while_the_first_runs() {
+    use std::sync::{Arc, Barrier};
+
+    let directory = cache_directory("race");
+    let sum = image_sum();
+    let server = TestServer::start(image_body(), Behaviour::Ranged);
+
+    // Hold the lock the way a running download holds it: the partial file is
+    // opened and locked before any byte moves.
+    let held = directory.join(format!("{sum}.img.part"));
+    let lock_taken = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let holder = {
+        let (lock_taken, release, held) =
+            (Arc::clone(&lock_taken), Arc::clone(&release), held.clone());
+        std::thread::spawn(move || {
+            let file = fs::File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&held)
+                .unwrap();
+            file.try_lock().unwrap();
+            lock_taken.wait();
+            release.wait();
+            drop(file);
+        })
+    };
+    lock_taken.wait();
+
+    let error = fetch_image(
+        ImageDownloadRequest {
+            url: server.url(),
+            expected_sha256: &sum,
+            cache_directory: &directory,
+        },
+        &ProgressPublisher::default(),
+        &AtomicBool::new(false),
+    )
+    .expect_err("two downloaders must not write into one partial file");
+
+    assert!(
+        matches!(error, DownloadError::AlreadyInProgress { .. }),
+        "got {error:?}"
+    );
+    assert!(
+        server.ranges_seen().is_empty(),
+        "the refusal must come before any bandwidth is spent"
+    );
+
+    release.wait();
+    holder.join().unwrap();
+
+    // With the lock gone, the same call goes through.
+    let path = fetch_image(
+        ImageDownloadRequest {
+            url: server.url(),
+            expected_sha256: &sum,
+            cache_directory: &directory,
+        },
+        &ProgressPublisher::default(),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    assert_eq!(fs::read(&path).unwrap(), image_body());
+
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn an_image_another_downloader_finished_first_is_adopted() {
     let directory = cache_directory("race-rename");
     let sum = image_sum();
