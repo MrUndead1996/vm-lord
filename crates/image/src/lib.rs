@@ -12,5 +12,6 @@
 
 mod cache;
 mod error;
+mod part;
 
 pub use error::DownloadError;
