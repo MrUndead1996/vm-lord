@@ -11,10 +11,12 @@
 //! by an interrupted download.
 
 mod cache;
+mod distro;
 mod download;
 mod error;
 mod http;
 mod part;
 
+pub use distro::{DistroProfile, UBUNTU};
 pub use download::{ImageDownloadRequest, fetch_image};
-pub use error::DownloadError;
+pub use error::{DownloadError, ResolveError};
