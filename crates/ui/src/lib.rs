@@ -68,6 +68,10 @@ struct SettingsForm {
     language: Language,
     log_file_path: String,
     log_level: LogLevel,
+    /// Carried through the dialog unchanged: the settings form rebuilds the
+    /// whole `AppSettings`, so a field it does not know about would be lost on
+    /// every save. The widget for it arrives with the image download UI.
+    image_cache_path: PathBuf,
     error: Option<String>,
 }
 
@@ -78,6 +82,7 @@ impl SettingsForm {
             language: settings.language.clone(),
             log_file_path: settings.log_file_path.display().to_string(),
             log_level: settings.log_level,
+            image_cache_path: settings.image_cache_path.clone(),
             error: None,
         }
     }
@@ -97,6 +102,7 @@ impl SettingsForm {
             language: self.language,
             log_file_path: PathBuf::from(log_file_path),
             log_level: self.log_level,
+            image_cache_path: self.image_cache_path.clone(),
         })
     }
 }

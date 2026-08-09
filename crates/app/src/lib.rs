@@ -775,12 +775,14 @@ mod tests {
             language: Language::EnUs,
             log_file_path: directory.join("logs").join("vmlord.log"),
             log_level: LogLevel::Info,
+            image_cache_path: directory.join("images"),
         };
         let updated_settings = AppSettings {
             vm_storage_path: directory.join("virtual-machines"),
             language: Language::EnUs,
             log_file_path: directory.join("diagnostics").join("application.log"),
             log_level: LogLevel::Debug,
+            image_cache_path: directory.join("cached-images"),
         };
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             should_fail: false,

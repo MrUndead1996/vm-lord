@@ -10,6 +10,7 @@ const SETTINGS_FILE_NAME: &str = "settings.toml";
 const DEFAULT_VM_DIRECTORY: &str = "vms";
 const DEFAULT_LOG_DIRECTORY: &str = "logs";
 const DEFAULT_LOG_FILE_NAME: &str = "vmlord.log";
+const DEFAULT_IMAGE_DIRECTORY: &str = "images";
 
 /// Persistent settings that configure application-wide behavior.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +22,14 @@ pub struct AppSettings {
     /// Destination for application log records.
     pub log_file_path: PathBuf,
     pub log_level: LogLevel,
+    /// Directory holding distribution images downloaded from the internet.
+    ///
+    /// `serde(default)` leaves this empty for a `settings.toml` written before
+    /// the field existed; `load_or_create` fills it in. That keeps existing
+    /// configurations loading without a migration, the same way `endpoint_id`
+    /// and `network_mode` are handled in `VmComputeSystemMapping`.
+    #[serde(default)]
+    pub image_cache_path: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,10 +84,22 @@ impl SettingsStore {
     /// Loads settings from disk, creating the default configuration if absent.
     pub fn load_or_create(&self) -> Result<AppSettings, SettingsError> {
         match fs::read_to_string(&self.config_path) {
-            Ok(contents) => toml::from_str(&contents).map_err(|source| SettingsError::Parse {
-                path: self.config_path.clone(),
-                source,
-            }),
+            Ok(contents) => {
+                let mut settings: AppSettings =
+                    toml::from_str(&contents).map_err(|source| SettingsError::Parse {
+                        path: self.config_path.clone(),
+                        source,
+                    })?;
+                if settings.image_cache_path.as_os_str().is_empty() {
+                    settings.image_cache_path =
+                        self.config_directory()?.join(DEFAULT_IMAGE_DIRECTORY);
+                    log::debug!(
+                        "settings carried no image cache path; defaulting to {}",
+                        settings.image_cache_path.display()
+                    );
+                }
+                Ok(settings)
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let settings = self.default_settings()?;
                 self.save(&settings)?;
@@ -103,6 +124,11 @@ impl SettingsStore {
         fs::create_dir_all(&settings.vm_storage_path).map_err(|source| SettingsError::Io {
             operation: "create VM storage directory",
             path: settings.vm_storage_path.clone(),
+            source,
+        })?;
+        fs::create_dir_all(&settings.image_cache_path).map_err(|source| SettingsError::Io {
+            operation: "create image cache directory",
+            path: settings.image_cache_path.clone(),
             source,
         })?;
         let log_directory =
@@ -135,6 +161,7 @@ impl SettingsStore {
                 .join(DEFAULT_LOG_DIRECTORY)
                 .join(DEFAULT_LOG_FILE_NAME),
             log_level: LogLevel::Info,
+            image_cache_path: config_directory.join(DEFAULT_IMAGE_DIRECTORY),
         })
     }
 
@@ -251,6 +278,68 @@ mod tests {
     }
 
     #[test]
+    fn defaults_put_the_image_cache_next_to_the_other_application_directories() {
+        let directory = temporary_directory();
+        let store = SettingsStore::new(directory.join("settings.toml"));
+
+        let settings = store.load_or_create().unwrap();
+
+        assert_eq!(settings.image_cache_path, directory.join("images"));
+        assert!(settings.image_cache_path.is_dir());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn settings_written_before_the_image_cache_existed_still_load() {
+        let directory = temporary_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("settings.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "vm_storage_path = {vms:?}\n\
+                 language = \"en-US\"\n\
+                 log_file_path = {log:?}\n\
+                 log_level = \"info\"\n",
+                vms = directory.join("vms").display().to_string(),
+                log = directory.join("vmlord.log").display().to_string(),
+            ),
+        )
+        .unwrap();
+
+        let settings = SettingsStore::new(&config_path).load_or_create().unwrap();
+
+        assert_eq!(
+            settings.image_cache_path,
+            directory.join("images"),
+            "an existing settings.toml must keep loading without a migration"
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn an_explicit_image_cache_path_is_preserved() {
+        let directory = temporary_directory();
+        let store = SettingsStore::new(directory.join("settings.toml"));
+        let settings = AppSettings {
+            vm_storage_path: directory.join("vms"),
+            language: Language::EnUs,
+            log_file_path: directory.join("logs").join("vmlord.log"),
+            log_level: LogLevel::Info,
+            image_cache_path: directory.join("elsewhere").join("images"),
+        };
+
+        store.save(&settings).unwrap();
+
+        assert_eq!(store.load_or_create().unwrap(), settings);
+        assert!(settings.image_cache_path.is_dir());
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn save_and_load_preserves_custom_settings() {
         let directory = temporary_directory();
         let store = SettingsStore::new(directory.join("settings.toml"));
@@ -259,6 +348,7 @@ mod tests {
             language: Language::EnUs,
             log_file_path: directory.join("diagnostics").join("application.log"),
             log_level: LogLevel::Debug,
+            image_cache_path: directory.join("images"),
         };
 
         store.save(&settings).unwrap();
