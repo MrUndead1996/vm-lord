@@ -40,8 +40,8 @@ pub fn fetch_image(
     progress: &ProgressPublisher,
     cancel: &AtomicBool,
 ) -> Result<PathBuf, DownloadError> {
-    let expected = normalized_checksum(request.expected_sha256)
-        .inspect_err(|error| log::error!("{error}"))?;
+    let expected =
+        normalized_checksum(request.expected_sha256).inspect_err(|error| log::error!("{error}"))?;
     let mut throttle = ProgressThrottle::new(progress.clone());
 
     fs::create_dir_all(request.cache_directory)
