@@ -5,6 +5,10 @@
 //! to write, and it would only ever prove that our own stub behaves the way we
 //! imagined. A socket exercises our code and `ureq` together.
 
+// Each integration test binary compiles this module separately, and none of
+// them uses every behaviour, so unused-code warnings here mean nothing.
+#![allow(dead_code)]
+
 use std::{
     io::{BufRead, BufReader, Write},
     net::{TcpListener, TcpStream},
@@ -23,6 +27,8 @@ pub enum Behaviour {
     RejectsRange,
     /// Promises the whole length, sends `bytes`, then hangs up.
     Truncated { bytes: usize },
+    /// Has no such image.
+    NotFound,
 }
 
 pub struct TestServer {
@@ -72,6 +78,10 @@ fn answer(mut stream: TcpStream, body: &[u8], behaviour: Behaviour) -> Option<St
         .and_then(|value| value.parse::<usize>().ok());
 
     match (behaviour, requested_from) {
+        (Behaviour::NotFound, _) => {
+            let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            let _ = stream.flush();
+        }
         (Behaviour::Truncated { bytes }, _) => {
             let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
             let _ = stream.write_all(head.as_bytes());

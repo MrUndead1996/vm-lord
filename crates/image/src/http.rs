@@ -35,8 +35,15 @@ pub(crate) enum ResumeOutcome {
 ///
 /// Both timeouts are explicit. A server that accepts a connection and then says
 /// nothing would otherwise park the worker thread forever.
+///
+/// `http_status_as_error(false)` hands the status table back to us. By default
+/// `ureq` turns any 4xx or 5xx into an `Err` before returning a response, which
+/// would make 416 -- a legitimate answer to a resume request, and one we act on
+/// -- indistinguishable from a transport failure, and would reduce every
+/// `UnexpectedStatus` to an opaque string.
 pub(crate) fn build_agent() -> Agent {
     Agent::config_builder()
+        .http_status_as_error(false)
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_recv_response(Some(RESPONSE_TIMEOUT))
         .tls_config(
