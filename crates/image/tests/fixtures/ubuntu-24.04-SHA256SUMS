@@ -1,0 +1,16 @@
+0533b0655c32e68b31d792ecd6ccfca95abdbc536c4446874fe0513bd4140ffe *ubuntu-24.04-server-cloudimg-amd64.img
+137cdec6444a55a85c5b0ee93e77e23901f50155c55147a0a2d02025551f1b1f *ubuntu-24.04-server-cloudimg-riscv64.img
+17eee7e96207f937b4399219df056953755af4dfcd8df49a7e30ebe993099b8d *ubuntu-24.04-server-cloudimg-amd64-root.manifest
+17eee7e96207f937b4399219df056953755af4dfcd8df49a7e30ebe993099b8d *ubuntu-24.04-server-cloudimg-amd64.squashfs.manifest
+198e71366f7e54008f8c0ff3235cbf9fb0a86c8ea32bcfd534075e5e912ec78e *ubuntu-24.04-server-cloudimg-amd64-azure.vhd.tar.gz
+477a75368f11b7928d123e2d9f47e3eea140e38ff6ea7a066cb60c5d2be7ac2d *ubuntu-24.04-server-cloudimg-s390x.img
+4827bf92014f23c87476dff65117110ef6c29f810905af16fb09514b019a4e4a *ubuntu-24.04-server-cloudimg-amd64-azure.vhd.manifest
+4881b54323d62bb2a791a48c5bfa841492e55cf7a27af18b047edc904d595051 *ubuntu-24.04-server-cloudimg-amd64-lxd.tar.xz
+497466a2fb464cbed05e28f67d93f9fa7d98217e623dd1433a4faa7f820a0778 *ubuntu-24.04-server-cloudimg-ppc64el.img
+4c5ea96ac403e38105b9f02536b8ff6ee38ec1d2c301048f78b2329b6c037130 *ubuntu-24.04-server-cloudimg-amd64.squashfs
+6fa20bf5cdab0b64003d2b6587a9f7343ee541234e5119078a7004b0df3d0b6d *ubuntu-24.04-server-cloudimg-amd64.manifest
+8fdafa961e9de4f26747e89a122093ed772565e80bddb45bc39e2eb57df07988 *ubuntu-24.04-server-cloudimg-amd64.vmdk
+915b4be62933475c3fb5f5031aa2e159294db95fb32aaa9e8b317aadcb6c065d *ubuntu-24.04-server-cloudimg-amd64-root.tar.xz
+aa6da05756e85ea6dde4836b841fecb10cfd1ba3bcea320189d9af945db70476 *ubuntu-24.04-server-cloudimg-arm64.img
+f4fb065998208f8183436d76899db5ca81cf6d02d790f5d42eff00b587827c54 *ubuntu-24.04-server-cloudimg-amd64.tar.gz
+f822f1c5ff5ccaa617ffb70630c00af593493578a3938b0fc21ebb3806b9f2f1 *ubuntu-24.04-server-cloudimg-amd64.ova

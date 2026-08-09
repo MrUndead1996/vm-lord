@@ -9,12 +9,21 @@
 //! whoever could swap the image could swap the list. The checksum is an
 //! integrity check, and above all the one defence against a file left truncated
 //! by an interrupted download.
+//!
+//! Which image a release means is worked out here too: a `DistroProfile` says
+//! where a distribution publishes its images, and `resolve_image` reads the
+//! checksum file published beside one to learn what it must hash to.
 
 mod cache;
+mod checksums;
+mod distro;
 mod download;
 mod error;
 mod http;
 mod part;
+mod resolve;
 
+pub use distro::{DistroProfile, UBUNTU};
 pub use download::{ImageDownloadRequest, fetch_image};
-pub use error::DownloadError;
+pub use error::{DownloadError, ResolveError};
+pub use resolve::{ResolvedImage, resolve_image};

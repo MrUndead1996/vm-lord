@@ -93,3 +93,54 @@ pub(crate) fn io_error(
         source,
     }
 }
+
+/// A failure working out which image a release means.
+///
+/// Separate from `DownloadError` on purpose: the two have different callers and
+/// tell the user different things. "the server published no checksum list for
+/// 24.04" and "the image that arrived does not match its checksum" are
+/// different accidents, and merging them would force every caller to match
+/// variants that cannot occur where it stands.
+#[derive(Debug)]
+pub enum ResolveError {
+    /// The caller supplied something that is not a release version.
+    InvalidRelease(String),
+    /// The transport failed: connection refused, TLS rejected, body cut short.
+    Http(String),
+    UnexpectedStatus {
+        status: u16,
+    },
+    /// The body arrived but is not a list of checksums -- typically an HTML
+    /// error page served with status 200.
+    MalformedChecksums {
+        url: String,
+    },
+    /// The list is a list, but this distribution does not publish that image.
+    ImageNotListed {
+        file_name: String,
+        url: String,
+    },
+}
+
+impl fmt::Display for ResolveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidRelease(value) => {
+                write!(formatter, "{value:?} is not a release version like \"24.04\"")
+            }
+            Self::Http(message) => write!(formatter, "the release lookup failed: {message}"),
+            Self::UnexpectedStatus { status } => write!(
+                formatter,
+                "the image server answered with status {status} for the checksum list"
+            ),
+            Self::MalformedChecksums { url } => {
+                write!(formatter, "{url} is not a list of checksums")
+            }
+            Self::ImageNotListed { file_name, url } => {
+                write!(formatter, "{url} lists no image named {file_name}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ResolveError {}

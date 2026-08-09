@@ -647,6 +647,31 @@ a distinct fact. Publishing is rate-limited, but a change of phase and the last
 value within a phase are never held back. The widget that draws it is separate
 work.
 
+### Release resolution
+
+`vmlord-image` also works out *which* image a release means. A `DistroProfile`
+is a table of data -- two URL templates, the name of the checksum file, the
+guest's default user and its admin group -- rather than a trait with one
+implementation per distribution, because that is what actually differs between
+Ubuntu and Fedora. `resolve_image` validates the release version, reads the
+checksum file published beside the image, and returns the image URL together
+with the SHA256 the download must produce, in the lowercase hex the downloader
+expects.
+
+Releases are addressed by version number rather than codename. The server
+answers `/releases/24.04/` with a 302 to `/releases/noble/`, so a table of
+codenames would need a line added for every future release and buy nothing. The
+version string is checked against a strict shape before it is pasted into a URL:
+it is attacker-influenced input, and unchecked it walks the request into another
+directory. The architecture is baked into the file name template, since Hyper-V
+here is x86_64.
+
+A body that parses as no checksum line at all is reported apart from a body that
+parses but does not list the image: the first means the server sent something
+else -- typically an HTML error page with status 200 -- and the second means the
+distribution publishes no such build. The checksum list is never cached: it is
+what says which build is current.
+
 ### VM update contract
 
 The edit workflow follows these rules:
