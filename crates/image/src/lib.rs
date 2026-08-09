@@ -11,6 +11,7 @@
 //! by an interrupted download.
 
 mod cache;
+mod checksums;
 mod distro;
 mod download;
 mod error;
