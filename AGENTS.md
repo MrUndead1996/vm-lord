@@ -70,14 +70,6 @@ Update **ARCHITECTURE.md** whenever architectural decisions change.
 
 ## Commits
 
-The repository-level `git config` belongs to the project owner.
-
-Automated agents must author commits under their own identity by passing:
-
-```powershell
-GIT_AUTHOR_NAME=agent GIT_AUTHOR_EMAIL=agent@vmlord.local GIT_COMMITTER_NAME=agent GIT_COMMITTER_EMAIL=agent@vmlord.local
-```
-
 Prefix every commit subject with the task number when it is known.
 
 Format commit subjects as `TASK-<No>: comment`.
@@ -86,20 +78,6 @@ Examples:
 
 * `TASK-2: Add VM update workflow`
 * `TASK-15: Refine SSH connection errors`
-
-## Delegation to the Local LLM (houtini/houtini-lm)
-
-Delegate bounded, self-contained side tasks to the local LLM via houtini instead of doing them directly:
-
-* drafting commit messages and merge-request descriptions;
-* drafting explanations, summaries, or documentation prose;
-* brainstorming approaches before committing to one.
-
-Do not delegate work that needs verification against the actual repository or toolchain, such as:
-
-* reading exact API signatures, dependency versions, or codebase conventions;
-* writing or editing code;
-* anything validated by `cargo build`/`test`/`clippy` or a live environment (e.g. Hyper-V).
 
 ## Decision Priority
 
