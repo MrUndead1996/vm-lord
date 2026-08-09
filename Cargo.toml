@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/core",
+    "crates/image",
     "crates/app",
     "crates/legacy-backend",
     "crates/platform",

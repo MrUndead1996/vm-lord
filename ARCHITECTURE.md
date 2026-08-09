@@ -563,9 +563,13 @@ is worse than reporting it incompletely.
 `core::settings` owns the UI-independent application settings model and TOML
 persistence. The composition root initializes it before the backend. Settings
 are stored per user at `%LOCALAPPDATA%\VMLord\settings.toml`; the initial file
-uses `%LOCALAPPDATA%\VMLord\vms` for VM data and
-`%LOCALAPPDATA%\VMLord\logs\vmlord.log` for logs. The configuration directory
-and the default VM and log directories are created on first launch.
+uses `%LOCALAPPDATA%\VMLord\vms` for VM data,
+`%LOCALAPPDATA%\VMLord\logs\vmlord.log` for logs and
+`%LOCALAPPDATA%\VMLord\images` for downloaded distribution images. The
+configuration directory and the default VM, log and image directories are
+created on first launch. `image_cache_path` carries `#[serde(default)]` and is
+filled in on load when absent, so a `settings.toml` written before the field
+existed keeps loading without a migration.
 
 `core::logging` installs the shared `log` backend after settings are loaded and
 before the backend starts. It writes records at the configured `log_level` to
@@ -585,6 +589,63 @@ instead: Start invokes `asb_vm_start`; Stop invokes the graceful
 configuration setters; Connect invokes `asb_vm_open_display`, which opens or
 focuses the temporary AppSandbox IDD window after the guest display driver is
 ready. It calls `asb_detach` on exit so it never stops VMs.
+
+### Image download
+
+`vmlord-image` fetches a distribution's cloud image over HTTPS into the
+directory configured as `image_cache_path`. It is a separate crate rather than
+part of `core` or `platform`: `core` carries no I/O dependencies, and `platform`
+is the Windows-specific layer where `unsafe` is allowed, while downloading needs
+neither. The qcow2 reader and the release resolver will join it there.
+
+The cache is addressed by content: an entry is named after the SHA256 it is
+expected to have, so two releases cannot collide on a name and a file whose name
+disagrees with its content cannot exist. The checksum is verified on every call,
+cache hit included -- it is the only thing that tells a complete image from one
+an interrupted download left truncated, and it costs seconds against re-fetching
+hundreds of megabytes.
+
+Trust comes from HTTPS. A checksum list downloaded from the same server as the
+image proves nothing about authenticity, because whoever could swap the image
+could swap the list. Certificates are checked against the platform verifier, so
+a host behind a TLS-inspecting corporate proxy works instead of failing with
+nothing the user can do. Signature checking is a later reinforcement.
+
+The client is blocking (`ureq`, no async runtime, following the DHCP worker in
+`platform::dhcp`). The `gzip` feature is deliberately off: transparent
+decompression would put the byte count out of step with the file on disk and
+send the resume offset astray. Downloads resume through HTTP `Range` when the
+server allows it, fall back to a fresh transfer when the server ignores or
+rejects the range, and report any other status as itself rather than as an
+opaque transport failure.
+
+Two downloaders of one image are separated by an exclusive operating-system lock
+on the partial file (`std::fs::File::try_lock`). It covers two threads of one
+process as well as two processes, and it is released when the handle closes,
+including when the process dies -- unlike a marker file, which survives a crash
+and forces a guess about whether it is stale. The second downloader is refused
+with `AlreadyInProgress` rather than made to wait: queueing behind another
+download is the caller's policy, and a wait buried in the fetch would need a
+timeout invented out of nothing. Cancellation leaves the partial file intact so
+the next attempt resumes it.
+
+That lock behaves differently on the two platforms, and the difference is not
+cosmetic. On Windows `LockFileEx` is **mandatory**: a second handle reading the
+locked range fails with `ERROR_LOCK_VIOLATION`. On Linux `flock` is advisory and
+the same read quietly succeeds. So the partial file is hashed through the very
+handle that holds its lock, never by reopening the path -- reopening passes
+every test on Linux and fails every download on Windows. Renaming the locked
+file into its final name does work on Windows, which is verified rather than
+assumed. Anything else added here must be exercised with
+`cargo test --target=x86_64-pc-windows-gnu`, because a native Linux run cannot
+see this class of bug at all.
+
+Progress is published as a `core::progress::DownloadPhase` snapshot that a UI
+thread can poll. It is a level rather than a queue of events, so only the latest
+value is kept -- the opposite choice from `VmEventSink`, where each HCS event is
+a distinct fact. Publishing is rate-limited, but a change of phase and the last
+value within a phase are never held back. The widget that draws it is separate
+work.
 
 ### VM update contract
 
