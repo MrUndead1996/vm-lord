@@ -1557,28 +1557,39 @@ fn a_vm_is_created_from_a_real_cloud_image() {
         network_mode: NetworkMode::Nat,
     };
 
-    let mapping = pipeline
-        .create(&store, &request, &vm_directory)
-        .expect("a cloud image should become a VM");
+    let created = pipeline.create(&store, &request, &vm_directory);
+    // Captured while the files still exist -- the cleanup below removes them
+    // regardless of whether the assertions that need them ever run.
+    let seed = created
+        .as_ref()
+        .ok()
+        .and_then(|_| fs::read(vm_directory.join("seed.iso")).ok());
+    let document: Option<serde_json::Value> = created.as_ref().ok().and_then(|_| {
+        fs::read_to_string(vm_directory.join("config.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+    });
 
-    let seed = std::fs::read(vm_directory.join("seed.iso")).expect("the seed should be written");
-    assert_eq!(&seed[16 * 2048 + 40..16 * 2048 + 46], b"CIDATA");
-    let text = String::from_utf8_lossy(&seed);
-    assert!(text.contains("user-data") && text.contains("meta-data"));
-
-    let document: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(vm_directory.join("config.json")).unwrap())
-            .unwrap();
-    assert_eq!(
-        document.pointer("/VirtualMachine/Devices/Scsi/Primary/Attachments/1/Path"),
-        Some(&serde_json::json!(vm_directory.join("seed.iso")))
-    );
-
-    // Best-effort cleanup, in the shape the other tests in this file use.
-    if let Ok(system) = HcsSystem::open(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL) {
+    // Best-effort cleanup regardless of the assertions below.
+    if let Ok(mapping) = &created
+        && let Ok(system) = HcsSystem::open(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL)
+    {
         let _ = system
             .terminate()
             .and_then(|operation| operation.wait_for_completion(Duration::from_secs(30)));
     }
     let _ = fs::remove_dir_all(&root);
+
+    created.expect("a cloud image should become a VM");
+
+    let seed = seed.expect("the seed should be written");
+    assert_eq!(&seed[16 * 2048 + 40..16 * 2048 + 46], b"CIDATA");
+    let text = String::from_utf8_lossy(&seed);
+    assert!(text.contains("user-data") && text.contains("meta-data"));
+
+    let document = document.expect("the configuration should be written and valid JSON");
+    assert_eq!(
+        document.pointer("/VirtualMachine/Devices/Scsi/Primary/Attachments/1/Path"),
+        Some(&serde_json::json!(vm_directory.join("seed.iso")))
+    );
 }
