@@ -9,6 +9,7 @@
 
 mod meta_data;
 mod scalar;
+mod user_data;
 
 use vmlord_core::SshAccess;
 
