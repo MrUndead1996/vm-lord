@@ -1,9 +1,11 @@
 //! UI-independent domain types and repository boundary for VMLord.
 
+pub mod distro;
 pub mod logging;
 pub mod progress;
 pub mod settings;
 
+pub use distro::{DistroProfile, ubuntu};
 pub use logging::{LoggingError, initialize as initialize_logging};
 pub use progress::{DownloadPhase, ProgressPublisher, ProgressThrottle};
 pub use settings::{AppSettings, Language, LogLevel, SettingsError, SettingsStore};

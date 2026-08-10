@@ -28,7 +28,8 @@ mod part;
 mod qcow2;
 mod resolve;
 
-pub use distro::{DistroProfile, UBUNTU};
+pub use distro::validated_release;
+pub use vmlord_core::{DistroProfile, ubuntu};
 pub use download::{ImageDownloadRequest, fetch_image};
 pub use error::{DownloadError, Qcow2Error, ResolveError};
 pub use qcow2::Qcow2Image;

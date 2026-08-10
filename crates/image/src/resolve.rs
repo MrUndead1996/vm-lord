@@ -1,9 +1,9 @@
 //! Turning a distribution release into a URL and the checksum to expect.
 
+use vmlord_core::DistroProfile;
+
 use crate::{
-    checksums::parse_sha256sums,
-    distro::{DistroProfile, validated_release},
-    error::ResolveError,
+    checksums::parse_sha256sums, distro::validated_release, error::ResolveError,
     http::build_agent,
 };
 
@@ -23,8 +23,8 @@ const MAX_CHECKSUMS_BYTES: u64 = 1024 * 1024;
 pub struct ResolvedImage {
     pub url: String,
     pub sha256: String,
-    pub default_user: &'static str,
-    pub admin_group: &'static str,
+    pub default_user: String,
+    pub admin_group: String,
 }
 
 /// Works out which image a release means, by reading the checksum file the
@@ -52,8 +52,8 @@ pub fn resolve_image(
     Ok(ResolvedImage {
         url,
         sha256,
-        default_user: profile.default_user,
-        admin_group: profile.admin_group,
+        default_user: profile.default_user.clone(),
+        admin_group: profile.admin_group.clone(),
     })
 }
 

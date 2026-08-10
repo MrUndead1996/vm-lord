@@ -1,78 +1,11 @@
-//! Which distribution to fetch, where its releases live, and what the guest
-//! inside them looks like.
+//! Which release of a distribution a request names.
 //!
-//! A profile is a table of data, not a trait with one implementation per
-//! distribution. Ubuntu and Fedora differ by a URL template, a default user, an
-//! admin group and the name of a checksum file -- those are fields, not
-//! behaviour, and five structs differing only in constants are exactly what
-//! AGENTS.md means by unnecessary abstractions.
+//! The profile itself lives in `vmlord-core`: it is a table of domain facts --
+//! a default user, an admin group -- that the provisioning contract reads.
+//! What stays here is the check that belongs to URL building rather than to the
+//! domain.
 
 use crate::error::ResolveError;
-
-/// The placeholder both templates carry.
-const RELEASE_PLACEHOLDER: &str = "{release}";
-
-/// Where a distribution publishes its cloud images, and what the guest inside
-/// them looks like.
-///
-/// The URL is kept as two templates rather than one: the checksum file sits in
-/// the same directory as the image, and a single template would have to have its
-/// tail cut off to get at that directory.
-pub struct DistroProfile {
-    pub name: &'static str,
-    pub directory_template: &'static str,
-    pub file_name_template: &'static str,
-    pub checksum_file: &'static str,
-    /// The account cloud-init creates in the guest.
-    pub default_user: &'static str,
-    /// The group that account must join to hold administrative rights.
-    pub admin_group: &'static str,
-}
-
-/// Ubuntu's official cloud images.
-///
-/// The directory is addressed by version number even though the server stores
-/// it under the codename: `/releases/24.04/` answers 302 to `/releases/noble/`,
-/// so a table of codenames would buy nothing and would need a line added for
-/// every future release. The file name, in contrast, does carry the version
-/// number rather than the codename -- verified on 24.04 and 22.04.
-///
-/// The architecture is baked into the template. Hyper-V here is x86_64, and a
-/// field with one possible value is no better than an enum with one variant.
-pub const UBUNTU: DistroProfile = DistroProfile {
-    name: "Ubuntu",
-    directory_template: "https://cloud-images.ubuntu.com/releases/{release}/release/",
-    file_name_template: "ubuntu-{release}-server-cloudimg-amd64.img",
-    checksum_file: "SHA256SUMS",
-    default_user: "ubuntu",
-    admin_group: "sudo",
-};
-
-impl DistroProfile {
-    /// The URL of the image itself.
-    pub(crate) fn image_url(&self, release: &str) -> String {
-        format!("{}{}", self.directory(release), self.file_name(release))
-    }
-
-    /// The URL of the checksum file published beside it.
-    pub(crate) fn checksums_url(&self, release: &str) -> String {
-        format!("{}{}", self.directory(release), self.checksum_file)
-    }
-
-    /// The name the image carries inside the checksum file.
-    pub(crate) fn file_name(&self, release: &str) -> String {
-        self.file_name_template.replace(RELEASE_PLACEHOLDER, release)
-    }
-
-    fn directory(&self, release: &str) -> String {
-        let directory = self.directory_template.replace(RELEASE_PLACEHOLDER, release);
-        if directory.ends_with('/') {
-            directory
-        } else {
-            format!("{directory}/")
-        }
-    }
-}
 
 /// Accepts a release version of two or three digits, a dot and two digits, and
 /// refuses everything else.
@@ -83,7 +16,7 @@ impl DistroProfile {
 /// directory of the same server. Codenames are refused on purpose -- the server
 /// redirects a version number to its codename by itself, and accepting both
 /// would give one release two spellings that resolve to different file names.
-pub(crate) fn validated_release(release: &str) -> Result<&str, ResolveError> {
+pub fn validated_release(release: &str) -> Result<&str, ResolveError> {
     let (year, month) = release
         .split_once('.')
         .ok_or_else(|| ResolveError::InvalidRelease(release.to_owned()))?;
@@ -100,7 +33,7 @@ pub(crate) fn validated_release(release: &str) -> Result<&str, ResolveError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DistroProfile, UBUNTU, validated_release};
+    use super::validated_release;
     use crate::error::ResolveError;
 
     #[test]
@@ -132,36 +65,5 @@ mod tests {
                 "{candidate:?} must not be pasted into a URL"
             );
         }
-    }
-
-    #[test]
-    fn a_profile_builds_the_image_url_and_the_checksums_url_in_one_directory() {
-        assert_eq!(
-            UBUNTU.image_url("24.04"),
-            "https://cloud-images.ubuntu.com/releases/24.04/release/\
-             ubuntu-24.04-server-cloudimg-amd64.img"
-        );
-        assert_eq!(
-            UBUNTU.checksums_url("24.04"),
-            "https://cloud-images.ubuntu.com/releases/24.04/release/SHA256SUMS"
-        );
-        assert_eq!(
-            UBUNTU.file_name("22.04"),
-            "ubuntu-22.04-server-cloudimg-amd64.img"
-        );
-    }
-
-    #[test]
-    fn a_directory_template_without_a_trailing_slash_still_joins_cleanly() {
-        let profile = DistroProfile {
-            directory_template: "http://127.0.0.1:9/{release}",
-            ..UBUNTU
-        };
-
-        assert_eq!(
-            profile.checksums_url("24.04"),
-            "http://127.0.0.1:9/24.04/SHA256SUMS",
-            "a profile written by hand must not silently produce a glued-together URL"
-        );
     }
 }
