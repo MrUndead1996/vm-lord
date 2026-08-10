@@ -22,6 +22,7 @@ mod hcn_endpoint;
 mod hcs;
 mod hcs_config;
 mod host_dns;
+mod import;
 mod layout;
 mod metadata;
 mod reconnect;
@@ -43,6 +44,7 @@ pub use hcn_endpoint::{EndpointAddress, HcnEndpoint};
 pub use hcs::{
     HcsClient, HcsOperation, HcsStartFailure, HcsSystem, HcsSystemState, HcsSystemSummary,
 };
+pub use import::{ImportSummary, import_image};
 pub use metadata::{MetadataStore, VmComputeSystemMapping};
 pub use reconnect::{
     ReconnectOutcome, ReconnectReport, ReconnectedVm, VmConnections, reconnect_known_vms,

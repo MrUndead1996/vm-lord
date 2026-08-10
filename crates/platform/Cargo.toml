@@ -17,6 +17,7 @@ windows = { workspace = true, features = [
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_Storage_Vhd",
     "Win32_System_Com",
     "Win32_System_HostComputeNetwork",
@@ -24,6 +25,12 @@ windows = { workspace = true, features = [
     "Win32_System_IO",
     "Win32_System_Threading",
 ] }
+
+[dev-dependencies]
+# Only the `#[ignore]`d import test uses it, to read a real cloud image the way
+# production will. The dependency runs one way: `image` knows nothing of
+# Windows, and `platform` does not depend on it to build.
+vmlord-image = { path = "../image" }
 
 [lints.rust]
 unsafe_code = "allow"

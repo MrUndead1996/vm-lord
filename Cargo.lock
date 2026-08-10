@@ -3686,6 +3686,7 @@ dependencies = [
  "serde_json",
  "uuid",
  "vmlord-core",
+ "vmlord-image",
  "windows 0.61.3",
 ]
 
