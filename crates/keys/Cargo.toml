@@ -1,0 +1,21 @@
+[package]
+name = "vmlord-keys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+log.workspace = true
+# `ecdsa` and `rsa` are off deliberately: a VM key is always ed25519, and the
+# unused algorithms would drag in their own crypto stacks.
+ssh-key = { version = "0.6", default-features = false, features = [
+    "alloc",
+    "ed25519",
+    "getrandom",
+    "std",
+] }
+vmlord-core = { path = "../core" }
+zeroize = "1"
+
+[lints]
+workspace = true

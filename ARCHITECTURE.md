@@ -820,6 +820,31 @@ A password travels as `Password`, whose `Debug` prints `<redacted>` and which
 has no `Display`: until the seed hashes it (#61), the plaintext sits inside a
 request that several call sites log with `{:?}`.
 
+### The VM's SSH key pair
+
+Every VM gets its own ed25519 pair rather than sharing one. AppSandbox kept a
+single key under `%ProgramData%\AppSandbox\ssh\id_appsandbox`
+(`legacy-backend/src/windows.rs:691`), where the compromise of one sandbox
+reached every other one.
+
+`vmlord-keys` generates the pair and serialises it: an OpenSSH PEM document for
+the private half, one `authorized_keys` line commented `vmlord@<vm>` for the
+public one. It depends on `core` alone, so its tests run on any host. The pair
+carries no passphrase -- VMLord connects to the guest unattended, and a
+passphrase stored beside the key it protects protects nothing. `VmKeyPair` has
+no `Debug`, for the reason `Password` and `Seed` have none.
+
+`platform::vm_key` puts the pair under `keys/` in the VM's directory:
+`id_ed25519` and `id_ed25519.pub`, both named by `platform::layout`. The private
+file is created empty, its DACL is narrowed to SYSTEM, the Administrators group
+and the user VMLord runs as -- who also becomes its owner -- and only then does
+the key go in; the window between creating the file and setting its permissions
+must not hold a private key. The user's own entry is what lets `ssh -i` work
+from an unelevated console, and it is the exact shape Win32-OpenSSH accepts. A
+VM that already has a key is never given another: the guest holds the public
+half, and a new pair would leave it trusting a key the host no longer has.
+Deleting the VM deletes the key with the directory.
+
 ### The cloud-init seed
 
 `vmlord-seed` turns the provisioning contract into the two NoCloud documents
