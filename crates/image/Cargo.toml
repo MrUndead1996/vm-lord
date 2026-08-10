@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 log.workspace = true
+qcow = "1"
 sha2 = "0.11"
 # `gzip`, part of the default feature set, is deliberately off: with it `ureq`
 # sends `accept-encoding: gzip` and transparently decompresses the body, after

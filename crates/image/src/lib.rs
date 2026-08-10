@@ -13,6 +13,10 @@
 //! Which image a release means is worked out here too: a `DistroProfile` says
 //! where a distribution publishes its images, and `resolve_image` reads the
 //! checksum file published beside one to learn what it must hash to.
+//!
+//! Once the file is on disk, `Qcow2Image` turns it back into the disk it holds:
+//! a `Read + Seek` stream of the guest's bytes, holes and compressed clusters
+//! included, for the importer to write into a VHDX.
 
 mod cache;
 mod checksums;
@@ -21,9 +25,11 @@ mod download;
 mod error;
 mod http;
 mod part;
+mod qcow2;
 mod resolve;
 
 pub use distro::{DistroProfile, UBUNTU};
 pub use download::{ImageDownloadRequest, fetch_image};
-pub use error::{DownloadError, ResolveError};
+pub use error::{DownloadError, Qcow2Error, ResolveError};
+pub use qcow2::Qcow2Image;
 pub use resolve::{ResolvedImage, resolve_image};
