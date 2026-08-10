@@ -1,0 +1,17 @@
+[package]
+name = "vmlord-seed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+log.workspace = true
+vmlord-core = { path = "../core" }
+
+[dev-dependencies]
+# Production prints the document by hand; the tests read it back the way
+# cloud-init's PyYAML does, so they assert on meaning rather than on bytes.
+serde_yaml_ng = "0.10"
+
+[lints]
+workspace = true
