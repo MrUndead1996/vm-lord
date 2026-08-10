@@ -40,6 +40,9 @@ pub(crate) fn render(request: &SeedRequest<'_>) -> String {
     document.push_str(&format!("timezone: {}\n", scalar::yaml(request.timezone)));
     document.push_str(&keyboard_file(request.keyboard));
     document.push_str("growpart:\n  mode: auto\n  devices: ['/']\nresize_rootfs: true\n");
+    if let Some(command) = disable_ssh(request) {
+        document.push_str(&command);
+    }
 
     document
 }
@@ -50,6 +53,29 @@ pub(crate) fn render(request: &SeedRequest<'_>) -> String {
 /// SSH off the setting has nobody to apply to.
 fn password_login_allowed(request: &SeedRequest<'_>) -> bool {
     matches!(request.ssh, vmlord_core::SshAccess::Enabled { .. }) && request.password_hash.is_some()
+}
+
+/// The `runcmd` entry that stops the SSH daemon and keeps it stopped.
+///
+/// The unit names come from the profile rather than from here: Debian-family
+/// systems socket-activate `ssh.socket`, Fedora and SUSE name both `sshd`. A
+/// unit that does not exist on a given release makes `systemctl` return
+/// non-zero, which `runcmd` does not treat as fatal.
+fn disable_ssh(request: &SeedRequest<'_>) -> Option<String> {
+    if request.ssh != vmlord_core::SshAccess::Disabled || request.ssh_units.is_empty() {
+        return None;
+    }
+
+    let units = request
+        .ssh_units
+        .iter()
+        .map(|unit| scalar::yaml(unit))
+        .collect::<Vec<_>>()
+        .join(", ");
+    log::debug!("the seed disables the SSH daemon: {units}");
+    Some(format!(
+        "runcmd:\n  - ['systemctl', 'disable', '--now', {units}]\n"
+    ))
 }
 
 /// The `write_files` entry that sets the console keyboard layout.
@@ -189,6 +215,77 @@ mod tests {
         assert_eq!(document["growpart"]["mode"], Value::from("auto"));
         assert_eq!(document["growpart"]["devices"], Value::from(vec!["/"]));
         assert_eq!(document["resize_rootfs"], Value::from(true));
+    }
+
+    /// A VM reachable by key only: the account exists, password login does not.
+    #[test]
+    fn without_a_hash_the_account_has_no_password_at_all() {
+        let document = parsed(&render(&SeedRequest {
+            password_hash: None,
+            ..request()
+        }));
+        let user = &document["users"][0];
+
+        assert_eq!(user["lock_passwd"], Value::from(true));
+        assert_eq!(user.get("hashed_passwd"), None);
+        assert_eq!(document["ssh_pwauth"], Value::from(false));
+    }
+
+    #[test]
+    fn without_a_key_the_user_has_no_authorized_keys_entry() {
+        let document = parsed(&render(&SeedRequest {
+            authorized_key: None,
+            ..request()
+        }));
+
+        assert_eq!(document["users"][0].get("ssh_authorized_keys"), None);
+    }
+
+    /// A cloud image ships the SSH daemon enabled, so "SSH off" has to be an
+    /// action: silence would leave the daemon running and the choice void.
+    #[test]
+    fn ssh_turned_off_disables_the_daemon_named_by_the_profile() {
+        let units = ["ssh.socket".to_string(), "ssh.service".to_string()];
+        let document = parsed(&render(&SeedRequest {
+            ssh: SshAccess::Disabled,
+            authorized_key: None,
+            ssh_units: &units,
+            ..request()
+        }));
+
+        assert_eq!(
+            document["runcmd"][0],
+            Value::from(vec![
+                "systemctl",
+                "disable",
+                "--now",
+                "ssh.socket",
+                "ssh.service"
+            ])
+        );
+        assert_eq!(document["ssh_pwauth"], Value::from(false));
+    }
+
+    #[test]
+    fn ssh_left_on_disables_nothing() {
+        let units = ["ssh.socket".to_string()];
+        let document = parsed(&render(&SeedRequest {
+            ssh_units: &units,
+            ..request()
+        }));
+
+        assert_eq!(document.get("runcmd"), None);
+    }
+
+    /// The plaintext password never reaches this crate, and the private key is
+    /// never handed to it. The test states that as a property of the output.
+    #[test]
+    fn no_secret_beyond_the_hash_and_the_public_key_appears_in_the_document() {
+        let document = render(&request());
+
+        assert!(!document.contains("hunter2"));
+        assert!(!document.contains("PRIVATE KEY"));
+        assert!(document.contains(HASH), "the hash is what the guest needs");
     }
 
     /// A value with an apostrophe is the one that breaks naive quoting.
