@@ -201,6 +201,22 @@ mod tests {
         assert!(!vm_directory.exists());
     }
 
+    /// The key must not outlive the VM it belongs to: nothing else ever
+    /// deletes it, so deleting the directory is the whole of its lifecycle.
+    #[test]
+    fn a_removed_vm_takes_its_ssh_key_with_it() {
+        let root = temp_root("keys");
+        let vm_directory = root.0.join("vm");
+        let pair = vmlord_keys::generate("dev-linux").expect("a key pair should be generated");
+        crate::vm_key::write_key_pair(&vm_directory, &pair)
+            .expect("the key pair should be written");
+
+        remove_vm_directory(&vm_directory).expect("a VM directory with a key should be removed");
+
+        assert!(!crate::layout::ssh_key_path(&vm_directory).exists());
+        assert!(!vm_directory.exists());
+    }
+
     #[test]
     fn an_absent_vm_directory_is_already_removed() {
         let root = temp_root("absent");
