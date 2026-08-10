@@ -9,7 +9,7 @@ use eframe::egui;
 use vmlord_app::{BackendStatus, VmAction, WorkspaceApp};
 use vmlord_core::{
     AgentStatus, AppSettings, DiagnosticLevel, GpuMode, Language, LogLevel, NetworkMode,
-    VmCreateRequest, VmDeleteRequest, VmState, VmSummary, VmUpdateRequest,
+    VmCreateRequest, VmDeleteRequest, VmSource, VmState, VmSummary, VmUpdateRequest,
 };
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -47,6 +47,9 @@ struct VmlordUi {
     settings_form: Option<SettingsForm>,
 }
 
+/// The form a local installation medium needs. A medium means the system is
+/// installed by hand, so there is no user, password or SSH choice to make here;
+/// those widgets return with the cloud-image form in #65.
 struct CreateVmForm {
     name: String,
     image_path: String,
@@ -55,11 +58,6 @@ struct CreateVmForm {
     cpu_cores: u32,
     gpu_mode: GpuMode,
     network_mode: NetworkMode,
-    username: String,
-    password: String,
-    password_confirmation: String,
-    ssh_enabled: bool,
-    ssh_deploy_key: bool,
     error: Option<String>,
 }
 
@@ -157,11 +155,6 @@ impl Default for CreateVmForm {
             cpu_cores: 4,
             gpu_mode: GpuMode::Default,
             network_mode: NetworkMode::Nat,
-            username: "user".into(),
-            password: String::new(),
-            password_confirmation: String::new(),
-            ssh_enabled: false,
-            ssh_deploy_key: false,
             error: None,
         }
     }
@@ -513,37 +506,7 @@ fn render_create_vm_dialog(
                             ui.selectable_value(&mut form.network_mode, NetworkMode::None, "None");
                         });
                     ui.end_row();
-
-                    ui.label("Username");
-                    ui.add_sized([260.0, 0.0], egui::TextEdit::singleline(&mut form.username));
-                    ui.end_row();
-
-                    ui.label("Password");
-                    ui.horizontal(|ui| {
-                        ui.add_sized(
-                            [140.0, 0.0],
-                            egui::TextEdit::singleline(&mut form.password).password(true),
-                        );
-                        ui.label("Confirm");
-                        ui.add_sized(
-                            [140.0, 0.0],
-                            egui::TextEdit::singleline(&mut form.password_confirmation)
-                                .password(true),
-                        );
-                    });
-                    ui.end_row();
                 });
-
-            ui.horizontal(|ui| {
-                ui.label("Options");
-                ui.checkbox(&mut form.ssh_enabled, "SSH Server");
-                ui.add_enabled_ui(form.ssh_enabled, |ui| {
-                    ui.checkbox(&mut form.ssh_deploy_key, "Deploy SSH key");
-                });
-            });
-            if !form.ssh_enabled {
-                form.ssh_deploy_key = false;
-            }
 
             if let Some(error) = &form.error {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
@@ -844,42 +807,16 @@ fn create_vm_request(
         return Err("Disk, RAM, and CPU values must be greater than zero.".into());
     }
 
-    let username = form.username.trim();
-    if username.is_empty()
-        || username.len() > 32
-        || !username
-            .bytes()
-            .enumerate()
-            .all(|(index, byte)| match index {
-                0 => byte.is_ascii_lowercase() || byte == b'_',
-                _ => {
-                    byte.is_ascii_lowercase()
-                        || byte.is_ascii_digit()
-                        || matches!(byte, b'_' | b'-')
-                }
-            })
-    {
-        return Err("Use a valid lowercase Linux username.".into());
-    }
-    if form.password.is_empty() {
-        return Err("Password is required.".into());
-    }
-    if form.password != form.password_confirmation {
-        return Err("Passwords do not match.".into());
-    }
-
     Ok(VmCreateRequest {
         name: name.into(),
-        image_path: form.image_path.trim().into(),
+        source: VmSource::LocalMedia {
+            path: form.image_path.trim().into(),
+        },
         ram_mb: form.ram_mb,
         disk_gb: form.disk_gb,
         cpu_cores: form.cpu_cores,
         gpu_mode: form.gpu_mode,
         network_mode: form.network_mode,
-        username: username.into(),
-        password: form.password.clone(),
-        ssh_enabled: form.ssh_enabled,
-        ssh_deploy_key: form.ssh_deploy_key,
     })
 }
 

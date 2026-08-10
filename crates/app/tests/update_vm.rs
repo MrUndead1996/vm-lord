@@ -115,8 +115,7 @@ fn update_vm_accepts_a_running_vm_and_warns_that_it_needs_a_restart() {
         &[update_request()]
     );
     assert!(app.diagnostics().iter().any(|diagnostic| {
-        diagnostic.message
-            == "VM \"dev\" is running; the new configuration applies after a restart"
+        diagnostic.message == "VM \"dev\" is running; the new configuration applies after a restart"
     }));
 }
 

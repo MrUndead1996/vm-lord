@@ -193,12 +193,17 @@ impl State {
                 let target = reply_target(&packet);
                 log::info!(
                     "answering the guest at {mac:02x?} with a DHCP {:?} to {target}",
-                    DhcpPacket::parse(&reply).ok().and_then(|reply| reply.message_type)
+                    DhcpPacket::parse(&reply)
+                        .ok()
+                        .and_then(|reply| reply.message_type)
                 );
                 Some((reply, target))
             }
             Ok(None) => {
-                log::debug!("the DHCP {:?} from {mac:02x?} needs no reply", packet.message_type);
+                log::debug!(
+                    "the DHCP {:?} from {mac:02x?} needs no reply",
+                    packet.message_type
+                );
                 None
             }
             Err(error) => {
@@ -476,7 +481,9 @@ fn bind_error(error: &io::Error) -> RepositoryError {
             "VMLord was not allowed to serve DHCP on UDP port 67: {error}. \
              Run VMLord elevated and allow it through the firewall"
         )),
-        _ => RepositoryError::new(format!("the DHCP server could not bind UDP port 67: {error}")),
+        _ => RepositoryError::new(format!(
+            "the DHCP server could not bind UDP port 67: {error}"
+        )),
     }
 }
 
@@ -528,9 +535,7 @@ mod tests {
 
     use arcbox_dhcp::{DhcpMessageType, DhcpPacket};
 
-    use super::{
-        DhcpService, State, bind_error, dhcp_config, endpoint_subnet, netmask, parse_mac,
-    };
+    use super::{DhcpService, State, bind_error, dhcp_config, endpoint_subnet, netmask, parse_mac};
     use crate::{hcn_endpoint::EndpointAddress, subnet::Ipv4Subnet};
 
     /// A state serving 172.22.42.0/24, the first candidate subnet.
@@ -850,13 +855,8 @@ mod tests {
 
     #[test]
     fn a_renewing_guest_is_answered_where_it_asked_from() {
-        let packet = DhcpPacket::parse(&datagram(
-            DhcpMessageType::Request,
-            GUEST_MAC,
-            None,
-            ip(5),
-        ))
-        .expect("the test datagram should parse");
+        let packet = DhcpPacket::parse(&datagram(DhcpMessageType::Request, GUEST_MAC, None, ip(5)))
+            .expect("the test datagram should parse");
 
         assert_eq!(super::reply_target(&packet), SocketAddrV4::new(ip(5), 68));
     }
@@ -875,8 +875,8 @@ mod tests {
         let index = crate::subnet::interface_index(gateway)
             .expect("the host should carry the VMLord network");
 
-        let socket = TestSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-            .expect("an ephemeral socket should bind");
+        let socket =
+            TestSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("an ephemeral socket should bind");
         socket
             .set_broadcast(true)
             .expect("the socket should take the broadcast option");

@@ -145,9 +145,8 @@ pub(crate) fn virtual_size_bytes(path: &Path) -> Result<u64, RepositoryError> {
         .expect("GET_VIRTUAL_DISK_INFO always fits in a u32");
     // SAFETY: `handle` is the disk opened above, and both out-parameters point
     // at live locals for the duration of the call.
-    let result = unsafe {
-        GetVirtualDiskInformation(handle, &mut information_size, &mut information, None)
-    };
+    let result =
+        unsafe { GetVirtualDiskInformation(handle, &mut information_size, &mut information, None) };
     // SAFETY: `handle` came from the successful `OpenVirtualDisk` above and is
     // closed exactly once here, after its last use.
     let closed = unsafe { CloseHandle(handle) };

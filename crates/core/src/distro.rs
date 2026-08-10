@@ -70,11 +70,14 @@ impl DistroProfile {
     /// The name the image carries inside the checksum file.
     #[must_use]
     pub fn file_name(&self, release: &str) -> String {
-        self.file_name_template.replace(RELEASE_PLACEHOLDER, release)
+        self.file_name_template
+            .replace(RELEASE_PLACEHOLDER, release)
     }
 
     fn directory(&self, release: &str) -> String {
-        let directory = self.directory_template.replace(RELEASE_PLACEHOLDER, release);
+        let directory = self
+            .directory_template
+            .replace(RELEASE_PLACEHOLDER, release);
         if directory.ends_with('/') {
             directory
         } else {

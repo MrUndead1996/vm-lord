@@ -217,7 +217,8 @@ mod tests {
         let root = temp_root(label);
         let vm_directory = root.0.join("dev");
         fs::create_dir_all(vm_directory.join("disks")).expect("disks directory should be created");
-        fs::write(vm_directory.join("config.json"), b"{}").expect("configuration should be written");
+        fs::write(vm_directory.join("config.json"), b"{}")
+            .expect("configuration should be written");
         fs::write(vm_directory.join("disks").join("system.vhdx"), b"vhdx")
             .expect("system disk should be written");
 
@@ -392,7 +393,11 @@ mod tests {
             "the configuration describes a VM that no longer exists"
         );
         assert!(
-            fixture.vm_directory.join("disks").join("system.vhdx").exists(),
+            fixture
+                .vm_directory
+                .join("disks")
+                .join("system.vhdx")
+                .exists(),
             "the disks must survive when the user asked to keep them"
         );
         assert!(
@@ -472,7 +477,12 @@ mod tests {
     #[test]
     fn production_pipeline_is_available_to_the_repository() {
         let _: fn() -> VmDeletionPipeline = VmDeletionPipeline::production;
-        let _: fn(&VmDeletionPipeline, &MetadataStore, &str, &Path, bool) -> Result<(), RepositoryError> =
-            VmDeletionPipeline::delete;
+        let _: fn(
+            &VmDeletionPipeline,
+            &MetadataStore,
+            &str,
+            &Path,
+            bool,
+        ) -> Result<(), RepositoryError> = VmDeletionPipeline::delete;
     }
 }

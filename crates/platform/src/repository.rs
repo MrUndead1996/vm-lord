@@ -693,10 +693,8 @@ mod tests {
     /// A store under a directory of this test's own, removed by the test that
     /// created it. The repository tests never share one.
     fn temp_store(label: &str) -> (std::path::PathBuf, MetadataStore) {
-        let root = std::env::temp_dir().join(format!(
-            "vmlord-repository-{label}-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("vmlord-repository-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).expect("test root should be created");
         let store = MetadataStore::new(root.join("vm-mapping.json"));

@@ -19,16 +19,14 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VmCreateRequest {
     pub name: String,
-    pub image_path: String,
+    /// Where the system comes from, and -- for a cloud image -- what VMLord
+    /// promises to configure inside it.
+    pub source: VmSource,
     pub ram_mb: u32,
     pub disk_gb: u32,
     pub cpu_cores: u32,
     pub gpu_mode: GpuMode,
     pub network_mode: NetworkMode,
-    pub username: String,
-    pub password: String,
-    pub ssh_enabled: bool,
-    pub ssh_deploy_key: bool,
 }
 
 impl VmCreateRequest {
@@ -38,9 +36,7 @@ impl VmCreateRequest {
         if self.name.trim().is_empty() {
             return Err(RepositoryError::new("VM name must not be empty"));
         }
-        if self.image_path.trim().is_empty() {
-            return Err(RepositoryError::new("VM image path must not be empty"));
-        }
+        self.source.validate()?;
         if self.ram_mb == 0 {
             return Err(RepositoryError::new("VM RAM must be greater than zero"));
         }
@@ -192,21 +188,19 @@ pub trait VmRepository {
 
 #[cfg(test)]
 mod tests {
-    use super::{GpuMode, NetworkMode, VmCreateRequest};
+    use super::{GpuMode, NetworkMode, VmCreateRequest, VmSource};
 
     fn valid_request() -> VmCreateRequest {
         VmCreateRequest {
             name: "dev-linux".into(),
-            image_path: "C:\\images\\ubuntu.iso".into(),
+            source: VmSource::LocalMedia {
+                path: "C:\\images\\ubuntu.iso".into(),
+            },
             ram_mb: 2048,
             disk_gb: 20,
             cpu_cores: 2,
             gpu_mode: GpuMode::None,
             network_mode: NetworkMode::None,
-            username: "admin".into(),
-            password: "secret".into(),
-            ssh_enabled: false,
-            ssh_deploy_key: false,
         }
     }
 
@@ -227,7 +221,9 @@ mod tests {
     #[test]
     fn rejects_an_empty_image_path() {
         let request = VmCreateRequest {
-            image_path: String::new(),
+            source: VmSource::LocalMedia {
+                path: String::new(),
+            },
             ..valid_request()
         };
         assert!(
@@ -236,6 +232,38 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("image path")
+        );
+    }
+
+    #[test]
+    fn rejects_provisioning_the_source_refuses() {
+        use super::{CloudImage, Provisioning, SshAccess, distro::ubuntu};
+
+        let request = VmCreateRequest {
+            source: VmSource::CloudImage {
+                image: CloudImage {
+                    profile: ubuntu(),
+                    release: "24.04".into(),
+                },
+                provisioning: Provisioning {
+                    username: "Invalid".into(),
+                    password: None,
+                    ssh: SshAccess::Enabled { deploy_key: true },
+                    locale: "en_US.UTF-8".into(),
+                    keyboard: "us".into(),
+                    timezone: "Europe/Moscow".into(),
+                },
+            },
+            ..valid_request()
+        };
+
+        assert!(
+            request
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("user name"),
+            "the request must ask its source to validate itself"
         );
     }
 

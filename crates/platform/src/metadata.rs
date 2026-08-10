@@ -388,12 +388,13 @@ mod tests {
 
         let loaded = MetadataStore::new(&path).find_by_vm_id(vm_id).unwrap();
 
-        assert_eq!(loaded, Some(mapping(vm_id, "legacy", "vmlord-1")).map(
-            |mapping| VmComputeSystemMapping {
+        assert_eq!(
+            loaded,
+            Some(mapping(vm_id, "legacy", "vmlord-1")).map(|mapping| VmComputeSystemMapping {
                 disk_gb: 0,
                 ..mapping
-            }
-        ));
+            })
+        );
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 

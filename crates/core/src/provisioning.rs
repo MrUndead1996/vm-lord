@@ -16,7 +16,13 @@ use crate::{RepositoryError, distro::DistroProfile};
 const MAX_USERNAME_LENGTH: usize = 32;
 
 /// Where a new VM's system comes from.
+///
+/// The cloud variant is some three hundred bytes larger than the local one,
+/// which clippy would rather see boxed. It is not: one of these is built per VM
+/// creation and moved a handful of times, so the indirection would buy nothing
+/// and would stand between every caller and the fields it reads.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum VmSource {
     /// Installation media. The guest system is installed by hand, so VMLord
     /// promises nothing about the user inside it.

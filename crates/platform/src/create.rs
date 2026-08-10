@@ -8,7 +8,7 @@ use vmlord_core::{RepositoryError, VmCreateRequest};
 use crate::{
     HcsClient,
     cleanup::{self, SystemTeardown},
-    hcs_config::HcsVmConfigBuilder,
+    hcs_config::{HcsVmConfigBuilder, local_media_path},
     layout,
     metadata::{MetadataStore, VmComputeSystemMapping},
     vhd::create_dynamic_vhdx,
@@ -89,6 +89,7 @@ impl VmCreationPipeline {
         // Rejects an unsupported request (name, GPU/network mode, ...) before
         // any filesystem or HCS side effect.
         let configuration = HcsVmConfigBuilder::build(request, &system_disk_path)?;
+        let image_path = local_media_path(request)?;
 
         log::info!(
             "creating VM \"{}\" ({vm_id}) as HCS compute system \"{hcs_compute_system_id}\"",
@@ -125,23 +126,22 @@ impl VmCreationPipeline {
                 u64::from(request.disk_gb) * BYTES_PER_GIB,
             )?;
 
-            if !Path::new(&request.image_path).is_file() {
+            if !Path::new(image_path).is_file() {
                 return Err(RepositoryError::new(format!(
-                    "VM image no longer exists: {}",
-                    request.image_path
+                    "VM image no longer exists: {image_path}"
                 )));
             }
 
-            fs::write(layout::configuration_path(vm_directory), &configuration).map_err(|error| {
-                RepositoryError::new(format!("failed to write HCS configuration: {error}"))
-            })?;
+            fs::write(layout::configuration_path(vm_directory), &configuration).map_err(
+                |error| RepositoryError::new(format!("failed to write HCS configuration: {error}")),
+            )?;
 
             // Hyper-V opens VM-owned files under the VM's own security
             // principal, not the creating user's token: without this, start
             // fails with access denied even though both files exist and are
             // readable by this (elevated) process.
             (self.access_granter)(&hcs_compute_system_id, &system_disk_path)?;
-            (self.access_granter)(&hcs_compute_system_id, Path::new(&request.image_path))?;
+            (self.access_granter)(&hcs_compute_system_id, Path::new(image_path))?;
 
             (self.system_creator)(&hcs_compute_system_id, &configuration)?;
             system_created = true;
@@ -231,7 +231,7 @@ mod tests {
         },
     };
 
-    use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest};
+    use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest, VmSource};
 
     use super::VmCreationPipeline;
     use crate::MetadataStore;
@@ -284,16 +284,14 @@ mod tests {
         fs::write(&image_path, b"iso").expect("test image should be written");
         let request = VmCreateRequest {
             name: "test-vm".into(),
-            image_path: image_path.to_string_lossy().into_owned(),
+            source: VmSource::LocalMedia {
+                path: image_path.to_string_lossy().into_owned(),
+            },
             ram_mb: 512,
             disk_gb: 1,
             cpu_cores: 1,
             gpu_mode: GpuMode::None,
             network_mode: NetworkMode::None,
-            username: "admin".into(),
-            password: "secret".into(),
-            ssh_enabled: false,
-            ssh_deploy_key: false,
         };
         Fixture {
             store: MetadataStore::new(root.path().join("vm-mapping.json")),

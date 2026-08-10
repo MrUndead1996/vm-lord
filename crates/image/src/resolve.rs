@@ -3,8 +3,7 @@
 use vmlord_core::DistroProfile;
 
 use crate::{
-    checksums::parse_sha256sums, distro::validated_release, error::ResolveError,
-    http::build_agent,
+    checksums::parse_sha256sums, distro::validated_release, error::ResolveError, http::build_agent,
 };
 
 /// The largest checksum file that will be read into memory.
