@@ -7,6 +7,7 @@
 //! both produced elsewhere, so "no plaintext password in the document" is a
 //! property of the types rather than a lucky outcome checked afterwards.
 
+mod iso;
 mod meta_data;
 mod scalar;
 mod user_data;
@@ -79,6 +80,31 @@ pub fn build(request: &SeedRequest<'_>) -> Seed {
     }
 }
 
+/// The label cloud-init hunts a NoCloud seed by. Uppercase because a volume
+/// identifier is spelled in ISO9660's own alphabet, unlike the file names below.
+const VOLUME_ID: &str = "CIDATA";
+
+/// The names cloud-init opens inside the volume. Neither fits ISO9660's
+/// alphabet -- a hyphen is not a d-character at any level -- and both are
+/// written literally anyway, because that is what the guest has to see.
+const USER_DATA: &str = "user-data";
+const META_DATA: &str = "meta-data";
+
+/// Packs the seed into the ISO9660 image the VM boots with.
+///
+/// Bytes rather than a file: this crate knows no filesystem, and the VM's
+/// directory belongs to the platform layer that writes them out.
+#[must_use]
+pub fn image(seed: &Seed) -> Vec<u8> {
+    iso::build(
+        VOLUME_ID,
+        &[
+            (USER_DATA, seed.user_data.as_bytes()),
+            (META_DATA, seed.meta_data.as_bytes()),
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{SeedRequest, build};
@@ -102,5 +128,39 @@ mod tests {
 
         assert!(seed.user_data.starts_with("#cloud-config\n"));
         assert!(seed.meta_data.contains("instance-id: 'vmlord-4f1c0e5a'"));
+    }
+
+    /// The three constants cloud-init actually depends on, checked through the
+    /// public entry point: the label it searches for and the two names it opens.
+    #[test]
+    fn the_image_carries_both_documents_on_a_cidata_volume() {
+        let seed = build(&SeedRequest {
+            vm_name: "my-vm",
+            instance_id: "vmlord-4f1c0e5a",
+            username: "dev",
+            password_hash: None,
+            authorized_key: Some("ssh-ed25519 AAAA vmlord"),
+            ssh: SshAccess::Enabled { deploy_key: true },
+            locale: "en_US.UTF-8",
+            keyboard: "us",
+            timezone: "Europe/Moscow",
+            admin_group: "sudo",
+            ssh_units: &[],
+        });
+
+        let bytes = super::image(&seed);
+
+        assert_eq!(&bytes[16 * 2048 + 40..16 * 2048 + 46], b"CIDATA");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("user-data"), "the root should name user-data");
+        assert!(text.contains("meta-data"), "the root should name meta-data");
+        assert!(
+            text.contains(&seed.user_data),
+            "user-data should be stored whole"
+        );
+        assert!(
+            text.contains(&seed.meta_data),
+            "meta-data should be stored whole"
+        );
     }
 }
