@@ -716,6 +716,62 @@ version 1 image. Their guest content is a pattern the tests recompute rather tha
 store, so a disk that comes back plausible but misaligned still fails. A real
 cloud image is read by the `#[ignore]`d test behind `VMLORD_TEST_CLOUD_IMAGE`.
 
+### Importing an image into a VHDX
+
+`platform::import` writes the disk a `Qcow2Image` holds into a new VHDX of the
+size the VM will have. It lives in `platform` rather than beside the reader
+because there is no API that writes into a VHDX file: the disk is created,
+attached to the host, and written to as the `\\.\PhysicalDriveN` Windows
+presents it as. `import_image` takes any `Read`, so the reader and the importer
+never meet in the type system -- the qcow2 crate stays out of `platform`, and
+the importer is testable with a stream of bytes.
+
+That route runs the image past the volume manager, and this is where failure is
+silent. Once a disk carries a partition table the volume manager recognises, it
+may mount what it finds and take the disk exclusively, after which writes are
+accepted and never arrive: a VHDX of the right size, in the right place, a log
+full of successes, and a VM that does not boot. AppSandbox met this and left the
+note in `tools/iso-patch/ubuntu_vhdx.c:204-208`, where
+`IOCTL_DISK_UPDATE_PROPERTIES` is deliberately delayed to the end of the run.
+
+Three things answer it. Nothing in the module calls
+`IOCTL_DISK_UPDATE_PROPERTIES` at all, so the volume manager is never asked to
+look. The chunk carrying sector zero is held back and written after every other
+byte, so the disk does not look like a disk until there is nothing left to
+write -- the same defence as AppSandbox's, one step earlier. And every chunk
+written is read back off the drive and matched against a digest taken on the way
+out, because this failure is otherwise indistinguishable from success. The
+read-back is what `FILE_FLAG_NO_BUFFERING` buys beyond throughput: a cached read
+would answer out of the same memory the write went into and agree with it
+whether or not the disk ever saw it.
+
+Holes are skipped rather than written. The reader hands out zeros for every
+cluster the image never allocated, and writing them back would allocate the
+whole disk -- a 600 MB image would land as a 64 GB file, which is the whole
+point of a dynamic VHDX gone. Everything moves in 1 MiB chunks: a multiple of
+every qcow2 cluster size in use and of the 4096-byte alignment an unbuffered
+handle demands, which is a multiple of both sector sizes Hyper-V presents, so
+the disk never has to be asked which one it has. Only the last chunk of an image
+is ever short, and it is padded with zeros the disk already reads as zeros.
+
+The disk is made the size the VM will have, not the size of the image, so the
+image's backup GPT header ends up short of the end of the disk. Moving it and
+growing the filesystem is the next subtask's business.
+
+A failed import leaves nothing behind: the disk is detached and the VHDX
+removed, because a half-written disk that looks complete is the failure the
+whole module is written against.
+
+The arithmetic -- filling a chunk from a reader that serves one cluster at a
+time, recognising a hole, padding a short tail, digesting a chunk -- is tested
+on its own, and the copy is tested against an in-memory disk that can be told to
+accept writes and drop them, which is the production failure reproduced exactly.
+What cannot be tested without a host is `#[ignore]`d in
+`crates/platform/tests/import.rs`: a synthetic image with a hole in the middle,
+whose VHDX must stay far smaller than the disk it presents, and a real cloud
+image behind `VMLORD_TEST_CLOUD_IMAGE`. All of them need an elevated process,
+because `AttachVirtualDisk` fails with `ERROR_PRIVILEGE_NOT_HELD` without one.
+
 ### VM update contract
 
 The edit workflow follows these rules:
