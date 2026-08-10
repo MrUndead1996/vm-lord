@@ -1,17 +1,21 @@
 //! Transactional creation of an HCS-backed virtual machine.
 
-use std::{fs, path::Path, time::Duration};
+use std::{fs, io::Write, path::Path, time::Duration};
 
 use uuid::Uuid;
-use vmlord_core::{RepositoryError, VmCreateRequest};
+use vmlord_core::{
+    CloudImage, Provisioning, RepositoryError, SshAccess, VmCreateRequest, VmSource,
+};
 
 use crate::{
     HcsClient,
     cleanup::{self, SystemTeardown},
-    hcs_config::{HcsVmConfigBuilder, local_media_path},
+    hcs_config::{self, HcsVmConfigBuilder},
     layout,
     metadata::{MetadataStore, VmComputeSystemMapping},
+    password_hash,
     vhd::create_dynamic_vhdx,
+    vm_key,
 };
 
 const CREATE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -21,6 +25,17 @@ type VhdCreator = Box<dyn Fn(&Path, u64) -> Result<(), RepositoryError>>;
 type AccessGranter = Box<dyn Fn(&str, &Path) -> Result<(), RepositoryError>>;
 type SystemCreator = Box<dyn Fn(&str, &str) -> Result<(), RepositoryError>>;
 
+/// Makes the VM's system disk out of a cloud image: fetch the image the release
+/// means, then write it into a VHDX at the given path, sized for the VM rather
+/// than for the image.
+///
+/// Injected rather than called directly because the fetching half is not
+/// Windows's business: it lives in `vmlord-image`, which knows no Windows API,
+/// and the composition root joins the two. The pipeline keeps the half that is
+/// Windows -- writing into a VHDX through the disk it is attached as.
+pub type CloudDiskImporter =
+    Box<dyn Fn(&CloudImage, u64, &Path) -> Result<(), RepositoryError>>;
+
 /// Orchestrates the multi-step, transactional creation of an HCS-backed VM.
 ///
 /// Every step after the VM directory is created is wrapped so that any
@@ -28,17 +43,23 @@ type SystemCreator = Box<dyn Fn(&str, &str) -> Result<(), RepositoryError>>;
 /// VM directory is removed.
 pub struct VmCreationPipeline {
     vhd_creator: VhdCreator,
+    cloud_disk: CloudDiskImporter,
     access_granter: AccessGranter,
     system_creator: SystemCreator,
     system_teardown: SystemTeardown,
 }
 
 impl VmCreationPipeline {
-    /// Creates a pipeline backed by the real VHDX and HCS APIs.
+    /// Creates a pipeline backed by the real VHDX and HCS APIs, importing cloud
+    /// images through `cloud_disk`.
+    ///
+    /// The importer is required rather than optional: a pipeline that silently
+    /// cannot build a VM from a cloud image is a state better left unspellable.
     #[must_use]
-    pub fn production() -> Self {
+    pub fn production(cloud_disk: CloudDiskImporter) -> Self {
         Self {
             vhd_creator: Box::new(create_dynamic_vhdx),
+            cloud_disk,
             access_granter: Box::new(grant_vm_access),
             system_creator: Box::new(create_hcs_system),
             system_teardown: Box::new(cleanup::teardown_compute_system),
@@ -48,12 +69,14 @@ impl VmCreationPipeline {
     #[cfg(test)]
     fn for_test(
         vhd_creator: impl Fn(&Path, u64) -> Result<(), RepositoryError> + 'static,
+        cloud_disk: impl Fn(&CloudImage, u64, &Path) -> Result<(), RepositoryError> + 'static,
         access_granter: impl Fn(&str, &Path) -> Result<(), RepositoryError> + 'static,
         system_creator: impl Fn(&str, &str) -> Result<(), RepositoryError> + 'static,
         system_teardown: impl Fn(&str) -> Result<(), RepositoryError> + 'static,
     ) -> Self {
         Self {
             vhd_creator: Box::new(vhd_creator),
+            cloud_disk: Box::new(cloud_disk),
             access_granter: Box::new(access_granter),
             system_creator: Box::new(system_creator),
             system_teardown: Box::new(system_teardown),
@@ -86,10 +109,11 @@ impl VmCreationPipeline {
         let vm_id = Uuid::new_v4();
         let hcs_compute_system_id = format!("vmlord-{}", vm_id.as_simple());
         let system_disk_path = layout::system_disk_path(vm_directory);
+        let seed_path = layout::seed_path(vm_directory);
         // Rejects an unsupported request (name, GPU/network mode, ...) before
         // any filesystem or HCS side effect.
-        let configuration = HcsVmConfigBuilder::build(request, &system_disk_path)?;
-        let image_path = local_media_path(request)?;
+        let configuration = HcsVmConfigBuilder::build(request, &system_disk_path, &seed_path)?;
+        let media_path = hcs_config::media_path(request, &seed_path).to_path_buf();
 
         log::info!(
             "creating VM \"{}\" ({vm_id}) as HCS compute system \"{hcs_compute_system_id}\"",
@@ -120,16 +144,40 @@ impl VmCreationPipeline {
         };
 
         let mut system_created = false;
+        // The disk is made the size the VM asked for, whichever way it is
+        // filled: an empty VHDX and an imported image agree on this much.
+        let disk_size_bytes = u64::from(request.disk_gb) * BYTES_PER_GIB;
         let result = (|| {
-            (self.vhd_creator)(
-                &system_disk_path,
-                u64::from(request.disk_gb) * BYTES_PER_GIB,
-            )?;
-
-            if !Path::new(image_path).is_file() {
-                return Err(RepositoryError::new(format!(
-                    "VM image no longer exists: {image_path}"
-                )));
+            match &request.source {
+                VmSource::LocalMedia { .. } => {
+                    (self.vhd_creator)(&system_disk_path, disk_size_bytes)?;
+                    if !media_path.is_file() {
+                        return Err(RepositoryError::new(format!(
+                            "VM image no longer exists: {}",
+                            media_path.display()
+                        )));
+                    }
+                }
+                VmSource::CloudImage {
+                    image,
+                    provisioning,
+                } => {
+                    log::debug!(
+                        "importing {} {} into {}",
+                        image.profile.name,
+                        image.release,
+                        system_disk_path.display()
+                    );
+                    (self.cloud_disk)(image, disk_size_bytes, &system_disk_path)?;
+                    write_provisioning(
+                        vm_directory,
+                        &seed_path,
+                        &request.name,
+                        &hcs_compute_system_id,
+                        image,
+                        provisioning,
+                    )?;
+                }
             }
 
             fs::write(layout::configuration_path(vm_directory), &configuration).map_err(
@@ -141,7 +189,7 @@ impl VmCreationPipeline {
             // fails with access denied even though both files exist and are
             // readable by this (elevated) process.
             (self.access_granter)(&hcs_compute_system_id, &system_disk_path)?;
-            (self.access_granter)(&hcs_compute_system_id, Path::new(image_path))?;
+            (self.access_granter)(&hcs_compute_system_id, &media_path)?;
 
             (self.system_creator)(&hcs_compute_system_id, &configuration)?;
             system_created = true;
@@ -184,12 +232,6 @@ impl VmCreationPipeline {
     }
 }
 
-impl Default for VmCreationPipeline {
-    fn default() -> Self {
-        Self::production()
-    }
-}
-
 fn grant_vm_access(id: &str, path: &Path) -> Result<(), RepositoryError> {
     HcsClient::new().grant_vm_access(id, path)
 }
@@ -220,6 +262,83 @@ fn create_hcs_system(id: &str, configuration: &str) -> Result<(), RepositoryErro
     }
 }
 
+/// Writes everything the guest's first boot reads: the VM's key pair, and the
+/// seed volume carrying the cloud-config documents.
+///
+/// The password is hashed here rather than carried further: what reaches
+/// `vmlord-seed` -- and through it the volume that stays attached to a running
+/// VM -- is a `$6$` entry, never the plaintext.
+fn write_provisioning(
+    vm_directory: &Path,
+    seed_path: &Path,
+    vm_name: &str,
+    instance_id: &str,
+    image: &CloudImage,
+    provisioning: &Provisioning,
+) -> Result<(), RepositoryError> {
+    let authorized_key = match provisioning.ssh {
+        SshAccess::Enabled { deploy_key: true } => {
+            let pair = vmlord_keys::generate(vm_name)?;
+            vm_key::write_key_pair(vm_directory, &pair)?;
+            Some(pair.public_openssh().to_owned())
+        }
+        _ => None,
+    };
+
+    let password_hash = provisioning
+        .password
+        .as_ref()
+        .map(password_hash::hash_password)
+        .transpose()?;
+
+    let seed = vmlord_seed::build(&vmlord_seed::SeedRequest {
+        vm_name,
+        instance_id,
+        username: &provisioning.username,
+        password_hash: password_hash.as_deref(),
+        authorized_key: authorized_key.as_deref(),
+        ssh: provisioning.ssh,
+        locale: &provisioning.locale,
+        keyboard: &provisioning.keyboard,
+        timezone: &provisioning.timezone,
+        admin_group: &image.profile.admin_group,
+        ssh_units: &image.profile.ssh_units,
+    });
+
+    write_seed(seed_path, &vmlord_seed::image(&seed))?;
+    log::debug!("wrote the cloud-init seed at {}", seed_path.display());
+    Ok(())
+}
+
+/// Writes the seed volume under the same DACL the private key gets.
+///
+/// The volume carries the password's SHA-512-crypt entry, so it is as much a
+/// secret on disk as the key is, and the storage root is a path the owner
+/// chooses -- point it somewhere with an inherited `Users:(R)` and the hash is
+/// readable by every local account. The ordering is `vm_key`'s: create the
+/// file empty, narrow it, and only then write, so that the bytes never exist
+/// under permissions wider than the ones they end up with.
+///
+/// The DACL is protected, which severs what the parent hands down but not what
+/// is added explicitly afterwards -- `HcsGrantVmAccess` still puts the VM's own
+/// SID on the file, which is why it can go on reading its seed.
+fn write_seed(seed_path: &Path, bytes: &[u8]) -> Result<(), RepositoryError> {
+    let mut file = fs::File::create(seed_path).map_err(|error| seed_failure(seed_path, &error))?;
+    vm_key::restrict_to_owner(seed_path)?;
+    file.write_all(bytes)
+        .and_then(|()| file.flush())
+        .map_err(|error| seed_failure(seed_path, &error))
+}
+
+fn seed_failure(seed_path: &Path, error: &std::io::Error) -> RepositoryError {
+    let error = RepositoryError::new(format!(
+        "failed to write the cloud-init seed at {}: {error}",
+        seed_path.display()
+    ));
+    log::error!("{error}");
+    error
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -231,7 +350,10 @@ mod tests {
         },
     };
 
-    use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest, VmSource};
+    use vmlord_core::{
+        CloudImage, GpuMode, NetworkMode, Password, Provisioning, SshAccess, VmCreateRequest,
+        VmSource,
+    };
 
     use super::VmCreationPipeline;
     use crate::MetadataStore;
@@ -264,6 +386,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct Calls {
         vhd: Arc<Mutex<Vec<(PathBuf, u64)>>>,
+        cloud: Arc<Mutex<Vec<(String, u64, PathBuf)>>>,
         grant: Arc<Mutex<Vec<(String, PathBuf)>>>,
         create: Arc<Mutex<Vec<(String, String)>>>,
         teardown: Arc<Mutex<Vec<String>>>,
@@ -303,7 +426,12 @@ mod tests {
         }
     }
 
-    fn pipeline(calls: &Calls, fail_vhd: bool, fail_create: bool) -> VmCreationPipeline {
+    fn pipeline(
+        calls: &Calls,
+        fail_vhd: bool,
+        fail_cloud: bool,
+        fail_create: bool,
+    ) -> VmCreationPipeline {
         VmCreationPipeline::for_test(
             {
                 let calls = calls.clone();
@@ -314,6 +442,24 @@ mod tests {
                     }
                     fs::write(path, b"vhdx")
                         .map_err(|error| vmlord_core::RepositoryError::new(format!("vhd: {error}")))
+                }
+            },
+            {
+                let calls = calls.clone();
+                move |image: &vmlord_core::CloudImage, size, path: &std::path::Path| {
+                    calls.cloud.lock().unwrap().push((
+                        image.release.clone(),
+                        size,
+                        path.to_path_buf(),
+                    ));
+                    if fail_cloud {
+                        return Err(vmlord_core::RepositoryError::new(
+                            "injected cloud image failure",
+                        ));
+                    }
+                    fs::write(path, b"imported vhdx").map_err(|error| {
+                        vmlord_core::RepositoryError::new(format!("import: {error}"))
+                    })
                 }
             },
             {
@@ -358,10 +504,24 @@ mod tests {
     }
 
     #[test]
+    fn a_local_media_vm_never_reaches_the_cloud_image_importer() {
+        let fixture = fixture("no-cloud");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+
+        pipeline
+            .create(&fixture.store, &fixture.request, &fixture.vm_directory)
+            .expect("creation should succeed");
+
+        assert!(calls.cloud.lock().unwrap().is_empty());
+        assert_eq!(calls.vhd.lock().unwrap().len(), 1);
+    }
+
+    #[test]
     fn creates_and_registers_a_vm_through_all_stages() {
         let fixture = fixture("happy");
         let calls = fixture.calls.clone();
-        let pipeline = pipeline(&calls, false, false);
+        let pipeline = pipeline(&calls, false, false, false);
 
         let mapping = pipeline
             .create(&fixture.store, &fixture.request, &fixture.vm_directory)
@@ -424,7 +584,7 @@ mod tests {
     fn rejects_a_duplicate_vm_name_before_any_side_effect() {
         let fixture = fixture("duplicate");
         let calls = fixture.calls.clone();
-        let pipeline = pipeline(&calls, false, false);
+        let pipeline = pipeline(&calls, false, false, false);
         pipeline
             .create(&fixture.store, &fixture.request, &fixture.vm_directory)
             .expect("the first creation should succeed");
@@ -445,7 +605,7 @@ mod tests {
         let fixture = fixture("existing-dir");
         let calls = fixture.calls.clone();
         fs::create_dir_all(&fixture.vm_directory).unwrap();
-        let pipeline = pipeline(&calls, false, false);
+        let pipeline = pipeline(&calls, false, false, false);
 
         let error = pipeline
             .create(&fixture.store, &fixture.request, &fixture.vm_directory)
@@ -459,7 +619,7 @@ mod tests {
     fn a_disk_creation_failure_removes_the_vm_directory_without_hcs() {
         let fixture = fixture("disk-failure");
         let calls = fixture.calls.clone();
-        let pipeline = pipeline(&calls, true, false);
+        let pipeline = pipeline(&calls, true, false, false);
 
         let error = pipeline
             .create(&fixture.store, &fixture.request, &fixture.vm_directory)
@@ -476,7 +636,7 @@ mod tests {
     fn a_missing_image_at_create_time_aborts_before_hcs() {
         let fixture = fixture("image-gone");
         let calls = fixture.calls.clone();
-        let pipeline = pipeline(&calls, false, false);
+        let pipeline = pipeline(&calls, false, false, false);
         fs::remove_file(&fixture.image_path).unwrap();
 
         let error = pipeline
@@ -492,7 +652,7 @@ mod tests {
     fn an_hcs_create_failure_tears_down_the_ambiguous_system() {
         let fixture = fixture("create-failure");
         let calls = fixture.calls.clone();
-        let pipeline = pipeline(&calls, false, true);
+        let pipeline = pipeline(&calls, false, false, true);
 
         let error = pipeline
             .create(&fixture.store, &fixture.request, &fixture.vm_directory)
@@ -524,7 +684,7 @@ mod tests {
         let blocked_parent = fixture.vm_directory.with_file_name("blocked");
         fs::write(&blocked_parent, b"file").unwrap();
         let blocked_store = MetadataStore::new(blocked_parent.join("vm-mapping.json"));
-        let pipeline = pipeline(&calls, false, false);
+        let pipeline = pipeline(&calls, false, false, false);
 
         let error = pipeline
             .create(&blocked_store, &fixture.request, &fixture.vm_directory)
@@ -544,10 +704,282 @@ mod tests {
     fn rollback_never_touches_the_source_image() {
         let fixture = fixture("image-safe");
         let calls = fixture.calls.clone();
-        let pipeline = pipeline(&calls, true, false);
+        let pipeline = pipeline(&calls, true, false, false);
 
         let _ = pipeline.create(&fixture.store, &fixture.request, &fixture.vm_directory);
 
         assert_eq!(fs::read(&fixture.image_path).unwrap(), b"iso");
+    }
+
+    fn cloud_request(name: &str) -> VmCreateRequest {
+        VmCreateRequest {
+            name: name.into(),
+            source: VmSource::CloudImage {
+                image: CloudImage {
+                    profile: vmlord_core::ubuntu(),
+                    release: "24.04".into(),
+                },
+                provisioning: Provisioning {
+                    username: "dev".into(),
+                    password: Some(Password::new("secret")),
+                    ssh: SshAccess::Enabled { deploy_key: true },
+                    locale: "en_US.UTF-8".into(),
+                    keyboard: "us".into(),
+                    timezone: "Europe/Moscow".into(),
+                },
+            },
+            ram_mb: 512,
+            disk_gb: 1,
+            cpu_cores: 1,
+            gpu_mode: GpuMode::None,
+            network_mode: NetworkMode::None,
+        }
+    }
+
+    /// The bytes of the seed volume the pipeline wrote.
+    fn seed_bytes(vm_directory: &std::path::Path) -> String {
+        String::from_utf8_lossy(&fs::read(vm_directory.join("seed.iso")).unwrap()).into_owned()
+    }
+
+    #[test]
+    fn a_cloud_vm_gets_an_imported_disk_a_key_pair_and_a_seed() {
+        let fixture = fixture("cloud-happy");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+        let request = cloud_request("cloud-vm");
+
+        let mapping = pipeline
+            .create(&fixture.store, &request, &fixture.vm_directory)
+            .expect("creation should succeed");
+
+        // The disk comes from the importer, not from an empty VHDX.
+        assert!(calls.vhd.lock().unwrap().is_empty());
+        assert_eq!(
+            calls.cloud.lock().unwrap().as_slice(),
+            &[(
+                "24.04".to_owned(),
+                1024 * 1024 * 1024,
+                fixture.vm_directory.join("disks").join("system.vhdx")
+            )]
+        );
+
+        assert!(fixture.vm_directory.join("seed.iso").is_file());
+        assert!(
+            fixture
+                .vm_directory
+                .join("keys")
+                .join("id_ed25519")
+                .is_file()
+        );
+        let public_key =
+            fs::read_to_string(fixture.vm_directory.join("keys").join("id_ed25519.pub")).unwrap();
+
+        // What the guest is told is in the seed, and only there.
+        let seed = seed_bytes(&fixture.vm_directory);
+        assert!(seed.contains("$6$"), "the seed carries the password hash");
+        assert!(
+            !seed.contains("secret"),
+            "and the hash instead of the password, not beside it"
+        );
+        assert!(seed.contains(public_key.trim_end()), "and the public key");
+        // The whole case for leaving the seed attached rests on this id being
+        // the compute system's own, so that it never changes across boots.
+        assert!(seed.contains(&format!(
+            "instance-id: '{}'",
+            mapping.hcs_compute_system_id
+        )));
+
+        let stored = fs::read_to_string(fixture.vm_directory.join("config.json")).unwrap();
+        let create_calls = calls.create.lock().unwrap();
+        for document in [&create_calls[0].1, &stored] {
+            assert!(!document.contains("secret"), "got {document}");
+            assert!(!document.contains("$6$"), "got {document}");
+        }
+        drop(create_calls);
+
+        // The VM must be able to open the seed, exactly as it opens its disk.
+        assert_eq!(
+            calls.grant.lock().unwrap().as_slice(),
+            &[
+                (
+                    mapping.hcs_compute_system_id.clone(),
+                    fixture.vm_directory.join("disks").join("system.vhdx")
+                ),
+                (
+                    mapping.hcs_compute_system_id.clone(),
+                    fixture.vm_directory.join("seed.iso")
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_key_only_cloud_vm_leaves_no_password_hash_anywhere() {
+        let fixture = fixture("cloud-key-only");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+        let request = VmCreateRequest {
+            source: VmSource::CloudImage {
+                image: CloudImage {
+                    profile: vmlord_core::ubuntu(),
+                    release: "24.04".into(),
+                },
+                provisioning: Provisioning {
+                    username: "dev".into(),
+                    password: None,
+                    ssh: SshAccess::Enabled { deploy_key: true },
+                    locale: "en_US.UTF-8".into(),
+                    keyboard: "us".into(),
+                    timezone: "Europe/Moscow".into(),
+                },
+            },
+            ..cloud_request("cloud-key-only-vm")
+        };
+
+        pipeline
+            .create(&fixture.store, &request, &fixture.vm_directory)
+            .expect("a key-only login is a valid VM");
+
+        assert!(!seed_bytes(&fixture.vm_directory).contains("$6$"));
+    }
+
+    #[test]
+    fn a_cloud_vm_without_ssh_gets_no_key_pair() {
+        let fixture = fixture("cloud-no-ssh");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+        let request = VmCreateRequest {
+            source: VmSource::CloudImage {
+                image: CloudImage {
+                    profile: vmlord_core::ubuntu(),
+                    release: "24.04".into(),
+                },
+                provisioning: Provisioning {
+                    username: "dev".into(),
+                    password: Some(Password::new("secret")),
+                    ssh: SshAccess::Disabled,
+                    locale: "en_US.UTF-8".into(),
+                    keyboard: "us".into(),
+                    timezone: "Europe/Moscow".into(),
+                },
+            },
+            ..cloud_request("cloud-no-ssh-vm")
+        };
+
+        pipeline
+            .create(&fixture.store, &request, &fixture.vm_directory)
+            .expect("a password-only VM is a valid VM");
+
+        assert!(!fixture.vm_directory.join("keys").exists());
+        assert!(fixture.vm_directory.join("seed.iso").is_file());
+    }
+
+    /// The seed carries the password's hash, so it is a secret on disk in the
+    /// same sense the private key is, and it is written under the same DACL.
+    /// The storage root is the owner's to choose; one with an inherited
+    /// `Users:(R)` would otherwise hand the hash to every local account.
+    #[test]
+    fn the_seed_is_written_with_the_same_restricted_dacl_as_the_key() {
+        let fixture = fixture("cloud-seed-dacl");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+
+        pipeline
+            .create(
+                &fixture.store,
+                &cloud_request("cloud-dacl-vm"),
+                &fixture.vm_directory,
+            )
+            .expect("creation should succeed");
+
+        let descriptor = crate::vm_key::security_descriptor(&fixture.vm_directory.join("seed.iso"))
+            .expect("the DACL should be read back");
+        assert!(descriptor.contains("D:P"), "{descriptor}");
+        assert!(
+            !descriptor.contains(";ID;"),
+            "nothing may be inherited from the storage root: {descriptor}"
+        );
+        assert_eq!(
+            descriptor.matches("(A;;FA;;;").count(),
+            3,
+            "SYSTEM, Administrators and the owner, and nobody else: {descriptor}"
+        );
+    }
+
+    /// SSH being on is not the same question as whether we deploy a key for
+    /// it: a VM the owner reaches with their own key asks for one and not the
+    /// other, and generating a key pair nobody asked for would put a private
+    /// key on disk and an unrequested login into the guest.
+    #[test]
+    fn a_cloud_vm_that_did_not_ask_for_a_key_gets_none() {
+        let fixture = fixture("cloud-no-deploy-key");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+        let request = VmCreateRequest {
+            source: VmSource::CloudImage {
+                image: CloudImage {
+                    profile: vmlord_core::ubuntu(),
+                    release: "24.04".into(),
+                },
+                provisioning: Provisioning {
+                    username: "dev".into(),
+                    password: Some(Password::new("secret")),
+                    ssh: SshAccess::Enabled { deploy_key: false },
+                    locale: "en_US.UTF-8".into(),
+                    keyboard: "us".into(),
+                    timezone: "Europe/Moscow".into(),
+                },
+            },
+            ..cloud_request("cloud-no-deploy-key-vm")
+        };
+
+        pipeline
+            .create(&fixture.store, &request, &fixture.vm_directory)
+            .expect("SSH without a deployed key is a valid VM");
+
+        assert!(!fixture.vm_directory.join("keys").exists());
+        let seed = seed_bytes(&fixture.vm_directory);
+        assert!(!seed.contains("ssh_authorized_keys"), "got {seed}");
+    }
+
+    #[test]
+    fn a_failed_import_takes_the_vm_directory_with_it() {
+        let fixture = fixture("cloud-import-failure");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, true, false);
+
+        let error = pipeline
+            .create(
+                &fixture.store,
+                &cloud_request("cloud-doomed"),
+                &fixture.vm_directory,
+            )
+            .expect_err("an import failure must abort creation");
+
+        assert!(error.to_string().contains("injected cloud image failure"));
+        assert!(!fixture.vm_directory.exists());
+        assert!(calls.create.lock().unwrap().is_empty());
+        assert!(fixture.store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_hcs_create_takes_the_seed_and_the_keys_with_it() {
+        let fixture = fixture("cloud-create-failure");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, true);
+
+        let error = pipeline
+            .create(
+                &fixture.store,
+                &cloud_request("cloud-rollback"),
+                &fixture.vm_directory,
+            )
+            .expect_err("an HCS create failure must abort creation");
+
+        assert!(error.to_string().contains("timed out"));
+        // The whole directory goes, seed and private key included: nothing is
+        // left of a VM that does not exist.
+        assert!(!fixture.vm_directory.exists());
+        assert!(fixture.store.list().unwrap().is_empty());
     }
 }

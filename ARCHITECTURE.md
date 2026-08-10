@@ -181,6 +181,7 @@ vmlord (composition root)
   -> core (safe domain models)
   -> platform (native HCS backend, default)
   -> seed (the NoCloud documents cloud-init reads)
+  -> image (release resolution, download, qcow2)
   -> legacy-backend (dynamic C FFI, transitional fallback)
   -> appsandbox_core.dll
 ```
@@ -191,10 +192,19 @@ It dynamically loads the prebuilt `appsandbox_core.dll` placed next to
 `vmlord.exe`; no C types cross into `core`, `app`, or `ui`.
 
 `platform` is the Windows-native foundation for the incremental replacement.
-It depends only on `core`, never on `app` or `ui`, and contains all direct
-`windows-rs` calls. It owns HCS/HCN handles and Windows events through safe
-RAII wrappers, and converts Windows failures to `RepositoryError` values that
-include the operation, VM name when applicable, and HRESULT.
+It depends on `core`, `keys` and `seed` -- all three portable and free of I/O,
+so nothing about needing them changes what `platform`'s own tests require --
+never on `app` or `ui`, and contains all direct `windows-rs` calls. It owns
+HCS/HCN handles and Windows events through safe RAII wrappers, and converts
+Windows failures to `RepositoryError` values that include the operation, VM
+name when applicable, and HRESULT. It deliberately does not depend on `image`
+at build time: `image` is where the network lives (`ureq`, TLS, HTTP), and
+pulling it into the crate that already holds every `unsafe` HCS call and every
+raw handle would be one more thing to hold in mind while reading `platform`,
+for the sake of a single call. `image` stays a dev-dependency there instead,
+used only by the `#[ignore]`d tests that exercise a real cloud image;
+the composition root is where the two halves meet in production, described in
+"Creating a VM from a cloud image" below.
 
 Windows-only HCS integration tests are intentionally ignored by default. They
 require Hyper-V, the Host Compute Service, and a disposable existing HCS VM ID
@@ -876,7 +886,8 @@ cloud-init reads on the first boot. It depends on `core` alone: no Windows API,
 no filesystem, no network, so its tests run on any host. `build(&SeedRequest)
 -> Seed` is infallible -- values arrive validated, and quoting handles the rest.
 So is `image(&Seed)` below it: the crate does no I/O at all, so the first
-failure any of this can produce belongs to #61, where the image meets a disk.
+failure any of this can produce belongs to the creation pipeline, where the
+volume meets a disk -- "Creating a VM from a cloud image" below.
 
 `SeedRequest` is flat rather than a borrowed `Provisioning`, and it deliberately
 has no field for a plaintext password: what reaches the crate is the `$6$` hash
@@ -930,21 +941,108 @@ specified" form and directory records carry zeros, which keeps the image
 reproducible and the crate free of calendar arithmetic `std` does not have.
 
 The image is returned as bytes rather than written to a file, so `crates/seed`
-still knows no filesystem; #61 writes it into the VM's directory and attaches
-it. The root directory grows by whole sectors as records need them, which is
-what lets the same transport carry a guest agent later without touching the
-writer.
+still knows no filesystem; `platform::create` writes them into the VM's
+directory as `seed.iso` and attaches it. The root directory grows by whole
+sectors as records need them, which is what lets the same transport carry a
+guest agent later without touching the writer.
 
 One limitation, stated rather than forgotten: `/etc/default/keyboard` is
 Debian-family. Fedora keeps the setting in `/etc/vconsole.conf` under different
 keys, which is a different mechanism rather than a different value; every other
 key in the document is a cloud-init module that works anywhere.
 
-The native backend refuses `CloudImage` with a message naming #61, the task
-that will build a VM from one. The legacy AppSandbox backend is given empty
-credentials for `LocalMedia`: its own model was "media plus unattended
-answers", which the domain no longer spells. That is a deliberate loss on a
-transitional path -- #66 removes the iso-patch dependency it belongs to.
+The native backend builds a VM from a `CloudImage`; the legacy AppSandbox
+backend refuses one outright and is given empty credentials for `LocalMedia`:
+its own model was "media plus unattended answers", which the domain no longer
+spells. That is a deliberate loss on a transitional path -- #66 removes the
+iso-patch dependency it belongs to.
+
+### Creating a VM from a cloud image
+
+`VmCreationPipeline::create` is one transaction with a fixed order, and the
+order is what makes it one. Everything that can refuse the request refuses it
+before a single side effect: `VmCreateRequest::validate`, the duplicate-name
+check against the metadata store, the "directory already exists" check, and
+`HcsVmConfigBuilder::build`, which is called this early precisely because it is
+where an unsupported GPU or network mode is rejected. The VM's id and its HCS
+compute-system id (`vmlord-` followed by the id's 32 hex digits, undashed) are
+minted just before the document is built, since neither leaves a trace on disk;
+only then does the VM get a directory.
+
+Inside the directory the cloud branch does two things the local-media branch
+does not. `CloudDiskImporter` turns the release into the system disk -- the
+VHDX is not created empty and then filled, it arrives already carrying the
+image, sized for the VM rather than for the image. Then `write_provisioning`
+writes what the first boot reads: the SSH key pair, when `deploy_key` asked for
+one; the `$6$` hash of the password, made here so that nothing further down ever
+holds the plaintext; and the seed volume built from both. After that the branches
+converge: `config.json` is written, the VM is granted access to its disk and to
+its medium, the compute system is created, and the mapping is inserted last, so
+a VM is known to VMLord only once it exists in HCS.
+
+The configuration has two SCSI attachments, not three: slot 0 is the system
+VHDX, slot 1 is an ISO -- the installer for local media, `seed.iso` for a cloud
+image. `hcs_config::media_path` is the single place that decides which, and it
+is asked twice, once by the configuration and once by the pipeline granting
+access to the same file, so the two can never name different paths. A third
+attachment would exist only to keep an empty slot for the source that does not
+use it, and every VM would then carry a device that is a hole in one of the two
+cases.
+
+`seed.iso` lives at `<vm>/seed.iso`, beside `config.json` rather than under
+`disks/`. It is a configuration medium, not a disk: `disks/` is what a person
+means when they ask VMLord to delete a VM but keep its disks, and a seed left in
+there would be either deleted with the disks it provisioned or kept as something
+that looks like one. Deleting a VM without its disks removes `config.json`
+alone, so the seed stays with the disk it belongs to.
+
+The seed carries the password's SHA-512-crypt entry, which makes it the second
+secret VMLord keeps in a file, and it is written the way the first one is:
+`vm_key::restrict_to_owner` narrows it to SYSTEM, Administrators and the owner,
+and the file is created empty and narrowed before the bytes go in, so they never
+sit under permissions wider than the ones they end up with. The storage root is
+the owner's to choose, and one carrying an inherited `Users:(R)` would otherwise
+hand the hash to every account on the machine -- while the private key beside it
+was locked down. The DACL is protected, which cuts off what the parent hands
+down but not what is added explicitly afterwards, so `HcsGrantVmAccess` still
+puts the VM's own SID on the file and the VM goes on reading its seed.
+
+Rollback needs to know none of this. Any failure after the directory exists
+tears down the compute system if one was created and then calls
+`cleanup::remove_vm_directory` on the whole directory -- disk, seed and private
+key together. Nothing enumerates the files a half-built VM might have left, so
+adding a file to the VM's directory later cannot leave one behind.
+
+`CloudDiskImporter` is `Fn(&CloudImage, u64, &Path) -> Result<(),
+RepositoryError>`, injected rather than called. It is the layering boundary in
+executable form: fetching the image is HTTPS, TLS and qcow2, which know nothing
+of Windows and live in `vmlord-image`; writing it into a VHDX has no API and
+must go through an attached `\\.\PhysicalDriveN`, which is `vmlord-platform`'s
+business and nobody else's. The composition root joins the halves in
+`vmlord::cloud_disk_importer`, which is what keeps the network out of the crate
+that holds every `unsafe` HCS call. The importer is required by
+`VmCreationPipeline::production` rather than optional, because a pipeline that
+silently cannot build a cloud VM is a state better left unspellable; and because
+it is a closure, the pipeline's own tests exercise every rollback path without a
+network or a Hyper-V host.
+
+The seed stays attached for the life of the VM rather than being ejected after
+the first boot. This is safe because `meta-data` carries an `instance-id`
+derived from the compute-system id, which never changes: cloud-init re-reads the
+volume on every boot, recognises the instance it has already provisioned, and
+skips the per-instance modules -- the user, the key, the password -- rather than
+re-running them. Ejecting would mean rewriting the configuration document and
+recreating the compute system on a schedule nobody owns, for no gain the guest
+can observe.
+
+What is deliberately absent is everything about time. The import is synchronous:
+`create_vm` runs on the calling thread, so a download of several hundred
+megabytes happens with the UI waiting on it. It is also silent -- the composition
+root hands `open_cloud_image` a default `ProgressPublisher` nobody reads and an
+`AtomicBool` nobody sets, which are the exact parameters #64 will fill in without
+changing a signature. There is no background thread, no `Building` state and no
+progress reporting until then; the seam for all three already exists, and this
+task deliberately stops short of using it.
 
 ---
 

@@ -1,7 +1,9 @@
 #[cfg(not(windows))]
 compile_error!("VMLord currently supports Windows only");
 
-use vmlord_core::{AppSettings, VmRepository};
+use std::{path::PathBuf, sync::atomic::AtomicBool};
+
+use vmlord_core::{AppSettings, ProgressPublisher, VmRepository};
 
 /// Selects the backend the composition root wires in.
 ///
@@ -54,6 +56,7 @@ fn load_backend(settings: &AppSettings) -> Box<dyn VmRepository> {
         );
         return Box::new(vmlord_platform::HcsVmRepository::new(
             settings.vm_storage_path.clone(),
+            cloud_disk_importer(settings.image_cache_path.clone()),
         ));
     }
 
@@ -65,6 +68,30 @@ fn load_backend(settings: &AppSettings) -> Box<dyn VmRepository> {
             vmlord_app::unavailable_repository(error.to_string())
         }
     }
+}
+
+/// Joins the two halves of getting a cloud image onto a VM's disk: fetching it,
+/// which knows nothing of Windows and lives in `vmlord-image`, and writing it
+/// into a VHDX, which is `vmlord-platform`'s business.
+///
+/// The composition root is where they meet, which is what keeps the network out
+/// of the Windows layer.
+///
+/// Progress and cancellation are stubbed here: creation still runs in the
+/// calling thread, so there is nobody to read a publisher and nobody to set a
+/// flag. #64 moves creation onto a worker thread and hands in the real ones.
+fn cloud_disk_importer(cache_directory: PathBuf) -> vmlord_platform::CloudDiskImporter {
+    Box::new(move |image, disk_size_bytes, target| {
+        let mut source = vmlord_image::open_cloud_image(
+            &image.profile,
+            &image.release,
+            &cache_directory,
+            disk_size_bytes,
+            &ProgressPublisher::default(),
+            &AtomicBool::new(false),
+        )?;
+        vmlord_platform::import_image(&mut source, target, disk_size_bytes).map(|_summary| ())
+    })
 }
 
 /// Reports whether the transitional legacy backend was asked for.

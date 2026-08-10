@@ -53,7 +53,8 @@ impl TestServer {
         // shutdown protocol into a fixture.
         thread::spawn(move || {
             while let Ok((stream, _)) = listener.accept() {
-                let range = answer(stream, &body, behaviour);
+                let range = read_range_header(&stream);
+                answer(stream, range.as_deref(), &body, behaviour);
                 recorded.lock().unwrap().push(range);
             }
         });
@@ -81,12 +82,55 @@ impl TestServer {
     pub fn ranges_seen(&self) -> Vec<Option<String>> {
         self.ranges.lock().unwrap().clone()
     }
+
+    /// Serves a directory: each request is answered with the file whose name it
+    /// asks for, and with 404 when there is no such file.
+    ///
+    /// `start` above answers every path with one body, which is enough for a
+    /// resolver or a download on its own but not for `open_cloud_image`, which
+    /// fetches the checksum list and the image it names in one call.
+    pub fn start_directory(files: Vec<(String, Vec<u8>)>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("the loopback port should bind");
+        let url = format!(
+            "http://{}/noble-cloudimg-amd64.img",
+            listener.local_addr().unwrap()
+        );
+        let base_url = format!("http://{}/", listener.local_addr().unwrap());
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+
+        let recorded = Arc::clone(&ranges);
+        thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                let (range, path) = read_request(&stream);
+                let file = files
+                    .iter()
+                    .find(|(name, _)| path.rsplit('/').next() == Some(name.as_str()));
+                match file {
+                    Some((_, body)) => {
+                        answer(stream, range.as_deref(), body, Behaviour::IgnoresRange)
+                    }
+                    None => answer(stream, range.as_deref(), &[], Behaviour::NotFound),
+                };
+                recorded.lock().unwrap().push(range);
+            }
+        });
+
+        Self {
+            url,
+            base_url,
+            ranges,
+        }
+    }
 }
 
-fn answer(mut stream: TcpStream, body: &[u8], behaviour: Behaviour) -> Option<String> {
-    let range = read_range_header(&stream);
+/// Writes a response for a request whose `range` header has already been read.
+///
+/// The header is read once, by the caller, and handed in rather than read
+/// again here: a second read on the same connection has nothing left to read
+/// -- the client sent the request in one write and is now blocked waiting on
+/// the response -- and blocks until the client's own read timeout fires.
+fn answer(mut stream: TcpStream, range: Option<&str>, body: &[u8], behaviour: Behaviour) {
     let requested_from = range
-        .as_deref()
         .and_then(|value| value.strip_prefix("bytes="))
         .and_then(|value| value.split('-').next())
         .and_then(|value| value.parse::<usize>().ok());
@@ -132,19 +176,19 @@ fn answer(mut stream: TcpStream, body: &[u8], behaviour: Behaviour) -> Option<St
             let _ = stream.flush();
         }
     }
-
-    range
 }
 
-/// Reads the request and returns its `range` header, if any.
+/// Reads the request, returning its `range` header and its path.
 ///
 /// Header names are matched case-insensitively because `ureq` sends them
 /// lowercase (`range: bytes=1000-`). A server looking for `Range: ` would
 /// silently answer 200 to every resume, and the resume test would pass while
 /// testing nothing.
-fn read_range_header(stream: &TcpStream) -> Option<String> {
+fn read_request(stream: &TcpStream) -> (Option<String>, String) {
     let mut reader = BufReader::new(stream.try_clone().expect("the stream should clone"));
     let mut range = None;
+    let mut path = String::new();
+    let mut first = true;
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line).unwrap_or(0) == 0 {
@@ -153,11 +197,23 @@ fn read_range_header(stream: &TcpStream) -> Option<String> {
         if line == "\r\n" {
             break;
         }
+        if first {
+            first = false;
+            path = line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_default()
+                .to_owned();
+        }
         if let Some((name, value)) = line.split_once(':')
             && name.trim().eq_ignore_ascii_case("range")
         {
             range = Some(value.trim().to_owned());
         }
     }
-    range
+    (range, path)
+}
+
+fn read_range_header(stream: &TcpStream) -> Option<String> {
+    read_request(stream).0
 }
