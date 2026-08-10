@@ -35,7 +35,10 @@ pub(crate) fn render(request: &SeedRequest<'_>) -> String {
         document.push_str(&format!("      - {}\n", scalar::yaml(key)));
     }
 
-    document.push_str(&format!("ssh_pwauth: {}\n", password_login_allowed(request)));
+    document.push_str(&format!(
+        "ssh_pwauth: {}\n",
+        password_login_allowed(request)
+    ));
     document.push_str(&format!("locale: {}\n", scalar::yaml(request.locale)));
     document.push_str(&format!("timezone: {}\n", scalar::yaml(request.timezone)));
     document.push_str(&keyboard_file(request.keyboard));
