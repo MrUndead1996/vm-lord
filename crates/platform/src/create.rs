@@ -393,7 +393,14 @@ mod tests {
                 fixture.vm_directory.join("disks").join("system.vhdx")
             ))
         );
-        assert!(!create_calls[0].1.contains("secret"));
+        // Neither the plaintext password nor the `$6$` hash it becomes may
+        // reach HCS or the `config.json` the pipeline leaves behind: the hash
+        // travels in the seed volume alone.
+        let stored = fs::read_to_string(fixture.vm_directory.join("config.json")).unwrap();
+        for document in [&create_calls[0].1, &stored] {
+            assert!(!document.contains("secret"), "got {document}");
+            assert!(!document.contains("$6$"), "got {document}");
+        }
         assert!(calls.teardown.lock().unwrap().is_empty());
 
         let grant_calls = calls.grant.lock().unwrap();

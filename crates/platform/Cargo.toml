@@ -11,6 +11,12 @@ arcbox-dhcp = "0.6"
 log.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+# `getrandom` is off deliberately: the salt comes from `BCryptGenRandom`, the
+# same source AppSandbox used, rather than from a second RNG stack.
+sha-crypt = { version = "0.6", default-features = false, features = [
+    "alloc",
+    "password-hash",
+] }
 uuid = { version = "1", features = ["v4", "serde"] }
 windows = { workspace = true, features = [
     "Win32_Foundation",
@@ -19,6 +25,7 @@ windows = { workspace = true, features = [
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
     "Win32_Storage_FileSystem",
     "Win32_Storage_Vhd",
     "Win32_System_Com",

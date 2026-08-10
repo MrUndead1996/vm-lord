@@ -25,6 +25,7 @@ mod host_dns;
 mod import;
 mod layout;
 mod metadata;
+mod password_hash;
 mod reconnect;
 mod repository;
 mod shutdown;
@@ -47,6 +48,7 @@ pub use hcs::{
 };
 pub use import::{ImportSummary, import_image};
 pub use metadata::{MetadataStore, VmComputeSystemMapping};
+pub use password_hash::hash_password;
 pub use reconnect::{
     ReconnectOutcome, ReconnectReport, ReconnectedVm, VmConnections, reconnect_known_vms,
 };

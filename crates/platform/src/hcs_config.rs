@@ -550,6 +550,11 @@ mod tests {
         assert!(!document.contains("secret"));
         assert!(!document.contains("password"));
         assert!(!document.contains("username"));
+        // Nor the hash the password becomes. It belongs in the seed volume,
+        // which the guest reads and this document only points at; a `$6$`
+        // entry here would be handed to anyone who can read the compute
+        // system's configuration.
+        assert!(!document.contains("$6$"));
     }
 
     #[test]

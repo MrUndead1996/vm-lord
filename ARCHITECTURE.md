@@ -817,8 +817,32 @@ and what the guest inside them looks like -- including the admin group and the
 systemd units that carry its SSH daemon.
 
 A password travels as `Password`, whose `Debug` prints `<redacted>` and which
-has no `Display`: until the seed hashes it (#61), the plaintext sits inside a
-request that several call sites log with `{:?}`.
+has no `Display`: until it is hashed, the plaintext sits inside a request that
+several call sites log with `{:?}`.
+
+### The guest password
+
+`platform::password_hash` turns a `Password` into a `$6$` SHA-512-crypt entry on
+the host. That is where the plaintext's journey ends: the seed, `config.json`,
+the VM metadata and the log see the hash or nothing at all, and the tests in
+`hcs_config` and `create` assert that neither the plaintext nor a `$6$` marker
+reaches the compute system's configuration.
+
+The digest comes from RustCrypto's `sha-crypt` rather than from a second
+translation of the specification -- AppSandbox wrote its own in C
+(`src/backend_win/disk_util.c:2235`), and every step of that algorithm is a
+chance to be subtly wrong. What VMLord does keep from AppSandbox is the source
+of the salt: twelve bytes from `BCryptGenRandom`, which encode to the sixteen
+crypt-base64 characters SHA-512-crypt reads. Ninety-six bits, each byte used
+once -- AppSandbox aimed for the same and cycled its twelve bytes over sixteen
+characters, so several of them repeated. The `sha-crypt` `getrandom` feature is
+off; the salt has one source. The entry names its cost explicitly
+(`$6$rounds=5000$...`), which is the specification's default and changes nothing
+about the digest.
+
+The module's unit tests pin the algorithm against the specification's published
+`$6$` vectors, not merely against itself: a hash that agrees only with this
+implementation would pass every other test and still be rejected by the guest.
 
 ### The VM's SSH key pair
 
@@ -855,7 +879,7 @@ so the first failure any of this can produce belongs to writing the ISO (#59).
 
 `SeedRequest` is flat rather than a borrowed `Provisioning`, and it deliberately
 has no field for a plaintext password: what reaches the crate is the `$6$` hash
-(#56) and the public key (#55). "The document contains no plaintext password"
+(#56, `platform::password_hash`) and the public key (#55). "The document contains no plaintext password"
 is therefore a property of the types, not an outcome checked afterwards. `Seed`
 has no `Debug` for the same reason -- `user_data` holds the hash.
 
