@@ -144,13 +144,13 @@ impl VmCreationPipeline {
         };
 
         let mut system_created = false;
+        // The disk is made the size the VM asked for, whichever way it is
+        // filled: an empty VHDX and an imported image agree on this much.
+        let disk_size_bytes = u64::from(request.disk_gb) * BYTES_PER_GIB;
         let result = (|| {
             match &request.source {
                 VmSource::LocalMedia { .. } => {
-                    (self.vhd_creator)(
-                        &system_disk_path,
-                        u64::from(request.disk_gb) * BYTES_PER_GIB,
-                    )?;
+                    (self.vhd_creator)(&system_disk_path, disk_size_bytes)?;
                     if !media_path.is_file() {
                         return Err(RepositoryError::new(format!(
                             "VM image no longer exists: {}",
@@ -168,11 +168,7 @@ impl VmCreationPipeline {
                         image.release,
                         system_disk_path.display()
                     );
-                    (self.cloud_disk)(
-                        image,
-                        u64::from(request.disk_gb) * BYTES_PER_GIB,
-                        &system_disk_path,
-                    )?;
+                    (self.cloud_disk)(image, disk_size_bytes, &system_disk_path)?;
                     write_provisioning(
                         vm_directory,
                         &seed_path,
@@ -759,8 +755,17 @@ mod tests {
         // What the guest is told is in the seed, and only there.
         let seed = seed_bytes(&fixture.vm_directory);
         assert!(seed.contains("$6$"), "the seed carries the password hash");
+        assert!(
+            !seed.contains("secret"),
+            "and the hash instead of the password, not beside it"
+        );
         assert!(seed.contains(public_key.trim_end()), "and the public key");
-        assert!(seed.contains("instance-id: 'vmlord-"));
+        // The whole case for leaving the seed attached rests on this id being
+        // the compute system's own, so that it never changes across boots.
+        assert!(seed.contains(&format!(
+            "instance-id: '{}'",
+            mapping.hcs_compute_system_id
+        )));
 
         let stored = fs::read_to_string(fixture.vm_directory.join("config.json")).unwrap();
         let create_calls = calls.create.lock().unwrap();
@@ -847,8 +852,44 @@ mod tests {
         assert!(fixture.vm_directory.join("seed.iso").is_file());
     }
 
+    /// SSH being on is not the same question as whether we deploy a key for
+    /// it: a VM the owner reaches with their own key asks for one and not the
+    /// other, and generating a key pair nobody asked for would put a private
+    /// key on disk and an unrequested login into the guest.
     #[test]
-    fn a_failed_import_leaves_neither_seed_nor_keys_behind() {
+    fn a_cloud_vm_that_did_not_ask_for_a_key_gets_none() {
+        let fixture = fixture("cloud-no-deploy-key");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+        let request = VmCreateRequest {
+            source: VmSource::CloudImage {
+                image: CloudImage {
+                    profile: vmlord_core::ubuntu(),
+                    release: "24.04".into(),
+                },
+                provisioning: Provisioning {
+                    username: "dev".into(),
+                    password: Some(Password::new("secret")),
+                    ssh: SshAccess::Enabled { deploy_key: false },
+                    locale: "en_US.UTF-8".into(),
+                    keyboard: "us".into(),
+                    timezone: "Europe/Moscow".into(),
+                },
+            },
+            ..cloud_request("cloud-no-deploy-key-vm")
+        };
+
+        pipeline
+            .create(&fixture.store, &request, &fixture.vm_directory)
+            .expect("SSH without a deployed key is a valid VM");
+
+        assert!(!fixture.vm_directory.join("keys").exists());
+        let seed = seed_bytes(&fixture.vm_directory);
+        assert!(!seed.contains("ssh_authorized_keys"), "got {seed}");
+    }
+
+    #[test]
+    fn a_failed_import_takes_the_vm_directory_with_it() {
         let fixture = fixture("cloud-import-failure");
         let calls = fixture.calls.clone();
         let pipeline = pipeline(&calls, false, true, false);
