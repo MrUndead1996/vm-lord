@@ -874,8 +874,9 @@ Deleting the VM deletes the key with the directory.
 `vmlord-seed` turns the provisioning contract into the two NoCloud documents
 cloud-init reads on the first boot. It depends on `core` alone: no Windows API,
 no filesystem, no network, so its tests run on any host. `build(&SeedRequest)
--> Seed` is infallible -- values arrive validated, and quoting handles the rest,
-so the first failure any of this can produce belongs to writing the ISO (#59).
+-> Seed` is infallible -- values arrive validated, and quoting handles the rest.
+So is `image(&Seed)` below it: the crate does no I/O at all, so the first
+failure any of this can produce belongs to #61, where the image meets a disk.
 
 `SeedRequest` is flat rather than a borrowed `Provisioning`, and it deliberately
 has no field for a plaintext password: what reaches the crate is the `$6$` hash
@@ -908,6 +909,31 @@ has no escape sequences at all; the keyboard layout is escaped a second time for
 the shell, because `/etc/default/keyboard` is read with `source`, where `$` and
 a quote are code. The tests read the result back with a YAML parser and assert
 on meaning, the way cloud-init's PyYAML will.
+
+`vmlord-seed::image` packs both documents into the ISO9660 volume the guest
+mounts: 2048-byte blocks, sixteen empty ones, a primary descriptor, a
+terminator, two path tables, the root directory and one extent per file. No
+Joliet, no Rock Ridge, no El Torito -- the volume is not bootable, and the names
+Rock Ridge usually carries are written straight into the ISO9660 records
+instead. The writer is ours rather than a crate's because the volume label is
+the only thing cloud-init has to find the seed by, and roughly three hundred
+lines of ECMA-119 can be verified byte for byte.
+
+Two decisions are worth stating. File identifiers are written literally --
+`user-data` and `meta-data`, lowercase, hyphenated, with no `;1` suffix -- even
+though a hyphen is not an ISO9660 d-character at any level and Level 2 relaxes
+only length. There is no conforming spelling of the names cloud-init requires,
+so the deviation is made once, explicitly, where the bytes written are the bytes
+the guest opens; `crates/seed/tests/mount.rs` proves it against a real Linux
+kernel. And nothing is dated: the descriptor's date fields carry the "not
+specified" form and directory records carry zeros, which keeps the image
+reproducible and the crate free of calendar arithmetic `std` does not have.
+
+The image is returned as bytes rather than written to a file, so `crates/seed`
+still knows no filesystem; #61 writes it into the VM's directory and attaches
+it. The root directory grows by whole sectors as records need them, which is
+what lets the same transport carry a guest agent later without touching the
+writer.
 
 One limitation, stated rather than forgotten: `/etc/default/keyboard` is
 Debian-family. Fedora keeps the setting in `/etc/vconsole.conf` under different
