@@ -996,6 +996,17 @@ there would be either deleted with the disks it provisioned or kept as something
 that looks like one. Deleting a VM without its disks removes `config.json`
 alone, so the seed stays with the disk it belongs to.
 
+The seed carries the password's SHA-512-crypt entry, which makes it the second
+secret VMLord keeps in a file, and it is written the way the first one is:
+`vm_key::restrict_to_owner` narrows it to SYSTEM, Administrators and the owner,
+and the file is created empty and narrowed before the bytes go in, so they never
+sit under permissions wider than the ones they end up with. The storage root is
+the owner's to choose, and one carrying an inherited `Users:(R)` would otherwise
+hand the hash to every account on the machine -- while the private key beside it
+was locked down. The DACL is protected, which cuts off what the parent hands
+down but not what is added explicitly afterwards, so `HcsGrantVmAccess` still
+puts the VM's own SID on the file and the VM goes on reading its seed.
+
 Rollback needs to know none of this. Any failure after the directory exists
 tears down the compute system if one was created and then calls
 `cleanup::remove_vm_directory` on the whole directory -- disk, seed and private

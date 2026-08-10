@@ -1,7 +1,11 @@
-//! The VM's own SSH key pair on disk.
+//! The VM's own SSH key pair on disk, and the DACL its secrets are written
+//! under.
 //!
-//! The private half is the one secret VMLord stores in a file, so the file
-//! carries an explicit DACL rather than whatever the storage root hands down.
+//! The private half is one of the two secrets VMLord stores in a file -- the
+//! other is the password hash inside `seed.iso` -- so the file carries an
+//! explicit DACL rather than whatever the storage root hands down.
+//! `restrict_to_owner` is shared with the seed for that reason: a hash left
+//! readable beside a key that is not would be an odd place to stop.
 
 use std::{
     fs::{self, File},
@@ -149,7 +153,7 @@ impl Drop for LocalDescriptor {
 /// being used by hand is what the key is for. It is also the exact shape
 /// Win32-OpenSSH insists on: it refuses a key whose DACL is wider than the
 /// owner plus SYSTEM and Administrators.
-fn restrict_to_owner(path: &Path) -> Result<(), RepositoryError> {
+pub(crate) fn restrict_to_owner(path: &Path) -> Result<(), RepositoryError> {
     let sid = current_user_sid()?;
     // `FA` is full access; `P` protects the list from everything the parent
     // directory would otherwise hand down.
@@ -269,7 +273,7 @@ fn fail(operation: &str, path: Option<&Path>, error: windows::core::Error) -> Re
 /// Only the tests need this: production sets the descriptor and never asks
 /// what it became.
 #[cfg(test)]
-fn security_descriptor(path: &Path) -> Result<String, RepositoryError> {
+pub(crate) fn security_descriptor(path: &Path) -> Result<String, RepositoryError> {
     use windows::Win32::Security::Authorization::{
         ConvertSecurityDescriptorToStringSecurityDescriptorW, GetNamedSecurityInfoW,
     };

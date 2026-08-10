@@ -1,6 +1,6 @@
 //! Transactional creation of an HCS-backed virtual machine.
 
-use std::{fs, path::Path, time::Duration};
+use std::{fs, io::Write, path::Path, time::Duration};
 
 use uuid::Uuid;
 use vmlord_core::{
@@ -305,16 +305,38 @@ fn write_provisioning(
         ssh_units: &image.profile.ssh_units,
     });
 
-    fs::write(seed_path, vmlord_seed::image(&seed)).map_err(|error| {
-        let error = RepositoryError::new(format!(
-            "failed to write the cloud-init seed at {}: {error}",
-            seed_path.display()
-        ));
-        log::error!("{error}");
-        error
-    })?;
+    write_seed(seed_path, &vmlord_seed::image(&seed))?;
     log::debug!("wrote the cloud-init seed at {}", seed_path.display());
     Ok(())
+}
+
+/// Writes the seed volume under the same DACL the private key gets.
+///
+/// The volume carries the password's SHA-512-crypt entry, so it is as much a
+/// secret on disk as the key is, and the storage root is a path the owner
+/// chooses -- point it somewhere with an inherited `Users:(R)` and the hash is
+/// readable by every local account. The ordering is `vm_key`'s: create the
+/// file empty, narrow it, and only then write, so that the bytes never exist
+/// under permissions wider than the ones they end up with.
+///
+/// The DACL is protected, which severs what the parent hands down but not what
+/// is added explicitly afterwards -- `HcsGrantVmAccess` still puts the VM's own
+/// SID on the file, which is why it can go on reading its seed.
+fn write_seed(seed_path: &Path, bytes: &[u8]) -> Result<(), RepositoryError> {
+    let mut file = fs::File::create(seed_path).map_err(|error| seed_failure(seed_path, &error))?;
+    vm_key::restrict_to_owner(seed_path)?;
+    file.write_all(bytes)
+        .and_then(|()| file.flush())
+        .map_err(|error| seed_failure(seed_path, &error))
+}
+
+fn seed_failure(seed_path: &Path, error: &std::io::Error) -> RepositoryError {
+    let error = RepositoryError::new(format!(
+        "failed to write the cloud-init seed at {}: {error}",
+        seed_path.display()
+    ));
+    log::error!("{error}");
+    error
 }
 
 #[cfg(test)]
@@ -850,6 +872,38 @@ mod tests {
 
         assert!(!fixture.vm_directory.join("keys").exists());
         assert!(fixture.vm_directory.join("seed.iso").is_file());
+    }
+
+    /// The seed carries the password's hash, so it is a secret on disk in the
+    /// same sense the private key is, and it is written under the same DACL.
+    /// The storage root is the owner's to choose; one with an inherited
+    /// `Users:(R)` would otherwise hand the hash to every local account.
+    #[test]
+    fn the_seed_is_written_with_the_same_restricted_dacl_as_the_key() {
+        let fixture = fixture("cloud-seed-dacl");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+
+        pipeline
+            .create(
+                &fixture.store,
+                &cloud_request("cloud-dacl-vm"),
+                &fixture.vm_directory,
+            )
+            .expect("creation should succeed");
+
+        let descriptor = crate::vm_key::security_descriptor(&fixture.vm_directory.join("seed.iso"))
+            .expect("the DACL should be read back");
+        assert!(descriptor.contains("D:P"), "{descriptor}");
+        assert!(
+            !descriptor.contains(";ID;"),
+            "nothing may be inherited from the storage root: {descriptor}"
+        );
+        assert_eq!(
+            descriptor.matches("(A;;FA;;;").count(),
+            3,
+            "SYSTEM, Administrators and the owner, and nobody else: {descriptor}"
+        );
     }
 
     /// SSH being on is not the same question as whether we deploy a key for
