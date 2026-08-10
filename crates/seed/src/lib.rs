@@ -7,6 +7,7 @@
 //! both produced elsewhere, so "no plaintext password in the document" is a
 //! property of the types rather than a lucky outcome checked afterwards.
 
+mod iso;
 mod meta_data;
 mod scalar;
 mod user_data;
