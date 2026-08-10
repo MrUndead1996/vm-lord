@@ -7,6 +7,10 @@ license.workspace = true
 [dependencies]
 vmlord-core = { path = "../core" }
 vmlord-keys = { path = "../keys" }
+# The seed documents and their ISO image. The crate is pure -- no filesystem,
+# no network, no Windows API -- and writing its bytes to disk is what this
+# layer is for.
+vmlord-seed = { path = "../seed" }
 arcbox-dhcp = "0.6"
 log.workspace = true
 serde = { version = "1.0", features = ["derive"] }

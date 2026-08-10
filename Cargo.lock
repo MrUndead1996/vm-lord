@@ -4267,6 +4267,7 @@ dependencies = [
  "vmlord-core",
  "vmlord-image",
  "vmlord-keys",
+ "vmlord-seed",
  "windows 0.61.3",
 ]
 
