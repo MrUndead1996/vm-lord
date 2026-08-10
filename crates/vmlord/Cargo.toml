@@ -14,6 +14,7 @@ bench = false
 log.workspace = true
 vmlord-app = { path = "../app" }
 vmlord-core = { path = "../core" }
+vmlord-image = { path = "../image" }
 vmlord-legacy-backend = { path = "../legacy-backend" }
 vmlord-platform = { path = "../platform" }
 vmlord-ui = { path = "../ui" }

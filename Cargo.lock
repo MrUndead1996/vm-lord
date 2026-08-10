@@ -4201,6 +4201,7 @@ dependencies = [
  "log",
  "vmlord-app",
  "vmlord-core",
+ "vmlord-image",
  "vmlord-legacy-backend",
  "vmlord-platform",
  "vmlord-ui",

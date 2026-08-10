@@ -1506,3 +1506,79 @@ fn mapping_owning(vm_name: &str, endpoint_id: Uuid) -> VmComputeSystemMapping {
         network_mode: NetworkMode::Nat,
     }
 }
+
+/// The whole path on a real host: a real Ubuntu cloud image becomes a VM's
+/// disk, and the seed the guest reads sits beside it.
+///
+/// Ignored by default -- it needs Hyper-V, an elevated process and a few
+/// hundred megabytes off the network. The importer is assembled from the same
+/// two calls the composition root makes, so what is exercised is what ships.
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS enabled"]
+fn a_vm_is_created_from_a_real_cloud_image() {
+    let root = std::env::temp_dir().join(format!("vmlord-cloud-image-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+    let cache = root.join("cache");
+    let vm_directory = root.join("cloud-vm");
+    let store = MetadataStore::new(root.join("vm-mapping.json"));
+
+    let pipeline = VmCreationPipeline::production(Box::new(move |image, size, target| {
+        let mut source = vmlord_image::open_cloud_image(
+            &image.profile,
+            &image.release,
+            &cache,
+            size,
+            &vmlord_core::ProgressPublisher::default(),
+            &std::sync::atomic::AtomicBool::new(false),
+        )?;
+        vmlord_platform::import_image(&mut source, target, size).map(|_| ())
+    }));
+
+    let request = VmCreateRequest {
+        name: "vmlord-cloud-test".into(),
+        source: vmlord_core::VmSource::CloudImage {
+            image: vmlord_core::CloudImage {
+                profile: vmlord_core::ubuntu(),
+                release: "24.04".into(),
+            },
+            provisioning: vmlord_core::Provisioning {
+                username: "dev".into(),
+                password: None,
+                ssh: vmlord_core::SshAccess::Enabled { deploy_key: true },
+                locale: "en_US.UTF-8".into(),
+                keyboard: "us".into(),
+                timezone: "Europe/Moscow".into(),
+            },
+        },
+        ram_mb: 2048,
+        disk_gb: 16,
+        cpu_cores: 2,
+        gpu_mode: GpuMode::None,
+        network_mode: NetworkMode::Nat,
+    };
+
+    let mapping = pipeline
+        .create(&store, &request, &vm_directory)
+        .expect("a cloud image should become a VM");
+
+    let seed = std::fs::read(vm_directory.join("seed.iso")).expect("the seed should be written");
+    assert_eq!(&seed[16 * 2048 + 40..16 * 2048 + 46], b"CIDATA");
+    let text = String::from_utf8_lossy(&seed);
+    assert!(text.contains("user-data") && text.contains("meta-data"));
+
+    let document: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(vm_directory.join("config.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        document.pointer("/VirtualMachine/Devices/Scsi/Primary/Attachments/1/Path"),
+        Some(&serde_json::json!(vm_directory.join("seed.iso")))
+    );
+
+    // Best-effort cleanup, in the shape the other tests in this file use.
+    if let Ok(system) = HcsSystem::open(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL) {
+        let _ = system
+            .terminate()
+            .and_then(|operation| operation.wait_for_completion(Duration::from_secs(30)));
+    }
+    let _ = fs::remove_dir_all(&root);
+}
