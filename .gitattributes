@@ -1,2 +1,6 @@
 # Store all text files in the repository with LF line endings.
 * text=auto eol=lf
+
+# The qcow2 fixtures are binary; no end-of-line conversion applies to them.
+*.qcow2 binary
+*.qcow binary
