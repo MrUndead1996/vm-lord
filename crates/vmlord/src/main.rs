@@ -54,6 +54,11 @@ fn load_backend(settings: &AppSettings) -> Box<dyn VmRepository> {
         );
         return Box::new(vmlord_platform::HcsVmRepository::new(
             settings.vm_storage_path.clone(),
+            Box::new(|_, _, _| {
+                Err(vmlord_core::RepositoryError::new(
+                    "cloud images are not wired up yet",
+                ))
+            }),
         ));
     }
 

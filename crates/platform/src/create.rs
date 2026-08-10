@@ -3,7 +3,7 @@
 use std::{fs, path::Path, time::Duration};
 
 use uuid::Uuid;
-use vmlord_core::{RepositoryError, VmCreateRequest, VmSource};
+use vmlord_core::{CloudImage, RepositoryError, VmCreateRequest, VmSource};
 
 use crate::{
     HcsClient,
@@ -21,6 +21,17 @@ type VhdCreator = Box<dyn Fn(&Path, u64) -> Result<(), RepositoryError>>;
 type AccessGranter = Box<dyn Fn(&str, &Path) -> Result<(), RepositoryError>>;
 type SystemCreator = Box<dyn Fn(&str, &str) -> Result<(), RepositoryError>>;
 
+/// Makes the VM's system disk out of a cloud image: fetch the image the release
+/// means, then write it into a VHDX at the given path, sized for the VM rather
+/// than for the image.
+///
+/// Injected rather than called directly because the fetching half is not
+/// Windows's business: it lives in `vmlord-image`, which knows no Windows API,
+/// and the composition root joins the two. The pipeline keeps the half that is
+/// Windows -- writing into a VHDX through the disk it is attached as.
+pub type CloudDiskImporter =
+    Box<dyn Fn(&CloudImage, u64, &Path) -> Result<(), RepositoryError>>;
+
 /// Orchestrates the multi-step, transactional creation of an HCS-backed VM.
 ///
 /// Every step after the VM directory is created is wrapped so that any
@@ -28,17 +39,26 @@ type SystemCreator = Box<dyn Fn(&str, &str) -> Result<(), RepositoryError>>;
 /// VM directory is removed.
 pub struct VmCreationPipeline {
     vhd_creator: VhdCreator,
+    // Not yet called from `create`: this task only opens the seam, so the
+    // cloud-image branch that calls it lands with the next one.
+    #[allow(dead_code)]
+    cloud_disk: CloudDiskImporter,
     access_granter: AccessGranter,
     system_creator: SystemCreator,
     system_teardown: SystemTeardown,
 }
 
 impl VmCreationPipeline {
-    /// Creates a pipeline backed by the real VHDX and HCS APIs.
+    /// Creates a pipeline backed by the real VHDX and HCS APIs, importing cloud
+    /// images through `cloud_disk`.
+    ///
+    /// The importer is required rather than optional: a pipeline that silently
+    /// cannot build a VM from a cloud image is a state better left unspellable.
     #[must_use]
-    pub fn production() -> Self {
+    pub fn production(cloud_disk: CloudDiskImporter) -> Self {
         Self {
             vhd_creator: Box::new(create_dynamic_vhdx),
+            cloud_disk,
             access_granter: Box::new(grant_vm_access),
             system_creator: Box::new(create_hcs_system),
             system_teardown: Box::new(cleanup::teardown_compute_system),
@@ -48,12 +68,14 @@ impl VmCreationPipeline {
     #[cfg(test)]
     fn for_test(
         vhd_creator: impl Fn(&Path, u64) -> Result<(), RepositoryError> + 'static,
+        cloud_disk: impl Fn(&CloudImage, u64, &Path) -> Result<(), RepositoryError> + 'static,
         access_granter: impl Fn(&str, &Path) -> Result<(), RepositoryError> + 'static,
         system_creator: impl Fn(&str, &str) -> Result<(), RepositoryError> + 'static,
         system_teardown: impl Fn(&str) -> Result<(), RepositoryError> + 'static,
     ) -> Self {
         Self {
             vhd_creator: Box::new(vhd_creator),
+            cloud_disk: Box::new(cloud_disk),
             access_granter: Box::new(access_granter),
             system_creator: Box::new(system_creator),
             system_teardown: Box::new(system_teardown),
@@ -186,12 +208,6 @@ impl VmCreationPipeline {
     }
 }
 
-impl Default for VmCreationPipeline {
-    fn default() -> Self {
-        Self::production()
-    }
-}
-
 fn grant_vm_access(id: &str, path: &Path) -> Result<(), RepositoryError> {
     HcsClient::new().grant_vm_access(id, path)
 }
@@ -266,6 +282,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct Calls {
         vhd: Arc<Mutex<Vec<(PathBuf, u64)>>>,
+        cloud: Arc<Mutex<Vec<(String, u64, PathBuf)>>>,
         grant: Arc<Mutex<Vec<(String, PathBuf)>>>,
         create: Arc<Mutex<Vec<(String, String)>>>,
         teardown: Arc<Mutex<Vec<String>>>,
@@ -305,7 +322,12 @@ mod tests {
         }
     }
 
-    fn pipeline(calls: &Calls, fail_vhd: bool, fail_create: bool) -> VmCreationPipeline {
+    fn pipeline(
+        calls: &Calls,
+        fail_vhd: bool,
+        fail_cloud: bool,
+        fail_create: bool,
+    ) -> VmCreationPipeline {
         VmCreationPipeline::for_test(
             {
                 let calls = calls.clone();
@@ -316,6 +338,24 @@ mod tests {
                     }
                     fs::write(path, b"vhdx")
                         .map_err(|error| vmlord_core::RepositoryError::new(format!("vhd: {error}")))
+                }
+            },
+            {
+                let calls = calls.clone();
+                move |image: &vmlord_core::CloudImage, size, path: &std::path::Path| {
+                    calls.cloud.lock().unwrap().push((
+                        image.release.clone(),
+                        size,
+                        path.to_path_buf(),
+                    ));
+                    if fail_cloud {
+                        return Err(vmlord_core::RepositoryError::new(
+                            "injected cloud image failure",
+                        ));
+                    }
+                    fs::write(path, b"imported vhdx").map_err(|error| {
+                        vmlord_core::RepositoryError::new(format!("import: {error}"))
+                    })
                 }
             },
             {
@@ -360,10 +400,24 @@ mod tests {
     }
 
     #[test]
+    fn a_local_media_vm_never_reaches_the_cloud_image_importer() {
+        let fixture = fixture("no-cloud");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+
+        pipeline
+            .create(&fixture.store, &fixture.request, &fixture.vm_directory)
+            .expect("creation should succeed");
+
+        assert!(calls.cloud.lock().unwrap().is_empty());
+        assert_eq!(calls.vhd.lock().unwrap().len(), 1);
+    }
+
+    #[test]
     fn creates_and_registers_a_vm_through_all_stages() {
         let fixture = fixture("happy");
         let calls = fixture.calls.clone();
-        let pipeline = pipeline(&calls, false, false);
+        let pipeline = pipeline(&calls, false, false, false);
 
         let mapping = pipeline
             .create(&fixture.store, &fixture.request, &fixture.vm_directory)
@@ -426,7 +480,7 @@ mod tests {
     fn rejects_a_duplicate_vm_name_before_any_side_effect() {
         let fixture = fixture("duplicate");
         let calls = fixture.calls.clone();
-        let pipeline = pipeline(&calls, false, false);
+        let pipeline = pipeline(&calls, false, false, false);
         pipeline
             .create(&fixture.store, &fixture.request, &fixture.vm_directory)
             .expect("the first creation should succeed");
@@ -447,7 +501,7 @@ mod tests {
         let fixture = fixture("existing-dir");
         let calls = fixture.calls.clone();
         fs::create_dir_all(&fixture.vm_directory).unwrap();
-        let pipeline = pipeline(&calls, false, false);
+        let pipeline = pipeline(&calls, false, false, false);
 
         let error = pipeline
             .create(&fixture.store, &fixture.request, &fixture.vm_directory)
@@ -461,7 +515,7 @@ mod tests {
     fn a_disk_creation_failure_removes_the_vm_directory_without_hcs() {
         let fixture = fixture("disk-failure");
         let calls = fixture.calls.clone();
-        let pipeline = pipeline(&calls, true, false);
+        let pipeline = pipeline(&calls, true, false, false);
 
         let error = pipeline
             .create(&fixture.store, &fixture.request, &fixture.vm_directory)
@@ -478,7 +532,7 @@ mod tests {
     fn a_missing_image_at_create_time_aborts_before_hcs() {
         let fixture = fixture("image-gone");
         let calls = fixture.calls.clone();
-        let pipeline = pipeline(&calls, false, false);
+        let pipeline = pipeline(&calls, false, false, false);
         fs::remove_file(&fixture.image_path).unwrap();
 
         let error = pipeline
@@ -494,7 +548,7 @@ mod tests {
     fn an_hcs_create_failure_tears_down_the_ambiguous_system() {
         let fixture = fixture("create-failure");
         let calls = fixture.calls.clone();
-        let pipeline = pipeline(&calls, false, true);
+        let pipeline = pipeline(&calls, false, false, true);
 
         let error = pipeline
             .create(&fixture.store, &fixture.request, &fixture.vm_directory)
@@ -526,7 +580,7 @@ mod tests {
         let blocked_parent = fixture.vm_directory.with_file_name("blocked");
         fs::write(&blocked_parent, b"file").unwrap();
         let blocked_store = MetadataStore::new(blocked_parent.join("vm-mapping.json"));
-        let pipeline = pipeline(&calls, false, false);
+        let pipeline = pipeline(&calls, false, false, false);
 
         let error = pipeline
             .create(&blocked_store, &fixture.request, &fixture.vm_directory)
@@ -546,7 +600,7 @@ mod tests {
     fn rollback_never_touches_the_source_image() {
         let fixture = fixture("image-safe");
         let calls = fixture.calls.clone();
-        let pipeline = pipeline(&calls, true, false);
+        let pipeline = pipeline(&calls, true, false, false);
 
         let _ = pipeline.create(&fixture.store, &fixture.request, &fixture.vm_directory);
 

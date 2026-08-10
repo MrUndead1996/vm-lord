@@ -13,9 +13,9 @@ use vmlord_core::{
 };
 
 use crate::{
-    HcsClient, HcsSystem, KnownVm, MetadataStore, VmComputeSystemMapping, VmConnections,
-    VmCreationPipeline, VmDeletionPipeline, VmForceStopPipeline, VmShutdownPipeline,
-    VmStartPipeline, cleanup,
+    CloudDiskImporter, HcsClient, HcsSystem, KnownVm, MetadataStore, VmComputeSystemMapping,
+    VmConnections, VmCreationPipeline, VmDeletionPipeline, VmForceStopPipeline,
+    VmShutdownPipeline, VmStartPipeline, cleanup,
     hcn::HcnNetwork,
     hcn_endpoint::{EndpointAddress, HcnEndpoint},
     hcs::{HCS_ACCESS_ALL, HcsSystemState},
@@ -61,9 +61,10 @@ pub struct HcsVmRepository {
 }
 
 impl HcsVmRepository {
-    /// Creates a repository storing its VMs under `storage_root`.
+    /// Creates a repository storing its VMs under `storage_root`, importing
+    /// cloud images through `cloud_disk`.
     #[must_use]
-    pub fn new(storage_root: impl Into<PathBuf>) -> Self {
+    pub fn new(storage_root: impl Into<PathBuf>, cloud_disk: CloudDiskImporter) -> Self {
         let storage_root = storage_root.into();
         let events = VmEventSink::default();
         Self {
@@ -71,7 +72,7 @@ impl HcsVmRepository {
             store: MetadataStore::new(storage_root.join(MAPPING_FILE_NAME)),
             storage_root,
             connections: VmConnections::with_events(events.clone()),
-            creation: VmCreationPipeline::production(),
+            creation: VmCreationPipeline::production(cloud_disk),
             start: VmStartPipeline::production(),
             shutdown: VmShutdownPipeline::production(),
             force_stop: VmForceStopPipeline::production(),
@@ -670,7 +671,14 @@ mod tests {
     };
 
     fn repository() -> HcsVmRepository {
-        HcsVmRepository::new(std::env::temp_dir().join("vmlord-repository-test"))
+        HcsVmRepository::new(
+            std::env::temp_dir().join("vmlord-repository-test"),
+            Box::new(|_, _, _| {
+                Err(RepositoryError::new(
+                    "this test creates no VM from a cloud image",
+                ))
+            }),
+        )
     }
 
     fn update_request() -> VmUpdateRequest {
