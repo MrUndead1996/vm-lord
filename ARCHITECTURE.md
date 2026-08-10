@@ -138,6 +138,10 @@ This layer exposes safe Rust APIs.
 
 It knows nothing about the UI.
 
+Its modules today: `settings`, `logging`, `progress`, `distro` (distribution
+profiles) and `provisioning` (what VMLord delivers into a Linux guest), plus
+the request, summary and repository types.
+
 ---
 
 ## Platform
@@ -577,9 +581,12 @@ both standard output and the append-only `log_file_path`; all Rust crates use
 the `log` facade to emit application records.
 
 The current UI initializes the backend, shows availability and diagnostics,
-lists known VMs, can create Linux VMs from ISO images, and can edit them. It
-submits safe requests through the application layer, which knows nothing about
-which backend serves them. Edit is available whichever state the VM is in;
+lists known VMs, can create Linux VMs from ISO images, and can edit them. The
+creation form asks for the medium, the sizes and the modes, but not for a user
+or a password: an installation medium is installed by hand, and those fields
+return with the cloud-image form in #65. It submits safe requests through the
+application layer, which knows nothing about which backend serves them. Edit is
+available whichever state the VM is in;
 Delete stays limited to stopped VMs. Snapshots remain future application-layer
 work.
 
@@ -788,6 +795,34 @@ The edit workflow follows these rules:
   the VM to change.
 * The VM name is treated as the guest hostname and also requires recreating the
   VM to change safely from VMLord.
+
+### VM creation contract
+
+A VM's system comes from one of two sources, and they are different in kind:
+
+* `VmSource::LocalMedia` is installation media. The system is installed by
+  hand, so VMLord promises nothing about the user inside it.
+* `VmSource::CloudImage` is a distribution's cloud image, provisioned by
+  cloud-init from a seed VMLord writes. It carries the provisioning contract:
+  user name, optional password, SSH access, locale, keyboard layout and
+  timezone.
+
+Provisioning lives inside the cloud variant rather than beside it, so "a local
+medium with a password" is a state that cannot be spelled rather than one that
+has to be rejected at run time. `core::provisioning` owns the types and their
+validation, including the user-name rules the UI used to hold; `core::distro`
+owns `DistroProfile`, the table of where a distribution publishes its images
+and what the guest inside them looks like.
+
+A password travels as `Password`, whose `Debug` prints `<redacted>` and which
+has no `Display`: until the seed hashes it (#61), the plaintext sits inside a
+request that several call sites log with `{:?}`.
+
+The native backend refuses `CloudImage` with a message naming #61, the task
+that will build a VM from one. The legacy AppSandbox backend is given empty
+credentials for `LocalMedia`: its own model was "media plus unattended
+answers", which the domain no longer spells. That is a deliberate loss on a
+transitional path -- #66 removes the iso-patch dependency it belongs to.
 
 ---
 
