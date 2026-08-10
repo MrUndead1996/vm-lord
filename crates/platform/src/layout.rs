@@ -46,6 +46,15 @@ pub(crate) fn system_disk_path(vm_directory: &Path) -> PathBuf {
     vm_directory.join("disks").join("system.vhdx")
 }
 
+/// Returns the path of the NoCloud seed the guest's cloud-init reads.
+///
+/// Beside `config.json` rather than under `disks/`: this is a configuration
+/// medium, not one of the VM's disks, and `disks/` is what a deletion removes
+/// when it is told to remove the VM's disks.
+pub(crate) fn seed_path(vm_directory: &Path) -> PathBuf {
+    vm_directory.join("seed.iso")
+}
+
 /// Returns the path of the VM's own SSH private key.
 pub(crate) fn ssh_key_path(vm_directory: &Path) -> PathBuf {
     vm_directory.join("keys").join("id_ed25519")
@@ -65,7 +74,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        configuration_path, ssh_key_path, ssh_public_key_path, system_disk_path, vm_directory,
+        configuration_path, seed_path, ssh_key_path, ssh_public_key_path, system_disk_path,
+        vm_directory,
     };
 
     #[test]
@@ -83,6 +93,18 @@ mod tests {
                 .join("dev-linux")
                 .join("disks")
                 .join("system.vhdx")
+        );
+    }
+
+    #[test]
+    fn the_seed_lives_beside_the_configuration_not_among_the_disks() {
+        // Not under `disks/`: the seed is a configuration medium, and `disks/` is
+        // what `delete_vm` removes when asked to remove a VM's disks.
+        let directory = vm_directory(Path::new("/vms"), "dev-linux").unwrap();
+
+        assert_eq!(
+            seed_path(&directory),
+            PathBuf::from("/vms").join("dev-linux").join("seed.iso")
         );
     }
 

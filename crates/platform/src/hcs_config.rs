@@ -16,8 +16,9 @@ pub(crate) struct HcsVmConfigBuilder;
 
 impl HcsVmConfigBuilder {
     /// Builds the JSON configuration for `request`, attaching
-    /// `system_disk_path` as the VM's boot disk and the installer ISO of its
-    /// source as the second attachment.
+    /// `system_disk_path` as the VM's boot disk and, as the second
+    /// attachment, the installer ISO for a local-media source or `seed_path`
+    /// for a cloud image.
     ///
     /// GPU configuration is not yet implemented; any mode other than `None` is
     /// rejected. Networking accepts `None` and `NetworkMode::Nat`; a NAT VM
@@ -26,6 +27,7 @@ impl HcsVmConfigBuilder {
     pub(crate) fn build(
         request: &VmCreateRequest,
         system_disk_path: &Path,
+        seed_path: &Path,
     ) -> Result<String, RepositoryError> {
         request.validate()?;
 
@@ -36,7 +38,6 @@ impl HcsVmConfigBuilder {
             )));
         }
         ensure_supported_network_mode(request.network_mode)?;
-        let image_path = local_media_path(request)?;
 
         let attachments = BTreeMap::from([
             (
@@ -50,7 +51,7 @@ impl HcsVmConfigBuilder {
                 "1".to_string(),
                 Attachment {
                     attachment_type: "Iso",
-                    path: PathBuf::from(image_path),
+                    path: media_path(request, seed_path).to_path_buf(),
                 },
             ),
         ]);
@@ -101,22 +102,15 @@ impl HcsVmConfigBuilder {
     }
 }
 
-/// The path of the installer ISO, or a refusal naming the task that will teach
-/// the pipeline to build a VM from a cloud image.
+/// The ISO the VM boots with: the installer for local media, the seed for a
+/// cloud image.
 ///
-/// Same shape as [`ensure_supported_network_mode`]: an unsupported request is
-/// refused in one place, with a message that says which task lifts the refusal.
-pub(crate) fn local_media_path(request: &VmCreateRequest) -> Result<&str, RepositoryError> {
+/// One place decides it, because two need it: the configuration document below
+/// and the pipeline, which grants the VM access to the same file.
+pub(crate) fn media_path<'a>(request: &'a VmCreateRequest, seed_path: &'a Path) -> &'a Path {
     match &request.source {
-        VmSource::LocalMedia { path } => Ok(path),
-        VmSource::CloudImage { .. } => {
-            let error = RepositoryError::new(
-                "the HCS backend cannot build a VM from a cloud image yet; \
-                 seed generation and provisioning arrive with #61",
-            );
-            log::error!("{error}");
-            Err(error)
-        }
+        VmSource::LocalMedia { path } => Path::new(path),
+        VmSource::CloudImage { .. } => seed_path,
     }
 }
 
@@ -417,7 +411,7 @@ struct EmptyObject {}
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use serde_json::{Value, json};
     use uuid::Uuid;
@@ -428,7 +422,7 @@ mod tests {
 
     use super::{
         HcsVmConfigBuilder, VmTopology, adapter_key, apply_network_adapter, apply_topology,
-        ensure_supported_network_mode, read_topology, remove_network_adapter,
+        ensure_supported_network_mode, media_path, read_topology, remove_network_adapter,
     };
 
     fn request() -> VmCreateRequest {
@@ -445,9 +439,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_cloud_image_is_refused_with_the_task_that_will_support_it() {
-        let request = VmCreateRequest {
+    fn cloud_request() -> VmCreateRequest {
+        VmCreateRequest {
             source: VmSource::CloudImage {
                 image: CloudImage {
                     profile: ubuntu(),
@@ -463,22 +456,64 @@ mod tests {
                 },
             },
             ..request()
-        };
+        }
+    }
 
-        let error = HcsVmConfigBuilder::build(
-            &request,
-            &PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx"),
+    #[test]
+    fn a_cloud_vm_boots_its_disk_with_the_seed_beside_it() {
+        // Two attachments, not three: a cloud image has no installer ISO, and a
+        // numbering hole reserved for one would have to be explained to everybody
+        // who opens `config.json`.
+        let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
+        let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
+
+        let json: Value = serde_json::from_str(
+            &HcsVmConfigBuilder::build(&cloud_request(), &system_disk_path, &seed_path).unwrap(),
         )
-        .expect_err("the pipeline cannot provision a cloud image yet");
+        .unwrap();
 
-        assert!(error.to_string().contains("#61"), "got {error}");
+        assert_eq!(
+            json.pointer("/VirtualMachine/Devices/Scsi/Primary/Attachments"),
+            Some(&json!({
+                "0": { "Type": "VirtualDisk", "Path": system_disk_path },
+                "1": { "Type": "Iso", "Path": seed_path }
+            }))
+        );
+    }
+
+    #[test]
+    fn a_cloud_vms_document_carries_no_secret_of_its_provisioning() {
+        let document = HcsVmConfigBuilder::build(
+            &cloud_request(),
+            &PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx"),
+            &PathBuf::from("C:\\vms\\test-vm\\seed.iso"),
+        )
+        .unwrap();
+
+        // The password travels to the guest inside the seed volume alone. Anyone
+        // who can read the compute system's configuration must learn nothing.
+        assert!(!document.contains("secret"), "got {document}");
+        assert!(!document.contains("$6$"), "got {document}");
+        assert!(!document.contains("user"), "got {document}");
+    }
+
+    #[test]
+    fn the_media_a_vm_boots_is_its_installer_or_its_seed() {
+        let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
+
+        assert_eq!(
+            media_path(&request(), &seed_path),
+            Path::new("C:\\images\\installer.iso")
+        );
+        assert_eq!(media_path(&cloud_request(), &seed_path), seed_path);
     }
 
     #[test]
     fn builds_the_minimal_configuration() {
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
+        let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
         let json: Value = serde_json::from_str(
-            &HcsVmConfigBuilder::build(&request(), &system_disk_path).unwrap(),
+            &HcsVmConfigBuilder::build(&request(), &system_disk_path, &seed_path).unwrap(),
         )
         .unwrap();
 
@@ -522,9 +557,12 @@ mod tests {
         };
         let system_disk_path = PathBuf::from("C:\\vms\\edge\\disks\\system.vhdx");
 
-        let json: Value =
-            serde_json::from_str(&HcsVmConfigBuilder::build(&request, &system_disk_path).unwrap())
-                .unwrap();
+        let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
+
+        let json: Value = serde_json::from_str(
+            &HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path).unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(
             json.pointer("/VirtualMachine/ComputeTopology/Memory/SizeInMB"),
@@ -544,8 +582,9 @@ mod tests {
     fn omits_request_secrets() {
         let request = VmCreateRequest { ..request() };
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
+        let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
 
-        let document = HcsVmConfigBuilder::build(&request, &system_disk_path).unwrap();
+        let document = HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path).unwrap();
 
         assert!(!document.contains("secret"));
         assert!(!document.contains("password"));
@@ -560,13 +599,14 @@ mod tests {
     #[test]
     fn rejects_each_unsupported_gpu_mode() {
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
+        let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
         for mode in [GpuMode::Default, GpuMode::TryAll, GpuMode::Unknown(42)] {
             let request = VmCreateRequest {
                 gpu_mode: mode,
                 ..request()
             };
             assert!(
-                HcsVmConfigBuilder::build(&request, &system_disk_path)
+                HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path)
                     .unwrap_err()
                     .to_string()
                     .contains("GPU mode")
@@ -579,12 +619,13 @@ mod tests {
         // Creation writes no adapter: the endpoint and its MAC only exist once
         // `VmStartPipeline` has run, so the section is the start's to write.
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
+        let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
         let request = VmCreateRequest {
             network_mode: NetworkMode::Nat,
             ..request()
         };
 
-        let document = HcsVmConfigBuilder::build(&request, &system_disk_path).unwrap();
+        let document = HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path).unwrap();
 
         let json: Value = serde_json::from_str(&document).unwrap();
         assert!(
@@ -596,6 +637,7 @@ mod tests {
     #[test]
     fn rejects_each_network_mode_that_waits_for_its_own_task() {
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
+        let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
         for mode in [
             NetworkMode::External,
             NetworkMode::Internal,
@@ -606,7 +648,7 @@ mod tests {
                 ..request()
             };
 
-            let message = HcsVmConfigBuilder::build(&request, &system_disk_path)
+            let message = HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path)
                 .unwrap_err()
                 .to_string();
 
@@ -618,7 +660,8 @@ mod tests {
     #[test]
     fn removes_the_network_adapter_section_and_nothing_else() {
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
-        let created = HcsVmConfigBuilder::build(&request(), &system_disk_path).unwrap();
+        let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
+        let created = HcsVmConfigBuilder::build(&request(), &system_disk_path, &seed_path).unwrap();
         let attached = apply_network_adapter(
             &created,
             Uuid::from_u128(0x3f2b_0c11_5c78_4c1b_9e2f_3a8b_7d4c_6e50),
@@ -643,7 +686,8 @@ mod tests {
         // Byte-identical, not merely equivalent: `VmStartPipeline` decides
         // whether to rewrite `config.json` by comparing the two strings.
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
-        let created = HcsVmConfigBuilder::build(&request(), &system_disk_path).unwrap();
+        let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
+        let created = HcsVmConfigBuilder::build(&request(), &system_disk_path, &seed_path).unwrap();
 
         let removed = remove_network_adapter(&created).unwrap();
 
@@ -675,12 +719,13 @@ mod tests {
     #[test]
     fn rejects_an_invalid_request_before_serializing() {
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
+        let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
         let request = VmCreateRequest {
             name: String::new(),
             ..request()
         };
 
-        assert!(HcsVmConfigBuilder::build(&request, &system_disk_path).is_err());
+        assert!(HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path).is_err());
     }
 
     #[test]
@@ -690,9 +735,12 @@ mod tests {
             cpu_cores: 4,
             ..request()
         };
-        let document =
-            HcsVmConfigBuilder::build(&request, &PathBuf::from("C:\\vms\\a\\disks\\system.vhdx"))
-                .unwrap();
+        let document = HcsVmConfigBuilder::build(
+            &request,
+            &PathBuf::from("C:\\vms\\a\\disks\\system.vhdx"),
+            &PathBuf::from("C:\\vms\\test-vm\\seed.iso"),
+        )
+        .unwrap();
 
         assert_eq!(
             read_topology(&document).unwrap(),
@@ -706,7 +754,8 @@ mod tests {
     #[test]
     fn applying_a_topology_changes_only_memory_and_processors() {
         let system_disk_path = PathBuf::from("C:\\vms\\a\\disks\\system.vhdx");
-        let document = HcsVmConfigBuilder::build(&request(), &system_disk_path).unwrap();
+        let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
+        let document = HcsVmConfigBuilder::build(&request(), &system_disk_path, &seed_path).unwrap();
 
         let updated = apply_topology(
             &document,
@@ -770,9 +819,12 @@ mod tests {
 
     #[test]
     fn attaching_an_adapter_names_the_endpoint_and_its_mac_address() {
-        let document =
-            HcsVmConfigBuilder::build(&request(), &PathBuf::from("C:\\vms\\a\\disks\\system.vhdx"))
-                .unwrap();
+        let document = HcsVmConfigBuilder::build(
+            &request(),
+            &PathBuf::from("C:\\vms\\a\\disks\\system.vhdx"),
+            &PathBuf::from("C:\\vms\\test-vm\\seed.iso"),
+        )
+        .unwrap();
 
         let updated: Value = serde_json::from_str(&with_adapter(&document)).unwrap();
 
@@ -790,7 +842,8 @@ mod tests {
     #[test]
     fn attaching_an_adapter_changes_nothing_else() {
         let system_disk_path = PathBuf::from("C:\\vms\\a\\disks\\system.vhdx");
-        let document = HcsVmConfigBuilder::build(&request(), &system_disk_path).unwrap();
+        let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
+        let document = HcsVmConfigBuilder::build(&request(), &system_disk_path, &seed_path).unwrap();
 
         let before: Value = serde_json::from_str(&document).unwrap();
         let mut after: Value = serde_json::from_str(&with_adapter(&document)).unwrap();
@@ -808,9 +861,12 @@ mod tests {
     fn attaching_the_same_adapter_twice_yields_the_same_document() {
         // Every start rewrites the section, so a VM that has already been
         // started must not accumulate adapters or churn its configuration file.
-        let document =
-            HcsVmConfigBuilder::build(&request(), &PathBuf::from("C:\\vms\\a\\disks\\system.vhdx"))
-                .unwrap();
+        let document = HcsVmConfigBuilder::build(
+            &request(),
+            &PathBuf::from("C:\\vms\\a\\disks\\system.vhdx"),
+            &PathBuf::from("C:\\vms\\test-vm\\seed.iso"),
+        )
+        .unwrap();
 
         let once = with_adapter(&document);
 
@@ -822,9 +878,12 @@ mod tests {
         // A detach names the adapter by this key in its resource path. A
         // spelling that drifts from the one the section uses detaches nothing
         // and still reports success, so both sides read it from here.
-        let document =
-            HcsVmConfigBuilder::build(&request(), &PathBuf::from("C:\\vms\\a\\disks\\system.vhdx"))
-                .unwrap();
+        let document = HcsVmConfigBuilder::build(
+            &request(),
+            &PathBuf::from("C:\\vms\\a\\disks\\system.vhdx"),
+            &PathBuf::from("C:\\vms\\test-vm\\seed.iso"),
+        )
+        .unwrap();
         let updated: Value = serde_json::from_str(&with_adapter(&document)).unwrap();
 
         let key = adapter_key(ENDPOINT_ID);

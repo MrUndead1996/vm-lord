@@ -3,12 +3,12 @@
 use std::{fs, path::Path, time::Duration};
 
 use uuid::Uuid;
-use vmlord_core::{RepositoryError, VmCreateRequest};
+use vmlord_core::{RepositoryError, VmCreateRequest, VmSource};
 
 use crate::{
     HcsClient,
     cleanup::{self, SystemTeardown},
-    hcs_config::{HcsVmConfigBuilder, local_media_path},
+    hcs_config::{self, HcsVmConfigBuilder},
     layout,
     metadata::{MetadataStore, VmComputeSystemMapping},
     vhd::create_dynamic_vhdx,
@@ -86,10 +86,11 @@ impl VmCreationPipeline {
         let vm_id = Uuid::new_v4();
         let hcs_compute_system_id = format!("vmlord-{}", vm_id.as_simple());
         let system_disk_path = layout::system_disk_path(vm_directory);
+        let seed_path = layout::seed_path(vm_directory);
         // Rejects an unsupported request (name, GPU/network mode, ...) before
         // any filesystem or HCS side effect.
-        let configuration = HcsVmConfigBuilder::build(request, &system_disk_path)?;
-        let image_path = local_media_path(request)?;
+        let configuration = HcsVmConfigBuilder::build(request, &system_disk_path, &seed_path)?;
+        let media_path = hcs_config::media_path(request, &seed_path).to_path_buf();
 
         log::info!(
             "creating VM \"{}\" ({vm_id}) as HCS compute system \"{hcs_compute_system_id}\"",
@@ -126,9 +127,10 @@ impl VmCreationPipeline {
                 u64::from(request.disk_gb) * BYTES_PER_GIB,
             )?;
 
-            if !Path::new(image_path).is_file() {
+            if matches!(request.source, VmSource::LocalMedia { .. }) && !media_path.is_file() {
                 return Err(RepositoryError::new(format!(
-                    "VM image no longer exists: {image_path}"
+                    "VM image no longer exists: {}",
+                    media_path.display()
                 )));
             }
 
@@ -141,7 +143,7 @@ impl VmCreationPipeline {
             // fails with access denied even though both files exist and are
             // readable by this (elevated) process.
             (self.access_granter)(&hcs_compute_system_id, &system_disk_path)?;
-            (self.access_granter)(&hcs_compute_system_id, Path::new(image_path))?;
+            (self.access_granter)(&hcs_compute_system_id, &media_path)?;
 
             (self.system_creator)(&hcs_compute_system_id, &configuration)?;
             system_created = true;
