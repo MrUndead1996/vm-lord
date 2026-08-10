@@ -53,4 +53,5 @@ pub use reconnect::{
 pub use repository::HcsVmRepository;
 pub use shutdown::VmShutdownPipeline;
 pub use start::VmStartPipeline;
+pub use vm_key::{read_public_key, write_key_pair};
 pub use watch::{HcsEventKind, HcsVmEvent, SystemWatch, VmEventSink};

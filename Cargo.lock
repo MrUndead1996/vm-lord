@@ -4222,6 +4222,7 @@ dependencies = [
  "uuid",
  "vmlord-core",
  "vmlord-image",
+ "vmlord-keys",
  "windows 0.61.3",
 ]
 

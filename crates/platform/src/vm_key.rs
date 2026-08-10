@@ -3,9 +3,14 @@
 //! The private half is the one secret VMLord stores in a file, so the file
 //! carries an explicit DACL rather than whatever the storage root hands down.
 
-use std::path::Path;
+use std::{
+    fs::{self, File},
+    io::{self, ErrorKind, Write},
+    path::Path,
+};
 
 use vmlord_core::RepositoryError;
+use vmlord_keys::VmKeyPair;
 use windows::{
     Win32::{
         Foundation::{CloseHandle, HANDLE, HLOCAL, LocalFree},
@@ -23,7 +28,80 @@ use windows::{
     core::{BOOL, HSTRING, PWSTR},
 };
 
-use crate::error::windows_error;
+use crate::{error::windows_error, layout};
+
+/// Writes `pair` into the VM's directory: the private half under a restricted
+/// DACL, the public half beside it.
+///
+/// The order matters. The file is created empty, its DACL is narrowed, and
+/// only then does the key go in: between `create_new` and
+/// `SetNamedSecurityInfoW` the file carries whatever the storage root hands
+/// down, and what sits there during that window must not be a private key.
+pub fn write_key_pair(vm_directory: &Path, pair: &VmKeyPair) -> Result<(), RepositoryError> {
+    let private_path = layout::ssh_key_path(vm_directory);
+    let keys_directory = private_path
+        .parent()
+        .expect("the private key path always has a parent under vm_directory");
+    fs::create_dir_all(keys_directory)
+        .map_err(|error| io_failure("create the keys directory", keys_directory, &error))?;
+
+    let mut file = match File::create_new(&private_path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            let error = RepositoryError::new(format!(
+                "VM directory {} already has an SSH key",
+                vm_directory.display()
+            ));
+            log::error!("{error}");
+            return Err(error);
+        }
+        Err(error) => return Err(io_failure("create the private key", &private_path, &error)),
+    };
+
+    // A failure here is a failure of the whole write: the file exists, and
+    // leaving a private key under inherited permissions is worse than failing.
+    if let Err(error) = restrict_to_owner(&private_path) {
+        drop(file);
+        let _ = fs::remove_file(&private_path);
+        return Err(error);
+    }
+
+    file.write_all(pair.private_openssh().as_bytes())
+        .and_then(|()| file.flush())
+        .map_err(|error| io_failure("write the private key", &private_path, &error))?;
+
+    let public_path = layout::ssh_public_key_path(vm_directory);
+    fs::write(&public_path, pair.public_openssh())
+        .map_err(|error| io_failure("write the public key", &public_path, &error))?;
+
+    log::debug!("wrote an SSH key pair into {}", keys_directory.display());
+    Ok(())
+}
+
+/// Reads the VM's public key back, as an `authorized_keys` line.
+///
+/// A VM with no key at all is a normal state -- SSH can be turned off -- so an
+/// absent file is `None` rather than a failure.
+pub fn read_public_key(vm_directory: &Path) -> Result<Option<String>, RepositoryError> {
+    let path = layout::ssh_public_key_path(vm_directory);
+    match fs::read_to_string(&path) {
+        Ok(key) => Ok(Some(key.trim_end().to_string())),
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            log::debug!("VM directory {} holds no SSH key", vm_directory.display());
+            Ok(None)
+        }
+        Err(error) => Err(io_failure("read the public key", &path, &error)),
+    }
+}
+
+fn io_failure(operation: &str, path: &Path, error: &io::Error) -> RepositoryError {
+    let error = RepositoryError::new(format!(
+        "failed to {operation} at {}: {error}",
+        path.display()
+    ));
+    log::error!("{error}");
+    error
+}
 
 /// A wide string the Windows API allocated and this process has to release.
 struct LocalString(PWSTR);
@@ -240,7 +318,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::{restrict_to_owner, security_descriptor};
+    use super::{read_public_key, restrict_to_owner, security_descriptor, write_key_pair};
 
     struct TempRoot(PathBuf);
 
@@ -283,6 +361,69 @@ mod tests {
             descriptor.matches("(A;;FA;;;").count(),
             3,
             "SYSTEM, Administrators and the owner, and nobody else: {descriptor}"
+        );
+    }
+
+    #[test]
+    fn writing_a_pair_leaves_both_halves_in_the_vms_keys_directory() {
+        let root = temp_root("write");
+        let pair = vmlord_keys::generate("dev-linux").expect("a key pair should be generated");
+
+        write_key_pair(&root.0, &pair).expect("the key pair should be written");
+
+        let private = fs::read_to_string(crate::layout::ssh_key_path(&root.0))
+            .expect("the private key should be on disk");
+        assert_eq!(private, pair.private_openssh());
+        assert_eq!(
+            read_public_key(&root.0).expect("the public key should be readable"),
+            Some(pair.public_openssh().to_string())
+        );
+    }
+
+    #[test]
+    fn the_private_key_is_written_with_a_restricted_dacl() {
+        let root = temp_root("write-dacl");
+        let pair = vmlord_keys::generate("dev-linux").expect("a key pair should be generated");
+
+        write_key_pair(&root.0, &pair).expect("the key pair should be written");
+
+        let descriptor = security_descriptor(&crate::layout::ssh_key_path(&root.0))
+            .expect("the DACL should be read back");
+        assert!(descriptor.contains("D:P"), "{descriptor}");
+        assert!(!descriptor.contains(";ID;"), "{descriptor}");
+    }
+
+    /// A guest already holds the public half of the key it was given; handing
+    /// the VM a new pair would leave the guest trusting a key the host no
+    /// longer has. Re-keying is deleting the VM and creating it again.
+    #[test]
+    fn a_vm_that_already_has_a_key_is_never_given_another_one() {
+        let root = temp_root("existing");
+        let first = vmlord_keys::generate("dev-linux").expect("a key pair should be generated");
+        let second = vmlord_keys::generate("dev-linux").expect("a key pair should be generated");
+        write_key_pair(&root.0, &first).expect("the first key pair should be written");
+
+        let message = write_key_pair(&root.0, &second)
+            .expect_err("a second key pair must be refused")
+            .to_string();
+
+        assert!(message.contains("already has an SSH key"), "{message}");
+        assert_eq!(
+            read_public_key(&root.0).expect("the public key should be readable"),
+            Some(first.public_openssh().to_string()),
+            "the existing key must survive the refusal"
+        );
+    }
+
+    /// A VM created with `ssh_enabled: false` has no key, and that is a state
+    /// rather than a failure.
+    #[test]
+    fn a_vm_without_a_key_reports_no_key_rather_than_an_error() {
+        let root = temp_root("keyless");
+
+        assert_eq!(
+            read_public_key(&root.0).expect("a keyless VM is not a failure"),
+            None
         );
     }
 

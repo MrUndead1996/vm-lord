@@ -46,11 +46,27 @@ pub(crate) fn system_disk_path(vm_directory: &Path) -> PathBuf {
     vm_directory.join("disks").join("system.vhdx")
 }
 
+/// Returns the path of the VM's own SSH private key.
+pub(crate) fn ssh_key_path(vm_directory: &Path) -> PathBuf {
+    vm_directory.join("keys").join("id_ed25519")
+}
+
+/// Returns the path of the VM's own SSH public key.
+///
+/// The public half is derivable from the private one in microseconds, so this
+/// file is a convenience rather than a necessity: it lets a person see which
+/// key went into the guest without starting the VM.
+pub(crate) fn ssh_public_key_path(vm_directory: &Path) -> PathBuf {
+    vm_directory.join("keys").join("id_ed25519.pub")
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
 
-    use super::{configuration_path, system_disk_path, vm_directory};
+    use super::{
+        configuration_path, ssh_key_path, ssh_public_key_path, system_disk_path, vm_directory,
+    };
 
     #[test]
     fn a_plain_name_becomes_a_directory_under_the_storage_root() {
@@ -67,6 +83,26 @@ mod tests {
                 .join("dev-linux")
                 .join("disks")
                 .join("system.vhdx")
+        );
+    }
+
+    #[test]
+    fn a_vms_key_pair_lives_beside_its_disks() {
+        let directory = vm_directory(Path::new("/vms"), "dev-linux").unwrap();
+
+        assert_eq!(
+            ssh_key_path(&directory),
+            PathBuf::from("/vms")
+                .join("dev-linux")
+                .join("keys")
+                .join("id_ed25519")
+        );
+        assert_eq!(
+            ssh_public_key_path(&directory),
+            PathBuf::from("/vms")
+                .join("dev-linux")
+                .join("keys")
+                .join("id_ed25519.pub")
         );
     }
 
