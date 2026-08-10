@@ -202,7 +202,7 @@ at build time: `image` is where the network lives (`ureq`, TLS, HTTP), and
 pulling it into the crate that already holds every `unsafe` HCS call and every
 raw handle would be one more thing to hold in mind while reading `platform`,
 for the sake of a single call. `image` stays a dev-dependency there instead,
-used only by the `#[ignore]`d Hyper-V test that exercises a real cloud image;
+used only by the `#[ignore]`d tests that exercise a real cloud image;
 the composition root is where the two halves meet in production, described in
 "Creating a VM from a cloud image" below.
 
@@ -942,9 +942,9 @@ reproducible and the crate free of calendar arithmetic `std` does not have.
 
 The image is returned as bytes rather than written to a file, so `crates/seed`
 still knows no filesystem; `platform::create` writes them into the VM's
-directory as `seed.iso` and attaches it. The root directory grows by whole sectors as records need them, which is
-what lets the same transport carry a guest agent later without touching the
-writer.
+directory as `seed.iso` and attaches it. The root directory grows by whole
+sectors as records need them, which is what lets the same transport carry a
+guest agent later without touching the writer.
 
 One limitation, stated rather than forgotten: `/etc/default/keyboard` is
 Debian-family. Fedora keeps the setting in `/etc/vconsole.conf` under different
@@ -964,8 +964,10 @@ order is what makes it one. Everything that can refuse the request refuses it
 before a single side effect: `VmCreateRequest::validate`, the duplicate-name
 check against the metadata store, the "directory already exists" check, and
 `HcsVmConfigBuilder::build`, which is called this early precisely because it is
-where an unsupported GPU or network mode is rejected. Only then does the VM get
-an id, an HCS compute-system id (`vmlord-<uuid>`) and a directory.
+where an unsupported GPU or network mode is rejected. The VM's id and its HCS
+compute-system id (`vmlord-` followed by the id's 32 hex digits, undashed) are
+minted just before the document is built, since neither leaves a trace on disk;
+only then does the VM get a directory.
 
 Inside the directory the cloud branch does two things the local-media branch
 does not. `CloudDiskImporter` turns the release into the system disk -- the
