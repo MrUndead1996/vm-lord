@@ -596,7 +596,7 @@ ready. It calls `asb_detach` on exit so it never stops VMs.
 directory configured as `image_cache_path`. It is a separate crate rather than
 part of `core` or `platform`: `core` carries no I/O dependencies, and `platform`
 is the Windows-specific layer where `unsafe` is allowed, while downloading needs
-neither. The qcow2 reader and the release resolver will join it there.
+neither. The qcow2 reader and the release resolver live there too.
 
 The cache is addressed by content: an entry is named after the SHA256 it is
 expected to have, so two releases cannot collide on a name and a file whose name
@@ -671,6 +671,50 @@ parses but does not list the image: the first means the server sent something
 else -- typically an HTML error page with status 200 -- and the second means the
 distribution publishes no such build. The checksum list is never cached: it is
 what says which build is current.
+
+### Reading a qcow2 image
+
+`Qcow2Image` turns a downloaded image back into the disk it holds: a
+`Read + Seek` stream where offset zero is the guest's sector zero, the stream
+ends at the disk's virtual size, and a hole reads as the zeros the guest would
+see. That is the whole interface the VHDX importer needs.
+
+Parsing the format is the `qcow` crate's work (MIT, panda-re/qcow-rs): headers,
+L1 and L2 tables, zlib and zstd clusters. Writing that again was never worth it.
+Mapping a guest offset onto those tables is ours, and the crate's own `Reader` is
+deliberately not used: it opens the backing file named in the header -- any path
+the image cares to name, opened on the host -- zero-fills a failed cluster read
+instead of reporting it, and panics on several malformed inputs. On a file
+fetched over HTTP none of that is acceptable, and the lookup that replaces it is
+fifty lines.
+
+The header is vetted before the parser is given the file, in
+`image::qcow2::header`. Two things are being defended against. The first is
+features: a qcow2 file states what a reader must understand, the spec requires
+refusing an image whose incompatible bits one does not know, and the crate
+discards the unknown bits while parsing -- so the field is read as the raw 64
+bits it is. Exactly one bit is accepted, the one that says the compression type
+field is present, and zstd is the only value behind it. Backing files,
+encryption, internal snapshots, external data files and extended L2 entries are
+each refused by name. The second is arithmetic: every count in the header becomes
+an allocation in the parser, and an image claiming four billion L1 entries is a
+few bytes to write and gigabytes to open, so the counts, the offsets and the
+header extensions are all bounded while the file is still nothing but bytes.
+Afterwards the parser's reading of the header is compared against ours, because a
+check passed against one reading protects nothing if reads are served against
+another.
+
+The size of the disk is settled at the same moment. An image whose virtual size
+exceeds the capacity it is headed for -- the VM's `disk_gb` -- is refused on
+opening rather than part way through writing a VHDX.
+
+Tests read fixtures written by qemu-img and committed under
+`crates/image/tests/fixtures/qcow2` (regenerate with `generate.sh`): a sparse
+image whose first cluster is a hole, the same disk in zlib and in zstd clusters
+with a different cluster size, an overlay with a backing file, and a legacy
+version 1 image. Their guest content is a pattern the tests recompute rather than
+store, so a disk that comes back plausible but misaligned still fails. A real
+cloud image is read by the `#[ignore]`d test behind `VMLORD_TEST_CLOUD_IMAGE`.
 
 ### VM update contract
 
