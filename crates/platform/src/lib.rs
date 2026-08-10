@@ -31,6 +31,7 @@ mod shutdown;
 mod start;
 mod subnet;
 mod vhd;
+mod vm_key;
 mod watch;
 
 pub use create::VmCreationPipeline;
