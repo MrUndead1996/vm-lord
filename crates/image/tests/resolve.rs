@@ -3,7 +3,7 @@
 mod support;
 
 use support::{Behaviour, TestServer};
-use vmlord_image::{DistroProfile, ResolveError, UBUNTU, resolve_image};
+use vmlord_image::{DistroProfile, ResolveError, resolve_image, ubuntu};
 
 const FIXTURE: &str = include_str!("fixtures/ubuntu-24.04-SHA256SUMS");
 
@@ -13,14 +13,12 @@ const FIXTURE: &str = include_str!("fixtures/ubuntu-24.04-SHA256SUMS");
 /// stubbed-out HTTP client, and the code under test is the same code that runs
 /// in production.
 ///
-/// The template is leaked because the port is only known at runtime while the
-/// field is `&'static str`. A handful of leaked strings in a test binary that
-/// exits seconds later is the cheaper end of the trade against making every
-/// profile own its strings for the sake of the tests.
+/// The port is only known at run time, which the owned template takes in its
+/// stride.
 fn profile_for(server: &TestServer) -> DistroProfile {
     DistroProfile {
-        directory_template: Box::leak(format!("{}{{release}}/", server.base_url()).into_boxed_str()),
-        ..UBUNTU
+        directory_template: format!("{}{{release}}/", server.base_url()),
+        ..ubuntu()
     }
 }
 

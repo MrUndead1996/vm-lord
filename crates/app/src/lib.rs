@@ -322,8 +322,7 @@ impl WorkspaceApp {
             .find(|vm| vm.name == request.name)
             .map(|vm| vm.state)
             .ok_or_else(|| {
-                let error =
-                    RepositoryError::new(format!("VM \"{}\" was not found", request.name));
+                let error = RepositoryError::new(format!("VM \"{}\" was not found", request.name));
                 self.diagnostics.push(Diagnostic {
                     level: DiagnosticLevel::Error,
                     message: error.to_string(),
@@ -904,8 +903,7 @@ mod tests {
 
         assert!(
             app.diagnostics().iter().any(|diagnostic| {
-                diagnostic.level == DiagnosticLevel::Warning
-                    && diagnostic.message.contains("disks")
+                diagnostic.level == DiagnosticLevel::Warning && diagnostic.message.contains("disks")
             }),
             "keeping the disks leaves the VM directory behind and the user must be told"
         );

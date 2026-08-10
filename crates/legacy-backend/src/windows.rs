@@ -12,7 +12,7 @@ use libloading::Library;
 use vmlord_app::{ImagePicker, SettingsPathPicker};
 use vmlord_core::{
     AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError,
-    VmCreateRequest, VmRepository, VmState, VmSummary, VmUpdateRequest,
+    VmCreateRequest, VmRepository, VmSource, VmState, VmSummary, VmUpdateRequest,
 };
 
 type AsbVm = *mut c_void;
@@ -248,9 +248,21 @@ impl VmRepository for AppSandboxBackend {
 
         let name = wide_string(&request.name);
         let os_type = wide_string("Linux");
-        let image_path = wide_string(&request.image_path);
-        let username = wide_string(&request.username);
-        let password = wide_string(&request.password);
+        // AppSandbox's own model is "installation media plus unattended
+        // answers", which the domain no longer spells: a local medium means a
+        // hand-installed system. The credentials therefore go over empty, and
+        // iso-patch performs no unattended install. The legacy backend is
+        // transitional (AGENTS.md), and #66 removes iso-patch altogether.
+        let image_path = match &request.source {
+            VmSource::LocalMedia { path } => wide_string(path),
+            VmSource::CloudImage { .. } => {
+                return Err(RepositoryError::new(
+                    "the legacy AppSandbox backend cannot create a VM from a cloud image",
+                ));
+            }
+        };
+        let username = wide_string("");
+        let password = wide_string("");
         let config = AsbVmConfig {
             name: name.as_ptr(),
             os_type: os_type.as_ptr(),
@@ -265,8 +277,8 @@ impl VmRepository for AppSandboxBackend {
             username: username.as_ptr(),
             password: password.as_ptr(),
             test_mode: 1,
-            ssh_enabled: i32::from(request.ssh_enabled),
-            ssh_deploy_key: i32::from(request.ssh_deploy_key),
+            ssh_enabled: 0,
+            ssh_deploy_key: 0,
             is_template: 0,
             linux_source: ptr::null(),
             locale: ptr::null(),

@@ -292,7 +292,9 @@ fn a_download_truncated_after_its_tables_fails_where_the_data_stops() {
     let stopped_at = image.stream_position().expect("the position survives") as usize;
     let previous = stopped_at - 4096;
     assert!(
-        reference()[previous..stopped_at].iter().any(|byte| *byte != 0),
+        reference()[previous..stopped_at]
+            .iter()
+            .any(|byte| *byte != 0),
         "the cluster this comes back to must not be a hole, or nothing is being tested"
     );
 

@@ -126,7 +126,10 @@ impl fmt::Display for ResolveError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidRelease(value) => {
-                write!(formatter, "{value:?} is not a release version like \"24.04\"")
+                write!(
+                    formatter,
+                    "{value:?} is not a release version like \"24.04\""
+                )
             }
             Self::Http(message) => write!(formatter, "the release lookup failed: {message}"),
             Self::UnexpectedStatus { status } => write!(

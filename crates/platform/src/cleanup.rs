@@ -191,7 +191,8 @@ mod tests {
         let root = temp_root("populated");
         let vm_directory = root.0.join("vm");
         fs::create_dir_all(vm_directory.join("disks")).expect("disks directory should be created");
-        fs::write(vm_directory.join("config.json"), b"{}").expect("configuration should be written");
+        fs::write(vm_directory.join("config.json"), b"{}")
+            .expect("configuration should be written");
         fs::write(vm_directory.join("disks").join("system.vhdx"), b"vhdx")
             .expect("disk should be written");
 

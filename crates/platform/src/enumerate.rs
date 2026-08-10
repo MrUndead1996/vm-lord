@@ -134,7 +134,9 @@ mod tests {
     use uuid::Uuid;
     use vmlord_core::NetworkMode;
 
-    use super::{HcsSystemState, HcsSystemSummary, KnownVm, open_by_vm_id, open_by_vm_name, reconcile};
+    use super::{
+        HcsSystemState, HcsSystemSummary, KnownVm, open_by_vm_id, open_by_vm_name, reconcile,
+    };
     use crate::metadata::{MetadataStore, VmComputeSystemMapping};
 
     fn temporary_mapping_file() -> std::path::PathBuf {

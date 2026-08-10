@@ -10,11 +10,10 @@ use uuid::Uuid;
 use vmlord_core::{NetworkMode, RepositoryError};
 
 use crate::{
-    HcsClient, HcsSystem,
+    HcsClient, HcsSystem, cleanup,
     dhcp::{self, DhcpRegistrar},
     hcn::HcnNetwork,
     hcn_endpoint::{EndpointAddress, HcnEndpoint},
-    cleanup,
     hcs::{HCS_ACCESS_ALL, HcsStartFailure},
     hcs_config, layout,
     metadata::{MetadataStore, VmComputeSystemMapping},
@@ -435,9 +434,7 @@ fn ensure_endpoint(
                     "replacing the occupied endpoint of VM \"{vm_name}\" with {id} on {}",
                     address.ip_address
                 ),
-                None => log::info!(
-                    "replacing the occupied endpoint of VM \"{vm_name}\" with {id}"
-                ),
+                None => log::info!("replacing the occupied endpoint of VM \"{vm_name}\" with {id}"),
             }
             (
                 id,
@@ -518,7 +515,9 @@ fn start_hcs_system(id: &str, configuration: &str) -> Result<(), HcsStartFailure
 /// failed, it does not decide it.
 fn tear_down_after_a_failed_creation(id: &str, failure: HcsStartFailure) -> HcsStartFailure {
     if let Err(error) = cleanup::teardown_compute_system(id) {
-        log::warn!("cleanup of the ambiguously-created compute system \"{id}\" also failed: {error}");
+        log::warn!(
+            "cleanup of the ambiguously-created compute system \"{id}\" also failed: {error}"
+        );
     }
     failure
 }
@@ -1261,7 +1260,10 @@ mod tests {
         .start(&fixture.store, "dev", &fixture.vm_directory)
         .expect_err("a start that cannot serve the guest its address must fail");
 
-        assert!(error.to_string().contains("injected DHCP failure"), "{error}");
+        assert!(
+            error.to_string().contains("injected DHCP failure"),
+            "{error}"
+        );
         assert!(calls.start.lock().unwrap().is_empty());
     }
 

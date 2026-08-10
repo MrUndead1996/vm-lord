@@ -218,7 +218,10 @@ mod tests {
             Ipv4Addr::new(9, 9, 9, 9),
         ];
 
-        assert_eq!(usable(configured, vmlord()), vec![Ipv4Addr::new(9, 9, 9, 9)]);
+        assert_eq!(
+            usable(configured, vmlord()),
+            vec![Ipv4Addr::new(9, 9, 9, 9)]
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::{
 
 use serde::Serialize;
 use uuid::Uuid;
-use vmlord_core::{GpuMode, NetworkMode, RepositoryError, VmCreateRequest};
+use vmlord_core::{GpuMode, NetworkMode, RepositoryError, VmCreateRequest, VmSource};
 use windows::core::GUID;
 
 /// Builds HCS compute-system configuration documents from a validated
@@ -16,8 +16,8 @@ pub(crate) struct HcsVmConfigBuilder;
 
 impl HcsVmConfigBuilder {
     /// Builds the JSON configuration for `request`, attaching
-    /// `system_disk_path` as the VM's boot disk and `request.image_path` as
-    /// its installer ISO.
+    /// `system_disk_path` as the VM's boot disk and the installer ISO of its
+    /// source as the second attachment.
     ///
     /// GPU configuration is not yet implemented; any mode other than `None` is
     /// rejected. Networking accepts `None` and `NetworkMode::Nat`; a NAT VM
@@ -36,6 +36,7 @@ impl HcsVmConfigBuilder {
             )));
         }
         ensure_supported_network_mode(request.network_mode)?;
+        let image_path = local_media_path(request)?;
 
         let attachments = BTreeMap::from([
             (
@@ -49,7 +50,7 @@ impl HcsVmConfigBuilder {
                 "1".to_string(),
                 Attachment {
                     attachment_type: "Iso",
-                    path: PathBuf::from(&request.image_path),
+                    path: PathBuf::from(image_path),
                 },
             ),
         ]);
@@ -97,6 +98,25 @@ impl HcsVmConfigBuilder {
         serde_json::to_string(&configuration).map_err(|error| {
             RepositoryError::new(format!("failed to serialize HCS VM configuration: {error}"))
         })
+    }
+}
+
+/// The path of the installer ISO, or a refusal naming the task that will teach
+/// the pipeline to build a VM from a cloud image.
+///
+/// Same shape as [`ensure_supported_network_mode`]: an unsupported request is
+/// refused in one place, with a message that says which task lifts the refusal.
+pub(crate) fn local_media_path(request: &VmCreateRequest) -> Result<&str, RepositoryError> {
+    match &request.source {
+        VmSource::LocalMedia { path } => Ok(path),
+        VmSource::CloudImage { .. } => {
+            let error = RepositoryError::new(
+                "the HCS backend cannot build a VM from a cloud image yet; \
+                 seed generation and provisioning arrive with #61",
+            );
+            log::error!("{error}");
+            Err(error)
+        }
     }
 }
 
@@ -401,7 +421,10 @@ mod tests {
 
     use serde_json::{Value, json};
     use uuid::Uuid;
-    use vmlord_core::{GpuMode, NetworkMode, VmCreateRequest};
+    use vmlord_core::{
+        CloudImage, GpuMode, NetworkMode, Password, Provisioning, SshAccess, VmCreateRequest,
+        VmSource, ubuntu,
+    };
 
     use super::{
         HcsVmConfigBuilder, VmTopology, adapter_key, apply_network_adapter, apply_topology,
@@ -411,17 +434,44 @@ mod tests {
     fn request() -> VmCreateRequest {
         VmCreateRequest {
             name: "test-vm".into(),
-            image_path: "C:\\images\\installer.iso".into(),
+            source: VmSource::LocalMedia {
+                path: "C:\\images\\installer.iso".into(),
+            },
             ram_mb: 512,
             disk_gb: 1,
             cpu_cores: 1,
             gpu_mode: GpuMode::None,
             network_mode: NetworkMode::None,
-            username: "admin".into(),
-            password: "password".into(),
-            ssh_enabled: true,
-            ssh_deploy_key: false,
         }
+    }
+
+    #[test]
+    fn a_cloud_image_is_refused_with_the_task_that_will_support_it() {
+        let request = VmCreateRequest {
+            source: VmSource::CloudImage {
+                image: CloudImage {
+                    profile: ubuntu(),
+                    release: "24.04".into(),
+                },
+                provisioning: Provisioning {
+                    username: "user".into(),
+                    password: Some(Password::new("secret")),
+                    ssh: SshAccess::Enabled { deploy_key: true },
+                    locale: "en_US.UTF-8".into(),
+                    keyboard: "us".into(),
+                    timezone: "Europe/Moscow".into(),
+                },
+            },
+            ..request()
+        };
+
+        let error = HcsVmConfigBuilder::build(
+            &request,
+            &PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx"),
+        )
+        .expect_err("the pipeline cannot provision a cloud image yet");
+
+        assert!(error.to_string().contains("#61"), "got {error}");
     }
 
     #[test]
@@ -492,10 +542,7 @@ mod tests {
 
     #[test]
     fn omits_request_secrets() {
-        let request = VmCreateRequest {
-            password: "secret \"password\"".into(),
-            ..request()
-        };
+        let request = VmCreateRequest { ..request() };
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
 
         let document = HcsVmConfigBuilder::build(&request, &system_disk_path).unwrap();

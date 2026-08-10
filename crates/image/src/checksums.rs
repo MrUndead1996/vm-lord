@@ -138,8 +138,7 @@ mod tests {
 
     #[test]
     fn carriage_returns_do_not_become_part_of_the_name() {
-        let text =
-            "0533b0655c32e68b31d792ecd6ccfca95abdbc536c4446874fe0513bd4140ffe *dos.img\r\n";
+        let text = "0533b0655c32e68b31d792ecd6ccfca95abdbc536c4446874fe0513bd4140ffe *dos.img\r\n";
 
         assert!(parse_sha256sums(text, "dos.img", URL).is_ok());
     }

@@ -296,8 +296,8 @@ mod tests {
                 ..Behavior::default()
             },
         )
-            .force_stop(&fixture.store, "dev")
-            .expect_err("a failed force stop must be reported");
+        .force_stop(&fixture.store, "dev")
+        .expect_err("a failed force stop must be reported");
 
         assert!(error.to_string().contains("injected termination failure"));
         assert_eq!(fixture.terminations.lock().unwrap().len(), 1);

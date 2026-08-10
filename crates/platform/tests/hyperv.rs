@@ -16,7 +16,8 @@ use std::{
 
 use uuid::Uuid;
 use vmlord_core::{
-    GpuMode, NetworkMode, VmCreateRequest, VmDeleteRequest, VmRepository, VmState, VmSummary,
+    GpuMode, NetworkMode, VmCreateRequest, VmDeleteRequest, VmRepository, VmSource, VmState,
+    VmSummary,
 };
 use vmlord_platform::{
     EndpointAddress, HcnEndpoint, HcnNetwork, HcsClient, HcsOperation, HcsSystem, HcsSystemState,
@@ -92,16 +93,12 @@ fn a_terminated_vm_reports_its_exit() {
 
     let request = VmCreateRequest {
         name: format!("vmlord-e2e-watch-test-{}", std::process::id()),
-        image_path,
+        source: VmSource::LocalMedia { path: image_path },
         ram_mb: 2048,
         disk_gb: 8,
         cpu_cores: 2,
         gpu_mode: GpuMode::None,
         network_mode: NetworkMode::None,
-        username: "admin".into(),
-        password: "not used by a watch".into(),
-        ssh_enabled: false,
-        ssh_deploy_key: false,
     };
     let vm_name = request.name.clone();
     // The same mapping file `HcsVmRepository::new` builds its own store from,
@@ -170,16 +167,14 @@ fn creates_and_persists_a_compute_system_end_to_end() {
 
     let request = VmCreateRequest {
         name: format!("vmlord-e2e-test-{}", std::process::id()),
-        image_path: image_path.to_string_lossy().into_owned(),
+        source: VmSource::LocalMedia {
+            path: image_path.to_string_lossy().into_owned(),
+        },
         ram_mb: 512,
         disk_gb: 1,
         cpu_cores: 1,
         gpu_mode: GpuMode::None,
         network_mode: NetworkMode::None,
-        username: "admin".into(),
-        password: "not used by create".into(),
-        ssh_enabled: false,
-        ssh_deploy_key: false,
     };
     let store = MetadataStore::new(root.join("vm-mapping.json"));
     let vm_directory = root.join("vm");
@@ -225,16 +220,14 @@ fn enumerates_and_reopens_a_created_vm() {
 
     let request = VmCreateRequest {
         name: format!("vmlord-e2e-enum-test-{}", std::process::id()),
-        image_path: image_path.to_string_lossy().into_owned(),
+        source: VmSource::LocalMedia {
+            path: image_path.to_string_lossy().into_owned(),
+        },
         ram_mb: 512,
         disk_gb: 1,
         cpu_cores: 1,
         gpu_mode: GpuMode::None,
         network_mode: NetworkMode::None,
-        username: "admin".into(),
-        password: "not used by create".into(),
-        ssh_enabled: false,
-        ssh_deploy_key: false,
     };
     let store = MetadataStore::new(root.join("vm-mapping.json"));
     let vm_directory = root.join("vm");
@@ -302,16 +295,12 @@ fn starts_a_created_vm() {
 
     let request = VmCreateRequest {
         name: format!("vmlord-e2e-start-test-{}", std::process::id()),
-        image_path,
+        source: VmSource::LocalMedia { path: image_path },
         ram_mb: 2048,
         disk_gb: 8,
         cpu_cores: 2,
         gpu_mode: GpuMode::None,
         network_mode: NetworkMode::None,
-        username: "admin".into(),
-        password: "not used by start".into(),
-        ssh_enabled: false,
-        ssh_deploy_key: false,
     };
     let store = MetadataStore::new(root.join("vm-mapping.json"));
     let vm_directory = root.join("vm");
@@ -361,16 +350,12 @@ fn force_stopped_vm_can_be_started_again() {
 
     let request = VmCreateRequest {
         name: format!("vmlord-e2e-force-stop-test-{}", std::process::id()),
-        image_path,
+        source: VmSource::LocalMedia { path: image_path },
         ram_mb: 2048,
         disk_gb: 8,
         cpu_cores: 2,
         gpu_mode: GpuMode::None,
         network_mode: NetworkMode::None,
-        username: "admin".into(),
-        password: "not used by a forced stop".into(),
-        ssh_enabled: false,
-        ssh_deploy_key: false,
     };
     let store = MetadataStore::new(root.join("vm-mapping.json"));
     let vm_directory = root.join("vm");
@@ -428,16 +413,12 @@ fn accepts_the_shutdown_options_document() {
 
     let request = VmCreateRequest {
         name: format!("vmlord-e2e-shutdown-test-{}", std::process::id()),
-        image_path,
+        source: VmSource::LocalMedia { path: image_path },
         ram_mb: 2048,
         disk_gb: 8,
         cpu_cores: 2,
         gpu_mode: GpuMode::None,
         network_mode: NetworkMode::None,
-        username: "admin".into(),
-        password: "not used by shutdown".into(),
-        ssh_enabled: false,
-        ssh_deploy_key: false,
     };
     let store = MetadataStore::new(root.join("vm-mapping.json"));
     let vm_directory = root.join("vm");
@@ -492,16 +473,14 @@ fn reconnects_to_a_created_vm() {
 
     let request = VmCreateRequest {
         name: format!("vmlord-e2e-reconnect-test-{}", std::process::id()),
-        image_path: image_path.to_string_lossy().into_owned(),
+        source: VmSource::LocalMedia {
+            path: image_path.to_string_lossy().into_owned(),
+        },
         ram_mb: 512,
         disk_gb: 1,
         cpu_cores: 1,
         gpu_mode: GpuMode::None,
         network_mode: NetworkMode::None,
-        username: "admin".into(),
-        password: "not used by reconnect".into(),
-        ssh_enabled: false,
-        ssh_deploy_key: false,
     };
     let store = MetadataStore::new(root.join("vm-mapping.json"));
     let vm_directory = root.join("vm");
@@ -577,16 +556,12 @@ fn reconnects_to_a_running_vm() {
 
     let request = VmCreateRequest {
         name: format!("vmlord-e2e-reconnect-running-test-{}", std::process::id()),
-        image_path,
+        source: VmSource::LocalMedia { path: image_path },
         ram_mb: 2048,
         disk_gb: 8,
         cpu_cores: 2,
         gpu_mode: GpuMode::None,
         network_mode: NetworkMode::None,
-        username: "admin".into(),
-        password: "not used by reconnect".into(),
-        ssh_enabled: false,
-        ssh_deploy_key: false,
     };
     let store = MetadataStore::new(root.join("vm-mapping.json"));
     let vm_directory = root.join("vm");
@@ -775,16 +750,14 @@ fn deletes_a_created_vm_completely() {
 
     let request = VmCreateRequest {
         name: format!("vmlord-e2e-delete-test-{}", std::process::id()),
-        image_path: image_path.to_string_lossy().into_owned(),
+        source: VmSource::LocalMedia {
+            path: image_path.to_string_lossy().into_owned(),
+        },
         ram_mb: 512,
         disk_gb: 1,
         cpu_cores: 1,
         gpu_mode: GpuMode::None,
         network_mode: NetworkMode::None,
-        username: "admin".into(),
-        password: "not used by create".into(),
-        ssh_enabled: false,
-        ssh_deploy_key: false,
     };
     let store = MetadataStore::new(root.join("vm-mapping.json"));
     let vm_directory = root.join("vm");
@@ -933,16 +906,12 @@ fn starts_a_nat_vm_on_its_endpoint() {
 
     let request = VmCreateRequest {
         name: format!("vmlord-e2e-nat-test-{}", std::process::id()),
-        image_path,
+        source: VmSource::LocalMedia { path: image_path },
         ram_mb: 2048,
         disk_gb: 8,
         cpu_cores: 2,
         gpu_mode: GpuMode::None,
         network_mode: NetworkMode::Nat,
-        username: "admin".into(),
-        password: "not used by start".into(),
-        ssh_enabled: false,
-        ssh_deploy_key: false,
     };
     let store = MetadataStore::new(root.join("vm-mapping.json"));
     let vm_directory = root.join("vm");
@@ -1056,16 +1025,12 @@ fn a_forcibly_stopped_nat_vm_starts_again_on_the_same_endpoint() {
 
     let request = VmCreateRequest {
         name: format!("vmlord-e2e-restart-test-{}", std::process::id()),
-        image_path,
+        source: VmSource::LocalMedia { path: image_path },
         ram_mb: 2048,
         disk_gb: 8,
         cpu_cores: 2,
         gpu_mode: GpuMode::None,
         network_mode: NetworkMode::Nat,
-        username: "admin".into(),
-        password: "not used by a forced stop".into(),
-        ssh_enabled: false,
-        ssh_deploy_key: false,
     };
     let store = MetadataStore::new(root.join("vm-mapping.json"));
     let vm_directory = root.join("vm");
@@ -1172,16 +1137,12 @@ fn a_started_nat_vm_is_served_the_address_hns_assigned() {
 
     let request = VmCreateRequest {
         name: format!("vmlord-e2e-dhcp-test-{}", std::process::id()),
-        image_path,
+        source: VmSource::LocalMedia { path: image_path },
         ram_mb: 2048,
         disk_gb: 8,
         cpu_cores: 2,
         gpu_mode: GpuMode::None,
         network_mode: NetworkMode::Nat,
-        username: "admin".into(),
-        password: "not used by start".into(),
-        ssh_enabled: false,
-        ssh_deploy_key: false,
     };
     let store = MetadataStore::new(root.join("vm-mapping.json"));
     let vm_directory = root.join("vm");
@@ -1277,16 +1238,12 @@ fn a_running_nat_vm_is_listed_with_the_address_hns_assigned() {
     let vm_name = format!("vmlord-e2e-ip-test-{}", std::process::id());
     let request = VmCreateRequest {
         name: vm_name.clone(),
-        image_path,
+        source: VmSource::LocalMedia { path: image_path },
         ram_mb: 2048,
         disk_gb: 8,
         cpu_cores: 2,
         gpu_mode: GpuMode::None,
         network_mode: NetworkMode::Nat,
-        username: "admin".into(),
-        password: "not used by start".into(),
-        ssh_enabled: false,
-        ssh_deploy_key: false,
     };
 
     let mut repository = HcsVmRepository::new(&root);
@@ -1398,16 +1355,14 @@ fn deletes_the_endpoint_of_a_deleted_vm() {
     let vm_name = format!("vmlord-e2e-endpoint-delete-{}", std::process::id());
     let request = VmCreateRequest {
         name: vm_name.clone(),
-        image_path: image_path.to_string_lossy().into_owned(),
+        source: VmSource::LocalMedia {
+            path: image_path.to_string_lossy().into_owned(),
+        },
         ram_mb: 512,
         disk_gb: 1,
         cpu_cores: 1,
         gpu_mode: GpuMode::None,
         network_mode: NetworkMode::Nat,
-        username: "admin".into(),
-        password: "not used by create".into(),
-        ssh_enabled: false,
-        ssh_deploy_key: false,
     };
     let store = MetadataStore::new(root.join("vm-mapping.json"));
     let vm_directory = root.join("vm");
