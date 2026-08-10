@@ -180,6 +180,7 @@ vmlord (composition root)
   -> app (workflows)
   -> core (safe domain models)
   -> platform (native HCS backend, default)
+  -> seed (the NoCloud documents cloud-init reads)
   -> legacy-backend (dynamic C FFI, transitional fallback)
   -> appsandbox_core.dll
 ```
@@ -812,11 +813,57 @@ medium with a password" is a state that cannot be spelled rather than one that
 has to be rejected at run time. `core::provisioning` owns the types and their
 validation, including the user-name rules the UI used to hold; `core::distro`
 owns `DistroProfile`, the table of where a distribution publishes its images
-and what the guest inside them looks like.
+and what the guest inside them looks like -- including the admin group and the
+systemd units that carry its SSH daemon.
 
 A password travels as `Password`, whose `Debug` prints `<redacted>` and which
 has no `Display`: until the seed hashes it (#61), the plaintext sits inside a
 request that several call sites log with `{:?}`.
+
+### The cloud-init seed
+
+`vmlord-seed` turns the provisioning contract into the two NoCloud documents
+cloud-init reads on the first boot. It depends on `core` alone: no Windows API,
+no filesystem, no network, so its tests run on any host. `build(&SeedRequest)
+-> Seed` is infallible -- values arrive validated, and quoting handles the rest,
+so the first failure any of this can produce belongs to writing the ISO (#59).
+
+`SeedRequest` is flat rather than a borrowed `Provisioning`, and it deliberately
+has no field for a plaintext password: what reaches the crate is the `$6$` hash
+(#56) and the public key (#55). "The document contains no plaintext password"
+is therefore a property of the types, not an outcome checked afterwards. `Seed`
+has no `Debug` for the same reason -- `user_data` holds the hash.
+
+`user-data` opens with the `#cloud-config` marker line and states: the user,
+their `hashed_passwd` and `lock_passwd`, membership in the profile's admin
+group, the sudo rule `ALL=(ALL) NOPASSWD:ALL` (cloud-init writes it into
+`/etc/sudoers.d` itself, so `sudo` and `wheel` need no special case), the
+authorized key, `ssh_pwauth`, `locale`, `timezone`, a `write_files` entry for
+`/etc/default/keyboard`, and `growpart`/`resize_rootfs`. Growing the root
+filesystem is a VMLord promise, so it is stated rather than left to cloud-init's
+defaults. `SshAccess::Disabled` adds a `runcmd` that disables the SSH daemon: a
+cloud image ships it enabled, and silence would make the choice void. The unit
+names come from `DistroProfile::ssh_units` -- `ssh.socket`/`ssh.service` in the
+Debian family, `sshd.service` elsewhere -- so the generator knows no
+distribution by name.
+
+`meta-data` carries `instance-id`, formatted from the VM's id, and
+`local-hostname`, the VM name. The identifier never changes, which is what makes
+it safe to leave the seed attached: cloud-init re-reads it on every boot and
+skips the per-instance modules it has already run.
+
+The documents are printed by hand, not serialised: they are small, fixed, and
+the `#cloud-config` line is a comment to YAML and a format marker to cloud-init.
+Every value from outside is printed as a single-quoted YAML scalar, where YAML
+has no escape sequences at all; the keyboard layout is escaped a second time for
+the shell, because `/etc/default/keyboard` is read with `source`, where `$` and
+a quote are code. The tests read the result back with a YAML parser and assert
+on meaning, the way cloud-init's PyYAML will.
+
+One limitation, stated rather than forgotten: `/etc/default/keyboard` is
+Debian-family. Fedora keeps the setting in `/etc/vconsole.conf` under different
+keys, which is a different mechanism rather than a different value; every other
+key in the document is a cloud-init module that works anywhere.
 
 The native backend refuses `CloudImage` with a message naming #61, the task
 that will build a VM from one. The legacy AppSandbox backend is given empty

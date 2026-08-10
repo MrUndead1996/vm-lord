@@ -5,6 +5,7 @@ members = [
     "crates/app",
     "crates/legacy-backend",
     "crates/platform",
+    "crates/seed",
     "crates/ui",
     "crates/vmlord",
 ]

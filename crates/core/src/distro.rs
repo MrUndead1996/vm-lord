@@ -30,6 +30,13 @@ pub struct DistroProfile {
     pub default_user: String,
     /// The group that account must join to hold administrative rights.
     pub admin_group: String,
+    /// The systemd units that carry the SSH daemon.
+    ///
+    /// Data rather than a literal in the seed generator: Debian-family systems
+    /// socket-activate `ssh.socket` and keep `ssh.service` beside it, while
+    /// Fedora and SUSE name both `sshd`. A VM created with SSH turned off has
+    /// these disabled on the first boot.
+    pub ssh_units: Vec<String>,
 }
 
 /// Ubuntu's official cloud images.
@@ -51,6 +58,7 @@ pub fn ubuntu() -> DistroProfile {
         checksum_file: "SHA256SUMS".into(),
         default_user: "ubuntu".into(),
         admin_group: "sudo".into(),
+        ssh_units: vec!["ssh.socket".into(), "ssh.service".into()],
     }
 }
 
@@ -105,6 +113,11 @@ mod tests {
             ubuntu().file_name("22.04"),
             "ubuntu-22.04-server-cloudimg-amd64.img"
         );
+    }
+
+    #[test]
+    fn a_profile_names_the_units_that_carry_its_ssh_daemon() {
+        assert_eq!(ubuntu().ssh_units, ["ssh.socket", "ssh.service"]);
     }
 
     #[test]
