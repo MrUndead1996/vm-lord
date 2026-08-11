@@ -12,6 +12,7 @@ compile_error!("vmlord-platform supports Windows only");
 mod build;
 mod cleanup;
 mod com1_reader;
+mod com1_terminal;
 mod create;
 mod delete;
 mod dhcp;

@@ -21,6 +21,7 @@ pub enum EventWaitResult {
 }
 
 /// An owned Windows event handle that is closed when dropped.
+#[derive(Debug)]
 pub struct WindowsEvent(HANDLE);
 
 impl WindowsEvent {
