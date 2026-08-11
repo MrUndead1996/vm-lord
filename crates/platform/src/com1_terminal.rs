@@ -95,12 +95,12 @@ impl Com1Session {
     }
 
     #[cfg(test)]
-    fn finish_for_test(&self) {
+    pub(crate) fn finish_for_test(&self) {
         self.finished.signal().unwrap();
     }
 
     #[cfg(test)]
-    fn fail_for_test(&self) {
+    pub(crate) fn fail_for_test(&self) {
         self.failed.signal().unwrap();
         self.finished.signal().unwrap();
     }
@@ -171,7 +171,7 @@ impl Com1Sessions {
     }
 
     #[cfg(test)]
-    fn contains(&self, vm_id: Uuid) -> bool {
+    pub(crate) fn contains(&self, vm_id: Uuid) -> bool {
         self.0.contains_key(&vm_id)
     }
 }

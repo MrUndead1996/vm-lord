@@ -8,7 +8,7 @@
 use std::{
     fs,
     net::IpAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -21,6 +21,7 @@ use crate::{
     CloudDiskImporter, HcsClient, HcsSystem, KnownVm, MetadataStore, VmComputeSystemMapping,
     VmConnections, VmCreationPipeline, VmDeletionPipeline, VmForceStopPipeline, VmShutdownPipeline,
     VmStartPipeline,
+    Com1LogMode,
     build::BuildRegistry,
     cleanup,
     com1_terminal::{Com1Launcher, Com1Sessions},
@@ -493,6 +494,19 @@ impl VmRepository for HcsVmRepository {
             }
         }
         self.connections = report.connections;
+        // A VM that survived the previous VMLord process is still writing to
+        // its serial port, so its console comes back -- appending, because the
+        // log of the boot it is in the middle of is the same log.
+        let known = list_known_vms(&self.client, &self.store)?;
+        for failure in launch_running_consoles(
+            &self.com1_launcher,
+            &mut self.com1_sessions,
+            &known,
+            &self.storage_root,
+        ) {
+            log::warn!("{failure}");
+            self.push_diagnostic(DiagnosticLevel::Warning, failure);
+        }
         // Before `initialized`, so no start of this process can have created an
         // endpoint the cleanup would then collect as one nobody owns.
         self.ensure_network();
@@ -628,6 +642,8 @@ impl VmRepository for HcsVmRepository {
 
         let mapping = self.mapping(name)?;
         self.shutdown.shutdown(&self.store, name)?;
+        // The console is left alone: the guest is still writing the messages it
+        // prints on its way down, and the pipe closing is what ends the capture.
         // The guest powers off on its own schedule and HCS destroys the
         // compute system as it goes, so the handle is released now rather than
         // kept until it refers to nothing.
@@ -641,6 +657,9 @@ impl VmRepository for HcsVmRepository {
 
         let mapping = self.mapping(name)?;
         self.force_stop.force_stop(&self.store, name)?;
+        // Nothing will close the pipe from the other end: the compute system
+        // was torn down under its guest.
+        self.com1_sessions.cancel(mapping.vm_id);
         self.connections.remove(mapping.vm_id);
         Ok(())
     }
@@ -657,6 +676,9 @@ impl VmRepository for HcsVmRepository {
         let mapping = self.mapping(&request.name)?;
         self.refuse_if_live(&mapping)?;
 
+        // Before the directory goes: the reader has `com1.log` open, and a VM
+        // being deleted has no console to keep.
+        self.com1_sessions.cancel(mapping.vm_id);
         let vm_directory = layout::vm_directory(&self.storage_root, &request.name)?;
         self.delete.delete(
             &self.store,
@@ -713,6 +735,10 @@ impl VmRepository for HcsVmRepository {
             self.connections.is_superseded(vm_id, generation)
         });
         for vm_id in drained.released {
+            // The compute system is gone, so its reader has nothing left to
+            // read; cancelling closes the window rather than leaving it open on
+            // a pipe that will never deliver again.
+            self.com1_sessions.cancel(vm_id);
             self.connections.remove(vm_id);
         }
         if drained.service_disconnected && !self.service_disconnect_reported {
@@ -741,6 +767,10 @@ impl VmRepository for HcsVmRepository {
             .drain(..)
             .collect();
         diagnostics.extend(drained.diagnostics);
+        diagnostics.extend(console_failure_diagnostics(
+            &mut self.com1_sessions,
+            &self.storage_root,
+        ));
         diagnostics
     }
 }
@@ -752,8 +782,75 @@ impl VmRepository for HcsVmRepository {
 /// forever on one that was never told to stop.
 impl Drop for HcsVmRepository {
     fn drop(&mut self) {
+        // First: a terminal window left open after VMLord is gone has nobody
+        // to close it.
+        self.com1_sessions.cancel_all();
         self.builds.cancel_all_and_join();
     }
+}
+
+/// Opens a COM1 console for every VM that is still running, appending to the
+/// log its previous console was writing.
+///
+/// Returns one message per VM whose console could not be opened. A failure here
+/// is not a reason to stop a guest: the VM was running before VMLord started
+/// and its owner did not ask for it to be touched.
+fn launch_running_consoles(
+    launcher: &Com1Launcher,
+    sessions: &mut Com1Sessions,
+    known: &[KnownVm],
+    storage_root: &Path,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    for vm in known
+        .iter()
+        .filter(|vm| vm.state == Some(HcsSystemState::Running))
+    {
+        let vm_directory = match layout::vm_directory(storage_root, &vm.mapping.vm_name) {
+            Ok(directory) => directory,
+            Err(error) => {
+                failures.push(format!(
+                    "Could not reopen the COM1 console of VM \"{}\": {error}",
+                    vm.mapping.vm_name
+                ));
+                continue;
+            }
+        };
+        match launcher.launch(&vm.mapping, &vm_directory, Com1LogMode::Append) {
+            Ok(session) => sessions.insert(session),
+            Err(error) => failures.push(format!(
+                "Could not reopen the COM1 console of VM \"{}\": {error}",
+                vm.mapping.vm_name
+            )),
+        }
+    }
+    failures
+}
+
+/// Turns every reader that stopped for the wrong reason into a diagnostic, and
+/// forgets every reader that is over.
+fn console_failure_diagnostics(
+    sessions: &mut Com1Sessions,
+    storage_root: &Path,
+) -> Vec<Diagnostic> {
+    sessions
+        .reap()
+        .into_iter()
+        .map(|failure| {
+            let log_path = layout::vm_directory(storage_root, &failure.vm_name)
+                .map(|directory| layout::com1_log_path(&directory).display().to_string())
+                .unwrap_or_else(|_| layout::COM1_LOG_FILE_NAME.to_owned());
+            let message = format!(
+                "COM1 diagnostics for VM \"{}\" stopped unexpectedly; see {log_path}",
+                failure.vm_name
+            );
+            log::error!("{message}");
+            Diagnostic {
+                level: DiagnosticLevel::Error,
+                message,
+            }
+        })
+        .collect()
 }
 
 /// Records a diagnostic in a buffer shared with the build threads.
@@ -773,7 +870,10 @@ fn push_shared_diagnostic(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{
+        fs,
+        sync::{Arc, Mutex},
+    };
 
     use uuid::Uuid;
     use vmlord_core::{
@@ -781,9 +881,13 @@ mod tests {
         VmState, VmUpdateRequest,
     };
 
-    use super::{HcsSystemState, HcsVmRepository, guest_ip, record_network_mode};
+    use super::{
+        HcsSystemState, HcsVmRepository, console_failure_diagnostics, guest_ip,
+        launch_running_consoles, record_network_mode,
+    };
     use crate::{
-        KnownVm, MetadataStore, VmComputeSystemMapping,
+        Com1Launcher, Com1LogMode, KnownVm, MetadataStore, VmComputeSystemMapping,
+        com1_terminal::{Com1Sessions, TerminalCommand},
         hcn_endpoint::EndpointAddress,
         watch::{HcsEventKind, HcsVmEvent},
     };
@@ -907,6 +1011,145 @@ mod tests {
             endpoint_id: None,
             network_mode,
         }
+    }
+
+    /// A VM as HCS and the store together report it.
+    fn known(name: &str, state: Option<HcsSystemState>) -> KnownVm {
+        KnownVm {
+            mapping: VmComputeSystemMapping {
+                vm_id: Uuid::new_v4(),
+                vm_name: name.to_owned(),
+                hcs_compute_system_id: format!("vmlord-{name}"),
+                disk_gb: 20,
+                endpoint_id: None,
+                network_mode: NetworkMode::None,
+            },
+            state,
+        }
+    }
+
+    /// A launcher that records the console it would have opened.
+    fn console_launcher(recorded: Arc<Mutex<Vec<String>>>) -> Com1Launcher {
+        Com1Launcher::for_test(
+            std::path::PathBuf::from(r"C:\VMLord\vmlord-com1.exe"),
+            move |command: &TerminalCommand| {
+                recorded.lock().unwrap().push(
+                    command
+                        .args
+                        .iter()
+                        .map(|argument| argument.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+                Ok(())
+            },
+        )
+    }
+
+    #[test]
+    fn reconnect_launches_append_only_for_running_vms() {
+        // A VM that is not running writes nothing to its serial port, and a
+        // truncating console would throw away the log of the boot that is still
+        // the last thing that happened to it.
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let launcher = console_launcher(recorded.clone());
+        let mut sessions = Com1Sessions::default();
+        let known = [
+            known("running", Some(HcsSystemState::Running)),
+            known("created", Some(HcsSystemState::Created)),
+            known("stopped", None),
+        ];
+
+        let failures = launch_running_consoles(
+            &launcher,
+            &mut sessions,
+            &known,
+            std::path::Path::new(r"C:\vms"),
+        );
+
+        let commands = recorded.lock().unwrap().clone();
+        assert!(failures.is_empty(), "{failures:?}");
+        assert_eq!(commands.len(), 1);
+        assert!(commands[0].contains("--mode append"), "{}", commands[0]);
+        assert!(commands[0].contains("--vm-name running"), "{}", commands[0]);
+        assert!(sessions.contains(known[0].mapping.vm_id));
+        assert!(!sessions.contains(known[1].mapping.vm_id));
+    }
+
+    #[test]
+    fn a_reconnect_that_cannot_open_a_console_leaves_the_guest_running() {
+        // The VM is already up: refusing to keep it because its window could
+        // not be restored would take a running guest down for a diagnostic.
+        let launcher = Com1Launcher::for_test(
+            std::path::PathBuf::from(r"C:\VMLord\vmlord-com1.exe"),
+            |_command: &TerminalCommand| Err(std::io::Error::other("no terminal here")),
+        );
+        let mut sessions = Com1Sessions::default();
+        let known = [known("running", Some(HcsSystemState::Running))];
+
+        let failures = launch_running_consoles(
+            &launcher,
+            &mut sessions,
+            &known,
+            std::path::Path::new(r"C:\vms"),
+        );
+
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("running"), "{}", failures[0]);
+        assert!(!sessions.contains(known[0].mapping.vm_id));
+    }
+
+    #[test]
+    fn a_failed_finished_reader_becomes_a_repository_diagnostic() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let launcher = console_launcher(recorded);
+        let mut sessions = Com1Sessions::default();
+        let mapping = known("dev", Some(HcsSystemState::Running)).mapping;
+        let session = launcher
+            .launch(
+                &mapping,
+                std::path::Path::new(r"C:\vms\dev"),
+                Com1LogMode::Append,
+            )
+            .unwrap();
+        session.fail_for_test();
+        sessions.insert(session);
+
+        let diagnostics =
+            console_failure_diagnostics(&mut sessions, std::path::Path::new(r"C:\vms"));
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, DiagnosticLevel::Error);
+        assert!(diagnostics[0].message.contains("COM1"), "{diagnostics:?}");
+        assert!(diagnostics[0].message.contains("dev"), "{diagnostics:?}");
+        assert!(
+            diagnostics[0].message.contains("com1.log"),
+            "a person asked about a reader that stopped needs the file to look in: {diagnostics:?}"
+        );
+        assert!(!sessions.contains(mapping.vm_id));
+    }
+
+    #[test]
+    fn a_reader_that_finished_with_its_pipe_is_no_diagnostic() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let launcher = console_launcher(recorded);
+        let mut sessions = Com1Sessions::default();
+        let mapping = known("dev", Some(HcsSystemState::Running)).mapping;
+        let session = launcher
+            .launch(
+                &mapping,
+                std::path::Path::new(r"C:\vms\dev"),
+                Com1LogMode::Append,
+            )
+            .unwrap();
+        session.finish_for_test();
+        sessions.insert(session);
+
+        let diagnostics =
+            console_failure_diagnostics(&mut sessions, std::path::Path::new(r"C:\vms"));
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert!(!sessions.contains(mapping.vm_id));
     }
 
     #[test]
