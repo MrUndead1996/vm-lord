@@ -23,6 +23,7 @@ mod hcn_endpoint;
 mod hcs;
 mod hcs_config;
 mod host_dns;
+mod host_guest_defaults;
 mod import;
 mod layout;
 mod metadata;
@@ -47,6 +48,7 @@ pub use hcn_endpoint::{EndpointAddress, HcnEndpoint};
 pub use hcs::{
     HcsClient, HcsOperation, HcsStartFailure, HcsSystem, HcsSystemState, HcsSystemSummary,
 };
+pub use host_guest_defaults::host_guest_defaults;
 pub use import::{ImportSummary, import_image};
 pub use metadata::{MetadataStore, VmComputeSystemMapping};
 pub use password_hash::hash_password;
