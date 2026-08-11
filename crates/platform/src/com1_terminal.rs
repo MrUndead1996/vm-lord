@@ -437,8 +437,14 @@ fn terminal_commands(helper: &Path, vm_name: &str, arguments: &[OsString]) -> Ve
     let title = format!("VMLord COM1 — {vm_name}");
 
     let mut windows_terminal = vec![
+        // `new`, not `0`: `0` hands the tab to whatever window Windows Terminal
+        // considers current, which is a window VMLord neither owns nor can see.
+        // That delivery is not exactly-once -- it has been observed to host the
+        // helper twice -- and two readers on one COM1 pipe means the second sits
+        // waiting to take the stream the moment the first window is closed.
+        // A window of its own is delivered by the process VMLord itself started.
         OsString::from("-w"),
-        OsString::from("0"),
+        OsString::from("new"),
         OsString::from("new-tab"),
         OsString::from("--title"),
         OsString::from(title),
@@ -650,6 +656,27 @@ mod tests {
         assert!(!commands[1].args.iter().any(|arg| arg == "-NoExit"));
         assert_eq!(commands[2].program, Path::new("cmd.exe"));
         assert!(commands[2].create_new_console);
+    }
+
+    /// One launch must be able to produce one reader, and asking Windows
+    /// Terminal for the current window is what breaks that: `-w 0` is delivered
+    /// to a window VMLord does not own, and a delivery that is retried or
+    /// replayed hosts the helper twice -- two tabs on one COM1 pipe, the second
+    /// of them waiting to steal the stream from the first.
+    #[test]
+    fn windows_terminal_is_asked_for_its_own_window() {
+        let commands = terminal_commands(Path::new(HELPER), "dev", &helper_args());
+        let arguments: Vec<String> = commands[0]
+            .args
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+
+        let window = arguments
+            .iter()
+            .position(|argument| argument == "-w")
+            .map(|flag| arguments[flag + 1].as_str());
+        assert_eq!(window, Some("new"), "{arguments:?}");
     }
 
     #[test]

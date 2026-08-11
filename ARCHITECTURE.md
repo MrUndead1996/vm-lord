@@ -1111,12 +1111,20 @@ event names, and none of those is ever a secret -- a command line is readable by
 anything on the machine that can enumerate the process.
 
 `Com1Launcher` puts the reader on screen through the first terminal host that
-starts: `wt.exe -w 0 new-tab --title "VMLord COM1 - <vm>"`, then
+starts: `wt.exe -w new new-tab --title "VMLord COM1 - <vm>"`, then
 `powershell.exe -NoLogo -NoProfile -Command`, then `cmd.exe /D /S /C`. Neither
 shell reads or tails the log -- they host the helper and nothing else -- and
 neither is given `-NoExit`, so the window closes when the reader does. A host
 that refuses is logged at `WARN` and the next is tried; only when all three
 refuse is there an error, and it names all three.
+
+The window Windows Terminal is asked for is a new one, never the current one.
+`-w 0` names a window VMLord neither owns nor can see, and delivering an action
+into it is not exactly-once: one launch was observed hosting the helper twice,
+in two tabs of one window. Two readers on one COM1 pipe are not two views of the
+same output -- the pipe serves one client, so the second reader sits in its
+connect loop and takes the stream over the moment the first window is closed,
+which is what a person sees as a second, empty console.
 
 The four events are created by VMLord before anything is spawned, under
 unguessable `Local\VMLord.Com1.<session-id>.*` names: `ready`, which the reader
