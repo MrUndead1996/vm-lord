@@ -133,7 +133,7 @@ impl SettingsForm {
     fn from_settings(settings: &AppSettings) -> Self {
         Self {
             vm_storage_path: settings.vm_storage_path.display().to_string(),
-            language: settings.language.clone(),
+            language: settings.language,
             log_file_path: settings.log_file_path.display().to_string(),
             log_level: settings.log_level,
             image_cache_path: settings.image_cache_path.clone(),
@@ -231,7 +231,7 @@ impl CreateVmForm {
 enum CreateVmDialogAction {
     BrowseImage,
     Cancel,
-    Submit(VmCreateRequest),
+    Submit(Box<VmCreateRequest>),
 }
 
 enum EditVmDialogAction {
@@ -405,7 +405,7 @@ impl eframe::App for VmlordUi {
             },
             Some(CreateVmDialogAction::Cancel) => self.create_vm_form = None,
             Some(CreateVmDialogAction::Submit(request)) => {
-                if let Err(error) = self.application.create_vm(request) {
+                if let Err(error) = self.application.create_vm(*request) {
                     if let Some(form) = &mut self.create_vm_form {
                         form.error = Some(error.to_string());
                     }
@@ -695,7 +695,9 @@ fn render_create_vm_dialog(
                 );
                 if create.clicked() {
                     match create_vm_request(form, existing_vms) {
-                        Ok(request) => action = Some(CreateVmDialogAction::Submit(request)),
+                        Ok(request) => {
+                            action = Some(CreateVmDialogAction::Submit(Box::new(request)))
+                        }
                         Err(error) => form.error = Some(error),
                     }
                 }
@@ -1102,7 +1104,7 @@ fn release_label(release: &str) -> String {
 }
 
 fn edit_vm_request(form: &EditVmForm) -> Result<VmUpdateRequest, String> {
-    if form.ram_mb < 512 || form.ram_mb % 2 != 0 {
+    if form.ram_mb < 512 || !form.ram_mb.is_multiple_of(2) {
         return Err("RAM must be an even number of MiB and at least 512 MiB.".into());
     }
     if form.cpu_cores == 0 {
@@ -1263,9 +1265,7 @@ fn render_selected_vm(
     let Some(name) = selected_vm_name else {
         return None;
     };
-    let Some(vm) = vms.iter().find(|vm| vm.name == *name) else {
-        return None;
-    };
+    let vm = vms.iter().find(|vm| vm.name == *name)?;
 
     ui.add_space(12.0);
     ui.separator();

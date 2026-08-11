@@ -88,7 +88,7 @@ impl SettingsStore {
                 let mut settings: AppSettings =
                     toml::from_str(&contents).map_err(|source| SettingsError::Parse {
                         path: self.config_path.clone(),
-                        source,
+                        source: Box::new(source),
                     })?;
                 if settings.image_cache_path.as_os_str().is_empty() {
                     settings.image_cache_path =
@@ -187,7 +187,7 @@ pub enum SettingsError {
     },
     Parse {
         path: PathBuf,
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
     Serialize(toml::ser::Error),
 }
@@ -244,7 +244,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{AppSettings, Language, LogLevel, SettingsStore};
+    use super::{AppSettings, Language, LogLevel, SettingsError, SettingsStore};
 
     fn temporary_directory() -> std::path::PathBuf {
         let unique_id = SystemTime::now()
@@ -252,6 +252,11 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("vmlord-settings-test-{unique_id}"))
+    }
+
+    #[test]
+    fn settings_errors_remain_compact() {
+        assert!(std::mem::size_of::<SettingsError>() <= 64);
     }
 
     #[test]

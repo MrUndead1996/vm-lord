@@ -106,6 +106,12 @@ impl WindowsImagePicker {
     }
 }
 
+impl Default for WindowsImagePicker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ImagePicker for WindowsImagePicker {
     fn pick_iso_image(&mut self) -> Result<Option<String>, RepositoryError> {
         Ok(rfd::FileDialog::new()
@@ -122,6 +128,12 @@ impl WindowsSettingsPathPicker {
     #[must_use]
     pub const fn new() -> Self {
         Self
+    }
+}
+
+impl Default for WindowsSettingsPathPicker {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

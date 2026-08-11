@@ -275,7 +275,7 @@ impl WorkspaceApp {
             .ok_or_else(|| {
                 RepositoryError::new(format!("VM \"{}\" was not found", request.name))
             })?;
-        if request.ram_mb < 512 || request.ram_mb % 2 != 0 {
+        if request.ram_mb < 512 || !request.ram_mb.is_multiple_of(2) {
             let error = RepositoryError::new(
                 "RAM must be 2 MiB-aligned and at least 512 MiB for VM updates",
             );
