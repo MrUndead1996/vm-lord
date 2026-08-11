@@ -16,7 +16,19 @@ use std::{
     time::Duration,
 };
 
-use crate::layout;
+use vmlord_core::{BuildMonitor, GuestReadinessTimeouts, RepositoryError};
+
+use crate::{layout, metadata::VmComputeSystemMapping};
+
+/// How often an unfinished phase looks again.
+///
+/// Two seconds rather than a tighter loop: nothing here becomes true faster
+/// than a guest boots, and every poll of the address costs an HNS call.
+const POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The port a Linux guest answers SSH on. Fixed, because the seed does not
+/// move it.
+const SSH_PORT: u16 = 22;
 
 /// Where Windows keeps its OpenSSH client.
 const SSH_CLIENT_RELATIVE_PATH: &str = r"System32\OpenSSH\ssh.exe";
@@ -116,6 +128,248 @@ pub(crate) fn outcome(
     }
 }
 
+/// The timeouts of a wait, as durations rather than as settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ReadinessTimeouts {
+    pub(crate) address: Duration,
+    pub(crate) ssh_port: Duration,
+    pub(crate) cloud_init: Duration,
+    pub(crate) connect: Duration,
+}
+
+impl From<GuestReadinessTimeouts> for ReadinessTimeouts {
+    fn from(settings: GuestReadinessTimeouts) -> Self {
+        Self {
+            address: Duration::from_secs(settings.address_secs),
+            ssh_port: Duration::from_secs(settings.ssh_port_secs),
+            cloud_init: Duration::from_secs(settings.cloud_init_secs),
+            connect: Duration::from_secs(settings.connect_timeout_secs),
+        }
+    }
+}
+
+impl Default for ReadinessTimeouts {
+    fn default() -> Self {
+        GuestReadinessTimeouts::default().into()
+    }
+}
+
+/// How a run of `ssh.exe` ended.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SshRun {
+    Exited {
+        code: Option<i32>,
+        transcript_tail: String,
+    },
+    /// The build was cancelled while the command ran, and the child was killed
+    /// for it. Distinct from a deadline -- an `Exited` with no code -- because
+    /// the two mean different things to whoever asked.
+    Cancelled,
+}
+
+type AddressSource =
+    Box<dyn Fn(&VmComputeSystemMapping) -> Result<Option<IpAddr>, RepositoryError> + Send + Sync>;
+/// Answers `Err(reason)` while the port is not open; the reason is what the
+/// failure quotes if the port never opens at all.
+type PortProbe = Box<dyn Fn(IpAddr, Duration) -> Result<(), String> + Send + Sync>;
+type SshRunner = Box<
+    dyn Fn(&SshInvocation, Duration, &BuildMonitor) -> Result<SshRun, RepositoryError>
+        + Send
+        + Sync,
+>;
+/// Time elapsed since the wait began, so tests can move it by hand.
+type Clock = Box<dyn Fn() -> Duration + Send + Sync>;
+type Sleeper = Box<dyn Fn(Duration) + Send + Sync>;
+
+/// Waits until a guest is ready, or says why it is not.
+///
+/// Every seam is `Send + Sync`: the wait runs on the build thread.
+pub(crate) struct GuestReadiness {
+    timeouts: ReadinessTimeouts,
+    /// `None` when this Windows installation has no OpenSSH client. Resolved
+    /// once, at construction, so that a wait fails at once instead of spending
+    /// twenty minutes on a guest it could never have asked.
+    client: Option<PathBuf>,
+    address: AddressSource,
+    port: PortProbe,
+    ssh: SshRunner,
+    now: Clock,
+    sleep: Sleeper,
+}
+
+impl GuestReadiness {
+    /// A readiness backed by HNS, a real TCP socket and Windows' OpenSSH.
+    #[must_use]
+    pub(crate) fn production(timeouts: ReadinessTimeouts) -> Self {
+        Self {
+            timeouts,
+            client: ssh_client_path(),
+            address: Box::new(endpoint_address),
+            port: Box::new(probe_port),
+            ssh: Box::new(run_ssh),
+            now: Box::new(elapsed_since_start()),
+            sleep: Box::new(std::thread::sleep),
+        }
+    }
+
+    /// Waits for the guest of `mapping`, in three phases with a timeout each.
+    pub(crate) fn wait(
+        &self,
+        mapping: &VmComputeSystemMapping,
+        vm_directory: &Path,
+        username: &str,
+        monitor: &BuildMonitor,
+    ) -> Result<GuestReady, ReadinessFailure> {
+        let Some(client) = self.client.clone() else {
+            log::error!("{}", ReadinessFailure::NoSshClient);
+            return Err(ReadinessFailure::NoSshClient);
+        };
+
+        let ip = self.wait_for_address(mapping, monitor)?;
+        log::debug!(
+            "VM \"{}\" has address {ip}; waiting for it to answer on port {SSH_PORT}",
+            mapping.vm_name
+        );
+        self.wait_for_port(mapping, ip, monitor)?;
+        log::debug!(
+            "VM \"{}\" answers on port {SSH_PORT}; asking cloud-init whether it has finished",
+            mapping.vm_name
+        );
+
+        let invocation = ssh_invocation(&client, vm_directory, username, ip, self.timeouts.connect);
+        let run = (self.ssh)(&invocation, self.timeouts.cloud_init, monitor).map_err(|error| {
+            log::error!(
+                "could not ask VM \"{}\" whether cloud-init has finished: {error}",
+                mapping.vm_name
+            );
+            ReadinessFailure::Unreachable {
+                last_error: error.to_string(),
+            }
+        })?;
+
+        let result = match run {
+            SshRun::Cancelled => Err(ReadinessFailure::Cancelled),
+            SshRun::Exited {
+                code,
+                transcript_tail,
+            } => outcome(code, &transcript_tail),
+        };
+        match &result {
+            Ok(GuestReady::Ready) => {
+                log::info!("VM \"{}\" reports that cloud-init is done", mapping.vm_name);
+            }
+            Ok(GuestReady::Degraded { detail }) => log::warn!(
+                "VM \"{}\" is up, but cloud-init finished degraded: {detail}",
+                mapping.vm_name
+            ),
+            Err(failure) => log::error!("VM \"{}\" is not ready: {failure}", mapping.vm_name),
+        }
+        result
+    }
+
+    /// Phase one: the endpoint has to be given an address.
+    fn wait_for_address(
+        &self,
+        mapping: &VmComputeSystemMapping,
+        monitor: &BuildMonitor,
+    ) -> Result<IpAddr, ReadinessFailure> {
+        let deadline = (self.now)() + self.timeouts.address;
+        loop {
+            if monitor.is_cancelled() {
+                return Err(ReadinessFailure::Cancelled);
+            }
+            match (self.address)(mapping) {
+                Ok(Some(ip)) => return Ok(ip),
+                Ok(None) => {}
+                Err(error) => log::debug!(
+                    "the address of VM \"{}\" is not readable yet: {error}",
+                    mapping.vm_name
+                ),
+            }
+            if (self.now)() >= deadline {
+                return Err(ReadinessFailure::NoAddress);
+            }
+            (self.sleep)(POLL_INTERVAL);
+        }
+    }
+
+    /// Phase two: something has to answer on port 22.
+    ///
+    /// A closed port and a refused connection are the same fact here -- the
+    /// guest has not raised sshd yet -- and the last reason is kept so that the
+    /// failure can quote it.
+    fn wait_for_port(
+        &self,
+        mapping: &VmComputeSystemMapping,
+        ip: IpAddr,
+        monitor: &BuildMonitor,
+    ) -> Result<(), ReadinessFailure> {
+        let deadline = (self.now)() + self.timeouts.ssh_port;
+        let mut last_error = "the guest never answered".to_owned();
+        loop {
+            if monitor.is_cancelled() {
+                return Err(ReadinessFailure::Cancelled);
+            }
+            match (self.port)(ip, self.timeouts.connect) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    log::debug!(
+                        "VM \"{}\" does not answer on {ip}:{SSH_PORT} yet: {error}",
+                        mapping.vm_name
+                    );
+                    last_error = error;
+                }
+            }
+            if (self.now)() >= deadline {
+                return Err(ReadinessFailure::Unreachable { last_error });
+            }
+            (self.sleep)(POLL_INTERVAL);
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(
+        timeouts: ReadinessTimeouts,
+        address: impl Fn(&VmComputeSystemMapping) -> Result<Option<IpAddr>, RepositoryError>
+        + Send
+        + Sync
+        + 'static,
+        port: impl Fn(IpAddr, Duration) -> Result<(), String> + Send + Sync + 'static,
+        ssh: impl Fn(&SshInvocation, Duration, &BuildMonitor) -> Result<SshRun, RepositoryError>
+        + Send
+        + Sync
+        + 'static,
+        now: impl Fn() -> Duration + Send + Sync + 'static,
+        sleep: impl Fn(Duration) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            timeouts,
+            client: Some(PathBuf::from(r"C:\Windows\System32\OpenSSH\ssh.exe")),
+            address: Box::new(address),
+            port: Box::new(port),
+            ssh: Box::new(ssh),
+            now: Box::new(now),
+            sleep: Box::new(sleep),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test_without_client(
+        timeouts: ReadinessTimeouts,
+        now: impl Fn() -> Duration + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            timeouts,
+            client: None,
+            address: Box::new(|_| panic!("nothing may be asked without an ssh client")),
+            port: Box::new(|_, _| panic!("nothing may be probed without an ssh client")),
+            ssh: Box::new(|_, _, _| panic!("ssh cannot run without an ssh client")),
+            now: Box::new(now),
+            sleep: Box::new(|_| panic!("nothing may be waited for without an ssh client")),
+        }
+    }
+}
+
 /// Everything one readiness command needs, decided without running it.
 ///
 /// Separate from running it so that the decisions -- which key, which
@@ -185,11 +439,339 @@ pub(crate) fn tail(text: &str, lines: usize) -> String {
     kept[start..].join("\n").trim().to_owned()
 }
 
+fn endpoint_address(_mapping: &VmComputeSystemMapping) -> Result<Option<IpAddr>, RepositoryError> {
+    unimplemented!("wired in the next task")
+}
+
+fn probe_port(_ip: IpAddr, _timeout: Duration) -> Result<(), String> {
+    unimplemented!("wired in the next task")
+}
+
+fn run_ssh(
+    _invocation: &SshInvocation,
+    _deadline: Duration,
+    _monitor: &BuildMonitor,
+) -> Result<SshRun, RepositoryError> {
+    unimplemented!("wired in the next task")
+}
+
+fn elapsed_since_start() -> impl Fn() -> Duration + Send + Sync {
+    let start = std::time::Instant::now();
+    move || start.elapsed()
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{net::IpAddr, path::Path, time::Duration};
+    use std::{
+        net::IpAddr,
+        path::Path,
+        sync::{
+            Arc,
+            atomic::{AtomicU64, Ordering},
+        },
+        time::Duration,
+    };
 
-    use super::{GuestReady, ReadinessFailure, SshInvocation, outcome, ssh_invocation, tail};
+    use uuid::Uuid;
+    use vmlord_core::{BuildMonitor, BuildStep, NetworkMode, RepositoryError};
+
+    use super::{
+        GuestReadiness, GuestReady, ReadinessFailure, ReadinessTimeouts, SshInvocation, SshRun,
+        outcome, ssh_invocation, tail,
+    };
+    use crate::metadata::VmComputeSystemMapping;
+
+    fn mapping() -> VmComputeSystemMapping {
+        VmComputeSystemMapping {
+            vm_id: Uuid::nil(),
+            vm_name: "dev-linux".to_owned(),
+            hcs_compute_system_id: "vmlord-test".to_owned(),
+            disk_gb: 20,
+            endpoint_id: None,
+            network_mode: NetworkMode::Nat,
+        }
+    }
+
+    fn monitor() -> BuildMonitor {
+        BuildMonitor::new(BuildStep::AwaitingGuest)
+    }
+
+    fn timeouts() -> ReadinessTimeouts {
+        ReadinessTimeouts {
+            address: Duration::from_secs(90),
+            ssh_port: Duration::from_secs(300),
+            cloud_init: Duration::from_secs(1200),
+            connect: Duration::from_secs(10),
+        }
+    }
+
+    fn address() -> IpAddr {
+        "10.0.0.2".parse().unwrap()
+    }
+
+    fn vm_directory() -> &'static Path {
+        Path::new(r"C:\VMs\dev-linux")
+    }
+
+    /// A clock that only moves when something sleeps on it, so a twenty-minute
+    /// timeout costs a test no time at all.
+    #[derive(Clone, Default)]
+    struct FakeClock(Arc<AtomicU64>);
+
+    impl FakeClock {
+        fn elapsed(&self) -> Duration {
+            Duration::from_millis(self.0.load(Ordering::Relaxed))
+        }
+
+        fn now(&self) -> impl Fn() -> Duration + Send + Sync + use<> {
+            let millis = Arc::clone(&self.0);
+            move || Duration::from_millis(millis.load(Ordering::Relaxed))
+        }
+
+        fn sleeper(&self) -> impl Fn(Duration) + Send + Sync + use<> {
+            let millis = Arc::clone(&self.0);
+            move |duration: Duration| {
+                millis.fetch_add(
+                    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_guest_that_answers_at_once_is_ready() {
+        let clock = FakeClock::default();
+        let readiness = GuestReadiness::for_test(
+            timeouts(),
+            |_| Ok(Some(address())),
+            |_, _| Ok(()),
+            |_, _, _| {
+                Ok(SshRun::Exited {
+                    code: Some(0),
+                    transcript_tail: "status: done".to_owned(),
+                })
+            },
+            clock.now(),
+            clock.sleeper(),
+        );
+
+        let ready = readiness
+            .wait(&mapping(), vm_directory(), "machi", &monitor())
+            .unwrap();
+
+        assert_eq!(ready, GuestReady::Ready);
+    }
+
+    #[test]
+    fn an_address_that_never_arrives_fails_on_its_own_timeout() {
+        let clock = FakeClock::default();
+        let readiness = GuestReadiness::for_test(
+            timeouts(),
+            |_| Ok(None),
+            |_, _| panic!("the port must not be probed before an address exists"),
+            |_, _, _| panic!("ssh must not run before an address exists"),
+            clock.now(),
+            clock.sleeper(),
+        );
+
+        let failure = readiness
+            .wait(&mapping(), vm_directory(), "machi", &monitor())
+            .unwrap_err();
+
+        assert_eq!(failure, ReadinessFailure::NoAddress);
+        // Its own timeout and no more: the later phases have theirs.
+        assert!(
+            clock.elapsed() >= Duration::from_secs(90),
+            "{:?}",
+            clock.elapsed()
+        );
+        assert!(
+            clock.elapsed() < Duration::from_secs(120),
+            "{:?}",
+            clock.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_port_that_never_opens_reports_the_last_connection_error() {
+        let clock = FakeClock::default();
+        let readiness = GuestReadiness::for_test(
+            timeouts(),
+            |_| Ok(Some(address())),
+            |_, _| Err("connection refused".to_owned()),
+            |_, _, _| panic!("ssh must not run before port 22 opens"),
+            clock.now(),
+            clock.sleeper(),
+        );
+
+        let failure = readiness
+            .wait(&mapping(), vm_directory(), "machi", &monitor())
+            .unwrap_err();
+
+        assert_eq!(
+            failure,
+            ReadinessFailure::Unreachable {
+                last_error: "connection refused".to_owned(),
+            }
+        );
+        assert!(
+            clock.elapsed() >= Duration::from_secs(300),
+            "{:?}",
+            clock.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_cancellation_while_waiting_for_an_address_stops_the_wait() {
+        let clock = FakeClock::default();
+        let monitor = monitor();
+        let readiness = GuestReadiness::for_test(
+            timeouts(),
+            {
+                let monitor = monitor.clone();
+                move |_| {
+                    monitor.cancel();
+                    Ok(None)
+                }
+            },
+            |_, _| panic!("the port must not be probed after a cancellation"),
+            |_, _, _| panic!("ssh must not run after a cancellation"),
+            clock.now(),
+            clock.sleeper(),
+        );
+
+        let failure = readiness
+            .wait(&mapping(), vm_directory(), "machi", &monitor)
+            .unwrap_err();
+
+        assert_eq!(failure, ReadinessFailure::Cancelled);
+    }
+
+    #[test]
+    fn a_cancellation_while_waiting_for_the_port_stops_the_wait() {
+        let clock = FakeClock::default();
+        let monitor = monitor();
+        let readiness = GuestReadiness::for_test(
+            timeouts(),
+            |_| Ok(Some(address())),
+            {
+                let monitor = monitor.clone();
+                move |_, _| {
+                    monitor.cancel();
+                    Err("not yet".to_owned())
+                }
+            },
+            |_, _, _| panic!("ssh must not run after a cancellation"),
+            clock.now(),
+            clock.sleeper(),
+        );
+
+        let failure = readiness
+            .wait(&mapping(), vm_directory(), "machi", &monitor)
+            .unwrap_err();
+
+        assert_eq!(failure, ReadinessFailure::Cancelled);
+    }
+
+    #[test]
+    fn a_cancelled_ssh_run_is_reported_as_a_cancellation_not_a_failure() {
+        let clock = FakeClock::default();
+        let readiness = GuestReadiness::for_test(
+            timeouts(),
+            |_| Ok(Some(address())),
+            |_, _| Ok(()),
+            |_, _, _| Ok(SshRun::Cancelled),
+            clock.now(),
+            clock.sleeper(),
+        );
+
+        let failure = readiness
+            .wait(&mapping(), vm_directory(), "machi", &monitor())
+            .unwrap_err();
+
+        assert_eq!(failure, ReadinessFailure::Cancelled);
+    }
+
+    #[test]
+    fn a_killed_ssh_child_is_a_timeout_not_a_cloud_init_failure() {
+        let clock = FakeClock::default();
+        let readiness = GuestReadiness::for_test(
+            timeouts(),
+            |_| Ok(Some(address())),
+            |_, _| Ok(()),
+            |_, _, _| {
+                Ok(SshRun::Exited {
+                    code: None,
+                    transcript_tail: "....".to_owned(),
+                })
+            },
+            clock.now(),
+            clock.sleeper(),
+        );
+
+        let failure = readiness
+            .wait(&mapping(), vm_directory(), "machi", &monitor())
+            .unwrap_err();
+
+        assert_eq!(failure, ReadinessFailure::TimedOut);
+    }
+
+    #[test]
+    fn an_address_lookup_that_fails_outright_is_reported_as_no_address() {
+        // HNS refusing to answer is not the same as an address that has not
+        // arrived yet, but from the guest's side the outcome is the same, and
+        // the underlying error has already gone to the log.
+        let clock = FakeClock::default();
+        let readiness = GuestReadiness::for_test(
+            timeouts(),
+            |_| Err(RepositoryError::new("HNS is unavailable")),
+            |_, _| panic!("the port must not be probed without an address"),
+            |_, _, _| panic!("ssh must not run without an address"),
+            clock.now(),
+            clock.sleeper(),
+        );
+
+        let failure = readiness
+            .wait(&mapping(), vm_directory(), "machi", &monitor())
+            .unwrap_err();
+
+        assert_eq!(failure, ReadinessFailure::NoAddress);
+    }
+
+    #[test]
+    fn a_missing_ssh_client_is_reported_before_anything_is_waited_for() {
+        let clock = FakeClock::default();
+        let readiness = GuestReadiness::for_test_without_client(timeouts(), clock.now());
+
+        let failure = readiness
+            .wait(&mapping(), vm_directory(), "machi", &monitor())
+            .unwrap_err();
+
+        assert_eq!(failure, ReadinessFailure::NoSshClient);
+        assert_eq!(clock.elapsed(), Duration::ZERO, "nothing may be waited for");
+    }
+
+    #[test]
+    fn the_timeouts_come_from_the_settings_unchanged() {
+        let converted = ReadinessTimeouts::from(vmlord_core::GuestReadinessTimeouts {
+            address_secs: 1,
+            ssh_port_secs: 2,
+            cloud_init_secs: 3,
+            connect_timeout_secs: 4,
+        });
+
+        assert_eq!(
+            converted,
+            ReadinessTimeouts {
+                address: Duration::from_secs(1),
+                ssh_port: Duration::from_secs(2),
+                cloud_init: Duration::from_secs(3),
+                connect: Duration::from_secs(4),
+            }
+        );
+        assert_eq!(ReadinessTimeouts::default(), timeouts());
+    }
 
     fn arguments(invocation: &SshInvocation) -> Vec<String> {
         invocation
