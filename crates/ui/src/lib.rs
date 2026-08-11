@@ -23,7 +23,14 @@ const VM_TABLE_COLUMN_COUNT: f32 = 9.0;
 /// a default should build. The list is written out rather than fetched --
 /// Canonical publishes no machine-readable index of current releases -- and it
 /// moves to the distribution profile when profiles come from JSON (#67).
-const UBUNTU_RELEASES: [&str; 2] = ["24.04", "22.04"];
+///
+/// All three are current: 26.04 is the newest LTS and the one a new VM gets by
+/// default, 24.04 and 22.04 are still under standard support. Each was checked
+/// against the file name the profile builds -- the server answers
+/// `/releases/26.04/` with a redirect to its codename, and
+/// `ubuntu-26.04-server-cloudimg-amd64.img` is listed in the `SHA256SUMS`
+/// behind it, which is what the release resolver reads.
+const UBUNTU_RELEASES: [&str; 3] = ["26.04", "24.04", "22.04"];
 
 const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
 
@@ -1816,7 +1823,19 @@ mod tests {
             ubuntu().default_user,
             "the account a cloud image already expects is the one to offer"
         );
+        assert_eq!(
+            form.release, "26.04",
+            "a new VM starts from the newest LTS, which is the first of the offered releases"
+        );
         assert_eq!(form.release, UBUNTU_RELEASES[0]);
+        for release in UBUNTU_RELEASES {
+            assert!(
+                vmlord_core::ubuntu()
+                    .image_url(release)
+                    .ends_with(&format!("ubuntu-{release}-server-cloudimg-amd64.img")),
+                "the resolver has to be able to build a URL for {release}"
+            );
+        }
     }
 
     #[test]
