@@ -749,7 +749,9 @@ fn render_provisioning_fields(
                 if form.password.is_empty() {
                     ui.small(
                         "No password: the guest is reachable by SSH key only, \
-                         and password logins are turned off.",
+                         and password logins are turned off. The COM1 console \
+                         cannot log in either, so a guest whose network fails \
+                         is out of reach.",
                     );
                 }
             });
