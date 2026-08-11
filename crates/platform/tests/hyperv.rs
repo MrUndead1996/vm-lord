@@ -36,6 +36,160 @@ const HCS_ACCESS_ALL: u32 = 0x1000_0000;
 /// reports it when `HcsShutDownComputeSystem` receives null options.
 const HCS_E_INVALID_JSON: &str = "0x8037010D";
 
+/// A repository whose importer is the one the composition root builds.
+fn cloud_repository(root: &std::path::Path) -> HcsVmRepository {
+    let cache = root.join("cache");
+    HcsVmRepository::new(
+        root,
+        Box::new(
+            move |image: &vmlord_core::CloudImage,
+                  size,
+                  target: &std::path::Path,
+                  monitor: &vmlord_core::BuildMonitor| {
+                monitor.report(vmlord_core::BuildStep::Downloading);
+                let mut source = vmlord_image::open_cloud_image(
+                    &image.profile,
+                    &image.release,
+                    &cache,
+                    size,
+                    monitor.downloads(),
+                    monitor.cancel_flag(),
+                )?;
+                monitor.report(vmlord_core::BuildStep::WritingDisk);
+                vmlord_platform::import_image(&mut source, target, size, monitor.cancel_flag())
+                    .map(|_| ())
+            },
+        ),
+    )
+}
+
+fn background_cloud_request(name: &str) -> VmCreateRequest {
+    VmCreateRequest {
+        name: name.to_owned(),
+        source: VmSource::CloudImage {
+            image: vmlord_core::CloudImage {
+                profile: vmlord_core::ubuntu(),
+                release: "24.04".into(),
+            },
+            provisioning: vmlord_core::Provisioning {
+                username: "dev".into(),
+                password: None,
+                ssh: vmlord_core::SshAccess::Enabled { deploy_key: true },
+                locale: "en_US.UTF-8".into(),
+                keyboard: "us".into(),
+                timezone: "Europe/Moscow".into(),
+            },
+        },
+        ram_mb: 2048,
+        disk_gb: 16,
+        cpu_cores: 2,
+        gpu_mode: GpuMode::None,
+        network_mode: NetworkMode::None,
+    }
+}
+
+/// Creating a VM from a real cloud image must return at once and finish on its
+/// own thread: this is the whole point of the task, and it cannot be observed
+/// anywhere but on a host with HCS.
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS and downloads a cloud image"]
+fn a_cloud_vm_is_built_in_the_background() {
+    let root = std::env::temp_dir().join(format!("vmlord-bg-build-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut repository = cloud_repository(&root);
+    repository
+        .initialize()
+        .expect("the native backend should initialize on a Hyper-V host");
+
+    let accepted_at = std::time::Instant::now();
+    repository
+        .create_vm(background_cloud_request("bg-build"))
+        .expect("the creation should be accepted");
+    let accepted_in = accepted_at.elapsed();
+
+    let mut seen_building = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20 * 60);
+    let outcome = loop {
+        let summaries = repository.list_vms().expect("listing should work");
+        match summaries.iter().find(|vm| vm.name == "bg-build") {
+            Some(vm) if matches!(vm.state, VmState::Building { .. }) => seen_building = true,
+            Some(_) => break Ok(()),
+            None => break Err(format!("the build failed: {:?}", repository.take_diagnostics())),
+        }
+        if std::time::Instant::now() >= deadline {
+            break Err("the build did not finish".to_owned());
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    };
+
+    // Best-effort cleanup regardless of the assertions below.
+    let _ = repository.delete_vm(VmDeleteRequest {
+        name: "bg-build".into(),
+        delete_disks: true,
+    });
+    drop(repository);
+    let _ = fs::remove_dir_all(&root);
+
+    outcome.expect("the VM should finish building");
+    assert!(
+        accepted_in < Duration::from_secs(2),
+        "create_vm must not wait for the build, took {accepted_in:?}"
+    );
+    assert!(
+        seen_building,
+        "the VM must be listed as Building while it builds"
+    );
+}
+
+/// A cancelled build leaves nothing: not the directory, not a metadata entry,
+/// not a row in the list.
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS and downloads a cloud image"]
+fn a_cancelled_build_leaves_nothing_behind() {
+    let root = std::env::temp_dir().join(format!("vmlord-bg-cancel-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut repository = cloud_repository(&root);
+    repository
+        .initialize()
+        .expect("the native backend should initialize on a Hyper-V host");
+
+    repository
+        .create_vm(background_cloud_request("bg-cancel"))
+        .expect("the creation should be accepted");
+    std::thread::sleep(Duration::from_secs(3));
+    repository
+        .cancel_create("bg-cancel")
+        .expect("a build in flight is cancellable");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    let outcome = loop {
+        let listed = repository
+            .list_vms()
+            .expect("listing should work")
+            .iter()
+            .any(|vm| vm.name == "bg-cancel");
+        if !listed {
+            break Ok(repository.take_diagnostics());
+        }
+        if std::time::Instant::now() >= deadline {
+            break Err("the cancelled build did not go away".to_owned());
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    };
+    let left_behind = root.join("bg-cancel").exists();
+    drop(repository);
+    let _ = fs::remove_dir_all(&root);
+
+    let diagnostics = outcome.expect("the cancelled build should disappear from the list");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("bg-cancel")),
+        "the user has to be told why the VM went away: {diagnostics:?}"
+    );
+    assert!(!left_behind, "the cancelled build must remove its directory");
+}
+
 /// A monitor for the tests that drive the creation pipeline directly.
 ///
 /// They call it on the calling thread and read nothing back from it: what they
