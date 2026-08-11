@@ -4,7 +4,8 @@ use std::{fs, io::Write, path::Path, time::Duration};
 
 use uuid::Uuid;
 use vmlord_core::{
-    CloudImage, Provisioning, RepositoryError, SshAccess, VmCreateRequest, VmSource,
+    BuildMonitor, BuildStep, CloudImage, Provisioning, RepositoryError, SshAccess, VmCreateRequest,
+    VmSource,
 };
 
 use crate::{
@@ -21,9 +22,9 @@ use crate::{
 const CREATE_TIMEOUT: Duration = Duration::from_secs(30);
 const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
 
-type VhdCreator = Box<dyn Fn(&Path, u64) -> Result<(), RepositoryError>>;
-type AccessGranter = Box<dyn Fn(&str, &Path) -> Result<(), RepositoryError>>;
-type SystemCreator = Box<dyn Fn(&str, &str) -> Result<(), RepositoryError>>;
+type VhdCreator = Box<dyn Fn(&Path, u64) -> Result<(), RepositoryError> + Send + Sync>;
+type AccessGranter = Box<dyn Fn(&str, &Path) -> Result<(), RepositoryError> + Send + Sync>;
+type SystemCreator = Box<dyn Fn(&str, &str) -> Result<(), RepositoryError> + Send + Sync>;
 
 /// Makes the VM's system disk out of a cloud image: fetch the image the release
 /// means, then write it into a VHDX at the given path, sized for the VM rather
@@ -33,8 +34,17 @@ type SystemCreator = Box<dyn Fn(&str, &str) -> Result<(), RepositoryError>>;
 /// Windows's business: it lives in `vmlord-image`, which knows no Windows API,
 /// and the composition root joins the two. The pipeline keeps the half that is
 /// Windows -- writing into a VHDX through the disk it is attached as.
-pub type CloudDiskImporter =
-    Box<dyn Fn(&CloudImage, u64, &Path) -> Result<(), RepositoryError>>;
+///
+/// The monitor comes with it because both halves are long: the importer
+/// reports `Downloading` and `WritingDisk` itself, and passes the cancellation
+/// flag down to the download. Whoever runs a step is who reports it -- from
+/// outside this closure the two are one call.
+///
+/// `Send + Sync` because creation runs on its own thread, and every seam of the
+/// pipeline goes with it.
+pub type CloudDiskImporter = Box<
+    dyn Fn(&CloudImage, u64, &Path, &BuildMonitor) -> Result<(), RepositoryError> + Send + Sync,
+>;
 
 /// Orchestrates the multi-step, transactional creation of an HCS-backed VM.
 ///
@@ -68,11 +78,14 @@ impl VmCreationPipeline {
 
     #[cfg(test)]
     fn for_test(
-        vhd_creator: impl Fn(&Path, u64) -> Result<(), RepositoryError> + 'static,
-        cloud_disk: impl Fn(&CloudImage, u64, &Path) -> Result<(), RepositoryError> + 'static,
-        access_granter: impl Fn(&str, &Path) -> Result<(), RepositoryError> + 'static,
-        system_creator: impl Fn(&str, &str) -> Result<(), RepositoryError> + 'static,
-        system_teardown: impl Fn(&str) -> Result<(), RepositoryError> + 'static,
+        vhd_creator: impl Fn(&Path, u64) -> Result<(), RepositoryError> + Send + Sync + 'static,
+        cloud_disk: impl Fn(&CloudImage, u64, &Path, &BuildMonitor) -> Result<(), RepositoryError>
+        + Send
+        + Sync
+        + 'static,
+        access_granter: impl Fn(&str, &Path) -> Result<(), RepositoryError> + Send + Sync + 'static,
+        system_creator: impl Fn(&str, &str) -> Result<(), RepositoryError> + Send + Sync + 'static,
+        system_teardown: impl Fn(&str) -> Result<(), RepositoryError> + Send + Sync + 'static,
     ) -> Self {
         Self {
             vhd_creator: Box::new(vhd_creator),
@@ -90,6 +103,7 @@ impl VmCreationPipeline {
         store: &MetadataStore,
         request: &VmCreateRequest,
         vm_directory: &Path,
+        monitor: &BuildMonitor,
     ) -> Result<VmComputeSystemMapping, RepositoryError> {
         request.validate()?;
 
@@ -148,8 +162,10 @@ impl VmCreationPipeline {
         // filled: an empty VHDX and an imported image agree on this much.
         let disk_size_bytes = u64::from(request.disk_gb) * BYTES_PER_GIB;
         let result = (|| {
+            monitor.check_cancelled()?;
             match &request.source {
                 VmSource::LocalMedia { .. } => {
+                    monitor.report(BuildStep::WritingDisk);
                     (self.vhd_creator)(&system_disk_path, disk_size_bytes)?;
                     if !media_path.is_file() {
                         return Err(RepositoryError::new(format!(
@@ -168,7 +184,11 @@ impl VmCreationPipeline {
                         image.release,
                         system_disk_path.display()
                     );
-                    (self.cloud_disk)(image, disk_size_bytes, &system_disk_path)?;
+                    // The importer reports `Downloading` and `WritingDisk`
+                    // itself: both happen inside this one call.
+                    (self.cloud_disk)(image, disk_size_bytes, &system_disk_path, monitor)?;
+                    monitor.check_cancelled()?;
+                    monitor.report(BuildStep::Provisioning);
                     write_provisioning(
                         vm_directory,
                         &seed_path,
@@ -179,6 +199,11 @@ impl VmCreationPipeline {
                     )?;
                 }
             }
+            monitor.check_cancelled()?;
+            // Local media reaches provisioning here: it writes no seed and no
+            // keys, but the configuration and the grants are still files
+            // written for the VM.
+            monitor.report(BuildStep::Provisioning);
 
             fs::write(layout::configuration_path(vm_directory), &configuration).map_err(
                 |error| RepositoryError::new(format!("failed to write HCS configuration: {error}")),
@@ -191,6 +216,8 @@ impl VmCreationPipeline {
             (self.access_granter)(&hcs_compute_system_id, &system_disk_path)?;
             (self.access_granter)(&hcs_compute_system_id, &media_path)?;
 
+            monitor.check_cancelled()?;
+            monitor.report(BuildStep::Registering);
             (self.system_creator)(&hcs_compute_system_id, &configuration)?;
             system_created = true;
 
@@ -355,8 +382,14 @@ mod tests {
         VmSource,
     };
 
+    use vmlord_core::{BuildMonitor, BuildStep};
+
     use super::VmCreationPipeline;
     use crate::MetadataStore;
+
+    fn monitor() -> BuildMonitor {
+        BuildMonitor::new(BuildStep::WritingDisk)
+    }
 
     struct TempRoot(PathBuf);
 
@@ -446,7 +479,10 @@ mod tests {
             },
             {
                 let calls = calls.clone();
-                move |image: &vmlord_core::CloudImage, size, path: &std::path::Path| {
+                move |image: &vmlord_core::CloudImage,
+                      size,
+                      path: &std::path::Path,
+                      _: &BuildMonitor| {
                     calls.cloud.lock().unwrap().push((
                         image.release.clone(),
                         size,
@@ -503,6 +539,158 @@ mod tests {
         )
     }
 
+    /// A pipeline whose seams record the step the monitor was reporting when
+    /// each of them ran.
+    fn observing_pipeline(
+        calls: &Calls,
+        monitor: &BuildMonitor,
+        seen: &Arc<Mutex<Vec<BuildStep>>>,
+    ) -> VmCreationPipeline {
+        // Boxed so the same recorder can be handed to three seams; a plain
+        // closure would be moved into the first of them.
+        let record: Arc<dyn Fn() + Send + Sync> = Arc::new({
+            let monitor = monitor.clone();
+            let seen = Arc::clone(seen);
+            move || seen.lock().unwrap().push(monitor.snapshot().step)
+        });
+        VmCreationPipeline::for_test(
+            {
+                let calls = calls.clone();
+                let record = Arc::clone(&record);
+                move |path: &std::path::Path, size| {
+                    record();
+                    calls.vhd.lock().unwrap().push((path.to_path_buf(), size));
+                    fs::write(path, b"vhdx")
+                        .map_err(|error| vmlord_core::RepositoryError::new(format!("vhd: {error}")))
+                }
+            },
+            |_: &CloudImage, _, _: &std::path::Path, _: &BuildMonitor| Ok(()),
+            {
+                let record = Arc::clone(&record);
+                move |_: &str, _: &std::path::Path| {
+                    record();
+                    Ok(())
+                }
+            },
+            {
+                let record = Arc::clone(&record);
+                move |_: &str, _: &str| {
+                    record();
+                    Ok(())
+                }
+            },
+            |_| Ok(()),
+        )
+    }
+
+    #[test]
+    fn a_local_media_build_reports_its_steps_in_order() {
+        let fixture = fixture("steps-local");
+        let calls = fixture.calls.clone();
+        let monitor = monitor();
+        // Each injected seam records the step the pipeline had reported by the
+        // time it was called, which is what "in order" can be checked against.
+        let seen: Arc<Mutex<Vec<BuildStep>>> = Arc::new(Mutex::new(Vec::new()));
+        let pipeline = observing_pipeline(&calls, &monitor, &seen);
+
+        pipeline
+            .create(
+                &fixture.store,
+                &fixture.request,
+                &fixture.vm_directory,
+                &monitor,
+            )
+            .expect("creation should succeed");
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &[
+                BuildStep::WritingDisk,
+                BuildStep::Provisioning,
+                BuildStep::Provisioning,
+                BuildStep::Registering,
+            ],
+            "the disk, then the files written for the VM and their grants, \
+             then the compute system"
+        );
+        assert_eq!(monitor.snapshot().step, BuildStep::Registering);
+    }
+
+    #[test]
+    fn a_cancelled_build_stops_before_touching_the_disk() {
+        let fixture = fixture("cancelled-early");
+        let calls = fixture.calls.clone();
+        let monitor = monitor();
+        monitor.cancel();
+        let pipeline = pipeline(&calls, false, false, false);
+
+        let error = pipeline
+            .create(
+                &fixture.store,
+                &fixture.request,
+                &fixture.vm_directory,
+                &monitor,
+            )
+            .expect_err("a cancelled build must not create a VM");
+
+        assert!(error.to_string().contains("cancelled"), "got {error}");
+        assert!(calls.vhd.lock().unwrap().is_empty());
+        assert!(calls.create.lock().unwrap().is_empty());
+        assert!(!fixture.vm_directory.exists());
+        assert!(fixture.store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_build_cancelled_while_writing_the_disk_is_rolled_back() {
+        let fixture = fixture("cancelled-midway");
+        let calls = fixture.calls.clone();
+        let monitor = monitor();
+        let pipeline = VmCreationPipeline::for_test(
+            {
+                let calls = calls.clone();
+                let monitor = monitor.clone();
+                move |path: &std::path::Path, size| {
+                    calls.vhd.lock().unwrap().push((path.to_path_buf(), size));
+                    fs::write(path, b"vhdx").unwrap();
+                    // The user pressed Cancel while the disk was being written.
+                    monitor.cancel();
+                    Ok(())
+                }
+            },
+            |_: &CloudImage, _, _: &std::path::Path, _: &BuildMonitor| Ok(()),
+            |_, _| Ok(()),
+            {
+                let calls = calls.clone();
+                move |id: &str, config: &str| {
+                    calls
+                        .create
+                        .lock()
+                        .unwrap()
+                        .push((id.to_owned(), config.to_owned()));
+                    Ok(())
+                }
+            },
+            |_| Ok(()),
+        );
+
+        let error = pipeline
+            .create(
+                &fixture.store,
+                &fixture.request,
+                &fixture.vm_directory,
+                &monitor,
+            )
+            .expect_err("a cancelled build must not create a VM");
+
+        assert!(error.to_string().contains("cancelled"), "got {error}");
+        assert!(
+            calls.create.lock().unwrap().is_empty(),
+            "cancellation must be noticed before the compute system is created"
+        );
+        assert!(!fixture.vm_directory.exists());
+        assert!(fixture.store.list().unwrap().is_empty());
+    }
+
     #[test]
     fn a_local_media_vm_never_reaches_the_cloud_image_importer() {
         let fixture = fixture("no-cloud");
@@ -510,7 +698,7 @@ mod tests {
         let pipeline = pipeline(&calls, false, false, false);
 
         pipeline
-            .create(&fixture.store, &fixture.request, &fixture.vm_directory)
+            .create(&fixture.store, &fixture.request, &fixture.vm_directory, &monitor())
             .expect("creation should succeed");
 
         assert!(calls.cloud.lock().unwrap().is_empty());
@@ -524,7 +712,7 @@ mod tests {
         let pipeline = pipeline(&calls, false, false, false);
 
         let mapping = pipeline
-            .create(&fixture.store, &fixture.request, &fixture.vm_directory)
+            .create(&fixture.store, &fixture.request, &fixture.vm_directory, &monitor())
             .expect("creation should succeed");
 
         assert_eq!(mapping.vm_name, "test-vm");
@@ -586,12 +774,12 @@ mod tests {
         let calls = fixture.calls.clone();
         let pipeline = pipeline(&calls, false, false, false);
         pipeline
-            .create(&fixture.store, &fixture.request, &fixture.vm_directory)
+            .create(&fixture.store, &fixture.request, &fixture.vm_directory, &monitor())
             .expect("the first creation should succeed");
 
         let other_directory = fixture.vm_directory.with_file_name("vm-2");
         let error = pipeline
-            .create(&fixture.store, &fixture.request, &other_directory)
+            .create(&fixture.store, &fixture.request, &other_directory, &monitor())
             .expect_err("a duplicate VM name must be rejected");
 
         assert!(error.to_string().contains("test-vm"));
@@ -608,7 +796,7 @@ mod tests {
         let pipeline = pipeline(&calls, false, false, false);
 
         let error = pipeline
-            .create(&fixture.store, &fixture.request, &fixture.vm_directory)
+            .create(&fixture.store, &fixture.request, &fixture.vm_directory, &monitor())
             .expect_err("an existing VM directory must be rejected");
 
         assert!(error.to_string().contains("already exists"));
@@ -622,7 +810,7 @@ mod tests {
         let pipeline = pipeline(&calls, true, false, false);
 
         let error = pipeline
-            .create(&fixture.store, &fixture.request, &fixture.vm_directory)
+            .create(&fixture.store, &fixture.request, &fixture.vm_directory, &monitor())
             .expect_err("disk failure must abort creation");
 
         assert!(error.to_string().contains("injected disk failure"));
@@ -640,7 +828,7 @@ mod tests {
         fs::remove_file(&fixture.image_path).unwrap();
 
         let error = pipeline
-            .create(&fixture.store, &fixture.request, &fixture.vm_directory)
+            .create(&fixture.store, &fixture.request, &fixture.vm_directory, &monitor())
             .expect_err("a vanished image must abort creation");
 
         assert!(error.to_string().contains("image"));
@@ -655,7 +843,7 @@ mod tests {
         let pipeline = pipeline(&calls, false, false, true);
 
         let error = pipeline
-            .create(&fixture.store, &fixture.request, &fixture.vm_directory)
+            .create(&fixture.store, &fixture.request, &fixture.vm_directory, &monitor())
             .expect_err("an HCS create failure must abort creation");
 
         assert!(error.to_string().contains("timed out"));
@@ -687,7 +875,7 @@ mod tests {
         let pipeline = pipeline(&calls, false, false, false);
 
         let error = pipeline
-            .create(&blocked_store, &fixture.request, &fixture.vm_directory)
+            .create(&blocked_store, &fixture.request, &fixture.vm_directory, &monitor())
             .expect_err("a metadata registration failure must abort creation");
 
         assert!(error.to_string().contains("creation of VM"));
@@ -706,7 +894,7 @@ mod tests {
         let calls = fixture.calls.clone();
         let pipeline = pipeline(&calls, true, false, false);
 
-        let _ = pipeline.create(&fixture.store, &fixture.request, &fixture.vm_directory);
+        let _ = pipeline.create(&fixture.store, &fixture.request, &fixture.vm_directory, &monitor());
 
         assert_eq!(fs::read(&fixture.image_path).unwrap(), b"iso");
     }
@@ -749,7 +937,7 @@ mod tests {
         let request = cloud_request("cloud-vm");
 
         let mapping = pipeline
-            .create(&fixture.store, &request, &fixture.vm_directory)
+            .create(&fixture.store, &request, &fixture.vm_directory, &monitor())
             .expect("creation should succeed");
 
         // The disk comes from the importer, not from an empty VHDX.
@@ -837,7 +1025,7 @@ mod tests {
         };
 
         pipeline
-            .create(&fixture.store, &request, &fixture.vm_directory)
+            .create(&fixture.store, &request, &fixture.vm_directory, &monitor())
             .expect("a key-only login is a valid VM");
 
         assert!(!seed_bytes(&fixture.vm_directory).contains("$6$"));
@@ -867,7 +1055,7 @@ mod tests {
         };
 
         pipeline
-            .create(&fixture.store, &request, &fixture.vm_directory)
+            .create(&fixture.store, &request, &fixture.vm_directory, &monitor())
             .expect("a password-only VM is a valid VM");
 
         assert!(!fixture.vm_directory.join("keys").exists());
@@ -889,6 +1077,7 @@ mod tests {
                 &fixture.store,
                 &cloud_request("cloud-dacl-vm"),
                 &fixture.vm_directory,
+                &monitor(),
             )
             .expect("creation should succeed");
 
@@ -934,7 +1123,7 @@ mod tests {
         };
 
         pipeline
-            .create(&fixture.store, &request, &fixture.vm_directory)
+            .create(&fixture.store, &request, &fixture.vm_directory, &monitor())
             .expect("SSH without a deployed key is a valid VM");
 
         assert!(!fixture.vm_directory.join("keys").exists());
@@ -953,6 +1142,7 @@ mod tests {
                 &fixture.store,
                 &cloud_request("cloud-doomed"),
                 &fixture.vm_directory,
+                &monitor(),
             )
             .expect_err("an import failure must abort creation");
 
@@ -973,6 +1163,7 @@ mod tests {
                 &fixture.store,
                 &cloud_request("cloud-rollback"),
                 &fixture.vm_directory,
+                &monitor(),
             )
             .expect_err("an HCS create failure must abort creation");
 

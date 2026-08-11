@@ -31,7 +31,7 @@ impl VmDeletionPipeline {
 
     #[cfg(test)]
     fn for_test(
-        teardown: impl Fn(&str) -> Result<(), RepositoryError> + 'static,
+        teardown: impl Fn(&str) -> Result<(), RepositoryError> + Send + Sync + 'static,
         endpoint_teardown: impl Fn(Uuid) -> Result<(), RepositoryError> + 'static,
     ) -> Self {
         Self {

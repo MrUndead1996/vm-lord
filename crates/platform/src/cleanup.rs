@@ -25,7 +25,10 @@ const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// Injected rather than called directly so the pipelines can be tested without
 /// a Hyper-V host.
-pub(crate) type SystemTeardown = Box<dyn Fn(&str) -> Result<(), RepositoryError>>;
+///
+/// `Send + Sync` because the creation pipeline holds one and runs on a thread
+/// of its own.
+pub(crate) type SystemTeardown = Box<dyn Fn(&str) -> Result<(), RepositoryError> + Send + Sync>;
 
 /// How a pipeline reaches HNS to delete a VM's endpoint.
 ///

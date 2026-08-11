@@ -8,8 +8,9 @@
 use std::{fs, net::IpAddr, path::PathBuf, sync::Mutex};
 
 use vmlord_core::{
-    AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError,
-    VmCreateRequest, VmDeleteRequest, VmRepository, VmState, VmSummary, VmUpdateRequest,
+    AgentStatus, BuildMonitor, BuildStep, Diagnostic, DiagnosticLevel, GpuMode, NetworkMode,
+    RepositoryError, VmCreateRequest, VmDeleteRequest, VmRepository, VmState, VmSummary,
+    VmUpdateRequest,
 };
 
 use crate::{
@@ -490,7 +491,12 @@ impl VmRepository for HcsVmRepository {
 
         let vm_directory = layout::vm_directory(&self.storage_root, &request.name)?;
         self.creation
-            .create(&self.store, &request, &vm_directory)
+            .create(
+                &self.store,
+                &request,
+                &vm_directory,
+                &BuildMonitor::new(BuildStep::WritingDisk),
+            )
             .map(|_mapping| ())
     }
 
@@ -673,7 +679,7 @@ mod tests {
     fn repository() -> HcsVmRepository {
         HcsVmRepository::new(
             std::env::temp_dir().join("vmlord-repository-test"),
-            Box::new(|_, _, _| {
+            Box::new(|_, _, _, _| {
                 Err(RepositoryError::new(
                     "this test creates no VM from a cloud image",
                 ))
