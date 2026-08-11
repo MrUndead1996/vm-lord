@@ -209,6 +209,54 @@ fn xkb_layout(klid: &str) -> String {
     }
 }
 
+/// Turns what the host said into what the create form starts out with.
+///
+/// Separate from the Win32 reads above it so that the fallbacks -- the part
+/// worth being sure about -- can be tested without a host to read.
+///
+/// Each field falls back on its own. A host whose keyboard is unrecognised
+/// still hands the guest its own timezone.
+fn guest_defaults(
+    locale: Option<&str>,
+    klid: Option<&str>,
+    timezone: Option<&str>,
+) -> GuestDefaults {
+    let fallback = GuestDefaults::default();
+
+    let locale = match locale.and_then(posix_locale) {
+        Some(mapped) => mapped,
+        None => {
+            log::warn!(
+                "the host locale {} has no POSIX name; the guest starts out with {}",
+                locale.unwrap_or("<unreadable>"),
+                fallback.locale
+            );
+            fallback.locale
+        }
+    };
+    let keyboard = xkb_layout(klid.unwrap_or_default());
+    let timezone = match timezone.and_then(iana_timezone) {
+        Some(mapped) => mapped,
+        None => {
+            log::warn!(
+                "the host time zone {} has no IANA name; the guest starts out with {}",
+                timezone.unwrap_or("<unreadable>"),
+                fallback.timezone
+            );
+            fallback.timezone
+        }
+    };
+
+    log::info!(
+        "a new VM starts out with locale {locale}, keyboard {keyboard}, timezone {timezone}"
+    );
+    GuestDefaults {
+        locale,
+        keyboard,
+        timezone,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,5 +366,42 @@ mod tests {
     #[test]
     fn a_klid_is_read_regardless_of_its_case() {
         assert_eq!(xkb_layout("0000041D"), "se");
+    }
+
+    #[test]
+    fn a_host_that_reads_gives_the_guest_its_own_settings() {
+        assert_eq!(
+            guest_defaults(
+                Some("ru-RU"),
+                Some("00000419"),
+                Some("Russian Standard Time")
+            ),
+            GuestDefaults {
+                locale: "ru_RU.UTF-8".into(),
+                keyboard: "ru".into(),
+                timezone: "Europe/Moscow".into(),
+            }
+        );
+    }
+
+    /// The promise the epic makes: an unreadable host setting is not a reason
+    /// to refuse to create a VM.
+    #[test]
+    fn a_host_that_reads_nothing_gives_the_guest_the_defaults() {
+        assert_eq!(guest_defaults(None, None, None), GuestDefaults::default());
+    }
+
+    /// The three fields are read and mapped apart, so one that fails leaves
+    /// the other two alone.
+    #[test]
+    fn a_field_that_does_not_map_leaves_the_others_untouched() {
+        assert_eq!(
+            guest_defaults(Some("en"), Some("00000419"), Some("Russian Standard Time")),
+            GuestDefaults {
+                locale: GuestDefaults::default().locale,
+                keyboard: "ru".into(),
+                timezone: "Europe/Moscow".into(),
+            }
+        );
     }
 }
