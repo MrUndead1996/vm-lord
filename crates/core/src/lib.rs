@@ -8,7 +8,9 @@ pub mod settings;
 
 pub use distro::{DistroProfile, ubuntu};
 pub use logging::{LoggingError, initialize as initialize_logging};
-pub use progress::{DownloadPhase, ProgressPublisher, ProgressThrottle};
+pub use progress::{
+    BuildMonitor, BuildProgress, BuildStep, DownloadPhase, ProgressPublisher, ProgressThrottle,
+};
 pub use provisioning::{CloudImage, Password, Provisioning, SshAccess, VmSource};
 pub use settings::{AppSettings, Language, LogLevel, SettingsError, SettingsStore};
 

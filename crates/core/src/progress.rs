@@ -8,9 +8,14 @@
 
 use std::{
     mem::Discriminant,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
+
+use crate::RepositoryError;
 
 /// What a download is doing right now.
 ///
@@ -134,11 +139,126 @@ impl<P: Copy> ProgressThrottle<P> {
     }
 }
 
+/// Which step of creating a VM is running.
+///
+/// Four steps and no overall percentage: fetching an image, writing a disk and
+/// handing the result to HCS are not commensurable, so a bar over all of them
+/// would need a denominator that does not exist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuildStep {
+    /// Fetching the cloud image into the cache. Cloud images only.
+    Downloading,
+    /// Writing the system disk: an empty VHDX, or the image onto one.
+    WritingDisk,
+    /// Writing what the VM needs into its directory -- the key pair, the seed
+    /// volume, the HCS configuration -- and granting the VM access to it.
+    Provisioning,
+    /// Creating the compute system and recording the VM in the metadata.
+    Registering,
+}
+
+/// What creating a VM looks like from outside the thread doing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BuildProgress {
+    pub step: BuildStep,
+    /// The download's own progress. Only meaningful while `step` is
+    /// `Downloading`, and `None` at every other step -- a stale byte count
+    /// shown beside a later step would read as a download still running.
+    pub download: Option<DownloadPhase>,
+}
+
+/// The channel between a VM being built and the thread watching it: what the
+/// build is doing, and whether it has been told to stop.
+///
+/// Two slots rather than one because the byte counts are published deep inside
+/// `vmlord-image`, which knows nothing of VMs, while the steps are published
+/// around it. Joining them at the moment of reading costs one comparison;
+/// joining them at the moment of writing would cost either a dependency the
+/// wrong way round or a thread whose only job is forwarding.
+#[derive(Clone)]
+pub struct BuildMonitor {
+    step: ProgressPublisher<BuildStep>,
+    download: ProgressPublisher<DownloadPhase>,
+    cancel: Arc<AtomicBool>,
+}
+
+impl BuildMonitor {
+    /// Starts a monitor already reporting `initial`.
+    ///
+    /// There is no empty state: a build that has been accepted is at some step
+    /// from the moment it is listed, and `initial` is the one its source
+    /// begins with. The worker replaces it with its own first report as soon
+    /// as it runs.
+    #[must_use]
+    pub fn new(initial: BuildStep) -> Self {
+        let step = ProgressPublisher::default();
+        step.publish(initial);
+        Self {
+            step,
+            download: ProgressPublisher::default(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Records the step the build has reached.
+    pub fn report(&self, step: BuildStep) {
+        log::debug!("a VM build reached {step:?}");
+        self.step.publish(step);
+    }
+
+    /// The slot the image download publishes its bytes into.
+    #[must_use]
+    pub fn downloads(&self) -> &ProgressPublisher<DownloadPhase> {
+        &self.download
+    }
+
+    /// The flag the long steps poll, for handing down to them.
+    #[must_use]
+    pub fn cancel_flag(&self) -> &AtomicBool {
+        &self.cancel
+    }
+
+    /// Asks the build to stop at its next checkpoint.
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// Turns a cancellation into the error the build fails with.
+    ///
+    /// Cancelling is an ordinary failure on purpose: it then takes the same
+    /// rollback every other failure takes, instead of a second cleanup path
+    /// that can drift away from the first.
+    pub fn check_cancelled(&self) -> Result<(), RepositoryError> {
+        if self.is_cancelled() {
+            return Err(RepositoryError::new("creating the VM was cancelled"));
+        }
+        Ok(())
+    }
+
+    /// What the watching thread shows for this build right now.
+    #[must_use]
+    pub fn snapshot(&self) -> BuildProgress {
+        let step = self.step.snapshot().unwrap_or(BuildStep::Downloading);
+        BuildProgress {
+            step,
+            download: match step {
+                BuildStep::Downloading => self.download.snapshot(),
+                _ => None,
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
-    use super::{DownloadPhase, ProgressPublisher, ProgressThrottle};
+    use super::{BuildMonitor, BuildStep, DownloadPhase, ProgressPublisher, ProgressThrottle};
 
     #[test]
     fn a_publisher_starts_empty_and_then_reports_the_last_phase() {
@@ -306,5 +426,71 @@ mod tests {
         publisher.publish(Step::Second);
 
         assert_eq!(publisher.snapshot(), Some(Step::Second));
+    }
+
+    #[test]
+    fn a_monitor_reports_the_step_it_was_started_at() {
+        let monitor = BuildMonitor::new(BuildStep::WritingDisk);
+
+        let progress = monitor.snapshot();
+
+        assert_eq!(progress.step, BuildStep::WritingDisk);
+        assert_eq!(
+            progress.download, None,
+            "a build that never downloads anything has no bytes to show"
+        );
+    }
+
+    #[test]
+    fn a_monitor_shows_downloaded_bytes_only_while_downloading() {
+        let monitor = BuildMonitor::new(BuildStep::Downloading);
+        monitor.downloads().publish(DownloadPhase::Downloading {
+            downloaded: 10,
+            total: Some(100),
+        });
+
+        assert_eq!(
+            monitor.snapshot().download,
+            Some(DownloadPhase::Downloading {
+                downloaded: 10,
+                total: Some(100),
+            })
+        );
+
+        monitor.report(BuildStep::WritingDisk);
+
+        assert_eq!(
+            monitor.snapshot(),
+            super::BuildProgress {
+                step: BuildStep::WritingDisk,
+                download: None,
+            },
+            "the download's last phase must not be shown beside a later step"
+        );
+    }
+
+    #[test]
+    fn a_clone_of_a_monitor_shares_the_step_and_the_cancellation() {
+        let monitor = BuildMonitor::new(BuildStep::Downloading);
+        let worker_side = monitor.clone();
+
+        worker_side.report(BuildStep::Registering);
+        monitor.cancel();
+
+        assert_eq!(monitor.snapshot().step, BuildStep::Registering);
+        assert!(worker_side.is_cancelled());
+    }
+
+    #[test]
+    fn check_cancelled_names_the_cancellation_as_the_cause() {
+        let monitor = BuildMonitor::new(BuildStep::Downloading);
+        assert!(monitor.check_cancelled().is_ok());
+
+        monitor.cancel();
+
+        let error = monitor
+            .check_cancelled()
+            .expect_err("a cancelled build must not be allowed to continue");
+        assert!(error.to_string().contains("cancelled"), "got {error}");
     }
 }
