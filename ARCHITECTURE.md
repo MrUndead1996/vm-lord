@@ -206,6 +206,12 @@ used only by the `#[ignore]`d tests that exercise a real cloud image;
 the composition root is where the two halves meet in production, described in
 "Creating a VM from a cloud image" below.
 
+`vmlord-com1.exe` is a second binary of the `vmlord` package rather than a
+crate of its own: it is a console for a terminal window to host, and every line
+it runs lives in `platform`. It is part of the composition, not a layer -- it
+depends on `core` for settings and logging and on `platform` for the capture,
+and nothing depends on it. See "The COM1 diagnostic console" below.
+
 Windows-only HCS integration tests are intentionally ignored by default. They
 require Hyper-V, the Host Compute Service, and a disposable existing HCS VM ID
 provided through `VMLORD_TEST_VM_ID`.
@@ -1035,6 +1041,73 @@ skips the per-instance modules -- the user, the key, the password -- rather than
 re-running them. Ejecting would mean rewriting the configuration document and
 recreating the compute system on a schedule nobody owns, for no gain the guest
 can observe.
+
+### The COM1 diagnostic console
+
+Every VM VMLord creates is wired to a serial port, and everything the guest
+writes to it is kept. `Devices.ComPorts.0.NamedPipe` in `config.json` names
+`\\.\pipe\vmlord-<vm-uuid>.com1`, derived from the compute system's own
+identity by `hcs_config::com1_pipe_path`: the endpoint has to survive a rename
+and stay distinct between VMs, and the UUID is the only thing about a VM that is
+both. The capture lands in `<vm>/com1.log`, beside `config.json` for the same
+reason the seed does -- it describes what the VM did, not what it is made of, so
+a deletion that keeps the disks must not be what decides whether the last boot's
+output survives. Nothing from the stream is copied into `vmlord.log`: guest
+output is bytes, not events, and mixing the two would make both harder to read.
+
+`vmlord-com1.exe` ships beside `vmlord.exe` and is the only thing that reads the
+pipe. It holds no business logic: it parses its arguments, opens the log, and
+mirrors every byte to the log and to its own stdout with no decoding, so a
+partial UTF-8 sequence or a control byte reaches the file exactly as the guest
+sent it. It exists as a separate process because a terminal window has to host
+something, and because a cancellable overlapped read of a named pipe belongs
+where the rest of `platform`'s Win32 code already is. The reader owns nothing
+the GUI owns: it is told a pipe, a log, a mode, its parent's process id and four
+event names, and none of those is ever a secret -- a command line is readable by
+anything on the machine that can enumerate the process.
+
+`Com1Launcher` puts the reader on screen through the first terminal host that
+starts: `wt.exe -w 0 new-tab --title "VMLord COM1 - <vm>"`, then
+`powershell.exe -NoLogo -NoProfile -Command`, then `cmd.exe /D /S /C`. Neither
+shell reads or tails the log -- they host the helper and nothing else -- and
+neither is given `-NoExit`, so the window closes when the reader does. A host
+that refuses is logged at `WARN` and the next is tried; only when all three
+refuse is there an error, and it names all three.
+
+The four events are created by VMLord before anything is spawned, under
+unguessable `Local\VMLord.Com1.<session-id>.*` names: `ready`, which the reader
+signals once its log is open and it can be cancelled; `cancel`, which ends the
+capture; `failed`, which distinguishes a reader that stopped for the wrong
+reason; and `finished`, which is signaled on every path out of the reader,
+including a panic. What VMLord keeps afterwards is a `Com1Session` holding those
+events, not a process handle: the terminal owns the reader, and the session is
+how VMLord speaks to it.
+
+Ownership follows the VM. An explicit start opens the console before the network
+and before HCS -- the output that explains a failed boot is written in the first
+seconds of one -- and truncates `com1.log`, because that boot's output replaces
+the previous one. A start whose console cannot be opened fails: a VM running
+without diagnostics is the case this feature exists for. Any failure after the
+launch drops the pending session, and dropping one signals cancellation, so no
+window survives a start that did not happen. A reconnect at startup is the other
+direction: for each VM HCS still reports as `Running`, a console is opened in
+append mode, because the boot it is in the middle of is the same boot. A
+reconnect launch that fails is a `Warning` diagnostic and nothing more -- the
+guest is already up, and no diagnostic is worth taking it down for.
+
+A graceful stop leaves the session alone: the guest is still printing what it
+does on the way down, and the pipe closing is what ends the capture. A force
+stop, a delete, an HCS exit event, and VMLord's own shutdown all cancel it,
+because in each of those cases nothing will ever close the pipe from the other
+end. `take_diagnostics` reaps finished sessions: one that finished with its pipe
+is a `DEBUG` line, and one that signaled `failed` becomes an `Error` diagnostic
+naming the VM and the `com1.log` to look in.
+
+`ubuntu_cloud_init_is_visible_on_com1` is the factual check, ignored like every
+other test that needs Hyper-V: it builds a real Ubuntu cloud image, starts it,
+and waits for the string `cloud-init` to appear in the VM's `com1.log`. That is
+the claim worth verifying -- that the serial console the guest was given is the
+one being captured, before SSH exists to ask it anything.
 
 ### Creating a VM in the background
 

@@ -108,20 +108,9 @@ fn a_cloud_vm_is_built_in_the_background() {
         .expect("the creation should be accepted");
     let accepted_in = accepted_at.elapsed();
 
-    let mut seen_building = false;
-    let deadline = std::time::Instant::now() + Duration::from_secs(20 * 60);
-    let outcome = loop {
-        let summaries = repository.list_vms().expect("listing should work");
-        match summaries.iter().find(|vm| vm.name == "bg-build") {
-            Some(vm) if matches!(vm.state, VmState::Building { .. }) => seen_building = true,
-            Some(_) => break Ok(()),
-            None => break Err(format!("the build failed: {:?}", repository.take_diagnostics())),
-        }
-        if std::time::Instant::now() >= deadline {
-            break Err("the build did not finish".to_owned());
-        }
-        std::thread::sleep(Duration::from_secs(2));
-    };
+    let outcome =
+        wait_until_build_finishes(&mut repository, "bg-build", Duration::from_secs(20 * 60));
+    let seen_building = outcome.as_ref().copied().unwrap_or(false);
 
     // Best-effort cleanup regardless of the assertions below.
     let _ = repository.delete_vm(VmDeleteRequest {
@@ -140,6 +129,96 @@ fn a_cloud_vm_is_built_in_the_background() {
         seen_building,
         "the VM must be listed as Building while it builds"
     );
+}
+
+/// Waits until VM `name` stops being listed as building, reporting whether it
+/// was ever seen building on the way.
+///
+/// A build that disappears from the list failed and rolled itself back, so the
+/// diagnostics it left are what the failure says.
+fn wait_until_build_finishes(
+    repository: &mut HcsVmRepository,
+    name: &str,
+    timeout: Duration,
+) -> Result<bool, String> {
+    let mut seen_building = false;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let summaries = repository.list_vms().expect("listing should work");
+        match summaries.iter().find(|vm| vm.name == name) {
+            Some(vm) if matches!(vm.state, VmState::Building { .. }) => seen_building = true,
+            Some(_) => return Ok(seen_building),
+            None => {
+                return Err(format!(
+                    "the build failed: {:?}",
+                    repository.take_diagnostics()
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err("the build did not finish".to_owned());
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// Waits for cloud-init to appear in a VM's captured serial output.
+fn wait_for_cloud_init_log(path: &Path, timeout: Duration) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(bytes) = fs::read(path) {
+            // Lossy on purpose: a serial console carries bytes, and this only
+            // has to find a word in them.
+            let text = String::from_utf8_lossy(&bytes);
+            if text.to_ascii_lowercase().contains("cloud-init") {
+                return Ok(text.into_owned());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("cloud-init did not appear in {}", path.display()));
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// What COM1 is for: an Ubuntu cloud image says what it is doing on its serial
+/// port long before SSH exists, and that output has to reach `com1.log`.
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS and downloads a cloud image"]
+fn ubuntu_cloud_init_is_visible_on_com1() {
+    let root = std::env::temp_dir().join(format!("vmlord-com1-cloud-init-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut repository = cloud_repository(&root);
+    repository
+        .initialize()
+        .expect("the native backend should initialize on a Hyper-V host");
+    let name = "com1-cloud-init";
+
+    repository
+        .create_vm(background_cloud_request(name))
+        .expect("the creation should be accepted");
+    wait_until_build_finishes(&mut repository, name, Duration::from_secs(20 * 60))
+        .expect("the VM should finish building");
+    repository
+        .start_vm(name)
+        .expect("the built VM should start");
+
+    let result = wait_for_cloud_init_log(
+        &root.join(name).join("com1.log"),
+        Duration::from_secs(10 * 60),
+    );
+
+    // Cleanup after the capture and before the assertion: a VM left running is
+    // worse than a failed test.
+    let _ = repository.force_stop_vm(name);
+    let _ = repository.delete_vm(VmDeleteRequest {
+        name: name.into(),
+        delete_disks: true,
+    });
+    drop(repository);
+    let _ = fs::remove_dir_all(&root);
+
+    result.expect("Ubuntu cloud-init output should reach COM1");
 }
 
 /// A cancelled build leaves nothing: not the directory, not a metadata entry,
