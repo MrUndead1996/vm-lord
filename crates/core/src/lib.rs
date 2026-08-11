@@ -181,6 +181,18 @@ pub trait VmRepository {
     /// Required rather than defaulted: a backend that cannot delete VMs has to
     /// say so, not inherit silence.
     fn delete_vm(&mut self, request: VmDeleteRequest) -> Result<(), RepositoryError>;
+    /// Stops a VM that is still being created, undoing what has been built.
+    ///
+    /// Defaulted rather than required: a backend that creates VMs
+    /// synchronously has nothing in flight to cancel, and saying so is the
+    /// honest answer. Deletion is deliberately not made to double as this --
+    /// removing a VM that does not exist yet is a different operation with a
+    /// different outcome.
+    fn cancel_create(&mut self, _name: &str) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(
+            "this backend creates VMs in the foreground, so there is nothing to cancel",
+        ))
+    }
     fn open_display(&mut self, _name: &str) -> Result<(), RepositoryError> {
         Err(RepositoryError::new(
             "display connections are not supported by this backend",

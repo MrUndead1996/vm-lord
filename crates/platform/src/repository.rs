@@ -657,6 +657,11 @@ impl VmRepository for HcsVmRepository {
         Ok(())
     }
 
+    fn cancel_create(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.require_initialized()?;
+        self.builds.cancel(name)
+    }
+
     fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError> {
         self.require_initialized()?;
 
