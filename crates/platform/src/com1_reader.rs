@@ -20,8 +20,8 @@ use windows::{
         Foundation::{
             CloseHandle, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_IO_INCOMPLETE,
             ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY,
-            ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
-            WAIT_TIMEOUT,
+            ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, WAIT_FAILED,
+            WAIT_OBJECT_0, WAIT_TIMEOUT,
         },
         Storage::FileSystem::{
             CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -48,6 +48,12 @@ const CONNECT_POLL: Duration = Duration::from_millis(250);
 
 /// How much guest output one read may return.
 const READ_BUFFER_BYTES: usize = 4096;
+
+/// The access the helper asks the COM1 pipe for.
+///
+/// Both directions: HCS serves the pipe duplex, and the same handle carries the
+/// guest's output out and the user's keystrokes in.
+const PIPE_ACCESS: u32 = GENERIC_READ.0 | GENERIC_WRITE.0;
 
 /// How the helper opens `com1.log`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,7 +240,7 @@ fn connect(
     options: &Com1HelperOptions,
     cancel: &WindowsEvent,
     parent: &OwnedHandle,
-) -> Result<Option<OwnedHandle>, RepositoryError> {
+) -> Result<Option<Com1Pipe>, RepositoryError> {
     let wide_path = HSTRING::from(options.pipe_path.as_os_str().to_string_lossy().as_ref());
     let poll_ms = CONNECT_POLL.as_millis() as u32;
 
@@ -248,7 +254,7 @@ fn connect(
         let opened = unsafe {
             CreateFileW(
                 &wide_path,
-                GENERIC_READ.0,
+                PIPE_ACCESS,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None,
                 OPEN_EXISTING,
@@ -257,7 +263,7 @@ fn connect(
             )
         };
         match opened {
-            Ok(handle) => return Ok(Some(OwnedHandle(handle))),
+            Ok(handle) => return Ok(Some(Com1Pipe(handle))),
             Err(error) if is_worth_retrying(&error) => {
                 // SAFETY: `wide_path` outlives the call; the result only says
                 // whether an instance became free within the interval, and
@@ -293,7 +299,7 @@ fn was_waited_for(error: &Error) -> bool {
 
 /// Reads the pipe until it closes, cancellation arrives, or the parent exits.
 fn read_until_closed(
-    pipe: &OwnedHandle,
+    pipe: &Com1Pipe,
     io_event: &WindowsEvent,
     cancel: &WindowsEvent,
     parent: &OwnedHandle,
@@ -311,8 +317,14 @@ fn read_until_closed(
         // SAFETY: `buffer` and `overlapped` outlive the operation: either it
         // completes below, or `abandon_read` cancels it and waits for the
         // completion before this frame is left.
-        let started =
-            unsafe { ReadFile(pipe.0, Some(&mut buffer), None, Some(&raw mut overlapped)) };
+        let started = unsafe {
+            ReadFile(
+                pipe.raw(),
+                Some(&mut buffer),
+                None,
+                Some(&raw mut overlapped),
+            )
+        };
         match started {
             Ok(()) => {}
             Err(error) if error.code() == ERROR_IO_PENDING.to_hresult() => {
@@ -338,7 +350,12 @@ fn read_until_closed(
         // SAFETY: `overlapped` describes the operation started above and is
         // still alive; the read has already completed, so this does not block.
         let completed = unsafe {
-            GetOverlappedResult(pipe.0, &raw const overlapped, &raw mut transferred, true)
+            GetOverlappedResult(
+                pipe.raw(),
+                &raw const overlapped,
+                &raw mut transferred,
+                true,
+            )
         };
         match completed {
             Ok(()) => {}
@@ -400,13 +417,13 @@ fn wait_for_read(
 /// Cancels a read that is still pending and waits for the kernel to give the
 /// buffer back, so that leaving this frame cannot free memory the kernel still
 /// writes to.
-fn abandon_read(pipe: &OwnedHandle, overlapped: &OVERLAPPED) {
+fn abandon_read(pipe: &Com1Pipe, overlapped: &OVERLAPPED) {
     // SAFETY: `pipe` is open and `overlapped` describes an operation issued on
     // it by this thread.
-    let _ = unsafe { CancelIoEx(pipe.0, Some(overlapped)) };
+    let _ = unsafe { CancelIoEx(pipe.raw(), Some(overlapped)) };
     let mut transferred = 0_u32;
     // SAFETY: as above; `true` waits for the cancelled operation to finish.
-    let _ = unsafe { GetOverlappedResult(pipe.0, overlapped, &raw mut transferred, true) };
+    let _ = unsafe { GetOverlappedResult(pipe.raw(), overlapped, &raw mut transferred, true) };
 }
 
 /// The ways a pipe stops delivering that are not failures: the guest closed it,
@@ -452,6 +469,39 @@ fn has_exited(process: &OwnedHandle) -> Result<bool, RepositoryError> {
             "Windows API operation \"wait for VMLord process\" returned unexpected status {}",
             result.0
         ))),
+    }
+}
+
+/// The COM1 pipe, owned by this module and closed exactly once.
+///
+/// There is one handle and there can only be one: HCS serves a single instance,
+/// so a second open would either be refused as busy or take the stream away
+/// from the reader. The capture loop and the input thread therefore share this
+/// one, each with its own `OVERLAPPED` and event -- which is what overlapped
+/// I/O is for.
+pub(crate) struct Com1Pipe(HANDLE);
+
+// SAFETY: a file handle is valid process-wide and is not owned by the thread
+// that opened it. Concurrent overlapped `ReadFile` and `WriteFile` on one handle
+// are supported as long as each carries its own `OVERLAPPED`, which is how the
+// capture loop and the input thread use it. The handle is closed in `Drop`, and
+// the input thread holds an `Arc` clone, so it cannot be closed under a write.
+unsafe impl Send for Com1Pipe {}
+// SAFETY: as above; every operation this type exposes takes `&self` and passes
+// the handle to a Win32 call that is safe to issue from several threads.
+unsafe impl Sync for Com1Pipe {}
+
+impl Com1Pipe {
+    pub(crate) fn raw(&self) -> HANDLE {
+        self.0
+    }
+}
+
+impl Drop for Com1Pipe {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from the successful `CreateFileW` in
+        // `connect` and is closed only here.
+        let _ = unsafe { CloseHandle(self.0) };
     }
 }
 
@@ -505,7 +555,7 @@ mod tests {
         core::Error,
     };
 
-    use super::{Com1LogMode, is_end_of_stream, mirror_chunk, parse_com1_helper_args};
+    use super::{Com1LogMode, PIPE_ACCESS, is_end_of_stream, mirror_chunk, parse_com1_helper_args};
 
     fn arguments() -> Vec<OsString> {
         [
@@ -607,6 +657,26 @@ mod tests {
             !is_end_of_stream(&Error::from_hresult(ERROR_ACCESS_DENIED.to_hresult())),
             "a reader that cannot read has not reached the end of anything"
         );
+    }
+
+    /// The console is two-way, and the only thing that makes it so is the
+    /// access this open asks for. A read-only mask compiles, runs, and silently
+    /// turns every keystroke into ERROR_ACCESS_DENIED.
+    #[test]
+    fn the_pipe_is_opened_for_writing_as_well_as_reading() {
+        use windows::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+
+        assert_eq!(PIPE_ACCESS & GENERIC_WRITE.0, GENERIC_WRITE.0);
+        assert_eq!(PIPE_ACCESS & GENERIC_READ.0, GENERIC_READ.0);
+    }
+
+    /// One handle is shared by the capture loop and the input thread, so the
+    /// type that owns it has to be sendable and shareable.
+    #[test]
+    fn the_pipe_handle_can_be_shared_with_another_thread() {
+        fn assert_shareable<T: Send + Sync>() {}
+
+        assert_shareable::<super::Com1Pipe>();
     }
 
     #[test]
