@@ -15,10 +15,17 @@ use windows::{
     Win32::{
         Foundation::{
             ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_NO_DATA,
-            ERROR_OPERATION_ABORTED, ERROR_PIPE_NOT_CONNECTED,
+            ERROR_OPERATION_ABORTED, ERROR_PIPE_NOT_CONNECTED, HANDLE,
         },
         Storage::FileSystem::WriteFile,
-        System::IO::{GetOverlappedResult, OVERLAPPED},
+        System::{
+            Console::{
+                CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT, ENABLE_PROCESSED_INPUT,
+                ENABLE_VIRTUAL_TERMINAL_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode,
+                GetStdHandle, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, SetConsoleMode,
+            },
+            IO::{GetOverlappedResult, OVERLAPPED},
+        },
     },
     core::Error,
 };
@@ -126,6 +133,84 @@ pub(crate) fn is_end_of_stream_io(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(code) if ends.contains(&(code as u32)))
 }
 
+/// The input mode a console has to be in for a serial console to work.
+pub(crate) fn raw_input_mode(original: CONSOLE_MODE) -> CONSOLE_MODE {
+    CONSOLE_MODE(
+        (original.0 & !(ENABLE_LINE_INPUT.0 | ENABLE_ECHO_INPUT.0 | ENABLE_PROCESSED_INPUT.0))
+            | ENABLE_VIRTUAL_TERMINAL_INPUT.0,
+    )
+}
+
+/// The output mode that lets what the guest draws arrive as drawing rather than
+/// as escape codes.
+pub(crate) fn vt_output_mode(original: CONSOLE_MODE) -> CONSOLE_MODE {
+    CONSOLE_MODE(original.0 | ENABLE_VIRTUAL_TERMINAL_PROCESSING.0)
+}
+
+/// The console modes the helper changed, restored when it is done.
+///
+/// A helper that exits leaving line input off would hand the user back a
+/// terminal that no longer echoes what they type, so the restore has to happen
+/// on every path out -- including a panic, which is what `Drop` gives.
+pub(crate) struct ConsoleModes {
+    changed: Vec<(HANDLE, CONSOLE_MODE)>,
+}
+
+impl ConsoleModes {
+    /// Takes the console out of cooked mode, as far as this console allows.
+    ///
+    /// A standard handle that is not a console -- output redirected to a file,
+    /// input from a pipe -- is left alone: there is no mode to change, and the
+    /// bytes still travel.
+    pub(crate) fn enter_raw() -> Self {
+        let mut changed = Vec::new();
+        for (which, mode_of) in [
+            (
+                STD_INPUT_HANDLE,
+                raw_input_mode as fn(CONSOLE_MODE) -> CONSOLE_MODE,
+            ),
+            (STD_OUTPUT_HANDLE, vt_output_mode),
+        ] {
+            match set_console_mode(which, mode_of) {
+                Some(previous) => changed.push(previous),
+                None => log::debug!(
+                    "COM1 console standard handle {} is not a console; leaving its mode alone",
+                    which.0
+                ),
+            }
+        }
+        Self { changed }
+    }
+}
+
+impl Drop for ConsoleModes {
+    fn drop(&mut self) {
+        for (handle, original) in self.changed.drain(..) {
+            // SAFETY: `handle` is a standard handle this process owns for its
+            // lifetime, and `original` is the mode read from it.
+            if let Err(error) = unsafe { SetConsoleMode(handle, original) } {
+                log::warn!("could not restore the COM1 console mode: {error}");
+            }
+        }
+    }
+}
+
+/// Applies `mode_of` to one standard handle, returning what it replaced.
+fn set_console_mode(
+    which: STD_HANDLE,
+    mode_of: fn(CONSOLE_MODE) -> CONSOLE_MODE,
+) -> Option<(HANDLE, CONSOLE_MODE)> {
+    // SAFETY: a standard handle is owned by the process and is not closed here.
+    let handle = unsafe { GetStdHandle(which) }.ok()?;
+    let mut original = CONSOLE_MODE::default();
+    // SAFETY: `handle` is valid and `original` outlives the call. A failure
+    // means the handle is not a console, which is not an error here.
+    unsafe { GetConsoleMode(handle, &raw mut original) }.ok()?;
+    // SAFETY: as above.
+    unsafe { SetConsoleMode(handle, mode_of(original)) }.ok()?;
+    Some((handle, original))
+}
+
 /// Starts the thread that carries this window's keyboard into the guest.
 ///
 /// The thread is never joined, and that is deliberate: a blocking console read
@@ -175,7 +260,65 @@ mod tests {
         core::Error,
     };
 
-    use super::{is_end_of_stream_io, pump_input, win32_code};
+    use super::{is_end_of_stream_io, pump_input, raw_input_mode, vt_output_mode, win32_code};
+
+    /// Raw mode is what makes the console usable: line input would hold every
+    /// keystroke until Enter, echo would double what the guest already echoes
+    /// and would show a password, and processed input would keep Ctrl-C for the
+    /// helper instead of passing it to the guest. Virtual terminal input is what
+    /// turns arrows and function keys into the sequences a Linux tty expects.
+    #[test]
+    fn raw_mode_frees_the_keyboard_and_leaves_nothing_else_touched() {
+        use windows::Win32::System::Console::{
+            CONSOLE_MODE, ENABLE_ECHO_INPUT, ENABLE_EXTENDED_FLAGS, ENABLE_LINE_INPUT,
+            ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_INPUT,
+        };
+
+        let original = CONSOLE_MODE(
+            ENABLE_LINE_INPUT.0
+                | ENABLE_ECHO_INPUT.0
+                | ENABLE_PROCESSED_INPUT.0
+                | ENABLE_EXTENDED_FLAGS.0,
+        );
+
+        let raw = raw_input_mode(original);
+
+        for cooked in [ENABLE_LINE_INPUT, ENABLE_ECHO_INPUT, ENABLE_PROCESSED_INPUT] {
+            assert_eq!(raw.0 & cooked.0, 0, "{cooked:?} must be off in raw mode");
+        }
+        assert_eq!(
+            raw.0 & ENABLE_VIRTUAL_TERMINAL_INPUT.0,
+            ENABLE_VIRTUAL_TERMINAL_INPUT.0
+        );
+        assert_eq!(
+            raw.0 & ENABLE_EXTENDED_FLAGS.0,
+            ENABLE_EXTENDED_FLAGS.0,
+            "a flag the helper has no opinion about stays as the user set it"
+        );
+    }
+
+    /// Without virtual terminal processing the colors and cursor movement of
+    /// cloud-init output and of any full-screen program in the guest arrive as
+    /// escape codes on screen.
+    #[test]
+    fn output_gains_virtual_terminal_processing_and_keeps_the_rest() {
+        use windows::Win32::System::Console::{
+            CONSOLE_MODE, ENABLE_PROCESSED_OUTPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        };
+
+        let original = CONSOLE_MODE(ENABLE_PROCESSED_OUTPUT.0);
+
+        let mode = vt_output_mode(original);
+
+        assert_eq!(
+            mode.0 & ENABLE_VIRTUAL_TERMINAL_PROCESSING.0,
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING.0
+        );
+        assert_eq!(
+            mode.0 & ENABLE_PROCESSED_OUTPUT.0,
+            ENABLE_PROCESSED_OUTPUT.0
+        );
+    }
 
     /// Keystrokes are bytes on a wire. Ctrl-C is 0x03 and has to arrive as
     /// 0x03, backspace as 0x7f, and a typed character that is not ASCII as the
