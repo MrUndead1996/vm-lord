@@ -19,9 +19,11 @@ use vmlord_core::{
 
 use crate::{
     CloudDiskImporter, HcsClient, HcsSystem, KnownVm, MetadataStore, VmComputeSystemMapping,
-    VmConnections, VmCreationPipeline, VmDeletionPipeline, VmForceStopPipeline,
-    VmShutdownPipeline, VmStartPipeline, cleanup,
+    VmConnections, VmCreationPipeline, VmDeletionPipeline, VmForceStopPipeline, VmShutdownPipeline,
+    VmStartPipeline,
     build::BuildRegistry,
+    cleanup,
+    com1_terminal::{Com1Launcher, Com1Sessions},
     hcn::HcnNetwork,
     hcn_endpoint::{EndpointAddress, HcnEndpoint},
     hcs::{HCS_ACCESS_ALL, HcsSystemState},
@@ -53,6 +55,10 @@ pub struct HcsVmRepository {
     /// The VMs being created right now.
     builds: Arc<BuildRegistry>,
     start: VmStartPipeline,
+    /// Opens the COM1 console of a VM that is starting or already running.
+    com1_launcher: Com1Launcher,
+    /// The consoles VMLord currently owns, one per running VM.
+    com1_sessions: Com1Sessions,
     shutdown: VmShutdownPipeline,
     force_stop: VmForceStopPipeline,
     delete: VmDeletionPipeline,
@@ -77,6 +83,7 @@ impl HcsVmRepository {
     pub fn new(storage_root: impl Into<PathBuf>, cloud_disk: CloudDiskImporter) -> Self {
         let storage_root = storage_root.into();
         let events = VmEventSink::default();
+        let com1_launcher = Com1Launcher::production();
         Self {
             client: HcsClient::new(),
             store: MetadataStore::new(storage_root.join(MAPPING_FILE_NAME)),
@@ -84,7 +91,9 @@ impl HcsVmRepository {
             connections: VmConnections::with_events(events.clone()),
             creation: Arc::new(VmCreationPipeline::production(cloud_disk)),
             builds: Arc::new(BuildRegistry::default()),
-            start: VmStartPipeline::production(),
+            start: VmStartPipeline::production(com1_launcher.clone()),
+            com1_launcher,
+            com1_sessions: Com1Sessions::default(),
             shutdown: VmShutdownPipeline::production(),
             force_stop: VmForceStopPipeline::production(),
             delete: VmDeletionPipeline::production(),
@@ -604,8 +613,11 @@ impl VmRepository for HcsVmRepository {
         self.builds.refuse_if_building(name)?;
 
         let vm_directory = layout::vm_directory(&self.storage_root, name)?;
-        self.start.start(&self.store, name, &vm_directory)?;
+        let session = self.start.start(&self.store, name, &vm_directory)?;
         let mapping = self.mapping(name)?;
+        // Before the local session drops: dropping it is what tells a reader
+        // that the start it was opened for is over.
+        self.com1_sessions.insert(session);
         self.hold_started_system(&mapping);
         Ok(())
     }

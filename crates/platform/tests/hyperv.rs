@@ -20,10 +20,11 @@ use vmlord_core::{
     VmSummary,
 };
 use vmlord_platform::{
-    EndpointAddress, HcnEndpoint, HcnNetwork, HcsClient, HcsOperation, HcsSystem, HcsSystemState,
-    HcsVmRepository, MetadataStore, ReconnectOutcome, VMLORD_NETWORK_ID, VmComputeSystemMapping,
-    VmCreationPipeline, VmDeletionPipeline, VmEventSink, VmForceStopPipeline, VmShutdownPipeline,
-    VmStartPipeline, list_known_vms, open_by_vm_id, open_by_vm_name, reconnect_known_vms,
+    Com1Launcher, EndpointAddress, HcnEndpoint, HcnNetwork, HcsClient, HcsOperation, HcsSystem,
+    HcsSystemState, HcsVmRepository, MetadataStore, ReconnectOutcome, VMLORD_NETWORK_ID,
+    VmComputeSystemMapping, VmCreationPipeline, VmDeletionPipeline, VmEventSink,
+    VmForceStopPipeline, VmShutdownPipeline, VmStartPipeline, list_known_vms, open_by_vm_id,
+    open_by_vm_name, reconnect_known_vms,
 };
 
 // `GENERIC_ALL`; matches the legacy AppSandbox backend's `hcs_vm.c` usage and
@@ -484,7 +485,11 @@ fn starts_a_created_vm() {
         .create(&store, &request, &vm_directory, &build_monitor())
         .expect("VM creation should succeed on an elevated Hyper-V host");
 
-    let started = VmStartPipeline::production().start(&store, &mapping.vm_name, &vm_directory);
+    let started = VmStartPipeline::production(Com1Launcher::production()).start(
+        &store,
+        &mapping.vm_name,
+        &vm_directory,
+    );
 
     // Best-effort cleanup regardless of the assertion below.
     if let Ok(system) = HcsSystem::open(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL) {
@@ -538,15 +543,18 @@ fn force_stopped_vm_can_be_started_again() {
     let mapping = VmCreationPipeline::production(no_cloud_images())
         .create(&store, &request, &vm_directory, &build_monitor())
         .expect("VM creation should succeed on an elevated Hyper-V host");
-    VmStartPipeline::production()
+    VmStartPipeline::production(Com1Launcher::production())
         .start(&store, &mapping.vm_name, &vm_directory)
         .expect("the created VM must start before it can be forcibly stopped");
 
     let force_stopped = VmForceStopPipeline::production().force_stop(&store, &mapping.vm_name);
-    let restarted = force_stopped
-        .as_ref()
-        .ok()
-        .map(|()| VmStartPipeline::production().start(&store, &mapping.vm_name, &vm_directory));
+    let restarted = force_stopped.as_ref().ok().map(|()| {
+        VmStartPipeline::production(Com1Launcher::production()).start(
+            &store,
+            &mapping.vm_name,
+            &vm_directory,
+        )
+    });
 
     // Best-effort cleanup regardless of the assertions below: a successful
     // restart leaves the VM running again.
@@ -601,7 +609,7 @@ fn accepts_the_shutdown_options_document() {
     let mapping = VmCreationPipeline::production(no_cloud_images())
         .create(&store, &request, &vm_directory, &build_monitor())
         .expect("VM creation should succeed on an elevated Hyper-V host");
-    VmStartPipeline::production()
+    VmStartPipeline::production(Com1Launcher::production())
         .start(&store, &mapping.vm_name, &vm_directory)
         .expect("the created VM must start before it can be shut down");
 
@@ -744,7 +752,7 @@ fn reconnects_to_a_running_vm() {
     let mapping = VmCreationPipeline::production(no_cloud_images())
         .create(&store, &request, &vm_directory, &build_monitor())
         .expect("VM creation should succeed on an elevated Hyper-V host");
-    VmStartPipeline::production()
+    VmStartPipeline::production(Com1Launcher::production())
         .start(&store, &mapping.vm_name, &vm_directory)
         .expect("the created VM must start before a reconnect can be observed");
 
@@ -1105,7 +1113,7 @@ fn starts_a_nat_vm_on_its_endpoint() {
     );
 
     let outcome = (|| -> Result<(), String> {
-        VmStartPipeline::production()
+        VmStartPipeline::production(Com1Launcher::production())
             .start(&store, &mapping.vm_name, &vm_directory)
             .map_err(|error| format!("the NAT VM must start: {error}"))?;
 
@@ -1138,7 +1146,7 @@ fn starts_a_nat_vm_on_its_endpoint() {
                 .terminate()
                 .and_then(|operation| operation.wait_for_completion(Duration::from_secs(30)));
         }
-        VmStartPipeline::production()
+        VmStartPipeline::production(Com1Launcher::production())
             .start(&store, &mapping.vm_name, &vm_directory)
             .map_err(|error| format!("the NAT VM must start a second time: {error}"))?;
 
@@ -1215,7 +1223,7 @@ fn a_forcibly_stopped_nat_vm_starts_again_on_the_same_endpoint() {
         .expect("VM creation should succeed on an elevated Hyper-V host");
 
     let outcome = (|| -> Result<(), String> {
-        VmStartPipeline::production()
+        VmStartPipeline::production(Com1Launcher::production())
             .start(&store, &mapping.vm_name, &vm_directory)
             .map_err(|error| format!("the NAT VM must start: {error}"))?;
 
@@ -1226,7 +1234,7 @@ fn a_forcibly_stopped_nat_vm_starts_again_on_the_same_endpoint() {
             .force_stop(&store, &mapping.vm_name)
             .map_err(|error| format!("a running VM must accept a forced stop: {error}"))?;
 
-        VmStartPipeline::production()
+        VmStartPipeline::production(Com1Launcher::production())
             .start(&store, &mapping.vm_name, &vm_directory)
             .map_err(|error| {
                 format!(
@@ -1330,7 +1338,7 @@ fn a_started_nat_vm_is_served_the_address_hns_assigned() {
         // The start fails rather than coming up silently without a network if
         // the DHCP server cannot bind UDP 67, so this is also the check that
         // nothing else on the host is already serving it.
-        VmStartPipeline::production()
+        VmStartPipeline::production(Com1Launcher::production())
             .start(&store, &mapping.vm_name, &vm_directory)
             .map_err(|error| {
                 format!("a NAT VM must start with its DHCP server running: {error}")
@@ -1357,7 +1365,7 @@ fn a_started_nat_vm_is_served_the_address_hns_assigned() {
                 .terminate()
                 .and_then(|operation| operation.wait_for_completion(Duration::from_secs(30)));
         }
-        VmStartPipeline::production()
+        VmStartPipeline::production(Com1Launcher::production())
             .start(&store, &mapping.vm_name, &vm_directory)
             .map_err(|error| {
                 format!("a second start must not trip over the existing reservation: {error}")

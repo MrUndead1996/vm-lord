@@ -58,9 +58,9 @@ pub(crate) struct TerminalCommand {
 
 /// A reader VMLord launched and can still speak to.
 #[derive(Debug)]
-pub(crate) struct Com1Session {
-    pub(crate) vm_id: Uuid,
-    pub(crate) vm_name: String,
+pub struct Com1Session {
+    pub vm_id: Uuid,
+    pub vm_name: String,
     cancel: WindowsEvent,
     failed: WindowsEvent,
     finished: WindowsEvent,
@@ -189,7 +189,7 @@ enum Readiness {
 
 /// Opens the diagnostic console of a VM.
 #[derive(Clone)]
-pub(crate) struct Com1Launcher {
+pub struct Com1Launcher {
     /// `None` in production: the helper is found beside this executable at
     /// launch time, which is also where the failure to find it belongs.
     helper: Option<PathBuf>,
@@ -201,7 +201,7 @@ pub(crate) struct Com1Launcher {
 
 impl Com1Launcher {
     /// The launcher VMLord runs with.
-    pub(crate) fn production() -> Self {
+    pub fn production() -> Self {
         Self {
             helper: None,
             spawn: Arc::new(spawn_terminal),
@@ -212,7 +212,7 @@ impl Com1Launcher {
     }
 
     /// Opens the COM1 console of `mapping` and returns the session that owns it.
-    pub(crate) fn launch(
+    pub fn launch(
         &self,
         mapping: &VmComputeSystemMapping,
         vm_directory: &Path,
@@ -318,7 +318,7 @@ impl Com1Launcher {
     }
 
     #[cfg(test)]
-    fn for_test(
+    pub(crate) fn for_test(
         helper: PathBuf,
         spawn: impl Fn(&TerminalCommand) -> io::Result<()> + Send + Sync + 'static,
     ) -> Self {
@@ -332,13 +332,13 @@ impl Com1Launcher {
     }
 
     #[cfg(test)]
-    fn never_ready(&mut self) {
+    pub(crate) fn never_ready(&mut self) {
         self.readiness = Readiness::Never;
         self.readiness_timeout = Duration::from_millis(100);
     }
 
     #[cfg(test)]
-    fn observe_cancellations(&mut self, cancellations: Arc<AtomicUsize>) {
+    pub(crate) fn observe_cancellations(&mut self, cancellations: Arc<AtomicUsize>) {
         self.cancellations = Some(cancellations);
     }
 }
