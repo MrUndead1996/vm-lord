@@ -23,6 +23,7 @@ mod hcn_endpoint;
 mod hcs;
 mod hcs_config;
 mod host_dns;
+mod host_guest_defaults;
 mod import;
 mod layout;
 mod metadata;

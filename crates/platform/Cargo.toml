@@ -22,6 +22,10 @@ sha-crypt = { version = "0.6", default-features = false, features = [
     "password-hash",
 ] }
 uuid = { version = "1", features = ["v4", "serde"] }
+# The CLDR table that turns a Windows time-zone key -- `Russian Standard Time`
+# -- into the IANA name a Linux guest wants. Generated data and nothing else:
+# with default features it pulls in no dependencies of its own.
+windows-timezones = "0.5.1"
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
