@@ -32,7 +32,7 @@ impl VmDeletionPipeline {
     #[cfg(test)]
     fn for_test(
         teardown: impl Fn(&str) -> Result<(), RepositoryError> + Send + Sync + 'static,
-        endpoint_teardown: impl Fn(Uuid) -> Result<(), RepositoryError> + 'static,
+        endpoint_teardown: impl Fn(Uuid) -> Result<(), RepositoryError> + Send + Sync + 'static,
     ) -> Self {
         Self {
             system_teardown: Box::new(teardown),

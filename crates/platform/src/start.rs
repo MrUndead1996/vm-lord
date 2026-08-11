@@ -48,10 +48,13 @@ pub(crate) enum EndpointPolicy {
     Replace,
 }
 
-type AccessGranter = Box<dyn Fn(&str, &Path) -> Result<(), RepositoryError>>;
-type SystemStarter = Box<dyn Fn(&str, &str) -> Result<(), HcsStartFailure>>;
-type EndpointProvider =
-    Box<dyn Fn(&str, Option<Uuid>, EndpointPolicy) -> Result<VmNetworkAdapter, RepositoryError>>;
+type AccessGranter = Box<dyn Fn(&str, &Path) -> Result<(), RepositoryError> + Send + Sync>;
+type SystemStarter = Box<dyn Fn(&str, &str) -> Result<(), HcsStartFailure> + Send + Sync>;
+type EndpointProvider = Box<
+    dyn Fn(&str, Option<Uuid>, EndpointPolicy) -> Result<VmNetworkAdapter, RepositoryError>
+        + Send
+        + Sync,
+>;
 
 /// Starts VMs created by [`crate::VmCreationPipeline`].
 pub struct VmStartPipeline {
@@ -81,15 +84,19 @@ impl VmStartPipeline {
     #[cfg(test)]
     fn for_test(
         com1: Com1Launcher,
-        access_granter: impl Fn(&str, &Path) -> Result<(), RepositoryError> + 'static,
-        system_starter: impl Fn(&str, &str) -> Result<(), HcsStartFailure> + 'static,
+        access_granter: impl Fn(&str, &Path) -> Result<(), RepositoryError> + Send + Sync + 'static,
+        system_starter: impl Fn(&str, &str) -> Result<(), HcsStartFailure> + Send + Sync + 'static,
         endpoint_provider: impl Fn(
             &str,
             Option<Uuid>,
             EndpointPolicy,
         ) -> Result<VmNetworkAdapter, RepositoryError>
+        + Send
+        + Sync
         + 'static,
         dhcp_registrar: impl Fn(&MetadataStore, &str, &EndpointAddress) -> Result<(), RepositoryError>
+        + Send
+        + Sync
         + 'static,
     ) -> Self {
         Self {
@@ -556,6 +563,19 @@ mod tests {
         hcs::HcsStartFailure,
         metadata::{MetadataStore, VmComputeSystemMapping},
     };
+
+    #[test]
+    fn the_pipelines_a_build_thread_needs_can_be_moved_to_it() {
+        // Creating a VM now starts it and waits for its guest, all on the build
+        // thread, so everything that cycle owns has to be able to go there.
+        const fn assert_send_sync<T: Send + Sync>() {}
+        const fn assert_send<T: Send>() {}
+
+        assert_send_sync::<VmStartPipeline>();
+        assert_send_sync::<crate::force_stop::VmForceStopPipeline>();
+        assert_send_sync::<crate::delete::VmDeletionPipeline>();
+        assert_send::<crate::com1_terminal::Com1Session>();
+    }
 
     struct TempRoot(PathBuf);
 
