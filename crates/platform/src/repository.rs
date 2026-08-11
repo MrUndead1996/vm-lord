@@ -565,6 +565,9 @@ impl VmRepository for HcsVmRepository {
                     );
                 }
             }
+            // Creation does not start the VM yet; the full cycle lands with
+            // `VmBuildCycle`.
+            None
         })
     }
 
@@ -959,6 +962,7 @@ mod tests {
                 while !held.load(std::sync::atomic::Ordering::Relaxed) {
                     std::thread::yield_now();
                 }
+                None
             })
             .expect("the build should start");
 
