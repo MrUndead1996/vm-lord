@@ -30,6 +30,46 @@ pub struct AppSettings {
     /// and `network_mode` are handled in `VmComputeSystemMapping`.
     #[serde(default)]
     pub image_cache_path: PathBuf,
+    /// Timeouts for the readiness wait that ends a VM's creation.
+    ///
+    /// Last in the struct on purpose: TOML demands that every value precede
+    /// every table, and this field is written as a table.
+    #[serde(default)]
+    pub guest_readiness: GuestReadinessTimeouts,
+}
+
+/// How long each phase of waiting for a freshly created guest may take.
+///
+/// Settings rather than constants because the numbers describe the user's
+/// network and hardware, not VMLord: the first boot of a cloud image installs
+/// the packages the seed asked for, and ten minutes of that is ordinary on a
+/// slow link.
+///
+/// `#[serde(default)]` on the struct fills in a field an older `settings.toml`
+/// does not have, and the same attribute on the field in [`AppSettings`] fills
+/// in the whole group -- the treatment `image_cache_path` already gets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GuestReadinessTimeouts {
+    /// Waiting for HNS to give the VM's endpoint an address.
+    pub address_secs: u64,
+    /// Waiting for port 22 to open once the address exists.
+    pub ssh_port_secs: u64,
+    /// Waiting for `cloud-init status --wait` to return.
+    pub cloud_init_secs: u64,
+    /// One SSH connection attempt, passed to the client as `ConnectTimeout`.
+    pub connect_timeout_secs: u64,
+}
+
+impl Default for GuestReadinessTimeouts {
+    fn default() -> Self {
+        Self {
+            address_secs: 90,
+            ssh_port_secs: 300,
+            cloud_init_secs: 1200,
+            connect_timeout_secs: 10,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +202,7 @@ impl SettingsStore {
                 .join(DEFAULT_LOG_FILE_NAME),
             log_level: LogLevel::Info,
             image_cache_path: config_directory.join(DEFAULT_IMAGE_DIRECTORY),
+            guest_readiness: GuestReadinessTimeouts::default(),
         })
     }
 
@@ -244,7 +285,9 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{AppSettings, Language, LogLevel, SettingsError, SettingsStore};
+    use super::{
+        AppSettings, GuestReadinessTimeouts, Language, LogLevel, SettingsError, SettingsStore,
+    };
 
     fn temporary_directory() -> std::path::PathBuf {
         let unique_id = SystemTime::now()
@@ -334,6 +377,7 @@ mod tests {
             log_file_path: directory.join("logs").join("vmlord.log"),
             log_level: LogLevel::Info,
             image_cache_path: directory.join("elsewhere").join("images"),
+            guest_readiness: GuestReadinessTimeouts::default(),
         };
 
         store.save(&settings).unwrap();
@@ -354,11 +398,67 @@ mod tests {
             log_file_path: directory.join("diagnostics").join("application.log"),
             log_level: LogLevel::Debug,
             image_cache_path: directory.join("images"),
+            guest_readiness: GuestReadinessTimeouts::default(),
         };
 
         store.save(&settings).unwrap();
 
         assert_eq!(store.load_or_create().unwrap(), settings);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn readiness_timeouts_have_defaults_and_survive_a_round_trip() {
+        let defaults = GuestReadinessTimeouts::default();
+
+        assert_eq!(defaults.address_secs, 90);
+        assert_eq!(defaults.ssh_port_secs, 300);
+        assert_eq!(defaults.cloud_init_secs, 1200);
+        assert_eq!(defaults.connect_timeout_secs, 10);
+
+        let directory = temporary_directory();
+        let store = SettingsStore::new(directory.join("settings.toml"));
+        let mut settings = store.load_or_create().unwrap();
+        assert_eq!(settings.guest_readiness, defaults);
+
+        settings.guest_readiness.cloud_init_secs = 60;
+        store.save(&settings).unwrap();
+
+        assert_eq!(
+            store
+                .load_or_create()
+                .unwrap()
+                .guest_readiness
+                .cloud_init_secs,
+            60
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn settings_written_before_the_readiness_timeouts_existed_still_load() {
+        // `#[serde(default)]`, as with `image_cache_path`: an older file loads
+        // without a migration and gets the default timeouts.
+        let directory = temporary_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("settings.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "vm_storage_path = {vms:?}\n\
+                 language = \"en-US\"\n\
+                 log_file_path = {log:?}\n\
+                 log_level = \"info\"\n",
+                vms = directory.join("vms").display().to_string(),
+                log = directory.join("vmlord.log").display().to_string(),
+            ),
+        )
+        .unwrap();
+
+        let settings = SettingsStore::new(&config_path).load_or_create().unwrap();
+
+        assert_eq!(settings.guest_readiness, GuestReadinessTimeouts::default());
+
         fs::remove_dir_all(directory).unwrap();
     }
 }

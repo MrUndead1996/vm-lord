@@ -155,6 +155,14 @@ pub enum BuildStep {
     Provisioning,
     /// Creating the compute system and recording the VM in the metadata.
     Registering,
+    /// Starting the VM that has just been created. Creation does not end at a
+    /// registered compute system: a VM nobody has ever started is not known to
+    /// work.
+    Starting,
+    /// Waiting for the guest's cloud-init to report that it has finished. The
+    /// last step, and usually the longest: the first boot installs whatever
+    /// packages the seed asked for.
+    AwaitingGuest,
 }
 
 /// What creating a VM looks like from outside the thread doing it.

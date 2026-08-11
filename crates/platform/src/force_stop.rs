@@ -16,8 +16,8 @@ use crate::{
 /// Compute Service.
 const FORCE_STOP_TIMEOUT: Duration = Duration::from_secs(60);
 
-type AdapterDetacher = Box<dyn Fn(&str, Uuid) -> Result<(), RepositoryError>>;
-type SystemTerminator = Box<dyn Fn(&str) -> Result<(), RepositoryError>>;
+type AdapterDetacher = Box<dyn Fn(&str, Uuid) -> Result<(), RepositoryError> + Send + Sync>;
+type SystemTerminator = Box<dyn Fn(&str) -> Result<(), RepositoryError> + Send + Sync>;
 
 /// Forcibly stops VMs known to [`MetadataStore`].
 pub struct VmForceStopPipeline {
@@ -37,8 +37,8 @@ impl VmForceStopPipeline {
 
     #[cfg(test)]
     fn for_test(
-        detacher: impl Fn(&str, Uuid) -> Result<(), RepositoryError> + 'static,
-        terminator: impl Fn(&str) -> Result<(), RepositoryError> + 'static,
+        detacher: impl Fn(&str, Uuid) -> Result<(), RepositoryError> + Send + Sync + 'static,
+        terminator: impl Fn(&str) -> Result<(), RepositoryError> + Send + Sync + 'static,
     ) -> Self {
         Self {
             adapter_detacher: Box::new(detacher),

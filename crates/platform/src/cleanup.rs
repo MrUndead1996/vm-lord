@@ -34,7 +34,7 @@ pub(crate) type SystemTeardown = Box<dyn Fn(&str) -> Result<(), RepositoryError>
 ///
 /// Injected for the same reason as [`SystemTeardown`]: a deletion has to be
 /// testable without a Hyper-V host.
-pub(crate) type EndpointTeardown = Box<dyn Fn(Uuid) -> Result<(), RepositoryError>>;
+pub(crate) type EndpointTeardown = Box<dyn Fn(Uuid) -> Result<(), RepositoryError> + Send + Sync>;
 
 /// Terminates the compute system `id`, treating one HCS does not know as
 /// already gone.

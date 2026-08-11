@@ -267,6 +267,21 @@ impl Com1Launcher {
         Ok(session)
     }
 
+    /// A session over unnamed events, for tests that need one to hand around
+    /// without a helper process to own it.
+    #[cfg(test)]
+    pub(crate) fn session_for_test(mapping: &VmComputeSystemMapping) -> Com1Session {
+        Com1Session {
+            vm_id: mapping.vm_id,
+            vm_name: mapping.vm_name.clone(),
+            cancel: WindowsEvent::new(true, false).expect("an unnamed event can always be created"),
+            failed: WindowsEvent::new(true, false).expect("an unnamed event can always be created"),
+            finished: WindowsEvent::new(true, false)
+                .expect("an unnamed event can always be created"),
+            cancellations: None,
+        }
+    }
+
     /// Tries every terminal host in turn, and reports them all if none works.
     fn spawn_somewhere(
         &self,

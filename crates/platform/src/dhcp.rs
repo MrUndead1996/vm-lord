@@ -321,8 +321,9 @@ impl Drop for DhcpService {
 ///
 /// The store is passed because the first call of the process also has to seed
 /// the server with the endpoints of every VM already recorded.
-pub(crate) type DhcpRegistrar =
-    Box<dyn Fn(&MetadataStore, &str, &EndpointAddress) -> Result<(), RepositoryError>>;
+pub(crate) type DhcpRegistrar = Box<
+    dyn Fn(&MetadataStore, &str, &EndpointAddress) -> Result<(), RepositoryError> + Send + Sync,
+>;
 
 /// The production registrar: it starts the server on the first NAT VM and
 /// reserves the guest's address on every start after that.

@@ -24,6 +24,19 @@ use vmlord_core::{
     VmSummary,
 };
 
+use crate::{com1_terminal::Com1Session, metadata::VmComputeSystemMapping};
+
+/// A VM whose creation got as far as starting it: what the main thread has to
+/// take over from the build thread.
+///
+/// The COM1 session and the compute system a start produces belong to the
+/// repository, and the repository is only reachable behind `&mut self` -- so
+/// the build thread parks them here and a reap hands them over.
+pub(crate) struct StartedVm {
+    pub(crate) mapping: VmComputeSystemMapping,
+    pub(crate) session: Com1Session,
+}
+
 /// Every VM VMLord creates today is a Linux guest.
 const OS_TYPE: &str = "Linux";
 
@@ -35,6 +48,9 @@ struct Build {
     /// Set by the worker as it leaves, by whichever exit -- returning or
     /// panicking -- so that a build that died still stops being listed.
     finished: Arc<AtomicBool>,
+    /// Filled in by the worker before it marks itself finished, and emptied by
+    /// the reap that removes this build.
+    outcome: Arc<Mutex<Option<StartedVm>>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -42,6 +58,11 @@ struct Build {
 #[derive(Default)]
 pub(crate) struct BuildRegistry {
     builds: Mutex<HashMap<String, Build>>,
+    /// What finished builds started, waiting for the main thread to take it
+    /// over. Kept here rather than returned by `reap`, which runs inside every
+    /// query -- a returned session that a caller dropped would silently cancel
+    /// the console reader of a running VM.
+    started: Mutex<Vec<StartedVm>>,
 }
 
 impl BuildRegistry {
@@ -62,7 +83,7 @@ impl BuildRegistry {
     /// function while the lock is held.
     pub(crate) fn start<F>(&self, request: VmCreateRequest, build: F) -> Result<(), RepositoryError>
     where
-        F: FnOnce(&BuildMonitor) + Send + 'static,
+        F: FnOnce(&BuildMonitor) -> Option<StartedVm> + Send + 'static,
     {
         let mut builds = self.lock();
         if builds.contains_key(&request.name) {
@@ -74,17 +95,24 @@ impl BuildRegistry {
 
         let monitor = BuildMonitor::new(first_step(&request.source));
         let finished = Arc::new(AtomicBool::new(false));
+        let outcome = Arc::new(Mutex::new(None));
         let worker = std::thread::Builder::new()
             .name(format!("vmlord-build-{}", request.name))
             .spawn({
                 let monitor = monitor.clone();
                 let finished = Arc::clone(&finished);
+                let outcome = Arc::clone(&outcome);
                 move || {
                     // Set on the way out however the build leaves, panic
                     // included: an entry nobody clears is a row that never
-                    // goes away.
+                    // goes away. Dropped after the outcome is stored, so a reap
+                    // that sees the flag also sees what the build produced.
                     let _finish = Finish(finished);
-                    build(&monitor);
+                    if let Some(started) = build(&monitor) {
+                        *outcome
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(started);
+                    }
                 }
             })
             .map_err(|error| {
@@ -103,6 +131,7 @@ impl BuildRegistry {
                 monitor,
                 request,
                 finished,
+                outcome,
                 worker: Some(worker),
             },
         );
@@ -188,12 +217,41 @@ impl BuildRegistry {
             .map(|(name, _)| name.clone())
             .collect();
         for name in done {
-            if let Some(mut build) = builds.remove(&name)
-                && let Some(worker) = build.worker.take()
+            let Some(mut build) = builds.remove(&name) else {
+                continue;
+            };
+            self.collect(&build);
+            if let Some(worker) = build.worker.take()
                 && worker.join().is_err()
             {
                 log::error!("the thread creating VM \"{name}\" panicked");
             }
+        }
+    }
+
+    /// Hands over the VMs that builds have started since this was last called.
+    pub(crate) fn take_started(&self) -> Vec<StartedVm> {
+        self.reap();
+        std::mem::take(
+            &mut *self
+                .started
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    /// Moves what a finished build started into the registry's own queue.
+    fn collect(&self, build: &Build) {
+        let started = build
+            .outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(started) = started {
+            self.started
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(started);
         }
     }
 
@@ -208,6 +266,7 @@ impl BuildRegistry {
             build.monitor.cancel();
         }
         for (name, mut build) in builds.drain() {
+            self.collect(&build);
             if let Some(worker) = build.worker.take()
                 && worker.join().is_err()
             {
@@ -255,7 +314,67 @@ mod tests {
         VmSource, VmState,
     };
 
-    use super::BuildRegistry;
+    use uuid::Uuid;
+
+    use super::{BuildRegistry, StartedVm};
+    use crate::{com1_terminal::Com1Launcher, metadata::VmComputeSystemMapping};
+
+    fn mapping(name: &str) -> VmComputeSystemMapping {
+        VmComputeSystemMapping {
+            vm_id: Uuid::from_u128(u128::from(name.len() as u64) + 1),
+            vm_name: name.to_owned(),
+            hcs_compute_system_id: format!("vmlord-{name}"),
+            disk_gb: 20,
+            endpoint_id: None,
+            network_mode: NetworkMode::None,
+        }
+    }
+
+    fn started(name: &str) -> StartedVm {
+        let mapping = mapping(name);
+        StartedVm {
+            session: Com1Launcher::session_for_test(&mapping),
+            mapping,
+        }
+    }
+
+    #[test]
+    fn a_build_hands_its_started_vm_to_whoever_reaps_it() {
+        // The session and the compute-system handle live on the main thread, so
+        // the build thread parks them here rather than holding them.
+        let registry = BuildRegistry::default();
+
+        registry
+            .start(request("dev"), move |_| Some(started("dev")))
+            .expect("the build should start");
+        // `reap` runs inside every query, so the outcome has to survive one:
+        // dropping a session is what cancels its reader.
+        while registry.contains("dev") {
+            std::thread::yield_now();
+        }
+        registry.reap();
+
+        let handed = registry.take_started();
+
+        assert_eq!(handed.len(), 1);
+        assert_eq!(handed[0].mapping.vm_name, "dev");
+        assert!(
+            registry.take_started().is_empty(),
+            "an outcome is handed over once"
+        );
+    }
+
+    #[test]
+    fn a_build_that_hands_back_nothing_leaves_nothing_to_collect() {
+        let registry = BuildRegistry::default();
+
+        registry
+            .start(request("rolled-back"), |_| None)
+            .expect("the build should start");
+        registry.cancel_all_and_join();
+
+        assert!(registry.take_started().is_empty());
+    }
 
     fn request(name: &str) -> VmCreateRequest {
         VmCreateRequest {
@@ -293,6 +412,7 @@ mod tests {
                 while !held.load(Ordering::Relaxed) {
                     std::thread::yield_now();
                 }
+                None
             })
             .expect("the build should start");
 
@@ -324,7 +444,7 @@ mod tests {
     fn a_finished_build_stops_being_listed_on_its_own() {
         let registry = BuildRegistry::default();
         registry
-            .start(request("dev"), |_| {})
+            .start(request("dev"), |_| None)
             .expect("the build should start");
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -353,6 +473,7 @@ mod tests {
                 while !held.load(Ordering::Relaxed) {
                     std::thread::yield_now();
                 }
+                None
             })
             .expect("the first build should start");
 
@@ -376,6 +497,7 @@ mod tests {
                     std::thread::yield_now();
                 }
                 reporter.store(true, Ordering::Relaxed);
+                None
             })
             .expect("the build should start");
 
@@ -424,6 +546,7 @@ mod tests {
                 while !held.load(Ordering::Relaxed) {
                     std::thread::yield_now();
                 }
+                None
             })
             .expect("the build should start");
 

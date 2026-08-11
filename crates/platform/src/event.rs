@@ -24,6 +24,17 @@ pub enum EventWaitResult {
 #[derive(Debug)]
 pub struct WindowsEvent(HANDLE);
 
+// SAFETY: an event is a kernel object referred to by a handle that is valid
+// process-wide, and the API exists precisely so that one thread can signal
+// another. This type owns its handle rather than sharing it, so handing the
+// owner to another thread hands over the whole object. `Sync` is deliberately
+// not claimed: nothing needs a shared reference to one event from two threads.
+//
+// This is what lets a build thread return the `Com1Session` it opened: the
+// session and the compute-system handle belong to the repository, which is only
+// reachable behind `&mut self` on the main thread.
+unsafe impl Send for WindowsEvent {}
+
 impl WindowsEvent {
     /// Creates an unnamed event.
     pub fn new(

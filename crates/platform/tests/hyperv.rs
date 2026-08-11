@@ -131,6 +131,70 @@ fn a_cloud_vm_is_built_in_the_background() {
     );
 }
 
+/// A build now ends where the guest says it is ready, not where HCS accepted a
+/// compute system: create a VM from a real cloud image and watch it become a
+/// running VM with an address and a cloud-init that reported `done`.
+///
+/// Ignored by default -- it needs Hyper-V, an elevated process, a network and
+/// the better part of ten minutes.
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS and downloads a cloud image"]
+fn a_created_vm_becomes_ready_before_its_build_finishes() {
+    let root = std::env::temp_dir().join(format!("vmlord-readiness-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut repository = cloud_repository(&root);
+    repository
+        .initialize()
+        .expect("the native backend should initialize on a Hyper-V host");
+
+    repository
+        .create_vm(background_cloud_request("ready-vm"))
+        .expect("the creation should be accepted");
+
+    // Longer than the default cloud-init timeout: the point is to observe the
+    // wait finishing, not to race it.
+    let outcome =
+        wait_until_build_finishes(&mut repository, "ready-vm", Duration::from_secs(30 * 60));
+    let summary = repository
+        .list_vms()
+        .expect("listing should work")
+        .into_iter()
+        .find(|vm| vm.name == "ready-vm");
+    let diagnostics = repository.take_diagnostics();
+    let transcript = fs::read_to_string(root.join("ready-vm").join("cloud-init-status.log"));
+
+    // Best-effort cleanup regardless of the assertions below.
+    let _ = repository.force_stop_vm("ready-vm");
+    let _ = repository.delete_vm(VmDeleteRequest {
+        name: "ready-vm".into(),
+        delete_disks: true,
+    });
+    drop(repository);
+    let _ = fs::remove_dir_all(&root);
+
+    outcome.expect("the VM should finish building");
+    let summary = summary.expect("a built VM is in the list");
+    assert!(
+        matches!(summary.state, VmState::Running { .. }),
+        "a build that waited for its guest leaves the VM running: {:?}",
+        summary.state
+    );
+    assert!(
+        summary.ip_address.is_some(),
+        "a guest that answered SSH has an address"
+    );
+    let errors: Vec<_> = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.level == vmlord_core::DiagnosticLevel::Error)
+        .collect();
+    assert!(errors.is_empty(), "the build reported errors: {errors:?}");
+    let transcript = transcript.expect("the readiness wait writes a transcript");
+    assert!(
+        transcript.contains("status: done"),
+        "cloud-init should have reported that it is done: {transcript}"
+    );
+}
+
 /// Waits until VM `name` stops being listed as building, reporting whether it
 /// was ever seen building on the way.
 ///

@@ -15,7 +15,7 @@ use crate::{
     dhcp::{self, DhcpRegistrar},
     hcn::HcnNetwork,
     hcn_endpoint::{EndpointAddress, HcnEndpoint},
-    hcs::{HCS_ACCESS_ALL, HcsStartFailure},
+    hcs::{HCS_ACCESS_ALL, HcsStartFailure, HcsSystemState},
     hcs_config, layout,
     metadata::{MetadataStore, VmComputeSystemMapping},
 };
@@ -48,15 +48,23 @@ pub(crate) enum EndpointPolicy {
     Replace,
 }
 
-type AccessGranter = Box<dyn Fn(&str, &Path) -> Result<(), RepositoryError>>;
-type SystemStarter = Box<dyn Fn(&str, &str) -> Result<(), HcsStartFailure>>;
-type EndpointProvider =
-    Box<dyn Fn(&str, Option<Uuid>, EndpointPolicy) -> Result<VmNetworkAdapter, RepositoryError>>;
+type AccessGranter = Box<dyn Fn(&str, &Path) -> Result<(), RepositoryError> + Send + Sync>;
+/// Brings the compute system into the shape `configuration` describes, without
+/// running it.
+type SystemPreparer = Box<dyn Fn(&str, &str) -> Result<(), HcsStartFailure> + Send + Sync>;
+/// Starts a compute system a preparer has already brought into shape.
+type SystemStarter = Box<dyn Fn(&str) -> Result<(), HcsStartFailure> + Send + Sync>;
+type EndpointProvider = Box<
+    dyn Fn(&str, Option<Uuid>, EndpointPolicy) -> Result<VmNetworkAdapter, RepositoryError>
+        + Send
+        + Sync,
+>;
 
 /// Starts VMs created by [`crate::VmCreationPipeline`].
 pub struct VmStartPipeline {
     com1: Com1Launcher,
     access_granter: AccessGranter,
+    system_preparer: SystemPreparer,
     system_starter: SystemStarter,
     endpoint_provider: EndpointProvider,
     dhcp_registrar: DhcpRegistrar,
@@ -72,6 +80,7 @@ impl VmStartPipeline {
         Self {
             com1,
             access_granter: Box::new(grant_vm_access),
+            system_preparer: Box::new(prepare_hcs_system),
             system_starter: Box::new(start_hcs_system),
             endpoint_provider: Box::new(ensure_endpoint),
             dhcp_registrar: dhcp::registrar(),
@@ -81,20 +90,26 @@ impl VmStartPipeline {
     #[cfg(test)]
     fn for_test(
         com1: Com1Launcher,
-        access_granter: impl Fn(&str, &Path) -> Result<(), RepositoryError> + 'static,
-        system_starter: impl Fn(&str, &str) -> Result<(), HcsStartFailure> + 'static,
+        access_granter: impl Fn(&str, &Path) -> Result<(), RepositoryError> + Send + Sync + 'static,
+        system_preparer: impl Fn(&str, &str) -> Result<(), HcsStartFailure> + Send + Sync + 'static,
+        system_starter: impl Fn(&str) -> Result<(), HcsStartFailure> + Send + Sync + 'static,
         endpoint_provider: impl Fn(
             &str,
             Option<Uuid>,
             EndpointPolicy,
         ) -> Result<VmNetworkAdapter, RepositoryError>
+        + Send
+        + Sync
         + 'static,
         dhcp_registrar: impl Fn(&MetadataStore, &str, &EndpointAddress) -> Result<(), RepositoryError>
+        + Send
+        + Sync
         + 'static,
     ) -> Self {
         Self {
             com1,
             access_granter: Box::new(access_granter),
+            system_preparer: Box::new(system_preparer),
             system_starter: Box::new(system_starter),
             endpoint_provider: Box::new(endpoint_provider),
             dhcp_registrar: Box::new(dhcp_registrar),
@@ -146,9 +161,6 @@ impl VmStartPipeline {
         // After reading the configuration, so that a VM whose stored state is
         // unusable never opens a window for a start that cannot happen.
         let stored = self.read_configuration(&mapping, vm_directory)?;
-        let session = self
-            .com1
-            .launch(&mapping, vm_directory, Com1LogMode::Truncate)?;
         let (configuration, endpoint) = self.attach_network(
             store,
             &mapping,
@@ -159,8 +171,8 @@ impl VmStartPipeline {
         )?;
         self.grant_access_to_attachments(&mapping, &configuration)?;
 
-        let failure = match (self.system_starter)(&mapping.hcs_compute_system_id, &configuration) {
-            Ok(()) => {
+        let failure = match self.open_console_and_start(&mapping, vm_directory, &configuration) {
+            Ok(session) => {
                 log::info!("started VM \"{}\" ({})", mapping.vm_name, mapping.vm_id);
                 return Ok(session);
             }
@@ -197,15 +209,45 @@ impl VmStartPipeline {
             EndpointPolicy::Replace,
         )?;
         self.grant_access_to_attachments(&mapping, &configuration)?;
-        (self.system_starter)(&mapping.hcs_compute_system_id, &configuration).map_err(
-            |failure| {
+        let session = self
+            .open_console_and_start(&mapping, vm_directory, &configuration)
+            .map_err(|failure| {
                 let error = failure.into_error();
                 log::error!("failed to start VM \"{}\": {error}", mapping.vm_name);
                 error
-            },
-        )?;
+            })?;
 
         log::info!("started VM \"{}\" ({})", mapping.vm_name, mapping.vm_id);
+        Ok(session)
+    }
+
+    /// Brings the compute system into shape, opens the VM's console, and only
+    /// then starts it.
+    ///
+    /// The order is the whole point. Preparing may destroy and re-create the
+    /// compute system, which destroys the named pipe its COM1 is served
+    /// through -- a console opened before that would be reading a pipe that
+    /// stops existing a moment later, which is exactly what it looks like: an
+    /// empty `com1.log` and a terminal window that closes itself. Opening the
+    /// console after the system is in its final shape and before it executes
+    /// anything keeps the guarantee that matters: no VM runs a single
+    /// instruction unobserved.
+    ///
+    /// The session is returned rather than stored, and dropping it is what
+    /// tells the reader to stop, so a failed start takes its console with it --
+    /// including the retry, which prepares the system again.
+    fn open_console_and_start(
+        &self,
+        mapping: &VmComputeSystemMapping,
+        vm_directory: &Path,
+        configuration: &str,
+    ) -> Result<Com1Session, HcsStartFailure> {
+        (self.system_preparer)(&mapping.hcs_compute_system_id, configuration)?;
+        let session = self
+            .com1
+            .launch(mapping, vm_directory, Com1LogMode::Truncate)
+            .map_err(HcsStartFailure::Failed)?;
+        (self.system_starter)(&mapping.hcs_compute_system_id)?;
         Ok(session)
     }
 
@@ -498,24 +540,101 @@ fn replaced_address(
 /// can run again. Re-creating from the stored configuration keeps the VM's id,
 /// disks and metadata mapping unchanged, so a stop stays a stop rather than
 /// becoming an implicit delete.
-fn start_hcs_system(id: &str, configuration: &str) -> Result<(), HcsStartFailure> {
-    // The system handle must outlive the start operation it issued.
+fn prepare_hcs_system(id: &str, configuration: &str) -> Result<(), HcsStartFailure> {
     let existing =
         HcsSystem::open_if_present(id, HCS_ACCESS_ALL).map_err(HcsStartFailure::Failed)?;
-    let system = match existing {
-        Some(system) => system,
+    let reusable = match existing {
+        Some(system) => {
+            let state = reported_state(id).map_err(HcsStartFailure::Failed)?;
+            match plan_for_existing(&state) {
+                ExistingSystemPlan::StartAsIs => Some(system),
+                ExistingSystemPlan::Rebuild => {
+                    log::info!(
+                        "compute system \"{id}\" has never run, so it is rebuilt from the \
+                         configuration this start prepared -- the one that carries the VM's \
+                         network adapter"
+                    );
+                    // Before the teardown: HCS refuses to destroy a system this
+                    // process still holds open.
+                    drop(system);
+                    if let Err(error) = cleanup::teardown_compute_system(id) {
+                        log::error!("the compute system \"{id}\" could not be rebuilt: {error}");
+                        return Err(HcsStartFailure::Failed(error));
+                    }
+                    None
+                }
+            }
+        }
         None => {
             log::info!(
                 "HCS no longer knows compute system \"{id}\"; \
                  re-creating it from the stored configuration before starting it"
             );
-            HcsClient::new()
-                .create_system_and_wait(id, configuration, CREATE_TIMEOUT)
-                .map_err(|failure| tear_down_after_a_failed_creation(id, failure))?
+            None
         }
     };
 
+    if reusable.is_none() {
+        HcsClient::new()
+            .create_system_and_wait(id, configuration, CREATE_TIMEOUT)
+            .map_err(|failure| tear_down_after_a_failed_creation(id, failure))?;
+    }
+    Ok(())
+}
+
+/// Starts the compute system [`prepare_hcs_system`] has already brought into
+/// shape.
+fn start_hcs_system(id: &str) -> Result<(), HcsStartFailure> {
+    // The handle must outlive the start operation it issued.
+    let system = HcsSystem::open(id, HCS_ACCESS_ALL).map_err(HcsStartFailure::Failed)?;
     system.start_and_wait(START_TIMEOUT)
+}
+
+/// What a start does with a compute system HCS already knows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExistingSystemPlan {
+    /// Start it as it stands.
+    StartAsIs,
+    /// Destroy it and create it again from the configuration this start
+    /// prepared.
+    Rebuild,
+}
+
+/// Decides what to do with a compute system that already exists.
+///
+/// Creation makes the compute system before the VM has an endpoint -- one is
+/// created on the first start, so that a VM nobody ever starts takes no address
+/// -- so the document creation used carries no `NetworkAdapters` section. The
+/// start is what creates the endpoint and writes the adapter in, and until this
+/// existed the freshly created system was simply started as it stood: the guest
+/// came up with no network card, while HNS held an endpoint with an address and
+/// nothing attached to it. Every later start already rebuilt the system, because
+/// HCS destroys one as it stops, so only the first start after a creation was
+/// ever wrong.
+///
+/// A system in `Created` has executed nothing, so rebuilding it destroys no
+/// state. Every other state has a guest behind it and is started as it stands.
+fn plan_for_existing(state: &HcsSystemState) -> ExistingSystemPlan {
+    match state {
+        HcsSystemState::Created => ExistingSystemPlan::Rebuild,
+        _ => ExistingSystemPlan::StartAsIs,
+    }
+}
+
+/// The state HCS reports for compute system `id`.
+///
+/// Read from the enumeration rather than from the system's own properties: a
+/// system that has been created and never started refuses a property query
+/// outright, and that is exactly the state this has to recognise. A system the
+/// enumeration does not mention is treated as `Created` for the same reason
+/// [`HcsSystemState::from_enumeration`] does -- it has certainly never run.
+fn reported_state(id: &str) -> Result<HcsSystemState, RepositoryError> {
+    let systems = HcsClient::new().enumerate_systems()?;
+    let reported = systems
+        .into_iter()
+        .find(|system| system.id == id)
+        .and_then(|system| system.state);
+    Ok(HcsSystemState::from_enumeration(reported))
 }
 
 /// Removes a compute system HCS may have created before the creation failed.
@@ -549,13 +668,63 @@ mod tests {
     use uuid::Uuid;
     use vmlord_core::{NetworkMode, RepositoryError};
 
-    use super::{EndpointPolicy, VmNetworkAdapter, VmStartPipeline, attachment_paths};
+    use super::{
+        EndpointPolicy, ExistingSystemPlan, HcsSystemState, VmNetworkAdapter, VmStartPipeline,
+        attachment_paths, plan_for_existing,
+    };
     use crate::{
         Com1Launcher,
         hcn_endpoint::EndpointAddress,
         hcs::HcsStartFailure,
         metadata::{MetadataStore, VmComputeSystemMapping},
     };
+
+    #[test]
+    fn a_system_that_has_never_run_is_rebuilt_from_the_configuration_the_start_prepared() {
+        // The compute system creation makes carries no network adapter: the
+        // endpoint does not exist yet, and the start is what creates it and
+        // writes it into the configuration. Starting the system as created
+        // therefore boots a guest with no network card at all, while the
+        // endpoint sits in HNS with an address nothing is attached to. A
+        // system in `Created` has executed nothing, so rebuilding it costs
+        // nothing and makes the start run the configuration it just prepared.
+        assert_eq!(
+            plan_for_existing(&HcsSystemState::Created),
+            ExistingSystemPlan::Rebuild
+        );
+    }
+
+    #[test]
+    fn a_system_that_has_already_run_is_started_as_it_stands() {
+        // Anything but `Created` has state a rebuild would destroy, and HCS
+        // destroys a compute system as it stops -- so a VM being started after
+        // a stop is not found at all and takes the re-creation path anyway.
+        for state in [
+            HcsSystemState::Running,
+            HcsSystemState::Paused,
+            HcsSystemState::Stopped,
+            HcsSystemState::Other("Zombie".to_owned()),
+        ] {
+            assert_eq!(
+                plan_for_existing(&state),
+                ExistingSystemPlan::StartAsIs,
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_pipelines_a_build_thread_needs_can_be_moved_to_it() {
+        // Creating a VM now starts it and waits for its guest, all on the build
+        // thread, so everything that cycle owns has to be able to go there.
+        const fn assert_send_sync<T: Send + Sync>() {}
+        const fn assert_send<T: Send>() {}
+
+        assert_send_sync::<VmStartPipeline>();
+        assert_send_sync::<crate::force_stop::VmForceStopPipeline>();
+        assert_send_sync::<crate::delete::VmDeletionPipeline>();
+        assert_send::<crate::com1_terminal::Com1Session>();
+    }
 
     struct TempRoot(PathBuf);
 
@@ -614,7 +783,12 @@ mod tests {
         /// rather than only on what each collaborator saw.
         steps: Arc<Mutex<Vec<&'static str>>>,
         grant: Arc<Mutex<Vec<(String, PathBuf)>>>,
+        /// Every compute system a preparer was asked to bring into shape, with
+        /// the configuration it was given. A start runs on whatever the
+        /// preparer left behind, so this is where the document reaches HCS.
         start: Arc<Mutex<Vec<(String, String)>>>,
+        /// How many times the system was actually started.
+        starts: Arc<Mutex<usize>>,
         endpoint: Arc<Mutex<Vec<EndpointRequest>>>,
         dhcp: Arc<Mutex<Vec<(String, EndpointAddress)>>>,
         /// The command line each COM1 console was opened with.
@@ -727,9 +901,12 @@ mod tests {
     }
 
     #[test]
-    fn starts_the_console_before_network_and_hcs() {
-        // Before, not after: the output that explains why a boot failed is
-        // written in the seconds right after HCS hands the VM to its worker.
+    fn opens_the_console_after_the_system_is_prepared_and_before_it_runs() {
+        // Not before preparing: preparing may destroy and re-create the compute
+        // system, and with it the named pipe COM1 is served through, leaving a
+        // console reading a pipe that no longer exists. Not after starting
+        // either: the output that explains a failed boot is written in the
+        // seconds right after HCS hands the VM to its worker.
         let fixture = fixture_with("console-order", NetworkMode::Nat, None);
         let calls = fixture.calls.clone();
 
@@ -739,7 +916,9 @@ mod tests {
 
         assert_eq!(
             calls.steps.lock().unwrap().as_slice(),
-            ["console", "endpoint", "dhcp", "grant", "grant", "start"]
+            [
+                "endpoint", "dhcp", "grant", "grant", "prepare", "console", "start"
+            ]
         );
     }
 
@@ -775,6 +954,31 @@ mod tests {
         let error = pipeline(
             &calls,
             Behavior {
+                fail_start: true,
+                ..Behavior::default()
+            },
+        )
+        .start(&fixture.store, "dev", &fixture.vm_directory)
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("injected start failure"),
+            "{error}"
+        );
+        assert_eq!(calls.console_cancellations.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_failure_before_the_console_launch_opens_no_console_at_all() {
+        // The endpoint is now settled before the console is opened, so a VM
+        // that cannot be given one never gets a terminal window it would only
+        // have to close again.
+        let fixture = fixture_with("console-none", NetworkMode::Nat, None);
+        let calls = fixture.calls.clone();
+
+        let error = pipeline(
+            &calls,
+            Behavior {
                 fail_endpoint: true,
                 ..Behavior::default()
             },
@@ -783,7 +987,8 @@ mod tests {
         .unwrap_err();
 
         assert!(error.to_string().contains("endpoint"), "{error}");
-        assert_eq!(calls.console_cancellations.load(Ordering::Relaxed), 1);
+        assert!(calls.console.lock().unwrap().is_empty());
+        assert_eq!(calls.console_cancellations.load(Ordering::Relaxed), 0);
     }
 
     fn pipeline(calls: &Calls, behavior: Behavior) -> VmStartPipeline {
@@ -804,10 +1009,22 @@ mod tests {
             {
                 let calls = calls.clone();
                 move |id: &str, configuration: &str| {
+                    calls.steps.lock().unwrap().push("prepare");
+                    calls
+                        .start
+                        .lock()
+                        .unwrap()
+                        .push((id.to_owned(), configuration.to_owned()));
+                    Ok(())
+                }
+            },
+            {
+                let calls = calls.clone();
+                move |_id: &str| {
                     calls.steps.lock().unwrap().push("start");
-                    let mut started = calls.start.lock().unwrap();
-                    started.push((id.to_owned(), configuration.to_owned()));
-                    if started.len() <= behavior.busy_starts {
+                    let mut starts = calls.starts.lock().unwrap();
+                    *starts += 1;
+                    if *starts <= behavior.busy_starts {
                         return Err(HcsStartFailure::EndpointBusy(RepositoryError::new(
                             "injected endpoint-busy failure",
                         )));
@@ -1033,7 +1250,9 @@ mod tests {
 
         assert_eq!(
             calls.steps.lock().unwrap().clone(),
-            vec!["console", "endpoint", "dhcp", "grant", "grant", "start"]
+            vec![
+                "endpoint", "dhcp", "grant", "grant", "prepare", "console", "start"
+            ]
         );
     }
 
@@ -1179,8 +1398,8 @@ mod tests {
         assert_eq!(
             calls.steps.lock().unwrap().clone(),
             vec![
-                "console", "endpoint", "dhcp", "grant", "grant", "start", "endpoint", "dhcp",
-                "grant", "grant", "start"
+                "endpoint", "dhcp", "grant", "grant", "prepare", "console", "start", "endpoint",
+                "dhcp", "grant", "grant", "prepare", "console", "start"
             ]
         );
     }
@@ -1379,6 +1598,7 @@ mod tests {
             console_launcher(&calls),
             |_id: &str, _path: &Path| Ok(()),
             |_id: &str, _configuration: &str| Ok(()),
+            |_id: &str| Ok(()),
             |_vm_name: &str, _recorded: Option<Uuid>, _policy: EndpointPolicy| {
                 Ok(VmNetworkAdapter {
                     endpoint_id: NEW_ENDPOINT_ID,

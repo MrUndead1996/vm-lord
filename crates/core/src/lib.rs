@@ -14,7 +14,9 @@ pub use progress::{
 pub use provisioning::{
     CloudImage, GuestDefaults, Password, Provisioning, SshAccess, VmSource, validate_vm_name,
 };
-pub use settings::{AppSettings, Language, LogLevel, SettingsError, SettingsStore};
+pub use settings::{
+    AppSettings, GuestReadinessTimeouts, Language, LogLevel, SettingsError, SettingsStore,
+};
 
 use std::fmt;
 
