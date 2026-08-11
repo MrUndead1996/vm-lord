@@ -1117,9 +1117,66 @@ the thread. `HcsVmRepository::create_vm` refuses what can be refused cheaply and
 certainly -- validation, a name the store or the build registry already knows, a
 directory that already exists -- and then hands the request to
 `build::BuildRegistry::start`, which spawns one `std::thread` per VM and returns.
-The thread runs `VmCreationPipeline::create` unchanged; a failure there rolls the
-build back exactly as it always did, and is reported to the user through the
+The thread runs `cycle::VmBuildCycle::run`, which is creation, start and the
+readiness wait as one operation; a failure is reported to the user through the
 shared diagnostics buffer rather than through a return value nobody is waiting on.
+
+### Waiting for the guest
+
+A build no longer ends where HCS accepts a compute system. That moment is where
+VMLord stops working and well before the VM does anything: cloud-init installs
+the SSH key at its init stage and applies `packages:` later, at its config stage,
+so a probe of port 22 answers "ready" in the middle of the work. `VmBuildCycle`
+therefore carries on -- `BuildStep::Starting`, then `BuildStep::AwaitingGuest` --
+and the build leaves the list only once the guest's own `cloud-init status
+--wait` has answered.
+
+`guest_ready::GuestReadiness` waits in three phases, each with its own timeout
+and its own failure, because the three are different facts about the guest: the
+endpoint has to be given an address (HNS assigns it, the DHCP server delivers
+it), something has to answer a TCP connection on port 22, and cloud-init has to
+report that it is done. The transport is `ssh.exe` from `%SystemRoot%\System32\
+OpenSSH`, driven as a child process behind a seam: every maintained Rust SSH
+client is async-only, and VMLord has no async runtime, while a second vendored C
+build under MSVC would cost more than this does. Its absence -- OpenSSH Client is
+an optional Windows feature -- is an outcome of its own, named in the message a
+person acts on. The child's output goes to `cloud-init-status.log` beside
+`com1.log` rather than to a pipe: `--wait` prints for as long as it runs, and a
+pipe nobody drains fills and deadlocks the child against the loop polling it.
+
+Exit codes decide readiness. `0` is done, `2` is done-but-degraded -- reported as
+a warning with what `--long` said, because one broken cloud-init module must not
+turn a working VM into a failed build -- and `1` is a cloud-init failure. `255`
+is OpenSSH's own code and says nothing about cloud-init, so it is reported as an
+unreachable guest.
+
+The rollback rules differ by what failed, and deliberately so. A start that fails
+rolls the whole creation back: a VM nobody has ever started is debris. A wait
+that fails does not: the VM exists, it runs, and its `com1.log` is the only
+account of what went wrong inside it, so the build ends with an error diagnostic
+carrying the tail of that log and the VM stays for a person to look at. A
+cancellation rolls everything back, running VM included -- force-stop, then
+delete -- because the downloaded image survives in the cache and repeating the
+creation is cheap. Installation media has no cloud-init and no key of VMLord's,
+so there is nobody in that guest to ask: the cycle ends at a started VM.
+
+The four timeouts live in `AppSettings::guest_readiness` -- 90 seconds for the
+address, 300 for port 22, 1200 for cloud-init, 10 for one connection attempt --
+under `#[serde(default)]`, so a `settings.toml` written before they existed keeps
+loading. They are file-only: four second-counts for a case that arises once in
+the life of an installation would dilute a dialog that shows a path, a language
+and log settings.
+
+A start produces a `Com1Session` and a compute-system handle, both of which
+belong to the repository behind `&mut self` -- which a build thread does not
+have. The thread therefore parks them in its `BuildRegistry` entry, and
+`take_started` hands them over on the next refresh, where `adopt_started` inserts
+the session and holds the system. `take_started` is separate from `reap` on
+purpose: `reap` runs inside queries taking `&self`, and a session dropped there
+would silently cancel the console reader of a running VM. Passing a session
+across threads is what `unsafe impl Send for WindowsEvent` is for -- an event
+handle is a process-wide kernel object whose whole purpose is signalling between
+threads, and the type owns its handle rather than sharing it.
 
 `list_vms` is where the two halves are joined: the VMs `MetadataStore` knows
 about, plus `BuildRegistry::summaries` for the ones still being built. A build

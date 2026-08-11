@@ -315,7 +315,9 @@ impl GuestReadiness {
         monitor: &BuildMonitor,
     ) -> Result<(), ReadinessFailure> {
         let deadline = (self.now)() + self.timeouts.ssh_port;
-        let mut last_error = "the guest never answered".to_owned();
+        // Deliberately uninitialised: the only way out of this loop that reads
+        // it is one that has probed at least once and been refused.
+        let mut last_error;
         loop {
             if monitor.is_cancelled() {
                 return Err(ReadinessFailure::Cancelled);

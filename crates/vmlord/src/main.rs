@@ -55,10 +55,13 @@ fn load_backend(settings: &AppSettings) -> Box<dyn VmRepository> {
             "using the native HCS backend with VM storage at {}",
             settings.vm_storage_path.display()
         );
-        return Box::new(vmlord_platform::HcsVmRepository::new(
-            settings.vm_storage_path.clone(),
-            cloud_disk_importer(settings.image_cache_path.clone()),
-        ));
+        return Box::new(
+            vmlord_platform::HcsVmRepository::new(
+                settings.vm_storage_path.clone(),
+                cloud_disk_importer(settings.image_cache_path.clone()),
+            )
+            .with_readiness_timeouts(settings.guest_readiness),
+        );
     }
 
     log::warn!("using the legacy AppSandbox backend because {BACKEND_VARIABLE}=legacy");

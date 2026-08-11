@@ -13,17 +13,20 @@ use std::{
 };
 
 use vmlord_core::{
-    AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError,
-    VmCreateRequest, VmDeleteRequest, VmRepository, VmState, VmSummary, VmUpdateRequest,
+    AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, GuestReadinessTimeouts, NetworkMode,
+    RepositoryError, VmCreateRequest, VmDeleteRequest, VmRepository, VmState, VmSummary,
+    VmUpdateRequest,
 };
 
 use crate::{
     CloudDiskImporter, Com1LogMode, HcsClient, HcsSystem, KnownVm, MetadataStore,
-    VmComputeSystemMapping, VmConnections, VmCreationPipeline, VmDeletionPipeline,
-    VmForceStopPipeline, VmShutdownPipeline, VmStartPipeline,
-    build::BuildRegistry,
+    VmComputeSystemMapping, VmConnections, VmDeletionPipeline, VmForceStopPipeline,
+    VmShutdownPipeline, VmStartPipeline,
+    build::{BuildRegistry, StartedVm},
     cleanup,
     com1_terminal::{Com1Launcher, Com1Sessions},
+    cycle::{CycleOutcome, VmBuildCycle},
+    guest_ready::ReadinessTimeouts,
     hcn::HcnNetwork,
     hcn_endpoint::{EndpointAddress, HcnEndpoint},
     hcs::{HCS_ACCESS_ALL, HcsSystemState},
@@ -50,8 +53,12 @@ pub struct HcsVmRepository {
     storage_root: PathBuf,
     connections: VmConnections,
     events: VmEventSink,
-    /// Shared with every build thread, which is why it is behind an `Arc`.
-    creation: Arc<VmCreationPipeline>,
+    /// The whole creation cycle -- build, start, wait for the guest -- shared
+    /// with every build thread, which is why it is behind an `Arc`.
+    cycle: Arc<VmBuildCycle>,
+    /// Kept beside the cycle so that a later `with_readiness_timeouts` can be
+    /// told apart from the defaults the cycle was built with.
+    readiness_timeouts: ReadinessTimeouts,
     /// The VMs being created right now.
     builds: Arc<BuildRegistry>,
     start: VmStartPipeline,
@@ -89,7 +96,12 @@ impl HcsVmRepository {
             store: MetadataStore::new(storage_root.join(MAPPING_FILE_NAME)),
             storage_root,
             connections: VmConnections::with_events(events.clone()),
-            creation: Arc::new(VmCreationPipeline::production(cloud_disk)),
+            cycle: Arc::new(VmBuildCycle::production(
+                cloud_disk,
+                com1_launcher.clone(),
+                ReadinessTimeouts::default(),
+            )),
+            readiness_timeouts: ReadinessTimeouts::default(),
             builds: Arc::new(BuildRegistry::default()),
             start: VmStartPipeline::production(com1_launcher.clone()),
             com1_launcher,
@@ -102,6 +114,27 @@ impl HcsVmRepository {
             initialized: false,
             service_disconnect_reported: false,
         }
+    }
+
+    /// Replaces the readiness timeouts with the user's own.
+    ///
+    /// A builder rather than an argument of `new`: the timeouts are the only
+    /// part of a repository that comes from settings, and every existing
+    /// caller -- the tests included -- means the defaults.
+    #[must_use]
+    pub fn with_readiness_timeouts(mut self, timeouts: GuestReadinessTimeouts) -> Self {
+        let timeouts = ReadinessTimeouts::from(timeouts);
+        self.readiness_timeouts = timeouts;
+        match Arc::get_mut(&mut self.cycle) {
+            // The composition root calls this before any build thread exists,
+            // so this is the only reference to the cycle.
+            Some(cycle) => cycle.set_timeouts(timeouts),
+            None => log::error!(
+                "the readiness timeouts stay at their defaults: a build is already running \
+                 with the cycle they would have changed"
+            ),
+        }
+        self
     }
 
     fn require_initialized(&self) -> Result<(), RepositoryError> {
@@ -156,6 +189,23 @@ impl HcsVmRepository {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .push(Diagnostic { level, message });
+    }
+
+    /// Takes over the VMs that background builds have started.
+    ///
+    /// The COM1 session and the compute-system handle a build produced belong
+    /// here rather than on its thread: both are reachable only behind
+    /// `&mut self`, which a build thread does not have.
+    fn adopt_started(&mut self, started: Vec<StartedVm>) {
+        for StartedVm { mapping, session } in started {
+            log::debug!(
+                "taking over the console and the compute system of VM \"{}\", built in the \
+                 background",
+                mapping.vm_name
+            );
+            self.com1_sessions.insert(session);
+            self.hold_started_system(&mapping);
+        }
     }
 
     /// Reopens and holds the compute system of a VM that has just started, and
@@ -545,29 +595,40 @@ impl VmRepository for HcsVmRepository {
             return Err(error);
         }
 
-        let pipeline = Arc::clone(&self.creation);
+        let cycle = Arc::clone(&self.cycle);
         let store = self.store.clone();
         let diagnostics = Arc::clone(&self.diagnostics);
         let name = request.name.clone();
         self.builds.start(request.clone(), move |monitor| {
-            match pipeline.create(&store, &request, &vm_directory, monitor) {
-                Ok(mapping) => log::info!(
-                    "VM \"{}\" ({}) finished building",
-                    mapping.vm_name,
-                    mapping.vm_id
-                ),
-                Err(error) => {
-                    log::error!("creating VM \"{name}\" failed: {error}");
-                    push_shared_diagnostic(
-                        &diagnostics,
-                        DiagnosticLevel::Error,
-                        format!("Failed to create VM \"{name}\": {error}"),
-                    );
+            let report = cycle.run(&store, &request, &vm_directory, monitor);
+            match report.outcome {
+                CycleOutcome::Ready => {
+                    log::info!("VM \"{name}\" finished building and its guest is ready");
                 }
+                CycleOutcome::Degraded { detail } => push_shared_diagnostic(
+                    &diagnostics,
+                    DiagnosticLevel::Warning,
+                    format!("VM \"{name}\" is up, but cloud-init finished degraded: {detail}"),
+                ),
+                CycleOutcome::NotReady { reason } => push_shared_diagnostic(
+                    &diagnostics,
+                    DiagnosticLevel::Error,
+                    format!(
+                        "VM \"{name}\" was created and started, but never became ready: {reason}"
+                    ),
+                ),
+                CycleOutcome::Failed { reason } => push_shared_diagnostic(
+                    &diagnostics,
+                    DiagnosticLevel::Error,
+                    format!("Failed to create VM \"{name}\": {reason}"),
+                ),
+                CycleOutcome::Cancelled => push_shared_diagnostic(
+                    &diagnostics,
+                    DiagnosticLevel::Info,
+                    format!("Creating VM \"{name}\" was cancelled"),
+                ),
             }
-            // Creation does not start the VM yet; the full cycle lands with
-            // `VmBuildCycle`.
-            None
+            report.started
         })
     }
 
@@ -731,8 +792,10 @@ impl VmRepository for HcsVmRepository {
     /// released.
     fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
         // The `&mut self` call the application already makes on every refresh,
-        // right after listing: the place a finished build can be joined.
-        self.builds.reap();
+        // right after listing: the place a finished build can be joined, and
+        // the place what it started can be taken over.
+        let started = self.builds.take_started();
+        self.adopt_started(started);
         let drained = watch::drain_events(&self.events, |vm_id, generation| {
             self.connections.is_superseded(vm_id, generation)
         });
@@ -903,6 +966,51 @@ mod tests {
                 ))
             }),
         )
+    }
+
+    #[test]
+    fn the_readiness_timeouts_come_from_the_settings() {
+        let repository =
+            repository().with_readiness_timeouts(vmlord_core::GuestReadinessTimeouts {
+                address_secs: 1,
+                ssh_port_secs: 2,
+                cloud_init_secs: 3,
+                connect_timeout_secs: 4,
+            });
+
+        assert_eq!(
+            repository.readiness_timeouts,
+            crate::guest_ready::ReadinessTimeouts {
+                address: std::time::Duration::from_secs(1),
+                ssh_port: std::time::Duration::from_secs(2),
+                cloud_init: std::time::Duration::from_secs(3),
+                connect: std::time::Duration::from_secs(4),
+            }
+        );
+    }
+
+    #[test]
+    fn a_repository_left_alone_keeps_the_default_timeouts() {
+        assert_eq!(
+            repository().readiness_timeouts,
+            crate::guest_ready::ReadinessTimeouts::default()
+        );
+    }
+
+    #[test]
+    fn a_started_vm_handed_over_by_a_build_is_held_and_its_console_kept() {
+        // A build thread can touch neither `com1_sessions` nor a compute-system
+        // handle: both live behind `&mut self`. Taking them over on refresh is
+        // what makes a VM created in the background indistinguishable from one
+        // started by hand.
+        let mut repository = repository();
+        let mapping = mapping(NetworkMode::Nat);
+        let vm_id = mapping.vm_id;
+        let session = crate::com1_terminal::Com1Launcher::session_for_test(&mapping);
+
+        repository.adopt_started(vec![crate::build::StartedVm { mapping, session }]);
+
+        assert!(repository.com1_sessions.contains(vm_id));
     }
 
     fn create_request(name: &str) -> vmlord_core::VmCreateRequest {
