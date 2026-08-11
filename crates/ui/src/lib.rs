@@ -27,6 +27,14 @@ const UBUNTU_RELEASES: [&str; 2] = ["24.04", "22.04"];
 
 const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
 
+/// The height a text field in a form claims.
+///
+/// Stated rather than left at zero: a widget added with no height of its own
+/// makes its grid row shorter than what is drawn in it, and the row below then
+/// starts inside it -- which is what made the combo box under "VM Name" and the
+/// password field under "User name" overlap the fields above them.
+const FIELD_HEIGHT: f32 = 24.0;
+
 pub fn run(application: WorkspaceApp) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([960.0, 640.0]),
@@ -553,7 +561,10 @@ fn render_create_vm_dialog(
                         .spacing([12.0, 8.0])
                         .show(ui, |ui| {
                             ui.label("VM Name");
-                            ui.add_sized([260.0, 0.0], egui::TextEdit::singleline(&mut form.name));
+                            ui.add_sized(
+                                [260.0, FIELD_HEIGHT],
+                                egui::TextEdit::singleline(&mut form.name),
+                            );
                             ui.end_row();
 
                             match form.source_kind {
@@ -587,7 +598,7 @@ fn render_create_vm_dialog(
                                     ui.label("OS Image");
                                     ui.horizontal(|ui| {
                                         ui.add_sized(
-                                            [300.0, 0.0],
+                                            [300.0, FIELD_HEIGHT],
                                             egui::TextEdit::singleline(&mut form.image_path)
                                                 .hint_text("Path to ISO or VHDX..."),
                                         );
@@ -705,13 +716,16 @@ fn render_provisioning_fields(
         .spacing([12.0, 8.0])
         .show(ui, |ui| {
             ui.label("User name");
-            ui.add_sized([260.0, 0.0], egui::TextEdit::singleline(&mut form.username));
+            ui.add_sized(
+                [260.0, FIELD_HEIGHT],
+                egui::TextEdit::singleline(&mut form.username),
+            );
             ui.end_row();
 
             ui.label("Password");
             ui.vertical(|ui| {
                 ui.add_sized(
-                    [260.0, 0.0],
+                    [260.0, FIELD_HEIGHT],
                     egui::TextEdit::singleline(&mut form.password)
                         .password(true)
                         .hint_text("Optional"),
@@ -748,15 +762,24 @@ fn render_provisioning_fields(
             ui.end_row();
 
             ui.label("Locale");
-            ui.add_sized([260.0, 0.0], egui::TextEdit::singleline(&mut form.locale));
+            ui.add_sized(
+                [260.0, FIELD_HEIGHT],
+                egui::TextEdit::singleline(&mut form.locale),
+            );
             ui.end_row();
 
             ui.label("Keyboard layout");
-            ui.add_sized([260.0, 0.0], egui::TextEdit::singleline(&mut form.keyboard));
+            ui.add_sized(
+                [260.0, FIELD_HEIGHT],
+                egui::TextEdit::singleline(&mut form.keyboard),
+            );
             ui.end_row();
 
             ui.label("Timezone");
-            ui.add_sized([260.0, 0.0], egui::TextEdit::singleline(&mut form.timezone));
+            ui.add_sized(
+                [260.0, FIELD_HEIGHT],
+                egui::TextEdit::singleline(&mut form.timezone),
+            );
             ui.end_row();
         });
     ui.small("The three settings above are filled in from this computer and applied to the guest.");
@@ -1213,7 +1236,7 @@ fn render_vm_list(ui: &mut egui::Ui, vms: &[VmSummary], selected_vm_name: &mut O
                     *selected_vm_name = Some(vm.name.clone());
                 }
                 ui.label(&vm.os_type);
-                ui.label(vm_state(vm.state));
+                ui.label(vm_state_label(vm.state));
                 render_agent_status(ui, agent_status(vm.state));
                 ui.label(format!("{} cores", vm.cpu_cores));
                 ui.label(format!("{} MiB", vm.ram_mb));
@@ -1322,10 +1345,8 @@ fn render_selected_vm(
             );
             detail_row(ui, "Operating system", vm.os_type.clone());
             detail_row(ui, "Status", vm_state(vm.state).into());
-            if let VmState::Building { progress } = vm.state
-                && let Some(detail) = build_detail(progress)
-            {
-                detail_row(ui, "Progress", detail);
+            if let VmState::Building { progress } = vm.state {
+                render_build_progress(ui, progress);
             }
             detail_row(
                 ui,
@@ -1563,6 +1584,31 @@ fn action_color(action: VmAction) -> egui::Color32 {
     }
 }
 
+/// One row of the details grid for a VM that is still being built: a bar while
+/// the image is being fetched, and the byte counts under it.
+///
+/// The bar appears only for the download, which is the one step that publishes
+/// counts. The others draw no bar rather than an empty one, because a bar
+/// standing at zero for two minutes says the opposite of what is happening.
+fn render_build_progress(ui: &mut egui::Ui, progress: BuildProgress) {
+    let Some(detail) = build_detail(progress) else {
+        return;
+    };
+
+    ui.strong("Progress");
+    ui.vertical(|ui| {
+        if let Some(percent) = download_percentage(progress) {
+            ui.add(
+                egui::ProgressBar::new(percent as f32 / 100.0)
+                    .desired_width(260.0)
+                    .text(format!("{percent}%")),
+            );
+        }
+        ui.label(detail);
+    });
+    ui.end_row();
+}
+
 fn detail_row(ui: &mut egui::Ui, label: &str, value: String) {
     ui.strong(label);
     ui.label(value);
@@ -1610,6 +1656,42 @@ fn agent_status_label(status: AgentStatus) -> &'static str {
         AgentStatus::Unknown => "Unknown",
         AgentStatus::Offline => "Offline",
         AgentStatus::Online => "Online",
+    }
+}
+
+/// The status column's text: the step, and how far into it the build is when
+/// that is a number.
+///
+/// The percentage is here and not only in the details panel because the list is
+/// what a person watches while an image downloads, and selecting a row to see
+/// whether anything is happening is not watching.
+fn vm_state_label(state: VmState) -> String {
+    let label = vm_state(state);
+    match state {
+        VmState::Building { progress } => match download_percentage(progress) {
+            Some(percent) => format!("{label} {percent}%"),
+            None => label.to_owned(),
+        },
+        _ => label.to_owned(),
+    }
+}
+
+/// How far the image transfer has got, when it is a fraction of something
+/// known.
+///
+/// A server that sent no length gives no denominator, and connecting and
+/// hashing-complete are not fractions of anything -- hence `None` rather than a
+/// zero that would read as no progress.
+fn download_percentage(progress: BuildProgress) -> Option<u64> {
+    match progress.download? {
+        DownloadPhase::Downloading {
+            downloaded,
+            total: Some(total),
+        } => Some(percentage(downloaded, total)),
+        DownloadPhase::Verifying { hashed, total } => Some(percentage(hashed, total)),
+        DownloadPhase::Downloading { total: None, .. }
+        | DownloadPhase::Connecting
+        | DownloadPhase::Completed => None,
     }
 }
 
@@ -1951,6 +2033,53 @@ mod tests {
             None,
             "a step that publishes no counts has nothing to add to its own name"
         );
+    }
+
+    /// The list is what a person watches while an image downloads, so the
+    /// percentage has to be there and not only behind a selected row.
+    #[test]
+    fn the_status_column_carries_the_downloads_percentage() {
+        let downloading = |download| {
+            vm_state_label(VmState::Building {
+                progress: BuildProgress {
+                    step: BuildStep::Downloading,
+                    download: Some(download),
+                },
+            })
+        };
+
+        assert_eq!(
+            downloading(DownloadPhase::Downloading {
+                downloaded: 25,
+                total: Some(100),
+            }),
+            "Building: downloading 25%"
+        );
+        assert_eq!(
+            downloading(DownloadPhase::Verifying {
+                hashed: 50,
+                total: 100,
+            }),
+            "Building: downloading 50%"
+        );
+        assert_eq!(
+            downloading(DownloadPhase::Downloading {
+                downloaded: 25,
+                total: None,
+            }),
+            "Building: downloading",
+            "a server that sent no length gives nothing to divide by"
+        );
+        assert_eq!(
+            vm_state_label(VmState::Building {
+                progress: BuildProgress {
+                    step: BuildStep::WritingDisk,
+                    download: None,
+                },
+            }),
+            "Building: writing the disk"
+        );
+        assert_eq!(vm_state_label(VmState::Stopped), "Stopped");
     }
 
     /// A bar that reads 100% while the work goes on is the one people wait on.
