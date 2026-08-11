@@ -436,17 +436,48 @@ once a second, so a louder log would repeat one unreadable endpoint forever.
 `platform::VmShutdownPipeline` asks the guest of a known VM to shut down
 through `HcsShutDownComputeSystem`. HCS parses that call's options as JSON and
 rejects a null pointer with `HCS_E_INVALID_JSON`, unlike start and terminate,
-so an empty JSON object is always passed. A successful shutdown means HCS
-delivered the request, not that the guest powered off, so forced stop remains a
-separate action.
+so a document is always passed. A successful shutdown means HCS delivered the
+request, not that the guest powered off, so forced stop remains a separate
+action.
 
-A VM whose guest exposes no shutdown channel HCS can use fails the shutdown
-*operation* with `ERROR_NOT_SUPPORTED` while the call and its options are
-accepted; that HRESULT is reported as its own error naming a forced stop as the
-remaining option, because no retry helps. Whether a fully booted guest fares
-better is not yet established: the legacy AppSandbox backend resolved
-`HcsShutDownComputeSystem` but never called it, implementing graceful shutdown
-over its own in-guest agent instead, so VMLord may need the same.
+Two things have to be right for that request to reach a guest at all, and until
+#70 neither was, which made every stop an emergency one.
+
+The first is the compute system's own configuration. Integration components
+live in `VirtualMachine.Services`, a section the HCS schema introduced in 2.5;
+VMLord asked for 2.1, a model that has no such section, and got whatever HCS
+offers by default -- timesync, but no shutdown. Nothing in the guest can make
+up for that: Linux' `hv_util` driver binds to the VMBus channel
+`0e0b6031-5213-4934-818b-38d90ced39db` and answers `ICMSGTYPE_SHUTDOWN` with
+`orderly_poweroff`, but only if the host offers the channel, and a VM built
+from a 2.1 document does not. `HcsVmConfigBuilder` therefore writes 2.5 and
+names `Shutdown` and `Timesync`; timesync is named beside shutdown because
+naming any service replaces the default set, and a VM must not lose its clock
+to gain a way to be turned off. Heartbeat and key-value exchange stay out until
+something needs them: an offered channel is a guest-facing surface, not a free
+courtesy.
+
+The second is the options document, which schema 2.5 also gave that call.
+`Mechanism` picks between the two ways HCS can reach a guest: `GuestConnection`,
+the hvsocket channel a utility VM's in-guest agent serves, and
+`IntegrationService`, the VMBus channel an ordinary guest's own drivers answer.
+Left unnamed -- the empty object VMLord used to pass -- HCS reaches for the
+guest connection VMLord's VMs have never had and fails the operation with
+`ERROR_NOT_SUPPORTED`. `Force` stays false: a graceful stop is the request a
+guest may take its time over, and stopping one that will not go is what
+terminating is for.
+
+That HRESULT is still reported as its own error naming a forced stop, because
+no retry helps -- but it now means something narrower: a VM whose stored
+`config.json` predates #70. That document is what a start re-creates the compute
+system from, so such a VM keeps being built without services and has to be
+re-created to become stoppable. Existing VMs are not migrated: VMLord has no
+users yet.
+
+The legacy AppSandbox backend never found this. It resolved
+`HcsShutDownComputeSystem`, never called it, and implemented graceful shutdown
+over its own in-guest agent instead, returning `ERROR_NOT_SUPPORTED` itself
+whenever that agent was unreachable. VMLord needs no agent for this.
 
 `platform::VmForceStopPipeline` is that remaining option: it stops a known VM
 through `HcsTerminateComputeSystem`, which needs nothing from the guest, so its

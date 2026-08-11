@@ -519,9 +519,23 @@ fn hcs_service_properties_query() -> PCWSTR {
 /// HCS parses the options as JSON and rejects a null pointer with
 /// `HCS_E_INVALID_JSON` ("Invalid JSON document '$'"), unlike
 /// `HcsStartComputeSystem` and `HcsTerminateComputeSystem`, which accept one.
-/// An empty object requests the default shutdown behaviour.
+///
+/// The mechanism has to be named. HCS knows two -- `GuestConnection`, the
+/// hvsocket channel a utility VM's in-guest agent serves, and
+/// `IntegrationService`, the VMBus channel an ordinary guest's own drivers
+/// answer -- and an empty document left the choice to HCS, which reached for
+/// the guest connection VMLord's VMs do not have and failed the operation with
+/// `ERROR_NOT_SUPPORTED`. An Ubuntu cloud image serves the other one out of the
+/// box, through `hv_util`, so that is the one to ask for (#70).
+///
+/// `Force` stays false: this is the request a guest is allowed to take its time
+/// over, and refusing it is the guest's right. Stopping a VM that will not go
+/// is what `HcsTerminateComputeSystem` is for.
 fn shutdown_options() -> &'static str {
-    "{}"
+    concat!(
+        r#"{"Mechanism":"IntegrationService","Type":"Shutdown","Force":false,"#,
+        r#""Reason":"VMLord was asked to stop this VM"}"#
+    )
 }
 
 /// The document asking HCS to hot-detach the adapter keyed by `endpoint_id`.
@@ -538,16 +552,22 @@ fn detach_adapter_document(endpoint_id: Uuid) -> String {
 
 /// Reports a shutdown HCS accepted but cannot deliver.
 ///
-/// A VM whose guest exposes no shutdown channel HCS can use -- one booted from
-/// installer media, for instance -- fails the shutdown *operation* with
-/// `ERROR_NOT_SUPPORTED` even though the call itself and its options document
-/// were accepted. No retry helps, so the message points at the only remaining
-/// way to stop the VM.
+/// The shutdown *operation* fails with `ERROR_NOT_SUPPORTED` -- the call itself
+/// and its options document having been accepted -- when the compute system
+/// offers its guest no shutdown integration service to carry the request.
+///
+/// Since #70 every VM VMLord creates is given one, so this now means a VM built
+/// from a configuration written before that: `config.json` is what a start
+/// re-creates the compute system from, and a document without a `Services`
+/// section keeps producing a VM that cannot be asked to stop. Re-creating the
+/// VM is what fixes it; no retry does, so the message names the only way to
+/// stop this one now.
 fn unsupported_shutdown_error(id: &str, hresult: u32) -> RepositoryError {
     RepositoryError::new(format!(
-        "HCS does not support a graceful shutdown of compute system \"{id}\" \
-         (HRESULT 0x{hresult:08X}, ERROR_NOT_SUPPORTED); the guest exposes no \
-         shutdown channel HCS can use, so only a forced stop can stop it"
+        "HCS cannot deliver a graceful shutdown to compute system \"{id}\" \
+         (HRESULT 0x{hresult:08X}, ERROR_NOT_SUPPORTED); the VM offers its guest \
+         no shutdown service, which is how VMLord built VMs before #70, so only \
+         a forced stop can stop it"
     ))
 }
 
@@ -988,6 +1008,22 @@ mod tests {
 
         assert!(!options.is_empty());
         assert!(serde_json::from_str::<serde_json::Value>(options).is_ok());
+    }
+
+    #[test]
+    fn a_shutdown_asks_the_guests_own_integration_service_to_do_it() {
+        // #70: left to itself HCS reaches for a guest connection -- the
+        // hvsocket agent a utility VM runs and VMLord's VMs do not -- and fails
+        // the operation. The VMBus service an ordinary Linux guest answers
+        // through `hv_util` has to be named.
+        let options: serde_json::Value = serde_json::from_str(shutdown_options()).unwrap();
+
+        assert_eq!(options["Mechanism"], "IntegrationService");
+        assert_eq!(options["Type"], "Shutdown");
+        // A graceful stop the guest may take its time over: forcing one is
+        // `HcsTerminateComputeSystem`'s job, and it is a separate action on
+        // purpose.
+        assert_eq!(options["Force"], false);
     }
 
     #[test]
