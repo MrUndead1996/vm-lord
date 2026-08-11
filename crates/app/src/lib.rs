@@ -911,6 +911,7 @@ mod tests {
             log_file_path: directory.join("logs").join("vmlord.log"),
             log_level: LogLevel::Info,
             image_cache_path: directory.join("images"),
+            guest_readiness: vmlord_core::GuestReadinessTimeouts::default(),
         };
         let updated_settings = AppSettings {
             vm_storage_path: directory.join("virtual-machines"),
@@ -918,6 +919,7 @@ mod tests {
             log_file_path: directory.join("diagnostics").join("application.log"),
             log_level: LogLevel::Debug,
             image_cache_path: directory.join("cached-images"),
+            guest_readiness: vmlord_core::GuestReadinessTimeouts::default(),
         };
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             should_fail: false,

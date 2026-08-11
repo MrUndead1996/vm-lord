@@ -9,8 +9,9 @@ use eframe::egui;
 use vmlord_app::{BackendStatus, VmAction, WorkspaceApp};
 use vmlord_core::{
     AgentStatus, AppSettings, BuildProgress, BuildStep, CloudImage, DiagnosticLevel, DownloadPhase,
-    GpuMode, GuestDefaults, Language, LogLevel, NetworkMode, Password, Provisioning, SshAccess,
-    VmCreateRequest, VmDeleteRequest, VmSource, VmState, VmSummary, VmUpdateRequest, ubuntu,
+    GpuMode, GuestDefaults, GuestReadinessTimeouts, Language, LogLevel, NetworkMode, Password,
+    Provisioning, SshAccess, VmCreateRequest, VmDeleteRequest, VmSource, VmState, VmSummary,
+    VmUpdateRequest, ubuntu,
 };
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -126,6 +127,10 @@ struct SettingsForm {
     /// whole `AppSettings`, so a field it does not know about would be lost on
     /// every save. The widget for it arrives with the image download UI.
     image_cache_path: PathBuf,
+    /// Carried through unchanged for the same reason as `image_cache_path`,
+    /// and with no widget of its own on purpose: the readiness timeouts are
+    /// edited in `settings.toml` on the rare occasion anyone needs to.
+    guest_readiness: GuestReadinessTimeouts,
     error: Option<String>,
 }
 
@@ -137,6 +142,7 @@ impl SettingsForm {
             log_file_path: settings.log_file_path.display().to_string(),
             log_level: settings.log_level,
             image_cache_path: settings.image_cache_path.clone(),
+            guest_readiness: settings.guest_readiness,
             error: None,
         }
     }
@@ -157,6 +163,7 @@ impl SettingsForm {
             log_file_path: PathBuf::from(log_file_path),
             log_level: self.log_level,
             image_cache_path: self.image_cache_path.clone(),
+            guest_readiness: self.guest_readiness,
         })
     }
 }
