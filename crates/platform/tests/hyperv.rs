@@ -132,6 +132,7 @@ fn a_terminated_vm_reports_its_exit() {
     repository
         .create_vm(request)
         .expect("VM creation should succeed on an elevated Hyper-V host");
+    wait_for_build(&repository, &vm_name).expect("the build should finish");
     repository
         .start_vm(&vm_name)
         .expect("the created VM must start before its exit can be watched");
@@ -1225,6 +1226,28 @@ fn a_started_nat_vm_is_served_the_address_hns_assigned() {
 }
 
 /// The summary `repository` lists for `vm_name`.
+/// Waits for a VM's background creation to finish.
+///
+/// `create_vm` returns as soon as the build is accepted, so a test that acts
+/// on the VM has to wait for it the way the UI does: by looking at the list.
+fn wait_for_build(repository: &HcsVmRepository, vm_name: &str) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(600);
+    loop {
+        let summaries = repository
+            .list_vms()
+            .map_err(|error| format!("listing should work: {error}"))?;
+        match summaries.iter().find(|vm| vm.name == vm_name) {
+            None => return Err(format!("the build of VM \"{vm_name}\" failed")),
+            Some(vm) if !matches!(vm.state, VmState::Building { .. }) => return Ok(()),
+            Some(_) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("the build of VM \"{vm_name}\" did not finish"));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 fn listed_summary(repository: &HcsVmRepository, vm_name: &str) -> Result<VmSummary, String> {
     repository
         .list_vms()
@@ -1273,6 +1296,7 @@ fn a_running_nat_vm_is_listed_with_the_address_hns_assigned() {
     repository
         .create_vm(request)
         .expect("VM creation should succeed on an elevated Hyper-V host");
+    wait_for_build(&repository, &vm_name).expect("the build should finish");
     // The repository keeps its mapping under its own storage root, and the
     // endpoint identifier has to be read from there to compare the listed
     // address against HNS's own answer.

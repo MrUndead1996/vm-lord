@@ -5,18 +5,23 @@
 //! compute-system handles, and maps each repository operation onto the
 //! pipeline that already implements it.
 
-use std::{fs, net::IpAddr, path::PathBuf, sync::Mutex};
+use std::{
+    fs,
+    net::IpAddr,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use vmlord_core::{
-    AgentStatus, BuildMonitor, BuildStep, Diagnostic, DiagnosticLevel, GpuMode, NetworkMode,
-    RepositoryError, VmCreateRequest, VmDeleteRequest, VmRepository, VmState, VmSummary,
-    VmUpdateRequest,
+    AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError,
+    VmCreateRequest, VmDeleteRequest, VmRepository, VmState, VmSummary, VmUpdateRequest,
 };
 
 use crate::{
     CloudDiskImporter, HcsClient, HcsSystem, KnownVm, MetadataStore, VmComputeSystemMapping,
     VmConnections, VmCreationPipeline, VmDeletionPipeline, VmForceStopPipeline,
     VmShutdownPipeline, VmStartPipeline, cleanup,
+    build::BuildRegistry,
     hcn::HcnNetwork,
     hcn_endpoint::{EndpointAddress, HcnEndpoint},
     hcs::{HCS_ACCESS_ALL, HcsSystemState},
@@ -43,14 +48,18 @@ pub struct HcsVmRepository {
     storage_root: PathBuf,
     connections: VmConnections,
     events: VmEventSink,
-    creation: VmCreationPipeline,
+    /// Shared with every build thread, which is why it is behind an `Arc`.
+    creation: Arc<VmCreationPipeline>,
+    /// The VMs being created right now.
+    builds: Arc<BuildRegistry>,
     start: VmStartPipeline,
     shutdown: VmShutdownPipeline,
     force_stop: VmForceStopPipeline,
     delete: VmDeletionPipeline,
-    // `list_vms` takes `&self` but still has findings worth surfacing, so the
-    // diagnostics buffer needs interior mutability.
-    diagnostics: Mutex<Vec<Diagnostic>>,
+    // `list_vms` takes `&self` but still has findings worth surfacing, and a
+    // build thread reports its failure the same way, so the diagnostics buffer
+    // is both shared and interior-mutable.
+    diagnostics: Arc<Mutex<Vec<Diagnostic>>>,
     initialized: bool,
     /// Whether the user has already been told that HCS event reporting stopped.
     ///
@@ -73,12 +82,13 @@ impl HcsVmRepository {
             store: MetadataStore::new(storage_root.join(MAPPING_FILE_NAME)),
             storage_root,
             connections: VmConnections::with_events(events.clone()),
-            creation: VmCreationPipeline::production(cloud_disk),
+            creation: Arc::new(VmCreationPipeline::production(cloud_disk)),
+            builds: Arc::new(BuildRegistry::default()),
             start: VmStartPipeline::production(),
             shutdown: VmShutdownPipeline::production(),
             force_stop: VmForceStopPipeline::production(),
             delete: VmDeletionPipeline::production(),
-            diagnostics: Mutex::new(Vec::new()),
+            diagnostics: Arc::new(Mutex::new(Vec::new())),
             events,
             initialized: false,
             service_disconnect_reported: false,
@@ -486,18 +496,54 @@ impl VmRepository for HcsVmRepository {
         Ok(())
     }
 
+    /// Accepts the creation of a VM and returns; the VM is built on a thread of
+    /// its own and appears in the list as `Building` until it is done.
+    ///
+    /// Everything that can be refused cheaply and certainly is refused here,
+    /// before the thread: an obvious mistake belongs in the return value of the
+    /// call that made it, not in a diagnostic a second later.
     fn create_vm(&mut self, request: VmCreateRequest) -> Result<(), RepositoryError> {
         self.require_initialized()?;
+        request.validate()?;
 
+        if self.store.find_by_vm_name(&request.name)?.is_some()
+            || self.builds.contains(&request.name)
+        {
+            let error = RepositoryError::new(format!("VM \"{}\" already exists", request.name));
+            log::error!("{error}");
+            return Err(error);
+        }
         let vm_directory = layout::vm_directory(&self.storage_root, &request.name)?;
-        self.creation
-            .create(
-                &self.store,
-                &request,
-                &vm_directory,
-                &BuildMonitor::new(BuildStep::WritingDisk),
-            )
-            .map(|_mapping| ())
+        if vm_directory.exists() {
+            let error = RepositoryError::new(format!(
+                "VM directory already exists: {}",
+                vm_directory.display()
+            ));
+            log::error!("{error}");
+            return Err(error);
+        }
+
+        let pipeline = Arc::clone(&self.creation);
+        let store = self.store.clone();
+        let diagnostics = Arc::clone(&self.diagnostics);
+        let name = request.name.clone();
+        self.builds.start(request.clone(), move |monitor| {
+            match pipeline.create(&store, &request, &vm_directory, monitor) {
+                Ok(mapping) => log::info!(
+                    "VM \"{}\" ({}) finished building",
+                    mapping.vm_name,
+                    mapping.vm_id
+                ),
+                Err(error) => {
+                    log::error!("creating VM \"{name}\" failed: {error}");
+                    push_shared_diagnostic(
+                        &diagnostics,
+                        DiagnosticLevel::Error,
+                        format!("Failed to create VM \"{name}\": {error}"),
+                    );
+                }
+            }
+        })
     }
 
     /// Rewrites the memory and processor counts in the VM's stored
@@ -509,6 +555,7 @@ impl VmRepository for HcsVmRepository {
     /// running VM keeps its current topology until it is restarted.
     fn update_vm(&mut self, request: VmUpdateRequest) -> Result<(), RepositoryError> {
         self.require_initialized()?;
+        self.builds.refuse_if_building(&request.name)?;
 
         let mapping = self.mapping(&request.name)?;
         if request.gpu_mode != GpuMode::None {
@@ -554,6 +601,7 @@ impl VmRepository for HcsVmRepository {
 
     fn start_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
         self.require_initialized()?;
+        self.builds.refuse_if_building(name)?;
 
         let vm_directory = layout::vm_directory(&self.storage_root, name)?;
         self.start.start(&self.store, name, &vm_directory)?;
@@ -564,6 +612,7 @@ impl VmRepository for HcsVmRepository {
 
     fn stop_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
         self.require_initialized()?;
+        self.builds.refuse_if_building(name)?;
 
         let mapping = self.mapping(name)?;
         self.shutdown.shutdown(&self.store, name)?;
@@ -576,6 +625,7 @@ impl VmRepository for HcsVmRepository {
 
     fn force_stop_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
         self.require_initialized()?;
+        self.builds.refuse_if_building(name)?;
 
         let mapping = self.mapping(name)?;
         self.force_stop.force_stop(&self.store, name)?;
@@ -590,6 +640,7 @@ impl VmRepository for HcsVmRepository {
     /// deliberately.
     fn delete_vm(&mut self, request: VmDeleteRequest) -> Result<(), RepositoryError> {
         self.require_initialized()?;
+        self.builds.refuse_if_building(&request.name)?;
 
         let mapping = self.mapping(&request.name)?;
         self.refuse_if_live(&mapping)?;
@@ -609,10 +660,14 @@ impl VmRepository for HcsVmRepository {
     fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError> {
         self.require_initialized()?;
 
-        Ok(list_known_vms(&self.client, &self.store)?
+        let mut summaries: Vec<VmSummary> = list_known_vms(&self.client, &self.store)?
             .into_iter()
             .map(|known| self.summary(known))
-            .collect())
+            .collect();
+        // A build that failed rolled itself back and never reached the store,
+        // so its row simply stops being here.
+        summaries.extend(self.builds.summaries());
+        Ok(summaries)
     }
 
     /// Reports everything the repository has to say since the last call,
@@ -623,6 +678,9 @@ impl VmRepository for HcsVmRepository {
     /// after listing, so it is where a released handle can actually be
     /// released.
     fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
+        // The `&mut self` call the application already makes on every refresh,
+        // right after listing: the place a finished build can be joined.
+        self.builds.reap();
         let drained = watch::drain_events(&self.events, |vm_id, generation| {
             self.connections.is_superseded(vm_id, generation)
         });
@@ -659,6 +717,32 @@ impl VmRepository for HcsVmRepository {
     }
 }
 
+/// Stops every build before the process leaves.
+///
+/// Without this, shutting VMLord down either kills a thread in the middle of
+/// writing a VHDX -- leaving the directory it was told to remove -- or waits
+/// forever on one that was never told to stop.
+impl Drop for HcsVmRepository {
+    fn drop(&mut self) {
+        self.builds.cancel_all_and_join();
+    }
+}
+
+/// Records a diagnostic in a buffer shared with the build threads.
+///
+/// Free rather than a method because a build thread has the buffer and not the
+/// repository: the repository is not `Send`, and does not need to be.
+fn push_shared_diagnostic(
+    diagnostics: &Mutex<Vec<Diagnostic>>,
+    level: DiagnosticLevel,
+    message: String,
+) {
+    diagnostics
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(Diagnostic { level, message });
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -685,6 +769,48 @@ mod tests {
                 ))
             }),
         )
+    }
+
+    fn create_request(name: &str) -> vmlord_core::VmCreateRequest {
+        vmlord_core::VmCreateRequest {
+            name: name.into(),
+            source: vmlord_core::VmSource::LocalMedia {
+                path: "C:\\images\\ubuntu.iso".into(),
+            },
+            ram_mb: 2048,
+            disk_gb: 20,
+            cpu_cores: 2,
+            gpu_mode: GpuMode::None,
+            network_mode: NetworkMode::None,
+        }
+    }
+
+    /// A build in flight is not in the metadata store yet, so without this the
+    /// duplicate-name check would let a second creation through and the two
+    /// would fight over one directory.
+    #[test]
+    fn a_name_being_built_counts_as_taken() {
+        let repository = repository();
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held = std::sync::Arc::clone(&release);
+        repository
+            .builds
+            .start(create_request("dev"), move |_| {
+                while !held.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::yield_now();
+                }
+            })
+            .expect("the build should start");
+
+        let error = repository
+            .builds
+            .refuse_if_building("dev")
+            .expect_err("a VM that is still being created cannot be started or deleted");
+        assert!(error.to_string().contains("still being created"));
+        assert!(repository.builds.contains("dev"));
+
+        release.store(true, std::sync::atomic::Ordering::Relaxed);
+        repository.builds.cancel_all_and_join();
     }
 
     fn update_request() -> VmUpdateRequest {
