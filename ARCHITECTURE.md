@@ -1110,12 +1110,20 @@ the list on screen and not about the request; the repository checks it again
 against the metadata store, where it is authoritative.
 
 Three fields are filled from the host: locale, keyboard layout and timezone.
-`GuestDefaults` carries them from the composition root through
-`WorkspaceApp::with_guest_defaults`, and its `Default` is the fallback --
-`en_US.UTF-8`, `us`, `Etc/UTC` -- so a VM is created in a state that works even
-when the host's settings have no counterpart in the guest. #60 replaces what
-VMLord passes in with the values mapped from Windows; nothing else moves when
-it does.
+`platform::host_guest_defaults` reads them once at startup --
+`GetUserDefaultLocaleName`, `GetKeyboardLayoutNameW` and
+`GetDynamicTimeZoneInformation` -- and maps each into what the guest names the
+same thing: a POSIX locale, an XKB layout, an IANA zone. The timezone is mapped
+by the CLDR table in `windows-timezones` from `TimeZoneKeyName`, the invariant
+registry key, rather than from the localized `StandardName` -- which on a
+Russian Windows reads «Русское стандартное время» and appears in no table. The
+keyboard has no such crate anywhere, so it has a table of its own: the frequent
+KLIDs, then the layout without its variant, then the language alone, then `us`.
+`GuestDefaults` carries the three from the composition root through
+`WorkspaceApp::with_guest_defaults`, and its `Default` -- `en_US.UTF-8`, `us`,
+`Etc/UTC` -- is what each field falls back to on its own, so a host whose
+keyboard is unrecognised still hands the guest its own timezone, and a VM is
+created in a state that works rather than not created at all.
 
 Leaving the password empty is a choice rather than a missing value: the guest
 gets no password at all, cloud-init turns password authentication off, and the

@@ -13,6 +13,11 @@
 //! layout is not a reason to refuse to create a VM.
 
 use vmlord_core::GuestDefaults;
+use windows::Win32::{
+    Globalization::GetUserDefaultLocaleName,
+    System::Time::{DYNAMIC_TIME_ZONE_INFORMATION, GetDynamicTimeZoneInformation},
+    UI::Input::KeyboardAndMouse::GetKeyboardLayoutNameW,
+};
 use windows_timezones::WindowsTimezone;
 
 /// The IANA name of the Windows time-zone key `windows_id`.
@@ -207,6 +212,73 @@ fn xkb_layout(klid: &str) -> String {
             DEFAULT_LAYOUT.to_owned()
         }
     }
+}
+
+/// What a new VM starts out with on this host.
+///
+/// Read once, at startup: these settings change rarely, and every one of the
+/// three fields stays editable in the create form regardless.
+#[must_use]
+pub fn host_guest_defaults() -> GuestDefaults {
+    guest_defaults(
+        host_locale().as_deref(),
+        host_klid().as_deref(),
+        host_time_zone_key().as_deref(),
+    )
+}
+
+/// The BCP-47 tag of the user's locale, `ru-RU`.
+fn host_locale() -> Option<String> {
+    // `LOCALE_NAME_MAX_LENGTH`, which the buffer is documented to need.
+    let mut buffer = [0u16; 85];
+    let written = unsafe { GetUserDefaultLocaleName(&mut buffer) };
+    if written <= 0 {
+        log::warn!("the host locale could not be read");
+        return None;
+    }
+    let tag = terminated(&buffer);
+    log::debug!("the host locale is {tag}");
+    Some(tag)
+}
+
+/// The Windows keyboard identifier of the calling thread's layout, `00000419`.
+///
+/// The calling thread is the composition root before it has a window, where
+/// the layout is the user's default input profile.
+fn host_klid() -> Option<String> {
+    let mut buffer = [0u16; 9];
+    if let Err(error) = unsafe { GetKeyboardLayoutNameW(&mut buffer) } {
+        log::warn!("the host keyboard layout could not be read: {error}");
+        return None;
+    }
+    let klid = terminated(&buffer);
+    log::debug!("the host keyboard identifier is {klid}");
+    Some(klid)
+}
+
+/// The invariant registry key of the host's time zone, `Russian Standard Time`.
+fn host_time_zone_key() -> Option<String> {
+    // `TIME_ZONE_ID_INVALID`, the one return value that means nothing was
+    // written; the other three each describe a zone that was.
+    const TIME_ZONE_ID_INVALID: u32 = 0xffff_ffff;
+
+    let mut information = DYNAMIC_TIME_ZONE_INFORMATION::default();
+    if unsafe { GetDynamicTimeZoneInformation(&mut information) } == TIME_ZONE_ID_INVALID {
+        log::warn!("the host time zone could not be read");
+        return None;
+    }
+    let key = terminated(&information.TimeZoneKeyName);
+    log::debug!("the host time zone key is {key}");
+    Some(key)
+}
+
+/// The string in a fixed-size UTF-16 buffer, up to its first NUL.
+fn terminated(buffer: &[u16]) -> String {
+    let length = buffer
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..length])
 }
 
 /// Turns what the host said into what the create form starts out with.

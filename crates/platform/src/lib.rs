@@ -48,6 +48,7 @@ pub use hcn_endpoint::{EndpointAddress, HcnEndpoint};
 pub use hcs::{
     HcsClient, HcsOperation, HcsStartFailure, HcsSystem, HcsSystemState, HcsSystemSummary,
 };
+pub use host_guest_defaults::host_guest_defaults;
 pub use import::{ImportSummary, import_image};
 pub use metadata::{MetadataStore, VmComputeSystemMapping};
 pub use password_hash::hash_password;

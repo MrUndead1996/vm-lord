@@ -35,6 +35,7 @@ fn main() {
         }
     };
     let mut application = vmlord_app::WorkspaceApp::new(repository)
+        .with_guest_defaults(vmlord_platform::host_guest_defaults())
         .with_image_picker(Box::new(vmlord_legacy_backend::WindowsImagePicker::new()))
         .with_settings_path_picker(Box::new(
             vmlord_legacy_backend::WindowsSettingsPathPicker::new(),
