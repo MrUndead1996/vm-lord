@@ -482,6 +482,19 @@ therefore re-creates the compute system from that stored configuration whenever
 HCS no longer knows it, under the same id, before starting it. Without that
 step a stop would silently become a delete.
 
+A system HCS *does* know is rebuilt too, but only when it is in `Created`. That
+is the state a creation leaves behind, and the document creation used carries no
+`NetworkAdapters` section: the endpoint does not exist yet, because one is made
+on the first start so that a VM nobody ever starts takes no address. The start
+creates the endpoint and writes the adapter into `config.json` -- and until
+`plan_for_existing` was added, the freshly created system was then started
+exactly as it stood, so the guest came up with no network card while HNS held an
+endpoint with an address and nothing attached to it. Only the first start after
+a creation was ever affected: every later one finds no system at all, because
+HCS destroys one as it stops, and takes the re-creation path already. A system
+in `Created` has executed nothing, so rebuilding it destroys no state; every
+other state has a guest behind it and is started as it stands.
+
 `platform::HcsVmRepository` is the `VmRepository` the composition root wires in
 by default. It owns the process-wide `HcsClient`, the `MetadataStore` under the
 configured VM storage directory, and the `VmConnections` registry, and maps each

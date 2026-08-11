@@ -15,7 +15,7 @@ use crate::{
     dhcp::{self, DhcpRegistrar},
     hcn::HcnNetwork,
     hcn_endpoint::{EndpointAddress, HcnEndpoint},
-    hcs::{HCS_ACCESS_ALL, HcsStartFailure},
+    hcs::{HCS_ACCESS_ALL, HcsStartFailure, HcsSystemState},
     hcs_config, layout,
     metadata::{MetadataStore, VmComputeSystemMapping},
 };
@@ -509,20 +509,92 @@ fn start_hcs_system(id: &str, configuration: &str) -> Result<(), HcsStartFailure
     // The system handle must outlive the start operation it issued.
     let existing =
         HcsSystem::open_if_present(id, HCS_ACCESS_ALL).map_err(HcsStartFailure::Failed)?;
-    let system = match existing {
-        Some(system) => system,
+    let reusable = match existing {
+        Some(system) => {
+            let state = reported_state(id).map_err(HcsStartFailure::Failed)?;
+            match plan_for_existing(&state) {
+                ExistingSystemPlan::StartAsIs => Some(system),
+                ExistingSystemPlan::Rebuild => {
+                    log::info!(
+                        "compute system \"{id}\" has never run, so it is rebuilt from the \
+                         configuration this start prepared -- the one that carries the VM's \
+                         network adapter"
+                    );
+                    // Before the teardown: HCS refuses to destroy a system this
+                    // process still holds open.
+                    drop(system);
+                    if let Err(error) = cleanup::teardown_compute_system(id) {
+                        log::error!("the compute system \"{id}\" could not be rebuilt: {error}");
+                        return Err(HcsStartFailure::Failed(error));
+                    }
+                    None
+                }
+            }
+        }
         None => {
             log::info!(
                 "HCS no longer knows compute system \"{id}\"; \
                  re-creating it from the stored configuration before starting it"
             );
-            HcsClient::new()
-                .create_system_and_wait(id, configuration, CREATE_TIMEOUT)
-                .map_err(|failure| tear_down_after_a_failed_creation(id, failure))?
+            None
         }
     };
 
+    let system = match reusable {
+        Some(system) => system,
+        None => HcsClient::new()
+            .create_system_and_wait(id, configuration, CREATE_TIMEOUT)
+            .map_err(|failure| tear_down_after_a_failed_creation(id, failure))?,
+    };
+
     system.start_and_wait(START_TIMEOUT)
+}
+
+/// What a start does with a compute system HCS already knows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExistingSystemPlan {
+    /// Start it as it stands.
+    StartAsIs,
+    /// Destroy it and create it again from the configuration this start
+    /// prepared.
+    Rebuild,
+}
+
+/// Decides what to do with a compute system that already exists.
+///
+/// Creation makes the compute system before the VM has an endpoint -- one is
+/// created on the first start, so that a VM nobody ever starts takes no address
+/// -- so the document creation used carries no `NetworkAdapters` section. The
+/// start is what creates the endpoint and writes the adapter in, and until this
+/// existed the freshly created system was simply started as it stood: the guest
+/// came up with no network card, while HNS held an endpoint with an address and
+/// nothing attached to it. Every later start already rebuilt the system, because
+/// HCS destroys one as it stops, so only the first start after a creation was
+/// ever wrong.
+///
+/// A system in `Created` has executed nothing, so rebuilding it destroys no
+/// state. Every other state has a guest behind it and is started as it stands.
+fn plan_for_existing(state: &HcsSystemState) -> ExistingSystemPlan {
+    match state {
+        HcsSystemState::Created => ExistingSystemPlan::Rebuild,
+        _ => ExistingSystemPlan::StartAsIs,
+    }
+}
+
+/// The state HCS reports for compute system `id`.
+///
+/// Read from the enumeration rather than from the system's own properties: a
+/// system that has been created and never started refuses a property query
+/// outright, and that is exactly the state this has to recognise. A system the
+/// enumeration does not mention is treated as `Created` for the same reason
+/// [`HcsSystemState::from_enumeration`] does -- it has certainly never run.
+fn reported_state(id: &str) -> Result<HcsSystemState, RepositoryError> {
+    let systems = HcsClient::new().enumerate_systems()?;
+    let reported = systems
+        .into_iter()
+        .find(|system| system.id == id)
+        .and_then(|system| system.state);
+    Ok(HcsSystemState::from_enumeration(reported))
 }
 
 /// Removes a compute system HCS may have created before the creation failed.
@@ -556,13 +628,50 @@ mod tests {
     use uuid::Uuid;
     use vmlord_core::{NetworkMode, RepositoryError};
 
-    use super::{EndpointPolicy, VmNetworkAdapter, VmStartPipeline, attachment_paths};
+    use super::{
+        EndpointPolicy, ExistingSystemPlan, HcsSystemState, VmNetworkAdapter, VmStartPipeline,
+        attachment_paths, plan_for_existing,
+    };
     use crate::{
         Com1Launcher,
         hcn_endpoint::EndpointAddress,
         hcs::HcsStartFailure,
         metadata::{MetadataStore, VmComputeSystemMapping},
     };
+
+    #[test]
+    fn a_system_that_has_never_run_is_rebuilt_from_the_configuration_the_start_prepared() {
+        // The compute system creation makes carries no network adapter: the
+        // endpoint does not exist yet, and the start is what creates it and
+        // writes it into the configuration. Starting the system as created
+        // therefore boots a guest with no network card at all, while the
+        // endpoint sits in HNS with an address nothing is attached to. A
+        // system in `Created` has executed nothing, so rebuilding it costs
+        // nothing and makes the start run the configuration it just prepared.
+        assert_eq!(
+            plan_for_existing(&HcsSystemState::Created),
+            ExistingSystemPlan::Rebuild
+        );
+    }
+
+    #[test]
+    fn a_system_that_has_already_run_is_started_as_it_stands() {
+        // Anything but `Created` has state a rebuild would destroy, and HCS
+        // destroys a compute system as it stops -- so a VM being started after
+        // a stop is not found at all and takes the re-creation path anyway.
+        for state in [
+            HcsSystemState::Running,
+            HcsSystemState::Paused,
+            HcsSystemState::Stopped,
+            HcsSystemState::Other("Zombie".to_owned()),
+        ] {
+            assert_eq!(
+                plan_for_existing(&state),
+                ExistingSystemPlan::StartAsIs,
+                "{state:?}"
+            );
+        }
+    }
 
     #[test]
     fn the_pipelines_a_build_thread_needs_can_be_moved_to_it() {
