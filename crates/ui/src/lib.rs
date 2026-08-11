@@ -1,19 +1,46 @@
 //! Desktop shell for the first VMLord milestone.
 
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use eframe::egui;
 use vmlord_app::{BackendStatus, VmAction, WorkspaceApp};
 use vmlord_core::{
-    AgentStatus, AppSettings, BuildStep, DiagnosticLevel, GpuMode, Language, LogLevel, NetworkMode,
-    VmCreateRequest, VmDeleteRequest, VmSource, VmState, VmSummary, VmUpdateRequest,
+    AgentStatus, AppSettings, BuildProgress, BuildStep, CloudImage, DiagnosticLevel, DownloadPhase,
+    GpuMode, GuestDefaults, Language, LogLevel, NetworkMode, Password, Provisioning, SshAccess,
+    VmCreateRequest, VmDeleteRequest, VmSource, VmState, VmSummary, VmUpdateRequest, ubuntu,
 };
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 const VM_TABLE_COLUMN_COUNT: f32 = 9.0;
+
+/// The releases the create form offers, newest first.
+///
+/// LTS only, which is the epic's boundary: an interim release is supported for
+/// nine months, and a workspace outliving its own security updates is not what
+/// a default should build. The list is written out rather than fetched --
+/// Canonical publishes no machine-readable index of current releases -- and it
+/// moves to the distribution profile when profiles come from JSON (#67).
+///
+/// All three are current: 26.04 is the newest LTS and the one a new VM gets by
+/// default, 24.04 and 22.04 are still under standard support. Each was checked
+/// against the file name the profile builds -- the server answers
+/// `/releases/26.04/` with a redirect to its codename, and
+/// `ubuntu-26.04-server-cloudimg-amd64.img` is listed in the `SHA256SUMS`
+/// behind it, which is what the release resolver reads.
+const UBUNTU_RELEASES: [&str; 3] = ["26.04", "24.04", "22.04"];
+
+const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
+
+/// The height a text field in a form claims.
+///
+/// Stated rather than left at zero: a widget added with no height of its own
+/// makes its grid row shorter than what is drawn in it, and the row below then
+/// starts inside it -- which is what made the combo box under "VM Name" and the
+/// password field under "User name" overlap the fields above them.
+const FIELD_HEIGHT: f32 = 24.0;
 
 pub fn run(application: WorkspaceApp) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -47,12 +74,41 @@ struct VmlordUi {
     settings_form: Option<SettingsForm>,
 }
 
-/// The form a local installation medium needs. A medium means the system is
-/// installed by hand, so there is no user, password or SSH choice to make here;
-/// those widgets return with the cloud-image form in #65.
+/// Where the new VM's system comes from, as the dialog's two radio buttons.
+///
+/// A copy of `VmSource`'s shape without its payload: a half-filled form is not
+/// a source yet -- the fields for the other mode are still there, waiting for
+/// the user to change their mind back -- and `VmSource` is built from it only
+/// when the request is submitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceKind {
+    CloudImage,
+    LocalMedia,
+}
+
+/// Everything both kinds of source need, plus the provisioning only a cloud
+/// image can carry.
+///
+/// The provisioning fields survive a switch to installation media rather than
+/// being cleared: switching back is one click, and a form that forgets a typed
+/// password because a radio button was pressed is the more annoying of the two
+/// behaviours. What is not submitted is decided by `create_vm_request`, which
+/// reads only the fields the chosen source has.
 struct CreateVmForm {
     name: String,
+    source_kind: SourceKind,
+    /// Installation media: the path to the ISO the guest is installed from.
     image_path: String,
+    /// Cloud image: the release, from [`UBUNTU_RELEASES`].
+    release: String,
+    username: String,
+    /// Empty means no password at all: the guest is reachable by key only.
+    password: String,
+    ssh_enabled: bool,
+    deploy_key: bool,
+    locale: String,
+    keyboard: String,
+    timezone: String,
     disk_gb: u32,
     ram_mb: u32,
     cpu_cores: u32,
@@ -145,11 +201,23 @@ impl DeleteVmForm {
     }
 }
 
-impl Default for CreateVmForm {
-    fn default() -> Self {
+impl CreateVmForm {
+    /// A form filled with what VMLord would do if nobody changed anything:
+    /// the newest supported release, the distribution's own account name, and
+    /// the host's locale, keyboard layout and timezone.
+    fn new(guest_defaults: &GuestDefaults) -> Self {
         Self {
             name: "ubuntu".into(),
+            source_kind: SourceKind::CloudImage,
             image_path: String::new(),
+            release: UBUNTU_RELEASES[0].into(),
+            username: ubuntu().default_user,
+            password: String::new(),
+            ssh_enabled: true,
+            deploy_key: true,
+            locale: guest_defaults.locale.clone(),
+            keyboard: guest_defaults.keyboard.clone(),
+            timezone: guest_defaults.timezone.clone(),
             disk_gb: 64,
             ram_mb: 4096,
             cpu_cores: 4,
@@ -262,7 +330,8 @@ impl eframe::App for VmlordUi {
         if let Some(action) = action.inner {
             match action {
                 VmAction::Create => {
-                    self.create_vm_form = Some(CreateVmForm::default());
+                    self.create_vm_form =
+                        Some(CreateVmForm::new(self.application.guest_defaults()));
                     self.edit_vm_form = None;
                 }
                 VmAction::Edit => {
@@ -276,6 +345,7 @@ impl eframe::App for VmlordUi {
                 VmAction::Start
                 | VmAction::Stop
                 | VmAction::ForceStop
+                | VmAction::CancelCreate
                 | VmAction::Connect
                 | VmAction::Ssh => {
                     if let Some(name) = self.selected_vm_name.clone() {
@@ -283,6 +353,7 @@ impl eframe::App for VmlordUi {
                             VmAction::Start => self.application.start_vm(&name),
                             VmAction::Stop => self.application.stop_vm(&name),
                             VmAction::ForceStop => self.application.force_stop_vm(&name),
+                            VmAction::CancelCreate => self.application.cancel_create(&name),
                             VmAction::Connect => self.application.connect_display(&name),
                             VmAction::Ssh => self.application.open_ssh(&name),
                             _ => unreachable!("only supported VM actions reach this branch"),
@@ -303,10 +374,20 @@ impl eframe::App for VmlordUi {
             context.request_repaint();
         }
 
-        let create_dialog_action = self
+        // Asked before the form is borrowed for drawing, and asked of the
+        // backend: where a VM's key pair goes is the platform layer's to know.
+        let ssh_key_path = self
             .create_vm_form
-            .as_mut()
-            .and_then(|form| render_create_vm_dialog(context, form, self.application.vms()));
+            .as_ref()
+            .and_then(|form| self.application.ssh_key_path(form.name.trim()));
+        let create_dialog_action = self.create_vm_form.as_mut().and_then(|form| {
+            render_create_vm_dialog(
+                context,
+                form,
+                self.application.vms(),
+                ssh_key_path.as_deref(),
+            )
+        });
         match create_dialog_action {
             Some(CreateVmDialogAction::BrowseImage) => match self.application.pick_iso_image() {
                 Ok(Some(path)) => {
@@ -438,6 +519,7 @@ fn render_create_vm_dialog(
     context: &egui::Context,
     form: &mut CreateVmForm,
     existing_vms: &[VmSummary],
+    ssh_key_path: Option<&Path>,
 ) -> Option<CreateVmDialogAction> {
     let mut open = true;
     let mut action = None;
@@ -447,70 +529,163 @@ fn render_create_vm_dialog(
         .default_width(620.0)
         .open(&mut open)
         .show(context, |ui| {
-            ui.label("Create a persistent Linux workspace from an ISO image.");
-            ui.add_space(4.0);
-            egui::Grid::new("create-vm-form")
-                .num_columns(2)
-                .spacing([12.0, 8.0])
+            // The form is taller than the main window when a cloud image is
+            // chosen, and a dialog whose Create button is off-screen cannot be
+            // submitted: the fields scroll, the buttons below do not.
+            egui::ScrollArea::vertical()
+                .max_height(420.0)
                 .show(ui, |ui| {
-                    ui.label("VM Name");
-                    ui.add_sized([260.0, 0.0], egui::TextEdit::singleline(&mut form.name));
-                    ui.end_row();
+                    ui.label("Create a persistent Linux workspace.");
+                    ui.add_space(8.0);
 
-                    ui.label("OS Image");
                     ui.horizontal(|ui| {
-                        ui.add_sized(
-                            [300.0, 0.0],
-                            egui::TextEdit::singleline(&mut form.image_path)
-                                .hint_text("Path to ISO or VHDX..."),
+                        ui.strong("System");
+                        ui.radio_value(
+                            &mut form.source_kind,
+                            SourceKind::CloudImage,
+                            "Cloud image (ready to use)",
                         );
-                        if ui.button("Browse...").clicked() {
-                            action = Some(CreateVmDialogAction::BrowseImage);
-                        }
+                        ui.radio_value(
+                            &mut form.source_kind,
+                            SourceKind::LocalMedia,
+                            "Own ISO (installed by hand)",
+                        );
                     });
-                    ui.end_row();
+                    match form.source_kind {
+                        SourceKind::CloudImage => ui.small(
+                            "The image is downloaded once and configured on the first boot: \
+                             the user below, their login and the guest settings.",
+                        ),
+                        SourceKind::LocalMedia => ui.small(
+                            "The installer runs in the VM and asks for the user, the password \
+                             and the guest settings itself, so VMLord configures none of them.",
+                        ),
+                    };
 
-                    ui.label("HDD Size");
-                    ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut form.disk_gb).range(1..=16_384));
-                        ui.label("GiB");
-                    });
-                    ui.end_row();
+                    ui.add_space(8.0);
+                    egui::Grid::new("create-vm-form")
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label("VM Name");
+                            ui.add_sized(
+                                [260.0, FIELD_HEIGHT],
+                                egui::TextEdit::singleline(&mut form.name),
+                            );
+                            ui.end_row();
 
-                    ui.label("RAM Size");
-                    ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut form.ram_mb).range(512..=1_048_576));
-                        ui.label("MiB");
-                    });
-                    ui.end_row();
+                            match form.source_kind {
+                                SourceKind::CloudImage => {
+                                    ui.label("Distribution");
+                                    // One entry until distribution profiles are read
+                                    // from a file (#67); the guest's account name and
+                                    // its admin group come from the same profile.
+                                    egui::ComboBox::from_id_salt("create-vm-distribution")
+                                        .selected_text(ubuntu().name)
+                                        .show_ui(ui, |ui| {
+                                            ui.label(ubuntu().name);
+                                        });
+                                    ui.end_row();
 
-                    ui.label("CPU Cores");
-                    ui.add(egui::DragValue::new(&mut form.cpu_cores).range(1..=256));
-                    ui.end_row();
+                                    ui.label("Release");
+                                    egui::ComboBox::from_id_salt("create-vm-release")
+                                        .selected_text(release_label(&form.release))
+                                        .show_ui(ui, |ui| {
+                                            for release in UBUNTU_RELEASES {
+                                                ui.selectable_value(
+                                                    &mut form.release,
+                                                    release.to_owned(),
+                                                    release_label(release),
+                                                );
+                                            }
+                                        });
+                                    ui.end_row();
+                                }
+                                SourceKind::LocalMedia => {
+                                    ui.label("OS Image");
+                                    ui.horizontal(|ui| {
+                                        ui.add_sized(
+                                            [300.0, FIELD_HEIGHT],
+                                            egui::TextEdit::singleline(&mut form.image_path)
+                                                .hint_text("Path to ISO or VHDX..."),
+                                        );
+                                        if ui.button("Browse...").clicked() {
+                                            action = Some(CreateVmDialogAction::BrowseImage);
+                                        }
+                                    });
+                                    ui.end_row();
+                                }
+                            }
 
-                    ui.label("GPU");
-                    egui::ComboBox::from_id_salt("create-vm-gpu")
-                        .selected_text(gpu_mode_label(form.gpu_mode))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut form.gpu_mode, GpuMode::Default, "Default");
-                            ui.selectable_value(&mut form.gpu_mode, GpuMode::TryAll, "Try all");
-                            ui.selectable_value(&mut form.gpu_mode, GpuMode::None, "None");
+                            ui.label("HDD Size");
+                            ui.horizontal(|ui| {
+                                ui.add(egui::DragValue::new(&mut form.disk_gb).range(1..=16_384));
+                                ui.label("GiB");
+                            });
+                            ui.end_row();
+
+                            ui.label("RAM Size");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::DragValue::new(&mut form.ram_mb).range(512..=1_048_576),
+                                );
+                                ui.label("MiB");
+                            });
+                            ui.end_row();
+
+                            ui.label("CPU Cores");
+                            ui.add(egui::DragValue::new(&mut form.cpu_cores).range(1..=256));
+                            ui.end_row();
+
+                            ui.label("GPU");
+                            egui::ComboBox::from_id_salt("create-vm-gpu")
+                                .selected_text(gpu_mode_label(form.gpu_mode))
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut form.gpu_mode,
+                                        GpuMode::Default,
+                                        "Default",
+                                    );
+                                    ui.selectable_value(
+                                        &mut form.gpu_mode,
+                                        GpuMode::TryAll,
+                                        "Try all",
+                                    );
+                                    ui.selectable_value(&mut form.gpu_mode, GpuMode::None, "None");
+                                });
+                            ui.end_row();
+
+                            ui.label("Network");
+                            egui::ComboBox::from_id_salt("create-vm-network")
+                                .selected_text(network_mode_label(form.network_mode))
+                                .show_ui(ui, |ui| {
+                                    ui.selectable_value(
+                                        &mut form.network_mode,
+                                        NetworkMode::Nat,
+                                        "NAT",
+                                    );
+                                    ui.selectable_value(
+                                        &mut form.network_mode,
+                                        NetworkMode::None,
+                                        "None",
+                                    );
+                                });
+                            ui.end_row();
                         });
-                    ui.end_row();
 
-                    ui.label("Network");
-                    egui::ComboBox::from_id_salt("create-vm-network")
-                        .selected_text(network_mode_label(form.network_mode))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut form.network_mode, NetworkMode::Nat, "NAT");
-                            ui.selectable_value(&mut form.network_mode, NetworkMode::None, "None");
-                        });
-                    ui.end_row();
+                    if form.source_kind == SourceKind::CloudImage {
+                        ui.add_space(10.0);
+                        ui.separator();
+                        ui.strong("Guest");
+                        ui.add_space(4.0);
+                        render_provisioning_fields(ui, form, ssh_key_path);
+                    }
+
+                    if let Some(error) = &form.error {
+                        ui.add_space(4.0);
+                        ui.colored_label(egui::Color32::LIGHT_RED, error);
+                    }
                 });
-
-            if let Some(error) = &form.error {
-                ui.colored_label(egui::Color32::LIGHT_RED, error);
-            }
 
             ui.separator();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -534,6 +709,87 @@ fn render_create_vm_dialog(
         action = Some(CreateVmDialogAction::Cancel);
     }
     action
+}
+
+/// The fields only a cloud image can carry: who the guest's user is, how they
+/// log in, and the three settings cloud-init applies on the first boot.
+fn render_provisioning_fields(
+    ui: &mut egui::Ui,
+    form: &mut CreateVmForm,
+    ssh_key_path: Option<&Path>,
+) {
+    egui::Grid::new("create-vm-provisioning")
+        .num_columns(2)
+        .spacing([12.0, 8.0])
+        .show(ui, |ui| {
+            ui.label("User name");
+            ui.add_sized(
+                [260.0, FIELD_HEIGHT],
+                egui::TextEdit::singleline(&mut form.username),
+            );
+            ui.end_row();
+
+            ui.label("Password");
+            ui.vertical(|ui| {
+                ui.add_sized(
+                    [260.0, FIELD_HEIGHT],
+                    egui::TextEdit::singleline(&mut form.password)
+                        .password(true)
+                        .hint_text("Optional"),
+                );
+                if form.password.is_empty() {
+                    ui.small(
+                        "No password: the guest is reachable by SSH key only, \
+                         and password logins are turned off.",
+                    );
+                }
+            });
+            ui.end_row();
+
+            ui.label("SSH");
+            ui.vertical(|ui| {
+                ui.checkbox(&mut form.ssh_enabled, "Run an SSH server in the guest");
+                ui.add_enabled_ui(form.ssh_enabled, |ui| {
+                    ui.checkbox(
+                        &mut form.deploy_key,
+                        "Generate a key pair for this VM and install the public half",
+                    );
+                });
+                if form.ssh_enabled && form.deploy_key {
+                    match ssh_key_path {
+                        Some(path) => {
+                            ui.small(format!("Private key: {}", path.display()));
+                        }
+                        None => {
+                            ui.small("The private key is stored in the VM's own folder.");
+                        }
+                    }
+                }
+            });
+            ui.end_row();
+
+            ui.label("Locale");
+            ui.add_sized(
+                [260.0, FIELD_HEIGHT],
+                egui::TextEdit::singleline(&mut form.locale),
+            );
+            ui.end_row();
+
+            ui.label("Keyboard layout");
+            ui.add_sized(
+                [260.0, FIELD_HEIGHT],
+                egui::TextEdit::singleline(&mut form.keyboard),
+            );
+            ui.end_row();
+
+            ui.label("Timezone");
+            ui.add_sized(
+                [260.0, FIELD_HEIGHT],
+                egui::TextEdit::singleline(&mut form.timezone),
+            );
+            ui.end_row();
+        });
+    ui.small("The three settings above are filled in from this computer and applied to the guest.");
 }
 
 fn render_settings_dialog(
@@ -777,47 +1033,72 @@ fn render_delete_vm_dialog(
     action
 }
 
+/// Turns the form into the request, and reports why it is not one yet.
+///
+/// The rules themselves are not here: `VmCreateRequest::validate` owns them --
+/// the VM name, the user name, the password, the guest settings -- and this
+/// function's own check is the one the domain cannot make, because it is about
+/// the list on screen rather than about the request.
 fn create_vm_request(
     form: &CreateVmForm,
     existing_vms: &[VmSummary],
 ) -> Result<VmCreateRequest, String> {
     let name = form.name.trim();
-    if name.is_empty() {
-        return Err("VM name is required.".into());
-    }
-    if name.len() > 63
-        || name.starts_with('-')
-        || name.ends_with('-')
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-    {
-        return Err("Use a lowercase Linux hostname of up to 63 characters.".into());
-    }
     if existing_vms
         .iter()
         .any(|vm| vm.name.eq_ignore_ascii_case(name))
     {
         return Err("A VM with this name already exists.".into());
     }
-    if form.image_path.trim().is_empty() {
-        return Err("A Linux ISO path is required.".into());
-    }
-    if form.disk_gb == 0 || form.ram_mb == 0 || form.cpu_cores == 0 {
-        return Err("Disk, RAM, and CPU values must be greater than zero.".into());
-    }
 
-    Ok(VmCreateRequest {
+    let request = VmCreateRequest {
         name: name.into(),
-        source: VmSource::LocalMedia {
-            path: form.image_path.trim().into(),
-        },
+        source: create_vm_source(form),
         ram_mb: form.ram_mb,
         disk_gb: form.disk_gb,
         cpu_cores: form.cpu_cores,
         gpu_mode: form.gpu_mode,
         network_mode: form.network_mode,
-    })
+    };
+    request.validate().map_err(|error| error.to_string())?;
+    Ok(request)
+}
+
+/// Reads the fields the chosen source has, and only those.
+fn create_vm_source(form: &CreateVmForm) -> VmSource {
+    match form.source_kind {
+        SourceKind::LocalMedia => VmSource::LocalMedia {
+            path: form.image_path.trim().into(),
+        },
+        SourceKind::CloudImage => VmSource::CloudImage {
+            image: CloudImage {
+                profile: ubuntu(),
+                release: form.release.clone(),
+            },
+            provisioning: Provisioning {
+                username: form.username.trim().into(),
+                // Not trimmed, and empty rather than blank-checked: a space is
+                // a character of a password, and "no password" is the field
+                // being left alone.
+                password: (!form.password.is_empty()).then(|| Password::new(form.password.clone())),
+                ssh: if form.ssh_enabled {
+                    SshAccess::Enabled {
+                        deploy_key: form.deploy_key,
+                    }
+                } else {
+                    SshAccess::Disabled
+                },
+                locale: form.locale.trim().into(),
+                keyboard: form.keyboard.trim().into(),
+                timezone: form.timezone.trim().into(),
+            },
+        },
+    }
+}
+
+/// Names a release the way the distribution does.
+fn release_label(release: &str) -> String {
+    format!("{} {release} LTS", ubuntu().name)
 }
 
 fn edit_vm_request(form: &EditVmForm) -> Result<VmUpdateRequest, String> {
@@ -962,7 +1243,7 @@ fn render_vm_list(ui: &mut egui::Ui, vms: &[VmSummary], selected_vm_name: &mut O
                     *selected_vm_name = Some(vm.name.clone());
                 }
                 ui.label(&vm.os_type);
-                ui.label(vm_state(vm.state));
+                ui.label(vm_state_label(vm.state));
                 render_agent_status(ui, agent_status(vm.state));
                 ui.label(format!("{} cores", vm.cpu_cores));
                 ui.label(format!("{} MiB", vm.ram_mb));
@@ -1026,6 +1307,18 @@ fn render_selected_vm(
             action = Some(clicked_action);
         }
         ui.separator();
+        // The only thing that can be done to a VM while it is being built, and
+        // the only time it can be done: the build rolls itself back and the
+        // row disappears on its own.
+        if let Some(clicked_action) = render_action_group(
+            ui,
+            &[(VmAction::CancelCreate, "Cancel creation")],
+            is_building,
+            Some("Available only while the VM is being created"),
+        ) {
+            action = Some(clicked_action);
+        }
+        ui.separator();
         // Editing a running VM is allowed; the change reaches it on its next
         // start. Deleting one is not.
         if let Some(clicked_action) = render_action_group(
@@ -1059,6 +1352,9 @@ fn render_selected_vm(
             );
             detail_row(ui, "Operating system", vm.os_type.clone());
             detail_row(ui, "Status", vm_state(vm.state).into());
+            if let VmState::Building { progress } = vm.state {
+                render_build_progress(ui, progress);
+            }
             detail_row(
                 ui,
                 "Agent status",
@@ -1190,6 +1486,16 @@ fn render_action_icon(ui: &mut egui::Ui, action: VmAction, enabled: bool) -> egu
                 stroke,
             );
         }
+        VmAction::CancelCreate => {
+            painter.circle_stroke(center, 6.0, stroke);
+            painter.line_segment(
+                [
+                    egui::pos2(center.x - 4.2, center.y - 4.2),
+                    egui::pos2(center.x + 4.2, center.y + 4.2),
+                ],
+                stroke,
+            );
+        }
         VmAction::Connect => {
             let screen = egui::Rect::from_center_size(center, egui::vec2(12.0, 8.0));
             painter.rect_stroke(screen, 0.0, stroke, egui::StrokeKind::Inside);
@@ -1278,10 +1584,36 @@ fn action_color(action: VmAction) -> egui::Color32 {
         VmAction::Create | VmAction::Start => egui::Color32::from_rgb(84, 158, 230),
         VmAction::Stop => egui::Color32::from_rgb(235, 210, 64),
         VmAction::ForceStop => egui::Color32::from_rgb(225, 70, 70),
+        VmAction::CancelCreate => egui::Color32::from_rgb(235, 170, 64),
         VmAction::Connect | VmAction::Ssh => egui::Color32::from_rgb(85, 193, 233),
         VmAction::Edit => egui::Color32::from_rgb(235, 134, 58),
         VmAction::Delete => egui::Color32::LIGHT_GRAY,
     }
+}
+
+/// One row of the details grid for a VM that is still being built: a bar while
+/// the image is being fetched, and the byte counts under it.
+///
+/// The bar appears only for the download, which is the one step that publishes
+/// counts. The others draw no bar rather than an empty one, because a bar
+/// standing at zero for two minutes says the opposite of what is happening.
+fn render_build_progress(ui: &mut egui::Ui, progress: BuildProgress) {
+    let Some(detail) = build_detail(progress) else {
+        return;
+    };
+
+    ui.strong("Progress");
+    ui.vertical(|ui| {
+        if let Some(percent) = download_percentage(progress) {
+            ui.add(
+                egui::ProgressBar::new(percent as f32 / 100.0)
+                    .desired_width(260.0)
+                    .text(format!("{percent}%")),
+            );
+        }
+        ui.label(detail);
+    });
+    ui.end_row();
 }
 
 fn detail_row(ui: &mut egui::Ui, label: &str, value: String) {
@@ -1334,6 +1666,90 @@ fn agent_status_label(status: AgentStatus) -> &'static str {
     }
 }
 
+/// The status column's text: the step, and how far into it the build is when
+/// that is a number.
+///
+/// The percentage is here and not only in the details panel because the list is
+/// what a person watches while an image downloads, and selecting a row to see
+/// whether anything is happening is not watching.
+fn vm_state_label(state: VmState) -> String {
+    let label = vm_state(state);
+    match state {
+        VmState::Building { progress } => match download_percentage(progress) {
+            Some(percent) => format!("{label} {percent}%"),
+            None => label.to_owned(),
+        },
+        _ => label.to_owned(),
+    }
+}
+
+/// How far the image transfer has got, when it is a fraction of something
+/// known.
+///
+/// A server that sent no length gives no denominator, and connecting and
+/// hashing-complete are not fractions of anything -- hence `None` rather than a
+/// zero that would read as no progress.
+fn download_percentage(progress: BuildProgress) -> Option<u64> {
+    match progress.download? {
+        DownloadPhase::Downloading {
+            downloaded,
+            total: Some(total),
+        } => Some(percentage(downloaded, total)),
+        DownloadPhase::Verifying { hashed, total } => Some(percentage(hashed, total)),
+        DownloadPhase::Downloading { total: None, .. }
+        | DownloadPhase::Connecting
+        | DownloadPhase::Completed => None,
+    }
+}
+
+/// What a build is doing inside the step it reports, when there is more to say
+/// than the step's own name.
+///
+/// Only the download has anything: writing the disk, provisioning and
+/// registering publish no counts of their own, and inventing a percentage for
+/// them would be inventing a denominator. `None` therefore means the step name
+/// already says everything, not that progress was lost.
+fn build_detail(progress: BuildProgress) -> Option<String> {
+    Some(match progress.download? {
+        DownloadPhase::Connecting => "Connecting to the image server".into(),
+        DownloadPhase::Downloading {
+            downloaded,
+            total: Some(total),
+        } => format!(
+            "Downloaded {} of {} ({}%)",
+            mebibytes(downloaded),
+            mebibytes(total),
+            percentage(downloaded, total)
+        ),
+        // A server that sent no length leaves nothing to divide by; the count
+        // still shows the download is moving.
+        DownloadPhase::Downloading {
+            downloaded,
+            total: None,
+        } => format!("Downloaded {}", mebibytes(downloaded)),
+        DownloadPhase::Verifying { hashed, total } => format!(
+            "Checking the image: {} of {} ({}%)",
+            mebibytes(hashed),
+            mebibytes(total),
+            percentage(hashed, total)
+        ),
+        DownloadPhase::Completed => "Image ready".into(),
+    })
+}
+
+fn mebibytes(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / BYTES_PER_MIB)
+}
+
+/// A whole percentage, and never 100 before the last byte: a bar that reads
+/// "100%" while the work continues is the one people wait on.
+fn percentage(done: u64, total: u64) -> u64 {
+    if total == 0 {
+        return 0;
+    }
+    (done.min(total) * 100 / total).min(if done < total { 99 } else { 100 })
+}
+
 fn vm_state(state: VmState) -> &'static str {
     match state {
         VmState::Stopped => "Stopped",
@@ -1378,6 +1794,319 @@ mod tests {
             }),
             "Building: registering"
         );
+    }
+
+    fn cloud_form() -> CreateVmForm {
+        CreateVmForm::new(&GuestDefaults {
+            locale: "ru_RU.UTF-8".into(),
+            keyboard: "ru".into(),
+            timezone: "Europe/Moscow".into(),
+        })
+    }
+
+    fn provisioning_of(request: &VmCreateRequest) -> &Provisioning {
+        match &request.source {
+            VmSource::CloudImage { provisioning, .. } => provisioning,
+            VmSource::LocalMedia { .. } => panic!("expected a cloud image request"),
+        }
+    }
+
+    #[test]
+    fn a_new_form_offers_the_hosts_settings_and_the_distributions_own_account() {
+        let form = cloud_form();
+
+        assert_eq!(form.locale, "ru_RU.UTF-8");
+        assert_eq!(form.keyboard, "ru");
+        assert_eq!(form.timezone, "Europe/Moscow");
+        assert_eq!(
+            form.username,
+            ubuntu().default_user,
+            "the account a cloud image already expects is the one to offer"
+        );
+        assert_eq!(
+            form.release, "26.04",
+            "a new VM starts from the newest LTS, which is the first of the offered releases"
+        );
+        assert_eq!(form.release, UBUNTU_RELEASES[0]);
+        for release in UBUNTU_RELEASES {
+            assert!(
+                vmlord_core::ubuntu()
+                    .image_url(release)
+                    .ends_with(&format!("ubuntu-{release}-server-cloudimg-amd64.img")),
+                "the resolver has to be able to build a URL for {release}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cloud_form_becomes_a_request_carrying_what_the_guest_is_configured_with() {
+        let form = CreateVmForm {
+            name: "  dev-linux  ".into(),
+            username: " dev ".into(),
+            password: "hunter2".into(),
+            release: "22.04".into(),
+            ..cloud_form()
+        };
+
+        let request = create_vm_request(&form, &[]).unwrap();
+
+        assert_eq!(request.name, "dev-linux");
+        let VmSource::CloudImage { image, .. } = &request.source else {
+            panic!("expected a cloud image request");
+        };
+        assert_eq!(image.release, "22.04");
+        assert_eq!(image.profile, ubuntu());
+        let provisioning = provisioning_of(&request);
+        assert_eq!(provisioning.username, "dev");
+        assert_eq!(
+            provisioning.password.as_ref().map(Password::as_str),
+            Some("hunter2")
+        );
+        assert_eq!(provisioning.ssh, SshAccess::Enabled { deploy_key: true });
+        assert_eq!(provisioning.locale, "ru_RU.UTF-8");
+        assert_eq!(provisioning.keyboard, "ru");
+        assert_eq!(provisioning.timezone, "Europe/Moscow");
+    }
+
+    /// An empty password field is a choice, not a missing value: the guest gets
+    /// no password at all and cloud-init turns password logins off.
+    #[test]
+    fn an_untouched_password_field_means_a_key_only_login() {
+        let request = create_vm_request(&cloud_form(), &[]).unwrap();
+
+        assert_eq!(provisioning_of(&request).password, None);
+    }
+
+    /// A space is a character of a password, so the field is not trimmed the
+    /// way the names beside it are.
+    #[test]
+    fn a_password_keeps_the_spaces_it_was_typed_with() {
+        let form = CreateVmForm {
+            password: " two words ".into(),
+            ..cloud_form()
+        };
+
+        let request = create_vm_request(&form, &[]).unwrap();
+
+        assert_eq!(
+            provisioning_of(&request)
+                .password
+                .as_ref()
+                .map(Password::as_str),
+            Some(" two words ")
+        );
+    }
+
+    #[test]
+    fn the_two_ssh_toggles_reach_the_request() {
+        let key_less = CreateVmForm {
+            deploy_key: false,
+            ..cloud_form()
+        };
+        assert_eq!(
+            provisioning_of(&create_vm_request(&key_less, &[]).unwrap()).ssh,
+            SshAccess::Enabled { deploy_key: false }
+        );
+
+        let no_ssh = CreateVmForm {
+            ssh_enabled: false,
+            password: "hunter2".into(),
+            ..cloud_form()
+        };
+        assert_eq!(
+            provisioning_of(&create_vm_request(&no_ssh, &[]).unwrap()).ssh,
+            SshAccess::Disabled
+        );
+    }
+
+    /// The form states the rules nowhere: it hands the request to the domain
+    /// and shows what comes back, so a rule changed there changes here too.
+    #[test]
+    fn the_domains_own_words_are_what_the_form_shows() {
+        let bad_username = CreateVmForm {
+            username: "Dev Linux".into(),
+            ..cloud_form()
+        };
+        assert!(
+            create_vm_request(&bad_username, &[])
+                .unwrap_err()
+                .contains("user name")
+        );
+
+        let bad_name = CreateVmForm {
+            name: "Dev_Linux".into(),
+            ..cloud_form()
+        };
+        assert!(
+            create_vm_request(&bad_name, &[])
+                .unwrap_err()
+                .contains("VM name")
+        );
+
+        let no_way_in = CreateVmForm {
+            ssh_enabled: false,
+            password: String::new(),
+            ..cloud_form()
+        };
+        let error = create_vm_request(&no_way_in, &[]).unwrap_err();
+        assert!(
+            error.contains("password") && error.contains("SSH"),
+            "{error}"
+        );
+
+        let no_locale = CreateVmForm {
+            locale: "   ".into(),
+            ..cloud_form()
+        };
+        assert!(
+            create_vm_request(&no_locale, &[])
+                .unwrap_err()
+                .contains("locale")
+        );
+    }
+
+    /// Installation media means a person installs the system by hand, so none
+    /// of the guest fields are submitted even though the form still holds them.
+    #[test]
+    fn installation_media_submits_no_provisioning() {
+        let form = CreateVmForm {
+            source_kind: SourceKind::LocalMedia,
+            image_path: " C:\\images\\ubuntu.iso ".into(),
+            password: "hunter2".into(),
+            ..cloud_form()
+        };
+
+        let request = create_vm_request(&form, &[]).unwrap();
+
+        assert_eq!(
+            request.source,
+            VmSource::LocalMedia {
+                path: "C:\\images\\ubuntu.iso".into()
+            }
+        );
+        assert!(
+            !format!("{:?}", request.source).contains("hunter2"),
+            "a password typed before the mode was switched must not travel with the ISO"
+        );
+    }
+
+    #[test]
+    fn installation_media_still_needs_its_image() {
+        let form = CreateVmForm {
+            source_kind: SourceKind::LocalMedia,
+            ..cloud_form()
+        };
+
+        assert!(
+            create_vm_request(&form, &[])
+                .unwrap_err()
+                .contains("image path")
+        );
+    }
+
+    /// The one check the domain cannot make: it is about the list on screen,
+    /// not about the request.
+    #[test]
+    fn a_name_already_in_the_list_is_refused_before_the_backend_sees_it() {
+        let existing = [VmSummary {
+            name: "DEV".into(),
+            os_type: "Linux".into(),
+            state: VmState::Stopped,
+            ram_mb: 2048,
+            disk_gb: 20,
+            cpu_cores: 2,
+            gpu_mode: GpuMode::None,
+            network_mode: NetworkMode::Nat,
+            ip_address: None,
+            ssh_port: None,
+        }];
+        let form = CreateVmForm {
+            name: "dev".into(),
+            ..cloud_form()
+        };
+
+        assert!(
+            create_vm_request(&form, &existing)
+                .unwrap_err()
+                .contains("already exists")
+        );
+    }
+
+    #[test]
+    fn a_build_shows_its_download_and_says_nothing_when_there_is_nothing_to_say() {
+        assert_eq!(
+            build_detail(BuildProgress {
+                step: BuildStep::Downloading,
+                download: Some(DownloadPhase::Downloading {
+                    downloaded: 50 * 1024 * 1024,
+                    total: Some(200 * 1024 * 1024),
+                }),
+            }),
+            Some("Downloaded 50.0 MiB of 200.0 MiB (25%)".into())
+        );
+        assert_eq!(
+            build_detail(BuildProgress {
+                step: BuildStep::WritingDisk,
+                download: None,
+            }),
+            None,
+            "a step that publishes no counts has nothing to add to its own name"
+        );
+    }
+
+    /// The list is what a person watches while an image downloads, so the
+    /// percentage has to be there and not only behind a selected row.
+    #[test]
+    fn the_status_column_carries_the_downloads_percentage() {
+        let downloading = |download| {
+            vm_state_label(VmState::Building {
+                progress: BuildProgress {
+                    step: BuildStep::Downloading,
+                    download: Some(download),
+                },
+            })
+        };
+
+        assert_eq!(
+            downloading(DownloadPhase::Downloading {
+                downloaded: 25,
+                total: Some(100),
+            }),
+            "Building: downloading 25%"
+        );
+        assert_eq!(
+            downloading(DownloadPhase::Verifying {
+                hashed: 50,
+                total: 100,
+            }),
+            "Building: downloading 50%"
+        );
+        assert_eq!(
+            downloading(DownloadPhase::Downloading {
+                downloaded: 25,
+                total: None,
+            }),
+            "Building: downloading",
+            "a server that sent no length gives nothing to divide by"
+        );
+        assert_eq!(
+            vm_state_label(VmState::Building {
+                progress: BuildProgress {
+                    step: BuildStep::WritingDisk,
+                    download: None,
+                },
+            }),
+            "Building: writing the disk"
+        );
+        assert_eq!(vm_state_label(VmState::Stopped), "Stopped");
+    }
+
+    /// A bar that reads 100% while the work goes on is the one people wait on.
+    #[test]
+    fn a_download_reaches_a_hundred_percent_only_with_its_last_byte() {
+        assert_eq!(percentage(999_999, 1_000_000), 99);
+        assert_eq!(percentage(1_000_000, 1_000_000), 100);
+        assert_eq!(percentage(0, 0), 0, "a length of zero must not divide");
     }
 
     #[test]

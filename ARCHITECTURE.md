@@ -821,7 +821,8 @@ A VM's system comes from one of two sources, and they are different in kind:
 Provisioning lives inside the cloud variant rather than beside it, so "a local
 medium with a password" is a state that cannot be spelled rather than one that
 has to be rejected at run time. `core::provisioning` owns the types and their
-validation, including the user-name rules the UI used to hold; `core::distro`
+validation, including the user-name and VM-name rules the UI used to hold and
+the `GuestDefaults` a create form starts from; `core::distro`
 owns `DistroProfile`, the table of where a distribution publishes its images
 and what the guest inside them looks like -- including the admin group and the
 systemd units that carry its SSH daemon.
@@ -1088,6 +1089,53 @@ two VMs would be gone from a file that reported success twice.
 There is still no async runtime anywhere in VMLord, and `VmRepository` remains
 synchronous. `std::thread`, `Arc`, `Mutex` and `AtomicBool` are the whole of the
 machinery, modelled on `platform::dhcp`, the project's other background thread.
+
+### The create form and what a build looks like on screen
+
+The dialog's first control is the one that decides the shape of the rest: a
+cloud image or the user's own installation ISO. It mirrors `VmSource` without
+its payload -- `CreateVmForm` keeps the fields of both modes side by side, so
+switching to media and back does not lose a typed password, and
+`create_vm_source` reads only the fields the chosen mode has. A password typed
+before the mode was switched therefore cannot travel with an ISO, which is a
+property of the function rather than of a clearing routine.
+
+The form states no rules. `create_vm_request` builds the request and calls
+`VmCreateRequest::validate`, showing what comes back: the user-name rules, the
+password rules, the guest settings and -- since this task -- the VM name, which
+is the guest's host name and moved out of the dialog into
+`core::provisioning::validate_vm_name` for the reason the user-name rules did.
+The one check that stays in the UI is the duplicate name, because it is about
+the list on screen and not about the request; the repository checks it again
+against the metadata store, where it is authoritative.
+
+Three fields are filled from the host: locale, keyboard layout and timezone.
+`GuestDefaults` carries them from the composition root through
+`WorkspaceApp::with_guest_defaults`, and its `Default` is the fallback --
+`en_US.UTF-8`, `us`, `Etc/UTC` -- so a VM is created in a state that works even
+when the host's settings have no counterpart in the guest. #60 replaces what
+VMLord passes in with the values mapped from Windows; nothing else moves when
+it does.
+
+Leaving the password empty is a choice rather than a missing value: the guest
+gets no password at all, cloud-init turns password authentication off, and the
+field is not trimmed, because a space is a character of a password. The key-pair
+toggle shows where the private key will be, and the path is answered by
+`VmRepository::ssh_key_path` rather than composed in the dialog -- the on-disk
+layout of a VM is the platform layer's, and the label has to be right before the
+file exists. A backend that gives VMs no keys of its own answers `None` and the
+dialog says only that the key lives with the VM.
+
+A build is a row in the list from the moment it is accepted, labelled with the
+step it has reached; the selected-VM panel adds the download's byte counts,
+which are the only counts any step publishes -- a percentage over the others
+would need a denominator that does not exist. `percentage` never reports 100
+before the last byte, because a bar that reads full while the work continues is
+the one people wait on. `VmAction::CancelCreate` is enabled only while a VM is
+building and is the only action then available: it calls
+`WorkspaceApp::cancel_create`, the build rolls itself back, and the row leaves
+the list on its own. Start, stop, edit and delete stay disabled meanwhile, since
+what exists of the VM is a directory the build still owns.
 
 ---
 

@@ -15,6 +15,9 @@ use crate::{RepositoryError, distro::DistroProfile};
 /// The longest user name Linux tools accept without complaint.
 const MAX_USERNAME_LENGTH: usize = 32;
 
+/// The longest host name a DNS label may carry.
+const MAX_VM_NAME_LENGTH: usize = 63;
+
 /// Where a new VM's system comes from.
 ///
 /// The cloud variant is some three hundred bytes larger than the local one,
@@ -158,6 +161,61 @@ impl Provisioning {
     }
 }
 
+/// The locale, keyboard layout and timezone a new VM is offered before anyone
+/// edits them.
+///
+/// A domain type rather than three strings the UI holds: the form is not
+/// allowed to invent what a guest's locale should be, and these three values
+/// are read from the host -- which is a Windows lookup, so it belongs to the
+/// composition root rather than to the layer drawing the fields.
+///
+/// [`Default`] is the fallback the epic's decision names: when the host's
+/// settings cannot be read, or have no counterpart in the guest, a VM is
+/// created in a state that works rather than not created at all. #60 replaces
+/// the values VMLord passes in with the ones mapped from Windows; nothing else
+/// changes when it does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestDefaults {
+    pub locale: String,
+    pub keyboard: String,
+    pub timezone: String,
+}
+
+impl Default for GuestDefaults {
+    fn default() -> Self {
+        Self {
+            locale: "en_US.UTF-8".into(),
+            keyboard: "us".into(),
+            timezone: "Etc/UTC".into(),
+        }
+    }
+}
+
+/// Accepts the names Linux accepts as a host name, which is what a VM's name
+/// becomes inside the guest.
+///
+/// Lives here rather than in the create form for the reason the user-name rule
+/// does: it is the guest that refuses these names, so the refusal is a fact
+/// about the domain and not about the dialog that happens to type them.
+pub fn validate_vm_name(name: &str) -> Result<(), RepositoryError> {
+    let shaped = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-';
+
+    if name.trim().is_empty() {
+        return Err(rejected("the VM name must not be empty"));
+    }
+    if name.len() > MAX_VM_NAME_LENGTH
+        || name.starts_with('-')
+        || name.ends_with('-')
+        || !name.bytes().all(shaped)
+    {
+        return Err(rejected(
+            "the VM name must be a lowercase Linux host name of up to 63 characters, \
+             made of letters, digits and inner hyphens",
+        ));
+    }
+    Ok(())
+}
+
 /// Accepts the user names `useradd` accepts and cloud-init passes on unchanged.
 fn validate_username(username: &str) -> Result<(), RepositoryError> {
     let shaped = |(index, byte): (usize, u8)| match index {
@@ -267,6 +325,38 @@ mod tests {
                 .to_string()
                 .contains("release")
         );
+    }
+
+    #[test]
+    fn a_vm_name_the_guest_can_carry_as_its_host_name_is_kept() {
+        for candidate in ["ubuntu", "dev-linux", "vm2", "a"] {
+            assert!(
+                super::validate_vm_name(candidate).is_ok(),
+                "{candidate:?} is a valid host name"
+            );
+        }
+    }
+
+    #[test]
+    fn a_vm_name_linux_would_refuse_as_a_host_name_is_rejected() {
+        for candidate in [
+            "",
+            "   ",
+            "Dev",
+            "dev linux",
+            "-dev",
+            "dev-",
+            "dev_linux",
+            "dev.linux",
+            "a/b",
+            "имя",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert!(
+                super::validate_vm_name(candidate).is_err(),
+                "{candidate:?} must be refused"
+            );
+        }
     }
 
     #[test]
