@@ -1765,6 +1765,8 @@ fn vm_state(state: VmState) -> &'static str {
             BuildStep::WritingDisk => "Building: writing the disk",
             BuildStep::Provisioning => "Building: provisioning",
             BuildStep::Registering => "Building: registering",
+            BuildStep::Starting => "Building: starting the VM",
+            BuildStep::AwaitingGuest => "Building: waiting for the guest",
         },
         VmState::Starting => "Starting",
         VmState::Running { .. } => "Running",
@@ -1774,6 +1776,29 @@ fn vm_state(state: VmState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Creating a VM no longer ends at a registered compute system, so the two
+    /// steps that follow have to be legible in the list rather than reading as
+    /// a build that has stalled at "registering".
+    #[test]
+    fn the_steps_after_registering_have_labels_of_their_own() {
+        use vmlord_core::{BuildProgress, BuildStep};
+
+        let label = |step| {
+            vm_state(VmState::Building {
+                progress: BuildProgress {
+                    step,
+                    download: None,
+                },
+            })
+        };
+
+        assert_eq!(label(BuildStep::Starting), "Building: starting the VM");
+        assert_eq!(
+            label(BuildStep::AwaitingGuest),
+            "Building: waiting for the guest"
+        );
+    }
 
     /// `Starting` and `Building` are different things, and the label said
     /// "Building" for `Starting` only because there was no building state yet.
