@@ -58,7 +58,7 @@ impl HcsVmConfigBuilder {
         ]);
 
         let configuration = HcsConfiguration {
-            schema_version: SchemaVersion { major: 2, minor: 1 },
+            schema_version: SCHEMA_VERSION,
             owner: "VMLord",
             // `false`: VMLord opens a fresh HCS handle per operation and
             // closes it when done (see ARCHITECTURE.md); a compute system is
@@ -99,6 +99,10 @@ impl HcsVmConfigBuilder {
                     },
                     keyboard: EmptyObject {},
                     mouse: EmptyObject {},
+                },
+                services: Services {
+                    shutdown: EmptyObject {},
+                    timesync: EmptyObject {},
                 },
             },
         };
@@ -330,6 +334,16 @@ struct SchemaVersion {
     minor: u32,
 }
 
+/// The HCS schema a VMLord compute system is described in.
+///
+/// 2.5 rather than the 2.1 VMLord used through #63, because that is the version
+/// that introduced `VirtualMachine.Services`: the integration components are
+/// simply not part of the model a 2.1 document asks for, and a compute system
+/// built from one is offered whatever HCS gives by default -- timesync, but no
+/// shutdown channel for the guest's `hv_utils` to bind to. That is the whole of
+/// bug #70.
+const SCHEMA_VERSION: SchemaVersion = SchemaVersion { major: 2, minor: 5 };
+
 #[derive(Serialize)]
 struct VirtualMachine {
     #[serde(rename = "Chipset")]
@@ -338,6 +352,28 @@ struct VirtualMachine {
     compute_topology: ComputeTopology,
     #[serde(rename = "Devices")]
     devices: Devices,
+    #[serde(rename = "Services")]
+    services: Services,
+}
+
+/// The integration components the VM's guest is offered over VMBus.
+///
+/// `Shutdown` is what makes a graceful stop possible at all: the guest's
+/// `hv_util` driver binds to the VMBus channel `0e0b6031-5213-4934-818b-38d90ced39db`
+/// and answers `ICMSGTYPE_SHUTDOWN` with `orderly_poweroff`, but it can only
+/// bind to a channel the host offers, and nothing in the guest can conjure one.
+///
+/// `Timesync` is named because naming any service replaces the default set, and
+/// a VM that lost its clock synchronisation to gain a shutdown channel would be
+/// a poor trade. Heartbeat and key-value exchange stay out until something
+/// needs them: an offered channel is a guest-facing surface, not a free
+/// courtesy.
+#[derive(Serialize)]
+struct Services {
+    #[serde(rename = "Shutdown")]
+    shutdown: EmptyObject,
+    #[serde(rename = "Timesync")]
+    timesync: EmptyObject,
 }
 
 #[derive(Serialize)]
@@ -575,7 +611,7 @@ mod tests {
         assert_eq!(
             json,
             json!({
-                "SchemaVersion": { "Major": 2, "Minor": 1 },
+                "SchemaVersion": { "Major": 2, "Minor": 5 },
                 "Owner": "VMLord",
                 "ShouldTerminateOnLastHandleClosed": false,
                 "VirtualMachine": {
@@ -598,9 +634,59 @@ mod tests {
                         "HvSocket": { "HvSocketConfig": { "ServiceTable": {} } },
                         "Keyboard": {},
                         "Mouse": {}
-                    }
+                    },
+                    "Services": { "Shutdown": {}, "Timesync": {} }
                 }
             }),
+        );
+    }
+
+    #[test]
+    fn a_vm_is_offered_the_shutdown_channel_its_guest_waits_for() {
+        // #70: a guest cannot ask for this. Linux' `hv_util` driver binds to the
+        // VMBus channel the host offers and does nothing until it is offered
+        // one, so a document that leaves `Services` out leaves the guest with
+        // no way to be asked to power off -- which is what
+        // `HcsShutDownComputeSystem` then reports as `ERROR_NOT_SUPPORTED`.
+        let json: Value = serde_json::from_str(
+            &HcsVmConfigBuilder::build(
+                &cloud_request(),
+                Path::new(r"C:\vms\test-vm\disks\system.vhdx"),
+                Path::new(r"C:\vms\test-vm\seed.iso"),
+                VM_ID,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            json.pointer("/VirtualMachine/Services/Shutdown"),
+            Some(&json!({}))
+        );
+        // The section exists only from schema 2.5 on; asking for an older
+        // model is asking for one that has no integration components in it.
+        assert_eq!(json.pointer("/SchemaVersion/Minor"), Some(&json!(5)));
+    }
+
+    #[test]
+    fn naming_the_services_keeps_the_clock_the_default_set_gave() {
+        // Naming any service replaces the set HCS offers by default, and
+        // timesync is in that set today: a VM must not lose its clock
+        // synchronisation as a side effect of gaining a shutdown channel.
+        let json: Value = serde_json::from_str(
+            &HcsVmConfigBuilder::build(
+                &request(),
+                Path::new(r"C:\vms\test-vm\disks\system.vhdx"),
+                Path::new(r"C:\vms\test-vm\seed.iso"),
+                VM_ID,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            json.pointer("/VirtualMachine/Services/Timesync"),
+            Some(&json!({}))
         );
     }
 
