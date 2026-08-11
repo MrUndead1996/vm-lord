@@ -26,6 +26,60 @@ fn iana_timezone(windows_id: &str) -> Option<String> {
     Some(zone.tzdb_id().to_owned())
 }
 
+/// The script subtags glibc keeps in a locale name, and the modifier it
+/// spells them with.
+///
+/// Everywhere else the region already says which script is meant, so the
+/// subtag is dropped. These two are the pairs where the script *is* the
+/// distinction, and the name below is the one in glibc's `SUPPORTED` -- which
+/// is the list `locale-gen` reads, modifier and no codeset. `locale -a` prints
+/// the same locales differently; matching it would generate nothing.
+const SCRIPT_MODIFIERS: [(&str, &str, &str); 2] =
+    [("sr", "Latn", "latin"), ("uz", "Cyrl", "cyrillic")];
+
+/// The POSIX locale name matching the BCP-47 tag `bcp47`.
+///
+/// Windows says `ru-RU`, `pt-BR`, `zh-Hans-CN` or `sr-Latn-RS`; a guest wants
+/// `ru_RU.UTF-8`. The parse is deliberately strict -- a tag that does not
+/// carry both a language and a two-letter region has no POSIX counterpart, and
+/// answering `None` puts the default in the form where the user can see and
+/// correct it.
+fn posix_locale(bcp47: &str) -> Option<String> {
+    let mut subtags = bcp47.split('-');
+
+    let language = subtags.next()?;
+    if !matches!(language.len(), 2..=3) || !language.bytes().all(|byte| byte.is_ascii_lowercase()) {
+        return None;
+    }
+
+    let mut next = subtags.next()?;
+    let mut script = None;
+    if next.len() == 4 && next.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        script = Some(next);
+        next = subtags.next()?;
+    }
+
+    let region = next;
+    if region.len() != 2 || !region.bytes().all(|byte| byte.is_ascii_alphabetic()) {
+        return None;
+    }
+    let region = region.to_ascii_uppercase();
+
+    let modifier = script.and_then(|script| {
+        SCRIPT_MODIFIERS
+            .iter()
+            .find(|(kept_language, kept_script, _)| {
+                *kept_language == language && *kept_script == script
+            })
+            .map(|(_, _, modifier)| *modifier)
+    });
+
+    Some(match modifier {
+        Some(modifier) => format!("{language}_{region}@{modifier}"),
+        None => format!("{language}_{region}.UTF-8"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -55,5 +109,45 @@ mod tests {
     fn a_key_the_table_does_not_know_maps_to_nothing() {
         assert_eq!(iana_timezone("No Such Standard Time"), None);
         assert_eq!(iana_timezone(""), None);
+    }
+
+    #[test]
+    fn a_language_and_a_region_become_a_posix_name() {
+        assert_eq!(posix_locale("ru-RU").as_deref(), Some("ru_RU.UTF-8"));
+        assert_eq!(posix_locale("en-US").as_deref(), Some("en_US.UTF-8"));
+        assert_eq!(posix_locale("pt-BR").as_deref(), Some("pt_BR.UTF-8"));
+    }
+
+    /// The region already says which script is meant, so the script subtag is
+    /// noise -- except where glibc itself keeps both, and then the name it
+    /// keeps is the one in `SUPPORTED`: a modifier and no codeset.
+    #[test]
+    fn a_script_is_dropped_unless_glibc_keeps_it() {
+        assert_eq!(posix_locale("zh-Hans-CN").as_deref(), Some("zh_CN.UTF-8"));
+        assert_eq!(posix_locale("zh-Hant-TW").as_deref(), Some("zh_TW.UTF-8"));
+        assert_eq!(posix_locale("sr-Latn-RS").as_deref(), Some("sr_RS@latin"));
+        assert_eq!(posix_locale("sr-Cyrl-RS").as_deref(), Some("sr_RS.UTF-8"));
+        assert_eq!(
+            posix_locale("uz-Cyrl-UZ").as_deref(),
+            Some("uz_UZ@cyrillic")
+        );
+        assert_eq!(posix_locale("uz-Latn-UZ").as_deref(), Some("uz_UZ.UTF-8"));
+    }
+
+    /// A POSIX name is a language *and* a territory. Inventing the territory
+    /// the user did not choose is worse than falling back to the default.
+    #[test]
+    fn a_tag_without_a_two_letter_region_maps_to_nothing() {
+        assert_eq!(posix_locale("en"), None);
+        assert_eq!(posix_locale("es-419"), None);
+        assert_eq!(posix_locale("zh-Hans"), None);
+    }
+
+    #[test]
+    fn a_tag_that_is_not_a_tag_maps_to_nothing() {
+        assert_eq!(posix_locale(""), None);
+        assert_eq!(posix_locale("---"), None);
+        assert_eq!(posix_locale("ru_RU"), None);
+        assert_eq!(posix_locale("r-RU"), None);
     }
 }
