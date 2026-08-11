@@ -47,6 +47,10 @@ pub(crate) struct BuildRegistry {
 impl BuildRegistry {
     /// Whether a VM of this name is being created right now.
     pub(crate) fn contains(&self, name: &str) -> bool {
+        // Before answering, not after: a build that is over holds neither a row
+        // nor its name, and the caller asking is the one that would otherwise
+        // refuse a retry of a build the user can no longer see.
+        self.reap();
         self.lock().contains_key(name)
     }
 
@@ -115,7 +119,14 @@ impl BuildRegistry {
     ///
     /// Sizes come from the request rather than from disk, because nothing of
     /// the VM is on disk yet to read them from.
+    ///
+    /// Builds that are over are cleared first, so a row disappears when its
+    /// thread ends rather than when something next asks for diagnostics. A
+    /// listing that lags behind is worse than late here: a build that succeeded
+    /// has already written itself to the metadata store, so until it is cleared
+    /// the same VM is in the list twice.
     pub(crate) fn summaries(&self) -> Vec<VmSummary> {
+        self.reap();
         self.lock()
             .values()
             .map(|build| VmSummary {
@@ -171,6 +182,10 @@ impl BuildRegistry {
     /// Joining a thread that has already left is immediate, and it is the only
     /// place its result is collected: a build reports what it did through the
     /// diagnostics, so there is nothing here to read but the end of the thread.
+    ///
+    /// Every query runs this first, so it must be called without the lock held
+    /// -- it takes the lock itself, and a `Mutex` is not reentrant. Joining
+    /// under the lock is safe because a build never touches the registry.
     pub(crate) fn reap(&self) {
         let mut builds = self.lock();
         let done: Vec<String> = builds
@@ -301,6 +316,37 @@ mod tests {
         registry.reap();
 
         assert!(registry.summaries().is_empty());
+    }
+
+    /// A build that is over must leave the list on its own, without waiting for
+    /// anything else to be called.
+    ///
+    /// It did not: the entry was removed only by `reap`, which runs from
+    /// `take_diagnostics`. A cancelled build therefore kept its `Building` row
+    /// until something asked for diagnostics, and a build that succeeded was
+    /// listed twice in the meantime -- once from the metadata store it had just
+    /// been written to, and once from here.
+    #[test]
+    fn a_finished_build_stops_being_listed_on_its_own() {
+        let registry = BuildRegistry::default();
+        registry
+            .start(request("dev"), |_| {})
+            .expect("the build should start");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !registry.summaries().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a build whose thread is over must not still be listed"
+            );
+            std::thread::yield_now();
+        }
+
+        assert!(
+            !registry.contains("dev"),
+            "and the name it held must be free again, or a retry is refused \
+             for a build the user can no longer see"
+        );
     }
 
     #[test]
