@@ -1110,6 +1110,39 @@ the GUI owns: it is told a pipe, a log, a mode, its parent's process id and four
 event names, and none of those is ever a secret -- a command line is readable by
 anything on the machine that can enumerate the process.
 
+The console is two-way. The pipe is opened `GENERIC_READ | GENERIC_WRITE` --
+HCS serves it duplex -- and a second thread in the helper carries its standard
+input into the guest, byte for byte, on the same handle: HCS serves one pipe
+instance, so a second open would be refused as busy or take the stream away from
+the reader, and one handle with an `OVERLAPPED` per operation is what overlapped
+I/O is for. This is the only way into a VM that has no network -- `network_mode:
+None`, a network that did not come up, a broken `sshd` -- and it is the reason
+`com1_input` exists at all.
+
+Typing works because the helper takes its console out of cooked mode for the
+life of the capture: line input, echo and processed input off, virtual terminal
+input and output on. Without that, keystrokes would be held until Enter, every
+character would be echoed twice, a password would be shown, Ctrl-C would kill
+the helper instead of the command running in the guest, and what a full-screen
+guest program draws would arrive as escape codes. The modes the helper found are
+restored on every path out, including a panic, so the window it leaves behind
+behaves as it did before. A standard handle that is not a console -- input from
+a pipe, output redirected to a file -- is left alone and the bytes still travel.
+
+What is typed goes to the pipe and nowhere else. It is never written to
+`com1.log`: the guest echoes what it means to echo, and a password is
+deliberately not echoed, so recording input would put it in a file beside the
+VM. Ctrl-C now belongs to the guest, which leaves the helper without a keyboard
+interrupt of its own -- the console is closed by closing its window, or by
+stopping the VM, which breaks the pipe. The input thread is never joined: a
+blocking console read cannot be woken, so it stays blocked and process exit
+collects it, and its `Arc` on the pipe handle is what guarantees the handle
+cannot be closed under a write in the meantime.
+
+A guest created without a password cannot be logged into here at all: cloud-init
+turns password authentication off and the user has no password to type. The
+creation form says so where the password is left empty.
+
 `Com1Launcher` puts the reader on screen through the first terminal host that
 starts: `wt.exe -w new new-tab --title "VMLord COM1 - <vm>"`, then
 `powershell.exe -NoLogo -NoProfile -Command`, then `cmd.exe /D /S /C`. Neither
@@ -1165,6 +1198,12 @@ other test that needs Hyper-V: it builds a real Ubuntu cloud image, starts it,
 and waits for the string `cloud-init` to appear in the VM's `com1.log`. That is
 the claim worth verifying -- that the serial console the guest was given is the
 one being captured, before SSH exists to ask it anything.
+
+`a_guest_can_be_logged_into_over_com1` is the same kind of check for the other
+direction: it builds a VM with a password, starts the compute system directly
+rather than through the repository -- a repository start opens its own helper,
+and the test has to be the pipe's only client -- then answers `login:`, types the
+password, runs a command and waits for its output to come back.
 
 ### Creating a VM in the background
 
