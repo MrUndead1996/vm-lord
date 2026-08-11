@@ -797,7 +797,12 @@ mod tests {
         let pipeline = pipeline(&calls, false, false, false);
 
         pipeline
-            .create(&fixture.store, &fixture.request, &fixture.vm_directory, &monitor())
+            .create(
+                &fixture.store,
+                &fixture.request,
+                &fixture.vm_directory,
+                &monitor(),
+            )
             .expect("creation should succeed");
 
         assert!(calls.cloud.lock().unwrap().is_empty());
@@ -811,7 +816,12 @@ mod tests {
         let pipeline = pipeline(&calls, false, false, false);
 
         let mapping = pipeline
-            .create(&fixture.store, &fixture.request, &fixture.vm_directory, &monitor())
+            .create(
+                &fixture.store,
+                &fixture.request,
+                &fixture.vm_directory,
+                &monitor(),
+            )
             .expect("creation should succeed");
 
         assert_eq!(mapping.vm_name, "test-vm");
@@ -873,12 +883,22 @@ mod tests {
         let calls = fixture.calls.clone();
         let pipeline = pipeline(&calls, false, false, false);
         pipeline
-            .create(&fixture.store, &fixture.request, &fixture.vm_directory, &monitor())
+            .create(
+                &fixture.store,
+                &fixture.request,
+                &fixture.vm_directory,
+                &monitor(),
+            )
             .expect("the first creation should succeed");
 
         let other_directory = fixture.vm_directory.with_file_name("vm-2");
         let error = pipeline
-            .create(&fixture.store, &fixture.request, &other_directory, &monitor())
+            .create(
+                &fixture.store,
+                &fixture.request,
+                &other_directory,
+                &monitor(),
+            )
             .expect_err("a duplicate VM name must be rejected");
 
         assert!(error.to_string().contains("test-vm"));
@@ -895,7 +915,12 @@ mod tests {
         let pipeline = pipeline(&calls, false, false, false);
 
         let error = pipeline
-            .create(&fixture.store, &fixture.request, &fixture.vm_directory, &monitor())
+            .create(
+                &fixture.store,
+                &fixture.request,
+                &fixture.vm_directory,
+                &monitor(),
+            )
             .expect_err("an existing VM directory must be rejected");
 
         assert!(error.to_string().contains("already exists"));
@@ -909,7 +934,12 @@ mod tests {
         let pipeline = pipeline(&calls, true, false, false);
 
         let error = pipeline
-            .create(&fixture.store, &fixture.request, &fixture.vm_directory, &monitor())
+            .create(
+                &fixture.store,
+                &fixture.request,
+                &fixture.vm_directory,
+                &monitor(),
+            )
             .expect_err("disk failure must abort creation");
 
         assert!(error.to_string().contains("injected disk failure"));
@@ -927,7 +957,12 @@ mod tests {
         fs::remove_file(&fixture.image_path).unwrap();
 
         let error = pipeline
-            .create(&fixture.store, &fixture.request, &fixture.vm_directory, &monitor())
+            .create(
+                &fixture.store,
+                &fixture.request,
+                &fixture.vm_directory,
+                &monitor(),
+            )
             .expect_err("a vanished image must abort creation");
 
         assert!(error.to_string().contains("image"));
@@ -942,7 +977,12 @@ mod tests {
         let pipeline = pipeline(&calls, false, false, true);
 
         let error = pipeline
-            .create(&fixture.store, &fixture.request, &fixture.vm_directory, &monitor())
+            .create(
+                &fixture.store,
+                &fixture.request,
+                &fixture.vm_directory,
+                &monitor(),
+            )
             .expect_err("an HCS create failure must abort creation");
 
         assert!(error.to_string().contains("timed out"));
@@ -974,7 +1014,12 @@ mod tests {
         let pipeline = pipeline(&calls, false, false, false);
 
         let error = pipeline
-            .create(&blocked_store, &fixture.request, &fixture.vm_directory, &monitor())
+            .create(
+                &blocked_store,
+                &fixture.request,
+                &fixture.vm_directory,
+                &monitor(),
+            )
             .expect_err("a metadata registration failure must abort creation");
 
         assert!(error.to_string().contains("creation of VM"));
@@ -993,7 +1038,12 @@ mod tests {
         let calls = fixture.calls.clone();
         let pipeline = pipeline(&calls, true, false, false);
 
-        let _ = pipeline.create(&fixture.store, &fixture.request, &fixture.vm_directory, &monitor());
+        let _ = pipeline.create(
+            &fixture.store,
+            &fixture.request,
+            &fixture.vm_directory,
+            &monitor(),
+        );
 
         assert_eq!(fs::read(&fixture.image_path).unwrap(), b"iso");
     }
@@ -1071,10 +1121,7 @@ mod tests {
         assert!(seed.contains(public_key.trim_end()), "and the public key");
         // The whole case for leaving the seed attached rests on this id being
         // the compute system's own, so that it never changes across boots.
-        assert!(seed.contains(&format!(
-            "instance-id: '{}'",
-            mapping.hcs_compute_system_id
-        )));
+        assert!(seed.contains(&format!("instance-id: '{}'", mapping.hcs_compute_system_id)));
 
         let stored = fs::read_to_string(fixture.vm_directory.join("config.json")).unwrap();
         let create_calls = calls.create.lock().unwrap();

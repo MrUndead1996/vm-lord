@@ -83,7 +83,8 @@ fn writes_an_image_into_a_vhdx_and_leaves_the_holes_unallocated() {
         hole: 16 * MIB..48 * MIB,
     };
 
-    let summary = import_image(&mut source, &target, GIB, &AtomicBool::new(false)).expect("the import should succeed");
+    let summary = import_image(&mut source, &target, GIB, &AtomicBool::new(false))
+        .expect("the import should succeed");
 
     println!("{summary:?}");
     assert_eq!(summary.image_bytes, 64 * MIB);
@@ -141,7 +142,8 @@ fn imports_a_real_cloud_image() {
         .expect("the cloud image should open");
     let virtual_size = source.virtual_size();
 
-    let summary = import_image(&mut source, &target, capacity, &AtomicBool::new(false)).expect("the import should succeed");
+    let summary = import_image(&mut source, &target, capacity, &AtomicBool::new(false))
+        .expect("the import should succeed");
 
     println!("{summary:?}");
     assert_eq!(summary.image_bytes, virtual_size);

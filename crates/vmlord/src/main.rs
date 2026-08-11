@@ -81,20 +81,27 @@ fn load_backend(settings: &AppSettings) -> Box<dyn VmRepository> {
 /// Both halves are long enough to report and to be cancelled, and both are
 /// invisible from outside this closure, so the steps are reported here.
 fn cloud_disk_importer(cache_directory: PathBuf) -> vmlord_platform::CloudDiskImporter {
-    Box::new(move |image, disk_size_bytes, target, monitor: &BuildMonitor| {
-        monitor.report(BuildStep::Downloading);
-        let mut source = vmlord_image::open_cloud_image(
-            &image.profile,
-            &image.release,
-            &cache_directory,
-            disk_size_bytes,
-            monitor.downloads(),
-            monitor.cancel_flag(),
-        )?;
-        monitor.report(BuildStep::WritingDisk);
-        vmlord_platform::import_image(&mut source, target, disk_size_bytes, monitor.cancel_flag())
+    Box::new(
+        move |image, disk_size_bytes, target, monitor: &BuildMonitor| {
+            monitor.report(BuildStep::Downloading);
+            let mut source = vmlord_image::open_cloud_image(
+                &image.profile,
+                &image.release,
+                &cache_directory,
+                disk_size_bytes,
+                monitor.downloads(),
+                monitor.cancel_flag(),
+            )?;
+            monitor.report(BuildStep::WritingDisk);
+            vmlord_platform::import_image(
+                &mut source,
+                target,
+                disk_size_bytes,
+                monitor.cancel_flag(),
+            )
             .map(|_summary| ())
-    })
+        },
+    )
 }
 
 /// Reports whether the transitional legacy backend was asked for.

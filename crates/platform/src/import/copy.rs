@@ -329,8 +329,14 @@ mod tests {
         source[..CHUNK].fill(0);
         let mut disk = MemoryDisk::new(8 * CHUNK);
 
-        let summary = copy_image(&mut Cursor::new(source), &mut disk, 8 * CHUNK as u64, CHUNK, &running())
-            .expect("the import should succeed");
+        let summary = copy_image(
+            &mut Cursor::new(source),
+            &mut disk,
+            8 * CHUNK as u64,
+            CHUNK,
+            &running(),
+        )
+        .expect("the import should succeed");
 
         assert_eq!(disk.write_offsets(), vec![CHUNK as u64]);
         assert_eq!(summary.skipped_bytes, CHUNK as u64);
@@ -439,8 +445,14 @@ mod tests {
         let mut source = image(3);
         source[CHUNK..2 * CHUNK].fill(0);
 
-        let summary = copy_image(&mut Cursor::new(source), &mut disk, 8 * CHUNK as u64, CHUNK, &running())
-            .expect("the import should succeed");
+        let summary = copy_image(
+            &mut Cursor::new(source),
+            &mut disk,
+            8 * CHUNK as u64,
+            CHUNK,
+            &running(),
+        )
+        .expect("the import should succeed");
 
         assert_eq!(summary.verified_bytes, summary.written_bytes);
         assert_eq!(summary.verified_bytes, 2 * CHUNK as u64);

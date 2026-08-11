@@ -60,20 +60,14 @@ impl BuildRegistry {
     /// `build` must not touch the registry: it runs while nothing holds the
     /// lock, but the entry it belongs to is inserted by the caller of this
     /// function while the lock is held.
-    pub(crate) fn start<F>(
-        &self,
-        request: VmCreateRequest,
-        build: F,
-    ) -> Result<(), RepositoryError>
+    pub(crate) fn start<F>(&self, request: VmCreateRequest, build: F) -> Result<(), RepositoryError>
     where
         F: FnOnce(&BuildMonitor) + Send + 'static,
     {
         let mut builds = self.lock();
         if builds.contains_key(&request.name) {
-            let error = RepositoryError::new(format!(
-                "VM \"{}\" is already being created",
-                request.name
-            ));
+            let error =
+                RepositoryError::new(format!("VM \"{}\" is already being created", request.name));
             log::error!("{error}");
             return Err(error);
         }

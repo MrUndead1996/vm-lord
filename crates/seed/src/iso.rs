@@ -518,7 +518,10 @@ mod tests {
     #[test]
     fn a_file_longer_than_a_sector_survives_intact() {
         let long: Vec<u8> = (0..5000u32).map(|byte| byte as u8).collect();
-        let bytes = build("CIDATA", &[("user-data", long.as_slice()), ("meta-data", b"two")]);
+        let bytes = build(
+            "CIDATA",
+            &[("user-data", long.as_slice()), ("meta-data", b"two")],
+        );
         let volume = Volume { bytes: &bytes };
 
         assert_eq!(volume.file("user-data"), &long[..]);

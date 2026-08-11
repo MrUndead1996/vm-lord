@@ -267,7 +267,10 @@ fn a_cancelled_build_leaves_nothing_behind() {
             .any(|diagnostic| diagnostic.message.contains("bg-cancel")),
         "the user has to be told why the VM went away: {diagnostics:?}"
     );
-    assert!(!left_behind, "the cancelled build must remove its directory");
+    assert!(
+        !left_behind,
+        "the cancelled build must remove its directory"
+    );
 }
 
 /// A monitor for the tests that drive the creation pipeline directly.
@@ -1807,7 +1810,8 @@ fn a_vm_is_created_from_a_real_cloud_image() {
                 monitor.cancel_flag(),
             )?;
             monitor.report(vmlord_core::BuildStep::WritingDisk);
-            vmlord_platform::import_image(&mut source, target, size, monitor.cancel_flag()).map(|_| ())
+            vmlord_platform::import_image(&mut source, target, size, monitor.cancel_flag())
+                .map(|_| ())
         },
     ));
 

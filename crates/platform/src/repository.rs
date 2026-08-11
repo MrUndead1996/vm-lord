@@ -18,10 +18,9 @@ use vmlord_core::{
 };
 
 use crate::{
-    CloudDiskImporter, HcsClient, HcsSystem, KnownVm, MetadataStore, VmComputeSystemMapping,
-    VmConnections, VmCreationPipeline, VmDeletionPipeline, VmForceStopPipeline, VmShutdownPipeline,
-    VmStartPipeline,
-    Com1LogMode,
+    CloudDiskImporter, Com1LogMode, HcsClient, HcsSystem, KnownVm, MetadataStore,
+    VmComputeSystemMapping, VmConnections, VmCreationPipeline, VmDeletionPipeline,
+    VmForceStopPipeline, VmShutdownPipeline, VmStartPipeline,
     build::BuildRegistry,
     cleanup,
     com1_terminal::{Com1Launcher, Com1Sessions},
