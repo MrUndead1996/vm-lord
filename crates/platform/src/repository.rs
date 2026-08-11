@@ -445,6 +445,27 @@ impl HcsVmRepository {
     }
 }
 
+/// Joins the VMs the store knows with the ones still being built, listing each
+/// name once.
+///
+/// A build reaches the store partway through: creation registers the VM, and
+/// the same thread then starts it and waits for its guest, which takes minutes.
+/// For that whole stretch both halves know the same VM, and the build's row is
+/// the one worth showing -- it says which step is running, while the stored row
+/// would say only "Running" for a guest nobody can use yet.
+///
+/// A build that failed rolled itself back and never reached the store, so its
+/// row simply stops being here.
+fn merge_with_builds(known: Vec<VmSummary>, builds: &BuildRegistry) -> Vec<VmSummary> {
+    let building = builds.summaries();
+    let mut summaries: Vec<VmSummary> = known
+        .into_iter()
+        .filter(|vm| !building.iter().any(|build| build.name == vm.name))
+        .collect();
+    summaries.extend(building);
+    summaries
+}
+
 /// Maps what HCS reports about a compute system onto the VM state the
 /// application layer works with.
 ///
@@ -773,14 +794,11 @@ impl VmRepository for HcsVmRepository {
     fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError> {
         self.require_initialized()?;
 
-        let mut summaries: Vec<VmSummary> = list_known_vms(&self.client, &self.store)?
+        let known: Vec<VmSummary> = list_known_vms(&self.client, &self.store)?
             .into_iter()
             .map(|known| self.summary(known))
             .collect();
-        // A build that failed rolled itself back and never reached the store,
-        // so its row simply stops being here.
-        summaries.extend(self.builds.summaries());
-        Ok(summaries)
+        Ok(merge_with_builds(known, &self.builds))
     }
 
     /// Reports everything the repository has to say since the last call,
@@ -942,16 +960,17 @@ mod tests {
 
     use uuid::Uuid;
     use vmlord_core::{
-        DiagnosticLevel, GpuMode, NetworkMode, RepositoryError, VmDeleteRequest, VmRepository,
-        VmState, VmUpdateRequest,
+        AgentStatus, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError, VmDeleteRequest,
+        VmRepository, VmState, VmSummary, VmUpdateRequest,
     };
 
     use super::{
-        HcsSystemState, HcsVmRepository, console_failure_diagnostics, guest_ip,
-        launch_running_consoles, record_network_mode,
+        HcsSystemState, HcsVmRepository, OS_TYPE, console_failure_diagnostics, guest_ip,
+        launch_running_consoles, merge_with_builds, record_network_mode,
     };
     use crate::{
         Com1Launcher, Com1LogMode, KnownVm, MetadataStore, VmComputeSystemMapping,
+        build::BuildRegistry,
         com1_terminal::{Com1Sessions, TerminalCommand},
         hcn_endpoint::EndpointAddress,
         watch::{HcsEventKind, HcsVmEvent},
@@ -966,6 +985,57 @@ mod tests {
                 ))
             }),
         )
+    }
+
+    #[test]
+    fn a_vm_being_built_is_listed_once_even_after_it_reaches_the_store() {
+        // A build now outlives its own registration: creation writes the VM to
+        // the store, and the thread carries on starting it and waiting for its
+        // guest for minutes afterwards. Both halves of `list_vms` therefore
+        // know the same VM, and the build's row is the one that tells the user
+        // what is still happening to it.
+        let (root, store) = temp_store("one-row");
+        let mapping = mapping(NetworkMode::Nat);
+        let name = mapping.vm_name.clone();
+        store.insert(mapping).expect("the mapping should be stored");
+        let builds = BuildRegistry::default();
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held = std::sync::Arc::clone(&release);
+        builds
+            .start(create_request(&name), move |_| {
+                while !held.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::yield_now();
+                }
+                None
+            })
+            .expect("the build should start");
+
+        let known = vec![VmSummary {
+            name: name.clone(),
+            os_type: OS_TYPE.to_string(),
+            state: VmState::Running {
+                agent_status: AgentStatus::Unknown,
+            },
+            ram_mb: 2048,
+            disk_gb: 20,
+            cpu_cores: 2,
+            gpu_mode: GpuMode::None,
+            network_mode: NetworkMode::Nat,
+            ip_address: None,
+            ssh_port: None,
+        }];
+        let listed = merge_with_builds(known, &builds);
+
+        release.store(true, std::sync::atomic::Ordering::Relaxed);
+        builds.cancel_all_and_join();
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(listed.len(), 1, "a VM appears once: {listed:?}");
+        assert!(
+            matches!(listed[0].state, VmState::Building { .. }),
+            "while it is still being built, the build's row is the one that shows: {:?}",
+            listed[0].state
+        );
     }
 
     #[test]
