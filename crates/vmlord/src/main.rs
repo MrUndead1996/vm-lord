@@ -91,7 +91,8 @@ fn cloud_disk_importer(cache_directory: PathBuf) -> vmlord_platform::CloudDiskIm
             monitor.cancel_flag(),
         )?;
         monitor.report(BuildStep::WritingDisk);
-        vmlord_platform::import_image(&mut source, target, disk_size_bytes).map(|_summary| ())
+        vmlord_platform::import_image(&mut source, target, disk_size_bytes, monitor.cancel_flag())
+            .map(|_summary| ())
     })
 }
 

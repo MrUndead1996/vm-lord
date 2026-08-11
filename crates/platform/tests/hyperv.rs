@@ -1542,7 +1542,7 @@ fn a_vm_is_created_from_a_real_cloud_image() {
                 monitor.cancel_flag(),
             )?;
             monitor.report(vmlord_core::BuildStep::WritingDisk);
-            vmlord_platform::import_image(&mut source, target, size).map(|_| ())
+            vmlord_platform::import_image(&mut source, target, size, monitor.cancel_flag()).map(|_| ())
         },
     ));
 

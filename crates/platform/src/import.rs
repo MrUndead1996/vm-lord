@@ -18,7 +18,7 @@ mod copy;
 mod drive;
 mod plan;
 
-use std::{fs, io::Read, path::Path};
+use std::{fs, io::Read, path::Path, sync::atomic::AtomicBool};
 
 use vmlord_core::RepositoryError;
 
@@ -49,10 +49,14 @@ use crate::{
 /// A failure leaves nothing behind: the disk is detached and the VHDX removed,
 /// because a half-written disk that looks complete is the failure this whole
 /// module is written against.
+///
+/// A cancelled import leaves nothing behind either: it takes the same path a
+/// failed one takes, because a cancellation here is an ordinary failure.
 pub fn import_image(
     source: &mut dyn Read,
     target: &Path,
     disk_size_bytes: u64,
+    cancel: &AtomicBool,
 ) -> Result<ImportSummary, RepositoryError> {
     create_dynamic_vhdx(target, disk_size_bytes)?;
     log::info!(
@@ -60,7 +64,7 @@ pub fn import_image(
         target.display()
     );
 
-    match write_into(source, target, disk_size_bytes) {
+    match write_into(source, target, disk_size_bytes, cancel) {
         Ok(summary) => {
             log::info!(
                 "imported {} bytes into {}, skipping {} bytes of holes",
@@ -82,11 +86,12 @@ fn write_into(
     source: &mut dyn Read,
     target: &Path,
     disk_size_bytes: u64,
+    cancel: &AtomicBool,
 ) -> Result<ImportSummary, RepositoryError> {
     let attached = AttachedDisk::attach(target)?;
     let summary = {
         let mut drive = PhysicalDrive::open(attached.physical_path(), CHUNK_BYTES)?;
-        copy_image(source, &mut drive, disk_size_bytes, CHUNK_BYTES)
+        copy_image(source, &mut drive, disk_size_bytes, CHUNK_BYTES, cancel)
         // The drive handle closes here, before the disk is detached: detaching
         // a disk somebody still holds open is how a VHDX ends up attached with
         // nothing left to detach it.
