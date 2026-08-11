@@ -10,7 +10,8 @@ use uuid::Uuid;
 use vmlord_core::{NetworkMode, RepositoryError};
 
 use crate::{
-    HcsClient, HcsSystem, cleanup,
+    Com1LogMode, HcsClient, HcsSystem, cleanup,
+    com1_terminal::{Com1Launcher, Com1Session},
     dhcp::{self, DhcpRegistrar},
     hcn::HcnNetwork,
     hcn_endpoint::{EndpointAddress, HcnEndpoint},
@@ -54,6 +55,7 @@ type EndpointProvider =
 
 /// Starts VMs created by [`crate::VmCreationPipeline`].
 pub struct VmStartPipeline {
+    com1: Com1Launcher,
     access_granter: AccessGranter,
     system_starter: SystemStarter,
     endpoint_provider: EndpointProvider,
@@ -62,9 +64,13 @@ pub struct VmStartPipeline {
 
 impl VmStartPipeline {
     /// Creates a pipeline backed by the real HCS and HNS APIs.
+    ///
+    /// The launcher is passed in rather than made here: the repository owns the
+    /// sessions this pipeline opens, and both halves have to be the same one.
     #[must_use]
-    pub fn production() -> Self {
+    pub fn production(com1: Com1Launcher) -> Self {
         Self {
+            com1,
             access_granter: Box::new(grant_vm_access),
             system_starter: Box::new(start_hcs_system),
             endpoint_provider: Box::new(ensure_endpoint),
@@ -74,6 +80,7 @@ impl VmStartPipeline {
 
     #[cfg(test)]
     fn for_test(
+        com1: Com1Launcher,
         access_granter: impl Fn(&str, &Path) -> Result<(), RepositoryError> + 'static,
         system_starter: impl Fn(&str, &str) -> Result<(), HcsStartFailure> + 'static,
         endpoint_provider: impl Fn(
@@ -86,6 +93,7 @@ impl VmStartPipeline {
         + 'static,
     ) -> Self {
         Self {
+            com1,
             access_granter: Box::new(access_granter),
             system_starter: Box::new(system_starter),
             endpoint_provider: Box::new(endpoint_provider),
@@ -110,12 +118,18 @@ impl VmStartPipeline {
     /// written into the configuration for the VM to come up with an adapter at
     /// all. Failing to provide either fails the start rather than quietly
     /// bringing the VM up without a network.
+    ///
+    /// The VM's COM1 console is opened before any of that, and the session that
+    /// owns it is what a successful start returns: a VM whose diagnostics could
+    /// not be captured is not started at all, because the output that explains
+    /// a failed boot is written in the first seconds of one. Every failure
+    /// after the launch drops the session, which tells the reader to stop.
     pub fn start(
         &self,
         store: &MetadataStore,
         vm_name: &str,
         vm_directory: &Path,
-    ) -> Result<(), RepositoryError> {
+    ) -> Result<Com1Session, RepositoryError> {
         let mapping = store.find_by_vm_name(vm_name)?.ok_or_else(|| {
             let error = RepositoryError::new(format!("no HCS mapping found for VM \"{vm_name}\""));
             log::error!("{error}");
@@ -129,7 +143,12 @@ impl VmStartPipeline {
             mapping.hcs_compute_system_id
         );
 
+        // After reading the configuration, so that a VM whose stored state is
+        // unusable never opens a window for a start that cannot happen.
         let stored = self.read_configuration(&mapping, vm_directory)?;
+        let session = self
+            .com1
+            .launch(&mapping, vm_directory, Com1LogMode::Truncate)?;
         let (configuration, endpoint) = self.attach_network(
             store,
             &mapping,
@@ -143,7 +162,7 @@ impl VmStartPipeline {
         let failure = match (self.system_starter)(&mapping.hcs_compute_system_id, &configuration) {
             Ok(()) => {
                 log::info!("started VM \"{}\" ({})", mapping.vm_name, mapping.vm_id);
-                return Ok(());
+                return Ok(session);
             }
             Err(failure) => failure,
         };
@@ -187,7 +206,7 @@ impl VmStartPipeline {
         )?;
 
         log::info!("started VM \"{}\" ({})", mapping.vm_name, mapping.vm_id);
-        Ok(())
+        Ok(session)
     }
 
     /// Gives the VM its endpoint and writes the adapter into `configuration`,
@@ -336,12 +355,6 @@ impl VmStartPipeline {
         }
 
         Ok(())
-    }
-}
-
-impl Default for VmStartPipeline {
-    fn default() -> Self {
-        Self::production()
     }
 }
 
@@ -529,7 +542,7 @@ mod tests {
         path::{Path, PathBuf},
         sync::{
             Arc, Mutex,
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicU64, AtomicUsize, Ordering},
         },
     };
 
@@ -538,6 +551,7 @@ mod tests {
 
     use super::{EndpointPolicy, VmNetworkAdapter, VmStartPipeline, attachment_paths};
     use crate::{
+        Com1Launcher,
         hcn_endpoint::EndpointAddress,
         hcs::HcsStartFailure,
         metadata::{MetadataStore, VmComputeSystemMapping},
@@ -603,6 +617,10 @@ mod tests {
         start: Arc<Mutex<Vec<(String, String)>>>,
         endpoint: Arc<Mutex<Vec<EndpointRequest>>>,
         dhcp: Arc<Mutex<Vec<(String, EndpointAddress)>>>,
+        /// The command line each COM1 console was opened with.
+        console: Arc<Mutex<Vec<String>>>,
+        /// How many COM1 sessions were told to stop.
+        console_cancellations: Arc<AtomicUsize>,
     }
 
     /// One call into the endpoint provider: the identifier it was offered and
@@ -684,8 +702,93 @@ mod tests {
         }
     }
 
+    /// A launcher that records the console it would have opened instead of
+    /// opening one, and lets a test see the sessions that were told to stop.
+    fn console_launcher(calls: &Calls) -> Com1Launcher {
+        let recorded = calls.console.clone();
+        let steps = calls.steps.clone();
+        let mut launcher = Com1Launcher::for_test(
+            PathBuf::from(r"C:\VMLord\vmlord-com1.exe"),
+            move |command: &crate::com1_terminal::TerminalCommand| {
+                steps.lock().unwrap().push("console");
+                recorded.lock().unwrap().push(
+                    command
+                        .args
+                        .iter()
+                        .map(|argument| argument.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+                Ok(())
+            },
+        );
+        launcher.observe_cancellations(calls.console_cancellations.clone());
+        launcher
+    }
+
+    #[test]
+    fn starts_the_console_before_network_and_hcs() {
+        // Before, not after: the output that explains why a boot failed is
+        // written in the seconds right after HCS hands the VM to its worker.
+        let fixture = fixture_with("console-order", NetworkMode::Nat, None);
+        let calls = fixture.calls.clone();
+
+        let _session = pipeline(&calls, Behavior::default())
+            .start(&fixture.store, "dev", &fixture.vm_directory)
+            .unwrap();
+
+        assert_eq!(
+            calls.steps.lock().unwrap().as_slice(),
+            ["console", "endpoint", "dhcp", "grant", "grant", "start"]
+        );
+    }
+
+    #[test]
+    fn an_explicit_start_truncates_the_log_of_the_vm_it_starts() {
+        let fixture = fixture_with("console-arguments", NetworkMode::Nat, None);
+        let calls = fixture.calls.clone();
+
+        let _session = pipeline(&calls, Behavior::default())
+            .start(&fixture.store, "dev", &fixture.vm_directory)
+            .unwrap();
+
+        let console = calls.console.lock().unwrap().clone();
+        assert_eq!(console.len(), 1);
+        assert!(console[0].contains("--mode truncate"), "{}", console[0]);
+        assert!(
+            console[0].contains(&fixture.mapping.vm_id.as_simple().to_string()),
+            "the console must read the pipe of this VM: {}",
+            console[0]
+        );
+        assert!(
+            console[0].contains(&fixture.vm_directory.display().to_string()),
+            "the log belongs beside the VM: {}",
+            console[0]
+        );
+    }
+
+    #[test]
+    fn a_failure_after_console_launch_cancels_the_session() {
+        let fixture = fixture_with("console-cancel", NetworkMode::Nat, None);
+        let calls = fixture.calls.clone();
+
+        let error = pipeline(
+            &calls,
+            Behavior {
+                fail_endpoint: true,
+                ..Behavior::default()
+            },
+        )
+        .start(&fixture.store, "dev", &fixture.vm_directory)
+        .unwrap_err();
+
+        assert!(error.to_string().contains("endpoint"), "{error}");
+        assert_eq!(calls.console_cancellations.load(Ordering::Relaxed), 1);
+    }
+
     fn pipeline(calls: &Calls, behavior: Behavior) -> VmStartPipeline {
         VmStartPipeline::for_test(
+            console_launcher(calls),
             {
                 let calls = calls.clone();
                 move |id: &str, path: &Path| {
@@ -930,7 +1033,7 @@ mod tests {
 
         assert_eq!(
             calls.steps.lock().unwrap().clone(),
-            vec!["endpoint", "dhcp", "grant", "grant", "start"]
+            vec!["console", "endpoint", "dhcp", "grant", "grant", "start"]
         );
     }
 
@@ -1076,8 +1179,8 @@ mod tests {
         assert_eq!(
             calls.steps.lock().unwrap().clone(),
             vec![
-                "endpoint", "dhcp", "grant", "grant", "start", "endpoint", "dhcp", "grant",
-                "grant", "start"
+                "console", "endpoint", "dhcp", "grant", "grant", "start", "endpoint", "dhcp",
+                "grant", "grant", "start"
             ]
         );
     }
@@ -1273,6 +1376,7 @@ mod tests {
         let calls = fixture.calls.clone();
 
         let pipeline = VmStartPipeline::for_test(
+            console_launcher(&calls),
             |_id: &str, _path: &Path| Ok(()),
             |_id: &str, _configuration: &str| Ok(()),
             |_vm_name: &str, _recorded: Option<Uuid>, _policy: EndpointPolicy| {

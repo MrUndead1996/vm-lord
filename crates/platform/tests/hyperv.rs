@@ -20,10 +20,11 @@ use vmlord_core::{
     VmSummary,
 };
 use vmlord_platform::{
-    EndpointAddress, HcnEndpoint, HcnNetwork, HcsClient, HcsOperation, HcsSystem, HcsSystemState,
-    HcsVmRepository, MetadataStore, ReconnectOutcome, VMLORD_NETWORK_ID, VmComputeSystemMapping,
-    VmCreationPipeline, VmDeletionPipeline, VmEventSink, VmForceStopPipeline, VmShutdownPipeline,
-    VmStartPipeline, list_known_vms, open_by_vm_id, open_by_vm_name, reconnect_known_vms,
+    Com1Launcher, EndpointAddress, HcnEndpoint, HcnNetwork, HcsClient, HcsOperation, HcsSystem,
+    HcsSystemState, HcsVmRepository, MetadataStore, ReconnectOutcome, VMLORD_NETWORK_ID,
+    VmComputeSystemMapping, VmCreationPipeline, VmDeletionPipeline, VmEventSink,
+    VmForceStopPipeline, VmShutdownPipeline, VmStartPipeline, list_known_vms, open_by_vm_id,
+    open_by_vm_name, reconnect_known_vms,
 };
 
 // `GENERIC_ALL`; matches the legacy AppSandbox backend's `hcs_vm.c` usage and
@@ -107,20 +108,9 @@ fn a_cloud_vm_is_built_in_the_background() {
         .expect("the creation should be accepted");
     let accepted_in = accepted_at.elapsed();
 
-    let mut seen_building = false;
-    let deadline = std::time::Instant::now() + Duration::from_secs(20 * 60);
-    let outcome = loop {
-        let summaries = repository.list_vms().expect("listing should work");
-        match summaries.iter().find(|vm| vm.name == "bg-build") {
-            Some(vm) if matches!(vm.state, VmState::Building { .. }) => seen_building = true,
-            Some(_) => break Ok(()),
-            None => break Err(format!("the build failed: {:?}", repository.take_diagnostics())),
-        }
-        if std::time::Instant::now() >= deadline {
-            break Err("the build did not finish".to_owned());
-        }
-        std::thread::sleep(Duration::from_secs(2));
-    };
+    let outcome =
+        wait_until_build_finishes(&mut repository, "bg-build", Duration::from_secs(20 * 60));
+    let seen_building = outcome.as_ref().copied().unwrap_or(false);
 
     // Best-effort cleanup regardless of the assertions below.
     let _ = repository.delete_vm(VmDeleteRequest {
@@ -139,6 +129,96 @@ fn a_cloud_vm_is_built_in_the_background() {
         seen_building,
         "the VM must be listed as Building while it builds"
     );
+}
+
+/// Waits until VM `name` stops being listed as building, reporting whether it
+/// was ever seen building on the way.
+///
+/// A build that disappears from the list failed and rolled itself back, so the
+/// diagnostics it left are what the failure says.
+fn wait_until_build_finishes(
+    repository: &mut HcsVmRepository,
+    name: &str,
+    timeout: Duration,
+) -> Result<bool, String> {
+    let mut seen_building = false;
+    let deadline = Instant::now() + timeout;
+    loop {
+        let summaries = repository.list_vms().expect("listing should work");
+        match summaries.iter().find(|vm| vm.name == name) {
+            Some(vm) if matches!(vm.state, VmState::Building { .. }) => seen_building = true,
+            Some(_) => return Ok(seen_building),
+            None => {
+                return Err(format!(
+                    "the build failed: {:?}",
+                    repository.take_diagnostics()
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err("the build did not finish".to_owned());
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// Waits for cloud-init to appear in a VM's captured serial output.
+fn wait_for_cloud_init_log(path: &Path, timeout: Duration) -> Result<String, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(bytes) = fs::read(path) {
+            // Lossy on purpose: a serial console carries bytes, and this only
+            // has to find a word in them.
+            let text = String::from_utf8_lossy(&bytes);
+            if text.to_ascii_lowercase().contains("cloud-init") {
+                return Ok(text.into_owned());
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("cloud-init did not appear in {}", path.display()));
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// What COM1 is for: an Ubuntu cloud image says what it is doing on its serial
+/// port long before SSH exists, and that output has to reach `com1.log`.
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS and downloads a cloud image"]
+fn ubuntu_cloud_init_is_visible_on_com1() {
+    let root = std::env::temp_dir().join(format!("vmlord-com1-cloud-init-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut repository = cloud_repository(&root);
+    repository
+        .initialize()
+        .expect("the native backend should initialize on a Hyper-V host");
+    let name = "com1-cloud-init";
+
+    repository
+        .create_vm(background_cloud_request(name))
+        .expect("the creation should be accepted");
+    wait_until_build_finishes(&mut repository, name, Duration::from_secs(20 * 60))
+        .expect("the VM should finish building");
+    repository
+        .start_vm(name)
+        .expect("the built VM should start");
+
+    let result = wait_for_cloud_init_log(
+        &root.join(name).join("com1.log"),
+        Duration::from_secs(10 * 60),
+    );
+
+    // Cleanup after the capture and before the assertion: a VM left running is
+    // worse than a failed test.
+    let _ = repository.force_stop_vm(name);
+    let _ = repository.delete_vm(VmDeleteRequest {
+        name: name.into(),
+        delete_disks: true,
+    });
+    drop(repository);
+    let _ = fs::remove_dir_all(&root);
+
+    result.expect("Ubuntu cloud-init output should reach COM1");
 }
 
 /// A cancelled build leaves nothing: not the directory, not a metadata entry,
@@ -484,7 +564,11 @@ fn starts_a_created_vm() {
         .create(&store, &request, &vm_directory, &build_monitor())
         .expect("VM creation should succeed on an elevated Hyper-V host");
 
-    let started = VmStartPipeline::production().start(&store, &mapping.vm_name, &vm_directory);
+    let started = VmStartPipeline::production(Com1Launcher::production()).start(
+        &store,
+        &mapping.vm_name,
+        &vm_directory,
+    );
 
     // Best-effort cleanup regardless of the assertion below.
     if let Ok(system) = HcsSystem::open(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL) {
@@ -538,15 +622,18 @@ fn force_stopped_vm_can_be_started_again() {
     let mapping = VmCreationPipeline::production(no_cloud_images())
         .create(&store, &request, &vm_directory, &build_monitor())
         .expect("VM creation should succeed on an elevated Hyper-V host");
-    VmStartPipeline::production()
+    VmStartPipeline::production(Com1Launcher::production())
         .start(&store, &mapping.vm_name, &vm_directory)
         .expect("the created VM must start before it can be forcibly stopped");
 
     let force_stopped = VmForceStopPipeline::production().force_stop(&store, &mapping.vm_name);
-    let restarted = force_stopped
-        .as_ref()
-        .ok()
-        .map(|()| VmStartPipeline::production().start(&store, &mapping.vm_name, &vm_directory));
+    let restarted = force_stopped.as_ref().ok().map(|()| {
+        VmStartPipeline::production(Com1Launcher::production()).start(
+            &store,
+            &mapping.vm_name,
+            &vm_directory,
+        )
+    });
 
     // Best-effort cleanup regardless of the assertions below: a successful
     // restart leaves the VM running again.
@@ -601,7 +688,7 @@ fn accepts_the_shutdown_options_document() {
     let mapping = VmCreationPipeline::production(no_cloud_images())
         .create(&store, &request, &vm_directory, &build_monitor())
         .expect("VM creation should succeed on an elevated Hyper-V host");
-    VmStartPipeline::production()
+    VmStartPipeline::production(Com1Launcher::production())
         .start(&store, &mapping.vm_name, &vm_directory)
         .expect("the created VM must start before it can be shut down");
 
@@ -744,7 +831,7 @@ fn reconnects_to_a_running_vm() {
     let mapping = VmCreationPipeline::production(no_cloud_images())
         .create(&store, &request, &vm_directory, &build_monitor())
         .expect("VM creation should succeed on an elevated Hyper-V host");
-    VmStartPipeline::production()
+    VmStartPipeline::production(Com1Launcher::production())
         .start(&store, &mapping.vm_name, &vm_directory)
         .expect("the created VM must start before a reconnect can be observed");
 
@@ -1105,7 +1192,7 @@ fn starts_a_nat_vm_on_its_endpoint() {
     );
 
     let outcome = (|| -> Result<(), String> {
-        VmStartPipeline::production()
+        VmStartPipeline::production(Com1Launcher::production())
             .start(&store, &mapping.vm_name, &vm_directory)
             .map_err(|error| format!("the NAT VM must start: {error}"))?;
 
@@ -1138,7 +1225,7 @@ fn starts_a_nat_vm_on_its_endpoint() {
                 .terminate()
                 .and_then(|operation| operation.wait_for_completion(Duration::from_secs(30)));
         }
-        VmStartPipeline::production()
+        VmStartPipeline::production(Com1Launcher::production())
             .start(&store, &mapping.vm_name, &vm_directory)
             .map_err(|error| format!("the NAT VM must start a second time: {error}"))?;
 
@@ -1215,7 +1302,7 @@ fn a_forcibly_stopped_nat_vm_starts_again_on_the_same_endpoint() {
         .expect("VM creation should succeed on an elevated Hyper-V host");
 
     let outcome = (|| -> Result<(), String> {
-        VmStartPipeline::production()
+        VmStartPipeline::production(Com1Launcher::production())
             .start(&store, &mapping.vm_name, &vm_directory)
             .map_err(|error| format!("the NAT VM must start: {error}"))?;
 
@@ -1226,7 +1313,7 @@ fn a_forcibly_stopped_nat_vm_starts_again_on_the_same_endpoint() {
             .force_stop(&store, &mapping.vm_name)
             .map_err(|error| format!("a running VM must accept a forced stop: {error}"))?;
 
-        VmStartPipeline::production()
+        VmStartPipeline::production(Com1Launcher::production())
             .start(&store, &mapping.vm_name, &vm_directory)
             .map_err(|error| {
                 format!(
@@ -1330,7 +1417,7 @@ fn a_started_nat_vm_is_served_the_address_hns_assigned() {
         // The start fails rather than coming up silently without a network if
         // the DHCP server cannot bind UDP 67, so this is also the check that
         // nothing else on the host is already serving it.
-        VmStartPipeline::production()
+        VmStartPipeline::production(Com1Launcher::production())
             .start(&store, &mapping.vm_name, &vm_directory)
             .map_err(|error| {
                 format!("a NAT VM must start with its DHCP server running: {error}")
@@ -1357,7 +1444,7 @@ fn a_started_nat_vm_is_served_the_address_hns_assigned() {
                 .terminate()
                 .and_then(|operation| operation.wait_for_completion(Duration::from_secs(30)));
         }
-        VmStartPipeline::production()
+        VmStartPipeline::production(Com1Launcher::production())
             .start(&store, &mapping.vm_name, &vm_directory)
             .map_err(|error| {
                 format!("a second start must not trip over the existing reservation: {error}")

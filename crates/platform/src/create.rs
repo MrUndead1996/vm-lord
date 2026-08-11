@@ -172,7 +172,8 @@ impl VmCreationPipeline {
         let seed_path = layout::seed_path(vm_directory);
         // Rejects an unsupported request (name, GPU/network mode, ...) before
         // any filesystem or HCS side effect.
-        let configuration = HcsVmConfigBuilder::build(request, &system_disk_path, &seed_path)?;
+        let configuration =
+            HcsVmConfigBuilder::build(request, &system_disk_path, &seed_path, vm_id)?;
         let media_path = hcs_config::media_path(request, &seed_path).to_path_buf();
 
         log::info!(

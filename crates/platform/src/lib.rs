@@ -11,6 +11,8 @@ compile_error!("vmlord-platform supports Windows only");
 
 mod build;
 mod cleanup;
+mod com1_reader;
+mod com1_terminal;
 mod create;
 mod delete;
 mod dhcp;
@@ -37,6 +39,8 @@ mod vhd;
 mod vm_key;
 mod watch;
 
+pub use com1_reader::{Com1HelperOptions, Com1LogMode, parse_com1_helper_args, run_com1_helper};
+pub use com1_terminal::{Com1Launcher, Com1Session};
 pub use create::{CloudDiskImporter, VmCreationPipeline};
 pub use delete::VmDeletionPipeline;
 pub use enumerate::{KnownVm, list_known_vms, open_by_vm_id, open_by_vm_name};

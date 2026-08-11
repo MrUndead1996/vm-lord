@@ -10,6 +10,15 @@ name = "vmlord"
 test = false
 bench = false
 
+# The COM1 diagnostic reader, hosted by a terminal window rather than by the
+# GUI. It ships beside `vmlord.exe` because that is where the launcher looks
+# for it.
+[[bin]]
+name = "vmlord-com1"
+path = "src/bin/vmlord-com1.rs"
+test = false
+bench = false
+
 [dependencies]
 log.workspace = true
 vmlord-app = { path = "../app" }
