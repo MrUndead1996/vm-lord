@@ -11,14 +11,24 @@
 use std::{
     ffi::OsString,
     fmt,
-    net::IpAddr,
+    fs::File,
+    io::Read,
+    net::{IpAddr, SocketAddr, TcpStream},
+    os::windows::process::CommandExt,
     path::{Path, PathBuf},
-    time::Duration,
+    process::{Child, Command, Stdio},
+    time::{Duration, Instant},
 };
 
 use vmlord_core::{BuildMonitor, GuestReadinessTimeouts, RepositoryError};
 
-use crate::{layout, metadata::VmComputeSystemMapping};
+use crate::{hcn_endpoint::HcnEndpoint, layout, metadata::VmComputeSystemMapping};
+
+/// Keeps the readiness command from flashing a console window of its own.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// How often a running `ssh.exe` is looked at.
+const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 /// How often an unfinished phase looks again.
 ///
@@ -439,20 +449,159 @@ pub(crate) fn tail(text: &str, lines: usize) -> String {
     kept[start..].join("\n").trim().to_owned()
 }
 
-fn endpoint_address(_mapping: &VmComputeSystemMapping) -> Result<Option<IpAddr>, RepositoryError> {
-    unimplemented!("wired in the next task")
+/// The address HNS has given the VM's endpoint, if it has one yet.
+///
+/// The endpoint is where a guest's address is known on the host side: HNS
+/// assigns it and VMLord's DHCP server offers the guest that one and no other.
+/// An address HNS spells in a way that does not parse is reported as no address
+/// rather than as an error -- it is exactly as unusable as none at all, and the
+/// phase's own timeout is what turns that into a failure.
+fn endpoint_address(mapping: &VmComputeSystemMapping) -> Result<Option<IpAddr>, RepositoryError> {
+    let Some(endpoint_id) = mapping.endpoint_id else {
+        return Ok(None);
+    };
+    let Some(endpoint) = HcnEndpoint::open_if_present(endpoint_id)? else {
+        return Ok(None);
+    };
+    let Some(address) = endpoint.address()? else {
+        return Ok(None);
+    };
+    match address.ip_address.parse() {
+        Ok(ip) => Ok(Some(ip)),
+        Err(error) => {
+            log::debug!(
+                "HNS reported \"{}\" as the address of VM \"{}\", which is not an IP address: \
+                 {error}",
+                address.ip_address,
+                mapping.vm_name
+            );
+            Ok(None)
+        }
+    }
 }
 
-fn probe_port(_ip: IpAddr, _timeout: Duration) -> Result<(), String> {
-    unimplemented!("wired in the next task")
+/// Whether anything answers a TCP connection at `ip:port`.
+fn probe_port_at(ip: IpAddr, port: u16, timeout: Duration) -> Result<(), String> {
+    TcpStream::connect_timeout(&SocketAddr::new(ip, port), timeout)
+        .map(drop)
+        .map_err(|error| error.to_string())
 }
 
+fn probe_port(ip: IpAddr, timeout: Duration) -> Result<(), String> {
+    probe_port_at(ip, SSH_PORT, timeout)
+}
+
+/// Runs one readiness command, killing it at `deadline` or on cancellation.
 fn run_ssh(
-    _invocation: &SshInvocation,
-    _deadline: Duration,
-    _monitor: &BuildMonitor,
+    invocation: &SshInvocation,
+    deadline: Duration,
+    monitor: &BuildMonitor,
 ) -> Result<SshRun, RepositoryError> {
-    unimplemented!("wired in the next task")
+    let transcript = File::create(&invocation.transcript).map_err(|error| {
+        let error = RepositoryError::new(format!(
+            "failed to open the readiness transcript {}: {error}",
+            invocation.transcript.display()
+        ));
+        log::error!("{error}");
+        error
+    })?;
+    let errors = transcript.try_clone().map_err(|error| {
+        let error = RepositoryError::new(format!(
+            "failed to capture the errors of the readiness command: {error}"
+        ));
+        log::error!("{error}");
+        error
+    })?;
+
+    log::debug!(
+        "running {} to wait for cloud-init; its output goes to {}",
+        invocation.program.display(),
+        invocation.transcript.display()
+    );
+    let mut child = Command::new(&invocation.program)
+        .args(&invocation.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(transcript))
+        .stderr(Stdio::from(errors))
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|error| {
+            let error = RepositoryError::new(format!(
+                "failed to run {}: {error}",
+                invocation.program.display()
+            ));
+            log::error!("{error}");
+            error
+        })?;
+
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Ok(SshRun::Exited {
+                    code: status.code(),
+                    transcript_tail: transcript_tail(&invocation.transcript),
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let error = RepositoryError::new(format!(
+                    "failed to wait for {}: {error}",
+                    invocation.program.display()
+                ));
+                log::error!("{error}");
+                return Err(error);
+            }
+        }
+
+        if monitor.is_cancelled() {
+            log::warn!("killing the readiness command because the build was cancelled");
+            kill(&mut child);
+            return Ok(SshRun::Cancelled);
+        }
+        if started.elapsed() >= deadline {
+            log::error!(
+                "the readiness command did not finish within {} seconds; killing it",
+                deadline.as_secs()
+            );
+            kill(&mut child);
+            return Ok(SshRun::Exited {
+                code: None,
+                transcript_tail: transcript_tail(&invocation.transcript),
+            });
+        }
+        std::thread::sleep(CHILD_POLL_INTERVAL);
+    }
+}
+
+/// Kills a child and reaps it, so that no zombie handle is left behind.
+fn kill(child: &mut Child) {
+    if let Err(error) = child.kill() {
+        log::warn!("the readiness command could not be killed: {error}");
+        return;
+    }
+    if let Err(error) = child.wait() {
+        log::warn!("the killed readiness command could not be reaped: {error}");
+    }
+}
+
+/// The end of a file, or nothing when there is nothing to read.
+fn file_tail(path: &Path) -> Option<String> {
+    let mut text = String::new();
+    File::open(path).ok()?.read_to_string(&mut text).ok()?;
+    Some(tail(&text, DIAGNOSTIC_TAIL_LINES))
+}
+
+fn transcript_tail(path: &Path) -> String {
+    file_tail(path).unwrap_or_default()
+}
+
+/// The end of the VM's serial console log, for a diagnostic about a guest that
+/// never became ready. A VM with no log yet has nothing to add rather than an
+/// error to report.
+pub(crate) fn com1_tail(vm_directory: &Path) -> Option<String> {
+    let captured = file_tail(&layout::com1_log_path(vm_directory))?;
+    (!captured.is_empty()).then_some(captured)
 }
 
 fn elapsed_since_start() -> impl Fn() -> Duration + Send + Sync {
@@ -750,6 +899,44 @@ mod tests {
 
         assert_eq!(failure, ReadinessFailure::NoSshClient);
         assert_eq!(clock.elapsed(), Duration::ZERO, "nothing may be waited for");
+    }
+
+    #[test]
+    fn the_com1_tail_is_the_end_of_the_log_and_nothing_more() {
+        let directory =
+            std::env::temp_dir().join(format!("vmlord-com1-tail-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let lines = (1..=100)
+            .map(|n| format!("boot line {n}"))
+            .collect::<Vec<_>>();
+        std::fs::write(crate::layout::com1_log_path(&directory), lines.join("\n")).unwrap();
+
+        let captured = super::com1_tail(&directory).unwrap();
+
+        assert!(captured.contains("boot line 100"), "{captured}");
+        assert!(
+            !captured.contains("boot line 59"),
+            "only the last {} lines belong in a diagnostic: {captured}",
+            super::DIAGNOSTIC_TAIL_LINES
+        );
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn a_vm_without_a_serial_log_has_no_tail_rather_than_an_error() {
+        // A VM whose console never opened still has to produce a diagnostic
+        // about its readiness; a missing log is simply nothing to add to one.
+        assert_eq!(super::com1_tail(Path::new(r"C:\VMs\never-existed")), None);
+    }
+
+    #[test]
+    fn a_probe_of_a_port_nobody_listens_on_fails_rather_than_hangs() {
+        // Port 9 is discard, which nothing serves on a developer machine: the
+        // probe has to come back with a reason rather than block.
+        let probed =
+            super::probe_port_at("127.0.0.1".parse().unwrap(), 9, Duration::from_millis(200));
+
+        assert!(probed.is_err(), "an unserved port must not report success");
     }
 
     #[test]
