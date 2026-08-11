@@ -177,15 +177,23 @@ impl Com1Sessions {
 }
 
 /// What a launch does once a terminal has been asked to start.
+///
+/// Test-only: production always waits for the helper process itself, and a
+/// launcher with no helper to wait for exists only in tests.
+#[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Readiness {
-    /// Production: wait for the helper process to say it is capturing.
+    /// Wait for the helper process to say it is capturing, as production does.
     Await,
-    /// Test: no helper exists, so stand in for one that reports readiness.
+    /// Stand in for a helper that reports readiness.
     Immediate,
-    /// Test: stand in for a helper that never does.
+    /// Stand in for a helper that never does.
     Never,
 }
+
+/// Starts one terminal host, which is what a test replaces to keep a launch
+/// off screen.
+type TerminalSpawner = Arc<dyn Fn(&TerminalCommand) -> io::Result<()> + Send + Sync>;
 
 /// Opens the diagnostic console of a VM.
 #[derive(Clone)]
@@ -193,7 +201,8 @@ pub struct Com1Launcher {
     /// `None` in production: the helper is found beside this executable at
     /// launch time, which is also where the failure to find it belongs.
     helper: Option<PathBuf>,
-    spawn: Arc<dyn Fn(&TerminalCommand) -> io::Result<()> + Send + Sync>,
+    spawn: TerminalSpawner,
+    #[cfg(test)]
     readiness: Readiness,
     readiness_timeout: Duration,
     cancellations: Option<Arc<AtomicUsize>>,
@@ -205,6 +214,7 @@ impl Com1Launcher {
         Self {
             helper: None,
             spawn: Arc::new(spawn_terminal),
+            #[cfg(test)]
             readiness: Readiness::Await,
             readiness_timeout: READINESS_TIMEOUT,
             cancellations: None,
@@ -241,6 +251,7 @@ impl Com1Launcher {
 
         let arguments = helper_arguments(mapping, vm_directory, mode, &events);
         self.spawn_somewhere(&helper, &mapping.vm_name, &arguments)?;
+        #[cfg(test)]
         if self.readiness == Readiness::Immediate {
             ready.signal()?;
         }

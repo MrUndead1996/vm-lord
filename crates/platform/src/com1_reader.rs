@@ -19,8 +19,9 @@ use windows::{
     Win32::{
         Foundation::{
             CloseHandle, ERROR_BROKEN_PIPE, ERROR_FILE_NOT_FOUND, ERROR_IO_INCOMPLETE,
-            ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY, GENERIC_READ, HANDLE,
-            WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+            ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_OPERATION_ABORTED, ERROR_PIPE_BUSY,
+            ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, HANDLE, WAIT_FAILED, WAIT_OBJECT_0,
+            WAIT_TIMEOUT,
         },
         Storage::FileSystem::{
             CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -408,11 +409,21 @@ fn abandon_read(pipe: &OwnedHandle, overlapped: &OVERLAPPED) {
     let _ = unsafe { GetOverlappedResult(pipe.0, overlapped, &raw mut transferred, true) };
 }
 
-/// The three ways a pipe stops delivering that are not failures: the guest
-/// closed it, the compute system went away, or this process cancelled the read.
+/// The ways a pipe stops delivering that are not failures: the guest closed it,
+/// the compute system it belonged to went away, or this process cancelled the
+/// read.
+///
+/// `ERROR_PIPE_NOT_CONNECTED` and `ERROR_NO_DATA` are in this list because they
+/// are what a VM being stopped looks like from here: HCS tears the serving end
+/// down under a pending read, and that read completes with one of them rather
+/// than with the broken pipe a guest-side close produces. Treating them as
+/// failures made every force-stop tell the user that COM1 had stopped
+/// unexpectedly.
 fn is_end_of_stream(error: &Error) -> bool {
     let code = error.code();
     code == ERROR_BROKEN_PIPE.to_hresult()
+        || code == ERROR_PIPE_NOT_CONNECTED.to_hresult()
+        || code == ERROR_NO_DATA.to_hresult()
         || code == ERROR_OPERATION_ABORTED.to_hresult()
         || code == ERROR_IO_INCOMPLETE.to_hresult()
 }
@@ -487,7 +498,14 @@ fn open_log(options: &Com1HelperOptions) -> Result<File, RepositoryError> {
 mod tests {
     use std::ffi::OsString;
 
-    use super::{Com1LogMode, mirror_chunk, parse_com1_helper_args};
+    use windows::{
+        Win32::Foundation::{
+            ERROR_ACCESS_DENIED, ERROR_BROKEN_PIPE, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED,
+        },
+        core::Error,
+    };
+
+    use super::{Com1LogMode, is_end_of_stream, mirror_chunk, parse_com1_helper_args};
 
     fn arguments() -> Vec<OsString> {
         [
@@ -571,6 +589,24 @@ mod tests {
         arguments[7] = OsString::from("0");
 
         assert!(parse_com1_helper_args(arguments).is_err());
+    }
+
+    #[test]
+    fn a_vm_being_stopped_ends_the_capture_rather_than_failing_it() {
+        // Observed on a Hyper-V host: stopping the VM completes the pending
+        // read with ERROR_PIPE_NOT_CONNECTED, not with a broken pipe. Reported
+        // as a failure, it told the user COM1 had stopped unexpectedly every
+        // time they stopped a VM.
+        for expected in [ERROR_PIPE_NOT_CONNECTED, ERROR_NO_DATA, ERROR_BROKEN_PIPE] {
+            assert!(
+                is_end_of_stream(&Error::from_hresult(expected.to_hresult())),
+                "{expected:?} is how a stopped VM ends a capture"
+            );
+        }
+        assert!(
+            !is_end_of_stream(&Error::from_hresult(ERROR_ACCESS_DENIED.to_hresult())),
+            "a reader that cannot read has not reached the end of anything"
+        );
     }
 
     #[test]
