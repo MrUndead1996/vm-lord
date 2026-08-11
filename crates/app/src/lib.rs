@@ -1,10 +1,11 @@
 //! Application workflows shared by desktop, CLI, and future automation clients.
 
-use std::fmt;
+use std::{fmt, path::PathBuf};
 
 use vmlord_core::{
-    AppSettings, Diagnostic, DiagnosticLevel, RepositoryError, SettingsError, SettingsStore,
-    VmCreateRequest, VmDeleteRequest, VmRepository, VmState, VmSummary, VmUpdateRequest,
+    AppSettings, Diagnostic, DiagnosticLevel, GuestDefaults, RepositoryError, SettingsError,
+    SettingsStore, VmCreateRequest, VmDeleteRequest, VmRepository, VmState, VmSummary,
+    VmUpdateRequest,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,6 +45,8 @@ pub enum VmAction {
     Start,
     Stop,
     ForceStop,
+    /// Stop building a VM that is still being created.
+    CancelCreate,
     Connect,
     Ssh,
     Edit,
@@ -57,6 +60,7 @@ impl VmAction {
             Self::Start => "Start",
             Self::Stop => "Stop",
             Self::ForceStop => "Force stop",
+            Self::CancelCreate => "Cancel creation",
             Self::Connect => "Connect",
             Self::Ssh => "SSH",
             Self::Edit => "Edit",
@@ -79,6 +83,7 @@ pub struct WorkspaceApp {
     image_picker: Option<Box<dyn ImagePicker>>,
     settings_path_picker: Option<Box<dyn SettingsPathPicker>>,
     settings: Option<SettingsContext>,
+    guest_defaults: GuestDefaults,
     status: BackendStatus,
     vms: Vec<VmSummary>,
     diagnostics: Vec<Diagnostic>,
@@ -97,6 +102,7 @@ impl WorkspaceApp {
             image_picker: None,
             settings_path_picker: None,
             settings: None,
+            guest_defaults: GuestDefaults::default(),
             status: BackendStatus::Starting,
             vms: Vec::new(),
             diagnostics: Vec::new(),
@@ -122,6 +128,35 @@ impl WorkspaceApp {
             current: settings,
         });
         self
+    }
+
+    /// Sets what a new VM's locale, keyboard layout and timezone start out as.
+    ///
+    /// Reading them from Windows is the composition root's job (#60); without
+    /// that call the application offers [`GuestDefaults::default`], which is a
+    /// guest that boots rather than a guest with no settings at all.
+    #[must_use]
+    pub fn with_guest_defaults(mut self, guest_defaults: GuestDefaults) -> Self {
+        self.guest_defaults = guest_defaults;
+        self
+    }
+
+    /// What a create form fills its guest settings with before anyone edits
+    /// them.
+    #[must_use]
+    pub fn guest_defaults(&self) -> &GuestDefaults {
+        &self.guest_defaults
+    }
+
+    /// Where the private half of the key pair VMLord generates for `name` is
+    /// written.
+    ///
+    /// Answered by the backend rather than composed here: the on-disk layout of
+    /// a VM is the platform layer's to decide, and the create form has to be
+    /// able to show the path before the VM -- and therefore the file -- exists.
+    #[must_use]
+    pub fn ssh_key_path(&self, name: &str) -> Option<PathBuf> {
+        self.repository.ssh_key_path(name)
     }
 
     #[must_use]
@@ -658,6 +693,10 @@ mod tests {
             Ok(())
         }
 
+        fn ssh_key_path(&self, name: &str) -> Option<PathBuf> {
+            Some(PathBuf::from("/vms").join(name).join("id_ed25519"))
+        }
+
         fn open_display(&mut self, name: &str) -> Result<(), RepositoryError> {
             self.actions.push(format!("display:{name}"));
             Ok(())
@@ -698,6 +737,51 @@ mod tests {
                 diagnostic.level == DiagnosticLevel::Error && diagnostic.message.contains("dev")
             }),
             "the user has to be told the cancellation did not happen"
+        );
+    }
+
+    /// The create form fills three fields from this, and it is the composition
+    /// root -- not the form -- that knows what the host says (#60).
+    #[test]
+    fn guest_defaults_are_offered_and_can_be_replaced_by_the_composition_root() {
+        let app = WorkspaceApp::new(Box::new(FakeRepository {
+            should_fail: false,
+            create_should_fail: false,
+            vm_is_running: false,
+            actions: Vec::new(),
+        }));
+
+        assert_eq!(app.guest_defaults(), &GuestDefaults::default());
+
+        let from_host = GuestDefaults {
+            locale: "ru_RU.UTF-8".into(),
+            keyboard: "ru".into(),
+            timezone: "Europe/Moscow".into(),
+        };
+        let app = app.with_guest_defaults(from_host.clone());
+
+        assert_eq!(app.guest_defaults(), &from_host);
+    }
+
+    /// Where a VM's key pair goes is the backend's to say, and the form shows
+    /// it before the VM -- and therefore the file -- exists.
+    #[test]
+    fn the_key_path_of_a_vm_comes_from_the_backend() {
+        let app = WorkspaceApp::new(Box::new(FakeRepository {
+            should_fail: false,
+            create_should_fail: false,
+            vm_is_running: false,
+            actions: Vec::new(),
+        }));
+
+        assert_eq!(
+            app.ssh_key_path("dev"),
+            Some(PathBuf::from("/vms").join("dev").join("id_ed25519"))
+        );
+        assert_eq!(
+            WorkspaceApp::new(unavailable_repository("no backend")).ssh_key_path("dev"),
+            None,
+            "a backend that gives VMs no keys of their own answers nothing"
         );
     }
 

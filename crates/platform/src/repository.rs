@@ -657,6 +657,17 @@ impl VmRepository for HcsVmRepository {
         Ok(())
     }
 
+    /// Where VM `name`'s private key is, or will be once it is created.
+    ///
+    /// A name that cannot be a directory has no key path rather than an error:
+    /// this answers a label in a dialog, and the same name is refused with a
+    /// message of its own the moment the VM is actually created.
+    fn ssh_key_path(&self, name: &str) -> Option<PathBuf> {
+        layout::vm_directory(&self.storage_root, name)
+            .ok()
+            .map(|directory| layout::ssh_key_path(&directory))
+    }
+
     fn cancel_create(&mut self, name: &str) -> Result<(), RepositoryError> {
         self.require_initialized()?;
         self.builds.cancel(name)
@@ -788,6 +799,35 @@ mod tests {
             gpu_mode: GpuMode::None,
             network_mode: NetworkMode::None,
         }
+    }
+
+    /// The create form shows this path beside the toggle that asks for a key
+    /// pair, so it has to be the path the VM will actually get -- named by
+    /// `layout`, and answered before the VM exists.
+    #[test]
+    fn the_key_path_of_a_vm_is_answered_before_the_vm_exists() {
+        let repository = repository();
+
+        let path = repository
+            .ssh_key_path("dev")
+            .expect("a plain name has a key path");
+
+        assert_eq!(
+            path,
+            crate::layout::ssh_key_path(
+                &crate::layout::vm_directory(
+                    &std::env::temp_dir().join("vmlord-repository-test"),
+                    "dev",
+                )
+                .unwrap(),
+            )
+        );
+        assert!(!path.exists(), "no VM has been created");
+        assert_eq!(
+            repository.ssh_key_path("../escape"),
+            None,
+            "a name that is not a directory names no file either"
+        );
     }
 
     /// A build in flight is not in the metadata store yet, so without this the

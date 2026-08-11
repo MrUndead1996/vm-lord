@@ -11,7 +11,9 @@ pub use logging::{LoggingError, initialize as initialize_logging};
 pub use progress::{
     BuildMonitor, BuildProgress, BuildStep, DownloadPhase, ProgressPublisher, ProgressThrottle,
 };
-pub use provisioning::{CloudImage, Password, Provisioning, SshAccess, VmSource};
+pub use provisioning::{
+    CloudImage, GuestDefaults, Password, Provisioning, SshAccess, VmSource, validate_vm_name,
+};
 pub use settings::{AppSettings, Language, LogLevel, SettingsError, SettingsStore};
 
 use std::fmt;
@@ -35,9 +37,7 @@ impl VmCreateRequest {
     /// Validates the fields required to provision a VM, before any
     /// filesystem or Windows API side effect is attempted.
     pub fn validate(&self) -> Result<(), RepositoryError> {
-        if self.name.trim().is_empty() {
-            return Err(RepositoryError::new("VM name must not be empty"));
-        }
+        validate_vm_name(&self.name)?;
         self.source.validate()?;
         if self.ram_mb == 0 {
             return Err(RepositoryError::new("VM RAM must be greater than zero"));
@@ -192,6 +192,14 @@ pub trait VmRepository {
         Err(RepositoryError::new(
             "this backend creates VMs in the foreground, so there is nothing to cancel",
         ))
+    }
+    /// Where the private half of the VM's own SSH key pair is, or will be.
+    ///
+    /// A path rather than a file: the create form shows it beside the toggle
+    /// that asks for a key pair, which is before any file exists. `None` is
+    /// what a backend answers when it does not give VMs keys of their own.
+    fn ssh_key_path(&self, _name: &str) -> Option<std::path::PathBuf> {
+        None
     }
     fn open_display(&mut self, _name: &str) -> Result<(), RepositoryError> {
         Err(RepositoryError::new(
