@@ -14,6 +14,7 @@ mod cleanup;
 mod com1_reader;
 mod com1_terminal;
 mod create;
+mod cycle;
 mod delete;
 mod dhcp;
 mod enumerate;

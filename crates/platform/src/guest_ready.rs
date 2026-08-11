@@ -338,7 +338,7 @@ impl GuestReadiness {
     }
 
     #[cfg(test)]
-    fn for_test(
+    pub(crate) fn for_test(
         timeouts: ReadinessTimeouts,
         address: impl Fn(&VmComputeSystemMapping) -> Result<Option<IpAddr>, RepositoryError>
         + Send
@@ -364,7 +364,7 @@ impl GuestReadiness {
     }
 
     #[cfg(test)]
-    fn for_test_without_client(
+    pub(crate) fn for_test_without_client(
         timeouts: ReadinessTimeouts,
         now: impl Fn() -> Duration + Send + Sync + 'static,
     ) -> Self {
