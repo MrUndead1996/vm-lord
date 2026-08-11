@@ -80,6 +80,135 @@ fn posix_locale(bcp47: &str) -> Option<String> {
     })
 }
 
+/// What a KLID means to X11, for the layouts a host is likely to be set to.
+///
+/// No crate maps these: the Windows side is a registry identifier and the
+/// Linux side is an `xkeyboard-config` name, and nothing publishes the join.
+/// The list is the frequent layouts rather than every one Windows ships --
+/// what is missing falls through to the language below, and then to `us`.
+const KEYBOARD_LAYOUTS: [(u32, &str); 50] = [
+    (0x0000_0409, "us"),
+    (0x0000_0809, "gb"),
+    (0x0000_0407, "de"),
+    (0x0000_0807, "ch"),
+    (0x0000_040c, "fr"),
+    (0x0000_080c, "be"),
+    (0x0000_0c0c, "ca"),
+    (0x0000_040a, "es"),
+    (0x0000_080a, "latam"),
+    (0x0000_0410, "it"),
+    (0x0000_0816, "pt"),
+    (0x0000_0416, "br"),
+    (0x0000_0413, "nl"),
+    (0x0000_041d, "se"),
+    (0x0000_0406, "dk"),
+    (0x0000_0414, "no"),
+    (0x0000_040b, "fi"),
+    (0x0000_040f, "is"),
+    (0x0000_0415, "pl"),
+    (0x0000_0405, "cz"),
+    (0x0000_041b, "sk"),
+    (0x0000_040e, "hu"),
+    (0x0000_0418, "ro"),
+    (0x0000_0402, "bg"),
+    (0x0000_041a, "hr"),
+    (0x0000_0424, "si"),
+    (0x0000_081a, "rs"),
+    (0x0000_0c1a, "rs"),
+    (0x0000_0419, "ru"),
+    (0x0000_0422, "ua"),
+    (0x0000_0423, "by"),
+    (0x0000_043f, "kz"),
+    (0x0000_0408, "gr"),
+    (0x0000_041f, "tr"),
+    (0x0000_042c, "az"),
+    (0x0000_040d, "il"),
+    (0x0000_0401, "ara"),
+    (0x0000_0429, "ir"),
+    (0x0000_041e, "th"),
+    (0x0000_0411, "jp"),
+    (0x0000_0412, "kr"),
+    (0x0000_0804, "cn"),
+    (0x0000_0404, "tw"),
+    (0x0000_042a, "vn"),
+    (0x0000_0425, "ee"),
+    (0x0000_0426, "lv"),
+    (0x0000_0427, "lt"),
+    (0x0000_0439, "in"),
+    (0x0000_042f, "mk"),
+    (0x0000_041c, "al"),
+];
+
+/// The layout a primary language implies, for the sublanguages
+/// [`KEYBOARD_LAYOUTS`] does not list one by one.
+///
+/// Keyed by the low ten bits of a LANGID, which is the language without its
+/// country: every Spanish of Latin America shares `0x0a`.
+const LANGUAGE_LAYOUTS: [(u16, &str); 24] = [
+    (0x0009, "us"),
+    (0x0007, "de"),
+    (0x000c, "fr"),
+    (0x000a, "es"),
+    (0x0010, "it"),
+    (0x0016, "pt"),
+    (0x0013, "nl"),
+    (0x001d, "se"),
+    (0x0006, "dk"),
+    (0x0014, "no"),
+    (0x000b, "fi"),
+    (0x0015, "pl"),
+    (0x0005, "cz"),
+    (0x000e, "hu"),
+    (0x0018, "ro"),
+    (0x0002, "bg"),
+    (0x0019, "ru"),
+    (0x0022, "ua"),
+    (0x0008, "gr"),
+    (0x001f, "tr"),
+    (0x000d, "il"),
+    (0x0001, "ara"),
+    (0x0011, "jp"),
+    (0x0004, "cn"),
+];
+
+/// The XKB layout name for the Windows keyboard identifier `klid`.
+///
+/// `klid` is eight hexadecimal digits, `00000419`. Four steps, each one wider
+/// than the last: the identifier itself, the identifier without its variant,
+/// the language alone, and finally `us` -- which the epic names as the
+/// fallback that keeps an unrecognised host from blocking a VM.
+fn xkb_layout(klid: &str) -> String {
+    const DEFAULT_LAYOUT: &str = "us";
+
+    let Ok(identifier) = u32::from_str_radix(klid.trim(), 16) else {
+        log::warn!("the host keyboard identifier \"{klid}\" is not a KLID; using {DEFAULT_LAYOUT}");
+        return DEFAULT_LAYOUT.to_owned();
+    };
+
+    let language_id = (identifier & 0xffff) as u16;
+    let base = u32::from(language_id);
+    let primary_language = language_id & 0x03ff;
+
+    let found = KEYBOARD_LAYOUTS
+        .iter()
+        .find(|(known, _)| *known == identifier || *known == base)
+        .map(|(_, layout)| *layout)
+        .or_else(|| {
+            LANGUAGE_LAYOUTS
+                .iter()
+                .find(|(known, _)| *known == primary_language)
+                .map(|(_, layout)| *layout)
+        });
+
+    match found {
+        Some(layout) => layout.to_owned(),
+        None => {
+            log::warn!("no XKB layout is known for the host KLID {klid}; using {DEFAULT_LAYOUT}");
+            DEFAULT_LAYOUT.to_owned()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +278,45 @@ mod tests {
         assert_eq!(posix_locale("---"), None);
         assert_eq!(posix_locale("ru_RU"), None);
         assert_eq!(posix_locale("r-RU"), None);
+    }
+
+    #[test]
+    fn a_known_klid_becomes_its_xkb_layout() {
+        assert_eq!(xkb_layout("00000419"), "ru");
+        assert_eq!(xkb_layout("00000409"), "us");
+        assert_eq!(xkb_layout("0000080a"), "latam");
+    }
+
+    /// Windows numbers a variant of a layout by setting the high word. The
+    /// base layout is the right answer for a variant the table does not list:
+    /// US-International is still a `us` keyboard.
+    #[test]
+    fn a_variant_falls_back_to_its_base_layout() {
+        assert_eq!(xkb_layout("00020409"), "us");
+        assert_eq!(xkb_layout("00010419"), "ru");
+    }
+
+    /// Sublanguages the table does not list still name a language, and the
+    /// language names a layout.
+    #[test]
+    fn an_unlisted_sublanguage_falls_back_to_its_language() {
+        assert_eq!(xkb_layout("00000c0a"), "es");
+        assert_eq!(xkb_layout("00001407"), "de");
+    }
+
+    /// The last resort the epic names: a layout nobody recognises does not
+    /// stop a VM from being created.
+    #[test]
+    fn an_unrecognised_klid_falls_back_to_us() {
+        assert_eq!(xkb_layout("0000ffff"), "us");
+        assert_eq!(xkb_layout("not a klid"), "us");
+        assert_eq!(xkb_layout(""), "us");
+    }
+
+    /// Windows writes a KLID in lower case; a table that only matched that
+    /// would be one `to_ascii_lowercase` away from a silent fallback.
+    #[test]
+    fn a_klid_is_read_regardless_of_its_case() {
+        assert_eq!(xkb_layout("0000041D"), "se");
     }
 }
