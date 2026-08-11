@@ -53,6 +53,15 @@ pub(crate) fn com1_log_path(vm_directory: &Path) -> PathBuf {
     vm_directory.join(COM1_LOG_FILE_NAME)
 }
 
+/// Returns the path of the transcript the readiness wait captures.
+///
+/// Beside `com1.log`, and for the same reason: it records what the VM did, not
+/// what it is made of. Its existence also says that the wait got as far as
+/// running something inside the guest, which the serial log alone does not.
+pub(crate) fn cloud_init_status_log_path(vm_directory: &Path) -> PathBuf {
+    vm_directory.join("cloud-init-status.log")
+}
+
 /// Returns the path of the VM's system disk.
 pub(crate) fn system_disk_path(vm_directory: &Path) -> PathBuf {
     vm_directory.join("disks").join("system.vhdx")
@@ -86,9 +95,23 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        com1_log_path, configuration_path, seed_path, ssh_key_path, ssh_public_key_path,
-        system_disk_path, vm_directory,
+        cloud_init_status_log_path, com1_log_path, configuration_path, seed_path, ssh_key_path,
+        ssh_public_key_path, system_disk_path, vm_directory,
     };
+
+    #[test]
+    fn the_readiness_transcript_lives_beside_the_serial_log() {
+        // Both record what the VM did rather than what it is made of, so both
+        // sit beside `config.json` rather than under `disks/`.
+        let directory = vm_directory(Path::new("/vms"), "dev-linux").unwrap();
+
+        assert_eq!(
+            cloud_init_status_log_path(&directory),
+            PathBuf::from("/vms")
+                .join("dev-linux")
+                .join("cloud-init-status.log")
+        );
+    }
 
     #[test]
     fn a_plain_name_becomes_a_directory_under_the_storage_root() {
