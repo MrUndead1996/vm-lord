@@ -3,9 +3,12 @@ use std::time::Duration;
 use windows::{
     Win32::{
         Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
-        System::Threading::{CreateEventW, SetEvent, WaitForSingleObject},
+        System::Threading::{
+            CreateEventW, EVENT_MODIFY_STATE, OpenEventW, SYNCHRONIZATION_SYNCHRONIZE, SetEvent,
+            WaitForSingleObject,
+        },
     },
-    core::Error,
+    core::{Error, HSTRING},
 };
 
 use crate::error::windows_error;
@@ -33,6 +36,40 @@ impl WindowsEvent {
         Ok(Self(handle))
     }
 
+    /// Creates an event under `name`, so that another process can open it.
+    ///
+    /// The name is expected to live in the `Local\` namespace: the helper runs
+    /// in the same session as VMLord, and a global name would let any session
+    /// on the machine cancel a reader.
+    pub fn create_named(
+        name: &str,
+        manual_reset: bool,
+        initially_signaled: bool,
+    ) -> Result<Self, vmlord_core::RepositoryError> {
+        let name = HSTRING::from(name);
+        // SAFETY: `name` outlives the call, and the returned handle is owned by
+        // this wrapper and closed in `Drop`.
+        let handle = unsafe { CreateEventW(None, manual_reset, initially_signaled, &name) }
+            .map_err(|error| windows_error("create named event", None, error))?;
+        Ok(Self(handle))
+    }
+
+    /// Opens an event another process created under `name`.
+    pub fn open(name: &str) -> Result<Self, vmlord_core::RepositoryError> {
+        let name = HSTRING::from(name);
+        // SAFETY: `name` outlives the call, and the returned handle is owned by
+        // this wrapper and closed in `Drop`.
+        let handle = unsafe {
+            OpenEventW(
+                EVENT_MODIFY_STATE | SYNCHRONIZATION_SYNCHRONIZE,
+                false,
+                &name,
+            )
+        }
+        .map_err(|error| windows_error("open named event", None, error))?;
+        Ok(Self(handle))
+    }
+
     /// Signals the event.
     pub fn signal(&self) -> Result<(), vmlord_core::RepositoryError> {
         // SAFETY: `self.0` is a valid event handle for the lifetime of `self`.
@@ -53,6 +90,20 @@ impl WindowsEvent {
             ))),
         }
     }
+
+    /// Reports whether the event is signaled right now, without blocking.
+    pub fn is_signaled(&self) -> Result<bool, vmlord_core::RepositoryError> {
+        Ok(matches!(
+            self.wait(Duration::ZERO)?,
+            EventWaitResult::Signaled
+        ))
+    }
+
+    /// The raw handle, for the few places that have to wait on an event
+    /// alongside other kernel objects.
+    pub(crate) fn raw_handle(&self) -> HANDLE {
+        self.0
+    }
 }
 
 impl Drop for WindowsEvent {
@@ -66,7 +117,29 @@ impl Drop for WindowsEvent {
 mod tests {
     use std::time::Duration;
 
+    use uuid::Uuid;
+
     use super::{EventWaitResult, WindowsEvent};
+
+    #[test]
+    fn a_named_event_can_be_opened_by_another_owner() {
+        // The COM1 helper runs in its own process: the parent creates the
+        // events, the helper opens them by name, and both see one state.
+        let name = format!(r"Local\VMLord.Test.{}", Uuid::new_v4());
+        let created = WindowsEvent::create_named(&name, true, false).unwrap();
+        let opened = WindowsEvent::open(&name).unwrap();
+
+        assert!(!opened.is_signaled().unwrap());
+        created.signal().unwrap();
+        assert!(opened.is_signaled().unwrap());
+    }
+
+    #[test]
+    fn opening_an_event_nobody_created_fails() {
+        let name = format!(r"Local\VMLord.Test.Missing.{}", Uuid::new_v4());
+
+        assert!(WindowsEvent::open(&name).is_err());
+    }
 
     #[test]
     fn event_can_be_signaled_and_waited() {
