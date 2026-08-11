@@ -46,6 +46,52 @@ pub type CloudDiskImporter = Box<
     dyn Fn(&CloudImage, u64, &Path, &BuildMonitor) -> Result<(), RepositoryError> + Send + Sync,
 >;
 
+/// Removes what a creation had built if it leaves without disarming this.
+///
+/// The `Err` path disarms the guard and rolls back explicitly, because the
+/// error the caller sees has to be able to say what the rollback itself could
+/// not do. What is left for the guard is the path with no `Err` to carry a
+/// message: a panic, which would otherwise leave a VM directory -- and
+/// possibly a compute system -- that nothing else knows about.
+///
+/// `catch_unwind` would be the other way to do this, and cannot be: the
+/// pipeline's seams are boxed closures, which are not `UnwindSafe`, and
+/// `AssertUnwindSafe` would assert exactly what needs proving.
+struct CreationGuard<'a> {
+    vm_directory: &'a Path,
+    teardown: &'a SystemTeardown,
+    hcs_compute_system_id: &'a str,
+    system_created: bool,
+    armed: bool,
+}
+
+impl Drop for CreationGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        log::error!(
+            "creating the VM at {} was interrupted; removing what it had created",
+            self.vm_directory.display()
+        );
+        if self.system_created
+            && let Err(error) = (self.teardown)(self.hcs_compute_system_id)
+        {
+            log::error!(
+                "the compute system \"{}\" of the interrupted creation could not be \
+                 torn down: {error}",
+                self.hcs_compute_system_id
+            );
+        }
+        if let Err(error) = cleanup::remove_vm_directory(self.vm_directory) {
+            log::error!(
+                "the directory of the interrupted creation at {} could not be removed: {error}",
+                self.vm_directory.display()
+            );
+        }
+    }
+}
+
 /// Orchestrates the multi-step, transactional creation of an HCS-backed VM.
 ///
 /// Every step after the VM directory is created is wrapped so that any
@@ -157,11 +203,17 @@ impl VmCreationPipeline {
             network_mode: request.network_mode,
         };
 
-        let mut system_created = false;
+        let mut guard = CreationGuard {
+            vm_directory,
+            teardown: &self.system_teardown,
+            hcs_compute_system_id: &hcs_compute_system_id,
+            system_created: false,
+            armed: true,
+        };
         // The disk is made the size the VM asked for, whichever way it is
         // filled: an empty VHDX and an imported image agree on this much.
         let disk_size_bytes = u64::from(request.disk_gb) * BYTES_PER_GIB;
-        let result = (|| {
+        let result = (|guard: &mut CreationGuard| {
             monitor.check_cancelled()?;
             match &request.source {
                 VmSource::LocalMedia { .. } => {
@@ -219,18 +271,19 @@ impl VmCreationPipeline {
             monitor.check_cancelled()?;
             monitor.report(BuildStep::Registering);
             (self.system_creator)(&hcs_compute_system_id, &configuration)?;
-            system_created = true;
+            guard.system_created = true;
 
             store.insert(mapping.clone())?;
             Ok(())
-        })();
+        })(&mut guard);
 
+        guard.armed = false;
         match result {
             Ok(()) => {
                 log::info!("created VM \"{}\" ({vm_id})", request.name);
                 Ok(mapping)
             }
-            Err(error) => Err(self.rollback(vm_directory, &mapping, system_created, error)),
+            Err(error) => Err(self.rollback(vm_directory, &mapping, guard.system_created, error)),
         }
     }
 
@@ -581,6 +634,51 @@ mod tests {
             },
             |_| Ok(()),
         )
+    }
+
+    /// A build runs on its own thread, and a panic there would otherwise leave
+    /// the VM's directory behind for good: nothing else knows it was ever
+    /// being created.
+    #[test]
+    fn a_panicking_step_leaves_no_vm_directory_behind() {
+        let fixture = fixture("panicking");
+        let calls = fixture.calls.clone();
+        let pipeline = VmCreationPipeline::for_test(
+            {
+                let calls = calls.clone();
+                move |path: &std::path::Path, size| {
+                    calls.vhd.lock().unwrap().push((path.to_path_buf(), size));
+                    fs::write(path, b"vhdx").unwrap();
+                    Ok(())
+                }
+            },
+            |_: &CloudImage, _, _: &std::path::Path, _: &BuildMonitor| Ok(()),
+            |_, _| Ok(()),
+            |_: &str, _: &str| panic!("the HCS client panicked"),
+            {
+                let calls = calls.clone();
+                move |id: &str| {
+                    calls.teardown.lock().unwrap().push(id.to_owned());
+                    Ok(())
+                }
+            },
+        );
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = pipeline.create(
+                &fixture.store,
+                &fixture.request,
+                &fixture.vm_directory,
+                &monitor(),
+            );
+        }));
+
+        assert!(panicked.is_err(), "the panic must reach the caller");
+        assert!(
+            !fixture.vm_directory.exists(),
+            "the guard must remove what the interrupted build had created"
+        );
+        assert!(fixture.store.list().unwrap().is_empty());
     }
 
     #[test]
