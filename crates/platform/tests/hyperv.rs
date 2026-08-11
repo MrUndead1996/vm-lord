@@ -10,7 +10,9 @@
 
 use std::{
     fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -20,9 +22,9 @@ use vmlord_core::{
     VmSummary,
 };
 use vmlord_platform::{
-    Com1Launcher, EndpointAddress, HcnEndpoint, HcnNetwork, HcsClient, HcsOperation, HcsSystem,
-    HcsSystemState, HcsVmRepository, MetadataStore, ReconnectOutcome, VMLORD_NETWORK_ID,
-    VmComputeSystemMapping, VmCreationPipeline, VmDeletionPipeline, VmEventSink,
+    Com1Launcher, EndpointAddress, HcnEndpoint, HcnNetwork, HcsClient, HcsOperation,
+    HcsStartFailure, HcsSystem, HcsSystemState, HcsVmRepository, MetadataStore, ReconnectOutcome,
+    VMLORD_NETWORK_ID, VmComputeSystemMapping, VmCreationPipeline, VmDeletionPipeline, VmEventSink,
     VmForceStopPipeline, VmShutdownPipeline, VmStartPipeline, list_known_vms, open_by_vm_id,
     open_by_vm_name, reconnect_known_vms,
 };
@@ -1988,4 +1990,139 @@ fn a_vm_is_created_from_a_real_cloud_image() {
         document.pointer("/VirtualMachine/Devices/Scsi/Primary/Attachments/1/Path"),
         Some(&serde_json::json!(vm_directory.join("seed.iso")))
     );
+}
+
+/// The COM1 pipe the helper opens, derived the way `hcs_config` derives it.
+fn com1_pipe_path(vm_id: Uuid) -> String {
+    format!(r"\\.\pipe\vmlord-{}.com1", vm_id.as_simple())
+}
+
+/// Everything the guest has said so far, collected by a thread so that the test
+/// can wait for a prompt while the guest is still talking.
+fn read_com1_in_background(pipe: fs::File) -> Arc<Mutex<String>> {
+    let transcript = Arc::new(Mutex::new(String::new()));
+    let collected = Arc::clone(&transcript);
+    std::thread::spawn(move || {
+        let mut pipe = pipe;
+        let mut buffer = [0u8; 4096];
+        while let Ok(read) = pipe.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            collected
+                .lock()
+                .unwrap()
+                .push_str(&String::from_utf8_lossy(&buffer[..read]));
+        }
+    });
+    transcript
+}
+
+/// Waits until the guest has said `expected`, or gives up with what it did say.
+fn wait_for_console(
+    transcript: &Arc<Mutex<String>>,
+    expected: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if transcript.lock().unwrap().contains(expected) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let seen = transcript.lock().unwrap().clone();
+            let tail: String = seen
+                .chars()
+                .rev()
+                .take(400)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            return Err(format!(
+                "\"{expected}\" never appeared on COM1; last output was: {tail}"
+            ));
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// The reason this task exists: a guest with no network is reachable only
+/// through its serial port, and only if the console can be typed into.
+///
+/// The VM is started through HCS directly rather than through the repository,
+/// because a repository start opens its own console helper and HCS serves one
+/// pipe instance -- the test has to be the only client.
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS and downloads a cloud image"]
+fn a_guest_can_be_logged_into_over_com1() {
+    let root = std::env::temp_dir().join(format!("vmlord-com1-login-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut repository = cloud_repository(&root);
+    repository
+        .initialize()
+        .expect("the native backend should initialize on a Hyper-V host");
+    let name = "com1-login";
+    let mut request = background_cloud_request(name);
+    if let VmSource::CloudImage { provisioning, .. } = &mut request.source {
+        // Without a password there is no console login: cloud-init turns
+        // password authentication off and the user has no password at all.
+        provisioning.password = Some(vmlord_core::Password::new("vmlord-console"));
+    }
+
+    repository
+        .create_vm(request)
+        .expect("the creation should be accepted");
+    wait_until_build_finishes(&mut repository, name, Duration::from_secs(20 * 60))
+        .expect("the VM should finish building");
+    let store = MetadataStore::new(root.join("vm-mapping.json"));
+    let mapping = store
+        .find_by_vm_name(name)
+        .expect("the mapping file should be readable")
+        .expect("a built VM has a mapping");
+    let system = open_by_vm_name(&store, name, HCS_ACCESS_ALL).expect("the VM should open");
+    system
+        .start_and_wait(Duration::from_secs(120))
+        .map_err(HcsStartFailure::into_error)
+        .expect("the built VM should start");
+
+    let result = (|| -> Result<(), String> {
+        let pipe = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(com1_pipe_path(mapping.vm_id))
+            .map_err(|error| format!("the COM1 pipe should open duplex: {error}"))?;
+        let mut input = pipe
+            .try_clone()
+            .map_err(|error| format!("the pipe handle should clone: {error}"))?;
+        let transcript = read_com1_in_background(pipe);
+
+        wait_for_console(&transcript, "login:", Duration::from_secs(10 * 60))?;
+        // Carriage return, not newline: this is a tty, and Enter is 0x0d.
+        input
+            .write_all(b"dev\r")
+            .map_err(|error| error.to_string())?;
+        wait_for_console(&transcript, "Password:", Duration::from_secs(60))?;
+        input
+            .write_all(b"vmlord-console\r")
+            .map_err(|error| error.to_string())?;
+        wait_for_console(&transcript, "dev@", Duration::from_secs(120))?;
+        input
+            .write_all(b"echo vmlord-console-works\r")
+            .map_err(|error| error.to_string())?;
+        wait_for_console(&transcript, "vmlord-console-works", Duration::from_secs(60))
+    })();
+
+    // Cleanup before the assertion: a VM left running is worse than a failed
+    // test.
+    let _ = system.terminate_and_wait(Duration::from_secs(120));
+    drop(system);
+    let _ = repository.delete_vm(VmDeleteRequest {
+        name: name.into(),
+        delete_disks: true,
+    });
+    drop(repository);
+    let _ = fs::remove_dir_all(&root);
+
+    result.expect("a guest should accept a login typed into COM1");
 }
