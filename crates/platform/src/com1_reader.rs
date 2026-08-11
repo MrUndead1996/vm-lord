@@ -11,6 +11,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Write},
     path::PathBuf,
+    sync::Arc,
     time::Duration,
 };
 
@@ -38,7 +39,7 @@ use windows::{
     core::{Error, HSTRING},
 };
 
-use crate::{error::windows_error, event::WindowsEvent};
+use crate::{com1_input::start_input, error::windows_error, event::WindowsEvent};
 
 /// How long one connection attempt waits for the pipe to exist.
 ///
@@ -229,6 +230,11 @@ fn capture(
         return Ok(());
     };
     log::debug!("COM1 reader for VM \"{}\" is connected", options.vm_name);
+
+    // The pipe is shared, not handed over: the input thread outlives this call
+    // by design, and its `Arc` keeps the handle open until the process exits.
+    let pipe = Arc::new(pipe);
+    start_input(Arc::clone(&pipe), options.vm_name.clone())?;
 
     read_until_closed(&pipe, &io_event, cancel, &parent, &mut log_file, options)
 }

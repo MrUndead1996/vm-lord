@@ -11,6 +11,7 @@ compile_error!("vmlord-platform supports Windows only");
 
 mod build;
 mod cleanup;
+mod com1_input;
 mod com1_reader;
 mod com1_terminal;
 mod create;
