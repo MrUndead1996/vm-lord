@@ -7,7 +7,7 @@ use std::{
     sync::atomic::AtomicBool,
 };
 
-use vmlord_core::ProgressThrottle;
+use vmlord_core::{DownloadPhase, ProgressThrottle};
 
 use crate::{
     cache::checksum_reader,
@@ -113,7 +113,7 @@ impl PartFile {
     /// would quietly succeed, which is exactly why this has to be deliberate.
     pub(crate) fn checksum(
         &mut self,
-        progress: &mut ProgressThrottle,
+        progress: &mut ProgressThrottle<DownloadPhase>,
         cancel: &AtomicBool,
     ) -> Result<String, DownloadError> {
         let total = self.len()?;

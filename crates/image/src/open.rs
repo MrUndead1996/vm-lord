@@ -8,7 +8,7 @@
 
 use std::{path::Path, sync::atomic::AtomicBool};
 
-use vmlord_core::{DistroProfile, ProgressPublisher, RepositoryError};
+use vmlord_core::{DistroProfile, DownloadPhase, ProgressPublisher, RepositoryError};
 
 use crate::{
     download::{ImageDownloadRequest, fetch_image},
@@ -35,7 +35,7 @@ pub fn open_cloud_image(
     release: &str,
     cache_directory: &Path,
     capacity: u64,
-    progress: &ProgressPublisher,
+    progress: &ProgressPublisher<DownloadPhase>,
     cancel: &AtomicBool,
 ) -> Result<Qcow2Image, RepositoryError> {
     log::debug!(

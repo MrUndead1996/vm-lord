@@ -37,7 +37,7 @@ pub struct ImageDownloadRequest<'a> {
 /// megabytes.
 pub fn fetch_image(
     request: ImageDownloadRequest<'_>,
-    progress: &ProgressPublisher,
+    progress: &ProgressPublisher<DownloadPhase>,
     cancel: &AtomicBool,
 ) -> Result<PathBuf, DownloadError> {
     let expected =
@@ -86,7 +86,7 @@ pub fn fetch_image(
 fn cache_hit(
     final_path: &Path,
     expected: &str,
-    throttle: &mut ProgressThrottle,
+    throttle: &mut ProgressThrottle<DownloadPhase>,
     cancel: &AtomicBool,
 ) -> Result<bool, DownloadError> {
     let actual = file_checksum(final_path, throttle, cancel)?;
@@ -139,7 +139,7 @@ fn publish_into_cache(part: &mut PartFile, final_path: &Path) -> Result<(), Down
 fn download_into(
     part: &mut PartFile,
     url: &str,
-    throttle: &mut ProgressThrottle,
+    throttle: &mut ProgressThrottle<DownloadPhase>,
     cancel: &AtomicBool,
 ) -> Result<(), DownloadError> {
     let agent = build_agent();
