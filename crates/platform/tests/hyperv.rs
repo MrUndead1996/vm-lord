@@ -722,10 +722,11 @@ fn force_stopped_vm_can_be_started_again() {
 ///
 /// This is the regression check for the options document alone --
 /// `HcsShutDownComputeSystem` rejects a null options pointer with
-/// `HCS_E_INVALID_JSON`, so the pipeline must pass `"{}"`. It deliberately
-/// does not assert that the shutdown succeeds: this VM boots installer media,
-/// so it runs no guest OS that could service the request, and HCS reports
-/// `ERROR_NOT_SUPPORTED`. `shuts_down_a_running_guest` is the test that
+/// `HCS_E_INVALID_JSON`, so the pipeline must pass a parsable one, and since
+/// #70 that document also names the mechanism the request travels by. It
+/// deliberately does not assert that the shutdown succeeds: this VM boots
+/// installer media, so whether anything in it answers the shutdown service is
+/// the installer's business. `shuts_down_a_running_guest` is the test that
 /// asserts a shutdown actually works.
 ///
 /// Set `VMLORD_TEST_IMAGE_PATH` to a real bootable ISO.
@@ -928,14 +929,19 @@ fn reconnects_to_a_running_vm() {
 }
 
 /// Asserts that a graceful shutdown actually stops a VM whose guest OS is
-/// running and able to service the request.
+/// running and able to service the request -- and that the guest, not the test,
+/// is what stops it.
 ///
-/// This is the test that distinguishes "this particular guest cannot service a
-/// shutdown" from "HCS never delivers a shutdown to a plain Hyper-V VM": a
-/// guest-less VM reports `ERROR_NOT_SUPPORTED`, and if a fully booted guest
-/// reports it too, `HcsShutDownComputeSystem` is the wrong mechanism for
-/// VMLord's VMs and graceful shutdown needs an in-guest agent instead (which
-/// is how the legacy AppSandbox backend implemented it).
+/// This is #70's regression test, and it covers both halves of that bug at
+/// once, because either one alone brings `ERROR_NOT_SUPPORTED` back: the
+/// configuration has to offer the guest a shutdown integration service, and the
+/// shutdown call has to name that service as the mechanism to carry the
+/// request. Before both, a graceful stop failed for every guest VMLord could
+/// build, and the only way to stop a VM was to pull its power.
+///
+/// A `shutdown` that returns `Ok` proves only that HCS took the request, so the
+/// assertion is on the compute system's disappearance: HCS destroys it as the
+/// VM stops, which nothing but the guest actually halting produces here.
 ///
 /// `VmCreationPipeline` always formats a fresh empty disk and attaches an
 /// installer ISO, so it cannot produce a VM with a booted guest. This test
@@ -1001,8 +1007,9 @@ fn shuts_down_a_running_guest() {
     let _ = fs::remove_dir_all(&root);
 
     result.expect(
-        "a running guest must accept a graceful shutdown; ERROR_NOT_SUPPORTED here means \
-         HcsShutDownComputeSystem cannot shut down VMLord's VMs at all",
+        "a running guest must accept a graceful shutdown and act on it; ERROR_NOT_SUPPORTED \
+         here means the VM was not offered a shutdown service or the request did not name it \
+         as its mechanism (#70)",
     );
 }
 
@@ -1018,7 +1025,11 @@ fn boot_and_shut_down(
     boot_wait: Duration,
 ) -> Result<(), vmlord_core::RepositoryError> {
     let configuration = serde_json::json!({
-        "SchemaVersion": { "Major": 2, "Minor": 1 },
+        // 2.5 and the `Services` section together are what #70 fixed: an older
+        // schema has no integration components in its model, so the guest is
+        // offered no shutdown channel to answer through and the shutdown
+        // operation fails however healthy the guest is.
+        "SchemaVersion": { "Major": 2, "Minor": 5 },
         "Owner": "VMLord",
         "ShouldTerminateOnLastHandleClosed": false,
         "VirtualMachine": {
@@ -1039,7 +1050,8 @@ fn boot_and_shut_down(
                 "HvSocket": { "HvSocketConfig": { "ServiceTable": {} } },
                 "Keyboard": {},
                 "Mouse": {}
-            }
+            },
+            "Services": { "Shutdown": {}, "Timesync": {} }
         }
     })
     .to_string();
@@ -1060,7 +1072,41 @@ fn boot_and_shut_down(
     );
     std::thread::sleep(boot_wait);
 
-    VmShutdownPipeline::production().shutdown(store, "guest-shutdown-probe")
+    VmShutdownPipeline::production().shutdown(store, "guest-shutdown-probe")?;
+    println!("the shutdown request was delivered; waiting for the guest to power itself off");
+    wait_until_gone(hcs_id, POWEROFF_WAIT)
+}
+
+/// How long a guest is given to finish powering off once it has been asked to.
+///
+/// The request returns as soon as HCS has delivered it, so this is the guest's
+/// own unmount-and-halt, not an API call: generous, because a slow disk is not
+/// a failed shutdown.
+const POWEROFF_WAIT: Duration = Duration::from_secs(180);
+
+/// Waits until HCS no longer knows `hcs_id`, which is what a guest that really
+/// powered itself off leaves behind.
+///
+/// HCS destroys a compute system as it stops, exactly as it does for a
+/// termination, so the system's absence -- and not the shutdown call returning
+/// `Ok`, which only means the request was delivered -- is the proof the guest
+/// acted on the request.
+fn wait_until_gone(hcs_id: &str, timeout: Duration) -> Result<(), vmlord_core::RepositoryError> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if HcsSystem::open_if_present(hcs_id, HCS_ACCESS_ALL)?.is_none() {
+            println!("HCS no longer knows \"{hcs_id}\": the guest powered itself off");
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(vmlord_core::RepositoryError::new(format!(
+                "compute system \"{hcs_id}\" was still there {}s after its guest accepted the \
+                 shutdown request",
+                timeout.as_secs()
+            )));
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
 }
 
 /// Exercises TASK-32's deletion against the real Host Compute Service: creates
