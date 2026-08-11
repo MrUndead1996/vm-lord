@@ -8,7 +8,7 @@ use std::{
 use eframe::egui;
 use vmlord_app::{BackendStatus, VmAction, WorkspaceApp};
 use vmlord_core::{
-    AgentStatus, AppSettings, DiagnosticLevel, GpuMode, Language, LogLevel, NetworkMode,
+    AgentStatus, AppSettings, BuildStep, DiagnosticLevel, GpuMode, Language, LogLevel, NetworkMode,
     VmCreateRequest, VmDeleteRequest, VmSource, VmState, VmSummary, VmUpdateRequest,
 };
 
@@ -991,18 +991,21 @@ fn render_selected_vm(
     ui.heading(format!("Selected VM: {}", vm.name));
 
     let primary_action = match vm.state {
-        VmState::Stopped => (VmAction::Start, "Start"),
+        VmState::Stopped | VmState::Building { .. } => (VmAction::Start, "Start"),
         VmState::Starting | VmState::Running { .. } => (VmAction::Stop, "Stop"),
     };
     let is_running = matches!(vm.state, VmState::Running { .. });
+    // A VM that is still being created has nothing to start, stop, edit or
+    // delete yet: what exists of it is a directory the build still owns.
+    let is_building = matches!(vm.state, VmState::Building { .. });
     let can_delete = matches!(vm.state, VmState::Stopped);
     let mut action = None;
     ui.horizontal(|ui| {
         action = render_action_group(
             ui,
             &[primary_action, (VmAction::ForceStop, "Force stop")],
-            true,
-            None,
+            !is_building,
+            Some("Available when the VM has finished building"),
         );
         ui.separator();
         if let Some(clicked_action) = render_action_group(
@@ -1028,7 +1031,7 @@ fn render_selected_vm(
         if let Some(clicked_action) = render_action_group(
             ui,
             &[(VmAction::Edit, "Edit")],
-            true,
+            !is_building,
             Some("Changes to a running VM apply after a restart"),
         ) {
             action = Some(clicked_action);
@@ -1319,7 +1322,7 @@ fn render_agent_status(ui: &mut egui::Ui, status: AgentStatus) {
 fn agent_status(state: VmState) -> AgentStatus {
     match state {
         VmState::Running { agent_status } => agent_status,
-        VmState::Stopped | VmState::Starting => AgentStatus::Unknown,
+        VmState::Stopped | VmState::Building { .. } | VmState::Starting => AgentStatus::Unknown,
     }
 }
 
@@ -1334,7 +1337,13 @@ fn agent_status_label(status: AgentStatus) -> &'static str {
 fn vm_state(state: VmState) -> &'static str {
     match state {
         VmState::Stopped => "Stopped",
-        VmState::Starting => "Building",
+        VmState::Building { progress } => match progress.step {
+            BuildStep::Downloading => "Building: downloading",
+            BuildStep::WritingDisk => "Building: writing the disk",
+            BuildStep::Provisioning => "Building: provisioning",
+            BuildStep::Registering => "Building: registering",
+        },
+        VmState::Starting => "Starting",
         VmState::Running { .. } => "Running",
     }
 }
@@ -1342,6 +1351,34 @@ fn vm_state(state: VmState) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Starting` and `Building` are different things, and the label said
+    /// "Building" for `Starting` only because there was no building state yet.
+    #[test]
+    fn each_state_gets_its_own_label() {
+        use vmlord_core::{BuildProgress, BuildStep};
+
+        assert_eq!(vm_state(VmState::Stopped), "Stopped");
+        assert_eq!(vm_state(VmState::Starting), "Starting");
+        assert_eq!(
+            vm_state(VmState::Building {
+                progress: BuildProgress {
+                    step: BuildStep::Downloading,
+                    download: None,
+                },
+            }),
+            "Building: downloading"
+        );
+        assert_eq!(
+            vm_state(VmState::Building {
+                progress: BuildProgress {
+                    step: BuildStep::Registering,
+                    download: None,
+                },
+            }),
+            "Building: registering"
+        );
+    }
 
     #[test]
     fn edit_vm_request_accepts_supported_modes() {

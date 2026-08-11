@@ -92,8 +92,15 @@ pub struct VmSummary {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VmState {
     Stopped,
+    /// The VM is being created: nothing of it exists yet that could be
+    /// started, stopped or deleted.
+    Building {
+        progress: BuildProgress,
+    },
     Starting,
-    Running { agent_status: AgentStatus },
+    Running {
+        agent_status: AgentStatus,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
