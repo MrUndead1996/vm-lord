@@ -1,6 +1,9 @@
 //! Copying an image onto a disk, and proving afterwards that it landed.
 
-use std::io::Read;
+use std::{
+    io::Read,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use vmlord_core::RepositoryError;
 
@@ -64,11 +67,16 @@ struct Written {
 ///
 /// `chunk_bytes` is the unit all of this works in; production passes
 /// [`CHUNK_BYTES`](super::plan::CHUNK_BYTES), and the tests pass kilobytes.
+///
+/// `cancel` is polled once per chunk. A build is cancelled by the user or by
+/// VMLord shutting down, and a copy that only noticed afterwards would hold
+/// both for as long as a disk takes to write.
 pub(crate) fn copy_image(
     source: &mut dyn Read,
     disk: &mut dyn DiskBlocks,
     capacity: u64,
     chunk_bytes: usize,
+    cancel: &AtomicBool,
 ) -> Result<ImportSummary, RepositoryError> {
     let mut chunk = vec![0u8; chunk_bytes];
     // The one chunk that is not written where it is read. It is held whole
@@ -82,6 +90,11 @@ pub(crate) fn copy_image(
     let mut offset = 0u64;
 
     loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(repository_error(
+                "writing the disk was cancelled".to_owned(),
+            ));
+        }
         let used = fill_chunk(source, &mut chunk)
             .map_err(|error| repository_error(format!("reading the image failed: {error}")))?;
         if used == 0 {
@@ -180,6 +193,11 @@ mod tests {
 
     const CHUNK: usize = 4096;
 
+    /// The flag of a copy nobody has cancelled.
+    fn running() -> std::sync::atomic::AtomicBool {
+        std::sync::atomic::AtomicBool::new(false)
+    }
+
     /// A disk that remembers not only what it holds but which of its bytes were
     /// ever written to, so a test can tell a skipped hole from a chunk of zeros
     /// that was written out in full.
@@ -242,6 +260,22 @@ mod tests {
             .collect()
     }
 
+    /// Writing a disk is the second-longest step of creating a VM, and a
+    /// cancellation that only takes effect after it would not be a
+    /// cancellation.
+    #[test]
+    fn a_cancelled_copy_stops_and_reports_why() {
+        let cancel = std::sync::atomic::AtomicBool::new(true);
+        let mut source = Cursor::new(vec![7u8; CHUNK * 4]);
+        let mut disk = MemoryDisk::new(CHUNK * 4);
+
+        let error = copy_image(&mut source, &mut disk, (CHUNK * 4) as u64, CHUNK, &cancel)
+            .expect_err("a cancelled copy must not report success");
+
+        assert!(error.to_string().contains("cancelled"), "got {error}");
+        assert!(disk.write_offsets().is_empty());
+    }
+
     #[test]
     fn every_byte_of_the_image_lands_at_the_offset_it_came_from() {
         let source = image(3);
@@ -252,6 +286,7 @@ mod tests {
             &mut disk,
             8 * CHUNK as u64,
             CHUNK,
+            &running(),
         )
         .expect("the import should succeed");
 
@@ -274,6 +309,7 @@ mod tests {
             &mut disk,
             8 * CHUNK as u64,
             CHUNK,
+            &running(),
         )
         .expect("the import should succeed");
 
@@ -293,7 +329,7 @@ mod tests {
         source[..CHUNK].fill(0);
         let mut disk = MemoryDisk::new(8 * CHUNK);
 
-        let summary = copy_image(&mut Cursor::new(source), &mut disk, 8 * CHUNK as u64, CHUNK)
+        let summary = copy_image(&mut Cursor::new(source), &mut disk, 8 * CHUNK as u64, CHUNK, &running())
             .expect("the import should succeed");
 
         assert_eq!(disk.write_offsets(), vec![CHUNK as u64]);
@@ -309,6 +345,7 @@ mod tests {
             &mut disk,
             8 * CHUNK as u64,
             CHUNK,
+            &running(),
         )
         .expect("the import should succeed");
 
@@ -330,6 +367,7 @@ mod tests {
             &mut disk,
             8 * CHUNK as u64,
             CHUNK,
+            &running(),
         )
         .expect("the import should succeed");
 
@@ -348,6 +386,7 @@ mod tests {
             &mut disk,
             2 * CHUNK as u64,
             CHUNK,
+            &running(),
         )
         .expect_err("an image that does not fit must be refused");
 
@@ -364,6 +403,7 @@ mod tests {
             &mut disk,
             8 * CHUNK as u64,
             CHUNK,
+            &running(),
         )
         .expect_err("a write that did not land must be reported");
 
@@ -382,6 +422,7 @@ mod tests {
             &mut disk,
             8 * CHUNK as u64,
             CHUNK,
+            &running(),
         )
         .expect("the import should succeed");
 
@@ -398,7 +439,7 @@ mod tests {
         let mut source = image(3);
         source[CHUNK..2 * CHUNK].fill(0);
 
-        let summary = copy_image(&mut Cursor::new(source), &mut disk, 8 * CHUNK as u64, CHUNK)
+        let summary = copy_image(&mut Cursor::new(source), &mut disk, 8 * CHUNK as u64, CHUNK, &running())
             .expect("the import should succeed");
 
         assert_eq!(summary.verified_bytes, summary.written_bytes);

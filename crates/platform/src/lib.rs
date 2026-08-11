@@ -9,6 +9,7 @@
 #[cfg(not(windows))]
 compile_error!("vmlord-platform supports Windows only");
 
+mod build;
 mod cleanup;
 mod create;
 mod delete;

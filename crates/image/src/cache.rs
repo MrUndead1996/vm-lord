@@ -72,7 +72,7 @@ fn url_extension(url: &str) -> Option<&str> {
 /// it costs seconds against re-fetching hundreds of megabytes.
 pub(crate) fn file_checksum(
     path: &Path,
-    progress: &mut ProgressThrottle,
+    progress: &mut ProgressThrottle<DownloadPhase>,
     cancel: &AtomicBool,
 ) -> Result<String, DownloadError> {
     let mut file = File::open(path).map_err(io_error("open the image for hashing", path))?;
@@ -96,7 +96,7 @@ pub(crate) fn checksum_reader(
     reader: &mut impl Read,
     total: u64,
     path: &Path,
-    progress: &mut ProgressThrottle,
+    progress: &mut ProgressThrottle<DownloadPhase>,
     cancel: &AtomicBool,
 ) -> Result<String, DownloadError> {
     log::debug!("hashing {} ({total} bytes)", path.display());

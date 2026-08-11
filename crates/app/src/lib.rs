@@ -376,6 +376,33 @@ impl WorkspaceApp {
         }
     }
 
+    /// Asks the backend to stop creating a VM.
+    ///
+    /// The build rolls itself back and leaves the list on its own, so there is
+    /// nothing to refresh here: the next refresh is a second away and will
+    /// find whatever the build made of the request.
+    pub fn cancel_create(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.require_ready_backend("cancelling VM creation")?;
+
+        match self.repository.cancel_create(name) {
+            Ok(()) => {
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Info,
+                    message: format!("Cancelling the creation of VM \"{name}\""),
+                });
+                Ok(())
+            }
+            Err(error) => {
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Error,
+                    message: format!("Failed to cancel the creation of VM \"{name}\": {error}"),
+                });
+                self.collect_diagnostics();
+                Err(error)
+            }
+        }
+    }
+
     pub fn connect_display(&mut self, name: &str) -> Result<(), RepositoryError> {
         self.require_ready_backend("display connection")?;
 
@@ -647,6 +674,31 @@ mod tests {
                 message: "ready".into(),
             }]
         }
+    }
+
+    /// The button that calls this arrives with #65; the contract arrives here,
+    /// so that adding the button is adding a button.
+    #[test]
+    fn cancelling_a_creation_a_backend_cannot_cancel_is_reported() {
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            should_fail: false,
+            create_should_fail: false,
+            vm_is_running: false,
+            actions: Vec::new(),
+        }));
+        app.start();
+
+        let error = app
+            .cancel_create("dev")
+            .expect_err("the fake backend inherits the trait's refusal");
+
+        assert!(!error.to_string().is_empty());
+        assert!(
+            app.diagnostics().iter().any(|diagnostic| {
+                diagnostic.level == DiagnosticLevel::Error && diagnostic.message.contains("dev")
+            }),
+            "the user has to be told the cancellation did not happen"
+        );
     }
 
     #[test]

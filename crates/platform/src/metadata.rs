@@ -9,11 +9,24 @@ use std::{
     fs,
     io::{self},
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use vmlord_core::{NetworkMode, RepositoryError};
+
+/// Serializes the read-modify-write of the mapping document.
+///
+/// Creating a VM runs on its own thread, so two builds finishing at the same
+/// moment would both read the document, both add their own VM and both write
+/// it back -- and one of the two VMs would be gone from a file that reported
+/// success twice. The lock is process-wide because a `MetadataStore` is a path
+/// and nothing else: two stores over the same file are the same document.
+///
+/// Two VMLord processes over one storage root are not covered, and are not a
+/// case this task creates.
+static DOCUMENT_LOCK: Mutex<()> = Mutex::new(());
 
 /// A persisted link between a VMLord VM and the HCS compute system that backs it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +100,9 @@ impl MetadataStore {
     pub fn insert(&self, mapping: VmComputeSystemMapping) -> Result<(), RepositoryError> {
         mapping.validate()?;
 
+        let _guard = DOCUMENT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut mappings = self.load()?;
         if let Some(conflict) = mappings.iter().find(|existing| {
             existing.vm_id != mapping.vm_id
@@ -113,6 +129,9 @@ impl MetadataStore {
 
     /// Removes the mapping for `vm_id`, if present.
     pub fn remove(&self, vm_id: Uuid) -> Result<(), RepositoryError> {
+        let _guard = DOCUMENT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut mappings = self.load()?;
         let original_len = mappings.len();
         mappings.retain(|existing| existing.vm_id != vm_id);
@@ -462,6 +481,35 @@ mod tests {
             Some(endpoint_id)
         );
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// Parallel builds are the first thing to write metadata concurrently, and
+    /// `insert` is a read-modify-write: two writers finishing together would
+    /// otherwise drop one of the two VMs that had just been created.
+    #[test]
+    fn concurrent_inserts_keep_every_mapping() {
+        let path = temporary_mapping_file();
+        let store = MetadataStore::new(&path);
+
+        let mut workers = Vec::new();
+        for index in 0..8 {
+            let store = store.clone();
+            workers.push(std::thread::spawn(move || {
+                store
+                    .insert(mapping(
+                        Uuid::new_v4(),
+                        &format!("vm-{index}"),
+                        &format!("vmlord-{index}"),
+                    ))
+                    .expect("each mapping should be stored");
+            }));
+        }
+        for worker in workers {
+            worker.join().expect("no writer should panic");
+        }
+
+        assert_eq!(store.list().unwrap().len(), 8);
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

@@ -1013,7 +1013,7 @@ tears down the compute system if one was created and then calls
 key together. Nothing enumerates the files a half-built VM might have left, so
 adding a file to the VM's directory later cannot leave one behind.
 
-`CloudDiskImporter` is `Fn(&CloudImage, u64, &Path) -> Result<(),
+`CloudDiskImporter` is `Fn(&CloudImage, u64, &Path, &BuildMonitor) -> Result<(),
 RepositoryError>`, injected rather than called. It is the layering boundary in
 executable form: fetching the image is HTTPS, TLS and qcow2, which know nothing
 of Windows and live in `vmlord-image`; writing it into a VHDX has no API and
@@ -1035,14 +1035,59 @@ re-running them. Ejecting would mean rewriting the configuration document and
 recreating the compute system on a schedule nobody owns, for no gain the guest
 can observe.
 
-What is deliberately absent is everything about time. The import is synchronous:
-`create_vm` runs on the calling thread, so a download of several hundred
-megabytes happens with the UI waiting on it. It is also silent -- the composition
-root hands `open_cloud_image` a default `ProgressPublisher` nobody reads and an
-`AtomicBool` nobody sets, which are the exact parameters #64 will fill in without
-changing a signature. There is no background thread, no `Building` state and no
-progress reporting until then; the seam for all three already exists, and this
-task deliberately stops short of using it.
+### Creating a VM in the background
+
+`create_vm` is asynchronous with respect to its caller, and `VmRepository` is
+still a synchronous trait: the two are reconciled inside `platform`, which owns
+the thread. `HcsVmRepository::create_vm` refuses what can be refused cheaply and
+certainly -- validation, a name the store or the build registry already knows, a
+directory that already exists -- and then hands the request to
+`build::BuildRegistry::start`, which spawns one `std::thread` per VM and returns.
+The thread runs `VmCreationPipeline::create` unchanged; a failure there rolls the
+build back exactly as it always did, and is reported to the user through the
+shared diagnostics buffer rather than through a return value nobody is waiting on.
+
+`list_vms` is where the two halves are joined: the VMs `MetadataStore` knows
+about, plus `BuildRegistry::summaries` for the ones still being built. A build
+therefore appears in the list as `VmState::Building { progress }` from the moment
+it is accepted, with its sizes taken from the request because nothing of the VM
+is on disk yet to read them from; and it stops appearing the moment its thread is
+over, because a failed build rolled itself back and never reached the store. The
+UI needs no new plumbing for any of this: the existing one-second refresh already
+calls `list_vms`, and `take_diagnostics` -- the `&mut self` call that follows it
+-- is where finished threads are joined by `BuildRegistry::reap`.
+
+Progress is a level in two slots joined at the moment of reading, not a stream:
+`BuildMonitor` holds a `ProgressPublisher<BuildStep>` written by the pipeline and
+a `ProgressPublisher<DownloadPhase>` written deep inside `vmlord-image`, which
+knows nothing of VMs. `BuildMonitor::snapshot` shows the byte counts only while
+the step is `Downloading`, so a stale count can never appear beside a later step.
+Whoever runs a step reports it, which is why `CloudDiskImporter` takes the
+monitor: fetching and writing the disk are one call from outside the closure.
+
+Cancellation is one `AtomicBool` in the same monitor, polled at the pipeline's
+checkpoints and once per chunk inside `copy_image`, and it fails the build with
+an ordinary `RepositoryError`. That is deliberate: a cancelled build then takes
+the same rollback every other failure takes, instead of a second cleanup path
+that can drift away from the first. `VmRepository::cancel_create` is the contract
+for asking, defaulted to a refusal so that a backend creating VMs in the
+foreground says so honestly. An interrupted build that carries no error at all --
+a panic on the worker thread -- is caught by `CreationGuard`, a drop guard the
+success and failure paths both disarm; `catch_unwind` is not an option, because
+the pipeline's seams are boxed closures and `AssertUnwindSafe` would assert what
+needs proving.
+
+`HcsVmRepository::drop` cancels every build and joins it. Without that, leaving
+VMLord either kills a thread in the middle of writing a VHDX -- leaving behind
+the directory it was told to remove -- or hangs on one that was never told to
+stop. Concurrency reaches one more place: `MetadataStore::insert` and `::remove`
+are a read-modify-write over one document, so a process-wide lock serializes
+them; two builds finishing together would otherwise both write, and one of the
+two VMs would be gone from a file that reported success twice.
+
+There is still no async runtime anywhere in VMLord, and `VmRepository` remains
+synchronous. `std::thread`, `Arc`, `Mutex` and `AtomicBool` are the whole of the
+machinery, modelled on `platform::dhcp`, the project's other background thread.
 
 ---
 

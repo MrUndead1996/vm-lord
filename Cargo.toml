@@ -27,3 +27,20 @@ unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# Builds zlib-ng against the same C runtime Rust links, rather than the debug
+# one.
+#
+# `qcow` requires `flate2` with `zlib-ng-compat` unconditionally, so `libz-sys`
+# builds zlib-ng through CMake. The `cmake` crate picks `CMAKE_BUILD_TYPE` from
+# `opt-level`, and at `0` that is `Debug` -- whose default MSVC runtime is
+# `MultiThreadedDebugDLL` (`/MDd`). Rust's MSVC target links the release CRT
+# even in a dev profile, so the two disagree and the linker reports LNK4098.
+#
+# Raising the level for this one package selects `RelWithDebInfo` instead:
+# the release CRT, with the C library's debug info kept. `/NODEFAULTLIB:MSVCRTD`
+# would silence the warning while leaving two runtimes in one binary, which is
+# the thing worth avoiding -- allocations crossing that boundary are what turns
+# a warning into a corrupted heap.
+[profile.dev.package.libz-sys]
+opt-level = 2

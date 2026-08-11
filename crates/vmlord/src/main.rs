@@ -1,9 +1,9 @@
 #[cfg(not(windows))]
 compile_error!("VMLord currently supports Windows only");
 
-use std::{path::PathBuf, sync::atomic::AtomicBool};
+use std::path::PathBuf;
 
-use vmlord_core::{AppSettings, ProgressPublisher, VmRepository};
+use vmlord_core::{AppSettings, BuildMonitor, BuildStep, VmRepository};
 
 /// Selects the backend the composition root wires in.
 ///
@@ -77,20 +77,22 @@ fn load_backend(settings: &AppSettings) -> Box<dyn VmRepository> {
 /// The composition root is where they meet, which is what keeps the network out
 /// of the Windows layer.
 ///
-/// Progress and cancellation are stubbed here: creation still runs in the
-/// calling thread, so there is nobody to read a publisher and nobody to set a
-/// flag. #64 moves creation onto a worker thread and hands in the real ones.
+/// Both halves are long enough to report and to be cancelled, and both are
+/// invisible from outside this closure, so the steps are reported here.
 fn cloud_disk_importer(cache_directory: PathBuf) -> vmlord_platform::CloudDiskImporter {
-    Box::new(move |image, disk_size_bytes, target| {
+    Box::new(move |image, disk_size_bytes, target, monitor: &BuildMonitor| {
+        monitor.report(BuildStep::Downloading);
         let mut source = vmlord_image::open_cloud_image(
             &image.profile,
             &image.release,
             &cache_directory,
             disk_size_bytes,
-            &ProgressPublisher::default(),
-            &AtomicBool::new(false),
+            monitor.downloads(),
+            monitor.cancel_flag(),
         )?;
-        vmlord_platform::import_image(&mut source, target, disk_size_bytes).map(|_summary| ())
+        monitor.report(BuildStep::WritingDisk);
+        vmlord_platform::import_image(&mut source, target, disk_size_bytes, monitor.cancel_flag())
+            .map(|_summary| ())
     })
 }
 

@@ -8,7 +8,9 @@ pub mod settings;
 
 pub use distro::{DistroProfile, ubuntu};
 pub use logging::{LoggingError, initialize as initialize_logging};
-pub use progress::{DownloadPhase, ProgressPublisher, ProgressThrottle};
+pub use progress::{
+    BuildMonitor, BuildProgress, BuildStep, DownloadPhase, ProgressPublisher, ProgressThrottle,
+};
 pub use provisioning::{CloudImage, Password, Provisioning, SshAccess, VmSource};
 pub use settings::{AppSettings, Language, LogLevel, SettingsError, SettingsStore};
 
@@ -90,8 +92,15 @@ pub struct VmSummary {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum VmState {
     Stopped,
+    /// The VM is being created: nothing of it exists yet that could be
+    /// started, stopped or deleted.
+    Building {
+        progress: BuildProgress,
+    },
     Starting,
-    Running { agent_status: AgentStatus },
+    Running {
+        agent_status: AgentStatus,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -172,6 +181,18 @@ pub trait VmRepository {
     /// Required rather than defaulted: a backend that cannot delete VMs has to
     /// say so, not inherit silence.
     fn delete_vm(&mut self, request: VmDeleteRequest) -> Result<(), RepositoryError>;
+    /// Stops a VM that is still being created, undoing what has been built.
+    ///
+    /// Defaulted rather than required: a backend that creates VMs
+    /// synchronously has nothing in flight to cancel, and saying so is the
+    /// honest answer. Deletion is deliberately not made to double as this --
+    /// removing a VM that does not exist yet is a different operation with a
+    /// different outcome.
+    fn cancel_create(&mut self, _name: &str) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(
+            "this backend creates VMs in the foreground, so there is nothing to cancel",
+        ))
+    }
     fn open_display(&mut self, _name: &str) -> Result<(), RepositoryError> {
         Err(RepositoryError::new(
             "display connections are not supported by this backend",

@@ -36,12 +36,174 @@ const HCS_ACCESS_ALL: u32 = 0x1000_0000;
 /// reports it when `HcsShutDownComputeSystem` receives null options.
 const HCS_E_INVALID_JSON: &str = "0x8037010D";
 
+/// A repository whose importer is the one the composition root builds.
+fn cloud_repository(root: &std::path::Path) -> HcsVmRepository {
+    let cache = root.join("cache");
+    HcsVmRepository::new(
+        root,
+        Box::new(
+            move |image: &vmlord_core::CloudImage,
+                  size,
+                  target: &std::path::Path,
+                  monitor: &vmlord_core::BuildMonitor| {
+                monitor.report(vmlord_core::BuildStep::Downloading);
+                let mut source = vmlord_image::open_cloud_image(
+                    &image.profile,
+                    &image.release,
+                    &cache,
+                    size,
+                    monitor.downloads(),
+                    monitor.cancel_flag(),
+                )?;
+                monitor.report(vmlord_core::BuildStep::WritingDisk);
+                vmlord_platform::import_image(&mut source, target, size, monitor.cancel_flag())
+                    .map(|_| ())
+            },
+        ),
+    )
+}
+
+fn background_cloud_request(name: &str) -> VmCreateRequest {
+    VmCreateRequest {
+        name: name.to_owned(),
+        source: VmSource::CloudImage {
+            image: vmlord_core::CloudImage {
+                profile: vmlord_core::ubuntu(),
+                release: "24.04".into(),
+            },
+            provisioning: vmlord_core::Provisioning {
+                username: "dev".into(),
+                password: None,
+                ssh: vmlord_core::SshAccess::Enabled { deploy_key: true },
+                locale: "en_US.UTF-8".into(),
+                keyboard: "us".into(),
+                timezone: "Europe/Moscow".into(),
+            },
+        },
+        ram_mb: 2048,
+        disk_gb: 16,
+        cpu_cores: 2,
+        gpu_mode: GpuMode::None,
+        network_mode: NetworkMode::None,
+    }
+}
+
+/// Creating a VM from a real cloud image must return at once and finish on its
+/// own thread: this is the whole point of the task, and it cannot be observed
+/// anywhere but on a host with HCS.
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS and downloads a cloud image"]
+fn a_cloud_vm_is_built_in_the_background() {
+    let root = std::env::temp_dir().join(format!("vmlord-bg-build-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut repository = cloud_repository(&root);
+    repository
+        .initialize()
+        .expect("the native backend should initialize on a Hyper-V host");
+
+    let accepted_at = std::time::Instant::now();
+    repository
+        .create_vm(background_cloud_request("bg-build"))
+        .expect("the creation should be accepted");
+    let accepted_in = accepted_at.elapsed();
+
+    let mut seen_building = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20 * 60);
+    let outcome = loop {
+        let summaries = repository.list_vms().expect("listing should work");
+        match summaries.iter().find(|vm| vm.name == "bg-build") {
+            Some(vm) if matches!(vm.state, VmState::Building { .. }) => seen_building = true,
+            Some(_) => break Ok(()),
+            None => break Err(format!("the build failed: {:?}", repository.take_diagnostics())),
+        }
+        if std::time::Instant::now() >= deadline {
+            break Err("the build did not finish".to_owned());
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    };
+
+    // Best-effort cleanup regardless of the assertions below.
+    let _ = repository.delete_vm(VmDeleteRequest {
+        name: "bg-build".into(),
+        delete_disks: true,
+    });
+    drop(repository);
+    let _ = fs::remove_dir_all(&root);
+
+    outcome.expect("the VM should finish building");
+    assert!(
+        accepted_in < Duration::from_secs(2),
+        "create_vm must not wait for the build, took {accepted_in:?}"
+    );
+    assert!(
+        seen_building,
+        "the VM must be listed as Building while it builds"
+    );
+}
+
+/// A cancelled build leaves nothing: not the directory, not a metadata entry,
+/// not a row in the list.
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS and downloads a cloud image"]
+fn a_cancelled_build_leaves_nothing_behind() {
+    let root = std::env::temp_dir().join(format!("vmlord-bg-cancel-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+    let mut repository = cloud_repository(&root);
+    repository
+        .initialize()
+        .expect("the native backend should initialize on a Hyper-V host");
+
+    repository
+        .create_vm(background_cloud_request("bg-cancel"))
+        .expect("the creation should be accepted");
+    std::thread::sleep(Duration::from_secs(3));
+    repository
+        .cancel_create("bg-cancel")
+        .expect("a build in flight is cancellable");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(180);
+    let outcome = loop {
+        let listed = repository
+            .list_vms()
+            .expect("listing should work")
+            .iter()
+            .any(|vm| vm.name == "bg-cancel");
+        if !listed {
+            break Ok(repository.take_diagnostics());
+        }
+        if std::time::Instant::now() >= deadline {
+            break Err("the cancelled build did not go away".to_owned());
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    };
+    let left_behind = root.join("bg-cancel").exists();
+    drop(repository);
+    let _ = fs::remove_dir_all(&root);
+
+    let diagnostics = outcome.expect("the cancelled build should disappear from the list");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("bg-cancel")),
+        "the user has to be told why the VM went away: {diagnostics:?}"
+    );
+    assert!(!left_behind, "the cancelled build must remove its directory");
+}
+
+/// A monitor for the tests that drive the creation pipeline directly.
+///
+/// They call it on the calling thread and read nothing back from it: what they
+/// check is the VM the pipeline built, not the steps it reported on the way.
+fn build_monitor() -> vmlord_core::BuildMonitor {
+    vmlord_core::BuildMonitor::new(vmlord_core::BuildStep::WritingDisk)
+}
+
 /// The importer for tests that create VMs from local media only.
 ///
 /// A cloud image would download hundreds of megabytes; the tests that need one
 /// build their own importer.
 fn no_cloud_images() -> vmlord_platform::CloudDiskImporter {
-    Box::new(|_, _, _| {
+    Box::new(|_, _, _, _| {
         Err(vmlord_core::RepositoryError::new(
             "this test creates no VM from a cloud image",
         ))
@@ -124,6 +286,7 @@ fn a_terminated_vm_reports_its_exit() {
     repository
         .create_vm(request)
         .expect("VM creation should succeed on an elevated Hyper-V host");
+    wait_for_build(&repository, &vm_name).expect("the build should finish");
     repository
         .start_vm(&vm_name)
         .expect("the created VM must start before its exit can be watched");
@@ -192,7 +355,7 @@ fn creates_and_persists_a_compute_system_end_to_end() {
     let vm_directory = root.join("vm");
 
     let mapping = VmCreationPipeline::production(no_cloud_images())
-        .create(&store, &request, &vm_directory)
+        .create(&store, &request, &vm_directory, &build_monitor())
         .expect("VM creation should succeed on an elevated Hyper-V host");
     println!(
         "created HCS compute system \"{}\" for VM {}",
@@ -245,7 +408,7 @@ fn enumerates_and_reopens_a_created_vm() {
     let vm_directory = root.join("vm");
 
     let mapping = VmCreationPipeline::production(no_cloud_images())
-        .create(&store, &request, &vm_directory)
+        .create(&store, &request, &vm_directory, &build_monitor())
         .expect("VM creation should succeed on an elevated Hyper-V host");
 
     let mut client = HcsClient::new();
@@ -318,7 +481,7 @@ fn starts_a_created_vm() {
     let vm_directory = root.join("vm");
 
     let mapping = VmCreationPipeline::production(no_cloud_images())
-        .create(&store, &request, &vm_directory)
+        .create(&store, &request, &vm_directory, &build_monitor())
         .expect("VM creation should succeed on an elevated Hyper-V host");
 
     let started = VmStartPipeline::production().start(&store, &mapping.vm_name, &vm_directory);
@@ -373,7 +536,7 @@ fn force_stopped_vm_can_be_started_again() {
     let vm_directory = root.join("vm");
 
     let mapping = VmCreationPipeline::production(no_cloud_images())
-        .create(&store, &request, &vm_directory)
+        .create(&store, &request, &vm_directory, &build_monitor())
         .expect("VM creation should succeed on an elevated Hyper-V host");
     VmStartPipeline::production()
         .start(&store, &mapping.vm_name, &vm_directory)
@@ -436,7 +599,7 @@ fn accepts_the_shutdown_options_document() {
     let vm_directory = root.join("vm");
 
     let mapping = VmCreationPipeline::production(no_cloud_images())
-        .create(&store, &request, &vm_directory)
+        .create(&store, &request, &vm_directory, &build_monitor())
         .expect("VM creation should succeed on an elevated Hyper-V host");
     VmStartPipeline::production()
         .start(&store, &mapping.vm_name, &vm_directory)
@@ -498,7 +661,7 @@ fn reconnects_to_a_created_vm() {
     let vm_directory = root.join("vm");
 
     let mapping = VmCreationPipeline::production(no_cloud_images())
-        .create(&store, &request, &vm_directory)
+        .create(&store, &request, &vm_directory, &build_monitor())
         .expect("VM creation should succeed on an elevated Hyper-V host");
 
     let first = reconnect_known_vms(&store, &VmEventSink::default());
@@ -579,7 +742,7 @@ fn reconnects_to_a_running_vm() {
     let vm_directory = root.join("vm");
 
     let mapping = VmCreationPipeline::production(no_cloud_images())
-        .create(&store, &request, &vm_directory)
+        .create(&store, &request, &vm_directory, &build_monitor())
         .expect("VM creation should succeed on an elevated Hyper-V host");
     VmStartPipeline::production()
         .start(&store, &mapping.vm_name, &vm_directory)
@@ -775,7 +938,7 @@ fn deletes_a_created_vm_completely() {
     let vm_directory = root.join("vm");
 
     let mapping = VmCreationPipeline::production(no_cloud_images())
-        .create(&store, &request, &vm_directory)
+        .create(&store, &request, &vm_directory, &build_monitor())
         .expect("VM creation should succeed on an elevated Hyper-V host");
     println!(
         "created HCS compute system \"{}\" for VM {}",
@@ -929,7 +1092,7 @@ fn starts_a_nat_vm_on_its_endpoint() {
     let vm_directory = root.join("vm");
 
     let mapping = VmCreationPipeline::production(no_cloud_images())
-        .create(&store, &request, &vm_directory)
+        .create(&store, &request, &vm_directory, &build_monitor())
         .expect("VM creation should succeed on an elevated Hyper-V host");
     assert_eq!(
         store
@@ -1048,7 +1211,7 @@ fn a_forcibly_stopped_nat_vm_starts_again_on_the_same_endpoint() {
     let vm_directory = root.join("vm");
 
     let mapping = VmCreationPipeline::production(no_cloud_images())
-        .create(&store, &request, &vm_directory)
+        .create(&store, &request, &vm_directory, &build_monitor())
         .expect("VM creation should succeed on an elevated Hyper-V host");
 
     let outcome = (|| -> Result<(), String> {
@@ -1160,7 +1323,7 @@ fn a_started_nat_vm_is_served_the_address_hns_assigned() {
     let vm_directory = root.join("vm");
 
     let mapping = VmCreationPipeline::production(no_cloud_images())
-        .create(&store, &request, &vm_directory)
+        .create(&store, &request, &vm_directory, &build_monitor())
         .expect("VM creation should succeed on an elevated Hyper-V host");
 
     let outcome = (|| -> Result<(), String> {
@@ -1217,6 +1380,28 @@ fn a_started_nat_vm_is_served_the_address_hns_assigned() {
 }
 
 /// The summary `repository` lists for `vm_name`.
+/// Waits for a VM's background creation to finish.
+///
+/// `create_vm` returns as soon as the build is accepted, so a test that acts
+/// on the VM has to wait for it the way the UI does: by looking at the list.
+fn wait_for_build(repository: &HcsVmRepository, vm_name: &str) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(600);
+    loop {
+        let summaries = repository
+            .list_vms()
+            .map_err(|error| format!("listing should work: {error}"))?;
+        match summaries.iter().find(|vm| vm.name == vm_name) {
+            None => return Err(format!("the build of VM \"{vm_name}\" failed")),
+            Some(vm) if !matches!(vm.state, VmState::Building { .. }) => return Ok(()),
+            Some(_) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!("the build of VM \"{vm_name}\" did not finish"));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
 fn listed_summary(repository: &HcsVmRepository, vm_name: &str) -> Result<VmSummary, String> {
     repository
         .list_vms()
@@ -1265,6 +1450,7 @@ fn a_running_nat_vm_is_listed_with_the_address_hns_assigned() {
     repository
         .create_vm(request)
         .expect("VM creation should succeed on an elevated Hyper-V host");
+    wait_for_build(&repository, &vm_name).expect("the build should finish");
     // The repository keeps its mapping under its own storage root, and the
     // endpoint identifier has to be read from there to compare the listed
     // address against HNS's own answer.
@@ -1380,7 +1566,7 @@ fn deletes_the_endpoint_of_a_deleted_vm() {
     let vm_directory = root.join("vm");
 
     let mapping = VmCreationPipeline::production(no_cloud_images())
-        .create(&store, &request, &vm_directory)
+        .create(&store, &request, &vm_directory, &build_monitor())
         .expect("VM creation should succeed on an elevated Hyper-V host");
 
     let network = HcnNetwork::ensure().expect("HNS should provide the VMLord NAT network");
@@ -1522,17 +1708,21 @@ fn a_vm_is_created_from_a_real_cloud_image() {
     let vm_directory = root.join("cloud-vm");
     let store = MetadataStore::new(root.join("vm-mapping.json"));
 
-    let pipeline = VmCreationPipeline::production(Box::new(move |image, size, target| {
-        let mut source = vmlord_image::open_cloud_image(
-            &image.profile,
-            &image.release,
-            &cache,
-            size,
-            &vmlord_core::ProgressPublisher::default(),
-            &std::sync::atomic::AtomicBool::new(false),
-        )?;
-        vmlord_platform::import_image(&mut source, target, size).map(|_| ())
-    }));
+    let pipeline = VmCreationPipeline::production(Box::new(
+        move |image, size, target, monitor: &vmlord_core::BuildMonitor| {
+            monitor.report(vmlord_core::BuildStep::Downloading);
+            let mut source = vmlord_image::open_cloud_image(
+                &image.profile,
+                &image.release,
+                &cache,
+                size,
+                monitor.downloads(),
+                monitor.cancel_flag(),
+            )?;
+            monitor.report(vmlord_core::BuildStep::WritingDisk);
+            vmlord_platform::import_image(&mut source, target, size, monitor.cancel_flag()).map(|_| ())
+        },
+    ));
 
     let request = VmCreateRequest {
         name: "vmlord-cloud-test".into(),
@@ -1557,7 +1747,12 @@ fn a_vm_is_created_from_a_real_cloud_image() {
         network_mode: NetworkMode::Nat,
     };
 
-    let created = pipeline.create(&store, &request, &vm_directory);
+    let created = pipeline.create(
+        &store,
+        &request,
+        &vm_directory,
+        &vmlord_core::BuildMonitor::new(vmlord_core::BuildStep::Downloading),
+    );
     // Captured while the files still exist -- the cleanup below removes them
     // regardless of whether the assertions that need them ever run.
     let seed = created
