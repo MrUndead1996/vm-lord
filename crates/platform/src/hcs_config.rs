@@ -28,6 +28,7 @@ impl HcsVmConfigBuilder {
         request: &VmCreateRequest,
         system_disk_path: &Path,
         seed_path: &Path,
+        vm_id: Uuid,
     ) -> Result<String, RepositoryError> {
         request.validate()?;
 
@@ -85,6 +86,12 @@ impl HcsVmConfigBuilder {
                     scsi: Scsi {
                         primary: ScsiController { attachments },
                     },
+                    com_ports: BTreeMap::from([(
+                        "0".to_owned(),
+                        ComPort {
+                            named_pipe: com1_pipe_path(vm_id),
+                        },
+                    )]),
                     hv_socket: HvSocket {
                         config: HvSocketConfig {
                             service_table: BTreeMap::new(),
@@ -100,6 +107,15 @@ impl HcsVmConfigBuilder {
             RepositoryError::new(format!("failed to serialize HCS VM configuration: {error}"))
         })
     }
+}
+
+/// Returns the named pipe the VM's first serial port is wired to.
+///
+/// Derived from the compute system's own identity: the endpoint has to stay the
+/// same across renames and stay distinct between VMs, and the UUID is the only
+/// thing about a VM that is both.
+pub(crate) fn com1_pipe_path(vm_id: Uuid) -> String {
+    format!(r"\\.\pipe\vmlord-{}.com1", vm_id.as_simple())
 }
 
 /// The ISO the VM boots with: the installer for local media, the seed for a
@@ -366,6 +382,8 @@ struct Processor {
 struct Devices {
     #[serde(rename = "Scsi")]
     scsi: Scsi,
+    #[serde(rename = "ComPorts")]
+    com_ports: BTreeMap<String, ComPort>,
     #[serde(rename = "HvSocket")]
     hv_socket: HvSocket,
     #[serde(rename = "Keyboard")]
@@ -392,6 +410,12 @@ struct Attachment {
     attachment_type: &'static str,
     #[serde(rename = "Path")]
     path: PathBuf,
+}
+
+#[derive(Serialize)]
+struct ComPort {
+    #[serde(rename = "NamedPipe")]
+    named_pipe: String,
 }
 
 #[derive(Serialize)]
@@ -422,8 +446,13 @@ mod tests {
 
     use super::{
         HcsVmConfigBuilder, VmTopology, adapter_key, apply_network_adapter, apply_topology,
-        ensure_supported_network_mode, media_path, read_topology, remove_network_adapter,
+        com1_pipe_path, ensure_supported_network_mode, media_path, read_topology,
+        remove_network_adapter,
     };
+
+    /// The identity a created compute system is given, fixed so that the pipe
+    /// name derived from it can be written down.
+    const VM_ID: Uuid = Uuid::from_u128(0x91cb_8e9a_f2a1_43b3_a682_5724_6fb8_f31d);
 
     fn request() -> VmCreateRequest {
         VmCreateRequest {
@@ -468,7 +497,8 @@ mod tests {
         let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
 
         let json: Value = serde_json::from_str(
-            &HcsVmConfigBuilder::build(&cloud_request(), &system_disk_path, &seed_path).unwrap(),
+            &HcsVmConfigBuilder::build(&cloud_request(), &system_disk_path, &seed_path, VM_ID)
+                .unwrap(),
         )
         .unwrap();
 
@@ -487,6 +517,7 @@ mod tests {
             &cloud_request(),
             &PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx"),
             &PathBuf::from("C:\\vms\\test-vm\\seed.iso"),
+            VM_ID,
         )
         .unwrap();
 
@@ -509,11 +540,35 @@ mod tests {
     }
 
     #[test]
+    fn a_vm_exposes_com1_through_its_stable_named_pipe() {
+        // The pipe name is derived from the VM's own identity rather than its
+        // name: a rename must not move the endpoint a running reader is
+        // attached to, and two VMs must never share one.
+        let document = HcsVmConfigBuilder::build(
+            &request(),
+            Path::new(r"C:\vms\test-vm\disks\system.vhdx"),
+            Path::new(r"C:\vms\test-vm\seed.iso"),
+            VM_ID,
+        )
+        .unwrap();
+        let json: Value = serde_json::from_str(&document).unwrap();
+
+        assert_eq!(
+            com1_pipe_path(VM_ID),
+            r"\\.\pipe\vmlord-91cb8e9af2a143b3a68257246fb8f31d.com1"
+        );
+        assert_eq!(
+            json.pointer("/VirtualMachine/Devices/ComPorts/0/NamedPipe"),
+            Some(&json!(com1_pipe_path(VM_ID)))
+        );
+    }
+
+    #[test]
     fn builds_the_minimal_configuration() {
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
         let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
         let json: Value = serde_json::from_str(
-            &HcsVmConfigBuilder::build(&request(), &system_disk_path, &seed_path).unwrap(),
+            &HcsVmConfigBuilder::build(&request(), &system_disk_path, &seed_path, VM_ID).unwrap(),
         )
         .unwrap();
 
@@ -539,6 +594,7 @@ mod tests {
                             "0": { "Type": "VirtualDisk", "Path": system_disk_path },
                             "1": { "Type": "Iso", "Path": "C:\\images\\installer.iso" }
                         }}},
+                        "ComPorts": { "0": { "NamedPipe": com1_pipe_path(VM_ID) } },
                         "HvSocket": { "HvSocketConfig": { "ServiceTable": {} } },
                         "Keyboard": {},
                         "Mouse": {}
@@ -560,7 +616,7 @@ mod tests {
         let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
 
         let json: Value = serde_json::from_str(
-            &HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path).unwrap(),
+            &HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path, VM_ID).unwrap(),
         )
         .unwrap();
 
@@ -584,7 +640,8 @@ mod tests {
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
         let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
 
-        let document = HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path).unwrap();
+        let document =
+            HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path, VM_ID).unwrap();
 
         assert!(!document.contains("secret"));
         assert!(!document.contains("password"));
@@ -606,7 +663,7 @@ mod tests {
                 ..request()
             };
             assert!(
-                HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path)
+                HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path, VM_ID)
                     .unwrap_err()
                     .to_string()
                     .contains("GPU mode")
@@ -625,7 +682,8 @@ mod tests {
             ..request()
         };
 
-        let document = HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path).unwrap();
+        let document =
+            HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path, VM_ID).unwrap();
 
         let json: Value = serde_json::from_str(&document).unwrap();
         assert!(
@@ -648,7 +706,7 @@ mod tests {
                 ..request()
             };
 
-            let message = HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path)
+            let message = HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path, VM_ID)
                 .unwrap_err()
                 .to_string();
 
@@ -661,7 +719,8 @@ mod tests {
     fn removes_the_network_adapter_section_and_nothing_else() {
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
         let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
-        let created = HcsVmConfigBuilder::build(&request(), &system_disk_path, &seed_path).unwrap();
+        let created =
+            HcsVmConfigBuilder::build(&request(), &system_disk_path, &seed_path, VM_ID).unwrap();
         let attached = apply_network_adapter(
             &created,
             Uuid::from_u128(0x3f2b_0c11_5c78_4c1b_9e2f_3a8b_7d4c_6e50),
@@ -687,7 +746,8 @@ mod tests {
         // whether to rewrite `config.json` by comparing the two strings.
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
         let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
-        let created = HcsVmConfigBuilder::build(&request(), &system_disk_path, &seed_path).unwrap();
+        let created =
+            HcsVmConfigBuilder::build(&request(), &system_disk_path, &seed_path, VM_ID).unwrap();
 
         let removed = remove_network_adapter(&created).unwrap();
 
@@ -725,7 +785,7 @@ mod tests {
             ..request()
         };
 
-        assert!(HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path).is_err());
+        assert!(HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path, VM_ID).is_err());
     }
 
     #[test]
@@ -739,6 +799,7 @@ mod tests {
             &request,
             &PathBuf::from("C:\\vms\\a\\disks\\system.vhdx"),
             &PathBuf::from("C:\\vms\\test-vm\\seed.iso"),
+            VM_ID,
         )
         .unwrap();
 
@@ -755,7 +816,8 @@ mod tests {
     fn applying_a_topology_changes_only_memory_and_processors() {
         let system_disk_path = PathBuf::from("C:\\vms\\a\\disks\\system.vhdx");
         let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
-        let document = HcsVmConfigBuilder::build(&request(), &system_disk_path, &seed_path).unwrap();
+        let document =
+            HcsVmConfigBuilder::build(&request(), &system_disk_path, &seed_path, VM_ID).unwrap();
 
         let updated = apply_topology(
             &document,
@@ -823,6 +885,7 @@ mod tests {
             &request(),
             &PathBuf::from("C:\\vms\\a\\disks\\system.vhdx"),
             &PathBuf::from("C:\\vms\\test-vm\\seed.iso"),
+            VM_ID,
         )
         .unwrap();
 
@@ -843,7 +906,8 @@ mod tests {
     fn attaching_an_adapter_changes_nothing_else() {
         let system_disk_path = PathBuf::from("C:\\vms\\a\\disks\\system.vhdx");
         let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
-        let document = HcsVmConfigBuilder::build(&request(), &system_disk_path, &seed_path).unwrap();
+        let document =
+            HcsVmConfigBuilder::build(&request(), &system_disk_path, &seed_path, VM_ID).unwrap();
 
         let before: Value = serde_json::from_str(&document).unwrap();
         let mut after: Value = serde_json::from_str(&with_adapter(&document)).unwrap();
@@ -865,6 +929,7 @@ mod tests {
             &request(),
             &PathBuf::from("C:\\vms\\a\\disks\\system.vhdx"),
             &PathBuf::from("C:\\vms\\test-vm\\seed.iso"),
+            VM_ID,
         )
         .unwrap();
 
@@ -882,6 +947,7 @@ mod tests {
             &request(),
             &PathBuf::from("C:\\vms\\a\\disks\\system.vhdx"),
             &PathBuf::from("C:\\vms\\test-vm\\seed.iso"),
+            VM_ID,
         )
         .unwrap();
         let updated: Value = serde_json::from_str(&with_adapter(&document)).unwrap();

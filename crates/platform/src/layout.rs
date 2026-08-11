@@ -15,6 +15,9 @@ use vmlord_core::RepositoryError;
 /// compute system from.
 pub(crate) const CONFIGURATION_FILE_NAME: &str = "config.json";
 
+/// The raw capture of everything the guest wrote to its first serial port.
+pub(crate) const COM1_LOG_FILE_NAME: &str = "com1.log";
+
 /// Returns the directory holding everything VM `vm_name` is made of.
 ///
 /// The name comes from the user and is used as a directory name, so anything
@@ -39,6 +42,15 @@ pub(crate) fn vm_directory(storage_root: &Path, vm_name: &str) -> Result<PathBuf
 /// Returns the path of the VM's stored HCS configuration document.
 pub(crate) fn configuration_path(vm_directory: &Path) -> PathBuf {
     vm_directory.join(CONFIGURATION_FILE_NAME)
+}
+
+/// Returns the path of the VM's serial-console capture.
+///
+/// Beside `config.json` rather than under `disks/`: it describes what the VM
+/// did, not what it is made of, and a deletion that removes the VM's disks must
+/// not be the thing that decides whether its last boot output survives.
+pub(crate) fn com1_log_path(vm_directory: &Path) -> PathBuf {
+    vm_directory.join(COM1_LOG_FILE_NAME)
 }
 
 /// Returns the path of the VM's system disk.
@@ -74,8 +86,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        configuration_path, seed_path, ssh_key_path, ssh_public_key_path, system_disk_path,
-        vm_directory,
+        com1_log_path, configuration_path, seed_path, ssh_key_path, ssh_public_key_path,
+        system_disk_path, vm_directory,
     };
 
     #[test]
@@ -93,6 +105,10 @@ mod tests {
                 .join("dev-linux")
                 .join("disks")
                 .join("system.vhdx")
+        );
+        assert_eq!(
+            com1_log_path(&directory),
+            PathBuf::from("/vms").join("dev-linux").join("com1.log")
         );
     }
 
