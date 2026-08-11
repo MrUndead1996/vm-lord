@@ -1096,11 +1096,16 @@ including a panic. What VMLord keeps afterwards is a `Com1Session` holding those
 events, not a process handle: the terminal owns the reader, and the session is
 how VMLord speaks to it.
 
-Ownership follows the VM. An explicit start opens the console before the network
-and before HCS -- the output that explains a failed boot is written in the first
-seconds of one -- and truncates `com1.log`, because that boot's output replaces
-the previous one. A start whose console cannot be opened fails: a VM running
-without diagnostics is the case this feature exists for. Any failure after the
+Ownership follows the VM. An explicit start opens the console once the compute
+system is in its final shape and before it executes anything, and truncates
+`com1.log`, because that boot's output replaces the previous one. Both halves of
+that order are load-bearing. Not earlier: preparing the system may destroy and
+re-create it, and the named pipe COM1 is served through goes with it, leaving a
+console reading a pipe that has stopped existing -- an empty `com1.log` and a
+terminal window that closes itself. Not later: the output that explains a failed
+boot is written in the first seconds of one. A start whose console cannot be
+opened fails: a VM running without diagnostics is the case this feature exists
+for. Any failure after the
 launch drops the pending session, and dropping one signals cancellation, so no
 window survives a start that did not happen. A reconnect at startup is the other
 direction: for each VM HCS still reports as `Running`, a console is opened in
