@@ -170,9 +170,18 @@ impl Com1Sessions {
         self.0.clear();
     }
 
-    #[cfg(test)]
     pub(crate) fn contains(&self, vm_id: Uuid) -> bool {
         self.0.contains_key(&vm_id)
+    }
+
+    /// Stands in for the reader of `vm_id` exiting, as it does when a person
+    /// closes its window.
+    #[cfg(test)]
+    pub(crate) fn finish_for_test(&self, vm_id: Uuid) {
+        self.0
+            .get(&vm_id)
+            .expect("the VM should have a session")
+            .finish_for_test();
     }
 }
 
