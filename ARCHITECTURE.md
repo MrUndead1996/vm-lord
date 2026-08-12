@@ -1003,6 +1003,53 @@ which splits on white space and expands `%d`-style tokens, not for a shell. A VM
 under `C:\Virtual Machines\` therefore keeps its known-hosts file, and one whose
 directory contains a `%` points where it says.
 
+### Opening an interactive session
+
+`platform::ssh_terminal` puts a shell on screen. Once `ssh.exe` runs in a
+terminal of its own, everything it says goes into that window and nothing comes
+back to VMLord, so everything knowable in advance is established before the
+window opens: Windows has an OpenSSH client, the VM has SSH access at all, its
+stored configuration is one anything can connect with, HNS has given it an
+address, something answers on the port it was created with, and -- in key mode
+-- the private key is still where VMLord keeps it. Each of those is its own
+failure with its own message, because each is a different thing for a person to
+do. What is deliberately left to OpenSSH is what only OpenSSH can decide: the
+host key, the credential and the transport.
+
+The port probe is one attempt with a three-second deadline, not the readiness
+wait's patient loop: the VM is running and someone is holding a mouse button
+down. Between that probe and the session there is a race a guest could lose its
+daemon in; it is left alone, because the window is milliseconds wide and the
+session that hits it lands in a terminal where OpenSSH explains itself. The
+session itself carries no `ConnectTimeout` -- a deadline VMLord invented would
+close a person's window mid-handshake -- and asks the guest to run nothing, so
+what they get is the guest's own shell.
+
+Two hosts are tried, in this order. Windows Terminal gets `-w new`, a titled
+tab, and the client and its argument vector after a `--`; `-w 0` is not used
+here for the reason it is not used for COM1, and `--` is what keeps an `ssh`
+option from being read as one of Windows Terminal's own. If that spawn fails
+*synchronously* -- no `wt.exe` on the machine, or Windows refusing to start it
+-- the fallback is the absolute `ssh.exe` itself with `CREATE_NEW_CONSOLE`,
+because VMLord is a windowed process whose console the session cannot inherit.
+If both refuse, the failure quotes both. What the fallback does not promise is
+anything about a Windows Terminal that *started*: a broken profile or an
+unreadable settings file is reported in its own window, and there is nothing
+left to fall back from. No `powershell.exe` and no `cmd.exe` appear anywhere on
+this path.
+
+A session is not VMLord's. No child handle is kept, nothing is killed when the
+repository is dropped, and no registry counts sessions per VM, so a guest may
+have as many shells as a person opens. That is the whole difference from the
+COM1 console, which owns exactly one reader per VM because two readers on one
+pipe would split the guest's output between two windows.
+
+`HcsVmRepository::open_ssh` is the way in. It asks HCS for the VM's state rather
+than trusting the list the user clicked in, refuses anything but `Running` --
+the network endpoint the guest answers on exists only while its compute system
+does -- and hands the preflight failure to the application layer with its own
+cause intact.
+
 ### The VM's SSH key pair
 
 Every VM gets its own ed25519 pair rather than sharing one. AppSandbox kept a

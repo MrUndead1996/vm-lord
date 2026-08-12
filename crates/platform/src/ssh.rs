@@ -84,11 +84,11 @@ pub(crate) fn guest_address(
 /// or installed by hand from local media. An error when it has a configuration
 /// that cannot be connected with: that is a stored document someone has since
 /// edited, and the last moment to refuse it is while it is still data.
-// Unused until #75 gives an operator a way to ask for a shell. The readiness
-// wait joins the two halves itself: it reads the configuration before the guest
-// has an address, so that a stored document nothing can connect with is refused
-// instead of spending an address timeout first.
-#[allow(dead_code)]
+///
+/// The interactive launcher joins the two halves here; the readiness wait joins
+/// them itself, because it reads the configuration before the guest has an
+/// address, so that a stored document nothing can connect with is refused
+/// instead of spending an address timeout first.
 pub(crate) fn endpoint(
     mapping: &VmComputeSystemMapping,
     address: IpAddr,
