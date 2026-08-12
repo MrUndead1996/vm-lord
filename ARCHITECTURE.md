@@ -1050,6 +1050,40 @@ the network endpoint the guest answers on exists only while its compute system
 does -- and hands the preflight failure to the application layer with its own
 cause intact.
 
+### Offering a session
+
+`WorkspaceApp::open_ssh` is the only thing the desktop shell calls. It carries
+the backend's refusal into the diagnostics unchanged -- "Failed to open SSH
+session for VM …" followed by which Windows feature is missing, which port did
+not answer, which key is gone -- because that preflight message is the only
+account anyone gets: once the terminal is up, everything else OpenSSH has to say
+goes into that window.
+
+The UI decides only what is worth offering, from the summary it drew the list
+from. `ssh_offer` answers three things rather than a boolean, because "no
+button" and "a button that cannot be pressed yet" are different things to see:
+
+* `Absent` -- the VM was created without SSH, or from installation media, so no
+  action appears at all.
+* `Waiting(reason)` -- SSH is configured, but the VM is being built, is not
+  running, or is running without an address on the VMLord network. The button
+  stays on screen and its tooltip names what it waits for.
+* `Ready` -- running, addressed, and worth pressing.
+
+That summary is a refresh old, which is exactly why the check is repeated in the
+repository against HCS when the button is pressed. The two are not redundant:
+one decides what to draw, the other decides what to do.
+
+The button reads "Open SSH" and names no terminal host, in the UI and in
+`VmAction`'s own label: which of the two hosts ends up showing the session is
+settled when it is launched, and a machine where the fallback answers would make
+the other name wrong.
+
+The details panel states the endpoint itself -- `user@address:port (key login)`
+-- once the guest has an address, and the configuration without one before that,
+saying that the address appears when the VM is running. A remembered address
+would be a guess: HNS hands out a new one on every start.
+
 ### The VM's SSH key pair
 
 Every VM gets its own ed25519 pair rather than sharing one. AppSandbox kept a

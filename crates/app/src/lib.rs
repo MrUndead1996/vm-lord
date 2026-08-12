@@ -64,7 +64,9 @@ impl VmAction {
             Self::ForceStop => "Force stop",
             Self::CancelCreate => "Cancel creation",
             Self::Connect => "Connect",
-            Self::Ssh => "SSH",
+            // What it opens, not where: which terminal host ends up showing
+            // the session is decided when it is launched.
+            Self::Ssh => "Open SSH",
             Self::Console => "Open COM port",
             Self::Edit => "Edit",
             Self::Delete => "Delete",
@@ -738,6 +740,12 @@ mod tests {
 
         fn open_ssh(&mut self, name: &str) -> Result<(), RepositoryError> {
             self.actions.push(format!("ssh:{name}"));
+            if !self.vm_is_running {
+                return Err(RepositoryError::new(format!(
+                    "cannot open an SSH session to VM \"{name}\": the guest does not \
+                     answer on port 22: connection refused"
+                )));
+            }
             Ok(())
         }
 
@@ -925,7 +933,7 @@ mod tests {
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             should_fail: false,
             create_should_fail: false,
-            vm_is_running: false,
+            vm_is_running: true,
             actions: Vec::new(),
         }));
         app.start();
@@ -936,6 +944,35 @@ mod tests {
             app.diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic.message == "SSH session for VM \"dev\" started")
+        );
+    }
+
+    /// The preflight check that stopped a session -- a missing Windows feature,
+    /// a port that did not answer, a key that is gone -- is the only account of
+    /// it anyone gets: once the terminal is up, everything else OpenSSH has to
+    /// say goes into that window. So it reaches the diagnostics whole, rather
+    /// than as a failure this layer describes in its own words.
+    #[test]
+    fn a_refused_ssh_session_is_reported_with_the_backends_own_reason() {
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            should_fail: false,
+            create_should_fail: false,
+            vm_is_running: false,
+            actions: Vec::new(),
+        }));
+        app.start();
+
+        let error = app.open_ssh("dev").unwrap_err();
+
+        assert!(
+            app.diagnostics().iter().any(|diagnostic| {
+                diagnostic.level == DiagnosticLevel::Error
+                    && diagnostic.message
+                        == format!("Failed to open SSH session for VM \"dev\": {error}")
+                    && diagnostic.message.contains("does not answer on port 22")
+            }),
+            "{:?}",
+            app.diagnostics()
         );
     }
 
