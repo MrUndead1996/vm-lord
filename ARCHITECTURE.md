@@ -1171,6 +1171,19 @@ including a panic. What VMLord keeps afterwards is a `Com1Session` holding those
 events, not a process handle: the terminal owns the reader, and the session is
 how VMLord speaks to it.
 
+A fifth name, `alive`, works the other way round: the helper creates that event
+itself and holds it for as long as its process lives, and VMLord only ever
+probes whether it exists, never holding a handle -- one would keep the object
+alive past the process it stands for. This is how a reader that said nothing is
+noticed. `finished` covers every way the helper can leave on its own two feet,
+and closing the console window is not one of them: the terminal kills the
+process where it stands, and a killed process signals nothing. Before this,
+such a session looked alive forever, and the VM whose window had been closed
+could never be given another console. A probe that fails for any reason other
+than "no such object" is a `WARN` and counts as alive: a reader that may still
+be reading is left alone. `Com1Sessions::reap` asks this question, so both the
+refresh that drains diagnostics and `open_console` see the same answer.
+
 Ownership follows the VM. An explicit start opens the console once the compute
 system is in its final shape and before it executes anything, and truncates
 `com1.log`, because that boot's output replaces the previous one. Both halves of
@@ -1207,9 +1220,12 @@ A graceful stop leaves the session alone: the guest is still printing what it
 does on the way down, and the pipe closing is what ends the capture. A force
 stop, a delete, an HCS exit event, and VMLord's own shutdown all cancel it,
 because in each of those cases nothing will ever close the pipe from the other
-end. `take_diagnostics` reaps finished sessions: one that finished with its pipe
-is a `DEBUG` line, and one that signaled `failed` becomes an `Error` diagnostic
-naming the VM and the `com1.log` to look in.
+end. `take_diagnostics` reaps sessions that are over: one that finished with its
+pipe, and one whose window was closed, are `DEBUG` lines, and one that signaled
+`failed` becomes an `Error` diagnostic naming the VM and the `com1.log` to look
+in. A killed helper cannot signal `failed`, so a window closed by hand and a
+helper killed some other way read alike -- as the ordinary end of a capture,
+which is what closing that window means.
 
 `ubuntu_cloud_init_is_visible_on_com1` is the factual check, ignored like every
 other test that needs Hyper-V: it builds a real Ubuntu cloud image, starts it,

@@ -80,12 +80,15 @@ pub struct Com1HelperOptions {
     pub ready_event_name: String,
     pub failed_event_name: String,
     pub finished_event_name: String,
+    /// The event this process creates and holds, so that VMLord can tell a
+    /// reader that is still running from one whose window was closed.
+    pub alive_event_name: String,
     pub vm_name: String,
 }
 
 /// The flags [`parse_com1_helper_args`] accepts, in the order the launcher
 /// writes them.
-const FLAGS: [&str; 9] = [
+const FLAGS: [&str; 10] = [
     "--pipe",
     "--log",
     "--mode",
@@ -94,6 +97,7 @@ const FLAGS: [&str; 9] = [
     "--ready-event",
     "--failed-event",
     "--finished-event",
+    "--alive-event",
     "--vm-name",
 ];
 
@@ -159,6 +163,7 @@ pub fn parse_com1_helper_args(
         ready_event_name: name()?,
         failed_event_name: name()?,
         finished_event_name: name()?,
+        alive_event_name: name()?,
         vm_name: name()?,
     })
 }
@@ -188,6 +193,12 @@ pub fn run_com1_helper(options: Com1HelperOptions) -> Result<(), RepositoryError
     let ready = WindowsEvent::open(&options.ready_event_name)?;
     let failed = WindowsEvent::open(&options.failed_event_name)?;
     let finished = WindowsEvent::open(&options.finished_event_name)?;
+    // Created here rather than by VMLord, and held for as long as this process
+    // lives: a named object exists while a handle to it does, so VMLord probing
+    // this name is asking whether this process is still there. That is the only
+    // question `finished` cannot answer -- a window a person closes takes the
+    // helper down with no chance to signal anything.
+    let _alive = WindowsEvent::create_named(&options.alive_event_name, true, false)?;
     // Whatever happens below -- success, error, or a panic unwinding through
     // it -- VMLord learns that this reader is over.
     let _finish = SignalOnDrop(&finished);
@@ -588,6 +599,8 @@ mod tests {
             r"Local\VMLord.Com1.failed.test",
             "--finished-event",
             r"Local\VMLord.Com1.finished.test",
+            "--alive-event",
+            r"Local\VMLord.Com1.alive.test",
             "--vm-name",
             "dev",
         ]
