@@ -499,6 +499,19 @@ disks can be kept at the user's request, which leaves the VM's directory in
 place and therefore reserves its name; the image the VM was installed from is
 never touched.
 
+Keeping the disks keeps the disks and nothing else that only served the VM. The
+`config.json` describes a compute system that is gone, and the VM's SSH identity
+-- the `keys/` pair and the `known_hosts` VMLord learned for it -- belongs to a
+guest nobody reaches through VMLord any more, so both go in either mode. A
+private key with no owner is worth removing on its own, and host keys kept past
+their VM would only pin a host that no longer answers; a guest booted from the
+kept disks brings its own `authorized_keys`, so giving it a key again is the
+user's to do. There is no separate choice about this: a checkbox for keeping an
+identity nothing can use would be a way to get it wrong. `com1.log` and
+`cloud-init-status.log` stay either way -- they record what the VM did rather
+than how to log into it, which is what someone who kept the disks may still need
+to read.
+
 An HCS compute system is a runtime object, not a registered machine: it exists
 only while it is created or running, and HCS destroys it as it exits -- whether
 the guest powered itself off or a forced stop terminated it. Reopening a stopped
@@ -543,8 +556,9 @@ keep VMLord on the backend being retired.
 
 The native backend deliberately reports less than AppSandbox did while the
 remaining migration tasks land: GPU mode is `None`, guest agent status is
-`Unknown`, and display and SSH connections report that the backend does not
-support them. SSH availability is not among them: it is read from the VM's
+`Unknown`, and display connections report that the backend does not support
+them. SSH is not among them any more -- it is the native backend's alone, as
+"Running the OpenSSH client" describes, and availability is read from the VM's
 mapping, which records what its creation asked for. Network mode is reported from the VM's mapping, because the
 edit form is filled from `VmSummary`: a summary that always said `None` would
 make an unrelated edit switch a NAT VM off the network. The guest's address comes
@@ -660,7 +674,11 @@ instead: Start invokes `asb_vm_start`; Stop invokes the graceful
 `asb_vm_shutdown`; Force stop invokes `asb_vm_stop`; Edit uses AppSandbox's
 configuration setters; Connect invokes `asb_vm_open_display`, which opens or
 focuses the temporary AppSandbox IDD window after the guest display driver is
-ready. It calls `asb_detach` on exit so it never stops VMs.
+ready. It calls `asb_detach` on exit so it never stops VMs. `Open SSH` is not
+among them: the legacy backend reports every VM's SSH as unavailable and answers
+that SSH connections are not supported, because a connection needs the key, the
+port and the `known_hosts` file only the native backend has. It reads no
+`asb_vm_ssh_*` export and launches no terminal of its own.
 
 ### Image download
 
@@ -1122,7 +1140,8 @@ must not hold a private key. The user's own entry is what lets `ssh -i` work
 from an unelevated console, and it is the exact shape Win32-OpenSSH accepts. A
 VM that already has a key is never given another: the guest holds the public
 half, and a new pair would leave it trusting a key the host no longer has.
-Deleting the VM deletes the key with the directory.
+Deleting the VM deletes the key: with the whole directory when the disks go, and
+with `keys/` and `known_hosts` alone when they are kept.
 
 ### The cloud-init seed
 
@@ -1278,8 +1297,8 @@ cases.
 `disks/`. It is a configuration medium, not a disk: `disks/` is what a person
 means when they ask VMLord to delete a VM but keep its disks, and a seed left in
 there would be either deleted with the disks it provisioned or kept as something
-that looks like one. Deleting a VM without its disks removes `config.json`
-alone, so the seed stays with the disk it belongs to.
+that looks like one. Deleting a VM without its disks removes `config.json` and
+the VM's SSH identity, so the seed stays with the disk it belongs to.
 
 The seed carries the password's SHA-512-crypt entry, which makes it the second
 secret VMLord keeps in a file, and it is written the way the first one is:

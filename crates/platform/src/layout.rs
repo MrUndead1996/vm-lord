@@ -76,9 +76,18 @@ pub(crate) fn seed_path(vm_directory: &Path) -> PathBuf {
     vm_directory.join("seed.iso")
 }
 
+/// Returns the directory holding the VM's own SSH key pair.
+///
+/// A directory of its own rather than loose files beside `config.json`: it is
+/// the whole of the VM's SSH identity, which lets a deletion that keeps the
+/// disks remove the identity in one step.
+pub(crate) fn ssh_keys_directory(vm_directory: &Path) -> PathBuf {
+    vm_directory.join("keys")
+}
+
 /// Returns the path of the VM's own SSH private key.
 pub(crate) fn ssh_key_path(vm_directory: &Path) -> PathBuf {
-    vm_directory.join("keys").join("id_ed25519")
+    ssh_keys_directory(vm_directory).join("id_ed25519")
 }
 
 /// Returns the path of the host keys VMLord has learned for this VM.
@@ -97,7 +106,7 @@ pub(crate) fn ssh_known_hosts_path(vm_directory: &Path) -> PathBuf {
 /// file is a convenience rather than a necessity: it lets a person see which
 /// key went into the guest without starting the VM.
 pub(crate) fn ssh_public_key_path(vm_directory: &Path) -> PathBuf {
-    vm_directory.join("keys").join("id_ed25519.pub")
+    ssh_keys_directory(vm_directory).join("id_ed25519.pub")
 }
 
 #[cfg(test)]
@@ -106,7 +115,8 @@ mod tests {
 
     use super::{
         cloud_init_status_log_path, com1_log_path, configuration_path, seed_path, ssh_key_path,
-        ssh_known_hosts_path, ssh_public_key_path, system_disk_path, vm_directory,
+        ssh_keys_directory, ssh_known_hosts_path, ssh_public_key_path, system_disk_path,
+        vm_directory,
     };
 
     #[test]
@@ -185,6 +195,17 @@ mod tests {
                 .join("keys")
                 .join("id_ed25519.pub")
         );
+    }
+
+    #[test]
+    fn both_halves_of_the_pair_live_in_the_vms_keys_directory() {
+        // The directory is what a deletion that keeps the disks removes, so
+        // nothing of the VM's SSH identity may sit outside it.
+        let directory = vm_directory(Path::new("/vms"), "dev-linux").unwrap();
+        let keys = ssh_keys_directory(&directory);
+
+        assert!(ssh_key_path(&directory).starts_with(&keys));
+        assert!(ssh_public_key_path(&directory).starts_with(&keys));
     }
 
     #[test]
