@@ -112,8 +112,9 @@ executable directly. The build stages the prebuilt
 `third_party/appsandbox/NOTICE.md` for the pinned artifact and license details.
 
 The shell targets `x86_64-pc-windows-msvc` and creates Linux workspaces either
-from a local ISO or from an Ubuntu cloud image. The cloud-image path is native:
-the image is downloaded and imported into a VHDX, and the guest is provisioned
+from a local ISO, which boots to the distribution's own installer, or from an
+Ubuntu cloud image, which needs no one at the keyboard: there the image is
+downloaded and imported into a VHDX, and the guest is provisioned
 by cloud-init from a NoCloud seed VMLord writes itself, with COM1 available as a
 diagnostic console. Display, snapshots, and GPU work remain migration work.
 AppSandbox macOS code, WebView UI, provisioning tools, and display resources are

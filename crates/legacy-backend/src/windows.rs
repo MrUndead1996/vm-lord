@@ -12,12 +12,11 @@ use libloading::Library;
 use vmlord_app::{ImagePicker, SettingsPathPicker};
 use vmlord_core::{
     AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError,
-    VmCreateRequest, VmRepository, VmSource, VmState, VmSummary, VmUpdateRequest,
+    VmCreateRequest, VmRepository, VmState, VmSummary, VmUpdateRequest,
 };
 
 type AsbVm = *mut c_void;
 type AsbInit = unsafe extern "system" fn() -> i32;
-type AsbVmCreate = unsafe extern "system" fn(*const AsbVmConfig) -> i32;
 type AsbVmStart = unsafe extern "system" fn(AsbVm, i32, i32, *const u16) -> i32;
 type AsbVmShutdown = unsafe extern "system" fn(AsbVm) -> i32;
 type AsbVmStop = unsafe extern "system" fn(AsbVm) -> i32;
@@ -25,29 +24,6 @@ type AsbVmOpenDisplay = unsafe extern "system" fn(AsbVm) -> i32;
 type AsbVmSetDword = unsafe extern "system" fn(AsbVm, u32) -> i32;
 type AsbVmSetInt = unsafe extern "system" fn(AsbVm, i32) -> i32;
 
-#[repr(C)]
-struct AsbVmConfig {
-    name: *const u16,
-    os_type: *const u16,
-    image_path: *const u16,
-    template_name: *const u16,
-    ram_mb: u32,
-    hdd_gb: u32,
-    cpu_cores: u32,
-    gpu_mode: i32,
-    network_mode: i32,
-    net_adapter: *const u16,
-    username: *const u16,
-    password: *const u16,
-    test_mode: i32,
-    ssh_enabled: i32,
-    ssh_deploy_key: i32,
-    is_template: i32,
-    linux_source: *const u16,
-    locale: *const u16,
-    keyboard: *const u16,
-    timezone: *const u16,
-}
 type AsbDetach = unsafe extern "system" fn();
 type AsbReconnectRunning = unsafe extern "system" fn();
 type AsbSetCallback = unsafe extern "system" fn(Option<Callback>, *mut c_void);
@@ -61,7 +37,6 @@ type Callback = unsafe extern "system" fn(*const u16, *mut c_void);
 
 struct Api {
     init: AsbInit,
-    vm_create: AsbVmCreate,
     vm_set_ram: Option<AsbVmSetDword>,
     vm_set_cpu: Option<AsbVmSetDword>,
     vm_set_gpu: Option<AsbVmSetInt>,
@@ -253,60 +228,19 @@ impl VmRepository for AppSandboxBackend {
         Ok(())
     }
 
-    fn create_vm(&mut self, request: VmCreateRequest) -> Result<(), RepositoryError> {
-        if !self.initialized {
-            return Err(RepositoryError::new("legacy backend is not initialized"));
-        }
-
-        let name = wide_string(&request.name);
-        let os_type = wide_string("Linux");
-        // AppSandbox's own model is "installation media plus unattended
-        // answers", which the domain no longer spells: a local medium means a
-        // hand-installed system. The credentials therefore go over empty, and
-        // no unattended install happens: `iso-patch.exe`, the tool AppSandbox
-        // ran for that, is no longer shipped. The legacy backend is
-        // transitional (AGENTS.md) and provisioning is the native path's.
-        let image_path = match &request.source {
-            VmSource::LocalMedia { path } => wide_string(path),
-            VmSource::CloudImage { .. } => {
-                return Err(RepositoryError::new(
-                    "the legacy AppSandbox backend cannot create a VM from a cloud image",
-                ));
-            }
-        };
-        let username = wide_string("");
-        let password = wide_string("");
-        let config = AsbVmConfig {
-            name: name.as_ptr(),
-            os_type: os_type.as_ptr(),
-            image_path: image_path.as_ptr(),
-            template_name: ptr::null(),
-            ram_mb: request.ram_mb,
-            hdd_gb: request.disk_gb,
-            cpu_cores: request.cpu_cores,
-            gpu_mode: gpu_mode_value(request.gpu_mode)?,
-            network_mode: network_mode_value(request.network_mode)?,
-            net_adapter: ptr::null(),
-            username: username.as_ptr(),
-            password: password.as_ptr(),
-            test_mode: 1,
-            ssh_enabled: 0,
-            ssh_deploy_key: 0,
-            is_template: 0,
-            linux_source: ptr::null(),
-            locale: ptr::null(),
-            keyboard: ptr::null(),
-            timezone: ptr::null(),
-        };
-        let result = unsafe { (self.api.vm_create)(&config) };
-        if result < 0 {
-            return Err(RepositoryError::new(format!(
-                "AppSandbox VM creation failed (HRESULT 0x{:08X})",
-                result as u32
-            )));
-        }
-
-        Ok(())
+    fn create_vm(&mut self, _request: VmCreateRequest) -> Result<(), RepositoryError> {
+        // AppSandbox builds a Linux disk by handing the medium to
+        // `iso-patch.exe`, a host-side Ubuntu installer VMLord no longer ships:
+        // the native backend imports a cloud image instead. Nothing else in the
+        // DLL creates a VM, so this refuses rather than failing inside the C
+        // code on a missing executable. Everything the backend still does with
+        // VMs it did not create -- list, start, stop, edit, delete -- is
+        // untouched; the legacy backend is transitional (AGENTS.md) and only
+        // runs when `VMLORD_BACKEND=legacy` asks for it.
+        Err(RepositoryError::new(
+            "the legacy AppSandbox backend can no longer create VMs; unset VMLORD_BACKEND to \
+             create one with the native backend",
+        ))
     }
 
     fn update_vm(&mut self, request: VmUpdateRequest) -> Result<(), RepositoryError> {
@@ -583,7 +517,6 @@ impl Api {
 
         Ok(Self {
             init: export!(b"asb_init\0", AsbInit),
-            vm_create: export!(b"asb_vm_create\0", AsbVmCreate),
             vm_set_ram: optional_export!(b"asb_vm_set_ram\0", AsbVmSetDword),
             vm_set_cpu: optional_export!(b"asb_vm_set_cpu\0", AsbVmSetDword),
             vm_set_gpu: optional_export!(b"asb_vm_set_gpu\0", AsbVmSetInt),
@@ -793,10 +726,6 @@ fn wide_ptr_to_string(pointer: *const u16) -> Result<String, RepositoryError> {
     Ok(String::from_utf16_lossy(unsafe {
         slice::from_raw_parts(pointer, length)
     }))
-}
-
-fn wide_string(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(Some(0)).collect()
 }
 
 fn gpu_mode_value(mode: GpuMode) -> Result<i32, RepositoryError> {
