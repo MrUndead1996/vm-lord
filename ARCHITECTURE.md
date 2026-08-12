@@ -1008,8 +1008,13 @@ key in the document is a cloud-init module that works anywhere.
 The native backend builds a VM from a `CloudImage`; the legacy AppSandbox
 backend refuses one outright and is given empty credentials for `LocalMedia`:
 its own model was "media plus unattended answers", which the domain no longer
-spells. That is a deliberate loss on a transitional path -- #66 removes the
-iso-patch dependency it belongs to.
+spells. That is a deliberate loss on a transitional path: the unattended half
+of that model was `iso-patch.exe`, and it is no longer shipped. AppSandbox ran
+it as a host-side Ubuntu installer -- its own ext4 writer, its own squashfs
+reader, a partition table written through `IOCTL_DISK_SET_DRIVE_LAYOUT_EX` --
+and building disks from cloud images leaves nothing for it to do. What remains
+of it in this document are citations to its C sources, which recorded Windows
+behaviour worth keeping; only the binary is gone.
 
 ### Creating a VM from a cloud image
 

@@ -263,8 +263,9 @@ impl VmRepository for AppSandboxBackend {
         // AppSandbox's own model is "installation media plus unattended
         // answers", which the domain no longer spells: a local medium means a
         // hand-installed system. The credentials therefore go over empty, and
-        // iso-patch performs no unattended install. The legacy backend is
-        // transitional (AGENTS.md), and #66 removes iso-patch altogether.
+        // no unattended install happens: `iso-patch.exe`, the tool AppSandbox
+        // ran for that, is no longer shipped. The legacy backend is
+        // transitional (AGENTS.md) and provisioning is the native path's.
         let image_path = match &request.source {
             VmSource::LocalMedia { path } => wide_string(path),
             VmSource::CloudImage { .. } => {
