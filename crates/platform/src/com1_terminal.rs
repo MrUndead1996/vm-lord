@@ -684,6 +684,7 @@ mod tests {
             disk_gb: 0,
             endpoint_id: None,
             network_mode: NetworkMode::None,
+            ssh: None,
         }
     }
 

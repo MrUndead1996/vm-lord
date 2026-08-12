@@ -20,8 +20,8 @@ use std::{
 };
 
 use vmlord_core::{
-    BuildMonitor, BuildStep, GpuMode, RepositoryError, VmCreateRequest, VmSource, VmState,
-    VmSummary,
+    BuildMonitor, BuildStep, GpuMode, RepositoryError, SshAvailability, VmCreateRequest, VmSource,
+    VmState, VmSummary,
 };
 
 use crate::{com1_terminal::Com1Session, metadata::VmComputeSystemMapping};
@@ -165,7 +165,9 @@ impl BuildRegistry {
                 network_mode: build.request.network_mode,
                 // A VM that does not exist answers nowhere.
                 ip_address: None,
-                ssh_port: None,
+                // Whatever it was asked for, there is nothing to connect to
+                // until the build has written the VM down.
+                ssh: SshAvailability::Disabled,
             })
             .collect()
     }
@@ -327,6 +329,7 @@ mod tests {
             disk_gb: 20,
             endpoint_id: None,
             network_mode: NetworkMode::None,
+            ssh: None,
         }
     }
 

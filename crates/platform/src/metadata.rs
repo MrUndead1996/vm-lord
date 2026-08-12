@@ -14,7 +14,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use vmlord_core::{NetworkMode, RepositoryError};
+use vmlord_core::{NetworkMode, RepositoryError, SshConfig};
 
 /// Serializes the read-modify-write of the mapping document.
 ///
@@ -65,6 +65,16 @@ pub struct VmComputeSystemMapping {
     /// for, since the HCS backend still rejects every other mode.
     #[serde(default)]
     pub network_mode: NetworkMode,
+    /// How to log into this VM over SSH, if it has an SSH server at all.
+    ///
+    /// `None` is a VM created with SSH switched off -- there are no VMs from
+    /// before this field existed, so absence needs no second meaning. What is
+    /// recorded is what a person chose at creation and what cloud-init was
+    /// asked to apply; the address is not, because the guest takes a new one
+    /// from HNS on every start, and the password is not, because a password on
+    /// disk is a password leaked.
+    #[serde(default)]
+    pub ssh: Option<SshConfig>,
 }
 
 impl VmComputeSystemMapping {
@@ -76,6 +86,12 @@ impl VmComputeSystemMapping {
             return Err(RepositoryError::new(
                 "HCS compute system ID must not be empty",
             ));
+        }
+        // Checked on the way in and on the way back out: a document edited by
+        // hand between the two is refused while it is still data, rather than
+        // when its user name has already become an `ssh -l` argument.
+        if let Some(ssh) = &self.ssh {
+            ssh.validate()?;
         }
         Ok(())
     }
@@ -260,7 +276,7 @@ mod tests {
     };
 
     use uuid::Uuid;
-    use vmlord_core::NetworkMode;
+    use vmlord_core::{NetworkMode, SshAuthentication, SshConfig, SshPort};
 
     use super::{MetadataStore, VmComputeSystemMapping};
 
@@ -282,6 +298,15 @@ mod tests {
             disk_gb: 20,
             endpoint_id: None,
             network_mode: NetworkMode::None,
+            ssh: None,
+        }
+    }
+
+    fn ssh_config() -> SshConfig {
+        SshConfig {
+            username: "ubuntu".into(),
+            port: SshPort::new(2222).unwrap(),
+            authentication: SshAuthentication::VmlordKey,
         }
     }
 
@@ -481,6 +506,90 @@ mod tests {
             Some(endpoint_id)
         );
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn an_ssh_configuration_survives_being_written_and_read_back() {
+        let path = temporary_mapping_file();
+        let store = MetadataStore::new(&path);
+        let vm_id = Uuid::new_v4();
+
+        store
+            .insert(VmComputeSystemMapping {
+                ssh: Some(ssh_config()),
+                ..mapping(vm_id, "dev-linux", "vmlord-1")
+            })
+            .unwrap();
+
+        let document = fs::read_to_string(&path).unwrap();
+        assert!(document.contains("2222"), "got {document}");
+        assert!(document.contains("VmlordKey"), "got {document}");
+        assert_eq!(
+            store.find_by_vm_id(vm_id).unwrap().unwrap().ssh,
+            Some(ssh_config())
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    /// A VM created with SSH switched off. There are no VMs from before the
+    /// field existed, so this is the only thing its absence can mean.
+    #[test]
+    fn a_vm_without_ssh_reads_back_as_having_none() {
+        let path = temporary_mapping_file();
+        let store = MetadataStore::new(&path);
+        let vm_id = Uuid::new_v4();
+
+        store.insert(mapping(vm_id, "no-ssh", "vmlord-1")).unwrap();
+
+        assert_eq!(store.find_by_vm_id(vm_id).unwrap().unwrap().ssh, None);
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn insert_rejects_an_ssh_user_name_the_guest_would_refuse() {
+        let store = MetadataStore::new(temporary_mapping_file());
+
+        let error = store
+            .insert(VmComputeSystemMapping {
+                ssh: Some(SshConfig {
+                    username: "root -oProxyCommand=calc".into(),
+                    ..ssh_config()
+                }),
+                ..mapping(Uuid::new_v4(), "dev-linux", "vmlord-1")
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("user name"), "got {error}");
+    }
+
+    /// Hand-edited metadata is refused as a document, long before a user name
+    /// or a port could reach the arguments of an `ssh.exe`.
+    #[test]
+    fn a_stored_ssh_section_that_cannot_be_connected_with_does_not_load() {
+        for stored_ssh in [
+            r#"{"username":"ubuntu","port":0,"authentication":"VmlordKey"}"#,
+            r#"{"username":"Ubuntu Admin","port":22,"authentication":"VmlordKey"}"#,
+            r#"{"username":"ubuntu","port":22,"authentication":"Agent"}"#,
+        ] {
+            let path = temporary_mapping_file();
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let vm_id = Uuid::new_v4();
+            fs::write(
+                &path,
+                format!(
+                    r#"[{{"vm_id":"{vm_id}","vm_name":"dev-linux",
+                        "hcs_compute_system_id":"vmlord-1","disk_gb":20,
+                        "ssh":{stored_ssh}}}]"#
+                ),
+            )
+            .unwrap();
+
+            assert!(
+                MetadataStore::new(&path).find_by_vm_id(vm_id).is_err(),
+                "{stored_ssh} must not load"
+            );
+            fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
     }
 
     /// Parallel builds are the first thing to write metadata concurrently, and

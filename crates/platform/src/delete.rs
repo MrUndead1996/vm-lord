@@ -233,6 +233,7 @@ mod tests {
             } else {
                 NetworkMode::None
             },
+            ssh: None,
         };
         let store = MetadataStore::new(root.0.join("vm-mapping.json"));
         store

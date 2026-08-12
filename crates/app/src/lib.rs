@@ -678,7 +678,11 @@ mod tests {
                 gpu_mode: vmlord_core::GpuMode::None,
                 network_mode: vmlord_core::NetworkMode::Nat,
                 ip_address: None,
-                ssh_port: Some(22),
+                ssh: vmlord_core::SshAvailability::Enabled(vmlord_core::SshConfig {
+                    username: "user".into(),
+                    port: vmlord_core::SshPort::DEFAULT,
+                    authentication: vmlord_core::SshAuthentication::VmlordKey,
+                }),
             }])
         }
 

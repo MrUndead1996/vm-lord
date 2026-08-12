@@ -2,8 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use vmlord_app::{BackendStatus, WorkspaceApp};
 use vmlord_core::{
-    AgentStatus, Diagnostic, GpuMode, NetworkMode, RepositoryError, VmRepository, VmState,
-    VmSummary, VmUpdateRequest,
+    AgentStatus, Diagnostic, GpuMode, NetworkMode, RepositoryError, SshAuthentication,
+    SshAvailability, SshConfig, SshPort, VmRepository, VmState, VmSummary, VmUpdateRequest,
 };
 
 #[derive(Clone, Default)]
@@ -57,7 +57,11 @@ impl VmRepository for FakeRepository {
             gpu_mode: GpuMode::Default,
             network_mode: NetworkMode::Nat,
             ip_address: None,
-            ssh_port: Some(22),
+            ssh: SshAvailability::Enabled(SshConfig {
+                username: "user".into(),
+                port: SshPort::DEFAULT,
+                authentication: SshAuthentication::VmlordKey,
+            }),
         }])
     }
 

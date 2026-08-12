@@ -211,6 +211,7 @@ mod tests {
             disk_gb: 20,
             endpoint_id,
             network_mode,
+            ssh: None,
         };
         let store = MetadataStore::new(root.0.join("vm-mapping.json"));
         store

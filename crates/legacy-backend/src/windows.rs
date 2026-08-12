@@ -12,7 +12,8 @@ use libloading::Library;
 use vmlord_app::{ImagePicker, SettingsPathPicker};
 use vmlord_core::{
     AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError,
-    VmCreateRequest, VmRepository, VmState, VmSummary, VmUpdateRequest,
+    SshAuthentication, SshAvailability, SshConfig, SshPort, VmCreateRequest, VmRepository, VmState,
+    VmSummary, VmUpdateRequest,
 };
 
 type AsbVm = *mut c_void;
@@ -450,7 +451,7 @@ impl AppSandboxBackend {
             let running = (self.api.vm_is_running)(vm) != 0;
             let building = (self.api.vm_is_building)(vm) != 0;
             let agent_online = (self.api.vm_agent_online)(vm) != 0;
-            let ssh_port = ((self.api.vm_ssh_enabled)(vm) != 0).then(|| (self.api.vm_ssh_port)(vm));
+            let ssh = self.ssh_availability(vm);
             let running_without_handle = self.running_without_handle_lock().contains(&name);
 
             Ok(VmSummary {
@@ -477,8 +478,53 @@ impl AppSandboxBackend {
                 network_mode: network_mode((self.api.vm_network_mode)(vm)),
                 // The temporary AppSandbox FFI does not expose a guest IP address yet.
                 ip_address: None,
-                ssh_port,
+                ssh,
             })
+        }
+    }
+
+    /// What AppSandbox knows about a VM's SSH access, as the domain spells it.
+    ///
+    /// Every piece has to be there for the answer to be `Enabled`: an older
+    /// `appsandbox_core.dll` has no user name to give, and a VM whose agent has
+    /// not finished its setup reports a port of zero. Both are a connection
+    /// that cannot be made, and neither is an error worth losing the VM from
+    /// the list over -- [`AppSandboxBackend::open_ssh`] is where a person who
+    /// asks for one anyway is told which of the two it was.
+    fn ssh_availability(&self, vm: AsbVm) -> SshAvailability {
+        // The handle and the returned string pointer originate from AppSandbox.
+        unsafe {
+            if (self.api.vm_ssh_enabled)(vm) == 0 {
+                return SshAvailability::Disabled;
+            }
+            let (Some(admin_user), Some(deploy_key)) =
+                (self.api.vm_admin_user, self.api.vm_ssh_deploy_key)
+            else {
+                return SshAvailability::Disabled;
+            };
+            let Ok(username) = wide_ptr_to_string(admin_user(vm)) else {
+                return SshAvailability::Disabled;
+            };
+            let port = u16::try_from((self.api.vm_ssh_port)(vm))
+                .ok()
+                .and_then(|port| SshPort::new(port).ok());
+            let Some(port) = port else {
+                return SshAvailability::Disabled;
+            };
+
+            let config = SshConfig {
+                username,
+                port,
+                authentication: if deploy_key(vm) != 0 {
+                    SshAuthentication::VmlordKey
+                } else {
+                    SshAuthentication::Password
+                },
+            };
+            if config.validate().is_err() {
+                return SshAvailability::Disabled;
+            }
+            SshAvailability::Enabled(config)
         }
     }
 }

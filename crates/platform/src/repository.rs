@@ -14,8 +14,8 @@ use std::{
 
 use vmlord_core::{
     AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, GuestReadinessTimeouts, NetworkMode,
-    RepositoryError, VmCreateRequest, VmDeleteRequest, VmRepository, VmState, VmSummary,
-    VmUpdateRequest,
+    RepositoryError, SshAvailability, VmCreateRequest, VmDeleteRequest, VmRepository, VmState,
+    VmSummary, VmUpdateRequest,
 };
 
 use crate::{
@@ -309,6 +309,7 @@ impl HcsVmRepository {
         let KnownVm { mapping, state } = known;
         // Read before `mapping.vm_name` is moved into the summary below.
         let network_mode = mapping.network_mode;
+        let ssh = SshAvailability::from(mapping.ssh.clone());
         let topology = self.topology(&mapping).unwrap_or(VmTopology {
             ram_mb: 0,
             cpu_cores: 0,
@@ -325,12 +326,12 @@ impl HcsVmRepository {
             ram_mb: topology.ram_mb,
             disk_gb,
             cpu_cores: topology.cpu_cores,
-            // GPU and SSH are not wired to the native backend yet and are
-            // reported as absent rather than guessed at.
+            // GPU is not wired to the native backend yet and is reported as
+            // absent rather than guessed at.
             gpu_mode: GpuMode::None,
             network_mode,
             ip_address,
-            ssh_port: None,
+            ssh,
         }
     }
 
@@ -1059,8 +1060,8 @@ mod tests {
 
     use uuid::Uuid;
     use vmlord_core::{
-        AgentStatus, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError, VmDeleteRequest,
-        VmRepository, VmState, VmSummary, VmUpdateRequest,
+        AgentStatus, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError, SshAvailability,
+        VmDeleteRequest, VmRepository, VmState, VmSummary, VmUpdateRequest,
     };
 
     use super::{
@@ -1121,7 +1122,7 @@ mod tests {
             gpu_mode: GpuMode::None,
             network_mode: NetworkMode::Nat,
             ip_address: None,
-            ssh_port: None,
+            ssh: SshAvailability::Disabled,
         }];
         let listed = merge_with_builds(known, &builds);
 
@@ -1290,6 +1291,7 @@ mod tests {
             disk_gb: 20,
             endpoint_id: None,
             network_mode,
+            ssh: None,
         }
     }
 
@@ -1303,6 +1305,7 @@ mod tests {
                 disk_gb: 20,
                 endpoint_id: None,
                 network_mode: NetworkMode::None,
+                ssh: None,
             },
             state,
         }

@@ -1308,7 +1308,7 @@ fn render_selected_vm(
         ) {
             action = Some(clicked_action);
         }
-        let ssh_ready = is_running && vm.ssh_port.is_some();
+        let ssh_ready = is_running && vm.ssh.is_enabled();
         if let Some(clicked_action) = render_action_group(
             ui,
             &[(VmAction::Ssh, "SSH")],
@@ -1392,9 +1392,16 @@ fn render_selected_vm(
             detail_row(ui, "GPU", gpu_mode_label(vm.gpu_mode).into());
             detail_row(
                 ui,
-                "SSH port",
-                vm.ssh_port
-                    .map_or_else(|| "Disabled".into(), |port| port.to_string()),
+                "SSH",
+                vm.ssh.config().map_or_else(
+                    || "Disabled".into(),
+                    |ssh| {
+                        format!(
+                            "{} on port {}, {} login",
+                            ssh.username, ssh.port, ssh.authentication
+                        )
+                    },
+                ),
             );
         });
 
@@ -1959,8 +1966,11 @@ mod tests {
 
     #[test]
     fn the_two_ssh_toggles_reach_the_request() {
+        // With no key deployed, the password is the only way in, and the domain
+        // insists on one.
         let key_less = CreateVmForm {
             deploy_key: false,
+            password: "hunter2".into(),
             ..cloud_form()
         };
         assert_eq!(
@@ -2068,6 +2078,8 @@ mod tests {
     /// not about the request.
     #[test]
     fn a_name_already_in_the_list_is_refused_before_the_backend_sees_it() {
+        use vmlord_core::SshAvailability;
+
         let existing = [VmSummary {
             name: "DEV".into(),
             os_type: "Linux".into(),
@@ -2078,7 +2090,7 @@ mod tests {
             gpu_mode: GpuMode::None,
             network_mode: NetworkMode::Nat,
             ip_address: None,
-            ssh_port: None,
+            ssh: SshAvailability::Disabled,
         }];
         let form = CreateVmForm {
             name: "dev".into(),
