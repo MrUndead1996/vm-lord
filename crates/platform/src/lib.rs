@@ -36,6 +36,7 @@ mod password_hash;
 mod reconnect;
 mod repository;
 mod shutdown;
+mod ssh;
 mod start;
 mod subnet;
 mod vhd;

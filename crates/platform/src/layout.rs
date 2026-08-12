@@ -81,6 +81,16 @@ pub(crate) fn ssh_key_path(vm_directory: &Path) -> PathBuf {
     vm_directory.join("keys").join("id_ed25519")
 }
 
+/// Returns the path of the host keys VMLord has learned for this VM.
+///
+/// One file per VM rather than the user's own `~/.ssh/known_hosts`: a VM's key
+/// is VMLord's business, it is learned automatically the first time the guest
+/// answers, and a guest that was deleted and recreated must not be able to make
+/// the user's own file grow entries -- or, worse, collide with a real host.
+pub(crate) fn ssh_known_hosts_path(vm_directory: &Path) -> PathBuf {
+    vm_directory.join("known_hosts")
+}
+
 /// Returns the path of the VM's own SSH public key.
 ///
 /// The public half is derivable from the private one in microseconds, so this
@@ -96,8 +106,18 @@ mod tests {
 
     use super::{
         cloud_init_status_log_path, com1_log_path, configuration_path, seed_path, ssh_key_path,
-        ssh_public_key_path, system_disk_path, vm_directory,
+        ssh_known_hosts_path, ssh_public_key_path, system_disk_path, vm_directory,
     };
+
+    #[test]
+    fn a_vm_learns_host_keys_into_a_file_of_its_own() {
+        let directory = vm_directory(Path::new("/vms"), "dev-linux").unwrap();
+
+        assert_eq!(
+            ssh_known_hosts_path(&directory),
+            PathBuf::from("/vms").join("dev-linux").join("known_hosts")
+        );
+    }
 
     #[test]
     fn the_readiness_transcript_lives_beside_the_serial_log() {
