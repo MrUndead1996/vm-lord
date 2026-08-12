@@ -4,8 +4,8 @@ use std::{fs, io::Write, path::Path, time::Duration};
 
 use uuid::Uuid;
 use vmlord_core::{
-    BuildMonitor, BuildStep, CloudImage, Provisioning, RepositoryError, SshAccess, SshPort,
-    VmCreateRequest, VmSource,
+    BuildMonitor, BuildStep, CloudImage, Provisioning, RepositoryError, SshAccess, VmCreateRequest,
+    VmSource,
 };
 
 use crate::{
@@ -203,16 +203,13 @@ impl VmCreationPipeline {
             endpoint_id: None,
             network_mode: request.network_mode,
             // What a person asked cloud-init to set up, recorded as what a
-            // later connection has to be told. Locally installed media gets
-            // none: VMLord promises nothing about the system inside it.
-            //
-            // The port is the default one until #74 lets the create form
-            // choose another.
+            // later connection has to be told -- including the port, which is
+            // the one the seed below configures the daemon with. Locally
+            // installed media gets none: VMLord promises nothing about the
+            // system inside it.
             ssh: match &request.source {
                 VmSource::LocalMedia { .. } => None,
-                VmSource::CloudImage { provisioning, .. } => {
-                    provisioning.ssh_config(SshPort::DEFAULT)
-                }
+                VmSource::CloudImage { provisioning, .. } => provisioning.ssh_config(),
             },
         };
 
@@ -370,7 +367,9 @@ fn write_provisioning(
     provisioning: &Provisioning,
 ) -> Result<(), RepositoryError> {
     let authorized_key = match provisioning.ssh {
-        SshAccess::Enabled { deploy_key: true } => {
+        SshAccess::Enabled {
+            deploy_key: true, ..
+        } => {
             let pair = vmlord_keys::generate(vm_name)?;
             vm_key::write_key_pair(vm_directory, &pair)?;
             Some(pair.public_openssh().to_owned())
@@ -395,7 +394,7 @@ fn write_provisioning(
         keyboard: &provisioning.keyboard,
         timezone: &provisioning.timezone,
         admin_group: &image.profile.admin_group,
-        ssh_units: &image.profile.ssh_units,
+        ssh_daemon: &image.profile.ssh,
     });
 
     write_seed(seed_path, &vmlord_seed::image(&seed))?;
@@ -444,8 +443,8 @@ mod tests {
     };
 
     use vmlord_core::{
-        CloudImage, GpuMode, NetworkMode, Password, Provisioning, SshAccess, VmCreateRequest,
-        VmSource,
+        CloudImage, GpuMode, NetworkMode, Password, Provisioning, SshAccess, SshPort,
+        VmCreateRequest, VmSource,
     };
 
     use vmlord_core::{BuildMonitor, BuildStep};
@@ -1071,7 +1070,10 @@ mod tests {
                 provisioning: Provisioning {
                     username: "dev".into(),
                     password: Some(Password::new("secret")),
-                    ssh: SshAccess::Enabled { deploy_key: true },
+                    ssh: SshAccess::Enabled {
+                        deploy_key: true,
+                        port: SshPort::DEFAULT,
+                    },
                     locale: "en_US.UTF-8".into(),
                     keyboard: "us".into(),
                     timezone: "Europe/Moscow".into(),
@@ -1173,7 +1175,10 @@ mod tests {
                 provisioning: Provisioning {
                     username: "dev".into(),
                     password: None,
-                    ssh: SshAccess::Enabled { deploy_key: true },
+                    ssh: SshAccess::Enabled {
+                        deploy_key: true,
+                        port: SshPort::DEFAULT,
+                    },
                     locale: "en_US.UTF-8".into(),
                     keyboard: "us".into(),
                     timezone: "Europe/Moscow".into(),
@@ -1271,7 +1276,10 @@ mod tests {
                 provisioning: Provisioning {
                     username: "dev".into(),
                     password: Some(Password::new("secret")),
-                    ssh: SshAccess::Enabled { deploy_key: false },
+                    ssh: SshAccess::Enabled {
+                        deploy_key: false,
+                        port: SshPort::DEFAULT,
+                    },
                     locale: "en_US.UTF-8".into(),
                     keyboard: "us".into(),
                     timezone: "Europe/Moscow".into(),

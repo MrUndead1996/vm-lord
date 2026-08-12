@@ -12,7 +12,7 @@ mod meta_data;
 mod scalar;
 mod user_data;
 
-use vmlord_core::SshAccess;
+use vmlord_core::{SshAccess, SshDaemon};
 
 /// Everything the two documents are printed from.
 pub struct SeedRequest<'a> {
@@ -26,14 +26,16 @@ pub struct SeedRequest<'a> {
     pub password_hash: Option<&'a str>,
     /// The public key, in `authorized_keys` form.
     pub authorized_key: Option<&'a str>,
+    /// Whether the guest runs an SSH daemon and, if it does, on what port.
     pub ssh: SshAccess,
     pub locale: &'a str,
     pub keyboard: &'a str,
     pub timezone: &'a str,
     /// The group that grants administrative rights: `sudo` or `wheel`.
     pub admin_group: &'a str,
-    /// The units that carry the SSH daemon, disabled when SSH is off.
-    pub ssh_units: &'a [String],
+    /// How the distribution runs its SSH daemon: the units to disable when SSH
+    /// is off, and the files to write when it is on.
+    pub ssh_daemon: &'a SshDaemon,
 }
 
 /// The two documents that go into the seed volume.
@@ -69,8 +71,8 @@ pub fn build(request: &SeedRequest<'_>) -> Seed {
             "absent"
         },
         match request.ssh {
-            SshAccess::Disabled => "SSH off",
-            SshAccess::Enabled { .. } => "SSH on",
+            SshAccess::Disabled => "SSH off".to_owned(),
+            SshAccess::Enabled { port, .. } => format!("SSH on port {port}"),
         }
     );
 
@@ -105,10 +107,20 @@ pub fn image(seed: &Seed) -> Vec<u8> {
     )
 }
 
+/// The one SSH daemon description the crate's own tests borrow.
+///
+/// A static because `SeedRequest` borrows it and the tests build
+/// `SeedRequest<'static>` fixtures; Ubuntu's because it is the profile VMLord
+/// ships, and a test that agreed only with a made-up profile would prove
+/// nothing about the seed a real VM gets.
+#[cfg(test)]
+pub(crate) static UBUNTU_SSH: std::sync::LazyLock<SshDaemon> =
+    std::sync::LazyLock::new(|| vmlord_core::ubuntu().ssh);
+
 #[cfg(test)]
 mod tests {
-    use super::{SeedRequest, build};
-    use vmlord_core::SshAccess;
+    use super::{SeedRequest, UBUNTU_SSH, build};
+    use vmlord_core::{SshAccess, SshPort};
 
     #[test]
     fn a_seed_carries_both_documents() {
@@ -118,12 +130,15 @@ mod tests {
             username: "dev",
             password_hash: Some("$6$rounds=4096$salt$hash"),
             authorized_key: None,
-            ssh: SshAccess::Enabled { deploy_key: false },
+            ssh: SshAccess::Enabled {
+                deploy_key: false,
+                port: SshPort::DEFAULT,
+            },
             locale: "en_US.UTF-8",
             keyboard: "us",
             timezone: "Europe/Moscow",
             admin_group: "sudo",
-            ssh_units: &[],
+            ssh_daemon: &UBUNTU_SSH,
         });
 
         assert!(seed.user_data.starts_with("#cloud-config\n"));
@@ -140,12 +155,15 @@ mod tests {
             username: "dev",
             password_hash: None,
             authorized_key: Some("ssh-ed25519 AAAA vmlord"),
-            ssh: SshAccess::Enabled { deploy_key: true },
+            ssh: SshAccess::Enabled {
+                deploy_key: true,
+                port: SshPort::DEFAULT,
+            },
             locale: "en_US.UTF-8",
             keyboard: "us",
             timezone: "Europe/Moscow",
             admin_group: "sudo",
-            ssh_units: &[],
+            ssh_daemon: &UBUNTU_SSH,
         });
 
         let bytes = super::image(&seed);

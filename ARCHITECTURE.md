@@ -879,7 +879,7 @@ validation, including the user-name and VM-name rules the UI used to hold and
 the `GuestDefaults` a create form starts from; `core::distro`
 owns `DistroProfile`, the table of where a distribution publishes its images
 and what the guest inside them looks like -- including the admin group and the
-systemd units that carry its SSH daemon.
+`SshDaemon` description below.
 
 A password travels as `Password`, whose `Debug` prints `<redacted>` and which
 has no `Display`: until it is hashed, the plaintext sits inside a request that
@@ -941,9 +941,23 @@ Four types replace it:
   host key filed under either would be lost on a rename or matched against a
   different guest that inherited the address.
 
+The port a guest listens on is chosen once, when the VM is created, and it lives
+inside `SshAccess::Enabled { deploy_key, port }` rather than beside it: a port
+for a guest that runs no daemon cannot be spelled, and neither can one for
+installation media, since provisioning lives inside `VmSource::CloudImage`. The
+create form holds it as a plain `u16` -- a field being edited passes through
+values nobody means, 0 among them, on the way from 22 to 2222 -- and turns it
+into an `SshPort` on submit, so a zero typed past the widget's `1..=65535` clamp
+is refused by the domain rather than by the dialog. There is no list of
+forbidden ports: a port some other service on the host happens to use is still
+one a guest can listen on. Changing the port of a VM that already exists means
+reconfiguring an installed guest, which is #72 rather than part of creation.
+
 `Provisioning::ssh_config` is the one place a configuration is derived from what
 cloud-init was asked to do, and `VmComputeSystemMapping::ssh` is where it is
-kept: `None` there is a VM created with SSH switched off. The mapping validates
+kept: `None` there is a VM created with SSH switched off. It takes the port from
+the same `SshAccess` the seed is printed from, so what is recorded and what the
+guest listens on cannot drift apart. The mapping validates
 it on the way in and on the way back out, through the same user-name validator
 the create form uses, so a name that reaches an `ssh -l` argument is one Linux
 would accept whether it was typed a minute ago or read from an edited document.
@@ -1001,11 +1015,45 @@ group, the sudo rule `ALL=(ALL) NOPASSWD:ALL` (cloud-init writes it into
 authorized key, `ssh_pwauth`, `locale`, `timezone`, a `write_files` entry for
 `/etc/default/keyboard`, and `growpart`/`resize_rootfs`. Growing the root
 filesystem is a VMLord promise, so it is stated rather than left to cloud-init's
-defaults. `SshAccess::Disabled` adds a `runcmd` that disables the SSH daemon: a
-cloud image ships it enabled, and silence would make the choice void. The unit
-names come from `DistroProfile::ssh_units` -- `ssh.socket`/`ssh.service` in the
-Debian family, `sshd.service` elsewhere -- so the generator knows no
-distribution by name.
+defaults.
+
+SSH is the one thing in the document with two opposite shapes, and both come out
+of `DistroProfile::ssh`, an `SshDaemon` -- unit names and two file paths -- so
+that the generator knows no distribution by name:
+
+* `SshAccess::Disabled` adds a `runcmd` that disables the daemon's units. A
+  cloud image ships it enabled, and silence would make the choice void. Nothing
+  is configured: the drop-ins below would be settings for a daemon being
+  switched off.
+* `SshAccess::Enabled { port, .. }` writes those drop-ins -- `Port <n>` for the
+  daemon, and `[Socket]` with an empty `ListenStream=` followed by
+  `ListenStream=<n>` for the socket unit, where the distribution has one -- and
+  then runs `systemctl daemon-reload` followed by one `try-restart` per unit, in
+  the order the profile lists them, the socket first.
+
+`try-restart` rather than `restart` because it restarts a unit that is running
+and does nothing to one that is not. Ubuntu 24.04 listens through `ssh.socket`
+and leaves `ssh.service` to be activated on demand; 22.04 ships the same socket
+unit without enabling it and runs the service directly. A plain `restart` would
+start whichever of the two the release deliberately leaves alone, and the guest
+would end up with a socket and a daemon competing for one port.
+
+Both files are written because either alone would be wrong somewhere: Ubuntu has
+socket-activated the daemon since 22.10, and a socket-activated `sshd` is handed
+a descriptor that is already bound, so `sshd_config`'s `Port` is read and then
+ignored; a distribution whose daemon opens its own port names no socket unit,
+and then the drop-in is the whole story. The empty `ListenStream=` is not a
+stray line either -- systemd appends to list settings, so without it the guest
+would answer on the distribution's port as well as the chosen one. The daemon's
+drop-in is numbered `10-` because `sshd_config` reads `sshd_config.d/*.conf` in
+name order and the *first* value of a keyword wins, which puts VMLord ahead of
+cloud-init's own `50-cloud-init.conf`. The default port is written out like any
+other: an image whose own configuration says something else would otherwise
+decide where the guest listens.
+
+A `runcmd` command that names a unit a release does not have makes `systemctl`
+return non-zero, which cloud-init does not treat as fatal -- which is why the
+restarts are one command per unit rather than one command listing all of them.
 
 `meta-data` carries `instance-id`, formatted from the VM's id, and
 `local-hostname`, the VM name. The identifier never changes, which is what makes
@@ -1472,7 +1520,11 @@ toggle shows where the private key will be, and the path is answered by
 `VmRepository::ssh_key_path` rather than composed in the dialog -- the on-disk
 layout of a VM is the platform layer's, and the label has to be right before the
 file exists. A backend that gives VMs no keys of its own answers `None` and the
-dialog says only that the key lives with the VM.
+dialog says only that the key lives with the VM. The port sits with the key
+toggle, inside the group the SSH checkbox disables, so a guest that runs no
+daemon has nothing to be asked about -- and installation media has no SSH
+controls at all, because the whole provisioning grid belongs to the cloud-image
+mode.
 
 A build is a row in the list from the moment it is accepted, labelled with the
 step it has reached; the selected-VM panel adds the download's byte counts,

@@ -30,13 +30,41 @@ pub struct DistroProfile {
     pub default_user: String,
     /// The group that account must join to hold administrative rights.
     pub admin_group: String,
-    /// The systemd units that carry the SSH daemon.
+    /// How this distribution runs and configures its SSH daemon.
+    pub ssh: SshDaemon,
+}
+
+/// How a distribution starts its SSH daemon, and where a setting of VMLord's
+/// has to be written for the daemon to read it.
+///
+/// Data rather than knowledge inside the seed generator: the differences
+/// between distributions here are file paths and unit names, and a generator
+/// that branched on `"Ubuntu"` would have to be edited for every profile added
+/// to a JSON file later.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshDaemon {
+    /// The systemd units that carry the daemon.
     ///
-    /// Data rather than a literal in the seed generator: Debian-family systems
-    /// socket-activate `ssh.socket` and keep `ssh.service` beside it, while
-    /// Fedora and SUSE name both `sshd`. A VM created with SSH turned off has
-    /// these disabled on the first boot.
-    pub ssh_units: Vec<String>,
+    /// Debian-family systems socket-activate `ssh.socket` and keep
+    /// `ssh.service` beside it, while Fedora and SUSE name both `sshd`. A VM
+    /// created with SSH turned off has these disabled on the first boot, and
+    /// one created with a port has them restarted after the drop-ins below are
+    /// written.
+    pub units: Vec<String>,
+    /// The drop-in file that overrides the daemon's own configuration.
+    ///
+    /// A file of VMLord's own rather than an edit of `sshd_config`: a drop-in
+    /// is written whole, so nothing has to be found, matched or replaced inside
+    /// a file the distribution owns and may change between releases.
+    pub config_drop_in: String,
+    /// The drop-in that overrides the listening socket, on distributions that
+    /// socket-activate the daemon.
+    ///
+    /// `None` where the daemon opens its own port, in which case
+    /// [`Self::config_drop_in`] is the whole story. Where a socket does the
+    /// listening, `sshd_config`'s `Port` is ignored -- the daemon is handed a
+    /// file descriptor that is already bound -- so both files have to agree.
+    pub socket_drop_in: Option<String>,
 }
 
 /// Ubuntu's official cloud images.
@@ -58,7 +86,18 @@ pub fn ubuntu() -> DistroProfile {
         checksum_file: "SHA256SUMS".into(),
         default_user: "ubuntu".into(),
         admin_group: "sudo".into(),
-        ssh_units: vec!["ssh.socket".into(), "ssh.service".into()],
+        ssh: SshDaemon {
+            units: vec!["ssh.socket".into(), "ssh.service".into()],
+            // `sshd_config` ends with `Include /etc/ssh/sshd_config.d/*.conf`
+            // read in name order, and the *first* value of a keyword wins --
+            // so the number decides who wins, and `10-` puts VMLord ahead of
+            // cloud-init's own `50-cloud-init.conf`.
+            config_drop_in: "/etc/ssh/sshd_config.d/10-vmlord.conf".into(),
+            // Ubuntu socket-activates the daemon since 22.10, and the unit
+            // lives under `/lib`, so the override goes under `/etc` where
+            // systemd looks for it second.
+            socket_drop_in: Some("/etc/systemd/system/ssh.socket.d/10-vmlord.conf".into()),
+        },
     }
 }
 
@@ -117,7 +156,20 @@ mod tests {
 
     #[test]
     fn a_profile_names_the_units_that_carry_its_ssh_daemon() {
-        assert_eq!(ubuntu().ssh_units, ["ssh.socket", "ssh.service"]);
+        assert_eq!(ubuntu().ssh.units, ["ssh.socket", "ssh.service"]);
+    }
+
+    /// Ubuntu listens through `ssh.socket`, so a port stated only in
+    /// `sshd_config` would be read and then ignored.
+    #[test]
+    fn a_socket_activated_profile_names_both_places_a_port_has_to_be_written() {
+        let ssh = ubuntu().ssh;
+
+        assert_eq!(ssh.config_drop_in, "/etc/ssh/sshd_config.d/10-vmlord.conf");
+        assert_eq!(
+            ssh.socket_drop_in.as_deref(),
+            Some("/etc/systemd/system/ssh.socket.d/10-vmlord.conf")
+        );
     }
 
     #[test]

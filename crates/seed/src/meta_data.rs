@@ -19,9 +19,9 @@ pub(crate) fn render(request: &SeedRequest<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::render;
-    use crate::SeedRequest;
+    use crate::{SeedRequest, UBUNTU_SSH};
     use serde_yaml_ng::Value;
-    use vmlord_core::SshAccess;
+    use vmlord_core::{SshAccess, SshPort};
 
     fn request() -> SeedRequest<'static> {
         SeedRequest {
@@ -30,12 +30,15 @@ mod tests {
             username: "dev",
             password_hash: Some("$6$rounds=4096$salt$hash"),
             authorized_key: Some("ssh-ed25519 AAAAC3Nz vmlord"),
-            ssh: SshAccess::Enabled { deploy_key: true },
+            ssh: SshAccess::Enabled {
+                deploy_key: true,
+                port: SshPort::DEFAULT,
+            },
             locale: "en_US.UTF-8",
             keyboard: "us",
             timezone: "Europe/Moscow",
             admin_group: "sudo",
-            ssh_units: &[],
+            ssh_daemon: &UBUNTU_SSH,
         }
     }
 

@@ -61,11 +61,19 @@ pub struct Provisioning {
     pub timezone: String,
 }
 
-/// Whether the guest runs an SSH server, and whether VMLord puts a key in it.
+/// Whether the guest runs an SSH server, on what port, and whether VMLord puts
+/// a key in it.
+///
+/// The port lives inside `Enabled` rather than beside it, for the reason
+/// provisioning itself lives inside `VmSource::CloudImage`: a port for a guest
+/// that runs no daemon is not a value to be ignored later but one that cannot
+/// be spelled. It is chosen once, when the VM is created -- changing it
+/// afterwards means reconfiguring a guest that is already installed, which is
+/// its own task (#72).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SshAccess {
     Disabled,
-    Enabled { deploy_key: bool },
+    Enabled { deploy_key: bool, port: SshPort },
 }
 
 /// A password in the clear, on its way to being hashed.
@@ -142,7 +150,15 @@ impl Provisioning {
         // The two SSH modes are the whole list: VMLord's own key, or the
         // password. An SSH server with neither is a server nobody can get
         // through -- there is no third credential to fall back on.
-        if self.password.is_none() && self.ssh == (SshAccess::Enabled { deploy_key: false }) {
+        if self.password.is_none()
+            && matches!(
+                self.ssh,
+                SshAccess::Enabled {
+                    deploy_key: false,
+                    ..
+                }
+            )
+        {
             return Err(rejected(
                 "an SSH server without a deployed key needs a password to log in with",
             ));
@@ -164,9 +180,15 @@ impl Provisioning {
                 "unset"
             },
             match self.ssh {
-                SshAccess::Disabled => "SSH off",
-                SshAccess::Enabled { deploy_key: false } => "SSH on",
-                SshAccess::Enabled { deploy_key: true } => "SSH on with a deployed key",
+                SshAccess::Disabled => "SSH off".to_owned(),
+                SshAccess::Enabled {
+                    deploy_key: false,
+                    port,
+                } => format!("SSH on port {port}"),
+                SshAccess::Enabled {
+                    deploy_key: true,
+                    port,
+                } => format!("SSH on port {port} with a deployed key"),
             }
         );
         Ok(())
@@ -178,16 +200,21 @@ impl Provisioning {
     /// `None` when the guest runs no SSH server: that is what "SSH is off"
     /// means everywhere afterwards, rather than a flag beside a port. The mode
     /// follows from what the guest is given -- a deployed key, or the password
-    /// [`Provisioning::validate`] insists on when there is no key.
-    ///
-    /// The port is passed in rather than read from here because it belongs to
-    /// the create request, not to what cloud-init writes into the guest.
+    /// [`Provisioning::validate`] insists on when there is no key -- and the
+    /// port is the one cloud-init is about to configure the daemon with, so
+    /// what is stored and what the guest listens on cannot drift apart.
     #[must_use]
-    pub fn ssh_config(&self, port: SshPort) -> Option<SshConfig> {
-        let authentication = match self.ssh {
+    pub fn ssh_config(&self) -> Option<SshConfig> {
+        let (authentication, port) = match self.ssh {
             SshAccess::Disabled => return None,
-            SshAccess::Enabled { deploy_key: true } => SshAuthentication::VmlordKey,
-            SshAccess::Enabled { deploy_key: false } => SshAuthentication::Password,
+            SshAccess::Enabled {
+                deploy_key: true,
+                port,
+            } => (SshAuthentication::VmlordKey, port),
+            SshAccess::Enabled {
+                deploy_key: false,
+                port,
+            } => (SshAuthentication::Password, port),
         };
         Some(SshConfig {
             username: self.username.clone(),
@@ -302,13 +329,16 @@ fn rejected(message: impl Into<String>) -> RepositoryError {
 #[cfg(test)]
 mod tests {
     use super::{CloudImage, Password, Provisioning, SshAccess, VmSource};
-    use crate::distro::ubuntu;
+    use crate::{distro::ubuntu, ssh::SshPort};
 
     fn provisioning() -> Provisioning {
         Provisioning {
             username: "user".into(),
             password: Some(Password::new("secret")),
-            ssh: SshAccess::Enabled { deploy_key: true },
+            ssh: SshAccess::Enabled {
+                deploy_key: true,
+                port: SshPort::DEFAULT,
+            },
             locale: "en_US.UTF-8".into(),
             keyboard: "us".into(),
             timezone: "Europe/Moscow".into(),
@@ -461,7 +491,10 @@ mod tests {
     fn a_key_only_login_needs_no_password() {
         let provisioning = Provisioning {
             password: None,
-            ssh: SshAccess::Enabled { deploy_key: true },
+            ssh: SshAccess::Enabled {
+                deploy_key: true,
+                port: SshPort::DEFAULT,
+            },
             ..provisioning()
         };
 
@@ -484,18 +517,45 @@ mod tests {
     #[test]
     fn ssh_without_a_deploy_key_is_a_valid_choice() {
         let provisioning = Provisioning {
-            ssh: SshAccess::Enabled { deploy_key: false },
+            ssh: SshAccess::Enabled {
+                deploy_key: false,
+                port: SshPort::DEFAULT,
+            },
             ..provisioning()
         };
 
         assert!(provisioning.validate().is_ok());
     }
 
+    /// The epic's range is `1..=65535` and nothing narrower: a port that some
+    /// other service on the host happens to use is still a port a guest can
+    /// listen on, and a list of "bad" ports would refuse working VMs.
+    #[test]
+    fn any_port_an_ssh_server_can_listen_on_is_accepted() {
+        for candidate in [1_u16, 22, 80, 445, 1080, 3389, 8080, 65535] {
+            let provisioning = Provisioning {
+                ssh: SshAccess::Enabled {
+                    deploy_key: true,
+                    port: SshPort::new(candidate).unwrap(),
+                },
+                ..provisioning()
+            };
+
+            assert!(
+                provisioning.validate().is_ok(),
+                "port {candidate} must not be refused"
+            );
+        }
+    }
+
     #[test]
     fn an_ssh_server_with_neither_a_key_nor_a_password_is_refused() {
         let provisioning = Provisioning {
             password: None,
-            ssh: SshAccess::Enabled { deploy_key: false },
+            ssh: SshAccess::Enabled {
+                deploy_key: false,
+                port: SshPort::DEFAULT,
+            },
             ..provisioning()
         };
 
@@ -505,34 +565,50 @@ mod tests {
 
     #[test]
     fn the_ssh_access_a_guest_is_left_with_is_what_gets_recorded() {
-        use crate::ssh::{SshAuthentication, SshConfig, SshPort};
+        use crate::ssh::{SshAuthentication, SshConfig};
 
         let port = SshPort::new(2222).unwrap();
+        let chosen = Provisioning {
+            ssh: SshAccess::Enabled {
+                deploy_key: true,
+                port,
+            },
+            ..provisioning()
+        };
 
         assert_eq!(
-            provisioning().ssh_config(port),
+            chosen.ssh_config(),
             Some(SshConfig {
                 username: "user".into(),
                 port,
                 authentication: SshAuthentication::VmlordKey,
-            })
+            }),
+            "what is recorded is the port cloud-init is about to configure"
         );
         assert_eq!(
             Provisioning {
-                ssh: SshAccess::Enabled { deploy_key: false },
+                ssh: SshAccess::Enabled {
+                    deploy_key: false,
+                    port,
+                },
                 ..provisioning()
             }
-            .ssh_config(port)
+            .ssh_config()
             .unwrap()
             .authentication,
             SshAuthentication::Password
+        );
+        assert_eq!(
+            provisioning().ssh_config().unwrap().port,
+            SshPort::DEFAULT,
+            "a VM nobody chose a port for listens where a guest normally does"
         );
         assert_eq!(
             Provisioning {
                 ssh: SshAccess::Disabled,
                 ..provisioning()
             }
-            .ssh_config(port),
+            .ssh_config(),
             None,
             "SSH being off is the absence of a configuration, not a flag inside one"
         );
