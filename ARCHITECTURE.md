@@ -648,8 +648,11 @@ or a password: an installation medium is installed by hand, and those fields
 return with the cloud-image form in #65. It submits safe requests through the
 application layer, which knows nothing about which backend serves them. Edit is
 available whichever state the VM is in;
-Delete stays limited to stopped VMs. Snapshots remain future application-layer
-work.
+Delete stays limited to stopped VMs. `Open COM port` is enabled only while the
+VM runs, and reopens the serial console described under "The COM1 diagnostic
+console" -- the UI calls `WorkspaceApp::open_console` and nothing else, since a
+named pipe is the platform layer's business. Snapshots remain future
+application-layer work.
 
 Under `VMLORD_BACKEND=legacy`, the same actions reach AppSandbox's C API
 instead: Start invokes `asb_vm_start`; Stop invokes the graceful
@@ -1185,6 +1188,21 @@ append mode, because the boot it is in the middle of is the same boot. A
 reconnect launch that fails is a `Warning` diagnostic and nothing more -- the
 guest is already up, and no diagnostic is worth taking it down for.
 
+A console can also be asked for. `VmRepository::open_console` -- `Open COM port`
+in the list, enabled only while the VM runs -- opens one for a VM that has none,
+in append mode, for the same reason a reconnect does: the boot it joins is the
+boot already being logged, and truncating would throw away the output the
+console is usually reopened to read. This is the only way a closed window comes
+back, and the way in when the guest is unreachable over the network. It asks HCS
+for the VM's state rather than the application layer's cached list, which can be
+a refresh out of date by the time the user clicks: only `Running` is accepted,
+because the pipe belongs to the compute system and outlives it by nothing. A VM
+that still has a session is refused with a message rather than given a second
+reader, for the reason above -- one pipe, one client. Sessions that are over are
+reaped first, so a window a person closed is not mistaken for one that is still
+reading; a reader that stopped for the wrong reason still becomes its `Error`
+diagnostic on the way through.
+
 A graceful stop leaves the session alone: the guest is still printing what it
 does on the way down, and the pipe closing is what ends the capture. A force
 stop, a delete, an HCS exit event, and VMLord's own shutdown all cancel it,
@@ -1198,6 +1216,12 @@ other test that needs Hyper-V: it builds a real Ubuntu cloud image, starts it,
 and waits for the string `cloud-init` to appear in the VM's `com1.log`. That is
 the claim worth verifying -- that the serial console the guest was given is the
 one being captured, before SSH exists to ask it anything.
+
+`the_com_port_of_a_running_vm_is_opened_once` covers what the action must not
+do, against a real compute system: no console before the VM runs, no second
+console while one is open, and none again once it is stopped. The case the
+action exists for -- reopening a window a person closed -- stays a manual check,
+because closing that window is what ends the session and no test can close it.
 
 `a_guest_can_be_logged_into_over_com1` is the same kind of check for the other
 direction: it builds a VM with a password, starts the compute system directly
