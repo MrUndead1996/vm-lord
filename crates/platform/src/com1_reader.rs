@@ -9,8 +9,8 @@
 use std::{
     ffi::{OsStr, OsString},
     fs::{File, OpenOptions},
-    io::{self, Write},
-    path::PathBuf,
+    io::{self, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -53,6 +53,15 @@ const CONNECT_POLL: Duration = Duration::from_millis(250);
 
 /// How much guest output one read may return.
 const READ_BUFFER_BYTES: usize = 4096;
+
+/// How much of `com1.log` a reopened console shows before the live stream.
+///
+/// A window opened onto a running guest is otherwise empty until the guest
+/// prints its next byte, and a guest sitting at `login:` prints nothing at all:
+/// the prompt was written once, minutes ago. Enough to carry the end of the
+/// boot and the prompt, and not so much that reopening a console scrolls a
+/// whole boot past the reader.
+const REPLAY_TAIL_BYTES: usize = 64 * 1024;
 
 /// The access the helper asks the COM1 pipe for.
 ///
@@ -235,6 +244,9 @@ fn capture(
     // Only now: a start that hears "ready" must know the log is open and the
     // helper is able to notice cancellation.
     ready.signal()?;
+    // Before the pipe, not after: the point of the replay is that the window
+    // has something in it while the connection is still being made.
+    replay_tail(options);
     log::debug!(
         "COM1 reader for VM \"{}\" is waiting for {}",
         options.vm_name,
@@ -549,6 +561,99 @@ impl Drop for SignalOnDrop<'_> {
     }
 }
 
+/// Shows the end of `com1.log` in the window before the live stream starts.
+///
+/// Only for a console that is joining a boot already in progress. A truncating
+/// start has no history by definition -- it is about to throw the previous
+/// boot's away -- and the guest is about to print this one from its first line.
+///
+/// Nothing here can fail the capture: the reason this window exists is the
+/// bytes the guest is about to write, not the ones it already has.
+fn replay_tail(options: &Com1HelperOptions) {
+    if options.log_mode != Com1LogMode::Append {
+        return;
+    }
+    let history = match read_tail(&options.log_path, REPLAY_TAIL_BYTES) {
+        Ok(history) => history,
+        Err(error) => {
+            log::warn!(
+                "the COM1 console of VM \"{}\" opens without history: {} could not be read: \
+                 {error}",
+                options.vm_name,
+                options.log_path.display()
+            );
+            return;
+        }
+    };
+    let tail = tail_from(&history, REPLAY_TAIL_BYTES);
+    if tail.is_empty() {
+        return;
+    }
+
+    let mut stdout = io::stdout().lock();
+    // The banner is written to the window and never to the log: it says where
+    // the record ends and the live guest begins, and it is not something the
+    // guest said.
+    let banner = format!(
+        "--- VMLord: {} earlier byte(s) from {}; live output follows ---\r\n",
+        tail.len(),
+        options.log_path.display()
+    );
+    // Bytes unchanged, as everywhere else in this reader: what is replayed is
+    // what the guest wrote, including its control characters.
+    if let Err(error) = stdout
+        .write_all(banner.as_bytes())
+        .and_then(|()| stdout.write_all(tail))
+        .and_then(|()| stdout.flush())
+    {
+        log::warn!(
+            "could not replay the COM1 history of VM \"{}\": {error}",
+            options.vm_name
+        );
+        return;
+    }
+    log::debug!(
+        "the COM1 console of VM \"{}\" opened with {} byte(s) of history",
+        options.vm_name,
+        tail.len()
+    );
+}
+
+/// Reads at most the last `limit` bytes of a file, and one more.
+///
+/// The extra byte is what tells a whole short log from a long one cut down to
+/// size: with it, [`tail_from`] can see that it is holding a window rather than
+/// a file, and trim the half line at its top.
+fn read_tail(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    let from = length.saturating_sub(limit as u64 + 1);
+    if from > 0 {
+        file.seek(SeekFrom::Start(from))?;
+    }
+    let mut window = Vec::new();
+    file.read_to_end(&mut window)?;
+    Ok(window)
+}
+
+/// The last `limit` bytes of `history`, starting at a line boundary.
+///
+/// Cutting a line in half would put half a message at the top of the window and
+/// leave any escape sequence it was in the middle of unterminated, which the
+/// terminal would then apply to everything after it.
+fn tail_from(history: &[u8], limit: usize) -> &[u8] {
+    if history.len() <= limit {
+        return history;
+    }
+    let window = &history[history.len() - limit..];
+    match window.iter().position(|byte| *byte == b'\n') {
+        Some(newline) => &window[newline + 1..],
+        // A window with no line break at all is one long line; showing it from
+        // where it happens to start is better than showing nothing.
+        None => window,
+    }
+}
+
 /// Opens `com1.log` the way `mode` asks for.
 fn open_log(options: &Com1HelperOptions) -> Result<File, RepositoryError> {
     let mut open = OpenOptions::new();
@@ -579,7 +684,10 @@ mod tests {
         core::Error,
     };
 
-    use super::{Com1LogMode, PIPE_ACCESS, is_end_of_stream, mirror_chunk, parse_com1_helper_args};
+    use super::{
+        Com1LogMode, PIPE_ACCESS, REPLAY_TAIL_BYTES, is_end_of_stream, mirror_chunk,
+        parse_com1_helper_args, read_tail, tail_from,
+    };
 
     fn arguments() -> Vec<OsString> {
         [
@@ -718,5 +826,77 @@ mod tests {
 
         assert_eq!(log, bytes);
         assert_eq!(terminal, bytes);
+    }
+
+    /// What a reopened console shows: a guest sitting at `login:` printed that
+    /// prompt once, minutes ago, and will not print it again unaided. Without
+    /// the replay the window is empty and the VM looks dead.
+    #[test]
+    fn a_history_shorter_than_the_limit_is_replayed_whole() {
+        let history = b"[  OK  ] Reached target Multi-User System.\r\ntest login: ";
+
+        assert_eq!(tail_from(history, REPLAY_TAIL_BYTES), history);
+    }
+
+    #[test]
+    fn a_long_history_is_cut_back_to_a_line_boundary() {
+        let history = b"first line\nsecond line\nthird line\n";
+
+        // A limit that lands inside "second line" must not put half of it at
+        // the top of the window.
+        assert_eq!(tail_from(history, 20), b"third line\n");
+    }
+
+    #[test]
+    fn one_long_line_is_shown_rather_than_nothing() {
+        let history = b"aaaaaaaaaaaaaaaaaaaa";
+
+        assert_eq!(tail_from(history, 5), b"aaaaa");
+    }
+
+    #[test]
+    fn an_empty_log_replays_nothing() {
+        assert!(tail_from(b"", REPLAY_TAIL_BYTES).is_empty());
+    }
+
+    /// The read has to be a seek rather than a load: a `com1.log` is the whole
+    /// output of a boot, and only its end is worth showing.
+    #[test]
+    fn only_the_end_of_a_long_log_is_read_and_it_starts_on_a_line() {
+        let path = std::env::temp_dir().join(format!("vmlord-com1-tail-{}", std::process::id()));
+        let mut written = Vec::new();
+        for line in 0..500 {
+            written.extend_from_slice(format!("line {line} of an old boot\r\n").as_bytes());
+        }
+        written.extend_from_slice(b"test login: ");
+        std::fs::write(&path, &written).unwrap();
+
+        let window = read_tail(&path, 200).unwrap();
+        let tail = tail_from(&window, 200);
+
+        let _ = std::fs::remove_file(&path);
+        assert!(window.len() <= 201, "read {} bytes", window.len());
+        assert!(
+            tail.ends_with(b"test login: "),
+            "the prompt a person reopened the console for must be there: {}",
+            String::from_utf8_lossy(tail)
+        );
+        assert!(
+            tail.starts_with(b"line "),
+            "the window must open on a whole line: {}",
+            String::from_utf8_lossy(tail)
+        );
+    }
+
+    #[test]
+    fn a_log_shorter_than_the_window_is_read_whole() {
+        let path =
+            std::env::temp_dir().join(format!("vmlord-com1-tail-short-{}", std::process::id()));
+        std::fs::write(&path, b"test login: ").unwrap();
+
+        let window = read_tail(&path, REPLAY_TAIL_BYTES).unwrap();
+
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(tail_from(&window, REPLAY_TAIL_BYTES), b"test login: ");
     }
 }

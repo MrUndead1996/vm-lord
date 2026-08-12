@@ -1201,6 +1201,19 @@ append mode, because the boot it is in the middle of is the same boot. A
 reconnect launch that fails is a `Warning` diagnostic and nothing more -- the
 guest is already up, and no diagnostic is worth taking it down for.
 
+A console opened in append mode -- a reopen, or a reconnect at startup -- shows
+the end of `com1.log` before the live stream, under a one-line banner that is
+written to the window and never to the log. Without it such a window is empty
+until the guest prints its next byte, and a guest sitting at `login:` prints
+nothing at all: it wrote that prompt once, minutes ago, and a `getty` repeats it
+only when something is typed. The replay is the last 64 KiB, cut back to a line
+boundary so that no half-finished escape sequence colours everything after it,
+and it is read by seeking rather than by loading a log that holds a whole boot.
+A replay that cannot be read is a `WARN` and an empty window, never a failed
+console: the window exists for the bytes the guest is about to write. A
+truncating start replays nothing -- it is throwing the previous boot's output
+away, and this one is about to print itself from the first line.
+
 A console can also be asked for. `VmRepository::open_console` -- `Open COM port`
 in the list, enabled only while the VM runs -- opens one for a VM that has none,
 in append mode, for the same reason a reconnect does: the boot it joins is the
