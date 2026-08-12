@@ -1304,6 +1304,88 @@ fn render_vm_list(ui: &mut egui::Ui, vms: &[VmSummary], selected_vm_name: &mut O
         });
 }
 
+/// What the button says.
+///
+/// "Open SSH" and not "Open in Windows Terminal": which terminal host the
+/// session lands in is decided when it is launched, and a button that named one
+/// would be wrong on the machine where the other answers.
+const SSH_ACTION_LABEL: &str = "Open SSH";
+
+/// What the SSH action can offer for one VM right now.
+///
+/// Three answers rather than a boolean, because "no button" and "a button that
+/// cannot be pressed yet" are different things to see: the first says this VM
+/// was created without SSH and never will have it, the second says to wait, and
+/// names what for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SshOffer {
+    /// This VM has no SSH access at all, so there is no action to show.
+    Absent,
+    /// SSH is configured, but the guest cannot be reached yet.
+    Waiting(&'static str),
+    Ready,
+}
+
+impl SshOffer {
+    /// The tooltip of a button that cannot be pressed, and nothing for one that
+    /// can.
+    const fn waiting_for(self) -> Option<&'static str> {
+        match self {
+            Self::Waiting(reason) => Some(reason),
+            Self::Absent | Self::Ready => None,
+        }
+    }
+}
+
+/// Whether a session into `vm` can be opened, and what stops it.
+///
+/// The two things a connection needs are the two things checked here: SSH the
+/// VM was created with, and a guest that is up and addressable. Both are read
+/// from the summary the list was drawn from, which is a refresh old -- the
+/// backend asks HCS again when the button is pressed, and refuses with the
+/// reason it finds. This only decides what is worth offering.
+fn ssh_offer(vm: &VmSummary) -> SshOffer {
+    if !vm.ssh.is_enabled() {
+        return SshOffer::Absent;
+    }
+
+    match vm.state {
+        VmState::Building { .. } => {
+            SshOffer::Waiting("Available once the VM has been built and started")
+        }
+        VmState::Stopped | VmState::Starting => {
+            SshOffer::Waiting("Available when the VM is running")
+        }
+        VmState::Running { .. } if vm.ip_address.is_none() => {
+            SshOffer::Waiting("Available when the guest has an address on the VMLord network")
+        }
+        VmState::Running { .. } => SshOffer::Ready,
+    }
+}
+
+/// What the details panel says about a VM's SSH access.
+///
+/// The endpoint itself once there is one -- the same `user@address:port` a
+/// person would type -- and the configuration without an address before that,
+/// because the address is HNS's to hand out when the VM starts and a remembered
+/// one would be a guess.
+fn ssh_detail(vm: &VmSummary) -> String {
+    let Some(ssh) = vm.ssh.config() else {
+        return "Disabled".into();
+    };
+
+    match vm.ip_address {
+        Some(address) => format!(
+            "{}@{}:{} ({} login)",
+            ssh.username, address, ssh.port, ssh.authentication
+        ),
+        None => format!(
+            "{} on port {} ({} login); the address appears when the VM is running",
+            ssh.username, ssh.port, ssh.authentication
+        ),
+    }
+}
+
 fn render_selected_vm(
     ui: &mut egui::Ui,
     vms: &[VmSummary],
@@ -1344,13 +1426,18 @@ fn render_selected_vm(
         ) {
             action = Some(clicked_action);
         }
-        let ssh_ready = is_running && vm.ssh.is_enabled();
-        if let Some(clicked_action) = render_action_group(
-            ui,
-            &[(VmAction::Ssh, "SSH")],
-            ssh_ready,
-            Some("Available when the SSH proxy is ready"),
-        ) {
+        // A VM created without SSH has no session to offer, so it gets no
+        // button; one that has SSH keeps the button in every state and says
+        // what it is still waiting for.
+        let ssh = ssh_offer(vm);
+        if ssh != SshOffer::Absent
+            && let Some(clicked_action) = render_action_group(
+                ui,
+                &[(VmAction::Ssh, SSH_ACTION_LABEL)],
+                ssh == SshOffer::Ready,
+                ssh.waiting_for(),
+            )
+        {
             action = Some(clicked_action);
         }
         // The way in when nothing else works: the console needs no network, no
@@ -1426,19 +1513,7 @@ fn render_selected_vm(
             detail_row(ui, "RAM", format!("{} MiB", vm.ram_mb));
             detail_row(ui, "Disk", format!("{} GiB", vm.disk_gb));
             detail_row(ui, "GPU", gpu_mode_label(vm.gpu_mode).into());
-            detail_row(
-                ui,
-                "SSH",
-                vm.ssh.config().map_or_else(
-                    || "Disabled".into(),
-                    |ssh| {
-                        format!(
-                            "{} on port {}, {} login",
-                            ssh.username, ssh.port, ssh.authentication
-                        )
-                    },
-                ),
-            );
+            detail_row(ui, "SSH", ssh_detail(vm));
         });
 
     action
@@ -1846,6 +1921,10 @@ fn vm_state(state: VmState) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use vmlord_core::{SshAuthentication, SshAvailability, SshConfig};
+
     use super::*;
 
     /// Creating a VM no longer ends at a registered compute system, so the two
@@ -2175,14 +2254,11 @@ mod tests {
         );
     }
 
-    /// The one check the domain cannot make: it is about the list on screen,
-    /// not about the request.
-    #[test]
-    fn a_name_already_in_the_list_is_refused_before_the_backend_sees_it() {
-        use vmlord_core::SshAvailability;
-
-        let existing = [VmSummary {
-            name: "DEV".into(),
+    /// A VM as the list holds one: stopped, without an address, and with no way
+    /// in over SSH. Every SSH test says which of those three it changes.
+    fn vm_summary() -> VmSummary {
+        VmSummary {
+            name: "dev".into(),
             os_type: "Linux".into(),
             state: VmState::Stopped,
             ram_mb: 2048,
@@ -2192,6 +2268,153 @@ mod tests {
             network_mode: NetworkMode::Nat,
             ip_address: None,
             ssh: SshAvailability::Disabled,
+        }
+    }
+
+    fn ssh_config() -> SshConfig {
+        SshConfig {
+            username: "dev".into(),
+            port: SshPort::DEFAULT,
+            authentication: SshAuthentication::VmlordKey,
+        }
+    }
+
+    fn address() -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(172, 30, 0, 5))
+    }
+
+    /// A VM created without SSH offers no session to open: the button is not
+    /// there to be hovered, rather than there and grey.
+    #[test]
+    fn a_vm_without_ssh_offers_no_session_at_all() {
+        assert_eq!(ssh_offer(&vm_summary()), SshOffer::Absent);
+        assert_eq!(
+            ssh_offer(&VmSummary {
+                state: VmState::Running {
+                    agent_status: AgentStatus::Online
+                },
+                ip_address: Some(address()),
+                ..vm_summary()
+            }),
+            SshOffer::Absent,
+            "a running VM with an address still has nothing to log into"
+        );
+    }
+
+    /// The capability belongs to the VM and the button to its state: a stopped
+    /// VM with SSH configured shows the action, and says what it is waiting for.
+    #[test]
+    fn a_configured_vm_shows_the_action_before_it_can_be_used() {
+        let configured = VmSummary {
+            ssh: SshAvailability::Enabled(ssh_config()),
+            ..vm_summary()
+        };
+
+        let SshOffer::Waiting(stopped) = ssh_offer(&configured) else {
+            panic!("a stopped VM shows the action and waits");
+        };
+        assert!(stopped.contains("running"), "{stopped}");
+
+        let SshOffer::Waiting(building) = ssh_offer(&VmSummary {
+            state: VmState::Building {
+                progress: BuildProgress {
+                    step: BuildStep::WritingDisk,
+                    download: None,
+                },
+            },
+            ..configured.clone()
+        }) else {
+            panic!("a VM still being built has no guest yet");
+        };
+        assert!(building.contains("built"), "{building}");
+
+        let SshOffer::Waiting(starting) = ssh_offer(&VmSummary {
+            state: VmState::Starting,
+            ..configured.clone()
+        }) else {
+            panic!("a VM on its way up has no guest yet");
+        };
+        assert!(starting.contains("running"), "{starting}");
+    }
+
+    /// Running is not enough: without an address on the VMLord network there is
+    /// nothing for a client to dial, and the tooltip says so rather than letting
+    /// the click fail in the backend.
+    #[test]
+    fn a_running_vm_without_an_address_is_not_ready() {
+        let running = VmSummary {
+            state: VmState::Running {
+                agent_status: AgentStatus::Unknown,
+            },
+            ssh: SshAvailability::Enabled(ssh_config()),
+            ..vm_summary()
+        };
+
+        let SshOffer::Waiting(reason) = ssh_offer(&running) else {
+            panic!("a VM with no address cannot be connected to");
+        };
+        assert!(reason.contains("address"), "{reason}");
+
+        assert_eq!(
+            ssh_offer(&VmSummary {
+                ip_address: Some(address()),
+                ..running
+            }),
+            SshOffer::Ready
+        );
+    }
+
+    /// What the details panel says about SSH, which is the endpoint itself once
+    /// there is one to state.
+    #[test]
+    fn the_details_state_the_endpoint_a_session_would_use() {
+        assert_eq!(ssh_detail(&vm_summary()), "Disabled");
+
+        let configured = VmSummary {
+            ssh: SshAvailability::Enabled(SshConfig {
+                port: SshPort::new(2222).unwrap(),
+                ..ssh_config()
+            }),
+            ..vm_summary()
+        };
+
+        let stopped = ssh_detail(&configured);
+        assert!(
+            stopped.contains("dev") && stopped.contains("2222") && stopped.contains("key login"),
+            "{stopped}"
+        );
+        assert!(
+            stopped.contains("address"),
+            "a VM with no address says why it shows none: {stopped}"
+        );
+
+        assert_eq!(
+            ssh_detail(&VmSummary {
+                state: VmState::Running {
+                    agent_status: AgentStatus::Online
+                },
+                ip_address: Some(address()),
+                ..configured
+            }),
+            "dev@172.30.0.5:2222 (key login)"
+        );
+    }
+
+    /// The button says what it does and promises no particular terminal: which
+    /// window the session lands in is the platform layer's business.
+    #[test]
+    fn the_action_is_named_after_what_it_opens() {
+        assert_eq!(SSH_ACTION_LABEL, "Open SSH");
+        assert!(!format!("{SSH_ACTION_LABEL:?}").contains("Terminal"));
+    }
+
+    /// The one check the domain cannot make: it is about the list on screen,
+    /// not about the request.
+    #[test]
+    fn a_name_already_in_the_list_is_refused_before_the_backend_sees_it() {
+        let existing = [VmSummary {
+            name: "DEV".into(),
+            ..vm_summary()
         }];
         let form = CreateVmForm {
             name: "dev".into(),

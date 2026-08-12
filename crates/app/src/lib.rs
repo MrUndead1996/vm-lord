@@ -64,7 +64,9 @@ impl VmAction {
             Self::ForceStop => "Force stop",
             Self::CancelCreate => "Cancel creation",
             Self::Connect => "Connect",
-            Self::Ssh => "SSH",
+            // What it opens, not where: which terminal host ends up showing
+            // the session is decided when it is launched.
+            Self::Ssh => "Open SSH",
             Self::Console => "Open COM port",
             Self::Edit => "Edit",
             Self::Delete => "Delete",
@@ -463,6 +465,13 @@ impl WorkspaceApp {
         }
     }
 
+    /// Opens an interactive SSH session into a running guest.
+    ///
+    /// Both outcomes are collected from the backend, which is what makes this
+    /// different from the other actions here. A session that opened says
+    /// nothing to VMLord afterwards -- it is a process in a window of its own --
+    /// so the command it was opened with is the only account of it there will
+    /// be, and it belongs in the log beside the failures.
     pub fn open_ssh(&mut self, name: &str) -> Result<(), RepositoryError> {
         self.require_ready_backend("SSH connection")?;
 
@@ -472,6 +481,7 @@ impl WorkspaceApp {
                     level: DiagnosticLevel::Info,
                     message: format!("SSH session for VM \"{name}\" started"),
                 });
+                self.collect_diagnostics();
                 Ok(())
             }
             Err(error) => {
@@ -645,11 +655,16 @@ mod tests {
     use super::*;
     use vmlord_core::{DiagnosticLevel, Language, LogLevel, VmState};
 
+    /// A backend that works: every test names only what it changes about it.
+    #[derive(Default)]
     struct FakeRepository {
         should_fail: bool,
         create_should_fail: bool,
         vm_is_running: bool,
         actions: Vec<String>,
+        /// What the backend has to say next, which a real one accumulates while
+        /// it works and hands over when it is asked.
+        pending_diagnostics: Vec<Diagnostic>,
     }
 
     impl VmRepository for FakeRepository {
@@ -736,8 +751,21 @@ mod tests {
             Ok(())
         }
 
+        /// Opens a session the way the native backend does: the command it was
+        /// opened with is left in the diagnostics, and a refusal names the
+        /// preflight check that stopped it.
         fn open_ssh(&mut self, name: &str) -> Result<(), RepositoryError> {
             self.actions.push(format!("ssh:{name}"));
+            if !self.vm_is_running {
+                return Err(RepositoryError::new(format!(
+                    "cannot open an SSH session to VM \"{name}\": the guest does not \
+                     answer on port 22: connection refused"
+                )));
+            }
+            self.pending_diagnostics.push(Diagnostic {
+                level: DiagnosticLevel::Info,
+                message: format!("SSH session for VM \"{name}\": ssh.exe -p 22 -l user 172.30.0.5"),
+            });
             Ok(())
         }
 
@@ -752,10 +780,12 @@ mod tests {
         }
 
         fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
-            vec![Diagnostic {
+            let mut diagnostics = vec![Diagnostic {
                 level: DiagnosticLevel::Info,
                 message: "ready".into(),
-            }]
+            }];
+            diagnostics.append(&mut self.pending_diagnostics);
+            diagnostics
         }
     }
 
@@ -763,12 +793,7 @@ mod tests {
     /// so that adding the button is adding a button.
     #[test]
     fn cancelling_a_creation_a_backend_cannot_cancel_is_reported() {
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
-            should_fail: false,
-            create_should_fail: false,
-            vm_is_running: false,
-            actions: Vec::new(),
-        }));
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()));
         app.start();
 
         let error = app
@@ -788,12 +813,7 @@ mod tests {
     /// root -- not the form -- that knows what the host says (#60).
     #[test]
     fn guest_defaults_are_offered_and_can_be_replaced_by_the_composition_root() {
-        let app = WorkspaceApp::new(Box::new(FakeRepository {
-            should_fail: false,
-            create_should_fail: false,
-            vm_is_running: false,
-            actions: Vec::new(),
-        }));
+        let app = WorkspaceApp::new(Box::new(FakeRepository::default()));
 
         assert_eq!(app.guest_defaults(), &GuestDefaults::default());
 
@@ -811,12 +831,7 @@ mod tests {
     /// it before the VM -- and therefore the file -- exists.
     #[test]
     fn the_key_path_of_a_vm_comes_from_the_backend() {
-        let app = WorkspaceApp::new(Box::new(FakeRepository {
-            should_fail: false,
-            create_should_fail: false,
-            vm_is_running: false,
-            actions: Vec::new(),
-        }));
+        let app = WorkspaceApp::new(Box::new(FakeRepository::default()));
 
         assert_eq!(
             app.ssh_key_path("dev"),
@@ -831,12 +846,7 @@ mod tests {
 
     #[test]
     fn start_loads_vm_list() {
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
-            should_fail: false,
-            create_should_fail: false,
-            vm_is_running: false,
-            actions: Vec::new(),
-        }));
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()));
         app.start();
         assert_eq!(app.status(), &BackendStatus::Ready);
         assert_eq!(app.vms().len(), 1);
@@ -847,9 +857,7 @@ mod tests {
     fn initialization_error_is_visible() {
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             should_fail: true,
-            create_should_fail: false,
-            vm_is_running: false,
-            actions: Vec::new(),
+            ..FakeRepository::default()
         }));
         app.start();
         assert_eq!(
@@ -872,12 +880,7 @@ mod tests {
 
     #[test]
     fn lifecycle_actions_are_available_to_ui_clients() {
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
-            should_fail: false,
-            create_should_fail: false,
-            vm_is_running: false,
-            actions: Vec::new(),
-        }));
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()));
         app.start();
 
         app.start_vm("dev").unwrap();
@@ -903,12 +906,7 @@ mod tests {
 
     #[test]
     fn opens_display_through_repository() {
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
-            should_fail: false,
-            create_should_fail: false,
-            vm_is_running: false,
-            actions: Vec::new(),
-        }));
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()));
         app.start();
 
         app.connect_display("dev").unwrap();
@@ -923,10 +921,8 @@ mod tests {
     #[test]
     fn opens_ssh_session_through_repository() {
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
-            should_fail: false,
-            create_should_fail: false,
-            vm_is_running: false,
-            actions: Vec::new(),
+            vm_is_running: true,
+            ..FakeRepository::default()
         }));
         app.start();
 
@@ -939,13 +935,57 @@ mod tests {
         );
     }
 
+    /// A session that opened is a process in a window of its own and says
+    /// nothing back, so the command it was opened with is the only account of
+    /// it there will ever be. It is the backend's to compose -- which key,
+    /// which known-hosts file, which port -- and this layer's to carry into the
+    /// log a person actually reads.
+    #[test]
+    fn the_command_a_session_opened_with_reaches_the_log() {
+        let mut app = app_with(true);
+
+        app.open_ssh("dev").unwrap();
+
+        assert!(
+            app.diagnostics().iter().any(|diagnostic| {
+                diagnostic.level == DiagnosticLevel::Info
+                    && diagnostic.message.contains("ssh.exe")
+                    && diagnostic.message.contains("-l user")
+            }),
+            "{:?}",
+            app.diagnostics()
+        );
+    }
+
+    /// The preflight check that stopped a session -- a missing Windows feature,
+    /// a port that did not answer, a key that is gone -- is the only account of
+    /// it anyone gets: once the terminal is up, everything else OpenSSH has to
+    /// say goes into that window. So it reaches the diagnostics whole, rather
+    /// than as a failure this layer describes in its own words.
+    #[test]
+    fn a_refused_ssh_session_is_reported_with_the_backends_own_reason() {
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()));
+        app.start();
+
+        let error = app.open_ssh("dev").unwrap_err();
+
+        assert!(
+            app.diagnostics().iter().any(|diagnostic| {
+                diagnostic.level == DiagnosticLevel::Error
+                    && diagnostic.message
+                        == format!("Failed to open SSH session for VM \"dev\": {error}")
+                    && diagnostic.message.contains("does not answer on port 22")
+            }),
+            "{:?}",
+            app.diagnostics()
+        );
+    }
+
     #[test]
     fn opens_the_com_port_through_the_repository() {
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
-            should_fail: false,
-            create_should_fail: false,
             vm_is_running: true,
-            actions: Vec::new(),
+            ..FakeRepository::default()
         }));
         app.start();
 
@@ -962,12 +1002,7 @@ mod tests {
     /// backend's message to pass on, not one to invent here.
     #[test]
     fn a_refused_com_port_is_reported_with_the_reason() {
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
-            should_fail: false,
-            create_should_fail: false,
-            vm_is_running: false,
-            actions: Vec::new(),
-        }));
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()));
         app.start();
 
         app.open_console("dev").unwrap_err();
@@ -1007,13 +1042,8 @@ mod tests {
             image_cache_path: directory.join("cached-images"),
             guest_readiness: vmlord_core::GuestReadinessTimeouts::default(),
         };
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
-            should_fail: false,
-            create_should_fail: false,
-            vm_is_running: false,
-            actions: Vec::new(),
-        }))
-        .with_settings(store.clone(), initial_settings);
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()))
+            .with_settings(store.clone(), initial_settings);
 
         app.update_settings(updated_settings.clone()).unwrap();
 
@@ -1029,12 +1059,7 @@ mod tests {
 
     #[test]
     fn vm_action_is_logged() {
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
-            should_fail: false,
-            create_should_fail: false,
-            vm_is_running: false,
-            actions: Vec::new(),
-        }));
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()));
 
         app.log_vm_action(VmAction::Create);
 
@@ -1043,10 +1068,8 @@ mod tests {
 
     fn app_with(vm_is_running: bool) -> WorkspaceApp {
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
-            should_fail: false,
-            create_should_fail: false,
             vm_is_running,
-            actions: Vec::new(),
+            ..FakeRepository::default()
         }));
         app.start();
         app
@@ -1106,9 +1129,7 @@ mod tests {
     fn refuses_to_delete_without_a_ready_backend() {
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             should_fail: true,
-            create_should_fail: false,
-            vm_is_running: false,
-            actions: Vec::new(),
+            ..FakeRepository::default()
         }));
         app.start();
 

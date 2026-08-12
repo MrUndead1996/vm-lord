@@ -263,7 +263,8 @@ impl HcsVmRepository {
         )?;
 
         let vm_directory = layout::vm_directory(&self.storage_root, &mapping.vm_name)?;
-        self.ssh_launcher
+        let invocation = self
+            .ssh_launcher
             .launch(mapping, &vm_directory)
             .map_err(|failure| {
                 let error = RepositoryError::new(format!(
@@ -272,7 +273,22 @@ impl HcsVmRepository {
                 ));
                 log::error!("{error}");
                 error
-            })
+            })?;
+
+        // The command, not just the fact of it. Everything the session goes on
+        // to say lands in its own window, so this line is the only account
+        // VMLord can give of what it asked for -- which key, which known-hosts
+        // file, which port -- and it is the first thing worth reading when a
+        // guest refuses a login.
+        self.push_diagnostic(
+            DiagnosticLevel::Info,
+            format!(
+                "SSH session for VM \"{}\": {}",
+                mapping.vm_name,
+                invocation.command_line()
+            ),
+        );
+        Ok(())
     }
 
     fn push_diagnostic(&self, level: DiagnosticLevel, message: String) {
@@ -1600,6 +1616,32 @@ mod tests {
             .expect("a running guest can be logged into");
 
         assert_eq!(recorded.lock().unwrap().clone(), ["wt.exe"]);
+    }
+
+    /// A session that opened tells VMLord nothing afterwards, so the command it
+    /// was opened with is what the log has to carry: the key, the known-hosts
+    /// file and the port that were actually asked for.
+    #[test]
+    fn an_opened_session_leaves_its_command_in_the_diagnostics() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut repository = repository_with_ssh(recorded);
+
+        repository
+            .open_ssh_in_state(&ssh_mapping(), Some(HcsSystemState::Running))
+            .expect("a running guest can be logged into");
+
+        let diagnostics = repository.take_diagnostics();
+        let logged = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("ssh.exe"))
+            .expect("the command has to be there to be read");
+
+        assert_eq!(logged.level, DiagnosticLevel::Info);
+        assert!(logged.message.contains("dev"), "{}", logged.message);
+        assert!(logged.message.contains("-l machi"), "{}", logged.message);
+        assert!(logged.message.contains("-p 22"), "{}", logged.message);
+        assert!(logged.message.contains("172.22.42.7"), "{}", logged.message);
+        assert!(logged.message.contains("known_hosts"), "{}", logged.message);
     }
 
     /// Two shells into one guest is an ordinary thing to want, and the
