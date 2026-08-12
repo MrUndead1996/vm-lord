@@ -30,6 +30,13 @@ pub(crate) enum CycleOutcome {
     Degraded {
         detail: String,
     },
+    /// The VM is up and answers SSH, and that is all the wait could establish:
+    /// without a deploy key there is nobody to ask whether cloud-init finished.
+    /// A success with a caveat rather than a failure -- the VM is there, and a
+    /// person can log into it.
+    Unverified {
+        detail: String,
+    },
     /// The VM exists and runs, but its guest never reported readiness. It is
     /// deliberately left in place: its serial log is the only account of what
     /// went wrong, and removing the VM would remove that account with it.
@@ -50,11 +57,17 @@ pub(crate) struct CycleReport {
     pub(crate) started: Option<StartedVm>,
 }
 
-/// The user a readiness wait logs in as, when there is one to log in as.
-fn readiness_username(request: &VmCreateRequest) -> Option<&str> {
+/// Whether this VM has a guest that can be asked about its own readiness.
+///
+/// Installation media carries no cloud-init and no user of VMLord's making:
+/// there is nobody in that guest to ask, and a person is going to install the
+/// system by hand. Everything a cloud image needs for the wait -- who to log in
+/// as, on which port, with which credential -- is on the VM's stored
+/// configuration by the time it starts.
+fn has_a_guest_to_ask(request: &VmCreateRequest) -> bool {
     match &request.source {
-        VmSource::CloudImage { provisioning, .. } => Some(&provisioning.username),
-        VmSource::LocalMedia { .. } => None,
+        VmSource::CloudImage { .. } => true,
+        VmSource::LocalMedia { .. } => false,
     }
 }
 
@@ -190,10 +203,7 @@ impl VmBuildCycle {
             .unwrap_or(mapping);
 
         let started = StartedVm { mapping, session };
-        // Installation media carries no cloud-init and no key of ours: there is
-        // nobody in that guest to ask, and a person is going to install the
-        // system by hand. The cycle ends at a started VM.
-        let Some(username) = readiness_username(request) else {
+        if !has_a_guest_to_ask(request) {
             log::info!(
                 "VM \"{}\" is created and started; it boots installation media, so there is no \
                  guest to ask about readiness",
@@ -203,12 +213,10 @@ impl VmBuildCycle {
                 outcome: CycleOutcome::Ready,
                 started: Some(started),
             };
-        };
+        }
 
         monitor.report(BuildStep::AwaitingGuest);
-        let waited = self
-            .readiness
-            .wait(&started.mapping, vm_directory, username, monitor);
+        let waited = self.readiness.wait(&started.mapping, vm_directory, monitor);
         match waited {
             Ok(GuestReady::Ready) => {
                 log::info!("VM \"{}\" is created, started and ready", request.name);
@@ -219,6 +227,10 @@ impl VmBuildCycle {
             }
             Ok(GuestReady::Degraded { detail }) => CycleReport {
                 outcome: CycleOutcome::Degraded { detail },
+                started: Some(started),
+            },
+            Ok(GuestReady::Unverified { detail }) => CycleReport {
+                outcome: CycleOutcome::Unverified { detail },
                 started: Some(started),
             },
             Err(ReadinessFailure::Cancelled) => {
@@ -323,7 +335,7 @@ mod tests {
     use uuid::Uuid;
     use vmlord_core::{
         BuildMonitor, BuildStep, CloudImage, GpuMode, NetworkMode, Provisioning, RepositoryError,
-        SshAccess, SshPort, VmCreateRequest, VmSource,
+        SshAccess, SshAuthentication, SshConfig, SshPort, VmCreateRequest, VmSource,
     };
 
     use super::{CycleOutcome, VmBuildCycle};
@@ -375,7 +387,14 @@ mod tests {
         }
     }
 
+    /// The VM the creation pipeline records: the SSH access `request` asks for,
+    /// as `Provisioning::ssh_config` derives it, because that is what the wait
+    /// reads to know how to reach the guest.
     fn mapping(name: &str) -> VmComputeSystemMapping {
+        mapping_with(name, Some(SshAuthentication::VmlordKey))
+    }
+
+    fn mapping_with(name: &str, ssh: Option<SshAuthentication>) -> VmComputeSystemMapping {
         VmComputeSystemMapping {
             vm_id: Uuid::nil(),
             vm_name: name.to_owned(),
@@ -383,7 +402,11 @@ mod tests {
             disk_gb: 20,
             endpoint_id: None,
             network_mode: NetworkMode::Nat,
-            ssh: None,
+            ssh: ssh.map(|authentication| SshConfig {
+                username: "machi".into(),
+                port: SshPort::DEFAULT,
+                authentication,
+            }),
         }
     }
 
@@ -419,7 +442,7 @@ mod tests {
         GuestReadiness::for_test(
             ReadinessTimeouts::default(),
             |_| Ok(Some("10.0.0.2".parse().unwrap())),
-            |_, _| Ok(()),
+            |_, _, _| Ok(()),
             move |_, _, _| match &run {
                 SshRun::Cancelled => Ok(SshRun::Cancelled),
                 SshRun::Exited {
@@ -445,11 +468,20 @@ mod tests {
     /// A cycle whose creation and start succeed, and whose rollback is recorded
     /// rather than performed.
     fn cycle(calls: &Calls, readiness: GuestReadiness) -> VmBuildCycle {
+        cycle_creating(calls, readiness, mapping("dev"))
+    }
+
+    /// The same cycle, for a VM recorded with an SSH access of its own.
+    fn cycle_creating(
+        calls: &Calls,
+        readiness: GuestReadiness,
+        created: VmComputeSystemMapping,
+    ) -> VmBuildCycle {
         let create = {
             let calls = calls.clone();
             move |_: &MetadataStore, _: &VmCreateRequest, _: &Path, _: &BuildMonitor| {
                 calls.record("create");
-                Ok(mapping("dev"))
+                Ok(created.clone())
             }
         };
         let start = {
@@ -515,6 +547,45 @@ mod tests {
             calls.taken(),
             ["create", "start"],
             "a degraded guest must not be rolled back"
+        );
+    }
+
+    /// A password-only VM is a finished build: it exists, it runs, and a person
+    /// can log into it. What it is not is a VM whose cloud-init anybody
+    /// watched, so the cycle carries that caveat out rather than reporting the
+    /// same "ready" a key-mode build earns.
+    #[test]
+    fn a_password_only_guest_finishes_its_build_with_a_caveat() {
+        let (_root, store, vm_directory) = temp_root("password-only");
+        let calls = Calls::default();
+        let readiness = GuestReadiness::for_test(
+            ReadinessTimeouts::default(),
+            |_| Ok(Some("10.0.0.2".parse().unwrap())),
+            |_, _, _| Ok(()),
+            |_, _, _| panic!("a password nobody can type must not be attempted"),
+            || Duration::ZERO,
+            |_| {},
+        );
+
+        let report = cycle_creating(
+            &calls,
+            readiness,
+            mapping_with("dev", Some(SshAuthentication::Password)),
+        )
+        .run(&store, &request("dev"), &vm_directory, &monitor());
+
+        let CycleOutcome::Unverified { detail } = report.outcome else {
+            panic!("a guest nobody asked is neither ready nor failed");
+        };
+        assert!(detail.contains("cloud-init"), "{detail}");
+        assert!(
+            report.started.is_some(),
+            "the VM is there and a person can log into it"
+        );
+        assert_eq!(
+            calls.taken(),
+            ["create", "start"],
+            "an unverified guest must not be rolled back"
         );
     }
 
@@ -782,7 +853,7 @@ mod tests {
         let readiness = GuestReadiness::for_test(
             ReadinessTimeouts::default(),
             |_| panic!("installation media carries no cloud-init to ask"),
-            |_, _| panic!("installation media carries no cloud-init to ask"),
+            |_, _, _| panic!("installation media carries no cloud-init to ask"),
             |_, _, _| panic!("installation media carries no key of ours to log in with"),
             || Duration::ZERO,
             |_| {},

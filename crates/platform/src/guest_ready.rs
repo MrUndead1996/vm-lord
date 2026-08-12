@@ -2,11 +2,18 @@
 //!
 //! A VM that HCS reports as running is not a VM anyone can use: the SSH key is
 //! installed at cloud-init's init stage, while `packages:` are applied later,
-//! at its config stage. Probing port 22 therefore answers "ready" in the middle
-//! of the work. The guest's own `cloud-init status --wait` is what actually
-//! knows, so that is what this module asks -- over Windows' own OpenSSH client,
-//! because every maintained Rust SSH client is async-only and this project has
-//! no async runtime.
+//! at its config stage. Probing the SSH port therefore answers "ready" in the
+//! middle of the work. The guest's own `cloud-init status --wait` is what
+//! actually knows, so that is what this module asks -- over Windows' own
+//! OpenSSH client, because every maintained Rust SSH client is async-only and
+//! this project has no async runtime.
+//!
+//! How far a wait can get depends on how the VM was told to let VMLord in. With
+//! the key VMLord deployed, it can ask that question unattended. With a password
+//! it cannot: the credential lives in the head of whoever created the VM, and a
+//! build is not a moment anyone is at a prompt. Such a wait ends at an open
+//! port and says so, rather than inventing a way to type the password or
+//! reporting a completeness it never checked.
 
 use std::{
     fmt,
@@ -19,10 +26,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use uuid::Uuid;
 use vmlord_core::{
-    BuildMonitor, GuestReadinessTimeouts, RepositoryError, SshAuthentication, SshConfig,
-    SshEndpoint, SshPort,
+    BuildMonitor, GuestReadinessTimeouts, RepositoryError, SshAuthentication, SshEndpoint,
 };
 
 use crate::{layout, metadata::VmComputeSystemMapping, ssh, ssh::SshInvocation};
@@ -38,14 +43,6 @@ const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// Two seconds rather than a tighter loop: nothing here becomes true faster
 /// than a guest boots, and every poll of the address costs an HNS call.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
-
-/// The port a Linux guest answers SSH on.
-///
-/// A constant only until #80: since #74 the seed configures whatever port the
-/// VM was created with, and readiness still probes the default one -- so a VM
-/// created on another port is reported ready late, by the timeout, rather than
-/// when its daemon comes up. The value to use is on the VM's own `SshConfig`.
-const SSH_PORT: u16 = 22;
 
 /// What the guest is asked, once a connection to it is possible.
 ///
@@ -65,6 +62,13 @@ pub(crate) enum GuestReady {
     /// cloud-init finished, but a module of it failed. The guest is usable; the
     /// detail says what is missing from it.
     Degraded {
+        detail: String,
+    },
+    /// The guest answers on its SSH port, and that is everything this wait was
+    /// able to establish. A successful outcome -- the VM is up and a person can
+    /// log into it -- carrying what was *not* checked, so that "ready" never
+    /// silently means two different things.
+    Unverified {
         detail: String,
     },
 }
@@ -200,7 +204,7 @@ type AddressSource =
     Box<dyn Fn(&VmComputeSystemMapping) -> Result<Option<IpAddr>, RepositoryError> + Send + Sync>;
 /// Answers `Err(reason)` while the port is not open; the reason is what the
 /// failure quotes if the port never opens at all.
-type PortProbe = Box<dyn Fn(IpAddr, Duration) -> Result<(), String> + Send + Sync>;
+type PortProbe = Box<dyn Fn(IpAddr, u16, Duration) -> Result<(), String> + Send + Sync>;
 type SshRunner = Box<
     dyn Fn(&ReadinessCommand, Duration, &BuildMonitor) -> Result<SshRun, RepositoryError>
         + Send
@@ -234,46 +238,46 @@ impl GuestReadiness {
             timeouts,
             client: ssh::client_path(),
             address: Box::new(ssh::guest_address),
-            port: Box::new(probe_port),
+            port: Box::new(probe_port_at),
             ssh: Box::new(run_ssh),
             now: Box::new(elapsed_since_start()),
             sleep: Box::new(std::thread::sleep),
         }
     }
 
-    /// Waits for the guest of `mapping`, in three phases with a timeout each.
+    /// Waits for the guest of `mapping`, in phases with a timeout each.
+    ///
+    /// Everything about the connection comes from the VM's own stored
+    /// configuration: the user name cloud-init created, the port the daemon was
+    /// configured with, and the credential VMLord holds. Nothing is guessed
+    /// from the request the VM was built out of -- the wait runs against the VM
+    /// that exists, not against the one that was asked for.
     pub(crate) fn wait(
         &self,
         mapping: &VmComputeSystemMapping,
         vm_directory: &Path,
-        username: &str,
         monitor: &BuildMonitor,
     ) -> Result<GuestReady, ReadinessFailure> {
-        let Some(client) = self.client.clone() else {
-            log::error!("{}", ReadinessFailure::NoSshClient);
-            return Err(ReadinessFailure::NoSshClient);
+        // A VM created with SSH switched off runs no daemon: there is no port
+        // to wait for and nobody in the guest to ask. The build succeeds, and
+        // says what it could not check.
+        let Some(config) = mapping.ssh.clone() else {
+            log::warn!(
+                "VM \"{}\" was created without SSH access, so nothing can be asked whether \
+                 cloud-init has finished",
+                mapping.vm_name
+            );
+            return Ok(GuestReady::Unverified {
+                detail: "the VM was created with SSH switched off, so there is nothing to ask \
+                         whether cloud-init has finished"
+                    .to_owned(),
+            });
         };
-
-        let ip = self.wait_for_address(mapping, monitor)?;
-        log::debug!(
-            "VM \"{}\" has address {ip}; waiting for it to answer on port {SSH_PORT}",
-            mapping.vm_name
-        );
-        self.wait_for_port(mapping, ip, monitor)?;
-        log::debug!(
-            "VM \"{}\" answers on port {SSH_PORT}; asking cloud-init whether it has finished",
-            mapping.vm_name
-        );
-
-        let command = readiness_command(
-            &client,
-            vm_directory,
-            mapping.vm_id,
-            username,
-            ip,
-            self.timeouts.connect,
-        )
-        .map_err(|error| {
+        // Refused here rather than after the address arrives: a stored
+        // configuration nothing can connect with is not going to become one,
+        // and a wait that spends its address timeout first says the same thing
+        // ninety seconds later.
+        config.validate().map_err(|error| {
             log::error!(
                 "VM \"{}\" cannot be asked anything over SSH: {error}",
                 mapping.vm_name
@@ -282,6 +286,53 @@ impl GuestReadiness {
                 detail: error.to_string(),
             }
         })?;
+        let question = self.question(config.authentication)?;
+
+        let ip = self.wait_for_address(mapping, monitor)?;
+        let endpoint = SshEndpoint::new(mapping.vm_id, &config, ip).map_err(|error| {
+            ReadinessFailure::Unusable {
+                detail: error.to_string(),
+            }
+        })?;
+        log::debug!(
+            "VM \"{}\" has address {ip}; waiting for it to answer on port {}",
+            mapping.vm_name,
+            endpoint.port
+        );
+        // The configured port and no other. A cloud image ships its daemon on
+        // 22 and cloud-init moves it, so a probe of 22 would answer during the
+        // very window this wait exists to sit through.
+        self.wait_for_port(mapping, ip, endpoint.port.get(), monitor)?;
+
+        let client = match question {
+            // Nobody is at a keyboard during a build, and there is no key to
+            // offer instead: an open port is the whole of what a password-mode
+            // wait can establish, and it establishes it honestly.
+            Question::PortOnly => {
+                log::warn!(
+                    "VM \"{}\" answers on port {}, but it has no deploy key, so cloud-init was \
+                     not asked whether it has finished",
+                    mapping.vm_name,
+                    endpoint.port
+                );
+                return Ok(GuestReady::Unverified {
+                    detail: format!(
+                        "the VM logs in by password, which nobody can type during a build, so \
+                         only its SSH port was checked: the guest answers on port {}, and \
+                         cloud-init may still be configuring it",
+                        endpoint.port
+                    ),
+                });
+            }
+            Question::CloudInit(client) => client,
+        };
+
+        log::debug!(
+            "VM \"{}\" answers on port {}; asking cloud-init whether it has finished",
+            mapping.vm_name,
+            endpoint.port
+        );
+        let command = readiness_command(&client, &endpoint, vm_directory, self.timeouts.connect);
         let run = (self.ssh)(&command, self.timeouts.cloud_init, monitor).map_err(|error| {
             log::error!(
                 "could not ask VM \"{}\" whether cloud-init has finished: {error}",
@@ -307,9 +358,33 @@ impl GuestReadiness {
                 "VM \"{}\" is up, but cloud-init finished degraded: {detail}",
                 mapping.vm_name
             ),
+            Ok(GuestReady::Unverified { detail }) => log::warn!(
+                "VM \"{}\" is up, but its readiness was not verified: {detail}",
+                mapping.vm_name
+            ),
             Err(failure) => log::error!("VM \"{}\" is not ready: {failure}", mapping.vm_name),
         }
         result
+    }
+
+    /// What this wait will be able to establish, decided before it waits.
+    ///
+    /// Key mode needs `ssh.exe`, so an installation without one fails at once
+    /// rather than after six minutes of waiting for a guest it could never have
+    /// asked. Password mode never runs a client, so a missing one is not this
+    /// wait's problem -- it is the interactive launcher's, which says so when a
+    /// person asks for a shell.
+    fn question(&self, authentication: SshAuthentication) -> Result<Question, ReadinessFailure> {
+        match authentication {
+            SshAuthentication::Password => Ok(Question::PortOnly),
+            SshAuthentication::VmlordKey => match self.client.clone() {
+                Some(client) => Ok(Question::CloudInit(client)),
+                None => {
+                    log::error!("{}", ReadinessFailure::NoSshClient);
+                    Err(ReadinessFailure::NoSshClient)
+                }
+            },
+        }
     }
 
     /// Phase one: the endpoint has to be given an address.
@@ -338,7 +413,8 @@ impl GuestReadiness {
         }
     }
 
-    /// Phase two: something has to answer on port 22.
+    /// Phase two: something has to answer on the port the guest was configured
+    /// with.
     ///
     /// A closed port and a refused connection are the same fact here -- the
     /// guest has not raised sshd yet -- and the last reason is kept so that the
@@ -347,6 +423,7 @@ impl GuestReadiness {
         &self,
         mapping: &VmComputeSystemMapping,
         ip: IpAddr,
+        port: u16,
         monitor: &BuildMonitor,
     ) -> Result<(), ReadinessFailure> {
         let deadline = (self.now)() + self.timeouts.ssh_port;
@@ -357,11 +434,11 @@ impl GuestReadiness {
             if monitor.is_cancelled() {
                 return Err(ReadinessFailure::Cancelled);
             }
-            match (self.port)(ip, self.timeouts.connect) {
+            match (self.port)(ip, port, self.timeouts.connect) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
                     log::debug!(
-                        "VM \"{}\" does not answer on {ip}:{SSH_PORT} yet: {error}",
+                        "VM \"{}\" does not answer on {ip}:{port} yet: {error}",
                         mapping.vm_name
                     );
                     last_error = error;
@@ -381,7 +458,7 @@ impl GuestReadiness {
         + Send
         + Sync
         + 'static,
-        port: impl Fn(IpAddr, Duration) -> Result<(), String> + Send + Sync + 'static,
+        port: impl Fn(IpAddr, u16, Duration) -> Result<(), String> + Send + Sync + 'static,
         ssh: impl Fn(&ReadinessCommand, Duration, &BuildMonitor) -> Result<SshRun, RepositoryError>
         + Send
         + Sync
@@ -409,12 +486,39 @@ impl GuestReadiness {
             timeouts,
             client: None,
             address: Box::new(|_| panic!("nothing may be asked without an ssh client")),
-            port: Box::new(|_, _| panic!("nothing may be probed without an ssh client")),
+            port: Box::new(|_, _, _| panic!("nothing may be probed without an ssh client")),
             ssh: Box::new(|_, _, _| panic!("ssh cannot run without an ssh client")),
             now: Box::new(now),
             sleep: Box::new(|_| panic!("nothing may be waited for without an ssh client")),
         }
     }
+
+    /// A host with no OpenSSH client whose guests are otherwise reachable: what
+    /// a password-mode wait, which runs no client, still has to get through.
+    #[cfg(test)]
+    pub(crate) fn for_test_without_client_but_reachable(
+        timeouts: ReadinessTimeouts,
+        now: impl Fn() -> Duration + Send + Sync + 'static,
+        sleep: impl Fn(Duration) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            timeouts,
+            client: None,
+            address: Box::new(|_| Ok(Some("10.0.0.2".parse().expect("a literal address")))),
+            port: Box::new(|_, _, _| Ok(())),
+            ssh: Box::new(|_, _, _| panic!("ssh cannot run without an ssh client")),
+            now: Box::new(now),
+            sleep: Box::new(sleep),
+        }
+    }
+}
+
+/// What a wait can find out about a guest, and what it needs to find it out.
+enum Question {
+    /// The guest can be asked cloud-init's own answer, with this client.
+    CloudInit(PathBuf),
+    /// Nothing can be asked: the wait ends where the port opens.
+    PortOnly,
 }
 
 /// Everything one readiness command needs, decided without running it.
@@ -432,36 +536,26 @@ pub(crate) struct ReadinessCommand {
 
 /// Builds the command that asks the guest whether cloud-init has finished.
 ///
-/// The endpoint it connects to is assembled here from what this wait knows: the
-/// user cloud-init was told to create, and the key VMLord generated for the VM.
-/// Reading the port and the authentication mode off the VM's stored
-/// configuration instead is #80's work -- until then a guest created on another
-/// port is asked on the default one.
+/// Only the question is decided here. Which key, which port, which user and
+/// which host-key file are the endpoint's, and the arguments carrying them are
+/// the shared builder's: a readiness wait is one more connection to the guest,
+/// not a second way of connecting to it.
 pub(crate) fn readiness_command(
     client: &Path,
+    endpoint: &SshEndpoint,
     vm_directory: &Path,
-    vm_id: Uuid,
-    username: &str,
-    ip: IpAddr,
     connect_timeout: Duration,
-) -> Result<ReadinessCommand, RepositoryError> {
-    let config = SshConfig {
-        username: username.to_owned(),
-        port: SshPort::DEFAULT,
-        authentication: SshAuthentication::VmlordKey,
-    };
-    let endpoint = SshEndpoint::new(vm_id, &config, ip)?;
-
-    Ok(ReadinessCommand {
+) -> ReadinessCommand {
+    ReadinessCommand {
         invocation: ssh::invocation(
             client,
-            &endpoint,
+            endpoint,
             vm_directory,
             Some(connect_timeout),
             Some(READINESS_COMMAND),
         ),
         transcript: layout::cloud_init_status_log_path(vm_directory),
-    })
+    }
 }
 
 /// The last `lines` lines of `text`, trimmed.
@@ -476,10 +570,6 @@ fn probe_port_at(ip: IpAddr, port: u16, timeout: Duration) -> Result<(), String>
     TcpStream::connect_timeout(&SocketAddr::new(ip, port), timeout)
         .map(drop)
         .map_err(|error| error.to_string())
-}
-
-fn probe_port(ip: IpAddr, timeout: Duration) -> Result<(), String> {
-    probe_port_at(ip, SSH_PORT, timeout)
 }
 
 /// Runs one readiness command, killing it at `deadline` or on cancellation.
@@ -607,14 +697,17 @@ mod tests {
         net::IpAddr,
         path::Path,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicU64, Ordering},
         },
         time::Duration,
     };
 
     use uuid::Uuid;
-    use vmlord_core::{BuildMonitor, BuildStep, NetworkMode, RepositoryError};
+    use vmlord_core::{
+        BuildMonitor, BuildStep, NetworkMode, RepositoryError, SshAuthentication, SshConfig,
+        SshEndpoint, SshPort,
+    };
 
     use super::{
         GuestReadiness, GuestReady, ReadinessCommand, ReadinessFailure, ReadinessTimeouts, SshRun,
@@ -622,7 +715,15 @@ mod tests {
     };
     use crate::metadata::VmComputeSystemMapping;
 
-    fn mapping() -> VmComputeSystemMapping {
+    fn config() -> SshConfig {
+        SshConfig {
+            username: "machi".to_owned(),
+            port: SshPort::DEFAULT,
+            authentication: SshAuthentication::VmlordKey,
+        }
+    }
+
+    fn mapping_with(ssh: Option<SshConfig>) -> VmComputeSystemMapping {
         VmComputeSystemMapping {
             vm_id: Uuid::nil(),
             vm_name: "dev-linux".to_owned(),
@@ -630,8 +731,14 @@ mod tests {
             disk_gb: 20,
             endpoint_id: None,
             network_mode: NetworkMode::Nat,
-            ssh: None,
+            ssh,
         }
+    }
+
+    /// The ordinary VM these tests wait for: a cloud image with the key VMLord
+    /// deployed into it.
+    fn mapping() -> VmComputeSystemMapping {
+        mapping_with(Some(config()))
     }
 
     fn monitor() -> BuildMonitor {
@@ -687,7 +794,7 @@ mod tests {
         let readiness = GuestReadiness::for_test(
             timeouts(),
             |_| Ok(Some(address())),
-            |_, _| Ok(()),
+            |_, _, _| Ok(()),
             |_, _, _| {
                 Ok(SshRun::Exited {
                     code: Some(0),
@@ -699,7 +806,7 @@ mod tests {
         );
 
         let ready = readiness
-            .wait(&mapping(), vm_directory(), "machi", &monitor())
+            .wait(&mapping(), vm_directory(), &monitor())
             .unwrap();
 
         assert_eq!(ready, GuestReady::Ready);
@@ -711,14 +818,14 @@ mod tests {
         let readiness = GuestReadiness::for_test(
             timeouts(),
             |_| Ok(None),
-            |_, _| panic!("the port must not be probed before an address exists"),
+            |_, _, _| panic!("the port must not be probed before an address exists"),
             |_, _, _| panic!("ssh must not run before an address exists"),
             clock.now(),
             clock.sleeper(),
         );
 
         let failure = readiness
-            .wait(&mapping(), vm_directory(), "machi", &monitor())
+            .wait(&mapping(), vm_directory(), &monitor())
             .unwrap_err();
 
         assert_eq!(failure, ReadinessFailure::NoAddress);
@@ -741,14 +848,14 @@ mod tests {
         let readiness = GuestReadiness::for_test(
             timeouts(),
             |_| Ok(Some(address())),
-            |_, _| Err("connection refused".to_owned()),
-            |_, _, _| panic!("ssh must not run before port 22 opens"),
+            |_, _, _| Err("connection refused".to_owned()),
+            |_, _, _| panic!("ssh must not run before the guest's SSH port opens"),
             clock.now(),
             clock.sleeper(),
         );
 
         let failure = readiness
-            .wait(&mapping(), vm_directory(), "machi", &monitor())
+            .wait(&mapping(), vm_directory(), &monitor())
             .unwrap_err();
 
         assert_eq!(
@@ -777,14 +884,14 @@ mod tests {
                     Ok(None)
                 }
             },
-            |_, _| panic!("the port must not be probed after a cancellation"),
+            |_, _, _| panic!("the port must not be probed after a cancellation"),
             |_, _, _| panic!("ssh must not run after a cancellation"),
             clock.now(),
             clock.sleeper(),
         );
 
         let failure = readiness
-            .wait(&mapping(), vm_directory(), "machi", &monitor)
+            .wait(&mapping(), vm_directory(), &monitor)
             .unwrap_err();
 
         assert_eq!(failure, ReadinessFailure::Cancelled);
@@ -799,7 +906,7 @@ mod tests {
             |_| Ok(Some(address())),
             {
                 let monitor = monitor.clone();
-                move |_, _| {
+                move |_, _, _| {
                     monitor.cancel();
                     Err("not yet".to_owned())
                 }
@@ -810,7 +917,7 @@ mod tests {
         );
 
         let failure = readiness
-            .wait(&mapping(), vm_directory(), "machi", &monitor)
+            .wait(&mapping(), vm_directory(), &monitor)
             .unwrap_err();
 
         assert_eq!(failure, ReadinessFailure::Cancelled);
@@ -822,14 +929,14 @@ mod tests {
         let readiness = GuestReadiness::for_test(
             timeouts(),
             |_| Ok(Some(address())),
-            |_, _| Ok(()),
+            |_, _, _| Ok(()),
             |_, _, _| Ok(SshRun::Cancelled),
             clock.now(),
             clock.sleeper(),
         );
 
         let failure = readiness
-            .wait(&mapping(), vm_directory(), "machi", &monitor())
+            .wait(&mapping(), vm_directory(), &monitor())
             .unwrap_err();
 
         assert_eq!(failure, ReadinessFailure::Cancelled);
@@ -841,7 +948,7 @@ mod tests {
         let readiness = GuestReadiness::for_test(
             timeouts(),
             |_| Ok(Some(address())),
-            |_, _| Ok(()),
+            |_, _, _| Ok(()),
             |_, _, _| {
                 Ok(SshRun::Exited {
                     code: None,
@@ -853,7 +960,7 @@ mod tests {
         );
 
         let failure = readiness
-            .wait(&mapping(), vm_directory(), "machi", &monitor())
+            .wait(&mapping(), vm_directory(), &monitor())
             .unwrap_err();
 
         assert_eq!(failure, ReadinessFailure::TimedOut);
@@ -868,14 +975,14 @@ mod tests {
         let readiness = GuestReadiness::for_test(
             timeouts(),
             |_| Err(RepositoryError::new("HNS is unavailable")),
-            |_, _| panic!("the port must not be probed without an address"),
+            |_, _, _| panic!("the port must not be probed without an address"),
             |_, _, _| panic!("ssh must not run without an address"),
             clock.now(),
             clock.sleeper(),
         );
 
         let failure = readiness
-            .wait(&mapping(), vm_directory(), "machi", &monitor())
+            .wait(&mapping(), vm_directory(), &monitor())
             .unwrap_err();
 
         assert_eq!(failure, ReadinessFailure::NoAddress);
@@ -887,7 +994,7 @@ mod tests {
         let readiness = GuestReadiness::for_test_without_client(timeouts(), clock.now());
 
         let failure = readiness
-            .wait(&mapping(), vm_directory(), "machi", &monitor())
+            .wait(&mapping(), vm_directory(), &monitor())
             .unwrap_err();
 
         assert_eq!(failure, ReadinessFailure::NoSshClient);
@@ -964,15 +1071,18 @@ mod tests {
 
     #[test]
     fn the_readiness_command_asks_cloud_init_and_keeps_its_answer_beside_the_vm() {
-        let command = readiness_command(
-            Path::new(r"C:\Windows\System32\OpenSSH\ssh.exe"),
-            Path::new(r"C:\VMs\dev-linux"),
+        let endpoint = SshEndpoint::new(
             Uuid::nil(),
-            "machi",
+            &config(),
             "172.22.42.7".parse::<IpAddr>().unwrap(),
-            Duration::from_secs(10),
         )
         .unwrap();
+        let command = readiness_command(
+            Path::new(r"C:\Windows\System32\OpenSSH\ssh.exe"),
+            &endpoint,
+            Path::new(r"C:\VMs\dev-linux"),
+            Duration::from_secs(10),
+        );
         let args = arguments(&command);
 
         assert_eq!(
@@ -999,17 +1109,182 @@ mod tests {
     }
 
     #[test]
-    fn a_user_name_the_guest_would_refuse_stops_the_wait_before_ssh_runs() {
-        let refused = readiness_command(
-            Path::new("ssh.exe"),
-            Path::new(r"C:\VMs\dev"),
-            Uuid::nil(),
-            "root -oProxyCommand=calc",
-            "10.0.0.2".parse::<IpAddr>().unwrap(),
-            Duration::from_secs(5),
+    fn a_user_name_the_guest_would_refuse_stops_the_wait_before_anything_is_waited_for() {
+        let clock = FakeClock::default();
+        let damaged = SshConfig {
+            username: "root -oProxyCommand=calc".to_owned(),
+            ..config()
+        };
+        let readiness = GuestReadiness::for_test(
+            timeouts(),
+            |_| panic!("a configuration nothing can connect with is not worth an address"),
+            |_, _, _| panic!("nor a port"),
+            |_, _, _| panic!("such a name must never reach ssh.exe"),
+            clock.now(),
+            clock.sleeper(),
         );
 
-        assert!(refused.is_err(), "such a name must never reach ssh.exe");
+        let failure = readiness
+            .wait(&mapping_with(Some(damaged)), vm_directory(), &monitor())
+            .unwrap_err();
+
+        let ReadinessFailure::Unusable { detail } = failure else {
+            panic!("a stored configuration nothing can connect with is its own failure");
+        };
+        assert!(detail.contains("user"), "{detail}");
+        assert_eq!(clock.elapsed(), Duration::ZERO, "nothing may be waited for");
+    }
+
+    /// A cloud image ships its daemon on 22 and cloud-init moves it to the port
+    /// the VM was created with. A wait that probed 22 would therefore answer
+    /// during the very window it exists to sit through -- and then ask the
+    /// question on a port nothing listens on.
+    #[test]
+    fn the_configured_port_is_the_only_one_a_key_mode_wait_looks_at() {
+        let clock = FakeClock::default();
+        let probed = Arc::new(Mutex::new(Vec::new()));
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let readiness = GuestReadiness::for_test(
+            timeouts(),
+            |_| Ok(Some(address())),
+            {
+                let probed = Arc::clone(&probed);
+                move |ip, port, _| {
+                    probed.lock().unwrap().push((ip, port));
+                    Ok(())
+                }
+            },
+            {
+                let asked = Arc::clone(&asked);
+                move |command: &ReadinessCommand, _, _| {
+                    *asked.lock().unwrap() = arguments(command);
+                    Ok(SshRun::Exited {
+                        code: Some(0),
+                        transcript_tail: "status: done".to_owned(),
+                    })
+                }
+            },
+            clock.now(),
+            clock.sleeper(),
+        );
+        let mapping = mapping_with(Some(SshConfig {
+            port: SshPort::new(2222).unwrap(),
+            ..config()
+        }));
+
+        let ready = readiness
+            .wait(&mapping, vm_directory(), &monitor())
+            .unwrap();
+
+        assert_eq!(ready, GuestReady::Ready);
+        assert_eq!(
+            *probed.lock().unwrap(),
+            [(address(), 2222)],
+            "the temporary listener on 22 is not this guest's SSH port"
+        );
+        let asked = asked.lock().unwrap().clone();
+        let port_flag = asked.iter().position(|argument| argument == "-p").unwrap();
+        assert_eq!(
+            asked[port_flag + 1],
+            "2222",
+            "the port that was probed is the port the question is asked on: {asked:?}"
+        );
+    }
+
+    /// Password mode has no credential VMLord can present unattended: the
+    /// password is in a person's head, and a build is not a moment anyone is at
+    /// a prompt. The wait ends where the port opens, and says what it did not
+    /// check rather than reporting a readiness it never established.
+    #[test]
+    fn a_password_only_guest_is_waited_for_up_to_its_port_and_no_further() {
+        let clock = FakeClock::default();
+        let probed = Arc::new(Mutex::new(Vec::new()));
+        let readiness = GuestReadiness::for_test(
+            timeouts(),
+            |_| Ok(Some(address())),
+            {
+                let probed = Arc::clone(&probed);
+                move |ip, port, _| {
+                    probed.lock().unwrap().push((ip, port));
+                    Ok(())
+                }
+            },
+            |_, _, _| panic!("a password nobody can type must not be attempted"),
+            clock.now(),
+            clock.sleeper(),
+        );
+        let mapping = mapping_with(Some(SshConfig {
+            port: SshPort::new(2222).unwrap(),
+            authentication: SshAuthentication::Password,
+            ..config()
+        }));
+
+        let ready = readiness
+            .wait(&mapping, vm_directory(), &monitor())
+            .unwrap();
+
+        let GuestReady::Unverified { detail } = ready else {
+            panic!("a guest whose cloud-init was never asked is not a verified one");
+        };
+        assert!(
+            detail.contains("password") && detail.contains("cloud-init"),
+            "the warning has to say what was not checked: {detail}"
+        );
+        assert!(detail.contains("2222"), "{detail}");
+        assert_eq!(
+            *probed.lock().unwrap(),
+            [(address(), 2222)],
+            "the configured port is waited for in both modes"
+        );
+    }
+
+    /// Only key mode runs a client. A password-mode build must not fail over a
+    /// Windows feature it was never going to use -- the interactive launcher is
+    /// where a missing `ssh.exe` becomes a person's problem.
+    #[test]
+    fn a_password_only_guest_needs_no_openssh_client_on_the_host() {
+        let clock = FakeClock::default();
+        let readiness = GuestReadiness::for_test_without_client_but_reachable(
+            timeouts(),
+            clock.now(),
+            clock.sleeper(),
+        );
+        let mapping = mapping_with(Some(SshConfig {
+            authentication: SshAuthentication::Password,
+            ..config()
+        }));
+
+        let ready = readiness
+            .wait(&mapping, vm_directory(), &monitor())
+            .unwrap();
+
+        assert!(matches!(ready, GuestReady::Unverified { .. }));
+    }
+
+    /// A VM created with SSH switched off runs no daemon: there is no port to
+    /// wait for and nobody to ask. The build succeeds -- the VM is there, and
+    /// its console is how a person gets in -- and says what it could not check.
+    #[test]
+    fn a_vm_created_without_ssh_is_not_waited_for_at_all() {
+        let clock = FakeClock::default();
+        let readiness = GuestReadiness::for_test(
+            timeouts(),
+            |_| panic!("a VM with no SSH server has no address worth waiting for"),
+            |_, _, _| panic!("nor a port"),
+            |_, _, _| panic!("nor anything to ask"),
+            clock.now(),
+            clock.sleeper(),
+        );
+
+        let ready = readiness
+            .wait(&mapping_with(None), vm_directory(), &monitor())
+            .unwrap();
+
+        let GuestReady::Unverified { detail } = ready else {
+            panic!("a guest nothing can be asked of is not a verified one");
+        };
+        assert!(detail.contains("SSH"), "{detail}");
+        assert_eq!(clock.elapsed(), Duration::ZERO, "nothing may be waited for");
     }
 
     #[test]
