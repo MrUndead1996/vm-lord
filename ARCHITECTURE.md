@@ -1209,6 +1209,16 @@ nothing at all: it wrote that prompt once, minutes ago, and a `getty` repeats it
 only when something is typed. The replay is the last 64 KiB, cut back to a line
 boundary so that no half-finished escape sequence colours everything after it,
 and it is read by seeking rather than by loading a log that holds a whole boot.
+What the replay does not carry is the questions. A boot log holds the probes the
+guest's own tools made -- `ESC[6n` for the cursor position, `ESC[c` for the
+terminal's identity -- and a terminal answers those on its *input*, which here
+is the helper's stdin, which goes into the guest's tty. Replayed unfiltered they
+made the terminal type `^[[30;1R` at the login prompt of a guest that had asked
+nothing. So the replay drops the sequences that solicit an answer, and keeps
+everything that only paints: history without its colours is history that is hard
+to read. The live stream is never filtered -- a guest that asks has asked, and
+answering it is what a serial terminal is for.
+
 A replay that cannot be read is a `WARN` and an empty window, never a failed
 console: the window exists for the bytes the guest is about to write. A
 truncating start replays nothing -- it is throwing the previous boot's output

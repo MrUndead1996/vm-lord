@@ -585,7 +585,7 @@ fn replay_tail(options: &Com1HelperOptions) {
             return;
         }
     };
-    let tail = tail_from(&history, REPLAY_TAIL_BYTES);
+    let tail = without_terminal_queries(tail_from(&history, REPLAY_TAIL_BYTES));
     if tail.is_empty() {
         return;
     }
@@ -603,7 +603,7 @@ fn replay_tail(options: &Com1HelperOptions) {
     // what the guest wrote, including its control characters.
     if let Err(error) = stdout
         .write_all(banner.as_bytes())
-        .and_then(|()| stdout.write_all(tail))
+        .and_then(|()| stdout.write_all(&tail))
         .and_then(|()| stdout.flush())
     {
         log::warn!(
@@ -617,6 +617,96 @@ fn replay_tail(options: &Com1HelperOptions) {
         options.vm_name,
         tail.len()
     );
+}
+
+/// Drops the sequences that ask the terminal a question.
+///
+/// Replaying history is not the same as receiving it. A boot log carries the
+/// probes the guest's own tools made -- `ESC[6n` to find out where the cursor
+/// is, `ESC[c` to ask what the terminal is -- and a terminal answers those on
+/// its *input*, which for this window is the helper's stdin, which goes
+/// straight into the guest's tty. Replayed unfiltered, the history makes the
+/// terminal type `^[[30;1R` at the login prompt of a guest that asked nothing.
+///
+/// Only the replay is filtered. A live guest that asks gets its answer: it did
+/// ask, and that is what a serial terminal is for.
+///
+/// Everything that merely paints -- colours, cursor movement, erasures -- is
+/// kept, because history that has lost its formatting is history that is hard
+/// to read.
+fn without_terminal_queries(history: &[u8]) -> Vec<u8> {
+    const ESCAPE: u8 = 0x1b;
+    const BELL: u8 = 0x07;
+
+    let mut kept = Vec::with_capacity(history.len());
+    let mut rest = history;
+    while let Some(start) = rest.iter().position(|byte| *byte == ESCAPE) {
+        kept.extend_from_slice(&rest[..start]);
+        let sequence = &rest[start..];
+        let Some((length, answers)) = measure_escape(sequence, ESCAPE, BELL) else {
+            // The log ends in the middle of a sequence: dropping it is what
+            // keeps the terminal from applying it to the live output that
+            // follows, which arrives from a different moment entirely.
+            return kept;
+        };
+        if !answers {
+            kept.extend_from_slice(&sequence[..length]);
+        }
+        rest = &sequence[length..];
+    }
+    kept.extend_from_slice(rest);
+    kept
+}
+
+/// How long the escape sequence at the start of `bytes` is, and whether a
+/// terminal answers it.
+///
+/// `None` means the sequence is unfinished, which at the end of a log means it
+/// was cut off rather than that more is coming.
+fn measure_escape(bytes: &[u8], escape: u8, bell: u8) -> Option<(usize, bool)> {
+    match bytes.get(1)? {
+        // CSI: parameters and intermediates, then one final byte that says what
+        // it was. `n` is a status report and `c` is a device attributes
+        // request; both are questions.
+        b'[' => {
+            let final_byte = bytes
+                .iter()
+                .enumerate()
+                .skip(2)
+                .find(|(_, byte)| (0x40..=0x7e).contains(*byte))?;
+            let (index, byte) = final_byte;
+            Some((index + 1, matches!(byte, b'n' | b'c')))
+        }
+        // OSC: ends at a bell or a string terminator. A `?` in one is a query
+        // -- "what is your background colour" and its like.
+        b']' => {
+            let end = terminated_string(bytes, escape, bell)?;
+            Some((end, bytes[..end].contains(&b'?')))
+        }
+        // DCS: nothing in a boot log needs one, and the ones that exist are
+        // requests for the terminal's settings.
+        b'P' => Some((terminated_string(bytes, escape, bell)?, true)),
+        // The obsolete "identify terminal", answered like a device attributes
+        // request.
+        b'Z' => Some((2, true)),
+        // Everything else is two bytes and paints something.
+        _ => Some((2, false)),
+    }
+}
+
+/// Where the string-terminated sequence at the start of `bytes` ends.
+fn terminated_string(bytes: &[u8], escape: u8, bell: u8) -> Option<usize> {
+    let mut index = 2;
+    while index < bytes.len() {
+        if bytes[index] == bell {
+            return Some(index + 1);
+        }
+        if bytes[index] == escape && bytes.get(index + 1) == Some(&b'\\') {
+            return Some(index + 2);
+        }
+        index += 1;
+    }
+    None
 }
 
 /// Reads at most the last `limit` bytes of a file, and one more.
@@ -686,7 +776,7 @@ mod tests {
 
     use super::{
         Com1LogMode, PIPE_ACCESS, REPLAY_TAIL_BYTES, is_end_of_stream, mirror_chunk,
-        parse_com1_helper_args, read_tail, tail_from,
+        parse_com1_helper_args, read_tail, tail_from, without_terminal_queries,
     };
 
     fn arguments() -> Vec<OsString> {
@@ -898,5 +988,75 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
         assert_eq!(tail_from(&window, REPLAY_TAIL_BYTES), b"test login: ");
+    }
+
+    /// The bug this covers, seen at a login prompt: the replayed history
+    /// carried the cursor-position query some tool made during the boot, the
+    /// terminal answered it on the helper's stdin, and the answer was typed
+    /// into the guest as `^[[30;1R`.
+    #[test]
+    fn a_replayed_cursor_query_is_not_asked_again() {
+        let history = b"\x1b[999;999H\x1b[6ntest login: ";
+
+        let replayed = without_terminal_queries(history);
+
+        assert_eq!(replayed, b"\x1b[999;999Htest login: ");
+    }
+
+    #[test]
+    fn a_replayed_device_attributes_request_is_dropped_in_every_spelling() {
+        for query in [
+            &b"\x1b[c"[..],
+            b"\x1b[>c",
+            b"\x1b[=0c",
+            b"\x1b[?6n",
+            b"\x1bZ",
+        ] {
+            let mut history = b"before".to_vec();
+            history.extend_from_slice(query);
+            history.extend_from_slice(b"after");
+
+            assert_eq!(
+                without_terminal_queries(&history),
+                b"beforeafter",
+                "{query:?} is a question the terminal answers"
+            );
+        }
+    }
+
+    /// History that has lost its formatting is history that is hard to read:
+    /// only the questions go.
+    #[test]
+    fn replayed_colour_and_movement_survive() {
+        let history = b"\x1b[32m[  OK  ]\x1b[0m Reached target\r\n\x1b[?25htest login: ";
+
+        assert_eq!(without_terminal_queries(history), history);
+    }
+
+    #[test]
+    fn a_replayed_window_title_survives_but_a_colour_question_does_not() {
+        let title = b"\x1b]0;a title\x07";
+        let query = b"\x1b]11;?\x1b\\";
+        let mut history = title.to_vec();
+        history.extend_from_slice(query);
+
+        assert_eq!(without_terminal_queries(&history), title);
+    }
+
+    /// A log can end anywhere, including inside a sequence. Passing half of one
+    /// on would leave the terminal applying it to the live output that follows.
+    #[test]
+    fn an_unfinished_sequence_at_the_end_is_dropped() {
+        assert_eq!(
+            without_terminal_queries(b"test login: \x1b[3"),
+            b"test login: "
+        );
+    }
+
+    #[test]
+    fn plain_history_is_replayed_unchanged() {
+        let history = b"Ubuntu 26.04 LTS test ttyS0\r\n\r\ntest login: ";
+
+        assert_eq!(without_terminal_queries(history), history);
     }
 }
