@@ -95,9 +95,10 @@ While AppSandbox focuses on isolated application environments across multiple pl
 
 ## Status
 
-🚧 Early development. The Windows x64 skeleton is now available: it loads the
-temporary AppSandbox legacy backend, displays its initialization status, and
-lists persisted VMs in an egui desktop shell.
+🚧 Early development. The Windows x64 application runs on the native HCS
+backend and lists persisted VMs in an egui desktop shell. The AppSandbox legacy
+backend remains as a transitional fallback, selected only by setting
+`VMLORD_BACKEND=legacy`.
 
 Build with `cargo build -p vmlord`, then launch the elevated executable with:
 
@@ -110,8 +111,11 @@ executable directly. The build stages the prebuilt
 `third_party/appsandbox/x64/appsandbox_core.dll` next to the executable. See
 `third_party/appsandbox/NOTICE.md` for the pinned artifact and license details.
 
-The initial shell can create Linux workspaces from ISO images and targets
-`x86_64-pc-windows-msvc`. Creation currently uses the temporary AppSandbox
-backend; VM lifecycle, provisioning, display, and snapshots remain migration
-work. AppSandbox macOS code, WebView UI, provisioning tools, and display
-resources are not included.
+The shell targets `x86_64-pc-windows-msvc` and creates Linux workspaces either
+from a local ISO, which boots to the distribution's own installer, or from an
+Ubuntu cloud image, which needs no one at the keyboard: there the image is
+downloaded and imported into a VHDX, and the guest is provisioned
+by cloud-init from a NoCloud seed VMLord writes itself, with COM1 available as a
+diagnostic console. Display, snapshots, and GPU work remain migration work.
+AppSandbox macOS code, WebView UI, provisioning tools, and display resources are
+not included.

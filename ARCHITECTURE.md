@@ -1005,11 +1005,17 @@ Debian-family. Fedora keeps the setting in `/etc/vconsole.conf` under different
 keys, which is a different mechanism rather than a different value; every other
 key in the document is a cloud-init module that works anywhere.
 
-The native backend builds a VM from a `CloudImage`; the legacy AppSandbox
-backend refuses one outright and is given empty credentials for `LocalMedia`:
-its own model was "media plus unattended answers", which the domain no longer
-spells. That is a deliberate loss on a transitional path -- #66 removes the
-iso-patch dependency it belongs to.
+Creating a VM is now the native backend's alone. AppSandbox's model was "media
+plus unattended answers", and the tool that carried out the answers was
+`iso-patch.exe`: a host-side Ubuntu installer with its own ext4 writer, its own
+squashfs reader, and a partition table written through
+`IOCTL_DISK_SET_DRIVE_LAYOUT_EX`. Importing a cloud image leaves it nothing to
+do, so VMLord stopped shipping it, and `AppSandboxBackend::create_vm` refuses
+rather than letting the DLL fail on a missing executable. Everything the legacy
+backend does with VMs it did not create -- list, start, stop, edit, delete --
+still works, which is what the transitional path is for. What remains of
+`iso-patch` here are citations to its C sources, which recorded Windows
+behaviour worth keeping; only the binary is gone.
 
 ### Creating a VM from a cloud image
 
