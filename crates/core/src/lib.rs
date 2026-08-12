@@ -213,6 +213,17 @@ pub trait VmRepository {
             "SSH connections are not supported by this backend",
         ))
     }
+    /// Opens the serial console of a running VM, appending to its log.
+    ///
+    /// Defaulted rather than required: a backend with no serial port has no
+    /// console to open, and saying so is the honest answer. The VM has to be
+    /// running -- the pipe the console reads exists only while its compute
+    /// system does.
+    fn open_console(&mut self, _name: &str) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(
+            "serial consoles are not supported by this backend",
+        ))
+    }
     fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError>;
     fn take_diagnostics(&mut self) -> Vec<Diagnostic>;
 }

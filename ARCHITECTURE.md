@@ -648,8 +648,11 @@ or a password: an installation medium is installed by hand, and those fields
 return with the cloud-image form in #65. It submits safe requests through the
 application layer, which knows nothing about which backend serves them. Edit is
 available whichever state the VM is in;
-Delete stays limited to stopped VMs. Snapshots remain future application-layer
-work.
+Delete stays limited to stopped VMs. `Open COM port` is enabled only while the
+VM runs, and reopens the serial console described under "The COM1 diagnostic
+console" -- the UI calls `WorkspaceApp::open_console` and nothing else, since a
+named pipe is the platform layer's business. Snapshots remain future
+application-layer work.
 
 Under `VMLORD_BACKEND=legacy`, the same actions reach AppSandbox's C API
 instead: Start invokes `asb_vm_start`; Stop invokes the graceful
@@ -1168,6 +1171,19 @@ including a panic. What VMLord keeps afterwards is a `Com1Session` holding those
 events, not a process handle: the terminal owns the reader, and the session is
 how VMLord speaks to it.
 
+A fifth name, `alive`, works the other way round: the helper creates that event
+itself and holds it for as long as its process lives, and VMLord only ever
+probes whether it exists, never holding a handle -- one would keep the object
+alive past the process it stands for. This is how a reader that said nothing is
+noticed. `finished` covers every way the helper can leave on its own two feet,
+and closing the console window is not one of them: the terminal kills the
+process where it stands, and a killed process signals nothing. Before this,
+such a session looked alive forever, and the VM whose window had been closed
+could never be given another console. A probe that fails for any reason other
+than "no such object" is a `WARN` and counts as alive: a reader that may still
+be reading is left alone. `Com1Sessions::reap` asks this question, so both the
+refresh that drains diagnostics and `open_console` see the same answer.
+
 Ownership follows the VM. An explicit start opens the console once the compute
 system is in its final shape and before it executes anything, and truncates
 `com1.log`, because that boot's output replaces the previous one. Both halves of
@@ -1185,19 +1201,66 @@ append mode, because the boot it is in the middle of is the same boot. A
 reconnect launch that fails is a `Warning` diagnostic and nothing more -- the
 guest is already up, and no diagnostic is worth taking it down for.
 
+A console opened in append mode -- a reopen, or a reconnect at startup -- shows
+the end of `com1.log` before the live stream, under a one-line banner that is
+written to the window and never to the log. Without it such a window is empty
+until the guest prints its next byte, and a guest sitting at `login:` prints
+nothing at all: it wrote that prompt once, minutes ago, and a `getty` repeats it
+only when something is typed. The replay is the last 64 KiB, cut back to a line
+boundary so that no half-finished escape sequence colours everything after it,
+and it is read by seeking rather than by loading a log that holds a whole boot.
+What the replay does not carry is the questions. A boot log holds the probes the
+guest's own tools made -- `ESC[6n` for the cursor position, `ESC[c` for the
+terminal's identity -- and a terminal answers those on its *input*, which here
+is the helper's stdin, which goes into the guest's tty. Replayed unfiltered they
+made the terminal type `^[[30;1R` at the login prompt of a guest that had asked
+nothing. So the replay drops the sequences that solicit an answer, and keeps
+everything that only paints: history without its colours is history that is hard
+to read. The live stream is never filtered -- a guest that asks has asked, and
+answering it is what a serial terminal is for.
+
+A replay that cannot be read is a `WARN` and an empty window, never a failed
+console: the window exists for the bytes the guest is about to write. A
+truncating start replays nothing -- it is throwing the previous boot's output
+away, and this one is about to print itself from the first line.
+
+A console can also be asked for. `VmRepository::open_console` -- `Open COM port`
+in the list, enabled only while the VM runs -- opens one for a VM that has none,
+in append mode, for the same reason a reconnect does: the boot it joins is the
+boot already being logged, and truncating would throw away the output the
+console is usually reopened to read. This is the only way a closed window comes
+back, and the way in when the guest is unreachable over the network. It asks HCS
+for the VM's state rather than the application layer's cached list, which can be
+a refresh out of date by the time the user clicks: only `Running` is accepted,
+because the pipe belongs to the compute system and outlives it by nothing. A VM
+that still has a session is refused with a message rather than given a second
+reader, for the reason above -- one pipe, one client. Sessions that are over are
+reaped first, so a window a person closed is not mistaken for one that is still
+reading; a reader that stopped for the wrong reason still becomes its `Error`
+diagnostic on the way through.
+
 A graceful stop leaves the session alone: the guest is still printing what it
 does on the way down, and the pipe closing is what ends the capture. A force
 stop, a delete, an HCS exit event, and VMLord's own shutdown all cancel it,
 because in each of those cases nothing will ever close the pipe from the other
-end. `take_diagnostics` reaps finished sessions: one that finished with its pipe
-is a `DEBUG` line, and one that signaled `failed` becomes an `Error` diagnostic
-naming the VM and the `com1.log` to look in.
+end. `take_diagnostics` reaps sessions that are over: one that finished with its
+pipe, and one whose window was closed, are `DEBUG` lines, and one that signaled
+`failed` becomes an `Error` diagnostic naming the VM and the `com1.log` to look
+in. A killed helper cannot signal `failed`, so a window closed by hand and a
+helper killed some other way read alike -- as the ordinary end of a capture,
+which is what closing that window means.
 
 `ubuntu_cloud_init_is_visible_on_com1` is the factual check, ignored like every
 other test that needs Hyper-V: it builds a real Ubuntu cloud image, starts it,
 and waits for the string `cloud-init` to appear in the VM's `com1.log`. That is
 the claim worth verifying -- that the serial console the guest was given is the
 one being captured, before SSH exists to ask it anything.
+
+`the_com_port_of_a_running_vm_is_opened_once` covers what the action must not
+do, against a real compute system: no console before the VM runs, no second
+console while one is open, and none again once it is stopped. The case the
+action exists for -- reopening a window a person closed -- stays a manual check,
+because closing that window is what ends the session and no test can close it.
 
 `a_guest_can_be_logged_into_over_com1` is the same kind of check for the other
 direction: it builds a VM with a password, starts the compute system directly

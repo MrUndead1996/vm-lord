@@ -184,6 +184,60 @@ impl HcsVmRepository {
         Err(error)
     }
 
+    /// What HCS says about this VM right now.
+    ///
+    /// Asked of HCS rather than of the application layer's cached list, which
+    /// can be a refresh out of date by the time the user clicks.
+    fn reported_state(
+        &self,
+        mapping: &VmComputeSystemMapping,
+    ) -> Result<Option<HcsSystemState>, RepositoryError> {
+        Ok(list_known_vms(&self.client, &self.store)?
+            .into_iter()
+            .find(|known| known.mapping.vm_id == mapping.vm_id)
+            .and_then(|known| known.state))
+    }
+
+    /// Opens the console of a VM HCS reports as being in `state`.
+    ///
+    /// Split from [`VmRepository::open_console`] at the one call that needs
+    /// HCS, so that what it decides can be tested without a compute system.
+    fn open_console_in_state(
+        &mut self,
+        mapping: &VmComputeSystemMapping,
+        state: Option<HcsSystemState>,
+    ) -> Result<(), RepositoryError> {
+        refuse_unless_running(&mapping.vm_name, state)?;
+
+        // A console whose window has been closed leaves a session behind that
+        // is over. Reaping it here is what makes reopening possible at all --
+        // and its failure, if it stopped for a reason worth reporting, is
+        // reported rather than dropped on the way.
+        for diagnostic in console_failure_diagnostics(&mut self.com1_sessions, &self.storage_root) {
+            self.push_diagnostic(diagnostic.level, diagnostic.message);
+        }
+        if self.com1_sessions.contains(mapping.vm_id) {
+            let error = RepositoryError::new(format!(
+                "VM \"{}\" already has a COM1 console open; close its window before \
+                 opening another",
+                mapping.vm_name
+            ));
+            log::error!("{error}");
+            return Err(error);
+        }
+
+        let vm_directory = layout::vm_directory(&self.storage_root, &mapping.vm_name)?;
+        let session = self
+            .com1_launcher
+            .launch(mapping, &vm_directory, Com1LogMode::Append)?;
+        self.com1_sessions.insert(session);
+        log::info!(
+            "the COM1 console of VM \"{}\" was reopened on request",
+            mapping.vm_name
+        );
+        Ok(())
+    }
+
     fn push_diagnostic(&self, level: DiagnosticLevel, message: String) {
         self.diagnostics
             .lock()
@@ -791,6 +845,26 @@ impl VmRepository for HcsVmRepository {
         self.builds.cancel(name)
     }
 
+    /// Reopens the COM1 console of a running VM.
+    ///
+    /// The console opens by itself when a VM starts and when VMLord reconnects
+    /// to one that was already running; this is how it comes back after its
+    /// window has been closed. The log is appended to rather than truncated:
+    /// the boot it is capturing is the same boot, and the messages already
+    /// written are the ones the console is usually reopened to read.
+    ///
+    /// A VM that already has a reader is refused rather than given a second
+    /// one: two readers on one pipe split the guest's output between two
+    /// windows and neither shows all of it.
+    fn open_console(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.require_initialized()?;
+        self.builds.refuse_if_building(name)?;
+
+        let mapping = self.mapping(name)?;
+        let state = self.reported_state(&mapping)?;
+        self.open_console_in_state(&mapping, state)
+    }
+
     fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError> {
         self.require_initialized()?;
 
@@ -908,6 +982,31 @@ fn launch_running_consoles(
         }
     }
     failures
+}
+
+/// Refuses a console unless HCS reports the VM as running.
+///
+/// The named pipe behind COM1 belongs to the compute system: it exists while
+/// the VM runs and not a moment longer. Only `Running` is accepted -- a VM that
+/// is merely `Created` has a configuration and no compute system to talk to,
+/// and a paused one has a pipe nobody is writing to.
+fn refuse_unless_running(
+    vm_name: &str,
+    state: Option<HcsSystemState>,
+) -> Result<(), RepositoryError> {
+    let description = match &state {
+        Some(HcsSystemState::Running) => return Ok(()),
+        None | Some(HcsSystemState::Stopped) => "stopped".to_string(),
+        Some(HcsSystemState::Created) => "created but not running".to_string(),
+        Some(HcsSystemState::Paused) => "paused".to_string(),
+        Some(HcsSystemState::Other(other)) => format!("in state \"{other}\""),
+    };
+
+    let error = RepositoryError::new(format!(
+        "VM \"{vm_name}\" is {description}, so it has no COM1 port to open; start it first"
+    ));
+    log::error!("{error}");
+    Err(error)
 }
 
 /// Turns every reader that stopped for the wrong reason into a diagnostic, and
@@ -1280,6 +1379,97 @@ mod tests {
         assert!(!sessions.contains(known[0].mapping.vm_id));
     }
 
+    /// A repository whose consoles are recorded instead of opened.
+    fn repository_with_console(recorded: Arc<Mutex<Vec<String>>>) -> HcsVmRepository {
+        let mut repository = repository();
+        repository.com1_launcher = console_launcher(recorded);
+        repository
+    }
+
+    #[test]
+    fn the_console_of_a_stopped_vm_is_refused_without_opening_a_window() {
+        // There is no pipe to read: HCS destroys the compute system as the VM
+        // stops, and a window opened on a name nothing serves would sit there
+        // empty.
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut repository = repository_with_console(recorded.clone());
+        let mapping = mapping(NetworkMode::None);
+
+        let error = repository
+            .open_console_in_state(&mapping, Some(HcsSystemState::Stopped))
+            .expect_err("a stopped VM has no COM1 port");
+
+        assert!(error.to_string().contains("stopped"), "{error}");
+        assert!(error.to_string().contains("start it first"), "{error}");
+        assert!(recorded.lock().unwrap().is_empty(), "nothing was launched");
+        assert!(!repository.com1_sessions.contains(mapping.vm_id));
+    }
+
+    #[test]
+    fn a_console_is_opened_appending_to_the_log_of_the_boot_it_joins() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut repository = repository_with_console(recorded.clone());
+        let mapping = mapping(NetworkMode::None);
+
+        repository
+            .open_console_in_state(&mapping, Some(HcsSystemState::Running))
+            .expect("a running VM has a pipe to read");
+
+        let commands = recorded.lock().unwrap().clone();
+        assert_eq!(commands.len(), 1);
+        assert!(
+            commands[0].contains("--mode append"),
+            "the boost that is already running keeps its log: {}",
+            commands[0]
+        );
+        assert!(commands[0].contains("--vm-name dev"), "{}", commands[0]);
+        assert!(repository.com1_sessions.contains(mapping.vm_id));
+    }
+
+    #[test]
+    fn a_second_console_for_the_same_vm_is_refused_rather_than_opened() {
+        // Two readers on one pipe split the guest's output between two windows
+        // and neither shows all of it.
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut repository = repository_with_console(recorded.clone());
+        let mapping = mapping(NetworkMode::None);
+        repository
+            .open_console_in_state(&mapping, Some(HcsSystemState::Running))
+            .expect("the first console opens");
+
+        let error = repository
+            .open_console_in_state(&mapping, Some(HcsSystemState::Running))
+            .expect_err("the second is refused");
+
+        assert!(error.to_string().contains("already has a COM1 console"));
+        assert_eq!(
+            recorded.lock().unwrap().len(),
+            1,
+            "the refusal opened no second window"
+        );
+        assert!(repository.com1_sessions.contains(mapping.vm_id));
+    }
+
+    #[test]
+    fn a_console_whose_window_was_closed_can_be_opened_again() {
+        // This is what the action exists for: the reader that is over is
+        // forgotten, and the VM gets its console back.
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut repository = repository_with_console(recorded.clone());
+        let mapping = mapping(NetworkMode::None);
+        repository
+            .open_console_in_state(&mapping, Some(HcsSystemState::Running))
+            .expect("the first console opens");
+        repository.com1_sessions.finish_for_test(mapping.vm_id);
+
+        repository
+            .open_console_in_state(&mapping, Some(HcsSystemState::Running))
+            .expect("a closed console reopens");
+
+        assert_eq!(recorded.lock().unwrap().len(), 2);
+        assert!(repository.com1_sessions.contains(mapping.vm_id));
+    }
+
     #[test]
     fn a_failed_finished_reader_becomes_a_repository_diagnostic() {
         let recorded = Arc::new(Mutex::new(Vec::new()));
@@ -1457,6 +1647,7 @@ mod tests {
         assert_not_initialized(repository.update_vm(update_request()));
         assert_not_initialized(repository.delete_vm(delete_request()));
         assert_not_initialized(repository.list_vms().map(|_| ()));
+        assert_not_initialized(repository.open_console("dev"));
     }
 
     #[test]

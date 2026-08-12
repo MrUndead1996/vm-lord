@@ -49,6 +49,8 @@ pub enum VmAction {
     CancelCreate,
     Connect,
     Ssh,
+    /// Reopen the serial console of a running VM.
+    Console,
     Edit,
     Delete,
 }
@@ -63,6 +65,7 @@ impl VmAction {
             Self::CancelCreate => "Cancel creation",
             Self::Connect => "Connect",
             Self::Ssh => "SSH",
+            Self::Console => "Open COM port",
             Self::Edit => "Edit",
             Self::Delete => "Delete",
         }
@@ -482,6 +485,33 @@ impl WorkspaceApp {
         }
     }
 
+    /// Reopens the serial console of a running VM.
+    ///
+    /// The console opens by itself when a VM starts; this is how it comes back
+    /// once its window has been closed, which is the only way into a guest
+    /// that cannot be reached over the network.
+    pub fn open_console(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.require_ready_backend("opening the COM port")?;
+
+        match self.repository.open_console(name) {
+            Ok(()) => {
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Info,
+                    message: format!("COM port console for VM \"{name}\" opened"),
+                });
+                Ok(())
+            }
+            Err(error) => {
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Error,
+                    message: format!("Failed to open the COM port of VM \"{name}\": {error}"),
+                });
+                self.collect_diagnostics();
+                Err(error)
+            }
+        }
+    }
+
     #[must_use]
     pub fn status(&self) -> &BackendStatus {
         &self.status
@@ -707,6 +737,16 @@ mod tests {
             Ok(())
         }
 
+        fn open_console(&mut self, name: &str) -> Result<(), RepositoryError> {
+            self.actions.push(format!("console:{name}"));
+            if !self.vm_is_running {
+                return Err(RepositoryError::new(format!(
+                    "VM \"{name}\" is stopped, so it has no COM1 port to open"
+                )));
+            }
+            Ok(())
+        }
+
         fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
             vec![Diagnostic {
                 level: DiagnosticLevel::Info,
@@ -892,6 +932,48 @@ mod tests {
             app.diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic.message == "SSH session for VM \"dev\" started")
+        );
+    }
+
+    #[test]
+    fn opens_the_com_port_through_the_repository() {
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            should_fail: false,
+            create_should_fail: false,
+            vm_is_running: true,
+            actions: Vec::new(),
+        }));
+        app.start();
+
+        app.open_console("dev").unwrap();
+
+        assert!(
+            app.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message == "COM port console for VM \"dev\" opened")
+        );
+    }
+
+    /// A refusal -- a stopped VM, or a console that is already open -- is the
+    /// backend's message to pass on, not one to invent here.
+    #[test]
+    fn a_refused_com_port_is_reported_with_the_reason() {
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            should_fail: false,
+            create_should_fail: false,
+            vm_is_running: false,
+            actions: Vec::new(),
+        }));
+        app.start();
+
+        app.open_console("dev").unwrap_err();
+
+        assert!(
+            app.diagnostics().iter().any(|diagnostic| diagnostic.message
+                == "Failed to open the COM port of VM \"dev\": VM \"dev\" is stopped, \
+                    so it has no COM1 port to open"),
+            "{:?}",
+            app.diagnostics()
         );
     }
 

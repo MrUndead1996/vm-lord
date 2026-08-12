@@ -354,7 +354,8 @@ impl eframe::App for VmlordUi {
                 | VmAction::ForceStop
                 | VmAction::CancelCreate
                 | VmAction::Connect
-                | VmAction::Ssh => {
+                | VmAction::Ssh
+                | VmAction::Console => {
                     if let Some(name) = self.selected_vm_name.clone() {
                         let result = match action {
                             VmAction::Start => self.application.start_vm(&name),
@@ -363,6 +364,7 @@ impl eframe::App for VmlordUi {
                             VmAction::CancelCreate => self.application.cancel_create(&name),
                             VmAction::Connect => self.application.connect_display(&name),
                             VmAction::Ssh => self.application.open_ssh(&name),
+                            VmAction::Console => self.application.open_console(&name),
                             _ => unreachable!("only supported VM actions reach this branch"),
                         };
                         if result.is_ok() {
@@ -1315,6 +1317,16 @@ fn render_selected_vm(
         ) {
             action = Some(clicked_action);
         }
+        // The way in when nothing else works: the console needs no network, no
+        // address and no sshd, only a running compute system to own the pipe.
+        if let Some(clicked_action) = render_action_group(
+            ui,
+            &[(VmAction::Console, "Open COM port")],
+            is_running,
+            Some("Available only when the VM is running"),
+        ) {
+            action = Some(clicked_action);
+        }
         ui.separator();
         // The only thing that can be done to a VM while it is being built, and
         // the only time it can be done: the build rolls itself back and the
@@ -1546,6 +1558,18 @@ fn render_action_icon(ui: &mut egui::Ui, action: VmAction, enabled: bool) -> egu
                 stroke,
             );
         }
+        VmAction::Console => {
+            // The D-sub connector on the back of a machine: what COM1 looks
+            // like to the person who needs it.
+            let shell = egui::Rect::from_center_size(center, egui::vec2(15.0, 9.0));
+            painter.rect_stroke(shell, 4.0, stroke, egui::StrokeKind::Inside);
+            for offset in [-4.0_f32, 0.0, 4.0] {
+                painter.circle_filled(egui::pos2(center.x + offset, center.y - 1.6), 1.0, color);
+            }
+            for offset in [-2.0_f32, 2.0] {
+                painter.circle_filled(egui::pos2(center.x + offset, center.y + 1.8), 1.0, color);
+            }
+        }
         VmAction::Edit => {
             painter.line_segment(
                 [
@@ -1594,7 +1618,9 @@ fn action_color(action: VmAction) -> egui::Color32 {
         VmAction::Stop => egui::Color32::from_rgb(235, 210, 64),
         VmAction::ForceStop => egui::Color32::from_rgb(225, 70, 70),
         VmAction::CancelCreate => egui::Color32::from_rgb(235, 170, 64),
-        VmAction::Connect | VmAction::Ssh => egui::Color32::from_rgb(85, 193, 233),
+        VmAction::Connect | VmAction::Ssh | VmAction::Console => {
+            egui::Color32::from_rgb(85, 193, 233)
+        }
         VmAction::Edit => egui::Color32::from_rgb(235, 134, 58),
         VmAction::Delete => egui::Color32::LIGHT_GRAY,
     }

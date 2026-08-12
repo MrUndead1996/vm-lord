@@ -9,8 +9,8 @@
 use std::{
     ffi::{OsStr, OsString},
     fs::{File, OpenOptions},
-    io::{self, Write},
-    path::PathBuf,
+    io::{self, Read, Seek, SeekFrom, Write},
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -54,6 +54,15 @@ const CONNECT_POLL: Duration = Duration::from_millis(250);
 /// How much guest output one read may return.
 const READ_BUFFER_BYTES: usize = 4096;
 
+/// How much of `com1.log` a reopened console shows before the live stream.
+///
+/// A window opened onto a running guest is otherwise empty until the guest
+/// prints its next byte, and a guest sitting at `login:` prints nothing at all:
+/// the prompt was written once, minutes ago. Enough to carry the end of the
+/// boot and the prompt, and not so much that reopening a console scrolls a
+/// whole boot past the reader.
+const REPLAY_TAIL_BYTES: usize = 64 * 1024;
+
 /// The access the helper asks the COM1 pipe for.
 ///
 /// Both directions: HCS serves the pipe duplex, and the same handle carries the
@@ -80,12 +89,15 @@ pub struct Com1HelperOptions {
     pub ready_event_name: String,
     pub failed_event_name: String,
     pub finished_event_name: String,
+    /// The event this process creates and holds, so that VMLord can tell a
+    /// reader that is still running from one whose window was closed.
+    pub alive_event_name: String,
     pub vm_name: String,
 }
 
 /// The flags [`parse_com1_helper_args`] accepts, in the order the launcher
 /// writes them.
-const FLAGS: [&str; 9] = [
+const FLAGS: [&str; 10] = [
     "--pipe",
     "--log",
     "--mode",
@@ -94,6 +106,7 @@ const FLAGS: [&str; 9] = [
     "--ready-event",
     "--failed-event",
     "--finished-event",
+    "--alive-event",
     "--vm-name",
 ];
 
@@ -159,6 +172,7 @@ pub fn parse_com1_helper_args(
         ready_event_name: name()?,
         failed_event_name: name()?,
         finished_event_name: name()?,
+        alive_event_name: name()?,
         vm_name: name()?,
     })
 }
@@ -188,6 +202,12 @@ pub fn run_com1_helper(options: Com1HelperOptions) -> Result<(), RepositoryError
     let ready = WindowsEvent::open(&options.ready_event_name)?;
     let failed = WindowsEvent::open(&options.failed_event_name)?;
     let finished = WindowsEvent::open(&options.finished_event_name)?;
+    // Created here rather than by VMLord, and held for as long as this process
+    // lives: a named object exists while a handle to it does, so VMLord probing
+    // this name is asking whether this process is still there. That is the only
+    // question `finished` cannot answer -- a window a person closes takes the
+    // helper down with no chance to signal anything.
+    let _alive = WindowsEvent::create_named(&options.alive_event_name, true, false)?;
     // Whatever happens below -- success, error, or a panic unwinding through
     // it -- VMLord learns that this reader is over.
     let _finish = SignalOnDrop(&finished);
@@ -224,6 +244,9 @@ fn capture(
     // Only now: a start that hears "ready" must know the log is open and the
     // helper is able to notice cancellation.
     ready.signal()?;
+    // Before the pipe, not after: the point of the replay is that the window
+    // has something in it while the connection is still being made.
+    replay_tail(options);
     log::debug!(
         "COM1 reader for VM \"{}\" is waiting for {}",
         options.vm_name,
@@ -538,6 +561,189 @@ impl Drop for SignalOnDrop<'_> {
     }
 }
 
+/// Shows the end of `com1.log` in the window before the live stream starts.
+///
+/// Only for a console that is joining a boot already in progress. A truncating
+/// start has no history by definition -- it is about to throw the previous
+/// boot's away -- and the guest is about to print this one from its first line.
+///
+/// Nothing here can fail the capture: the reason this window exists is the
+/// bytes the guest is about to write, not the ones it already has.
+fn replay_tail(options: &Com1HelperOptions) {
+    if options.log_mode != Com1LogMode::Append {
+        return;
+    }
+    let history = match read_tail(&options.log_path, REPLAY_TAIL_BYTES) {
+        Ok(history) => history,
+        Err(error) => {
+            log::warn!(
+                "the COM1 console of VM \"{}\" opens without history: {} could not be read: \
+                 {error}",
+                options.vm_name,
+                options.log_path.display()
+            );
+            return;
+        }
+    };
+    let tail = without_terminal_queries(tail_from(&history, REPLAY_TAIL_BYTES));
+    if tail.is_empty() {
+        return;
+    }
+
+    let mut stdout = io::stdout().lock();
+    // The banner is written to the window and never to the log: it says where
+    // the record ends and the live guest begins, and it is not something the
+    // guest said.
+    let banner = format!(
+        "--- VMLord: {} earlier byte(s) from {}; live output follows ---\r\n",
+        tail.len(),
+        options.log_path.display()
+    );
+    // Bytes unchanged, as everywhere else in this reader: what is replayed is
+    // what the guest wrote, including its control characters.
+    if let Err(error) = stdout
+        .write_all(banner.as_bytes())
+        .and_then(|()| stdout.write_all(&tail))
+        .and_then(|()| stdout.flush())
+    {
+        log::warn!(
+            "could not replay the COM1 history of VM \"{}\": {error}",
+            options.vm_name
+        );
+        return;
+    }
+    log::debug!(
+        "the COM1 console of VM \"{}\" opened with {} byte(s) of history",
+        options.vm_name,
+        tail.len()
+    );
+}
+
+/// Drops the sequences that ask the terminal a question.
+///
+/// Replaying history is not the same as receiving it. A boot log carries the
+/// probes the guest's own tools made -- `ESC[6n` to find out where the cursor
+/// is, `ESC[c` to ask what the terminal is -- and a terminal answers those on
+/// its *input*, which for this window is the helper's stdin, which goes
+/// straight into the guest's tty. Replayed unfiltered, the history makes the
+/// terminal type `^[[30;1R` at the login prompt of a guest that asked nothing.
+///
+/// Only the replay is filtered. A live guest that asks gets its answer: it did
+/// ask, and that is what a serial terminal is for.
+///
+/// Everything that merely paints -- colours, cursor movement, erasures -- is
+/// kept, because history that has lost its formatting is history that is hard
+/// to read.
+fn without_terminal_queries(history: &[u8]) -> Vec<u8> {
+    const ESCAPE: u8 = 0x1b;
+    const BELL: u8 = 0x07;
+
+    let mut kept = Vec::with_capacity(history.len());
+    let mut rest = history;
+    while let Some(start) = rest.iter().position(|byte| *byte == ESCAPE) {
+        kept.extend_from_slice(&rest[..start]);
+        let sequence = &rest[start..];
+        let Some((length, answers)) = measure_escape(sequence, ESCAPE, BELL) else {
+            // The log ends in the middle of a sequence: dropping it is what
+            // keeps the terminal from applying it to the live output that
+            // follows, which arrives from a different moment entirely.
+            return kept;
+        };
+        if !answers {
+            kept.extend_from_slice(&sequence[..length]);
+        }
+        rest = &sequence[length..];
+    }
+    kept.extend_from_slice(rest);
+    kept
+}
+
+/// How long the escape sequence at the start of `bytes` is, and whether a
+/// terminal answers it.
+///
+/// `None` means the sequence is unfinished, which at the end of a log means it
+/// was cut off rather than that more is coming.
+fn measure_escape(bytes: &[u8], escape: u8, bell: u8) -> Option<(usize, bool)> {
+    match bytes.get(1)? {
+        // CSI: parameters and intermediates, then one final byte that says what
+        // it was. `n` is a status report and `c` is a device attributes
+        // request; both are questions.
+        b'[' => {
+            let final_byte = bytes
+                .iter()
+                .enumerate()
+                .skip(2)
+                .find(|(_, byte)| (0x40..=0x7e).contains(*byte))?;
+            let (index, byte) = final_byte;
+            Some((index + 1, matches!(byte, b'n' | b'c')))
+        }
+        // OSC: ends at a bell or a string terminator. A `?` in one is a query
+        // -- "what is your background colour" and its like.
+        b']' => {
+            let end = terminated_string(bytes, escape, bell)?;
+            Some((end, bytes[..end].contains(&b'?')))
+        }
+        // DCS: nothing in a boot log needs one, and the ones that exist are
+        // requests for the terminal's settings.
+        b'P' => Some((terminated_string(bytes, escape, bell)?, true)),
+        // The obsolete "identify terminal", answered like a device attributes
+        // request.
+        b'Z' => Some((2, true)),
+        // Everything else is two bytes and paints something.
+        _ => Some((2, false)),
+    }
+}
+
+/// Where the string-terminated sequence at the start of `bytes` ends.
+fn terminated_string(bytes: &[u8], escape: u8, bell: u8) -> Option<usize> {
+    let mut index = 2;
+    while index < bytes.len() {
+        if bytes[index] == bell {
+            return Some(index + 1);
+        }
+        if bytes[index] == escape && bytes.get(index + 1) == Some(&b'\\') {
+            return Some(index + 2);
+        }
+        index += 1;
+    }
+    None
+}
+
+/// Reads at most the last `limit` bytes of a file, and one more.
+///
+/// The extra byte is what tells a whole short log from a long one cut down to
+/// size: with it, [`tail_from`] can see that it is holding a window rather than
+/// a file, and trim the half line at its top.
+fn read_tail(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    let from = length.saturating_sub(limit as u64 + 1);
+    if from > 0 {
+        file.seek(SeekFrom::Start(from))?;
+    }
+    let mut window = Vec::new();
+    file.read_to_end(&mut window)?;
+    Ok(window)
+}
+
+/// The last `limit` bytes of `history`, starting at a line boundary.
+///
+/// Cutting a line in half would put half a message at the top of the window and
+/// leave any escape sequence it was in the middle of unterminated, which the
+/// terminal would then apply to everything after it.
+fn tail_from(history: &[u8], limit: usize) -> &[u8] {
+    if history.len() <= limit {
+        return history;
+    }
+    let window = &history[history.len() - limit..];
+    match window.iter().position(|byte| *byte == b'\n') {
+        Some(newline) => &window[newline + 1..],
+        // A window with no line break at all is one long line; showing it from
+        // where it happens to start is better than showing nothing.
+        None => window,
+    }
+}
+
 /// Opens `com1.log` the way `mode` asks for.
 fn open_log(options: &Com1HelperOptions) -> Result<File, RepositoryError> {
     let mut open = OpenOptions::new();
@@ -568,7 +774,10 @@ mod tests {
         core::Error,
     };
 
-    use super::{Com1LogMode, PIPE_ACCESS, is_end_of_stream, mirror_chunk, parse_com1_helper_args};
+    use super::{
+        Com1LogMode, PIPE_ACCESS, REPLAY_TAIL_BYTES, is_end_of_stream, mirror_chunk,
+        parse_com1_helper_args, read_tail, tail_from, without_terminal_queries,
+    };
 
     fn arguments() -> Vec<OsString> {
         [
@@ -588,6 +797,8 @@ mod tests {
             r"Local\VMLord.Com1.failed.test",
             "--finished-event",
             r"Local\VMLord.Com1.finished.test",
+            "--alive-event",
+            r"Local\VMLord.Com1.alive.test",
             "--vm-name",
             "dev",
         ]
@@ -705,5 +916,147 @@ mod tests {
 
         assert_eq!(log, bytes);
         assert_eq!(terminal, bytes);
+    }
+
+    /// What a reopened console shows: a guest sitting at `login:` printed that
+    /// prompt once, minutes ago, and will not print it again unaided. Without
+    /// the replay the window is empty and the VM looks dead.
+    #[test]
+    fn a_history_shorter_than_the_limit_is_replayed_whole() {
+        let history = b"[  OK  ] Reached target Multi-User System.\r\ntest login: ";
+
+        assert_eq!(tail_from(history, REPLAY_TAIL_BYTES), history);
+    }
+
+    #[test]
+    fn a_long_history_is_cut_back_to_a_line_boundary() {
+        let history = b"first line\nsecond line\nthird line\n";
+
+        // A limit that lands inside "second line" must not put half of it at
+        // the top of the window.
+        assert_eq!(tail_from(history, 20), b"third line\n");
+    }
+
+    #[test]
+    fn one_long_line_is_shown_rather_than_nothing() {
+        let history = b"aaaaaaaaaaaaaaaaaaaa";
+
+        assert_eq!(tail_from(history, 5), b"aaaaa");
+    }
+
+    #[test]
+    fn an_empty_log_replays_nothing() {
+        assert!(tail_from(b"", REPLAY_TAIL_BYTES).is_empty());
+    }
+
+    /// The read has to be a seek rather than a load: a `com1.log` is the whole
+    /// output of a boot, and only its end is worth showing.
+    #[test]
+    fn only_the_end_of_a_long_log_is_read_and_it_starts_on_a_line() {
+        let path = std::env::temp_dir().join(format!("vmlord-com1-tail-{}", std::process::id()));
+        let mut written = Vec::new();
+        for line in 0..500 {
+            written.extend_from_slice(format!("line {line} of an old boot\r\n").as_bytes());
+        }
+        written.extend_from_slice(b"test login: ");
+        std::fs::write(&path, &written).unwrap();
+
+        let window = read_tail(&path, 200).unwrap();
+        let tail = tail_from(&window, 200);
+
+        let _ = std::fs::remove_file(&path);
+        assert!(window.len() <= 201, "read {} bytes", window.len());
+        assert!(
+            tail.ends_with(b"test login: "),
+            "the prompt a person reopened the console for must be there: {}",
+            String::from_utf8_lossy(tail)
+        );
+        assert!(
+            tail.starts_with(b"line "),
+            "the window must open on a whole line: {}",
+            String::from_utf8_lossy(tail)
+        );
+    }
+
+    #[test]
+    fn a_log_shorter_than_the_window_is_read_whole() {
+        let path =
+            std::env::temp_dir().join(format!("vmlord-com1-tail-short-{}", std::process::id()));
+        std::fs::write(&path, b"test login: ").unwrap();
+
+        let window = read_tail(&path, REPLAY_TAIL_BYTES).unwrap();
+
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(tail_from(&window, REPLAY_TAIL_BYTES), b"test login: ");
+    }
+
+    /// The bug this covers, seen at a login prompt: the replayed history
+    /// carried the cursor-position query some tool made during the boot, the
+    /// terminal answered it on the helper's stdin, and the answer was typed
+    /// into the guest as `^[[30;1R`.
+    #[test]
+    fn a_replayed_cursor_query_is_not_asked_again() {
+        let history = b"\x1b[999;999H\x1b[6ntest login: ";
+
+        let replayed = without_terminal_queries(history);
+
+        assert_eq!(replayed, b"\x1b[999;999Htest login: ");
+    }
+
+    #[test]
+    fn a_replayed_device_attributes_request_is_dropped_in_every_spelling() {
+        for query in [
+            &b"\x1b[c"[..],
+            b"\x1b[>c",
+            b"\x1b[=0c",
+            b"\x1b[?6n",
+            b"\x1bZ",
+        ] {
+            let mut history = b"before".to_vec();
+            history.extend_from_slice(query);
+            history.extend_from_slice(b"after");
+
+            assert_eq!(
+                without_terminal_queries(&history),
+                b"beforeafter",
+                "{query:?} is a question the terminal answers"
+            );
+        }
+    }
+
+    /// History that has lost its formatting is history that is hard to read:
+    /// only the questions go.
+    #[test]
+    fn replayed_colour_and_movement_survive() {
+        let history = b"\x1b[32m[  OK  ]\x1b[0m Reached target\r\n\x1b[?25htest login: ";
+
+        assert_eq!(without_terminal_queries(history), history);
+    }
+
+    #[test]
+    fn a_replayed_window_title_survives_but_a_colour_question_does_not() {
+        let title = b"\x1b]0;a title\x07";
+        let query = b"\x1b]11;?\x1b\\";
+        let mut history = title.to_vec();
+        history.extend_from_slice(query);
+
+        assert_eq!(without_terminal_queries(&history), title);
+    }
+
+    /// A log can end anywhere, including inside a sequence. Passing half of one
+    /// on would leave the terminal applying it to the live output that follows.
+    #[test]
+    fn an_unfinished_sequence_at_the_end_is_dropped() {
+        assert_eq!(
+            without_terminal_queries(b"test login: \x1b[3"),
+            b"test login: "
+        );
+    }
+
+    #[test]
+    fn plain_history_is_replayed_unchanged() {
+        let history = b"Ubuntu 26.04 LTS test ttyS0\r\n\r\ntest login: ";
+
+        assert_eq!(without_terminal_queries(history), history);
     }
 }

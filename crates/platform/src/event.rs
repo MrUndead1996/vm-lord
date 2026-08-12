@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use windows::{
     Win32::{
-        Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        Foundation::{
+            CloseHandle, ERROR_FILE_NOT_FOUND, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        },
         System::Threading::{
             CreateEventW, EVENT_MODIFY_STATE, OpenEventW, SYNCHRONIZATION_SYNCHRONIZE, SetEvent,
             WaitForSingleObject,
@@ -80,6 +82,29 @@ impl WindowsEvent {
         }
         .map_err(|error| windows_error("open named event", None, error))?;
         Ok(Self(handle))
+    }
+
+    /// Whether an event exists under `name` right now.
+    ///
+    /// A named kernel object lives exactly as long as some handle to it does,
+    /// so an event only one process holds answers whether that process is still
+    /// there -- including when it was killed and had no chance to say anything.
+    /// The handle this opens is closed again immediately: holding one would
+    /// keep the object alive and make the answer always "yes".
+    pub fn exists(name: &str) -> Result<bool, vmlord_core::RepositoryError> {
+        let name = HSTRING::from(name);
+        // SAFETY: `name` outlives the call, and the handle the call may return
+        // is closed here rather than escaping.
+        match unsafe { OpenEventW(SYNCHRONIZATION_SYNCHRONIZE, false, &name) } {
+            Ok(handle) => {
+                // SAFETY: the handle was just opened by this call and is owned
+                // by nothing else.
+                let _ = unsafe { CloseHandle(handle) };
+                Ok(true)
+            }
+            Err(error) if error.code() == ERROR_FILE_NOT_FOUND.to_hresult() => Ok(false),
+            Err(error) => Err(windows_error("open named event", None, error)),
+        }
     }
 
     /// Signals the event.

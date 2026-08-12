@@ -2126,3 +2126,95 @@ fn a_guest_can_be_logged_into_over_com1() {
 
     result.expect("a guest should accept a login typed into COM1");
 }
+
+/// Exercises TASK-69's reopening of the COM port against a real compute
+/// system: a running VM refuses a second console, and a stopped one refuses
+/// any.
+///
+/// The case the action exists for -- a window that a person closed, reopened
+/// from the list -- cannot be asserted from here: closing the terminal is what
+/// ends the session, and no test can close a window a person opened. That half
+/// stays a manual check. What is checked here is everything the button must
+/// not do: open a second reader on the one pipe HCS serves, or a window on a
+/// VM whose compute system no longer exists.
+///
+/// A boot is enough, so installer media does: set `VMLORD_TEST_IMAGE_PATH` to
+/// a real bootable ISO.
+///
+/// Run elevated with:
+/// `cargo test -p vmlord-platform --test hyperv -- --ignored --exact the_com_port_of_a_running_vm_is_opened_once --nocapture`
+#[test]
+#[ignore = "requires an elevated Windows host with Hyper-V/HCS and VMLORD_TEST_IMAGE_PATH set"]
+fn the_com_port_of_a_running_vm_is_opened_once() {
+    let image_path = std::env::var("VMLORD_TEST_IMAGE_PATH")
+        .expect("VMLORD_TEST_IMAGE_PATH must point to a real ISO image");
+    let root = std::env::temp_dir().join(format!("vmlord-com1-reopen-{}", std::process::id()));
+    fs::create_dir_all(&root).expect("test root should be created");
+    let vm_name = format!("vmlord-e2e-com1-open-{}", std::process::id());
+
+    let mut repository = HcsVmRepository::new(&root, no_cloud_images());
+    repository
+        .initialize()
+        .expect("the native backend should initialize on a Hyper-V host");
+    repository
+        .create_vm(VmCreateRequest {
+            name: vm_name.clone(),
+            source: VmSource::LocalMedia { path: image_path },
+            ram_mb: 2048,
+            disk_gb: 8,
+            cpu_cores: 2,
+            gpu_mode: GpuMode::None,
+            network_mode: NetworkMode::None,
+        })
+        .expect("VM creation should succeed on an elevated Hyper-V host");
+    wait_for_build(&repository, &vm_name).expect("the build should finish");
+
+    let outcome = (|| -> Result<(), String> {
+        // Before the VM runs there is no pipe: HCS creates it with the compute
+        // system.
+        let stopped = repository
+            .open_console(&vm_name)
+            .expect_err("a VM that has never run has no COM port to open");
+        if !stopped.to_string().contains("start it first") {
+            return Err(format!("a stopped VM should say so, got: {stopped}"));
+        }
+
+        repository
+            .start_vm(&vm_name)
+            .map_err(|error| format!("the VM must start: {error}"))?;
+
+        // The start opened one, and HCS serves this pipe to one client.
+        let running = repository
+            .open_console(&vm_name)
+            .expect_err("a VM whose console is open must not get a second one");
+        if !running.to_string().contains("already has a COM1 console") {
+            return Err(format!(
+                "an open console should be reported as open, got: {running}"
+            ));
+        }
+
+        repository
+            .force_stop_vm(&vm_name)
+            .map_err(|error| format!("the VM must stop: {error}"))?;
+
+        // The forced stop cancelled the session with the compute system it read
+        // from, so what is refused now is the VM's state and not its console.
+        let gone = repository
+            .open_console(&vm_name)
+            .expect_err("a stopped VM has no COM port to open");
+        if !gone.to_string().contains("start it first") {
+            return Err(format!("a stopped VM should say so, got: {gone}"));
+        }
+        Ok(())
+    })();
+
+    let _ = repository.force_stop_vm(&vm_name);
+    let _ = repository.delete_vm(VmDeleteRequest {
+        name: vm_name,
+        delete_disks: true,
+    });
+    drop(repository);
+    let _ = fs::remove_dir_all(&root);
+
+    outcome.expect("the COM port of a running VM is opened once and only while it runs");
+}

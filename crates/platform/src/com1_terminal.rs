@@ -2,8 +2,9 @@
 //!
 //! Windows has no one terminal every machine has, so three hosts are tried in
 //! turn. What VMLord keeps afterwards is not a process handle -- the terminal
-//! owns the reader, not this process -- but a [`Com1Session`]: four named
-//! events through which a reader can be told to stop and can say that it has.
+//! owns the reader, not this process -- but a [`Com1Session`]: named events
+//! through which a reader can be told to stop, can say that it has, and can be
+//! found to be gone without having said anything at all.
 
 use std::{
     collections::BTreeMap,
@@ -64,6 +65,8 @@ pub struct Com1Session {
     cancel: WindowsEvent,
     failed: WindowsEvent,
     finished: WindowsEvent,
+    /// How VMLord tells a reader that is still there from one that is not.
+    liveness: Liveness,
     /// Test-only counter of cancellations, so that a test can see the signal a
     /// dropped session sends without a helper process to observe it.
     cancellations: Option<Arc<AtomicUsize>>,
@@ -94,6 +97,36 @@ impl Com1Session {
         self.failed.is_signaled().unwrap_or(false)
     }
 
+    /// Whether the reader is over, however it ended.
+    ///
+    /// `finished` covers every way the helper can leave on its own two feet,
+    /// and nothing else: a person closing the terminal window kills the process
+    /// where it stands, and a killed process signals nothing. What it cannot
+    /// take with it is the named event it created and held, so an event that is
+    /// gone is a reader that is gone.
+    fn has_exited(&self) -> bool {
+        if self.has_finished() {
+            return true;
+        }
+        match &self.liveness {
+            Liveness::Probe(name) => match WindowsEvent::exists(name) {
+                Ok(exists) => !exists,
+                // Unprovable rather than proven: a reader that may still be
+                // reading is left alone, as it was before this could be asked.
+                Err(error) => {
+                    log::warn!(
+                        "could not tell whether the COM1 reader for VM \"{}\" is still \
+                         running: {error}",
+                        self.vm_name
+                    );
+                    false
+                }
+            },
+            #[cfg(test)]
+            Liveness::Held { .. } => false,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn finish_for_test(&self) {
         self.finished.signal().unwrap();
@@ -110,6 +143,19 @@ impl Drop for Com1Session {
     fn drop(&mut self) {
         self.cancel();
     }
+}
+
+/// How VMLord asks whether the helper process is still running.
+#[derive(Debug)]
+enum Liveness {
+    /// The name of the event the helper created and holds. It exists for
+    /// exactly as long as that process does.
+    Probe(String),
+    /// A test's stand-in for a helper that is running: an event this session
+    /// holds itself, so the probe can never find it gone. Held for its
+    /// existence and never read.
+    #[cfg(test)]
+    Held { _event: WindowsEvent },
 }
 
 /// A reader that stopped for a reason worth telling a person about.
@@ -141,7 +187,7 @@ impl Com1Sessions {
         let finished: Vec<Uuid> = self
             .0
             .values()
-            .filter(|session| session.has_finished())
+            .filter(|session| session.has_exited())
             .map(|session| session.vm_id)
             .collect();
 
@@ -170,9 +216,18 @@ impl Com1Sessions {
         self.0.clear();
     }
 
-    #[cfg(test)]
     pub(crate) fn contains(&self, vm_id: Uuid) -> bool {
         self.0.contains_key(&vm_id)
+    }
+
+    /// Stands in for the reader of `vm_id` exiting, as it does when a person
+    /// closes its window.
+    #[cfg(test)]
+    pub(crate) fn finish_for_test(&self, vm_id: Uuid) {
+        self.0
+            .get(&vm_id)
+            .expect("the VM should have a session")
+            .finish_for_test();
     }
 }
 
@@ -240,12 +295,23 @@ impl Com1Launcher {
         let ready = WindowsEvent::create_named(&events.ready, true, false)?;
         let failed = WindowsEvent::create_named(&events.failed, true, false)?;
         let finished = WindowsEvent::create_named(&events.finished, true, false)?;
+        // The alive event is not created here: the helper creates that one, and
+        // a handle held by VMLord would keep it alive past the process it
+        // stands for. In tests nothing starts a helper, so the launcher stands
+        // in for one and holds the event it would have created.
+        #[cfg(not(test))]
+        let liveness = Liveness::Probe(events.alive.clone());
+        #[cfg(test)]
+        let liveness = Liveness::Held {
+            _event: WindowsEvent::create_named(&events.alive, true, false)?,
+        };
         let session = Com1Session {
             vm_id: mapping.vm_id,
             vm_name: mapping.vm_name.clone(),
             cancel,
             failed,
             finished,
+            liveness,
             cancellations: self.cancellations.clone(),
         };
 
@@ -278,6 +344,10 @@ impl Com1Launcher {
             failed: WindowsEvent::new(true, false).expect("an unnamed event can always be created"),
             finished: WindowsEvent::new(true, false)
                 .expect("an unnamed event can always be created"),
+            liveness: Liveness::Held {
+                _event: WindowsEvent::new(true, false)
+                    .expect("an unnamed event can always be created"),
+            },
             cancellations: None,
         }
     }
@@ -375,6 +445,7 @@ struct EventNames {
     ready: String,
     failed: String,
     finished: String,
+    alive: String,
 }
 
 impl EventNames {
@@ -387,6 +458,7 @@ impl EventNames {
             ready: format!("{prefix}.ready"),
             failed: format!("{prefix}.failed"),
             finished: format!("{prefix}.finished"),
+            alive: format!("{prefix}.alive"),
         }
     }
 }
@@ -422,6 +494,8 @@ fn helper_arguments(
         OsString::from(&events.failed),
         OsString::from("--finished-event"),
         OsString::from(&events.finished),
+        OsString::from("--alive-event"),
+        OsString::from(&events.alive),
         OsString::from("--vm-name"),
         OsString::from(&mapping.vm_name),
     ]
@@ -578,9 +652,10 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        Com1Launcher, Com1Sessions, TerminalCommand, cmd_argument, powershell_argument,
-        terminal_commands,
+        Com1Launcher, Com1Session, Com1Sessions, EventNames, Liveness, TerminalCommand,
+        cmd_argument, helper_arguments, powershell_argument, terminal_commands,
     };
+    use crate::event::WindowsEvent;
     use vmlord_core::NetworkMode;
 
     use crate::{Com1LogMode, metadata::VmComputeSystemMapping};
@@ -885,5 +960,91 @@ mod tests {
 
         assert_eq!(cancelled.load(Ordering::Relaxed), 2);
         assert!(sessions.reap().is_empty());
+    }
+
+    /// A session as production builds one: the liveness of its reader is a
+    /// question about a process, asked of an object only that process holds.
+    fn session_probing(name: &str, alive: &str) -> Com1Session {
+        Com1Session {
+            vm_id: mapping(name).vm_id,
+            vm_name: name.to_owned(),
+            cancel: WindowsEvent::new(true, false).unwrap(),
+            failed: WindowsEvent::new(true, false).unwrap(),
+            finished: WindowsEvent::new(true, false).unwrap(),
+            liveness: Liveness::Probe(alive.to_owned()),
+            cancellations: None,
+        }
+    }
+
+    /// The bug this covers: closing the console window kills the helper where
+    /// it stands, so `finished` -- which the helper signals on its way out --
+    /// is never signaled at all, and the session VMLord kept looked alive
+    /// forever. Nothing could reopen that VM's console afterwards.
+    #[test]
+    fn a_reader_whose_process_is_gone_is_reaped_though_it_said_nothing() {
+        let alive = format!(r"Local\VMLord.Test.Alive.{}", Uuid::new_v4());
+        let held = WindowsEvent::create_named(&alive, true, false).unwrap();
+        let mut sessions = Com1Sessions::default();
+        let vm_id = mapping("dev").vm_id;
+        sessions.insert(session_probing("dev", &alive));
+
+        assert!(sessions.reap().is_empty(), "the helper is still running");
+        assert!(sessions.contains(vm_id));
+
+        // What closing the window does to the helper's own event.
+        drop(held);
+
+        assert!(
+            sessions.reap().is_empty(),
+            "a closed window is nobody's failure"
+        );
+        assert!(
+            !sessions.contains(vm_id),
+            "a VM whose console window was closed must be able to get another"
+        );
+    }
+
+    /// A reader that is still there is not reaped just because it has been
+    /// quiet: the guest may print nothing for hours.
+    #[test]
+    fn a_reader_that_is_still_running_survives_a_reap() {
+        let alive = format!(r"Local\VMLord.Test.Alive.{}", Uuid::new_v4());
+        let _held = WindowsEvent::create_named(&alive, true, false).unwrap();
+        let mut sessions = Com1Sessions::default();
+        sessions.insert(session_probing("dev", &alive));
+
+        for _ in 0..3 {
+            assert!(sessions.reap().is_empty());
+        }
+
+        assert!(sessions.contains(mapping("dev").vm_id));
+    }
+
+    /// The helper cannot create the event VMLord probes unless it is told its
+    /// name.
+    #[test]
+    fn the_helper_is_told_the_name_of_the_event_it_must_hold() {
+        let events = EventNames::of(Uuid::from_u128(7));
+        let arguments = helper_arguments(
+            &mapping("dev"),
+            Path::new(r"C:\vms\dev"),
+            Com1LogMode::Append,
+            &events,
+        );
+        let arguments: Vec<String> = arguments
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+
+        let name = arguments
+            .iter()
+            .position(|argument| argument == "--alive-event")
+            .map(|flag| arguments[flag + 1].as_str());
+        assert_eq!(name, Some(events.alive.as_str()), "{arguments:?}");
+        assert!(
+            events.alive.ends_with(".alive") && events.alive.starts_with(r"Local\VMLord.Com1."),
+            "{}",
+            events.alive
+        );
     }
 }
