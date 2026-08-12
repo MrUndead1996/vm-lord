@@ -36,8 +36,12 @@ const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(500);
 /// than a guest boots, and every poll of the address costs an HNS call.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// The port a Linux guest answers SSH on. Fixed, because the seed does not
-/// move it.
+/// The port a Linux guest answers SSH on.
+///
+/// A constant only until #80: since #74 the seed configures whatever port the
+/// VM was created with, and readiness still probes the default one -- so a VM
+/// created on another port is reported ready late, by the timeout, rather than
+/// when its daemon comes up. The value to use is on the VM's own `SshConfig`.
 const SSH_PORT: u16 = 22;
 
 /// Where Windows keeps its OpenSSH client.

@@ -18,7 +18,7 @@
 
 use std::{fs, path::PathBuf, process::Command};
 
-use vmlord_core::SshAccess;
+use vmlord_core::{SshAccess, SshPort, ubuntu};
 use vmlord_seed::{Seed, SeedRequest, build, image};
 
 /// A directory that unmounts and deletes itself however the test ends.
@@ -56,12 +56,15 @@ fn seed() -> Seed {
         username: "dev",
         password_hash: Some("$6$rounds=4096$salt$hash"),
         authorized_key: Some("ssh-ed25519 AAAA vmlord"),
-        ssh: SshAccess::Enabled { deploy_key: true },
+        ssh: SshAccess::Enabled {
+            deploy_key: true,
+            port: SshPort::DEFAULT,
+        },
         locale: "en_US.UTF-8",
         keyboard: "us",
         timezone: "Europe/Moscow",
         admin_group: "sudo",
-        ssh_units: &[],
+        ssh_daemon: &ubuntu().ssh,
     })
 }
 

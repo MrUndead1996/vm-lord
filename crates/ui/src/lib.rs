@@ -10,8 +10,8 @@ use vmlord_app::{BackendStatus, VmAction, WorkspaceApp};
 use vmlord_core::{
     AgentStatus, AppSettings, BuildProgress, BuildStep, CloudImage, DiagnosticLevel, DownloadPhase,
     GpuMode, GuestDefaults, GuestReadinessTimeouts, Language, LogLevel, NetworkMode, Password,
-    Provisioning, SshAccess, VmCreateRequest, VmDeleteRequest, VmSource, VmState, VmSummary,
-    VmUpdateRequest, ubuntu,
+    Provisioning, SshAccess, SshPort, VmCreateRequest, VmDeleteRequest, VmSource, VmState,
+    VmSummary, VmUpdateRequest, ubuntu,
 };
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -107,6 +107,14 @@ struct CreateVmForm {
     password: String,
     ssh_enabled: bool,
     deploy_key: bool,
+    /// The port the guest's SSH daemon is asked to listen on.
+    ///
+    /// A plain `u16` rather than an [`SshPort`]: a field being edited passes
+    /// through values nobody means -- 0 among them, on the way from 22 to 2222
+    /// -- and the domain type exists precisely so that those cannot be spelled.
+    /// It becomes an `SshPort` when the form is submitted, or the submission
+    /// fails.
+    ssh_port: u16,
     locale: String,
     keyboard: String,
     timezone: String,
@@ -222,6 +230,7 @@ impl CreateVmForm {
             password: String::new(),
             ssh_enabled: true,
             deploy_key: true,
+            ssh_port: SshPort::DEFAULT.get(),
             locale: guest_defaults.locale.clone(),
             keyboard: guest_defaults.keyboard.clone(),
             timezone: guest_defaults.timezone.clone(),
@@ -767,6 +776,25 @@ fn render_provisioning_fields(
                         &mut form.deploy_key,
                         "Generate a key pair for this VM and install the public half",
                     );
+                    ui.horizontal(|ui| {
+                        ui.label("Port");
+                        // The range is the domain's own `1..=65535`, and the
+                        // widget clamps to it, so the field cannot be dragged
+                        // to a port nothing can be reached on. A typed 0 is
+                        // still refused on submit -- clamping is the widget's
+                        // courtesy, not the rule.
+                        ui.add(
+                            egui::DragValue::new(&mut form.ssh_port)
+                                .range(1..=u16::MAX)
+                                .speed(1.0),
+                        );
+                    });
+                    if form.ssh_port != SshPort::DEFAULT.get() {
+                        ui.small(
+                            "The port is fixed when the VM is created; \
+                             connections VMLord opens use it automatically.",
+                        );
+                    }
                 });
                 if form.ssh_enabled && form.deploy_key {
                     match ssh_key_path {
@@ -1066,7 +1094,7 @@ fn create_vm_request(
 
     let request = VmCreateRequest {
         name: name.into(),
-        source: create_vm_source(form),
+        source: create_vm_source(form)?,
         ram_mb: form.ram_mb,
         disk_gb: form.disk_gb,
         cpu_cores: form.cpu_cores,
@@ -1078,8 +1106,13 @@ fn create_vm_request(
 }
 
 /// Reads the fields the chosen source has, and only those.
-fn create_vm_source(form: &CreateVmForm) -> VmSource {
-    match form.source_kind {
+///
+/// Fallible because of the port: everything else the form holds is already the
+/// shape the domain wants, while a port is a number that has to become an
+/// [`SshPort`] -- and installation media has no port at all, so the failure
+/// cannot even arise on that branch.
+fn create_vm_source(form: &CreateVmForm) -> Result<VmSource, String> {
+    Ok(match form.source_kind {
         SourceKind::LocalMedia => VmSource::LocalMedia {
             path: form.image_path.trim().into(),
         },
@@ -1097,8 +1130,11 @@ fn create_vm_source(form: &CreateVmForm) -> VmSource {
                 ssh: if form.ssh_enabled {
                     SshAccess::Enabled {
                         deploy_key: form.deploy_key,
+                        port: SshPort::new(form.ssh_port).map_err(|error| error.to_string())?,
                     }
                 } else {
+                    // A guest with no daemon is asked for no port: whatever
+                    // the field happens to hold is not part of the request.
                     SshAccess::Disabled
                 },
                 locale: form.locale.trim().into(),
@@ -1106,7 +1142,7 @@ fn create_vm_source(form: &CreateVmForm) -> VmSource {
                 timezone: form.timezone.trim().into(),
             },
         },
-    }
+    })
 }
 
 /// Names a release the way the distribution does.
@@ -1929,7 +1965,13 @@ mod tests {
             provisioning.password.as_ref().map(Password::as_str),
             Some("hunter2")
         );
-        assert_eq!(provisioning.ssh, SshAccess::Enabled { deploy_key: true });
+        assert_eq!(
+            provisioning.ssh,
+            SshAccess::Enabled {
+                deploy_key: true,
+                port: SshPort::DEFAULT
+            }
+        );
         assert_eq!(provisioning.locale, "ru_RU.UTF-8");
         assert_eq!(provisioning.keyboard, "ru");
         assert_eq!(provisioning.timezone, "Europe/Moscow");
@@ -1975,7 +2017,10 @@ mod tests {
         };
         assert_eq!(
             provisioning_of(&create_vm_request(&key_less, &[]).unwrap()).ssh,
-            SshAccess::Enabled { deploy_key: false }
+            SshAccess::Enabled {
+                deploy_key: false,
+                port: SshPort::DEFAULT
+            }
         );
 
         let no_ssh = CreateVmForm {
@@ -1985,6 +2030,59 @@ mod tests {
         };
         assert_eq!(
             provisioning_of(&create_vm_request(&no_ssh, &[]).unwrap()).ssh,
+            SshAccess::Disabled
+        );
+    }
+
+    /// A new form offers the port a guest normally listens on, and a typed one
+    /// reaches the request unchanged.
+    #[test]
+    fn the_chosen_ssh_port_reaches_the_request() {
+        assert_eq!(cloud_form().ssh_port, 22);
+
+        for port in [1, 22, 2222, 65535] {
+            let form = CreateVmForm {
+                ssh_port: port,
+                ..cloud_form()
+            };
+
+            assert_eq!(
+                provisioning_of(&create_vm_request(&form, &[]).unwrap()).ssh,
+                SshAccess::Enabled {
+                    deploy_key: true,
+                    port: SshPort::new(port).unwrap()
+                }
+            );
+        }
+    }
+
+    /// The widget clamps, but the rule is the domain's: a form that arrived at
+    /// zero some other way is still refused, and with the domain's own words.
+    #[test]
+    fn a_port_nothing_can_be_reached_on_is_refused() {
+        let form = CreateVmForm {
+            ssh_port: 0,
+            ..cloud_form()
+        };
+
+        let error = create_vm_request(&form, &[]).unwrap_err();
+
+        assert!(error.contains("SSH port"), "{error}");
+    }
+
+    /// Turning SSH off leaves the port field on screen holding whatever it held;
+    /// what it holds is then not part of the request, valid or not.
+    #[test]
+    fn a_guest_without_ssh_carries_no_port_whatever_the_field_holds() {
+        let form = CreateVmForm {
+            ssh_enabled: false,
+            ssh_port: 0,
+            password: "hunter2".into(),
+            ..cloud_form()
+        };
+
+        assert_eq!(
+            provisioning_of(&create_vm_request(&form, &[]).unwrap()).ssh,
             SshAccess::Disabled
         );
     }
@@ -2043,6 +2141,9 @@ mod tests {
             source_kind: SourceKind::LocalMedia,
             image_path: " C:\\images\\ubuntu.iso ".into(),
             password: "hunter2".into(),
+            // A port a cloud image would be refused for: installation media
+            // has no SSH controls at all, so it is not even looked at.
+            ssh_port: 0,
             ..cloud_form()
         };
 

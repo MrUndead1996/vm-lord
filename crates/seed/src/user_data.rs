@@ -4,6 +4,8 @@
 //! what it must be is known exactly -- including the `#cloud-config` line, which
 //! is a comment to YAML and the format marker to cloud-init.
 
+use vmlord_core::{SshAccess, SshPort};
+
 use crate::{SeedRequest, scalar};
 
 /// The indentation a block scalar's content sits at inside `write_files`.
@@ -41,13 +43,125 @@ pub(crate) fn render(request: &SeedRequest<'_>) -> String {
     ));
     document.push_str(&format!("locale: {}\n", scalar::yaml(request.locale)));
     document.push_str(&format!("timezone: {}\n", scalar::yaml(request.timezone)));
-    document.push_str(&keyboard_file(request.keyboard));
+    document.push_str(&write_files(request));
     document.push_str("growpart:\n  mode: auto\n  devices: ['/']\nresize_rootfs: true\n");
-    if let Some(command) = disable_ssh(request) {
-        document.push_str(&command);
-    }
+    document.push_str(&runcmd(request));
 
     document
+}
+
+/// Every file the first boot writes, as one `write_files` block.
+///
+/// One block because YAML has one: a second `write_files` key later in the
+/// document would not add to the first, it would replace it.
+fn write_files(request: &SeedRequest<'_>) -> String {
+    let mut files = format!(
+        "write_files:\n{}",
+        file(KEYBOARD_PATH, &keyboard_settings(request.keyboard))
+    );
+
+    if let SshAccess::Enabled { port, .. } = request.ssh {
+        files.push_str(&file(
+            &request.ssh_daemon.config_drop_in,
+            &format!("Port {port}\n"),
+        ));
+        if let Some(path) = &request.ssh_daemon.socket_drop_in {
+            files.push_str(&file(path, &socket_settings(port)));
+        }
+    }
+    files
+}
+
+/// The commands the first boot runs, as one `runcmd` block, or nothing when
+/// there are none.
+///
+/// SSH is the only thing here, and it is one of two opposite jobs: switching
+/// the daemon off, or moving it to the port the VM was created with.
+fn runcmd(request: &SeedRequest<'_>) -> String {
+    let commands = match request.ssh {
+        SshAccess::Disabled => disable_ssh(request),
+        SshAccess::Enabled { .. } => apply_ssh_configuration(request),
+    };
+    if commands.is_empty() {
+        return String::new();
+    }
+
+    let mut block = String::from("runcmd:\n");
+    for command in commands {
+        block.push_str(&format!(
+            "  - [{}]\n",
+            command
+                .iter()
+                .map(|word| scalar::yaml(word))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    block
+}
+
+/// Stops the SSH daemon and keeps it stopped.
+///
+/// The unit names come from the profile rather than from here: Debian-family
+/// systems socket-activate `ssh.socket`, Fedora and SUSE name both `sshd`. A
+/// unit that does not exist on a given release makes `systemctl` return
+/// non-zero, which `runcmd` does not treat as fatal.
+fn disable_ssh(request: &SeedRequest<'_>) -> Vec<Vec<String>> {
+    let units = &request.ssh_daemon.units;
+    if units.is_empty() {
+        return Vec::new();
+    }
+
+    log::debug!("the seed disables the SSH daemon: {}", units.join(", "));
+    let mut command = vec![
+        "systemctl".to_owned(),
+        "disable".to_owned(),
+        "--now".to_owned(),
+    ];
+    command.extend(units.iter().cloned());
+    vec![command]
+}
+
+/// Makes the daemon read the drop-ins `write_files` has just left behind.
+///
+/// `daemon-reload` first, because a socket unit's override is only a file until
+/// systemd has re-read it. Then `try-restart` -- not `restart` -- once per
+/// unit: it restarts a unit that is running and does nothing to one that is
+/// not, which is the whole difference between moving a guest's listener and
+/// creating a second one. Ubuntu 24.04 listens through `ssh.socket` and leaves
+/// `ssh.service` to be activated on demand; 22.04 ships the same socket unit
+/// but does not enable it and runs the service directly. A plain `restart`
+/// would start whichever of the two the release deliberately leaves alone, and
+/// the guest would end up with a socket and a daemon competing for one port.
+///
+/// One command per unit rather than one naming all of them, for the reason
+/// `runcmd` tolerates a failure: a name a release does not have must not take
+/// the other units down with it. The order is the profile's, socket first.
+fn apply_ssh_configuration(request: &SeedRequest<'_>) -> Vec<Vec<String>> {
+    let units = &request.ssh_daemon.units;
+    if units.is_empty() {
+        return Vec::new();
+    }
+
+    let mut commands = vec![vec!["systemctl".to_owned(), "daemon-reload".to_owned()]];
+    commands.extend(units.iter().map(|unit| {
+        vec![
+            "systemctl".to_owned(),
+            "try-restart".to_owned(),
+            unit.to_owned(),
+        ]
+    }));
+    commands
+}
+
+/// The socket unit override that moves the listener.
+///
+/// The empty `ListenStream=` is not a stray line: systemd appends to a list
+/// setting, so without it the socket would listen on the distribution's port
+/// *and* on the chosen one, and the VM would answer where it was not supposed
+/// to.
+fn socket_settings(port: SshPort) -> String {
+    format!("[Socket]\nListenStream=\nListenStream={port}\n")
 }
 
 /// Whether the SSH daemon accepts a password.
@@ -58,58 +172,52 @@ fn password_login_allowed(request: &SeedRequest<'_>) -> bool {
     matches!(request.ssh, vmlord_core::SshAccess::Enabled { .. }) && request.password_hash.is_some()
 }
 
-/// The `runcmd` entry that stops the SSH daemon and keeps it stopped.
-///
-/// The unit names come from the profile rather than from here: Debian-family
-/// systems socket-activate `ssh.socket`, Fedora and SUSE name both `sshd`. A
-/// unit that does not exist on a given release makes `systemctl` return
-/// non-zero, which `runcmd` does not treat as fatal.
-fn disable_ssh(request: &SeedRequest<'_>) -> Option<String> {
-    if request.ssh != vmlord_core::SshAccess::Disabled || request.ssh_units.is_empty() {
-        return None;
-    }
-
-    let units = request
-        .ssh_units
-        .iter()
-        .map(|unit| scalar::yaml(unit))
-        .collect::<Vec<_>>()
-        .join(", ");
-    log::debug!("the seed disables the SSH daemon: {units}");
-    Some(format!(
-        "runcmd:\n  - ['systemctl', 'disable', '--now', {units}]\n"
-    ))
+/// One `write_files` entry: a path, the permissions every file here gets, and
+/// the content as a block scalar.
+fn file(path: &str, content: &str) -> String {
+    let body = content
+        .lines()
+        .map(|line| format!("{FILE_INDENT}{line}\n"))
+        .collect::<String>();
+    format!(
+        "  - path: {}\n    permissions: '0644'\n    content: |\n{body}",
+        scalar::yaml(path)
+    )
 }
 
-/// The `write_files` entry that sets the console keyboard layout.
+/// Where the console keyboard layout is configured.
 ///
-/// `/etc/default/keyboard` is Debian-family: Fedora keeps the same setting in
-/// `/etc/vconsole.conf` under different keys, which is a different mechanism
-/// rather than a different value, so it waits for a second distribution.
+/// Debian-family: Fedora keeps the same setting in `/etc/vconsole.conf` under
+/// different keys, which is a different mechanism rather than a different
+/// value, so it waits for a second distribution.
+const KEYBOARD_PATH: &str = "/etc/default/keyboard";
+
+/// The content of that file.
 ///
 /// The layout is escaped for the shell, not for YAML: this file is read with
 /// `source`, where an unescaped `$` or quote is code.
-fn keyboard_file(layout: &str) -> String {
+fn keyboard_settings(layout: &str) -> String {
     let layout = scalar::shell(layout);
     format!(
-        "write_files:\n  - path: '/etc/default/keyboard'\n    permissions: '0644'\n    content: |\n\
-         {FILE_INDENT}XKBMODEL=\"pc105\"\n\
-         {FILE_INDENT}XKBLAYOUT=\"{layout}\"\n\
-         {FILE_INDENT}XKBVARIANT=\"\"\n\
-         {FILE_INDENT}XKBOPTIONS=\"\"\n\
-         {FILE_INDENT}BACKSPACE=\"guess\"\n"
+        "XKBMODEL=\"pc105\"\n\
+         XKBLAYOUT=\"{layout}\"\n\
+         XKBVARIANT=\"\"\n\
+         XKBOPTIONS=\"\"\n\
+         BACKSPACE=\"guess\"\n"
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::render;
-    use crate::SeedRequest;
+    use crate::{SeedRequest, UBUNTU_SSH};
     use serde_yaml_ng::Value;
-    use vmlord_core::SshAccess;
+    use vmlord_core::{SshAccess, SshDaemon, SshPort};
 
     const HASH: &str = "$6$rounds=4096$salt$hash";
     const KEY: &str = "ssh-ed25519 AAAAC3Nz vmlord";
+    const SSHD_DROP_IN: &str = "/etc/ssh/sshd_config.d/10-vmlord.conf";
+    const SOCKET_DROP_IN: &str = "/etc/systemd/system/ssh.socket.d/10-vmlord.conf";
 
     fn request() -> SeedRequest<'static> {
         SeedRequest {
@@ -118,17 +226,51 @@ mod tests {
             username: "dev",
             password_hash: Some(HASH),
             authorized_key: Some(KEY),
-            ssh: SshAccess::Enabled { deploy_key: true },
+            ssh: SshAccess::Enabled {
+                deploy_key: true,
+                port: SshPort::DEFAULT,
+            },
             locale: "en_US.UTF-8",
             keyboard: "us",
             timezone: "Europe/Moscow",
             admin_group: "sudo",
-            ssh_units: &[],
+            ssh_daemon: &UBUNTU_SSH,
         }
     }
 
     fn parsed(document: &str) -> Value {
         serde_yaml_ng::from_str(document).expect("cloud-init reads this with a YAML parser too")
+    }
+
+    /// The `write_files` entry for a path, whichever position it was written
+    /// at: the order of the files is not what any of these tests are about.
+    fn file(document: &Value, path: &str) -> Value {
+        document["write_files"]
+            .as_sequence()
+            .expect("write_files is a list")
+            .iter()
+            .find(|file| file["path"].as_str() == Some(path))
+            .unwrap_or_else(|| panic!("no file written at {path}"))
+            .clone()
+    }
+
+    fn commands(document: &Value) -> Vec<Vec<String>> {
+        document["runcmd"]
+            .as_sequence()
+            .map(|commands| {
+                commands
+                    .iter()
+                    .map(|command| {
+                        command
+                            .as_sequence()
+                            .expect("a command is a list of words")
+                            .iter()
+                            .map(|word| word.as_str().expect("a word is a string").to_owned())
+                            .collect()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// cloud-init recognises the format by this line, and a YAML parser reads
@@ -179,9 +321,8 @@ mod tests {
             keyboard: "ru",
             ..request()
         }));
-        let file = &document["write_files"][0];
+        let file = file(&document, "/etc/default/keyboard");
 
-        assert_eq!(file["path"], Value::from("/etc/default/keyboard"));
         assert_eq!(file["permissions"], Value::from("0644"));
         assert_eq!(
             file["content"],
@@ -202,7 +343,7 @@ mod tests {
         }));
 
         assert!(
-            document["write_files"][0]["content"]
+            file(&document, "/etc/default/keyboard")["content"]
                 .as_str()
                 .expect("the file content is a string")
                 .contains("XKBLAYOUT=\"us\\$(reboot)\"")
@@ -248,36 +389,116 @@ mod tests {
     /// action: silence would leave the daemon running and the choice void.
     #[test]
     fn ssh_turned_off_disables_the_daemon_named_by_the_profile() {
-        let units = ["ssh.socket".to_string(), "ssh.service".to_string()];
         let document = parsed(&render(&SeedRequest {
             ssh: SshAccess::Disabled,
             authorized_key: None,
-            ssh_units: &units,
             ..request()
         }));
 
         assert_eq!(
-            document["runcmd"][0],
-            Value::from(vec![
-                "systemctl",
-                "disable",
-                "--now",
-                "ssh.socket",
-                "ssh.service"
-            ])
+            commands(&document),
+            [["systemctl", "disable", "--now", "ssh.socket", "ssh.service"]]
         );
         assert_eq!(document["ssh_pwauth"], Value::from(false));
     }
 
+    /// A guest with no daemon has no port to be told about either: the drop-ins
+    /// would configure something that is being switched off.
     #[test]
-    fn ssh_left_on_disables_nothing() {
-        let units = ["ssh.socket".to_string()];
+    fn ssh_turned_off_writes_no_ssh_configuration() {
         let document = parsed(&render(&SeedRequest {
-            ssh_units: &units,
+            ssh: SshAccess::Disabled,
+            authorized_key: None,
+            ..request()
+        }));
+        let paths = document["write_files"]
+            .as_sequence()
+            .expect("write_files is a list")
+            .iter()
+            .map(|file| file["path"].as_str().unwrap_or_default().to_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, ["/etc/default/keyboard"]);
+    }
+
+    /// The port a VM was created with is the port its guest has to answer on --
+    /// including the default one, which is written rather than assumed: an
+    /// image whose own configuration says something else would otherwise win.
+    #[test]
+    fn the_chosen_port_is_written_where_the_daemon_and_the_socket_read_it() {
+        for port in [22, 2222, 65535] {
+            let document = parsed(&render(&SeedRequest {
+                ssh: SshAccess::Enabled {
+                    deploy_key: true,
+                    port: SshPort::new(port).unwrap(),
+                },
+                ..request()
+            }));
+
+            assert_eq!(
+                file(&document, SSHD_DROP_IN)["content"],
+                Value::from(format!("Port {port}\n")),
+                "sshd reads its own configuration"
+            );
+            assert_eq!(
+                file(&document, SOCKET_DROP_IN)["content"],
+                Value::from(format!("[Socket]\nListenStream=\nListenStream={port}\n")),
+                "the empty entry clears the port the unit already listens on"
+            );
+            assert_eq!(
+                file(&document, SSHD_DROP_IN)["permissions"],
+                Value::from("0644")
+            );
+        }
+    }
+
+    /// A file written into `/etc` changes nothing until systemd has read it and
+    /// the daemon has been restarted -- and the socket goes first, because it
+    /// owns the listening port. `try-restart` leaves a unit the release keeps
+    /// stopped alone, so the guest never ends up with two listeners.
+    #[test]
+    fn the_daemon_is_reloaded_and_restarted_so_the_port_takes_effect() {
+        let document = parsed(&render(&request()));
+
+        assert_eq!(
+            commands(&document),
+            [
+                vec!["systemctl", "daemon-reload"],
+                vec!["systemctl", "try-restart", "ssh.socket"],
+                vec!["systemctl", "try-restart", "ssh.service"],
+            ]
+        );
+    }
+
+    /// A distribution whose daemon opens its own port names no socket unit, and
+    /// then there is nothing to override.
+    #[test]
+    fn a_profile_without_socket_activation_gets_no_socket_drop_in() {
+        let daemon = SshDaemon {
+            units: vec!["sshd.service".into()],
+            config_drop_in: "/etc/ssh/sshd_config.d/10-vmlord.conf".into(),
+            socket_drop_in: None,
+        };
+        let document = parsed(&render(&SeedRequest {
+            ssh_daemon: &daemon,
             ..request()
         }));
 
-        assert_eq!(document.get("runcmd"), None);
+        assert_eq!(
+            document["write_files"]
+                .as_sequence()
+                .expect("write_files is a list")
+                .len(),
+            2,
+            "the keyboard file and the daemon's own drop-in, and nothing else"
+        );
+        assert_eq!(
+            commands(&document),
+            [
+                vec!["systemctl", "daemon-reload"],
+                vec!["systemctl", "try-restart", "sshd.service"],
+            ]
+        );
     }
 
     /// The plaintext password never reaches this crate, and the private key is

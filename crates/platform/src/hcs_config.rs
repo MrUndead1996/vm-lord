@@ -476,8 +476,8 @@ mod tests {
     use serde_json::{Value, json};
     use uuid::Uuid;
     use vmlord_core::{
-        CloudImage, GpuMode, NetworkMode, Password, Provisioning, SshAccess, VmCreateRequest,
-        VmSource, ubuntu,
+        CloudImage, GpuMode, NetworkMode, Password, Provisioning, SshAccess, SshPort,
+        VmCreateRequest, VmSource, ubuntu,
     };
 
     use super::{
@@ -514,7 +514,10 @@ mod tests {
                 provisioning: Provisioning {
                     username: "user".into(),
                     password: Some(Password::new("secret")),
-                    ssh: SshAccess::Enabled { deploy_key: true },
+                    ssh: SshAccess::Enabled {
+                        deploy_key: true,
+                        port: SshPort::DEFAULT,
+                    },
                     locale: "en_US.UTF-8".into(),
                     keyboard: "us".into(),
                     timezone: "Europe/Moscow".into(),

@@ -7,7 +7,7 @@ pub mod provisioning;
 pub mod settings;
 pub mod ssh;
 
-pub use distro::{DistroProfile, ubuntu};
+pub use distro::{DistroProfile, SshDaemon, ubuntu};
 pub use logging::{LoggingError, initialize as initialize_logging};
 pub use progress::{
     BuildMonitor, BuildProgress, BuildStep, DownloadPhase, ProgressPublisher, ProgressThrottle,
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn rejects_provisioning_the_source_refuses() {
-        use super::{CloudImage, Provisioning, SshAccess, distro::ubuntu};
+        use super::{CloudImage, Provisioning, SshAccess, SshPort, distro::ubuntu};
 
         let request = VmCreateRequest {
             source: VmSource::CloudImage {
@@ -298,7 +298,10 @@ mod tests {
                 provisioning: Provisioning {
                     username: "Invalid".into(),
                     password: None,
-                    ssh: SshAccess::Enabled { deploy_key: true },
+                    ssh: SshAccess::Enabled {
+                        deploy_key: true,
+                        port: SshPort::DEFAULT,
+                    },
                     locale: "en_US.UTF-8".into(),
                     keyboard: "us".into(),
                     timezone: "Europe/Moscow".into(),

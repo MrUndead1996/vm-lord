@@ -323,7 +323,7 @@ mod tests {
     use uuid::Uuid;
     use vmlord_core::{
         BuildMonitor, BuildStep, CloudImage, GpuMode, NetworkMode, Provisioning, RepositoryError,
-        SshAccess, VmCreateRequest, VmSource,
+        SshAccess, SshPort, VmCreateRequest, VmSource,
     };
 
     use super::{CycleOutcome, VmBuildCycle};
@@ -358,7 +358,10 @@ mod tests {
                 provisioning: Provisioning {
                     username: "machi".into(),
                     password: None,
-                    ssh: SshAccess::Enabled { deploy_key: true },
+                    ssh: SshAccess::Enabled {
+                        deploy_key: true,
+                        port: SshPort::DEFAULT,
+                    },
                     locale: "en_US.UTF-8".into(),
                     keyboard: "us".into(),
                     timezone: "Europe/Moscow".into(),

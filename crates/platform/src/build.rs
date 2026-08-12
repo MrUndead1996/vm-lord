@@ -312,8 +312,8 @@ mod tests {
     };
 
     use vmlord_core::{
-        BuildStep, CloudImage, GpuMode, NetworkMode, Provisioning, SshAccess, VmCreateRequest,
-        VmSource, VmState,
+        BuildStep, CloudImage, GpuMode, NetworkMode, Provisioning, SshAccess, SshPort,
+        VmCreateRequest, VmSource, VmState,
     };
 
     use uuid::Uuid;
@@ -390,7 +390,10 @@ mod tests {
                 provisioning: Provisioning {
                     username: "dev".into(),
                     password: None,
-                    ssh: SshAccess::Enabled { deploy_key: true },
+                    ssh: SshAccess::Enabled {
+                        deploy_key: true,
+                        port: SshPort::DEFAULT,
+                    },
                     locale: "en_US.UTF-8".into(),
                     keyboard: "us".into(),
                     timezone: "Europe/Moscow".into(),

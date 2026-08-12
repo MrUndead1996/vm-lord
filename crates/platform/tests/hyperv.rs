@@ -77,7 +77,10 @@ fn background_cloud_request(name: &str) -> VmCreateRequest {
             provisioning: vmlord_core::Provisioning {
                 username: "dev".into(),
                 password: None,
-                ssh: vmlord_core::SshAccess::Enabled { deploy_key: true },
+                ssh: vmlord_core::SshAccess::Enabled {
+                    deploy_key: true,
+                    port: vmlord_core::SshPort::DEFAULT,
+                },
                 locale: "en_US.UTF-8".into(),
                 keyboard: "us".into(),
                 timezone: "Europe/Moscow".into(),
@@ -1939,7 +1942,13 @@ fn a_vm_is_created_from_a_real_cloud_image() {
             provisioning: vmlord_core::Provisioning {
                 username: "dev".into(),
                 password: None,
-                ssh: vmlord_core::SshAccess::Enabled { deploy_key: true },
+                // A port nobody would land on by accident: the assertions
+                // below would pass on the default one even if the choice were
+                // dropped somewhere between the form and the seed.
+                ssh: vmlord_core::SshAccess::Enabled {
+                    deploy_key: true,
+                    port: vmlord_core::SshPort::new(2222).expect("2222 is a port"),
+                },
                 locale: "en_US.UTF-8".into(),
                 keyboard: "us".into(),
                 timezone: "Europe/Moscow".into(),
@@ -1980,12 +1989,25 @@ fn a_vm_is_created_from_a_real_cloud_image() {
     }
     let _ = fs::remove_dir_all(&root);
 
-    created.expect("a cloud image should become a VM");
+    let mapping = created.expect("a cloud image should become a VM");
+
+    assert_eq!(
+        mapping.ssh.as_ref().map(|ssh| ssh.port.get()),
+        Some(2222),
+        "the port the VM was created with is what a later connection is told"
+    );
 
     let seed = seed.expect("the seed should be written");
     assert_eq!(&seed[16 * 2048 + 40..16 * 2048 + 46], b"CIDATA");
     let text = String::from_utf8_lossy(&seed);
     assert!(text.contains("user-data") && text.contains("meta-data"));
+    // The same port on the volume the guest actually mounts: this is where the
+    // choice stops being VMLord's own bookkeeping.
+    assert!(text.contains("Port 2222"), "sshd is given the chosen port");
+    assert!(
+        text.contains("ListenStream=2222"),
+        "so is the socket that does the listening"
+    );
 
     let document = document.expect("the configuration should be written and valid JSON");
     assert_eq!(
