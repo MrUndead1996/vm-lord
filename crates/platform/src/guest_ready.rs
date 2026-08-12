@@ -9,7 +9,6 @@
 //! no async runtime.
 
 use std::{
-    ffi::OsString,
     fmt,
     fs::File,
     io::Read,
@@ -20,9 +19,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use vmlord_core::{BuildMonitor, GuestReadinessTimeouts, RepositoryError};
+use uuid::Uuid;
+use vmlord_core::{
+    BuildMonitor, GuestReadinessTimeouts, RepositoryError, SshAuthentication, SshConfig,
+    SshEndpoint, SshPort,
+};
 
-use crate::{hcn_endpoint::HcnEndpoint, layout, metadata::VmComputeSystemMapping};
+use crate::{layout, metadata::VmComputeSystemMapping, ssh, ssh::SshInvocation};
 
 /// Keeps the readiness command from flashing a console window of its own.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -43,9 +46,6 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// created on another port is reported ready late, by the timeout, rather than
 /// when its daemon comes up. The value to use is on the VM's own `SshConfig`.
 const SSH_PORT: u16 = 22;
-
-/// Where Windows keeps its OpenSSH client.
-const SSH_CLIENT_RELATIVE_PATH: &str = r"System32\OpenSSH\ssh.exe";
 
 /// What the guest is asked, once a connection to it is possible.
 ///
@@ -74,8 +74,19 @@ pub(crate) enum GuestReady {
 pub(crate) enum ReadinessFailure {
     NoSshClient,
     NoAddress,
-    Unreachable { last_error: String },
-    CloudInitFailed { detail: String },
+    /// The VM's SSH configuration is not one anything can connect with -- a
+    /// user name that would be read as flags, say. Separate from a guest that
+    /// does not answer: nothing was tried, and nothing will be until the stored
+    /// configuration is fixed.
+    Unusable {
+        detail: String,
+    },
+    Unreachable {
+        last_error: String,
+    },
+    CloudInitFailed {
+        detail: String,
+    },
     TimedOut,
     Cancelled,
 }
@@ -92,6 +103,10 @@ impl fmt::Display for ReadinessFailure {
             Self::NoAddress => write!(
                 formatter,
                 "the VM started but was never given an address on the VMLord network"
+            ),
+            Self::Unusable { detail } => write!(
+                formatter,
+                "the VM's SSH configuration cannot be connected with: {detail}"
             ),
             Self::Unreachable { last_error } => write!(
                 formatter,
@@ -187,7 +202,7 @@ type AddressSource =
 /// failure quotes if the port never opens at all.
 type PortProbe = Box<dyn Fn(IpAddr, Duration) -> Result<(), String> + Send + Sync>;
 type SshRunner = Box<
-    dyn Fn(&SshInvocation, Duration, &BuildMonitor) -> Result<SshRun, RepositoryError>
+    dyn Fn(&ReadinessCommand, Duration, &BuildMonitor) -> Result<SshRun, RepositoryError>
         + Send
         + Sync,
 >;
@@ -217,8 +232,8 @@ impl GuestReadiness {
     pub(crate) fn production(timeouts: ReadinessTimeouts) -> Self {
         Self {
             timeouts,
-            client: ssh_client_path(),
-            address: Box::new(endpoint_address),
+            client: ssh::client_path(),
+            address: Box::new(ssh::guest_address),
             port: Box::new(probe_port),
             ssh: Box::new(run_ssh),
             now: Box::new(elapsed_since_start()),
@@ -250,8 +265,24 @@ impl GuestReadiness {
             mapping.vm_name
         );
 
-        let invocation = ssh_invocation(&client, vm_directory, username, ip, self.timeouts.connect);
-        let run = (self.ssh)(&invocation, self.timeouts.cloud_init, monitor).map_err(|error| {
+        let command = readiness_command(
+            &client,
+            vm_directory,
+            mapping.vm_id,
+            username,
+            ip,
+            self.timeouts.connect,
+        )
+        .map_err(|error| {
+            log::error!(
+                "VM \"{}\" cannot be asked anything over SSH: {error}",
+                mapping.vm_name
+            );
+            ReadinessFailure::Unusable {
+                detail: error.to_string(),
+            }
+        })?;
+        let run = (self.ssh)(&command, self.timeouts.cloud_init, monitor).map_err(|error| {
             log::error!(
                 "could not ask VM \"{}\" whether cloud-init has finished: {error}",
                 mapping.vm_name
@@ -351,7 +382,7 @@ impl GuestReadiness {
         + Sync
         + 'static,
         port: impl Fn(IpAddr, Duration) -> Result<(), String> + Send + Sync + 'static,
-        ssh: impl Fn(&SshInvocation, Duration, &BuildMonitor) -> Result<SshRun, RepositoryError>
+        ssh: impl Fn(&ReadinessCommand, Duration, &BuildMonitor) -> Result<SshRun, RepositoryError>
         + Send
         + Sync
         + 'static,
@@ -388,64 +419,49 @@ impl GuestReadiness {
 
 /// Everything one readiness command needs, decided without running it.
 ///
-/// Separate from running it so that the decisions -- which key, which
-/// known-hosts file, which timeout -- are testable without a guest, a network,
-/// or an `ssh.exe` to run.
-pub(crate) struct SshInvocation {
-    pub(crate) program: PathBuf,
-    pub(crate) args: Vec<OsString>,
+/// The command itself is the shared one every SSH connection to a VM uses; what
+/// this adds is the only thing particular to a readiness wait, which is where
+/// the long transcript of `--wait` goes.
+pub(crate) struct ReadinessCommand {
+    pub(crate) invocation: SshInvocation,
     /// Where the child's output goes. A file rather than a pipe: `--wait`
     /// prints a dot a second for as long as twenty minutes, and a pipe nobody
     /// drains fills up and deadlocks the child against the parent polling it.
     pub(crate) transcript: PathBuf,
 }
 
-/// Windows' own OpenSSH client, if this installation has one.
-///
-/// Optional Windows features can be absent, so this is a state to report rather
-/// than a reason to panic: [`ReadinessFailure::NoSshClient`] names the feature
-/// a person has to install.
-pub(crate) fn ssh_client_path() -> Option<PathBuf> {
-    let root = std::env::var_os("SystemRoot")?;
-    let path = PathBuf::from(root).join(SSH_CLIENT_RELATIVE_PATH);
-    path.is_file().then_some(path)
-}
-
 /// Builds the command that asks the guest whether cloud-init has finished.
-pub(crate) fn ssh_invocation(
+///
+/// The endpoint it connects to is assembled here from what this wait knows: the
+/// user cloud-init was told to create, and the key VMLord generated for the VM.
+/// Reading the port and the authentication mode off the VM's stored
+/// configuration instead is #80's work -- until then a guest created on another
+/// port is asked on the default one.
+pub(crate) fn readiness_command(
     client: &Path,
     vm_directory: &Path,
+    vm_id: Uuid,
     username: &str,
     ip: IpAddr,
     connect_timeout: Duration,
-) -> SshInvocation {
-    let mut args = vec![
-        OsString::from("-i"),
-        layout::ssh_key_path(vm_directory).into_os_string(),
-    ];
-    for option in [
-        "BatchMode=yes".to_owned(),
-        "IdentitiesOnly=yes".to_owned(),
-        "StrictHostKeyChecking=accept-new".to_owned(),
-        format!(
-            "UserKnownHostsFile={}",
-            vm_directory.join("known_hosts").display()
-        ),
-        format!("ConnectTimeout={}", connect_timeout.as_secs()),
-    ] {
-        args.push(OsString::from("-o"));
-        args.push(OsString::from(option));
-    }
-    args.push(OsString::from("-l"));
-    args.push(OsString::from(username));
-    args.push(OsString::from(ip.to_string()));
-    args.push(OsString::from(READINESS_COMMAND));
+) -> Result<ReadinessCommand, RepositoryError> {
+    let config = SshConfig {
+        username: username.to_owned(),
+        port: SshPort::DEFAULT,
+        authentication: SshAuthentication::VmlordKey,
+    };
+    let endpoint = SshEndpoint::new(vm_id, &config, ip)?;
 
-    SshInvocation {
-        program: client.to_path_buf(),
-        args,
+    Ok(ReadinessCommand {
+        invocation: ssh::invocation(
+            client,
+            &endpoint,
+            vm_directory,
+            Some(connect_timeout),
+            Some(READINESS_COMMAND),
+        ),
         transcript: layout::cloud_init_status_log_path(vm_directory),
-    }
+    })
 }
 
 /// The last `lines` lines of `text`, trimmed.
@@ -453,37 +469,6 @@ pub(crate) fn tail(text: &str, lines: usize) -> String {
     let kept: Vec<&str> = text.trim_end().lines().collect();
     let start = kept.len().saturating_sub(lines);
     kept[start..].join("\n").trim().to_owned()
-}
-
-/// The address HNS has given the VM's endpoint, if it has one yet.
-///
-/// The endpoint is where a guest's address is known on the host side: HNS
-/// assigns it and VMLord's DHCP server offers the guest that one and no other.
-/// An address HNS spells in a way that does not parse is reported as no address
-/// rather than as an error -- it is exactly as unusable as none at all, and the
-/// phase's own timeout is what turns that into a failure.
-fn endpoint_address(mapping: &VmComputeSystemMapping) -> Result<Option<IpAddr>, RepositoryError> {
-    let Some(endpoint_id) = mapping.endpoint_id else {
-        return Ok(None);
-    };
-    let Some(endpoint) = HcnEndpoint::open_if_present(endpoint_id)? else {
-        return Ok(None);
-    };
-    let Some(address) = endpoint.address()? else {
-        return Ok(None);
-    };
-    match address.ip_address.parse() {
-        Ok(ip) => Ok(Some(ip)),
-        Err(error) => {
-            log::debug!(
-                "HNS reported \"{}\" as the address of VM \"{}\", which is not an IP address: \
-                 {error}",
-                address.ip_address,
-                mapping.vm_name
-            );
-            Ok(None)
-        }
-    }
 }
 
 /// Whether anything answers a TCP connection at `ip:port`.
@@ -499,14 +484,15 @@ fn probe_port(ip: IpAddr, timeout: Duration) -> Result<(), String> {
 
 /// Runs one readiness command, killing it at `deadline` or on cancellation.
 fn run_ssh(
-    invocation: &SshInvocation,
+    command: &ReadinessCommand,
     deadline: Duration,
     monitor: &BuildMonitor,
 ) -> Result<SshRun, RepositoryError> {
-    let transcript = File::create(&invocation.transcript).map_err(|error| {
+    let invocation = &command.invocation;
+    let transcript = File::create(&command.transcript).map_err(|error| {
         let error = RepositoryError::new(format!(
             "failed to open the readiness transcript {}: {error}",
-            invocation.transcript.display()
+            command.transcript.display()
         ));
         log::error!("{error}");
         error
@@ -522,7 +508,7 @@ fn run_ssh(
     log::debug!(
         "running {} to wait for cloud-init; its output goes to {}",
         invocation.program.display(),
-        invocation.transcript.display()
+        command.transcript.display()
     );
     let mut child = Command::new(&invocation.program)
         .args(&invocation.args)
@@ -546,7 +532,7 @@ fn run_ssh(
             Ok(Some(status)) => {
                 return Ok(SshRun::Exited {
                     code: status.code(),
-                    transcript_tail: transcript_tail(&invocation.transcript),
+                    transcript_tail: transcript_tail(&command.transcript),
                 });
             }
             Ok(None) => {}
@@ -573,7 +559,7 @@ fn run_ssh(
             kill(&mut child);
             return Ok(SshRun::Exited {
                 code: None,
-                transcript_tail: transcript_tail(&invocation.transcript),
+                transcript_tail: transcript_tail(&command.transcript),
             });
         }
         std::thread::sleep(CHILD_POLL_INTERVAL);
@@ -631,8 +617,8 @@ mod tests {
     use vmlord_core::{BuildMonitor, BuildStep, NetworkMode, RepositoryError};
 
     use super::{
-        GuestReadiness, GuestReady, ReadinessFailure, ReadinessTimeouts, SshInvocation, SshRun,
-        outcome, ssh_invocation, tail,
+        GuestReadiness, GuestReady, ReadinessCommand, ReadinessFailure, ReadinessTimeouts, SshRun,
+        outcome, readiness_command, tail,
     };
     use crate::metadata::VmComputeSystemMapping;
 
@@ -967,8 +953,9 @@ mod tests {
         assert_eq!(ReadinessTimeouts::default(), timeouts());
     }
 
-    fn arguments(invocation: &SshInvocation) -> Vec<String> {
-        invocation
+    fn arguments(command: &ReadinessCommand) -> Vec<String> {
+        command
+            .invocation
             .args
             .iter()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -976,36 +963,21 @@ mod tests {
     }
 
     #[test]
-    fn the_ssh_invocation_can_neither_prompt_nor_touch_the_users_known_hosts() {
-        let invocation = ssh_invocation(
+    fn the_readiness_command_asks_cloud_init_and_keeps_its_answer_beside_the_vm() {
+        let command = readiness_command(
             Path::new(r"C:\Windows\System32\OpenSSH\ssh.exe"),
             Path::new(r"C:\VMs\dev-linux"),
+            Uuid::nil(),
             "machi",
             "172.22.42.7".parse::<IpAddr>().unwrap(),
             Duration::from_secs(10),
-        );
-        let args = arguments(&invocation);
+        )
+        .unwrap();
+        let args = arguments(&command);
 
         assert_eq!(
-            invocation.program,
+            command.invocation.program,
             Path::new(r"C:\Windows\System32\OpenSSH\ssh.exe")
-        );
-        // No prompt can hang a build, and no key of the user's own agent can be
-        // tried in place of the VM's.
-        assert!(args.contains(&"BatchMode=yes".to_owned()), "{args:?}");
-        assert!(args.contains(&"IdentitiesOnly=yes".to_owned()), "{args:?}");
-        assert!(
-            args.contains(&"StrictHostKeyChecking=accept-new".to_owned()),
-            "{args:?}"
-        );
-        assert!(
-            args.contains(&r"UserKnownHostsFile=C:\VMs\dev-linux\known_hosts".to_owned()),
-            "the VM's host key must not land in the user's own known_hosts: {args:?}"
-        );
-        assert!(args.contains(&"ConnectTimeout=10".to_owned()), "{args:?}");
-        assert!(
-            args.contains(&r"C:\VMs\dev-linux\keys\id_ed25519".to_owned()),
-            "{args:?}"
         );
         assert_eq!(
             args.last().map(String::as_str),
@@ -1013,27 +985,31 @@ mod tests {
             "{args:?}"
         );
         assert_eq!(
-            invocation.transcript,
+            command.transcript,
             Path::new(r"C:\VMs\dev-linux\cloud-init-status.log")
+        );
+        // The rest of the arguments are the shared builder's, and are its tests
+        // to make; what a readiness wait cannot survive is a prompt, so that one
+        // is checked here too.
+        assert!(args.contains(&"BatchMode=\"yes\"".to_owned()), "{args:?}");
+        assert!(
+            args.contains(&"ConnectTimeout=\"10\"".to_owned()),
+            "{args:?}"
         );
     }
 
     #[test]
-    fn the_user_and_the_address_are_separate_arguments_not_a_joined_string() {
-        // `-l user host` rather than `user@host`: a username containing an `@`
-        // would otherwise be split in the wrong place by ssh itself.
-        let invocation = ssh_invocation(
+    fn a_user_name_the_guest_would_refuse_stops_the_wait_before_ssh_runs() {
+        let refused = readiness_command(
             Path::new("ssh.exe"),
             Path::new(r"C:\VMs\dev"),
-            "a@b",
+            Uuid::nil(),
+            "root -oProxyCommand=calc",
             "10.0.0.2".parse::<IpAddr>().unwrap(),
             Duration::from_secs(5),
         );
-        let args = arguments(&invocation);
-        let user_flag = args.iter().position(|argument| argument == "-l").unwrap();
 
-        assert_eq!(args[user_flag + 1], "a@b");
-        assert_eq!(args[user_flag + 2], "10.0.0.2");
+        assert!(refused.is_err(), "such a name must never reach ssh.exe");
     }
 
     #[test]
@@ -1119,6 +1095,10 @@ mod tests {
         let messages = [
             ReadinessFailure::NoSshClient.to_string(),
             ReadinessFailure::NoAddress.to_string(),
+            ReadinessFailure::Unusable {
+                detail: "the user name is not one Linux would accept".into(),
+            }
+            .to_string(),
             ReadinessFailure::Unreachable {
                 last_error: "refused".into(),
             }
@@ -1133,9 +1113,10 @@ mod tests {
 
         assert!(messages[0].contains("OpenSSH"), "{}", messages[0]);
         assert!(messages[1].contains("address"), "{}", messages[1]);
-        assert!(messages[2].contains("refused"), "{}", messages[2]);
-        assert!(messages[3].contains("boom"), "{}", messages[3]);
-        assert!(messages[4].contains("did not finish"), "{}", messages[4]);
-        assert!(messages[5].contains("cancelled"), "{}", messages[5]);
+        assert!(messages[2].contains("user name"), "{}", messages[2]);
+        assert!(messages[3].contains("refused"), "{}", messages[3]);
+        assert!(messages[4].contains("boom"), "{}", messages[4]);
+        assert!(messages[5].contains("did not finish"), "{}", messages[5]);
+        assert!(messages[6].contains("cancelled"), "{}", messages[6]);
     }
 }

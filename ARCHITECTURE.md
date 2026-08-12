@@ -967,6 +967,42 @@ for the same reason it refuses a VM with neither a password nor SSH: there is no
 third credential to fall back on, so the guest would run a daemon nobody can get
 through.
 
+### Running the OpenSSH client
+
+`platform::ssh` is the single place a VM becomes a run of `ssh.exe`. It answers
+two questions and nothing else: which endpoint a VM currently is -- its stored
+`SshConfig` joined to the address HNS gives its endpoint, `None` when the VM has
+no SSH access at all -- and what argument vector connects to that endpoint.
+
+The readiness wait and the interactive launcher connect to the same guests with
+the same key, the same host-key file and the same rules about what may prompt;
+they differ only in what they ask the guest to run, which is one `Option<&str>`.
+Two copies of these arguments would drift, and a drift here is not cosmetic: it
+is one client learning a host key the other refuses, or one of them falling back
+to a credential VMLord did not choose.
+
+Every invocation carries `HostKeyAlias=<vm id>`, the VM's own
+`UserKnownHostsFile` under its directory, and
+`StrictHostKeyChecking=accept-new`. A key is therefore learned once, filed under
+something a rename and a new address cannot move, and a key that changes
+afterwards stops the login. Nothing here deletes or rewrites such a key: that is
+a decision for a person who has been shown it. Key mode adds `-i`, the VM's own
+private key, `IdentitiesOnly=yes` -- no agent key may stand in for it -- and
+`BatchMode=yes`, so a key that stopped working is an error rather than a prompt.
+Password mode adds `PubkeyAuthentication=no` and
+`PreferredAuthentications=keyboard-interactive,password`, and no `BatchMode`,
+because the prompt is what password mode is.
+
+Nothing here builds a command *line*. `ssh.exe` is spawned with an argument
+vector, so no user name, path or address is ever a substring something a shell,
+PowerShell or `cmd` would parse; the user name is `-l user host` rather than
+`user@host`, so a name containing an `@` cannot be split in the wrong place. The
+values that do land inside a larger string are the `-o` options carrying a path,
+and those are quoted and `%`-doubled -- for OpenSSH's own configuration parser,
+which splits on white space and expands `%d`-style tokens, not for a shell. A VM
+under `C:\Virtual Machines\` therefore keeps its known-hosts file, and one whose
+directory contains a `%` points where it says.
+
 ### The VM's SSH key pair
 
 Every VM gets its own ed25519 pair rather than sharing one. AppSandbox kept a
@@ -1394,7 +1430,8 @@ and its own failure, because the three are different facts about the guest: the
 endpoint has to be given an address (HNS assigns it, the DHCP server delivers
 it), something has to answer a TCP connection on port 22, and cloud-init has to
 report that it is done. The transport is `ssh.exe` from `%SystemRoot%\System32\
-OpenSSH`, driven as a child process behind a seam: every maintained Rust SSH
+OpenSSH`, its arguments built by `platform::ssh` like every other connection to a
+guest, driven as a child process behind a seam: every maintained Rust SSH
 client is async-only, and VMLord has no async runtime, while a second vendored C
 build under MSVC would cost more than this does. Its absence -- OpenSSH Client is
 an optional Windows feature -- is an outcome of its own, named in the message a
