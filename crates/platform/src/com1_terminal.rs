@@ -601,9 +601,14 @@ fn cmd_argument(argument: &str) -> String {
 
 /// Starts one terminal host.
 ///
-/// The child is deliberately not waited for: the terminal owns the reader, and
-/// VMLord speaks to it through events rather than through a process handle.
-fn spawn_terminal(command: &TerminalCommand) -> io::Result<()> {
+/// The child is deliberately not waited for: the terminal owns what it hosts,
+/// and VMLord speaks to a reader through events rather than through a process
+/// handle -- while an SSH session it has no business speaking to at all.
+///
+/// Shared with [`crate::ssh_terminal`], which puts a different program on
+/// screen the same way: a terminal is started, and what it hosts is not this
+/// process's child to wait for.
+pub(crate) fn spawn_terminal(command: &TerminalCommand) -> io::Result<()> {
     use std::os::windows::process::CommandExt;
 
     let mut process = Command::new(&command.program);

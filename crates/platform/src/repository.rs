@@ -33,6 +33,7 @@ use crate::{
     hcs_config::{self, VmTopology},
     layout, list_known_vms,
     reconnect::{ReconnectOutcome, reconnect_known_vms},
+    ssh_terminal::SshLauncher,
     vhd, watch,
     watch::VmEventSink,
 };
@@ -66,6 +67,9 @@ pub struct HcsVmRepository {
     com1_launcher: Com1Launcher,
     /// The consoles VMLord currently owns, one per running VM.
     com1_sessions: Com1Sessions,
+    /// Opens interactive SSH sessions into running guests. Nothing is kept
+    /// beside it: a session belongs to whoever asked for it, not to VMLord.
+    ssh_launcher: SshLauncher,
     shutdown: VmShutdownPipeline,
     force_stop: VmForceStopPipeline,
     delete: VmDeletionPipeline,
@@ -106,6 +110,7 @@ impl HcsVmRepository {
             start: VmStartPipeline::production(com1_launcher.clone()),
             com1_launcher,
             com1_sessions: Com1Sessions::default(),
+            ssh_launcher: SshLauncher::production(),
             shutdown: VmShutdownPipeline::production(),
             force_stop: VmForceStopPipeline::production(),
             delete: VmDeletionPipeline::production(),
@@ -207,7 +212,11 @@ impl HcsVmRepository {
         mapping: &VmComputeSystemMapping,
         state: Option<HcsSystemState>,
     ) -> Result<(), RepositoryError> {
-        refuse_unless_running(&mapping.vm_name, state)?;
+        refuse_unless_running(
+            &mapping.vm_name,
+            state,
+            "so it has no COM1 port to open; start it first",
+        )?;
 
         // A console whose window has been closed leaves a session behind that
         // is over. Reaping it here is what makes reopening possible at all --
@@ -236,6 +245,34 @@ impl HcsVmRepository {
             mapping.vm_name
         );
         Ok(())
+    }
+
+    /// Opens a session into a VM HCS reports as being in `state`.
+    ///
+    /// Split from [`VmRepository::open_ssh`] at the one call that needs HCS, so
+    /// that what it decides can be tested without a compute system.
+    fn open_ssh_in_state(
+        &self,
+        mapping: &VmComputeSystemMapping,
+        state: Option<HcsSystemState>,
+    ) -> Result<(), RepositoryError> {
+        refuse_unless_running(
+            &mapping.vm_name,
+            state,
+            "so there is no guest to log into; start it first",
+        )?;
+
+        let vm_directory = layout::vm_directory(&self.storage_root, &mapping.vm_name)?;
+        self.ssh_launcher
+            .launch(mapping, &vm_directory)
+            .map_err(|failure| {
+                let error = RepositoryError::new(format!(
+                    "cannot open an SSH session to VM \"{}\": {failure}",
+                    mapping.vm_name
+                ));
+                log::error!("{error}");
+                error
+            })
     }
 
     fn push_diagnostic(&self, level: DiagnosticLevel, message: String) {
@@ -871,6 +908,30 @@ impl VmRepository for HcsVmRepository {
         self.open_console_in_state(&mapping, state)
     }
 
+    /// Opens an interactive SSH session into a running guest.
+    ///
+    /// Nothing is recorded afterwards. The session runs in a terminal of its
+    /// own, outlives whatever VMLord does next, and a VM may have as many of
+    /// them as a person opens: this is a shell somebody asked for, not a
+    /// resource VMLord owns. That is the whole difference from
+    /// [`VmRepository::open_console`], which owns exactly one reader per VM
+    /// because two on one pipe would split the guest's output.
+    ///
+    /// The state is asked of HCS rather than taken from the list the user
+    /// clicked in, which can be a refresh out of date. What comes back on
+    /// failure is the preflight check that stopped the session -- which Windows
+    /// feature is missing, which port did not answer, which key is gone --
+    /// because once the terminal is up, everything else OpenSSH has to say goes
+    /// into that window and not into this process.
+    fn open_ssh(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.require_initialized()?;
+        self.builds.refuse_if_building(name)?;
+
+        let mapping = self.mapping(name)?;
+        let state = self.reported_state(&mapping)?;
+        self.open_ssh_in_state(&mapping, state)
+    }
+
     fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError> {
         self.require_initialized()?;
 
@@ -990,15 +1051,21 @@ fn launch_running_consoles(
     failures
 }
 
-/// Refuses a console unless HCS reports the VM as running.
+/// Refuses an operation on a live guest unless HCS reports the VM as running.
 ///
-/// The named pipe behind COM1 belongs to the compute system: it exists while
-/// the VM runs and not a moment longer. Only `Running` is accepted -- a VM that
-/// is merely `Created` has a configuration and no compute system to talk to,
-/// and a paused one has a pipe nobody is writing to.
+/// Both things a person can open on a guest -- its console and a shell -- exist
+/// only while the compute system does: the named pipe behind COM1 belongs to
+/// it, and so does the network endpoint the guest answers SSH on. Only
+/// `Running` is accepted -- a VM that is merely `Created` has a configuration
+/// and no compute system to talk to, and a paused one has neither a pipe
+/// anybody is writing to nor a guest anybody can log into.
+///
+/// `consequence` says what this particular VM therefore does not have, so that
+/// the message names the thing the person actually asked for.
 fn refuse_unless_running(
     vm_name: &str,
     state: Option<HcsSystemState>,
+    consequence: &str,
 ) -> Result<(), RepositoryError> {
     let description = match &state {
         Some(HcsSystemState::Running) => return Ok(()),
@@ -1008,9 +1075,7 @@ fn refuse_unless_running(
         Some(HcsSystemState::Other(other)) => format!("in state \"{other}\""),
     };
 
-    let error = RepositoryError::new(format!(
-        "VM \"{vm_name}\" is {description}, so it has no COM1 port to open; start it first"
-    ));
+    let error = RepositoryError::new(format!("VM \"{vm_name}\" is {description}, {consequence}"));
     log::error!("{error}");
     Err(error)
 }
@@ -1065,8 +1130,9 @@ mod tests {
 
     use uuid::Uuid;
     use vmlord_core::{
-        AgentStatus, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError, SshAvailability,
-        VmDeleteRequest, VmRepository, VmState, VmSummary, VmUpdateRequest,
+        AgentStatus, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError, SshAuthentication,
+        SshAvailability, SshConfig, SshPort, VmDeleteRequest, VmRepository, VmState, VmSummary,
+        VmUpdateRequest,
     };
 
     use super::{
@@ -1078,6 +1144,7 @@ mod tests {
         build::BuildRegistry,
         com1_terminal::{Com1Sessions, TerminalCommand},
         hcn_endpoint::EndpointAddress,
+        ssh_terminal::SshLauncher,
         watch::{HcsEventKind, HcsVmEvent},
     };
 
@@ -1478,6 +1545,102 @@ mod tests {
         assert!(repository.com1_sessions.contains(mapping.vm_id));
     }
 
+    /// A VM with SSH access, an address and a key: everything a session needs,
+    /// so that a test can take one thing away at a time.
+    fn ssh_mapping() -> VmComputeSystemMapping {
+        VmComputeSystemMapping {
+            ssh: Some(SshConfig {
+                username: "machi".to_owned(),
+                port: SshPort::DEFAULT,
+                authentication: SshAuthentication::VmlordKey,
+            }),
+            ..mapping(NetworkMode::Nat)
+        }
+    }
+
+    /// A repository whose SSH sessions are recorded instead of opened.
+    fn repository_with_ssh(recorded: Arc<Mutex<Vec<String>>>) -> HcsVmRepository {
+        let mut repository = repository();
+        repository.ssh_launcher = SshLauncher::for_test(
+            |_| Ok(Some("172.22.42.7".parse().unwrap())),
+            |_, _, _| Ok(()),
+            |_| true,
+            move |command: &TerminalCommand| {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(command.program.display().to_string());
+                Ok(())
+            },
+        );
+        repository
+    }
+
+    #[test]
+    fn an_ssh_session_into_a_stopped_vm_is_refused_without_opening_a_window() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let repository = repository_with_ssh(recorded.clone());
+
+        let error = repository
+            .open_ssh_in_state(&ssh_mapping(), Some(HcsSystemState::Stopped))
+            .expect_err("a stopped VM has no guest to log into");
+
+        assert!(error.to_string().contains("stopped"), "{error}");
+        assert!(error.to_string().contains("start it first"), "{error}");
+        assert!(recorded.lock().unwrap().is_empty(), "nothing was launched");
+    }
+
+    #[test]
+    fn an_ssh_session_into_a_running_vm_opens_a_terminal() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let repository = repository_with_ssh(recorded.clone());
+
+        repository
+            .open_ssh_in_state(&ssh_mapping(), Some(HcsSystemState::Running))
+            .expect("a running guest can be logged into");
+
+        assert_eq!(recorded.lock().unwrap().clone(), ["wt.exe"]);
+    }
+
+    /// Two shells into one guest is an ordinary thing to want, and the
+    /// repository keeps nothing that would make the second one a collision.
+    #[test]
+    fn a_running_vm_may_be_logged_into_more_than_once() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let repository = repository_with_ssh(recorded.clone());
+        let mapping = ssh_mapping();
+
+        for _ in 0..2 {
+            repository
+                .open_ssh_in_state(&mapping, Some(HcsSystemState::Running))
+                .expect("a second shell is not a second reader on one pipe");
+        }
+
+        assert_eq!(recorded.lock().unwrap().len(), 2);
+    }
+
+    /// The preflight checks exist to be reported: what the person sees has to
+    /// name the thing that stopped the session, not that one did not open.
+    #[test]
+    fn a_preflight_failure_reaches_the_repository_with_its_own_reason() {
+        let mut repository = repository();
+        repository.ssh_launcher = SshLauncher::for_test(
+            |_| Ok(Some("172.22.42.7".parse().unwrap())),
+            |_, _, _| Err("connection refused".to_owned()),
+            |_| panic!("a guest that does not answer is not asked for its key"),
+            |_| panic!("nor given a terminal"),
+        );
+
+        let error = repository
+            .open_ssh_in_state(&ssh_mapping(), Some(HcsSystemState::Running))
+            .expect_err("a guest that does not answer cannot be logged into")
+            .to_string();
+
+        assert!(error.contains("dev"), "{error}");
+        assert!(error.contains("port 22"), "{error}");
+        assert!(error.contains("connection refused"), "{error}");
+    }
+
     #[test]
     fn a_failed_finished_reader_becomes_a_repository_diagnostic() {
         let recorded = Arc::new(Mutex::new(Vec::new()));
@@ -1656,22 +1819,16 @@ mod tests {
         assert_not_initialized(repository.delete_vm(delete_request()));
         assert_not_initialized(repository.list_vms().map(|_| ()));
         assert_not_initialized(repository.open_console("dev"));
+        assert_not_initialized(repository.open_ssh("dev"));
     }
 
     #[test]
-    fn display_and_ssh_report_that_the_native_backend_lacks_them() {
+    fn a_display_connection_reports_that_the_native_backend_lacks_it() {
         let mut repository = repository();
 
         assert!(
             repository
                 .open_display("dev")
-                .unwrap_err()
-                .to_string()
-                .contains("not supported")
-        );
-        assert!(
-            repository
-                .open_ssh("dev")
                 .unwrap_err()
                 .to_string()
                 .contains("not supported")
