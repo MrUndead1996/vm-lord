@@ -640,6 +640,7 @@ mod tests {
             disk_gb: 20,
             endpoint_id: None,
             network_mode: NetworkMode::Nat,
+            ssh: None,
         }
     }
 

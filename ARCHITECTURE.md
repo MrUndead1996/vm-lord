@@ -542,9 +542,10 @@ the migration leaves it something the native backend cannot do; any other value
 keep VMLord on the backend being retired.
 
 The native backend deliberately reports less than AppSandbox did while the
-remaining migration tasks land: GPU mode and SSH port are `None`, guest agent
-status is `Unknown`, and display and SSH connections report that the backend does
-not support them. Network mode is reported from the VM's mapping, because the
+remaining migration tasks land: GPU mode is `None`, guest agent status is
+`Unknown`, and display and SSH connections report that the backend does not
+support them. SSH availability is not among them: it is read from the VM's
+mapping, which records what its creation asked for. Network mode is reported from the VM's mapping, because the
 edit form is filled from `VmSummary`: a summary that always said `None` would
 make an unrelated edit switch a NAT VM off the network. The guest's address comes
 from the VM's HNS endpoint, as above.
@@ -907,6 +908,50 @@ about the digest.
 The module's unit tests pin the algorithm against the specification's published
 `$6$` vectors, not merely against itself: a hash that agrees only with this
 implementation would pass every other test and still be rejected by the guest.
+
+### The SSH contract
+
+`core::ssh` owns what VMLord knows about logging into a guest. It used to be a
+number beside a VM -- `VmSummary::ssh_port: Option<u32>` -- where a missing port
+meant "SSH is off", "the VM is not running yet" and "this backend cannot answer"
+at once, and every reader picked one of the three.
+
+Four types replace it:
+
+* `SshAuthentication` is `VmlordKey` or `Password`, and there is no third. The
+  user's own keys and any running agent are deliberately absent: a login that
+  succeeded through some other credential is a login VMLord cannot reproduce.
+  Key mode does not fall back to a password either.
+* `SshPort` wraps a `NonZeroU16`, so `1..=65535` is the type rather than a check
+  at every use -- port 0 means "any free port" to a listener and nothing at all
+  to a client. It serialises as a plain number, and a stored `0` fails to parse.
+* `SshConfig` is what a VM's creation settled: user name, port and mode. No
+  address, because the guest takes a new one from HNS on every start; no
+  password, because a password on disk is a password leaked -- `Password` the
+  variant records only that a person will type one.
+* `SshAvailability` is what a listed VM has: `Disabled`, or `Enabled` with the
+  configuration. A capability rather than a number, so the SSH button and the
+  detail row read the same fact.
+* `SshEndpoint` is one running guest as a client would have to be told about it:
+  a configuration plus an address plus the VM's id. `SshEndpoint::new` is the
+  only way to build one and validates the configuration first, so metadata
+  edited by hand is refused while it is still data rather than after a process
+  has been handed its arguments. The id -- not the name, not the address -- is
+  the guest's `HostKeyAlias`: both of the others change over a VM's life, and a
+  host key filed under either would be lost on a rename or matched against a
+  different guest that inherited the address.
+
+`Provisioning::ssh_config` is the one place a configuration is derived from what
+cloud-init was asked to do, and `VmComputeSystemMapping::ssh` is where it is
+kept: `None` there is a VM created with SSH switched off. The mapping validates
+it on the way in and on the way back out, through the same user-name validator
+the create form uses, so a name that reaches an `ssh -l` argument is one Linux
+would accept whether it was typed a minute ago or read from an edited document.
+
+Provisioning refuses an SSH server with neither a deployed key nor a password
+for the same reason it refuses a VM with neither a password nor SSH: there is no
+third credential to fall back on, so the guest would run a daemon nobody can get
+through.
 
 ### The VM's SSH key pair
 

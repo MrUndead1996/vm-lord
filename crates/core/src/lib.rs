@@ -5,6 +5,7 @@ pub mod logging;
 pub mod progress;
 pub mod provisioning;
 pub mod settings;
+pub mod ssh;
 
 pub use distro::{DistroProfile, ubuntu};
 pub use logging::{LoggingError, initialize as initialize_logging};
@@ -12,11 +13,13 @@ pub use progress::{
     BuildMonitor, BuildProgress, BuildStep, DownloadPhase, ProgressPublisher, ProgressThrottle,
 };
 pub use provisioning::{
-    CloudImage, GuestDefaults, Password, Provisioning, SshAccess, VmSource, validate_vm_name,
+    CloudImage, GuestDefaults, Password, Provisioning, SshAccess, VmSource, validate_username,
+    validate_vm_name,
 };
 pub use settings::{
     AppSettings, GuestReadinessTimeouts, Language, LogLevel, SettingsError, SettingsStore,
 };
+pub use ssh::{SshAuthentication, SshAvailability, SshConfig, SshEndpoint, SshPort};
 
 use std::fmt;
 
@@ -88,7 +91,12 @@ pub struct VmSummary {
     pub gpu_mode: GpuMode,
     pub network_mode: NetworkMode,
     pub ip_address: Option<std::net::IpAddr>,
-    pub ssh_port: Option<u32>,
+    /// Whether this VM can be reached over SSH, and with what.
+    ///
+    /// A capability rather than a port: a missing port used to mean "SSH is
+    /// off", "the VM is not running" and "this backend does not know" at once,
+    /// and every reader had to pick one.
+    pub ssh: SshAvailability,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

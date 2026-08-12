@@ -994,6 +994,7 @@ fn shuts_down_a_running_guest() {
             disk_gb: 20,
             endpoint_id: None,
             network_mode: NetworkMode::None,
+            ssh: None,
         })
         .expect("mapping should be persisted");
 
@@ -1892,6 +1893,7 @@ fn mapping_owning(vm_name: &str, endpoint_id: Uuid) -> VmComputeSystemMapping {
         disk_gb: 1,
         endpoint_id: Some(endpoint_id),
         network_mode: NetworkMode::Nat,
+        ssh: None,
     }
 }
 

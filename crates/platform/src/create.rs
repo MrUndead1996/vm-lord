@@ -4,8 +4,8 @@ use std::{fs, io::Write, path::Path, time::Duration};
 
 use uuid::Uuid;
 use vmlord_core::{
-    BuildMonitor, BuildStep, CloudImage, Provisioning, RepositoryError, SshAccess, VmCreateRequest,
-    VmSource,
+    BuildMonitor, BuildStep, CloudImage, Provisioning, RepositoryError, SshAccess, SshPort,
+    VmCreateRequest, VmSource,
 };
 
 use crate::{
@@ -202,6 +202,18 @@ impl VmCreationPipeline {
             // that is never started never takes an address.
             endpoint_id: None,
             network_mode: request.network_mode,
+            // What a person asked cloud-init to set up, recorded as what a
+            // later connection has to be told. Locally installed media gets
+            // none: VMLord promises nothing about the system inside it.
+            //
+            // The port is the default one until #74 lets the create form
+            // choose another.
+            ssh: match &request.source {
+                VmSource::LocalMedia { .. } => None,
+                VmSource::CloudImage { provisioning, .. } => {
+                    provisioning.ssh_config(SshPort::DEFAULT)
+                }
+            },
         };
 
         let mut guard = CreationGuard {

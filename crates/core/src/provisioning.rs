@@ -10,7 +10,11 @@
 
 use std::fmt;
 
-use crate::{RepositoryError, distro::DistroProfile};
+use crate::{
+    RepositoryError,
+    distro::DistroProfile,
+    ssh::{SshAuthentication, SshConfig, SshPort},
+};
 
 /// The longest user name Linux tools accept without complaint.
 const MAX_USERNAME_LENGTH: usize = 32;
@@ -135,6 +139,14 @@ impl Provisioning {
                 "a VM with neither a password nor SSH cannot be logged into",
             ));
         }
+        // The two SSH modes are the whole list: VMLord's own key, or the
+        // password. An SSH server with neither is a server nobody can get
+        // through -- there is no third credential to fall back on.
+        if self.password.is_none() && self.ssh == (SshAccess::Enabled { deploy_key: false }) {
+            return Err(rejected(
+                "an SSH server without a deployed key needs a password to log in with",
+            ));
+        }
 
         validate_guest_setting("locale", &self.locale)?;
         validate_guest_setting("keyboard layout", &self.keyboard)?;
@@ -158,6 +170,30 @@ impl Provisioning {
             }
         );
         Ok(())
+    }
+
+    /// The SSH access this provisioning leaves behind, as it will be recorded
+    /// against the VM.
+    ///
+    /// `None` when the guest runs no SSH server: that is what "SSH is off"
+    /// means everywhere afterwards, rather than a flag beside a port. The mode
+    /// follows from what the guest is given -- a deployed key, or the password
+    /// [`Provisioning::validate`] insists on when there is no key.
+    ///
+    /// The port is passed in rather than read from here because it belongs to
+    /// the create request, not to what cloud-init writes into the guest.
+    #[must_use]
+    pub fn ssh_config(&self, port: SshPort) -> Option<SshConfig> {
+        let authentication = match self.ssh {
+            SshAccess::Disabled => return None,
+            SshAccess::Enabled { deploy_key: true } => SshAuthentication::VmlordKey,
+            SshAccess::Enabled { deploy_key: false } => SshAuthentication::Password,
+        };
+        Some(SshConfig {
+            username: self.username.clone(),
+            port,
+            authentication,
+        })
     }
 }
 
@@ -217,7 +253,11 @@ pub fn validate_vm_name(name: &str) -> Result<(), RepositoryError> {
 }
 
 /// Accepts the user names `useradd` accepts and cloud-init passes on unchanged.
-fn validate_username(username: &str) -> Result<(), RepositoryError> {
+///
+/// Public because a user name outlives the request that typed it: it is stored
+/// with the VM and read back for every SSH connection, and what reaches an
+/// `ssh -l` argument has to pass the same rule then as it did in the form.
+pub fn validate_username(username: &str) -> Result<(), RepositoryError> {
     let shaped = |(index, byte): (usize, u8)| match index {
         0 => byte.is_ascii_lowercase() || byte == b'_',
         _ => byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-'),
@@ -449,6 +489,53 @@ mod tests {
         };
 
         assert!(provisioning.validate().is_ok());
+    }
+
+    #[test]
+    fn an_ssh_server_with_neither_a_key_nor_a_password_is_refused() {
+        let provisioning = Provisioning {
+            password: None,
+            ssh: SshAccess::Enabled { deploy_key: false },
+            ..provisioning()
+        };
+
+        let message = provisioning.validate().unwrap_err().to_string();
+        assert!(message.contains("password"), "got {message:?}");
+    }
+
+    #[test]
+    fn the_ssh_access_a_guest_is_left_with_is_what_gets_recorded() {
+        use crate::ssh::{SshAuthentication, SshConfig, SshPort};
+
+        let port = SshPort::new(2222).unwrap();
+
+        assert_eq!(
+            provisioning().ssh_config(port),
+            Some(SshConfig {
+                username: "user".into(),
+                port,
+                authentication: SshAuthentication::VmlordKey,
+            })
+        );
+        assert_eq!(
+            Provisioning {
+                ssh: SshAccess::Enabled { deploy_key: false },
+                ..provisioning()
+            }
+            .ssh_config(port)
+            .unwrap()
+            .authentication,
+            SshAuthentication::Password
+        );
+        assert_eq!(
+            Provisioning {
+                ssh: SshAccess::Disabled,
+                ..provisioning()
+            }
+            .ssh_config(port),
+            None,
+            "SSH being off is the absence of a configuration, not a flag inside one"
+        );
     }
 
     #[test]
