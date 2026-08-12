@@ -111,6 +111,40 @@ pub(crate) struct SshInvocation {
     pub(crate) args: Vec<OsString>,
 }
 
+impl SshInvocation {
+    /// The run this describes, as one line to show a person.
+    ///
+    /// For reading, not for re-running: nothing on this path goes through a
+    /// shell, and this is the only place these arguments ever become a single
+    /// string. It exists because a session that opened tells VMLord nothing
+    /// afterwards -- what was asked of `ssh.exe` is knowable only here, and it
+    /// is the first thing anyone needs when a guest refuses a login for a
+    /// reason only the client saw.
+    ///
+    /// A token holding white space is wrapped in quotes so the line can be read
+    /// back. The `-o` values already carry quotes of their own -- OpenSSH's
+    /// configuration parser put them there -- and are left exactly as they go
+    /// to the client, because a log that shows something other than what ran is
+    /// worse than no log.
+    pub(crate) fn command_line(&self) -> String {
+        std::iter::once(self.program.as_os_str())
+            .chain(self.args.iter().map(OsString::as_os_str))
+            .map(quote_for_reading)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// One token of a command line, quoted only when reading it back needs it.
+fn quote_for_reading(token: &OsStr) -> String {
+    let text = token.to_string_lossy();
+    if text.contains(char::is_whitespace) && !text.contains('"') {
+        format!("\"{text}\"")
+    } else {
+        text.into_owned()
+    }
+}
+
 /// Builds the command that connects to `endpoint`.
 ///
 /// `remote_command` is what the guest is asked to run, or `None` for the
@@ -328,6 +362,55 @@ mod tests {
         let args = arguments(invocation);
         let at = args.iter().position(|argument| argument == flag)?;
         args.get(at + 1).cloned()
+    }
+
+    /// What the diagnostics show after a session opens, since the session
+    /// itself says nothing back. It has to be the arguments that ran, not a
+    /// tidied version of them.
+    #[test]
+    fn an_invocation_can_be_read_back_as_the_line_it_is() {
+        let line = built(config()).command_line();
+
+        assert!(
+            line.starts_with(r"C:\Windows\System32\OpenSSH\ssh.exe "),
+            "{line}"
+        );
+        assert!(line.contains("-p 22"), "{line}");
+        assert!(line.contains("-l machi"), "{line}");
+        assert!(line.contains("172.22.42.7"), "{line}");
+        assert!(
+            line.contains(r#"-o UserKnownHostsFile="C:\VMs\dev-linux\known_hosts""#),
+            "an option keeps the quotes OpenSSH's own parser needs: {line}"
+        );
+    }
+
+    /// A path with a space in it is what quoting is for -- and the `-o` values
+    /// beside it must not be quoted twice, because what is shown has to be what
+    /// was passed.
+    #[test]
+    fn a_token_with_a_space_is_readable_and_one_that_quotes_itself_is_left_alone() {
+        let invocation = invocation(
+            Path::new(r"C:\Program Files\OpenSSH\ssh.exe"),
+            &endpoint_with(config()),
+            Path::new(r"C:\Virtual Machines\dev-linux"),
+            None,
+            None,
+        );
+
+        let line = invocation.command_line();
+
+        assert!(
+            line.starts_with(r#""C:\Program Files\OpenSSH\ssh.exe" "#),
+            "{line}"
+        );
+        assert!(
+            line.contains(r#"-i "C:\Virtual Machines\dev-linux\keys\id_ed25519""#),
+            "{line}"
+        );
+        assert!(
+            line.contains(r#"-o UserKnownHostsFile="C:\Virtual Machines\dev-linux\known_hosts""#),
+            "the option is shown exactly as the client gets it: {line}"
+        );
     }
 
     #[test]

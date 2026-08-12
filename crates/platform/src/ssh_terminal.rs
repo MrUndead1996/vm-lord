@@ -154,11 +154,16 @@ impl SshLauncher {
     /// Whether the VM is running is not asked here: that is a question for HCS,
     /// and the repository has already asked it. Everything else is checked in
     /// the order that spends the least time before refusing.
+    ///
+    /// What comes back is what was asked of `ssh.exe`. The session says nothing
+    /// to VMLord after this -- it is a process in a window of its own -- so the
+    /// arguments are the last thing knowable about it, and the repository puts
+    /// them where a person can read them.
     pub(crate) fn launch(
         &self,
         mapping: &VmComputeSystemMapping,
         vm_directory: &Path,
-    ) -> Result<(), SshLaunchFailure> {
+    ) -> Result<SshInvocation, SshLaunchFailure> {
         let client = self.client.clone().ok_or(SshLaunchFailure::NoSshClient)?;
         if mapping.ssh.is_none() {
             return Err(SshLaunchFailure::Disabled);
@@ -214,7 +219,7 @@ impl SshLauncher {
             "an SSH session to VM \"{}\" was opened at {endpoint}",
             mapping.vm_name
         );
-        Ok(())
+        Ok(invocation)
     }
 
     /// Starts the first terminal host that will have it, and reports both if
@@ -463,6 +468,30 @@ mod tests {
         assert!(
             arguments.contains(&"VMLord SSH — dev-linux".to_owned()),
             "{arguments:?}"
+        );
+    }
+
+    /// What the launch reports is what it spawned. The repository puts this
+    /// line in front of a person, and a log describing a run other than the one
+    /// that happened is worse than no log at all.
+    #[test]
+    fn the_launch_reports_the_command_it_spawned() {
+        let attempts = Attempts::default();
+
+        let invocation = launcher(&attempts)
+            .launch(&mapping(), vm_directory())
+            .unwrap();
+
+        assert_eq!(invocation.program, Path::new(CLIENT));
+        let reported: Vec<String> = invocation
+            .args
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            reported,
+            attempts.arguments(0)[7..],
+            "the arguments after Windows Terminal's own are the ones reported back"
         );
     }
 

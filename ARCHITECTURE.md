@@ -1052,12 +1052,27 @@ cause intact.
 
 ### Offering a session
 
-`WorkspaceApp::open_ssh` is the only thing the desktop shell calls. It carries
-the backend's refusal into the diagnostics unchanged -- "Failed to open SSH
-session for VM …" followed by which Windows feature is missing, which port did
-not answer, which key is gone -- because that preflight message is the only
-account anyone gets: once the terminal is up, everything else OpenSSH has to say
-goes into that window.
+`WorkspaceApp::open_ssh` is the only thing the desktop shell calls, and it
+collects the backend's diagnostics on both outcomes -- which is what makes it
+different from the other actions beside it.
+
+A refusal reaches the log unchanged: "Failed to open SSH session for VM …"
+followed by which Windows feature is missing, which port did not answer, which
+key is gone. A session that *opened* leaves the command it opened with:
+`SSH session for VM "dev": C:\Windows\System32\OpenSSH\ssh.exe -o
+HostKeyAlias="…" … -p 22 -l dev 172.30.0.5`. The launcher returns the
+`SshInvocation` it spawned and the repository logs
+`SshInvocation::command_line`, so what is shown is the argument vector that ran
+rather than a reconstruction of it -- tokens holding white space are quoted for
+reading, and the `-o` values keep the quotes OpenSSH's own parser needs.
+
+Both exist for the same reason: the session is a process in a window of its own
+and says nothing back. What was asked of `ssh.exe` -- which key, which
+known-hosts file, which port -- is knowable only at the moment of the spawn, and
+it is the first thing anyone needs when a guest refuses a login for a reason
+only the client saw. `command_line` is for reading, not for re-running: nothing
+on this path goes through a shell, and this is the only place these arguments
+ever become a single string.
 
 The UI decides only what is worth offering, from the summary it drew the list
 from. `ssh_offer` answers three things rather than a boolean, because "no
