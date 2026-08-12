@@ -58,10 +58,11 @@ impl VmDeletionPipeline {
     /// re-pick the subnet and move every guest's address, which is exactly what
     /// keeping an endpoint for the life of its VM exists to avoid.
     ///
-    /// With `delete_disks` the whole VM directory goes; without it only the
-    /// stored configuration does, and the disks are left for the user. The
-    /// image the VM was installed from is never touched: it belongs to the
-    /// user, not to the VM.
+    /// With `delete_disks` the whole VM directory goes; without it the disks are
+    /// left for the user and everything that only served the VM itself -- its
+    /// configuration and its SSH identity -- still goes, as [`remove_files`]
+    /// describes. The image the VM was installed from is never touched: it
+    /// belongs to the user, not to the VM.
     pub fn delete(
         &self,
         store: &MetadataStore,
@@ -134,28 +135,104 @@ impl Default for VmDeletionPipeline {
 }
 
 /// Removes the VM's files, honouring the user's choice about its disks.
+///
+/// Keeping the disks keeps the disks and nothing else that only made sense
+/// while the VM existed. The HCS configuration describes a compute system that
+/// is gone, and the VM's SSH identity -- its key pair and the host keys VMLord
+/// learned for it -- belongs to a guest nobody can reach through VMLord any
+/// more: a private key with no owner is worth removing on its own, and a
+/// `known_hosts` file kept past its VM would only pin the keys of a host that no
+/// longer answers. The kept disks are the user's to attach elsewhere, and a
+/// guest booted from them brings its own `authorized_keys` with it, so it is
+/// theirs to give a key of their own.
+///
+/// `cloud-init-status.log` and `com1.log` stay: they record what the VM did
+/// rather than how to log into it, which is exactly what a person who kept the
+/// disks may still need to read.
 fn remove_files(vm_directory: &Path, delete_disks: bool) -> Result<(), RepositoryError> {
     if delete_disks {
         return cleanup::remove_vm_directory(vm_directory);
     }
 
-    let configuration = layout::configuration_path(vm_directory);
-    if !configuration.exists() {
+    // Each removal runs even if an earlier one failed, for the reason the whole
+    // deletion works that way: one file left behind is not a reason to leave the
+    // others.
+    let mut failures = Vec::new();
+    if let Err(error) = remove_file_if_present(
+        &layout::configuration_path(vm_directory),
+        "the HCS configuration",
+    ) {
+        failures.push(error.to_string());
+    }
+    if let Err(error) = remove_directory_if_present(
+        &layout::ssh_keys_directory(vm_directory),
+        "the SSH key pair",
+    ) {
+        failures.push(error.to_string());
+    }
+    if let Err(error) = remove_file_if_present(
+        &layout::ssh_known_hosts_path(vm_directory),
+        "the learned SSH host keys",
+    ) {
+        failures.push(error.to_string());
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(cleanup::combine_failures(
+            "some files of the deleted VM were not removed",
+            failures,
+        ))
+    }
+}
+
+/// Removes `path`, treating a file that is not there as already removed.
+fn remove_file_if_present(path: &Path, description: &str) -> Result<(), RepositoryError> {
+    if !path.exists() {
         log::debug!(
-            "the configuration of the deleted VM at {} is already gone",
-            configuration.display()
+            "{description} of the deleted VM at {} is already gone",
+            path.display()
         );
         return Ok(());
     }
-    fs::remove_file(&configuration).map_err(|error| {
+    fs::remove_file(path).map_err(|error| {
         let error = RepositoryError::new(format!(
-            "failed to remove the HCS configuration {}: {error}",
-            configuration.display()
+            "failed to remove {description} of the deleted VM at {}: {error}",
+            path.display()
         ));
         log::error!("{error}");
         error
     })?;
-    log::debug!("removed the HCS configuration {}", configuration.display());
+    log::debug!(
+        "removed {description} of the deleted VM at {}",
+        path.display()
+    );
+    Ok(())
+}
+
+/// Removes `path` and everything under it, treating an absent directory as
+/// already removed.
+fn remove_directory_if_present(path: &Path, description: &str) -> Result<(), RepositoryError> {
+    if !path.exists() {
+        log::debug!(
+            "{description} of the deleted VM at {} is already gone",
+            path.display()
+        );
+        return Ok(());
+    }
+    fs::remove_dir_all(path).map_err(|error| {
+        let error = RepositoryError::new(format!(
+            "failed to remove {description} of the deleted VM at {}: {error}",
+            path.display()
+        ));
+        log::error!("{error}");
+        error
+    })?;
+    log::debug!(
+        "removed {description} of the deleted VM at {}",
+        path.display()
+    );
     Ok(())
 }
 
@@ -206,8 +283,10 @@ mod tests {
         order: Arc<Mutex<Vec<&'static str>>>,
     }
 
-    /// A VM as it looks on disk once creation is done: a configuration document
-    /// and a system disk under the VM's own directory.
+    /// A VM as it looks on disk once creation is done and it has been started
+    /// once: a configuration document, a system disk, the SSH key pair it was
+    /// given, the host key VMLord learned from it, and the readiness transcript
+    /// of its first boot.
     fn fixture(label: &str) -> Fixture {
         fixture_with(label, None)
     }
@@ -221,6 +300,19 @@ mod tests {
             .expect("configuration should be written");
         fs::write(vm_directory.join("disks").join("system.vhdx"), b"vhdx")
             .expect("system disk should be written");
+        fs::create_dir_all(crate::layout::ssh_keys_directory(&vm_directory))
+            .expect("keys directory should be created");
+        fs::write(crate::layout::ssh_key_path(&vm_directory), b"private")
+            .expect("private key should be written");
+        fs::write(crate::layout::ssh_public_key_path(&vm_directory), b"public")
+            .expect("public key should be written");
+        fs::write(crate::layout::ssh_known_hosts_path(&vm_directory), b"host")
+            .expect("known hosts should be written");
+        fs::write(
+            crate::layout::cloud_init_status_log_path(&vm_directory),
+            b"status: done",
+        )
+        .expect("readiness transcript should be written");
 
         let mapping = VmComputeSystemMapping {
             vm_id: Uuid::new_v4(),
@@ -401,6 +493,74 @@ mod tests {
                 .exists(),
             "the disks must survive when the user asked to keep them"
         );
+        assert!(
+            fixture
+                .store
+                .find_by_vm_name("dev")
+                .expect("the store should be readable")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn keeping_the_disks_still_takes_the_ssh_identity_with_the_vm() {
+        // The user asked to keep the disks, not to keep a private key for a VM
+        // that no longer exists.
+        let fixture = fixture("keep-disks-ssh");
+
+        pipeline(&fixture, false)
+            .delete(&fixture.store, "dev", &fixture.vm_directory, false)
+            .expect("deletion should succeed");
+
+        assert!(
+            !crate::layout::ssh_keys_directory(&fixture.vm_directory).exists(),
+            "the VM's key pair must not outlive the VM"
+        );
+        assert!(
+            !crate::layout::ssh_known_hosts_path(&fixture.vm_directory).exists(),
+            "the learned host keys pin a guest that can no longer be reached"
+        );
+        assert!(
+            crate::layout::cloud_init_status_log_path(&fixture.vm_directory).exists(),
+            "the readiness transcript says what the VM did, not how to log into it"
+        );
+        assert!(
+            fixture
+                .vm_directory
+                .join("disks")
+                .join("system.vhdx")
+                .exists(),
+            "removing the SSH identity must not touch the kept disks"
+        );
+    }
+
+    #[test]
+    fn a_full_deletion_takes_the_ssh_identity_with_everything_else() {
+        let fixture = fixture("delete-disks-ssh");
+
+        pipeline(&fixture, false)
+            .delete(&fixture.store, "dev", &fixture.vm_directory, true)
+            .expect("deletion should succeed");
+
+        assert!(!crate::layout::ssh_keys_directory(&fixture.vm_directory).exists());
+        assert!(!crate::layout::ssh_known_hosts_path(&fixture.vm_directory).exists());
+        assert!(!fixture.vm_directory.exists());
+    }
+
+    #[test]
+    fn a_vm_that_never_got_an_ssh_identity_leaves_nothing_to_remove() {
+        // A VM created with SSH disabled has no key pair and never learned a
+        // host key; that is a VM with nothing to clean up, not a failure.
+        let fixture = fixture("no-ssh-identity");
+        fs::remove_dir_all(crate::layout::ssh_keys_directory(&fixture.vm_directory))
+            .expect("the keys directory should be removable");
+        fs::remove_file(crate::layout::ssh_known_hosts_path(&fixture.vm_directory))
+            .expect("the known hosts file should be removable");
+
+        pipeline(&fixture, false)
+            .delete(&fixture.store, "dev", &fixture.vm_directory, false)
+            .expect("an absent SSH identity is not a failure");
+
         assert!(
             fixture
                 .store
