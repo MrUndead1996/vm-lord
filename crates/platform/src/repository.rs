@@ -686,6 +686,11 @@ impl VmRepository for HcsVmRepository {
                     DiagnosticLevel::Warning,
                     format!("VM \"{name}\" is up, but cloud-init finished degraded: {detail}"),
                 ),
+                CycleOutcome::Unverified { detail } => push_shared_diagnostic(
+                    &diagnostics,
+                    DiagnosticLevel::Warning,
+                    format!("VM \"{name}\" was created and started, but is not confirmed ready: {detail}"),
+                ),
                 CycleOutcome::NotReady { reason } => push_shared_diagnostic(
                     &diagnostics,
                     DiagnosticLevel::Error,

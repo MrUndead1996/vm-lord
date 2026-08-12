@@ -1425,10 +1425,10 @@ therefore carries on -- `BuildStep::Starting`, then `BuildStep::AwaitingGuest` -
 and the build leaves the list only once the guest's own `cloud-init status
 --wait` has answered.
 
-`guest_ready::GuestReadiness` waits in three phases, each with its own timeout
-and its own failure, because the three are different facts about the guest: the
-endpoint has to be given an address (HNS assigns it, the DHCP server delivers
-it), something has to answer a TCP connection on port 22, and cloud-init has to
+`guest_ready::GuestReadiness` waits in phases, each with its own timeout and its
+own failure, because they are different facts about the guest: the endpoint has
+to be given an address (HNS assigns it, the DHCP server delivers it), something
+has to answer a TCP connection on the guest's SSH port, and cloud-init has to
 report that it is done. The transport is `ssh.exe` from `%SystemRoot%\System32\
 OpenSSH`, its arguments built by `platform::ssh` like every other connection to a
 guest, driven as a child process behind a seam: every maintained Rust SSH
@@ -1438,6 +1438,36 @@ an optional Windows feature -- is an outcome of its own, named in the message a
 person acts on. The child's output goes to `cloud-init-status.log` beside
 `com1.log` rather than to a pipe: `--wait` prints for as long as it runs, and a
 pipe nobody drains fills and deadlocks the child against the loop polling it.
+
+Everything about the connection comes from `VmComputeSystemMapping::ssh`, the
+configuration the creation pipeline recorded, rather than from the request the
+VM was built out of: the wait runs against the VM that exists. The port it probes
+is therefore the one cloud-init configured the daemon with. Probing 22 instead
+would answer during the very window the wait exists to sit through -- a cloud
+image ships its daemon on 22 and the seed moves it -- and would then ask the
+question on a port nothing listens on. A configuration that cannot be connected
+with is refused before the first phase rather than after the address timeout: it
+is not going to become connectable in ninety seconds.
+
+How far the wait can get depends on how the VM lets VMLord in, so the two
+authentication modes end differently and say so:
+
+* **Key mode** asks the guest's own `cloud-init status --wait --long` over
+  `ssh.exe` and reports what it answered.
+* **Password mode** ends where the port opens. The password is in the head of
+  whoever created the VM, and a build is not a moment anyone is at a prompt;
+  nothing here tries to type one non-interactively, and no other credential may
+  stand in. The build succeeds with a warning naming what was not checked, which
+  is `GuestReady::Unverified` -- an outcome of its own rather than a `Ready` that
+  quietly means something weaker. A VM created with SSH switched off gets the
+  same answer for the same reason: there is no daemon to reach and nobody to ask.
+  Password mode needs no OpenSSH client on the host, because it runs none; a
+  missing client is the interactive launcher's problem to report.
+
+The probe and `ssh.exe` connect separately, so a guest can accept the probe and
+refuse the connection a moment later. That race is left alone deliberately: the
+probe exists to avoid a pointless first attempt, not to guarantee the second,
+and OpenSSH's own message is the better account of what went wrong anyway.
 
 Exit codes decide readiness. `0` is done, `2` is done-but-degraded -- reported as
 a warning with what `--long` said, because one broken cloud-init module must not
@@ -1456,7 +1486,7 @@ creation is cheap. Installation media has no cloud-init and no key of VMLord's,
 so there is nobody in that guest to ask: the cycle ends at a started VM.
 
 The four timeouts live in `AppSettings::guest_readiness` -- 90 seconds for the
-address, 300 for port 22, 1200 for cloud-init, 10 for one connection attempt --
+address, 300 for the SSH port, 1200 for cloud-init, 10 for one connection attempt --
 under `#[serde(default)]`, so a `settings.toml` written before they existed keeps
 loading. They are file-only: four second-counts for a case that arises once in
 the life of an installation would dilute a dialog that shows a path, a language
