@@ -7,7 +7,7 @@ license.workspace = true
 # The agent is a guest program, so it is not part of the workspace's default
 # build -- see `default-members` in the root manifest. Build it with:
 #
-#     cargo build -p vmlord-agent --target x86_64-unknown-linux-gnu
+#     cargo agent
 [[bin]]
 name = "vmlord-agent"
 bench = false

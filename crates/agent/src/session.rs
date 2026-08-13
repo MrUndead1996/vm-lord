@@ -10,13 +10,12 @@ use vmlord_agent_protocol::{
     auth::{self, Nonce, Secret},
     frame::{self, FrameError},
     v1::{
-        AuthenticateResponse, Envelope, ErrorCode, HeartbeatRequest, HeartbeatResponse,
-        HelloRequest, ProtocolVersion, envelope, request, response,
+        AuthenticateResponse, Envelope, ErrorCode, HeartbeatResponse, HelloRequest,
+        ProtocolVersion, envelope, request, response,
     },
 };
 
 const HELLO_REQUEST_ID: u32 = 1;
-const FIRST_HEARTBEAT_REQUEST_ID: u32 = HELLO_REQUEST_ID + 1;
 
 /// Opens and serves the guest half of an agent session.
 ///
@@ -65,6 +64,12 @@ fn greet<S: Read + Write>(
             refuse_unsupported(stream, request_id, buffer)?;
             Err(SessionError::OutOfOrder(kind_name(&kind)))
         }
+        Body::UnknownRequest => {
+            refuse_unsupported(stream, request_id, buffer)?;
+            Err(SessionError::OutOfOrder(
+                "an unsupported request out of order",
+            ))
+        }
         Body::Response(_) => Err(SessionError::OutOfOrder(
             "a response other than the hello reply",
         )),
@@ -91,6 +96,12 @@ fn authenticate<S: Read + Write>(
             refuse_unsupported(stream, request_id, buffer)?;
             return Err(SessionError::OutOfOrder(kind_name(&kind)));
         }
+        Body::UnknownRequest => {
+            refuse_unsupported(stream, request_id, buffer)?;
+            return Err(SessionError::OutOfOrder(
+                "an unsupported request out of order",
+            ));
+        }
         Body::Response(_) => {
             return Err(SessionError::OutOfOrder(
                 "a response instead of a challenge",
@@ -108,32 +119,10 @@ fn authenticate<S: Read + Write>(
 }
 
 fn serve<S: Read + Write>(stream: &mut S, buffer: &mut Vec<u8>) -> Result<(), SessionError> {
-    let mut next_request_id = FIRST_HEARTBEAT_REQUEST_ID;
-    let mut pending_heartbeat = None;
-
     loop {
         let envelope = match frame::read(stream, buffer) {
             Ok(envelope) => envelope,
             Err(FrameError::Closed) => return Ok(()),
-            Err(FrameError::Io(error))
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                ) =>
-            {
-                if pending_heartbeat.is_some() {
-                    return Err(SessionError::Frame(FrameError::Io(error)));
-                }
-                let request_id = next_request_id;
-                next_request_id = next_request_id
-                    .checked_add(1)
-                    .ok_or(SessionError::RequestIdsExhausted)?;
-                let heartbeat =
-                    Envelope::request(request_id, request::Kind::Heartbeat(HeartbeatRequest {}));
-                frame::write(stream, &heartbeat, buffer).map_err(SessionError::Frame)?;
-                pending_heartbeat = Some(request_id);
-                continue;
-            }
             Err(error) => return Err(SessionError::Frame(error)),
         };
 
@@ -144,11 +133,8 @@ fn serve<S: Read + Write>(stream: &mut S, buffer: &mut Vec<u8>) -> Result<(), Se
                     Envelope::response(request_id, response::Kind::Heartbeat(HeartbeatResponse {}));
                 frame::write(stream, &heartbeat, buffer).map_err(SessionError::Frame)?;
             }
-            Body::Request(_) => refuse_unsupported(stream, request_id, buffer)?,
-            Body::Response(response::Kind::Heartbeat(_))
-                if pending_heartbeat == Some(request_id) =>
-            {
-                pending_heartbeat = None;
+            Body::Request(_) | Body::UnknownRequest => {
+                refuse_unsupported(stream, request_id, buffer)?;
             }
             Body::Response(response::Kind::Error(error)) => {
                 return Err(SessionError::Refused {
@@ -184,16 +170,16 @@ fn refuse_unsupported<S: Write>(
 
 enum Body {
     Request(request::Kind),
+    UnknownRequest,
     Response(response::Kind),
 }
 
 fn body(envelope: Envelope) -> Result<Body, SessionError> {
     match envelope.body {
-        Some(envelope::Body::Request(request)) => {
-            request.kind.map(Body::Request).ok_or_else(|| {
-                SessionError::Malformed("a request with no kind this build knows".to_owned())
-            })
-        }
+        Some(envelope::Body::Request(request)) => Ok(request
+            .kind
+            .map(Body::Request)
+            .unwrap_or(Body::UnknownRequest)),
         Some(envelope::Body::Response(response)) => {
             response.kind.map(Body::Response).ok_or_else(|| {
                 SessionError::Malformed("a response with no kind this build knows".to_owned())
@@ -221,7 +207,6 @@ pub enum SessionError {
     InvalidHello,
     OutOfOrder(&'static str),
     Malformed(String),
-    RequestIdsExhausted,
 }
 
 impl fmt::Display for SessionError {
@@ -236,7 +221,6 @@ impl fmt::Display for SessionError {
             }
             Self::OutOfOrder(what) => write!(formatter, "the host sent {what}"),
             Self::Malformed(what) => write!(formatter, "the host sent {what}"),
-            Self::RequestIdsExhausted => formatter.write_str("the agent exhausted its request ids"),
         }
     }
 }
@@ -248,8 +232,7 @@ impl Error for SessionError {
             Self::Refused { .. }
             | Self::InvalidHello
             | Self::OutOfOrder(_)
-            | Self::Malformed(_)
-            | Self::RequestIdsExhausted => None,
+            | Self::Malformed(_) => None,
         }
     }
 }
@@ -265,8 +248,8 @@ mod tests {
         auth::{self, Nonce, Secret},
         frame,
         v1::{
-            AuthenticateRequest, ErrorCode, HeartbeatResponse, HelloRequest, HelloResponse,
-            ProtocolVersion, envelope, request, response,
+            AuthenticateRequest, ErrorCode, HelloRequest, HelloResponse, ProtocolVersion, envelope,
+            request, response,
         },
     };
 
@@ -295,6 +278,15 @@ mod tests {
             let mut bytes = Vec::new();
             frame::encode(&envelope, &mut bytes).expect("a host frame that fits");
             ReadStep::Bytes(bytes)
+        }
+
+        fn partial_frame(
+            envelope: vmlord_agent_protocol::v1::Envelope,
+            byte_count: usize,
+        ) -> ReadStep {
+            let mut bytes = Vec::new();
+            frame::encode(&envelope, &mut bytes).expect("a host frame that fits");
+            ReadStep::Bytes(bytes[..byte_count].to_vec())
         }
 
         fn written_frames(&self) -> Vec<vmlord_agent_protocol::v1::Envelope> {
@@ -341,9 +333,10 @@ mod tests {
     }
 
     #[test]
-    fn would_block_after_authentication_sends_a_heartbeat() {
-        // Treating Linux's SO_RCVTIMEO EAGAIN as a session error would make
-        // an otherwise idle host never receive its heartbeat.
+    fn would_block_after_authentication_ends_the_session_without_a_heartbeat() {
+        // `frame::read` cannot distinguish an idle timeout from one after it
+        // consumed part of a frame, so sending any new frame would corrupt the
+        // stream in the latter case.
         let secret = Secret::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
             .expect("a valid test secret");
         let nonce = Nonce::from_wire(&[7; auth::LEN]).expect("a valid nonce");
@@ -363,20 +356,18 @@ mod tests {
                 }),
             )),
             ReadStep::WouldBlock,
-            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::response(
-                2,
-                response::Kind::Heartbeat(HeartbeatResponse {}),
-            )),
-            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::request(
-                8,
-                request::Kind::Hello(HelloRequest::default()),
-            )),
         ]);
 
-        run(&mut stream, &secret, "test-agent").expect("a clean host hang-up");
+        let error = run(&mut stream, &secret, "test-agent")
+            .expect_err("a timeout must end the session before a frame can be written");
+        assert!(matches!(
+            error,
+            super::SessionError::Frame(frame::FrameError::Io(error))
+                if error.kind() == io::ErrorKind::WouldBlock
+        ));
 
         let frames = stream.written_frames();
-        assert_eq!(frames.len(), 4);
+        assert_eq!(frames.len(), 2);
         assert_eq!(
             frames[0],
             vmlord_agent_protocol::v1::Envelope::request(
@@ -396,19 +387,90 @@ mod tests {
             panic!("the challenge needs an authentication tag");
         };
         assert_eq!(authenticate.tag, auth::tag(&secret, &nonce).as_bytes());
-        assert_eq!(
-            frames[2],
-            vmlord_agent_protocol::v1::Envelope::request(
-                2,
-                request::Kind::Heartbeat(vmlord_agent_protocol::v1::HeartbeatRequest {}),
-            )
-        );
-        assert_eq!(frames[3].request_id, 8);
-        let Some(envelope::Body::Response(error)) = &frames[3].body else {
-            panic!("the unsupported request needs an error response");
+    }
+
+    #[test]
+    fn would_block_after_part_of_a_frame_does_not_send_a_heartbeat() {
+        // A heartbeat at this point would be interleaved with a host frame
+        // whose prefix has already been consumed, corrupting the session.
+        let secret = Secret::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .expect("a valid test secret");
+        let nonce = Nonce::from_wire(&[7; auth::LEN]).expect("a valid nonce");
+        let version = ProtocolVersion::current();
+        let mut stream = ScriptedStream::new([
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::response(
+                1,
+                response::Kind::Hello(HelloResponse {
+                    version: Some(version),
+                    capabilities: vec![],
+                }),
+            )),
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::request(
+                1,
+                request::Kind::Authenticate(AuthenticateRequest {
+                    nonce: nonce.as_bytes().to_vec(),
+                }),
+            )),
+            ScriptedStream::partial_frame(
+                vmlord_agent_protocol::v1::Envelope::request(
+                    8,
+                    request::Kind::Heartbeat(vmlord_agent_protocol::v1::HeartbeatRequest {}),
+                ),
+                1,
+            ),
+            ReadStep::WouldBlock,
+        ]);
+
+        let error = run(&mut stream, &secret, "test-agent")
+            .expect_err("a timeout after a partial frame must end the session");
+        assert!(matches!(
+            error,
+            super::SessionError::Frame(frame::FrameError::Io(error))
+                if error.kind() == io::ErrorKind::WouldBlock
+        ));
+        assert_eq!(stream.written_frames().len(), 2);
+    }
+
+    #[test]
+    fn an_unknown_request_kind_is_refused_with_its_request_id() {
+        // Turning an unrecognized request into a malformed-session error
+        // leaves a conforming host waiting forever for the response it needs.
+        let secret = Secret::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .expect("a valid test secret");
+        let nonce = Nonce::from_wire(&[7; auth::LEN]).expect("a valid nonce");
+        let version = ProtocolVersion::current();
+        let mut stream = ScriptedStream::new([
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::response(
+                1,
+                response::Kind::Hello(HelloResponse {
+                    version: Some(version),
+                    capabilities: vec![],
+                }),
+            )),
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::request(
+                1,
+                request::Kind::Authenticate(AuthenticateRequest {
+                    nonce: nonce.as_bytes().to_vec(),
+                }),
+            )),
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope {
+                request_id: 27,
+                body: Some(envelope::Body::Request(
+                    vmlord_agent_protocol::v1::Request::default(),
+                )),
+            }),
+        ]);
+
+        run(&mut stream, &secret, "test-agent").expect("the host closes after the refusal");
+
+        let frames = stream.written_frames();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[2].request_id, 27);
+        let Some(envelope::Body::Response(response)) = &frames[2].body else {
+            panic!("the unknown request needs an error response");
         };
-        let Some(response::Kind::Error(error)) = &error.kind else {
-            panic!("the unsupported request needs an error response");
+        let Some(response::Kind::Error(error)) = &response.kind else {
+            panic!("the unknown request needs an error response");
         };
         assert_eq!(error.code(), ErrorCode::UnsupportedRequest);
     }

@@ -14,7 +14,7 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!(
     "vmlord-agent runs in a Linux guest; build it with \
-     `cargo build -p vmlord-agent --target x86_64-unknown-linux-gnu`"
+     `cargo agent`"
 );
 
 use std::{error::Error, fs, process};
