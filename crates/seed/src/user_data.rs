@@ -256,7 +256,7 @@ fn entry(path: &str, content: &str, permissions: &str, owner: Option<&str>) -> S
 const KEYBOARD_PATH: &str = "/etc/default/keyboard";
 
 const AGENT_SERVICE_PATH: &str = "/etc/systemd/system/vmlord-agent.service";
-const AGENT_SERVICE: &str = "[Unit]\nDescription=VMLord guest agent\nConditionPathExists=/etc/vmlord/agent.secret\n\n[Service]\nExecStart=/usr/local/lib/vmlord/vmlord-agent\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n";
+const AGENT_SERVICE: &str = "[Unit]\nDescription=VMLord guest agent\nConditionPathExists=/etc/vmlord/agent.secret\n\n[Service]\nExecStart=/usr/local/lib/vmlord/vmlord-agent\nUser=root\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n";
 
 /// The content of that file.
 ///
@@ -637,6 +637,7 @@ mod tests {
         for line in [
             "ConditionPathExists=/etc/vmlord/agent.secret",
             "ExecStart=/usr/local/lib/vmlord/vmlord-agent",
+            "User=root",
             "Restart=always",
             "RestartSec=5",
             "WantedBy=multi-user.target",
