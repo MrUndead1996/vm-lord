@@ -12,6 +12,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use uuid::Uuid;
 use vmlord_core::{
     AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, GuestReadinessTimeouts, NetworkMode,
     RepositoryError, SshAvailability, VmCreateRequest, VmDeleteRequest, VmGpuFacts, VmRepository,
@@ -22,6 +23,7 @@ use crate::{
     CloudDiskImporter, Com1LogMode, HcsClient, HcsSystem, KnownVm, MetadataStore,
     VmComputeSystemMapping, VmConnections, VmDeletionPipeline, VmForceStopPipeline,
     VmShutdownPipeline, VmStartPipeline,
+    agent::{AgentConnection, AgentSessions},
     build::{BuildRegistry, StartedVm},
     cleanup,
     com1_terminal::{Com1Launcher, Com1Sessions},
@@ -67,6 +69,13 @@ pub struct HcsVmRepository {
     com1_launcher: Com1Launcher,
     /// The consoles VMLord currently owns, one per running VM.
     com1_sessions: Com1Sessions,
+    /// The agent connections VMLord currently owns, one per running VM.
+    ///
+    /// Beside the consoles rather than inside the start pipeline: like a
+    /// console, an agent connection belongs to a VM's run and has to be given
+    /// up when that run ends, and this is the only place that sees every way a
+    /// run can end.
+    agent_sessions: AgentSessions,
     /// Opens interactive SSH sessions into running guests. Nothing is kept
     /// beside it: a session belongs to whoever asked for it, not to VMLord.
     ssh_launcher: SshLauncher,
@@ -110,6 +119,7 @@ impl HcsVmRepository {
             start: VmStartPipeline::production(com1_launcher.clone()),
             com1_launcher,
             com1_sessions: Com1Sessions::default(),
+            agent_sessions: AgentSessions::default(),
             ssh_launcher: SshLauncher::production(),
             shutdown: VmShutdownPipeline::production(),
             force_stop: VmForceStopPipeline::production(),
@@ -356,10 +366,74 @@ impl HcsVmRepository {
                 mapping.vm_id
             ),
         }
+        self.listen_for_agent(mapping, self.runtime_id(mapping));
+    }
+
+    /// The partition a VM is running as right now.
+    ///
+    /// Asked of HCS rather than stored: Hyper-V hands out a new runtime id on
+    /// every start, so a recorded one would address the previous run.
+    fn runtime_id(&self, mapping: &VmComputeSystemMapping) -> Option<Uuid> {
+        list_known_vms(&self.client, &self.store)
+            .inspect_err(|error| {
+                log::warn!(
+                    "VMLord cannot tell which partition VM \"{}\" is running as: {error}",
+                    mapping.vm_name
+                );
+            })
+            .ok()?
+            .into_iter()
+            .find(|known| known.mapping.vm_id == mapping.vm_id)?
+            .runtime_id
+    }
+
+    /// Starts listening for the agent of a VM that is running.
+    ///
+    /// Nothing here can fail a start: the VM runs whether or not its agent can
+    /// be reached, and every way this can go wrong -- a partition HCS will not
+    /// name, a VM created before it was given an agent secret, a service its
+    /// configuration does not list -- leaves a working VM with no agent rather
+    /// than a broken one. Each is logged, and the VM is then listed with an
+    /// agent status of unknown, which is what "VMLord is not listening for
+    /// this one" honestly reads as.
+    fn listen_for_agent(&mut self, mapping: &VmComputeSystemMapping, runtime_id: Option<Uuid>) {
+        let Some(runtime_id) = runtime_id else {
+            log::warn!(
+                "VM \"{}\" ({}) is running, but HCS names no partition for it, so VMLord \
+                 cannot listen for its agent",
+                mapping.vm_name,
+                mapping.vm_id
+            );
+            return;
+        };
+        let vm_directory = match layout::vm_directory(&self.storage_root, &mapping.vm_name) {
+            Ok(directory) => directory,
+            Err(error) => {
+                log::warn!("VMLord cannot listen for the agent of this VM: {error}");
+                return;
+            }
+        };
+
+        match AgentConnection::start(
+            mapping,
+            runtime_id,
+            &layout::agent_secret_path(&vm_directory),
+        ) {
+            Ok(connection) => self.agent_sessions.insert(connection),
+            Err(error) => log::warn!(
+                "VM \"{}\" ({}) is running, but VMLord is not listening for its agent: {error}",
+                mapping.vm_name,
+                mapping.vm_id
+            ),
+        }
     }
 
     fn summary(&self, known: KnownVm) -> VmSummary {
-        let KnownVm { mapping, state } = known;
+        let KnownVm {
+            mapping,
+            state,
+            runtime_id: _,
+        } = known;
         // Read before `mapping.vm_name` is moved into the summary below.
         let network_mode = mapping.network_mode;
         let ssh = SshAvailability::from(mapping.ssh.clone());
@@ -369,7 +443,11 @@ impl HcsVmRepository {
         });
         let disk_gb = self.disk_gb(&mapping);
 
-        let state = vm_state(&mapping, state);
+        let state = vm_state(
+            &mapping,
+            state,
+            self.agent_sessions.is_online(mapping.vm_id),
+        );
         let ip_address = self.guest_address(&mapping, state);
 
         VmSummary {
@@ -584,13 +662,24 @@ fn merge_with_builds(known: Vec<VmSummary>, builds: &BuildRegistry) -> Vec<VmSum
 /// `Paused` or already-`Stopped` system is not running either. Only `Running`
 /// is running.
 ///
-/// Whether a running guest has finished booting is still not observable --
-/// HCS reports nothing about it, watch included -- so the agent status stays
-/// unknown until the guest agent lands.
-fn vm_state(mapping: &VmComputeSystemMapping, state: Option<HcsSystemState>) -> VmState {
+/// The agent status comes from the connection registry rather than from HCS,
+/// which reports nothing about what runs inside a guest. `agent_online` is
+/// `None` for a VM VMLord is not listening for at all -- one whose partition
+/// HCS would not name, or one created before VMs were given an agent -- and
+/// that is reported as unknown rather than offline: an agent that was never
+/// offered a socket has not failed to connect.
+fn vm_state(
+    mapping: &VmComputeSystemMapping,
+    state: Option<HcsSystemState>,
+    agent_online: Option<bool>,
+) -> VmState {
     match state {
         Some(HcsSystemState::Running) => VmState::Running {
-            agent_status: AgentStatus::Unknown,
+            agent_status: match agent_online {
+                Some(true) => AgentStatus::Online,
+                Some(false) => AgentStatus::Offline,
+                None => AgentStatus::Unknown,
+            },
         },
         Some(other) => {
             log::debug!(
@@ -686,6 +775,14 @@ impl VmRepository for HcsVmRepository {
         ) {
             log::warn!("{failure}");
             self.push_diagnostic(DiagnosticLevel::Warning, failure);
+        }
+        // A VM that survived the previous VMLord process has an agent inside it
+        // that is trying to reconnect, so the offer it connects to is put back
+        // up here rather than waiting for the VM to be started again.
+        for known in &known {
+            if known.state == Some(HcsSystemState::Running) {
+                self.listen_for_agent(&known.mapping, known.runtime_id);
+            }
         }
         // Before `initialized`, so no start of this process can have created an
         // endpoint the cleanup would then collect as one nobody owns.
@@ -841,6 +938,10 @@ impl VmRepository for HcsVmRepository {
 
         let mapping = self.mapping(name)?;
         self.shutdown.shutdown(&self.store, name)?;
+        // The agent goes down with the guest that runs it, and the partition
+        // its listener is bound to stops existing as HCS tears the compute
+        // system down.
+        self.agent_sessions.cancel(mapping.vm_id);
         // The console is left alone: the guest is still writing the messages it
         // prints on its way down, and the pipe closing is what ends the capture.
         // The guest powers off on its own schedule and HCS destroys the
@@ -859,6 +960,7 @@ impl VmRepository for HcsVmRepository {
         // Nothing will close the pipe from the other end: the compute system
         // was torn down under its guest.
         self.com1_sessions.cancel(mapping.vm_id);
+        self.agent_sessions.cancel(mapping.vm_id);
         self.connections.remove(mapping.vm_id);
         Ok(())
     }
@@ -875,9 +977,11 @@ impl VmRepository for HcsVmRepository {
         let mapping = self.mapping(&request.name)?;
         self.refuse_if_live(&mapping)?;
 
-        // Before the directory goes: the reader has `com1.log` open, and a VM
-        // being deleted has no console to keep.
+        // Before the directory goes: the reader has `com1.log` open, and the
+        // agent listener holds the secret read out of a file that is about to
+        // be removed.
         self.com1_sessions.cancel(mapping.vm_id);
+        self.agent_sessions.cancel(mapping.vm_id);
         let vm_directory = layout::vm_directory(&self.storage_root, &request.name)?;
         self.delete.delete(
             &self.store,
@@ -981,6 +1085,7 @@ impl VmRepository for HcsVmRepository {
             // read; cancelling closes the window rather than leaving it open on
             // a pipe that will never deliver again.
             self.com1_sessions.cancel(vm_id);
+            self.agent_sessions.cancel(vm_id);
             self.connections.remove(vm_id);
         }
         if drained.service_disconnected && !self.service_disconnect_reported {
@@ -1027,6 +1132,9 @@ impl Drop for HcsVmRepository {
         // First: a terminal window left open after VMLord is gone has nobody
         // to close it.
         self.com1_sessions.cancel_all();
+        // Each listener's thread is joined as it goes, so no socket outlives
+        // the process that bound it.
+        self.agent_sessions.cancel_all();
         self.builds.cancel_all_and_join();
     }
 }
@@ -1159,6 +1267,7 @@ mod tests {
     };
     use crate::{
         Com1Launcher, Com1LogMode, KnownVm, MetadataStore, VmComputeSystemMapping,
+        agent::AgentConnection,
         build::BuildRegistry,
         com1_terminal::{Com1Sessions, TerminalCommand},
         hcn_endpoint::EndpointAddress,
@@ -1399,6 +1508,7 @@ mod tests {
                 ssh: None,
             },
             state,
+            runtime_id: None,
         }
     }
 
@@ -1776,6 +1886,7 @@ mod tests {
         let summary = repository.summary(KnownVm {
             mapping: mapping(NetworkMode::Nat),
             state: None,
+            runtime_id: None,
         });
 
         assert_eq!(summary.network_mode, NetworkMode::Nat);
@@ -1825,10 +1936,68 @@ mod tests {
         let summary = repository.summary(KnownVm {
             mapping,
             state: None,
+            runtime_id: None,
         });
 
         assert_eq!(summary.state, VmState::Stopped);
         assert_eq!(summary.ip_address, None);
+    }
+
+    #[test]
+    fn a_running_vm_nobody_listens_for_has_an_agent_of_unknown_status() {
+        // Not offline: an agent that was never offered a socket -- a VM whose
+        // partition HCS would not name, one created before VMs had a secret --
+        // has not failed to connect.
+        let repository = repository();
+
+        let summary = repository.summary(KnownVm {
+            mapping: mapping(NetworkMode::None),
+            state: Some(HcsSystemState::Running),
+            runtime_id: Some(Uuid::new_v4()),
+        });
+
+        assert_eq!(
+            summary.state,
+            VmState::Running {
+                agent_status: AgentStatus::Unknown
+            }
+        );
+    }
+
+    #[test]
+    fn a_listener_reports_its_agent_as_offline_until_a_session_opens() {
+        let mut repository = repository();
+        let mapping = mapping(NetworkMode::None);
+        repository
+            .agent_sessions
+            .insert(AgentConnection::for_test(mapping.vm_id, false));
+
+        let waiting = repository.summary(KnownVm {
+            mapping: mapping.clone(),
+            state: Some(HcsSystemState::Running),
+            runtime_id: Some(Uuid::new_v4()),
+        });
+        repository
+            .agent_sessions
+            .insert(AgentConnection::for_test(mapping.vm_id, true));
+        let connected = repository.summary(KnownVm {
+            mapping,
+            state: Some(HcsSystemState::Running),
+            runtime_id: Some(Uuid::new_v4()),
+        });
+
+        assert_eq!(
+            waiting.state,
+            VmState::Running {
+                agent_status: AgentStatus::Offline
+            }
+        );
+        assert_eq!(
+            connected.state,
+            VmState::Running {
+                agent_status: AgentStatus::Online
+            }
+        );
     }
 
     #[test]
@@ -1840,6 +2009,7 @@ mod tests {
         let summary = repository.summary(KnownVm {
             mapping: mapping(NetworkMode::None),
             state: Some(HcsSystemState::Running),
+            runtime_id: Some(Uuid::new_v4()),
         });
 
         assert!(matches!(summary.state, VmState::Running { .. }));

@@ -19,6 +19,12 @@ pub struct KnownVm {
     /// the normal state of every stopped VM: HCS destroys a compute system as
     /// it stops.
     pub state: Option<HcsSystemState>,
+    /// The partition the VM is running as, when HCS reports one.
+    ///
+    /// What an HvSocket address names, and the only way to reach the agent
+    /// inside the guest. It is not recorded in the mapping because it is not a
+    /// property of the VM: Hyper-V hands out a new one on every start.
+    pub runtime_id: Option<Uuid>,
 }
 
 impl KnownVm {
@@ -65,6 +71,7 @@ fn reconcile(live: &[HcsSystemSummary], mappings: Vec<VmComputeSystemMapping>) -
                 return KnownVm {
                     mapping,
                     state: None,
+                    runtime_id: None,
                 };
             };
 
@@ -81,6 +88,7 @@ fn reconcile(live: &[HcsSystemSummary], mappings: Vec<VmComputeSystemMapping>) -
             KnownVm {
                 mapping,
                 state: Some(state),
+                runtime_id: system.runtime_id,
             }
         })
         .collect()
@@ -165,8 +173,12 @@ mod tests {
         HcsSystemSummary {
             id: id.into(),
             state: Some(state),
+            runtime_id: Some(RUNTIME_ID),
         }
     }
+
+    /// The partition a live compute system is reported to run as.
+    const RUNTIME_ID: Uuid = Uuid::from_u128(0x8636_363d_c5f9_49aa_b507_3b83_f98c_0d14);
 
     #[test]
     fn reconcile_carries_the_state_hcs_reports_for_each_mapping() {
@@ -191,14 +203,17 @@ mod tests {
                 KnownVm {
                     mapping: running,
                     state: Some(HcsSystemState::Running),
+                    runtime_id: Some(RUNTIME_ID),
                 },
                 KnownVm {
                     mapping: created,
                     state: Some(HcsSystemState::Created),
+                    runtime_id: Some(RUNTIME_ID),
                 },
                 KnownVm {
                     mapping: missing,
                     state: None,
+                    runtime_id: None,
                 },
             ]
         );
@@ -214,11 +229,23 @@ mod tests {
         let live = vec![HcsSystemSummary {
             id: "vmlord-1".into(),
             state: None,
+            runtime_id: Some(RUNTIME_ID),
         }];
 
         let result = reconcile(&live, vec![dev]);
 
         assert_eq!(result[0].state, Some(HcsSystemState::Created));
+    }
+
+    #[test]
+    fn a_stopped_vm_is_running_as_no_partition_at_all() {
+        // HCS destroys a compute system as it stops, so there is nothing left
+        // to address -- and nothing to listen for the VM's agent on.
+        let dev = mapping(Uuid::new_v4(), "dev-linux", "vmlord-1");
+
+        let result = reconcile(&[], vec![dev]);
+
+        assert_eq!(result[0].runtime_id, None);
     }
 
     #[test]
