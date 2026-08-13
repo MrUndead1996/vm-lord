@@ -1,12 +1,16 @@
 //! Application workflows shared by desktop, CLI, and future automation clients.
 
-use std::{fmt, path::PathBuf};
+pub mod gpu;
+
+use std::{collections::HashMap, fmt, path::PathBuf, time::SystemTime};
 
 use vmlord_core::{
     AppSettings, Diagnostic, DiagnosticLevel, GuestDefaults, RepositoryError, SettingsError,
-    SettingsStore, VmCreateRequest, VmDeleteRequest, VmRepository, VmState, VmSummary,
+    SettingsStore, VmCreateRequest, VmDeleteRequest, VmGpuStatus, VmRepository, VmState, VmSummary,
     VmUpdateRequest,
 };
+
+pub use gpu::derive_status as derive_gpu_status;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BackendStatus {
@@ -91,6 +95,12 @@ pub struct WorkspaceApp {
     guest_defaults: GuestDefaults,
     status: BackendStatus,
     vms: Vec<VmSummary>,
+    /// What GPU-PV is doing for each listed VM, keyed by VM name.
+    ///
+    /// Derived once per refresh rather than on every read, so that a status
+    /// keeps the time its facts were taken instead of ageing forward under a
+    /// UI that redraws sixty times a second.
+    gpu_status: HashMap<String, VmGpuStatus>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -110,6 +120,7 @@ impl WorkspaceApp {
             guest_defaults: GuestDefaults::default(),
             status: BackendStatus::Starting,
             vms: Vec::new(),
+            gpu_status: HashMap::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -240,7 +251,19 @@ impl WorkspaceApp {
         }
 
         match self.repository.list_vms() {
-            Ok(vms) => self.vms = vms,
+            Ok(vms) => {
+                let now = SystemTime::now();
+                self.gpu_status = vms
+                    .iter()
+                    .map(|vm| {
+                        (
+                            vm.name.clone(),
+                            gpu::derive_status(vm.gpu_mode, vm.state, &vm.gpu, now),
+                        )
+                    })
+                    .collect();
+                self.vms = vms;
+            }
             Err(error) => self.status = BackendStatus::Unavailable(error.to_string()),
         }
         self.collect_diagnostics();
@@ -532,6 +555,16 @@ impl WorkspaceApp {
         &self.vms
     }
 
+    /// What GPU-PV was doing for `vm_name` as of the last refresh.
+    ///
+    /// `None` for a name the last listing did not contain: a VM VMLord does
+    /// not know about has no GPU to report on, and answering "disabled" would
+    /// make a vanished VM look like a configured one.
+    #[must_use]
+    pub fn gpu_status(&self, vm_name: &str) -> Option<&VmGpuStatus> {
+        self.gpu_status.get(vm_name)
+    }
+
     #[must_use]
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
@@ -661,6 +694,9 @@ mod tests {
         should_fail: bool,
         create_should_fail: bool,
         vm_is_running: bool,
+        /// What the VM asks of the GPU, and what the backend saw of it.
+        gpu_mode: vmlord_core::GpuMode,
+        gpu: vmlord_core::VmGpuFacts,
         actions: Vec<String>,
         /// What the backend has to say next, which a real one accumulates while
         /// it works and hands over when it is asked.
@@ -690,7 +726,8 @@ mod tests {
                 ram_mb: 4096,
                 disk_gb: 64,
                 cpu_cores: 4,
-                gpu_mode: vmlord_core::GpuMode::None,
+                gpu_mode: self.gpu_mode,
+                gpu: self.gpu.clone(),
                 network_mode: vmlord_core::NetworkMode::Nat,
                 ip_address: None,
                 ssh: vmlord_core::SshAvailability::Enabled(vmlord_core::SshConfig {
@@ -807,6 +844,54 @@ mod tests {
             }),
             "the user has to be told the cancellation did not happen"
         );
+    }
+
+    /// The backend reports facts and the application layer says what they
+    /// mean: a VM that renders on its GPU is `GuestReady` without the backend
+    /// ever having named a state.
+    #[test]
+    fn the_application_layer_reads_a_gpu_status_out_of_the_backend_s_facts() {
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            vm_is_running: true,
+            gpu_mode: vmlord_core::GpuMode::Mirror,
+            gpu: vmlord_core::VmGpuFacts {
+                assignment: Some(vmlord_core::GpuAssignment::Complete(
+                    vmlord_core::NativeGpuDetail {
+                        adapter: Some("NVIDIA RTX 4070".into()),
+                        adapters: 2,
+                    },
+                )),
+                guest: Some(vmlord_core::GuestGpuReport::Ready(
+                    vmlord_core::GuestGpuDetail {
+                        driver: Some("dxgkrnl".into()),
+                        render_node: Some("/dev/dri/renderD128".into()),
+                    },
+                )),
+                observed_at: None,
+            },
+            ..FakeRepository::default()
+        }));
+        app.start();
+
+        let status = app.gpu_status("dev").expect("the listed VM has a status");
+
+        assert_eq!(status.state, vmlord_core::GpuState::GuestReady);
+        assert_eq!(status.code, vmlord_core::GpuStatusCode::GuestReady);
+        assert_eq!(
+            app.vms()[0].gpu_mode,
+            vmlord_core::GpuMode::Mirror,
+            "the desired mode is reported as it was stored, not as the runtime found it"
+        );
+    }
+
+    /// The status is derived per refresh, so a VM that is no longer listed has
+    /// none rather than a stale one.
+    #[test]
+    fn a_vm_the_backend_does_not_list_has_no_gpu_status() {
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()));
+        app.start();
+
+        assert!(app.gpu_status("never-created").is_none());
     }
 
     /// The create form fills three fields from this, and it is the composition

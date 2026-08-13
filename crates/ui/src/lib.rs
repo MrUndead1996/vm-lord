@@ -9,9 +9,10 @@ use eframe::egui;
 use vmlord_app::{BackendStatus, VmAction, WorkspaceApp};
 use vmlord_core::{
     AgentStatus, AppSettings, BuildProgress, BuildStep, CloudImage, DiagnosticLevel, DownloadPhase,
-    GpuMode, GuestDefaults, GuestReadinessTimeouts, Language, LogLevel, NetworkMode, Password,
-    Provisioning, SshAccess, SshPort, VmCreateRequest, VmDeleteRequest, VmSource, VmState,
-    VmSummary, VmUpdateRequest, ubuntu,
+    GpuMode, GpuState, GuestDefaults, GuestReadinessTimeouts, Language, LogLevel, NetworkMode,
+    Password,
+    Provisioning, SshAccess, SshPort, VmCreateRequest, VmDeleteRequest, VmGpuStatus, VmSource,
+    VmState, VmSummary, VmUpdateRequest, ubuntu,
 };
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -333,8 +334,12 @@ impl eframe::App for VmlordUi {
 
             ui.add_space(12.0);
             render_vm_list(ui, self.application.vms(), &mut self.selected_vm_name);
+            let gpu_status = self
+                .selected_vm_name
+                .as_deref()
+                .and_then(|name| self.application.gpu_status(name));
             if let Some(action) =
-                render_selected_vm(ui, self.application.vms(), &self.selected_vm_name)
+                render_selected_vm(ui, self.application.vms(), &self.selected_vm_name, gpu_status)
             {
                 selected_action = Some(action);
             }
@@ -1189,6 +1194,31 @@ fn language_label(language: Language) -> &'static str {
     }
 }
 
+/// What the GPU is doing right now, as opposed to what the VM asks of it.
+///
+/// Two rows rather than one: a VM configured for `Mirror` whose guest has not
+/// come up yet is not a VM without a GPU, and a single line could only say one
+/// of the two.
+fn gpu_status_detail(status: Option<&VmGpuStatus>) -> String {
+    // Only a VM the last refresh did not list has no status, and that VM is
+    // not on screen to be asked about.
+    let Some(status) = status else {
+        return "Unknown".into();
+    };
+    format!("{}: {}", gpu_state_label(status.state), status.message)
+}
+
+fn gpu_state_label(state: GpuState) -> &'static str {
+    match state {
+        GpuState::Disabled => "Disabled",
+        GpuState::WaitingForGuest => "Waiting for guest",
+        GpuState::Assigned => "Assigned",
+        GpuState::GuestReady => "Ready",
+        GpuState::Degraded => "Degraded",
+        GpuState::Failed => "Failed",
+    }
+}
+
 fn gpu_mode_label(mode: GpuMode) -> &'static str {
     match mode {
         GpuMode::None => "None",
@@ -1390,6 +1420,7 @@ fn render_selected_vm(
     ui: &mut egui::Ui,
     vms: &[VmSummary],
     selected_vm_name: &Option<String>,
+    gpu_status: Option<&VmGpuStatus>,
 ) -> Option<VmAction> {
     let Some(name) = selected_vm_name else {
         return None;
@@ -1513,6 +1544,7 @@ fn render_selected_vm(
             detail_row(ui, "RAM", format!("{} MiB", vm.ram_mb));
             detail_row(ui, "Disk", format!("{} GiB", vm.disk_gb));
             detail_row(ui, "GPU", gpu_mode_label(vm.gpu_mode).into());
+            detail_row(ui, "GPU status", gpu_status_detail(gpu_status));
             detail_row(ui, "SSH", ssh_detail(vm));
         });
 
@@ -1923,7 +1955,7 @@ fn vm_state(state: VmState) -> &'static str {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use vmlord_core::{SshAuthentication, SshAvailability, SshConfig};
+    use vmlord_core::{SshAuthentication, SshAvailability, SshConfig, VmGpuFacts};
 
     use super::*;
 
@@ -2265,6 +2297,7 @@ mod tests {
             disk_gb: 20,
             cpu_cores: 2,
             gpu_mode: GpuMode::None,
+            gpu: VmGpuFacts::default(),
             network_mode: NetworkMode::Nat,
             ip_address: None,
             ssh: SshAvailability::Disabled,

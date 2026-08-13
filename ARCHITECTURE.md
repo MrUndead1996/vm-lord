@@ -139,8 +139,9 @@ This layer exposes safe Rust APIs.
 It knows nothing about the UI.
 
 Its modules today: `settings`, `logging`, `progress`, `distro` (distribution
-profiles) and `provisioning` (what VMLord delivers into a Linux guest), plus
-the request, summary and repository types.
+profiles), `provisioning` (what VMLord delivers into a Linux guest) and `gpu`
+(what a VM asks of GPU-PV and what has been observed of it), plus the request,
+summary and repository types.
 
 ---
 
@@ -555,8 +556,8 @@ the migration leaves it something the native backend cannot do; any other value
 keep VMLord on the backend being retired.
 
 The native backend deliberately reports less than AppSandbox did while the
-remaining migration tasks land: GPU mode is `None`, guest agent status is
-`Unknown`, and display connections report that the backend does not support
+remaining migration tasks land: GPU mode is `None` and its GPU facts are empty,
+guest agent status is `Unknown`, and display connections report that the backend does not support
 them. SSH is not among them any more -- it is the native backend's alone, as
 "Running the OpenSSH client" describes, and availability is read from the VM's
 mapping, which records what its creation asked for. Network mode is reported from the VM's mapping, because the
@@ -861,6 +862,48 @@ What cannot be tested without a host is `#[ignore]`d in
 whose VHDX must stay far smaller than the disk it presents, and a real cloud
 image behind `VMLORD_TEST_CLOUD_IMAGE`. All of them need an elevated process,
 because `AttachVirtualDisk` fails with `ERROR_PRIVILEGE_NOT_HELD` without one.
+
+### GPU: desired mode and runtime status
+
+What a VM asks of the host's GPU and what GPU-PV is actually doing for it are
+two types, not one field. `GpuMode` is desired state: chosen in the create or
+edit form, stored with the VM, and unchanged by whatever a start makes of it --
+a `Mirror` VM whose adapters could not be attached is still a `Mirror` VM.
+`VmGpuStatus` is runtime state: derived per refresh, never stored, and thrown
+away when the next refresh describes the next moment. GPU is applied best
+effort and never blocks a start, so a VM routinely runs with less GPU than it
+asked for, and a single field would have to lie about one of the two.
+
+Between them sits `VmGpuFacts`, which is what a backend reports on `VmSummary`:
+what the host did when it tried to attach adapters (`GpuAssignment`: complete,
+partial with a reason, or failed), what the guest agent last said about the
+device it was given (`GuestGpuReport`: the device is present, it renders, or it
+cannot be used), and when the newest of those was observed. Facts only -- a
+backend never names a state. `vmlord_app::gpu::derive_status` turns them into a
+`VmGpuStatus`, and `WorkspaceApp` derives one per listed VM on every refresh
+and answers for it by name. Deriving once per refresh rather than per read is
+what lets a status keep the time its facts were taken, under a UI that redraws
+sixty times a second.
+
+A `VmGpuStatus` says three things at three levels of detail, so that the coarse
+one does not have to grow a variant per reason:
+
+* `GpuState` is what a person takes in at a glance -- `Disabled`,
+  `WaitingForGuest`, `Assigned`, `GuestReady`, `Degraded`, `Failed`. `Disabled`
+  covers both "this VM does not use GPU-PV" and "it is not running, so nothing
+  is attached"; neither is a failure, and a stopped `Mirror` VM must not be
+  painted like one whose assignment was rejected. `Degraded` is the state that
+  makes best-effort GPU legible: it works, with less than the mode asked for.
+* `GpuStage` says which step the reading came from: `Idle`, `Assignment` (the
+  host choosing adapters, attaching them and exporting their drivers) or
+  `Guest` (the guest bringing the GPU up).
+* `GpuStatusCode` says exactly why, and is stable: it is what logs, tests and
+  future automation match on, while the message beside it carries the
+  host-specific detail and is free to be reworded.
+
+The UI only displays this. It shows the desired mode and the runtime status as
+separate rows, because a VM configured for `Mirror` whose guest has not come up
+yet is not a VM without a GPU.
 
 ### VM update contract
 
