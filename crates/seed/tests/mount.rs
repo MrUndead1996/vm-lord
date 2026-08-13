@@ -19,7 +19,7 @@
 use std::{fs, path::PathBuf, process::Command};
 
 use vmlord_core::{SshAccess, SshPort, ubuntu};
-use vmlord_seed::{Seed, SeedRequest, build, image};
+use vmlord_seed::{Seed, SeedRequest, build, image, tools_image};
 
 /// A directory that unmounts and deletes itself however the test ends.
 struct Scratch {
@@ -30,6 +30,8 @@ impl Scratch {
     fn new() -> Self {
         let directory = std::env::temp_dir().join(format!("vmlord-seed-{}", std::process::id()));
         fs::create_dir_all(directory.join("mnt")).expect("a scratch directory should be creatable");
+        fs::create_dir_all(directory.join("tools-mnt"))
+            .expect("a tools scratch directory should be creatable");
         Self { directory }
     }
 
@@ -40,11 +42,22 @@ impl Scratch {
     fn mount_point(&self) -> PathBuf {
         self.directory.join("mnt")
     }
+
+    fn tools_image_path(&self) -> PathBuf {
+        self.directory.join("tools.iso")
+    }
+
+    fn tools_mount_point(&self) -> PathBuf {
+        self.directory.join("tools-mnt")
+    }
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
         let _ = Command::new("umount").arg(self.mount_point()).status();
+        let _ = Command::new("umount")
+            .arg(self.tools_mount_point())
+            .status();
         let _ = fs::remove_dir_all(&self.directory);
     }
 }
@@ -75,6 +88,9 @@ fn a_linux_kernel_reads_the_seed_the_way_cloud_init_will() {
     let seed = seed();
     let scratch = Scratch::new();
     fs::write(scratch.image_path(), image(&seed)).expect("the image should be written");
+    let agent = b"vmlord-agent test bytes";
+    fs::write(scratch.tools_image_path(), tools_image(agent))
+        .expect("the tools image should be written");
 
     // blkid is how cloud-init finds the seed: by label, not by device name.
     let label = Command::new("blkid")
@@ -105,5 +121,33 @@ fn a_linux_kernel_reads_the_seed_the_way_cloud_init_will() {
     assert_eq!(
         fs::read_to_string(mount_point.join("meta-data")).expect("meta-data should be readable"),
         seed.meta_data
+    );
+
+    let tools_label = Command::new("blkid")
+        .args(["-s", "LABEL", "-o", "value"])
+        .arg(scratch.tools_image_path())
+        .output()
+        .expect("blkid should be installed");
+    assert_eq!(
+        String::from_utf8_lossy(&tools_label.stdout).trim(),
+        "VMLTOOLS",
+        "blkid stderr: {}",
+        String::from_utf8_lossy(&tools_label.stderr)
+    );
+
+    let tools_mounted = Command::new("mount")
+        .args(["-o", "loop,ro"])
+        .arg(scratch.tools_image_path())
+        .arg(scratch.tools_mount_point())
+        .status()
+        .expect("mount should be installed");
+    assert!(
+        tools_mounted.success(),
+        "tools mount failed; this test needs root"
+    );
+    assert_eq!(
+        fs::read(scratch.tools_mount_point().join("vmlord-agent"))
+            .expect("the agent should be readable"),
+        agent
     );
 }
