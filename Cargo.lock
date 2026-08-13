@@ -4506,9 +4506,15 @@ dependencies = [
 name = "vmlord-agent-protocol"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "getrandom 0.3.4",
+ "hmac",
  "prost",
  "prost-build",
  "protox",
+ "sha2 0.10.9",
+ "subtle",
+ "zeroize",
 ]
 
 [[package]]
@@ -4571,6 +4577,7 @@ dependencies = [
  "serde_json",
  "sha-crypt",
  "uuid",
+ "vmlord-agent-protocol",
  "vmlord-core",
  "vmlord-image",
  "vmlord-keys",
@@ -4585,6 +4592,7 @@ version = "0.1.0"
 dependencies = [
  "log",
  "serde_yaml_ng",
+ "vmlord-agent-protocol",
  "vmlord-core",
 ]
 

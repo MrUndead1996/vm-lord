@@ -36,6 +36,13 @@ pub struct SeedRequest<'a> {
     /// How the distribution runs its SSH daemon: the units to disable when SSH
     /// is off, and the files to write when it is on.
     pub ssh_daemon: &'a SshDaemon,
+    /// The VM's agent secret, base64 as `auth::Secret::to_base64` prints it.
+    /// `None` is a VM whose guest runs no agent.
+    ///
+    /// Already encoded rather than a `Secret`, for the reason the password
+    /// arrives here hashed: this crate prints documents and has no business
+    /// holding the thing itself.
+    pub agent_secret: Option<&'a str>,
 }
 
 /// The two documents that go into the seed volume.
@@ -139,6 +146,7 @@ mod tests {
             timezone: "Europe/Moscow",
             admin_group: "sudo",
             ssh_daemon: &UBUNTU_SSH,
+            agent_secret: None,
         });
 
         assert!(seed.user_data.starts_with("#cloud-config\n"));
@@ -164,6 +172,7 @@ mod tests {
             timezone: "Europe/Moscow",
             admin_group: "sudo",
             ssh_daemon: &UBUNTU_SSH,
+            agent_secret: None,
         });
 
         let bytes = super::image(&seed);

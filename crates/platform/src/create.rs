@@ -3,6 +3,7 @@
 use std::{fs, io::Write, path::Path, time::Duration};
 
 use uuid::Uuid;
+use vmlord_agent_protocol::auth;
 use vmlord_core::{
     BuildMonitor, BuildStep, CloudImage, Provisioning, RepositoryError, SshAccess, VmCreateRequest,
     VmSource,
@@ -352,8 +353,8 @@ fn create_hcs_system(id: &str, configuration: &str) -> Result<(), RepositoryErro
     }
 }
 
-/// Writes everything the guest's first boot reads: the VM's key pair, and the
-/// seed volume carrying the cloud-config documents.
+/// Writes everything the guest's first boot reads: the VM's key pair, its
+/// agent secret, and the seed volume carrying the cloud-config documents.
 ///
 /// The password is hashed here rather than carried further: what reaches
 /// `vmlord-seed` -- and through it the volume that stays attached to a running
@@ -383,6 +384,19 @@ fn write_provisioning(
         .map(password_hash::hash_password)
         .transpose()?;
 
+    // Minted here and written twice: once for the host, which is what verifies
+    // a session, and once into the seed, which is the only way it reaches the
+    // guest. It is never rotated -- a VM's secret lives as long as the VM --
+    // and never travels on the agent protocol itself.
+    let agent_secret = auth::Secret::generate().to_base64();
+    let agent_secret_path = layout::agent_secret_path(vm_directory);
+    write_restricted(
+        &agent_secret_path,
+        format!("{}\n", agent_secret.as_str()).as_bytes(),
+        "the agent secret",
+    )?;
+    log::debug!("wrote the agent secret at {}", agent_secret_path.display());
+
     let seed = vmlord_seed::build(&vmlord_seed::SeedRequest {
         vm_name,
         instance_id,
@@ -395,37 +409,41 @@ fn write_provisioning(
         timezone: &provisioning.timezone,
         admin_group: &image.profile.admin_group,
         ssh_daemon: &image.profile.ssh,
+        agent_secret: Some(&agent_secret),
     });
 
-    write_seed(seed_path, &vmlord_seed::image(&seed))?;
+    write_restricted(seed_path, &vmlord_seed::image(&seed), "the cloud-init seed")?;
     log::debug!("wrote the cloud-init seed at {}", seed_path.display());
     Ok(())
 }
 
-/// Writes the seed volume under the same DACL the private key gets.
+/// Writes a file of the VM's under the same DACL the private key gets.
 ///
-/// The volume carries the password's SHA-512-crypt entry, so it is as much a
-/// secret on disk as the key is, and the storage root is a path the owner
-/// chooses -- point it somewhere with an inherited `Users:(R)` and the hash is
+/// Both callers hold a secret: the seed carries the password's SHA-512-crypt
+/// entry and the guest's copy of the agent secret, and `agent.secret` is the
+/// host's copy of the same. The storage root is a path the owner chooses --
+/// point it somewhere with an inherited `Users:(R)` and either file would be
 /// readable by every local account. The ordering is `vm_key`'s: create the
 /// file empty, narrow it, and only then write, so that the bytes never exist
 /// under permissions wider than the ones they end up with.
 ///
 /// The DACL is protected, which severs what the parent hands down but not what
 /// is added explicitly afterwards -- `HcsGrantVmAccess` still puts the VM's own
-/// SID on the file, which is why it can go on reading its seed.
-fn write_seed(seed_path: &Path, bytes: &[u8]) -> Result<(), RepositoryError> {
-    let mut file = fs::File::create(seed_path).map_err(|error| seed_failure(seed_path, &error))?;
-    vm_key::restrict_to_owner(seed_path)?;
+/// SID on the seed, which is why the guest can go on reading it. Nothing
+/// grants the VM its way onto `agent.secret`: the guest has its own copy.
+fn write_restricted(path: &Path, bytes: &[u8], description: &str) -> Result<(), RepositoryError> {
+    let mut file =
+        fs::File::create(path).map_err(|error| write_failure(path, description, &error))?;
+    vm_key::restrict_to_owner(path)?;
     file.write_all(bytes)
         .and_then(|()| file.flush())
-        .map_err(|error| seed_failure(seed_path, &error))
+        .map_err(|error| write_failure(path, description, &error))
 }
 
-fn seed_failure(seed_path: &Path, error: &std::io::Error) -> RepositoryError {
+fn write_failure(path: &Path, description: &str, error: &std::io::Error) -> RepositoryError {
     let error = RepositoryError::new(format!(
-        "failed to write the cloud-init seed at {}: {error}",
-        seed_path.display()
+        "failed to write {description} at {}: {error}",
+        path.display()
     ));
     log::error!("{error}");
     error
@@ -866,7 +884,7 @@ mod tests {
         // travels in the seed volume alone.
         let stored = fs::read_to_string(fixture.vm_directory.join("config.json")).unwrap();
         for document in [&create_calls[0].1, &stored] {
-            assert!(!document.contains("secret"), "got {document}");
+            assert!(!document.contains("hunter2"), "got {document}");
             assert!(!document.contains("$6$"), "got {document}");
         }
         assert!(calls.teardown.lock().unwrap().is_empty());
@@ -1069,7 +1087,7 @@ mod tests {
                 },
                 provisioning: Provisioning {
                     username: "dev".into(),
-                    password: Some(Password::new("secret")),
+                    password: Some(Password::new("hunter2")),
                     ssh: SshAccess::Enabled {
                         deploy_key: true,
                         port: SshPort::DEFAULT,
@@ -1129,7 +1147,7 @@ mod tests {
         let seed = seed_bytes(&fixture.vm_directory);
         assert!(seed.contains("$6$"), "the seed carries the password hash");
         assert!(
-            !seed.contains("secret"),
+            !seed.contains("hunter2"),
             "and the hash instead of the password, not beside it"
         );
         assert!(seed.contains(public_key.trim_end()), "and the public key");
@@ -1140,7 +1158,7 @@ mod tests {
         let stored = fs::read_to_string(fixture.vm_directory.join("config.json")).unwrap();
         let create_calls = calls.create.lock().unwrap();
         for document in [&create_calls[0].1, &stored] {
-            assert!(!document.contains("secret"), "got {document}");
+            assert!(!document.contains("hunter2"), "got {document}");
             assert!(!document.contains("$6$"), "got {document}");
         }
         drop(create_calls);
@@ -1159,6 +1177,121 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// The secret exists in exactly two places: a host file the VM cannot
+    /// read, and the seed the guest boots from. It never reaches the HCS
+    /// document, which is not a secret at all.
+    #[test]
+    fn a_cloud_vm_gets_an_agent_secret_the_host_and_the_seed_agree_on() {
+        let fixture = fixture("cloud-agent-secret");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+
+        pipeline
+            .create(
+                &fixture.store,
+                &cloud_request("cloud-agent-vm"),
+                &fixture.vm_directory,
+                &monitor(),
+            )
+            .expect("creation should succeed");
+
+        let stored =
+            fs::read_to_string(crate::layout::agent_secret_path(&fixture.vm_directory)).unwrap();
+        // Readable as a secret at all, which a truncated or mangled file
+        // would not be.
+        vmlord_agent_protocol::auth::Secret::from_base64(&stored)
+            .expect("the host's copy is a secret");
+
+        let seed = seed_bytes(&fixture.vm_directory);
+        assert!(
+            seed.contains(stored.trim_end()),
+            "the guest gets the same secret through its seed"
+        );
+        assert!(seed.contains("/etc/vmlord/agent.secret"));
+
+        let configuration = fs::read_to_string(fixture.vm_directory.join("config.json")).unwrap();
+        assert!(!configuration.contains(stored.trim_end()));
+    }
+
+    #[test]
+    fn the_agent_secret_is_written_with_the_same_restricted_dacl_as_the_key() {
+        let fixture = fixture("cloud-agent-secret-dacl");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+
+        pipeline
+            .create(
+                &fixture.store,
+                &cloud_request("cloud-agent-dacl-vm"),
+                &fixture.vm_directory,
+                &monitor(),
+            )
+            .expect("creation should succeed");
+
+        let descriptor = crate::vm_key::security_descriptor(&crate::layout::agent_secret_path(
+            &fixture.vm_directory,
+        ))
+        .expect("the DACL should be read back");
+        assert!(descriptor.contains("D:P"), "{descriptor}");
+        assert!(
+            !descriptor.contains(";ID;"),
+            "nothing may be inherited from the storage root: {descriptor}"
+        );
+        assert_eq!(
+            descriptor.matches("(A;;FA;;;").count(),
+            3,
+            "SYSTEM, Administrators and the owner, and nobody else: {descriptor}"
+        );
+    }
+
+    /// The VM opens its seed and nothing else of VMLord's: the host's copy of
+    /// the secret is not something the guest has any business reading.
+    #[test]
+    fn the_vm_is_never_granted_access_to_the_hosts_copy_of_the_secret() {
+        let fixture = fixture("cloud-agent-secret-grant");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+
+        pipeline
+            .create(
+                &fixture.store,
+                &cloud_request("cloud-agent-grant-vm"),
+                &fixture.vm_directory,
+                &monitor(),
+            )
+            .expect("creation should succeed");
+
+        let secret = crate::layout::agent_secret_path(&fixture.vm_directory);
+        assert!(
+            calls
+                .grant
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(_, path)| path != &secret)
+        );
+    }
+
+    /// A VM installed from local media runs no agent: VMLord promises nothing
+    /// about the system inside it, so there is nothing to authenticate.
+    #[test]
+    fn a_local_media_vm_gets_no_agent_secret() {
+        let fixture = fixture("local-media-agent-secret");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+
+        pipeline
+            .create(
+                &fixture.store,
+                &fixture.request,
+                &fixture.vm_directory,
+                &monitor(),
+            )
+            .expect("creation should succeed");
+
+        assert!(!crate::layout::agent_secret_path(&fixture.vm_directory).exists());
     }
 
     #[test]
@@ -1207,7 +1340,7 @@ mod tests {
                 },
                 provisioning: Provisioning {
                     username: "dev".into(),
-                    password: Some(Password::new("secret")),
+                    password: Some(Password::new("hunter2")),
                     ssh: SshAccess::Disabled,
                     locale: "en_US.UTF-8".into(),
                     keyboard: "us".into(),
@@ -1275,7 +1408,7 @@ mod tests {
                 },
                 provisioning: Provisioning {
                     username: "dev".into(),
-                    password: Some(Password::new("secret")),
+                    password: Some(Password::new("hunter2")),
                     ssh: SshAccess::Enabled {
                         deploy_key: false,
                         port: SshPort::DEFAULT,

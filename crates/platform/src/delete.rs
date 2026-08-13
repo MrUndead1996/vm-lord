@@ -146,6 +146,11 @@ impl Default for VmDeletionPipeline {
 /// guest booted from them brings its own `authorized_keys` with it, so it is
 /// theirs to give a key of their own.
 ///
+/// The agent secret goes with them, for the same reason: it authenticates an
+/// agent as this VM, and the VM it would speak for no longer exists. The
+/// guest's own copy rides along in the seed, which stays with the disks it
+/// provisioned.
+///
 /// `cloud-init-status.log` and `com1.log` stay: they record what the VM did
 /// rather than how to log into it, which is exactly what a person who kept the
 /// disks may still need to read.
@@ -174,6 +179,11 @@ fn remove_files(vm_directory: &Path, delete_disks: bool) -> Result<(), Repositor
         &layout::ssh_known_hosts_path(vm_directory),
         "the learned SSH host keys",
     ) {
+        failures.push(error.to_string());
+    }
+    if let Err(error) =
+        remove_file_if_present(&layout::agent_secret_path(vm_directory), "the agent secret")
+    {
         failures.push(error.to_string());
     }
 
@@ -313,6 +323,8 @@ mod tests {
             b"status: done",
         )
         .expect("readiness transcript should be written");
+        fs::write(crate::layout::agent_secret_path(&vm_directory), b"c2VjcmV0")
+            .expect("agent secret should be written");
 
         let mapping = VmComputeSystemMapping {
             vm_id: Uuid::new_v4(),
@@ -532,6 +544,41 @@ mod tests {
                 .exists(),
             "removing the SSH identity must not touch the kept disks"
         );
+    }
+
+    /// The secret authenticates an agent as this VM. The VM is gone, so what
+    /// the secret would authenticate is gone with it -- and unlike the disks,
+    /// it is of no use to anyone who kept them.
+    #[test]
+    fn keeping_the_disks_still_takes_the_agent_secret_with_the_vm() {
+        let fixture = fixture("keep-disks-agent-secret");
+
+        pipeline(&fixture, false)
+            .delete(&fixture.store, "dev", &fixture.vm_directory, false)
+            .expect("deletion should succeed");
+
+        assert!(!crate::layout::agent_secret_path(&fixture.vm_directory).exists());
+        assert!(
+            fixture
+                .vm_directory
+                .join("disks")
+                .join("system.vhdx")
+                .exists(),
+            "removing the secret must not touch the kept disks"
+        );
+    }
+
+    /// A VM created from local media never got a secret; having nothing to
+    /// remove is not a failed deletion.
+    #[test]
+    fn a_vm_that_never_got_an_agent_secret_leaves_nothing_to_remove() {
+        let fixture = fixture("no-agent-secret");
+        fs::remove_file(crate::layout::agent_secret_path(&fixture.vm_directory))
+            .expect("the secret should be removable");
+
+        pipeline(&fixture, false)
+            .delete(&fixture.store, "dev", &fixture.vm_directory, false)
+            .expect("deletion should succeed");
     }
 
     #[test]

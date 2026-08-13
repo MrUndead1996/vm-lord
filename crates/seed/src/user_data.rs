@@ -4,6 +4,7 @@
 //! what it must be is known exactly -- including the `#cloud-config` line, which
 //! is a comment to YAML and the format marker to cloud-init.
 
+use vmlord_agent_protocol::auth::GUEST_SECRET_PATH;
 use vmlord_core::{SshAccess, SshPort};
 
 use crate::{SeedRequest, scalar};
@@ -68,6 +69,16 @@ fn write_files(request: &SeedRequest<'_>) -> String {
         if let Some(path) = &request.ssh_daemon.socket_drop_in {
             files.push_str(&file(path, &socket_settings(port)));
         }
+    }
+    if let Some(secret) = request.agent_secret {
+        // Root alone, unlike everything else here: the other files describe
+        // the guest, and this one is what lets a process claim to be its
+        // agent.
+        files.push_str(&restricted_file(
+            GUEST_SECRET_PATH,
+            &format!("{secret}\n"),
+            "root:root",
+        ));
     }
     files
 }
@@ -172,15 +183,29 @@ fn password_login_allowed(request: &SeedRequest<'_>) -> bool {
     matches!(request.ssh, vmlord_core::SshAccess::Enabled { .. }) && request.password_hash.is_some()
 }
 
-/// One `write_files` entry: a path, the permissions every file here gets, and
-/// the content as a block scalar.
+/// One `write_files` entry for a file the whole guest may read.
 fn file(path: &str, content: &str) -> String {
+    entry(path, content, "0644", None)
+}
+
+/// One `write_files` entry for a file nobody but its owner may read.
+fn restricted_file(path: &str, content: &str, owner: &str) -> String {
+    entry(path, content, "0600", Some(owner))
+}
+
+/// A `write_files` entry: a path, its permissions and owner, and the content
+/// as a block scalar.
+fn entry(path: &str, content: &str, permissions: &str, owner: Option<&str>) -> String {
     let body = content
         .lines()
         .map(|line| format!("{FILE_INDENT}{line}\n"))
         .collect::<String>();
+    let owner = owner
+        .map(|owner| format!("    owner: {}\n", scalar::yaml(owner)))
+        .unwrap_or_default();
+
     format!(
-        "  - path: {}\n    permissions: '0644'\n    content: |\n{body}",
+        "  - path: {}\n    permissions: '{permissions}'\n{owner}    content: |\n{body}",
         scalar::yaml(path)
     )
 }
@@ -209,13 +234,14 @@ fn keyboard_settings(layout: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::render;
+    use super::{GUEST_SECRET_PATH, render};
     use crate::{SeedRequest, UBUNTU_SSH};
     use serde_yaml_ng::Value;
     use vmlord_core::{SshAccess, SshDaemon, SshPort};
 
     const HASH: &str = "$6$rounds=4096$salt$hash";
     const KEY: &str = "ssh-ed25519 AAAAC3Nz vmlord";
+    const AGENT_SECRET: &str = "Zm9ydHktdHdvIGJ5dGVzIG9mIHNlY3JldCBoZXJlIQ==";
     const SSHD_DROP_IN: &str = "/etc/ssh/sshd_config.d/10-vmlord.conf";
     const SOCKET_DROP_IN: &str = "/etc/systemd/system/ssh.socket.d/10-vmlord.conf";
 
@@ -235,6 +261,10 @@ mod tests {
             timezone: "Europe/Moscow",
             admin_group: "sudo",
             ssh_daemon: &UBUNTU_SSH,
+            // The fixture is a VM with no agent, so that the tests counting
+            // written files stay about the files they are named after. The
+            // two tests about the secret set it themselves.
+            agent_secret: None,
         }
     }
 
@@ -510,6 +540,38 @@ mod tests {
         assert!(!document.contains("hunter2"));
         assert!(!document.contains("PRIVATE KEY"));
         assert!(document.contains(HASH), "the hash is what the guest needs");
+    }
+
+    /// The agent's secret is the one file in the document no other account may
+    /// read: anything that can read it can open an authenticated session as
+    /// this VM's agent.
+    #[test]
+    fn the_agent_secret_is_written_where_only_root_can_read_it() {
+        let document = parsed(&render(&SeedRequest {
+            agent_secret: Some(AGENT_SECRET),
+            ..request()
+        }));
+
+        let file = file(&document, GUEST_SECRET_PATH);
+        assert_eq!(file["content"], Value::from(format!("{AGENT_SECRET}\n")));
+        assert_eq!(file["permissions"], Value::from("0600"));
+        assert_eq!(file["owner"], Value::from("root:root"));
+    }
+
+    #[test]
+    fn a_vm_with_no_agent_secret_has_no_such_file() {
+        let document = parsed(&render(&SeedRequest {
+            agent_secret: None,
+            ..request()
+        }));
+
+        assert!(
+            document["write_files"]
+                .as_sequence()
+                .expect("write_files is a list")
+                .iter()
+                .all(|file| file["path"].as_str() != Some(GUEST_SECRET_PATH))
+        );
     }
 
     /// A value with an apostrophe is the one that breaks naive quoting.

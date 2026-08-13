@@ -65,6 +65,7 @@ fn seed() -> Seed {
         timezone: "Europe/Moscow",
         admin_group: "sudo",
         ssh_daemon: &ubuntu().ssh,
+        agent_secret: None,
     })
 }
 

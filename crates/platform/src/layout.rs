@@ -76,6 +76,17 @@ pub(crate) fn seed_path(vm_directory: &Path) -> PathBuf {
     vm_directory.join("seed.iso")
 }
 
+/// Returns the path of the host's copy of the VM's agent secret.
+///
+/// Beside `config.json` rather than in `keys/`: that directory is the VM's SSH
+/// identity, and this is what authenticates the agent inside the guest, which
+/// is a different thing reached by a different route. The guest's copy travels
+/// in the seed; this one is the host's and the VM is never granted access to
+/// it.
+pub(crate) fn agent_secret_path(vm_directory: &Path) -> PathBuf {
+    vm_directory.join("agent.secret")
+}
+
 /// Returns the directory holding the VM's own SSH key pair.
 ///
 /// A directory of its own rather than loose files beside `config.json`: it is
@@ -140,6 +151,18 @@ mod tests {
             PathBuf::from("/vms")
                 .join("dev-linux")
                 .join("cloud-init-status.log")
+        );
+    }
+
+    #[test]
+    fn the_agent_secret_lives_beside_the_configuration_not_among_the_disks() {
+        // The guest's copy travels in the seed; this is the host's, and it is
+        // what a deletion that keeps the disks has to take away.
+        let directory = vm_directory(Path::new("/vms"), "dev-linux").unwrap();
+
+        assert_eq!(
+            super::agent_secret_path(&directory),
+            PathBuf::from("/vms").join("dev-linux").join("agent.secret")
         );
     }
 

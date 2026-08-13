@@ -1333,7 +1333,8 @@ VHDX is not created empty and then filled, it arrives already carrying the
 image, sized for the VM rather than for the image. Then `write_provisioning`
 writes what the first boot reads: the SSH key pair, when `deploy_key` asked for
 one; the `$6$` hash of the password, made here so that nothing further down ever
-holds the plaintext; and the seed volume built from both. After that the branches
+holds the plaintext; the VM's agent secret, kept in `agent.secret` and handed
+to the guest through the seed; and the seed volume built from all three. After that the branches
 converge: `config.json` is written, the VM is granted access to its disk and to
 its medium, the compute system is created, and the mapping is inserted last, so
 a VM is known to VMLord only once it exists in HCS.
@@ -1815,6 +1816,39 @@ version -- an agent on a VM with no GPU is not an older agent -- and only
 capabilities both peers named may be used. A capability number this build has
 never heard of is dropped rather than refused, which is what lets a newer agent
 talk to an older host at all.
+
+A session proves who it is with a secret the VM was created with. VMLord mints
+32 random bytes per VM in `write_provisioning`, beside the SSH key pair, and
+writes them twice: into `<vm>/agent.secret` for itself, and into the seed as
+`/etc/vmlord/agent.secret`, owned by root with mode `0600`. Both host files are
+written the way the private key is -- created empty, narrowed by
+`vm_key::restrict_to_owner`, and only then filled -- but only the seed is handed
+to the VM by `HcsGrantVmAccess`: the guest has its own copy and has no business
+reading the host's. One secret per VM rather than one for all of them, for the
+reason each VM gets its own SSH key: the compromise of one guest must not reach
+the next. `auth::GUEST_SECRET_PATH` is where the path is spelled, once, because
+the crate that writes the seed and the crate that reads the file inside the
+guest must not spell it separately.
+
+The secret never travels on the protocol. What travels is a challenge: after
+the hello exchange the host sends `AuthenticateRequest` with a nonce drawn
+fresh for that session, and the agent answers `AuthenticateResponse` with
+HMAC-SHA-256 over a fixed domain string and that nonce, keyed by the secret.
+The host recomputes the tag and compares it in constant time -- an early return
+on the first differing byte is how a tag gets forged a byte at a time. Freshness
+is what makes a recorded answer worthless, so a reconnecting agent runs the
+exchange again rather than replaying anything; `auth::allowed_unauthenticated`
+is the rule for what a session may do before it has, and the answer is the hello
+and the challenge and nothing else. Everything else is refused with
+`ERROR_CODE_UNAUTHENTICATED`. Nothing rotates a secret: a VM's secret lives as
+long as the VM, and replacing one means recreating the guest that reads it.
+Deleting a VM removes the host's copy even when the disks are kept, for the
+reason the SSH identity goes -- what it would authenticate no longer exists.
+
+Both sides compute the tag with the same functions in `vmlord-agent-protocol`,
+which is what keeps them from disagreeing about what is being signed. The
+crypto is RustCrypto and `getrandom`: pure Rust, so the agent stays a static
+musl binary built without a C toolchain.
 
 Failures are `Error { code, message }` rather than a string. The code is what a
 peer branches on -- an unsupported version, an unauthenticated session, a

@@ -39,6 +39,7 @@ mod tests {
             timezone: "Europe/Moscow",
             admin_group: "sudo",
             ssh_daemon: &UBUNTU_SSH,
+            agent_secret: None,
         }
     }
 
