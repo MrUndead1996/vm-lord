@@ -14,9 +14,9 @@ use std::{
 
 use uuid::Uuid;
 use vmlord_core::{
-    AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, GuestReadinessTimeouts, NetworkMode,
-    RepositoryError, SshAvailability, VmCreateRequest, VmDeleteRequest, VmGpuFacts, VmRepository,
-    VmState, VmSummary, VmUpdateRequest,
+    AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, GuestReadinessTimeouts,
+    HostGpuCapabilities, NetworkMode, RepositoryError, SshAvailability, VmCreateRequest,
+    VmDeleteRequest, VmGpuFacts, VmRepository, VmState, VmSummary, VmUpdateRequest,
 };
 
 use crate::{
@@ -1052,6 +1052,11 @@ impl VmRepository for HcsVmRepository {
         let mapping = self.mapping(name)?;
         let state = self.reported_state(&mapping)?;
         self.open_ssh_in_state(&mapping, state)
+    }
+
+    /// Reads the host afresh on every call: see [`crate::discover_host_gpu`].
+    fn host_gpu_capabilities(&self) -> Result<HostGpuCapabilities, RepositoryError> {
+        Ok(crate::gpu_discovery::discover_host_gpu())
     }
 
     fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError> {

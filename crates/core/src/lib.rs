@@ -237,13 +237,29 @@ pub trait VmRepository {
             "serial consoles are not supported by this backend",
         ))
     }
+    /// What the host can do for GPU-PV, as far as it can be told without
+    /// starting a VM.
+    ///
+    /// Defaulted rather than required, and an error rather than an empty
+    /// report: a backend that cannot inspect the host does not thereby know
+    /// the host has nothing. "This backend cannot tell you" and "this host
+    /// cannot do it" are different answers and a reader has to be able to tell
+    /// them apart.
+    fn host_gpu_capabilities(&self) -> Result<HostGpuCapabilities, RepositoryError> {
+        Err(RepositoryError::new(
+            "host GPU capabilities are not supported by this backend",
+        ))
+    }
     fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError>;
     fn take_diagnostics(&mut self) -> Vec<Diagnostic>;
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{GpuMode, NetworkMode, VmCreateRequest, VmSource};
+    use super::{
+        Diagnostic, GpuMode, NetworkMode, RepositoryError, VmCreateRequest, VmDeleteRequest,
+        VmRepository, VmSource, VmSummary, VmUpdateRequest,
+    };
 
     fn valid_request() -> VmCreateRequest {
         VmCreateRequest {
@@ -350,6 +366,50 @@ mod tests {
             }
             .validate()
             .is_err()
+        );
+    }
+
+    #[test]
+    fn a_backend_that_cannot_inspect_the_host_says_so() {
+        struct SilentBackend;
+
+        impl VmRepository for SilentBackend {
+            fn initialize(&mut self) -> Result<(), RepositoryError> {
+                Ok(())
+            }
+            fn create_vm(&mut self, _request: VmCreateRequest) -> Result<(), RepositoryError> {
+                Ok(())
+            }
+            fn update_vm(&mut self, _request: VmUpdateRequest) -> Result<(), RepositoryError> {
+                Ok(())
+            }
+            fn start_vm(&mut self, _name: &str) -> Result<(), RepositoryError> {
+                Ok(())
+            }
+            fn stop_vm(&mut self, _name: &str) -> Result<(), RepositoryError> {
+                Ok(())
+            }
+            fn force_stop_vm(&mut self, _name: &str) -> Result<(), RepositoryError> {
+                Ok(())
+            }
+            fn delete_vm(&mut self, _request: VmDeleteRequest) -> Result<(), RepositoryError> {
+                Ok(())
+            }
+            fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError> {
+                Ok(Vec::new())
+            }
+            fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
+                Vec::new()
+            }
+        }
+
+        let error = SilentBackend
+            .host_gpu_capabilities()
+            .expect_err("the default must not claim to know the host");
+
+        assert!(
+            error.to_string().contains("not supported by this backend"),
+            "a backend that cannot answer has to say so rather than report an empty host: {error}"
         );
     }
 }
