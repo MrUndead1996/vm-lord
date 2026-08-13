@@ -3,6 +3,9 @@
 debug
 target
 
+# Assembled by `cargo dist`
+dist
+
 # Runtime and diagnostic logs
 *.log
 

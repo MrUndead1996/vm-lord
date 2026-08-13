@@ -89,5 +89,17 @@ When multiple solutions are possible, prefer:
 4. Native Windows integration
 5. Performance
 
-## Commands:
-- WSL build: ```cargo build --target=x86_64-pc-windows-gnu```
+## Commands
+
+Use the Cargo aliases from `.cargo/config.toml` rather than spelling targets out:
+
+* `cargo check-windows` — compile-check the Windows application from WSL.
+* `cargo test-windows` — build and run the Windows tests from WSL; they execute
+  through WSL interop, so no Wine is involved.
+* `cargo agent` / `cargo agent-release` — build the Linux guest agent
+  (`x86_64-unknown-linux-musl`, statically linked, no C toolchain needed).
+* `cargo dist` — Windows-only release build into `dist/`.
+
+Never add a dependency that forces the agent to link against system C
+libraries without raising it first: it would cost the toolchain-free
+cross-compilation described in **ARCHITECTURE.md**.
