@@ -319,9 +319,96 @@ pub struct HostGpuAdapter {
     pub service: Option<String>,
 }
 
+/// The Plan9 shares a guest is offered, as the guest is told about them.
+///
+/// Roles, never host paths. Where a share is mounted is the guest's decision,
+/// taken from its own allowlist: a host path would be useless to it and would
+/// put the host's topology on the wire and into guest logs. Not serializable
+/// -- it has no on-disk format, and the task that starts sending it converts
+/// it to protobuf.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GpuShareManifest {
+    pub shares: Vec<GpuShare>,
+}
+
+/// One share: what it is called on the wire, and what it holds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuShare {
+    /// The share's name, which is also `aname=` when the guest mounts it.
+    pub name: String,
+    pub role: GpuShareRole,
+}
+
+/// What a guest is meant to make of a share.
+///
+/// The guest never parses the name to find this out: an agent that derived
+/// meaning from a string would have to be updated in step with whatever
+/// produced it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GpuShareRole {
+    /// The host's WSL Linux userspace.
+    WslLib,
+    /// One driver package, named by its DriverStore folder.
+    DriverPackage { package: String },
+}
+
+/// The share name the host's WSL Linux userspace is offered under.
+pub const WSL_LIB_SHARE: &str = "vmlord.gpu.wsl-lib";
+
+/// What every driver package share's name starts with.
+const DRIVER_PACKAGE_SHARE_PREFIX: &str = "vmlord.gpu.drv.";
+
+/// The longest package folder name that may become part of a share name.
+///
+/// A share name travels in a comma-separated `mount` option string, so it is
+/// bounded for the guest's sake rather than by anything Windows imposes.
+const MAX_PACKAGE_NAME: usize = 96;
+
+impl GpuShare {
+    /// The share for the host's WSL Linux userspace.
+    #[must_use]
+    pub fn wsl_lib() -> Self {
+        Self {
+            name: WSL_LIB_SHARE.to_owned(),
+            role: GpuShareRole::WslLib,
+        }
+    }
+
+    /// The share for one driver package, or `None` when the folder's name
+    /// cannot safely become a share name.
+    ///
+    /// The name ends up in an HCS JSON document and in a `mount` option
+    /// string, so a separator, a quote, a space or a traversal component in it
+    /// would be read by something downstream as structure rather than as text.
+    #[must_use]
+    pub fn driver_package(package: &str) -> Option<Self> {
+        if package.is_empty() || package.len() > MAX_PACKAGE_NAME {
+            return None;
+        }
+        if package == "." || package == ".." {
+            return None;
+        }
+        if !package.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-')
+        }) {
+            return None;
+        }
+
+        Some(Self {
+            name: format!("{DRIVER_PACKAGE_SHARE_PREFIX}{package}"),
+            role: GpuShareRole::DriverPackage {
+                package: package.to_owned(),
+            },
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{GpuAvailability, GpuFailure, GpuStatusCode, HostGpuCapabilities};
+    use super::{
+        GpuAvailability, GpuFailure, GpuShare, GpuShareRole, GpuStatusCode, HostGpuCapabilities,
+        WSL_LIB_SHARE,
+    };
 
     #[test]
     fn host_status_codes_have_stable_strings() {
@@ -361,5 +448,56 @@ mod tests {
             Some(GpuStatusCode::HostLinuxPayloadMissing)
         );
         assert!(capabilities.assignment.failure().is_none());
+    }
+
+    #[test]
+    fn the_wsl_lib_share_is_named_once_and_carries_its_role() {
+        let share = GpuShare::wsl_lib();
+
+        assert_eq!(share.name, WSL_LIB_SHARE);
+        assert_eq!(share.role, GpuShareRole::WslLib);
+    }
+
+    #[test]
+    fn a_driver_package_share_is_named_after_its_folder() {
+        let share = GpuShare::driver_package("nvltsi.inf_amd64_5b0e0dc41b0dbf1e")
+            .expect("an ordinary DriverStore folder name is admissible");
+
+        assert_eq!(share.name, "vmlord.gpu.drv.nvltsi.inf_amd64_5b0e0dc41b0dbf1e");
+        assert_eq!(
+            share.role,
+            GpuShareRole::DriverPackage {
+                package: "nvltsi.inf_amd64_5b0e0dc41b0dbf1e".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn a_package_name_that_could_break_a_mount_option_is_refused() {
+        // A share name becomes `aname=` in a comma-separated mount option
+        // string and a JSON string in the HCS document; a separator or a
+        // traversal component in it would be read by something downstream.
+        for refused in [
+            "",
+            ".",
+            "..",
+            "pkg,other",
+            "pkg other",
+            r"pkg\other",
+            "pkg/other",
+            "pkg\"other",
+            "пакет",
+            &"a".repeat(97),
+        ] {
+            assert!(
+                GpuShare::driver_package(refused).is_none(),
+                "{refused:?} must not become a share name"
+            );
+        }
+    }
+
+    #[test]
+    fn a_package_name_at_the_limit_is_still_admissible() {
+        assert!(GpuShare::driver_package(&"a".repeat(96)).is_some());
     }
 }

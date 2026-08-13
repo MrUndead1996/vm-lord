@@ -966,6 +966,51 @@ method is defaulted on the trait and its default is an error rather than an
 empty report: the legacy backend cannot inspect the host, and "this backend
 cannot tell you" is a different answer from "this host cannot do it".
 
+### GPU: what is exported to a guest
+
+A GPU partition is useless to a Linux guest without the host's driver package
+and the WSL Linux userspace beside it, and the way in is a Plan9 share.
+`vmlord_platform::gpu_exports` decides what may be shared, and the answer is
+two directories and nothing else: `System32\DriverStore\FileRepository`, for
+the driver packages behind the host's adapters, and `System32\lxss\lib`, for
+the Linux userspace WSL stages.
+
+Every candidate is canonicalized before it is judged -- opened as a directory
+handle, without `FILE_FLAG_OPEN_REPARSE_POINT`, and resolved with
+`GetFinalPathNameByHandleW`. That is what collapses `..` and what turns a
+junction into its target, so a link leading out of an allowed root fails the
+root check instead of quietly exporting whatever it points at. The root check
+is component-wise and case-insensitive, because `...\FileRepositoryEvil` passes
+a string prefix and is a different directory. A root that itself resolves
+outside `System32` admits nothing at all. What is exported afterwards is the
+canonical path, not the one discovery reported, and the set is deduplicated by
+it: two adapters from one vendor usually share a `FileRepository` folder.
+
+A candidate that fails any of this is dropped with a log line and the rest are
+still offered, and a set with nothing in it is `None` rather than an error: GPU
+is applied best effort and never blocks a start. `HcsGrantVmAccess` runs only
+after a path has passed -- a grant before the check is what makes the check
+decorative -- and an export the grant refused is dropped too, because offering
+a VM a share it cannot open trades a clear line in the host log for an opaque
+mount failure in the guest.
+
+What the guest is told is a `GpuShareManifest`: for each share, a name and a
+role -- `WslLib`, or `DriverPackage` with the package's folder name. Never a
+host path. Where a share is mounted is the guest's decision, taken from its own
+allowlist, so the host cannot dictate a path into a guest filesystem and the
+host's topology does not travel. Share names are `vmlord.gpu.wsl-lib` and
+`vmlord.gpu.drv.<package>`, restricted to `[A-Za-z0-9._-]`, because a name ends
+up both in the HCS document and in a comma-separated `mount` option string.
+
+`hcs_config::apply_plan9_shares` writes the set into the stored configuration
+under `Devices/Plan9`, each share carrying port 50001 and the read-only flag;
+`remove_plan9_shares` takes the section away again for a VM whose GPU was
+switched off. Read-only is therefore stated twice and independently: by the
+share's flag on the host and by the guest's own `MS_RDONLY` mount. The set is
+computed once per start and written before the compute system is prepared,
+which is what makes it immutable for the lifetime of a boot -- changing a GPU
+mode takes a full VM restart.
+
 ### VM update contract
 
 The edit workflow follows these rules:
