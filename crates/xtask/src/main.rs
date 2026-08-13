@@ -46,7 +46,7 @@ fn main() -> ExitCode {
     }
 }
 
-/// Builds the release artifacts and gathers them into `dist/`.
+/// Builds the release artifacts and gathers them under Cargo's target directory.
 fn dist() -> Result<(), String> {
     if !cfg!(windows) {
         return Err(format!(
@@ -74,7 +74,7 @@ fn dist() -> Result<(), String> {
         ],
     )?;
 
-    let destination = workspace.join("dist");
+    let destination = distribution_directory(&workspace);
     if destination.exists() {
         fs::remove_dir_all(&destination)
             .map_err(|error| format!("cannot clear {}: {error}", destination.display()))?;
@@ -99,6 +99,14 @@ fn dist() -> Result<(), String> {
 
     println!("dist: written to {}", destination.display());
     Ok(())
+}
+
+/// Returns the directory holding the assembled release distribution.
+///
+/// Keeping it below `target` makes `cargo clean` remove generated release
+/// artifacts as well as Cargo's normal build outputs.
+fn distribution_directory(workspace: &Path) -> PathBuf {
+    workspace.join("target").join("dist")
 }
 
 /// Runs Cargo in the workspace, failing on anything but a clean exit.
@@ -129,4 +137,21 @@ fn workspace_root() -> Result<PathBuf, String> {
         .nth(2)
         .map(Path::to_path_buf)
         .ok_or_else(|| "cannot locate the workspace root above crates/xtask".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::distribution_directory;
+
+    #[test]
+    fn the_distribution_lives_under_target_so_cargo_clean_removes_it() {
+        let workspace = Path::new("workspace");
+
+        assert_eq!(
+            distribution_directory(workspace),
+            PathBuf::from("workspace").join("target").join("dist")
+        );
+    }
 }

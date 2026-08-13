@@ -9,7 +9,6 @@ publish = false
 # aliases in `.cargo/config.toml`, so it stays out of `default-members`.
 [[bin]]
 name = "xtask"
-test = false
 bench = false
 
 [lints]
