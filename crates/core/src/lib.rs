@@ -124,7 +124,7 @@ pub enum AgentStatus {
 pub enum GpuMode {
     None,
     Default,
-    TryAll,
+    Mirror,
     Unknown(i32),
 }
 

@@ -746,7 +746,7 @@ mod tests {
     fn rejects_each_unsupported_gpu_mode() {
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
         let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
-        for mode in [GpuMode::Default, GpuMode::TryAll, GpuMode::Unknown(42)] {
+        for mode in [GpuMode::Default, GpuMode::Mirror, GpuMode::Unknown(42)] {
             let request = VmCreateRequest {
                 gpu_mode: mode,
                 ..request()
