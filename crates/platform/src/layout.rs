@@ -76,6 +76,14 @@ pub(crate) fn seed_path(vm_directory: &Path) -> PathBuf {
     vm_directory.join("seed.iso")
 }
 
+/// Returns the path of the optional tools volume for a cloud VM.
+///
+/// The agent itself is common to every VM but the ISO is per-VM, so it lives
+/// with the seed it accompanies rather than beside the host executable.
+pub(crate) fn tools_path(vm_directory: &Path) -> PathBuf {
+    vm_directory.join("tools.iso")
+}
+
 /// Returns the path of the host's copy of the VM's agent secret.
 ///
 /// Beside `config.json` rather than in `keys/`: that directory is the VM's SSH
@@ -127,7 +135,7 @@ mod tests {
     use super::{
         cloud_init_status_log_path, com1_log_path, configuration_path, seed_path, ssh_key_path,
         ssh_keys_directory, ssh_known_hosts_path, ssh_public_key_path, system_disk_path,
-        vm_directory,
+        tools_path, vm_directory,
     };
 
     #[test]
@@ -197,6 +205,16 @@ mod tests {
         assert_eq!(
             seed_path(&directory),
             PathBuf::from("/vms").join("dev-linux").join("seed.iso")
+        );
+    }
+
+    #[test]
+    fn the_tools_volume_lives_beside_the_cloud_seed() {
+        let directory = vm_directory(Path::new("/vms"), "dev-linux").unwrap();
+
+        assert_eq!(
+            tools_path(&directory),
+            PathBuf::from("/vms").join("dev-linux").join("tools.iso")
         );
     }
 

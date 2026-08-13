@@ -193,15 +193,17 @@ agent-protocol (portable wire contract)
 
 `vmlord-agent` is the only crate that is not part of `vmlord.exe`. It is a
 Linux program that runs inside a guest, so it is excluded from the workspace's
-`default-members` and built on its own with
-`cargo build -p vmlord-agent --target x86_64-unknown-linux-gnu`. Its `main`
-refuses to compile for any other target rather than link-failing later.
+`default-members` and built on its own with `cargo agent`, which targets
+`x86_64-unknown-linux-musl`. Its `main` refuses to compile for non-Linux
+targets rather than link-failing later.
 `agent-protocol` is in both sets, because both ends of the connection speak it.
 
-`legacy-backend` is the only crate that may contain `unsafe` code, raw C
-pointers, or Windows DLL loading for the temporary AppSandbox implementation.
-It dynamically loads the prebuilt `appsandbox_core.dll` placed next to
-`vmlord.exe`; no C types cross into `core`, `app`, or `ui`.
+`legacy-backend`, `platform`, and `vmlord-agent` are the only crates that
+override the workspace's `unsafe_code = "deny"`: the legacy backend for the
+temporary AppSandbox C ABI, platform for Windows APIs, and the agent's `vsock`
+module for the Linux socket ABI. `legacy-backend` dynamically loads the
+prebuilt `appsandbox_core.dll` placed next to `vmlord.exe`; no C types cross
+into `core`, `app`, or `ui`.
 
 `platform` is the Windows-native foundation for the incremental replacement.
 It depends on `core`, `keys` and `seed` -- all three portable and free of I/O,
@@ -1333,11 +1335,13 @@ VHDX is not created empty and then filled, it arrives already carrying the
 image, sized for the VM rather than for the image. Then `write_provisioning`
 writes what the first boot reads: the SSH key pair, when `deploy_key` asked for
 one; the `$6$` hash of the password, made here so that nothing further down ever
-holds the plaintext; the VM's agent secret, kept in `agent.secret` and handed
-to the guest through the seed; and the seed volume built from all three. After that the branches
-converge: `config.json` is written, the VM is granted access to its disk and to
-its medium, the compute system is created, and the mapping is inserted last, so
-a VM is known to VMLord only once it exists in HCS.
+holds the plaintext; and the seed volume. When the bundled agent binary is
+available, it also mints the VM's agent secret, keeps the host copy in
+`agent.secret`, puts the guest copy in the seed, and writes the tools ISO
+carrying the binary. After that the branches converge: `config.json` is
+written, the VM is granted access to its disk and to its medium, the compute
+system is created, and the mapping is inserted last, so a VM is known to
+VMLord only once it exists in HCS.
 
 The configuration has two SCSI attachments, not three: slot 0 is the system
 VHDX, slot 1 is an ISO -- the installer for local media, `seed.iso` for a cloud
@@ -1817,9 +1821,10 @@ capabilities both peers named may be used. A capability number this build has
 never heard of is dropped rather than refused, which is what lets a newer agent
 talk to an older host at all.
 
-A session proves who it is with a secret the VM was created with. VMLord mints
-32 random bytes per VM in `write_provisioning`, beside the SSH key pair, and
-writes them twice: into `<vm>/agent.secret` for itself, and into the seed as
+A session proves who it is with a secret the VM was created with. When a
+cloud-image VM has the bundled agent binary available, VMLord mints 32 random
+bytes in `write_provisioning`, beside the SSH key pair, and writes them twice:
+into `<vm>/agent.secret` for itself, and into the seed as
 `/etc/vmlord/agent.secret`, owned by root with mode `0600`. Both host files are
 written the way the private key is -- created empty, narrowed by
 `vm_key::restrict_to_owner`, and only then filled -- but only the seed is handed
@@ -1849,6 +1854,29 @@ Both sides compute the tag with the same functions in `vmlord-agent-protocol`,
 which is what keeps them from disagreeing about what is being signed. The
 crypto is RustCrypto and `getrandom`: pure Rust, so the agent stays a static
 musl binary built without a C toolchain.
+
+### Installing the guest agent
+
+A cloud-image VM gets the agent on its first boot. At creation VMLord looks for
+the statically linked `vmlord-agent` beside its own executable. When it is
+present, the creation transaction writes its bytes to a per-VM `tools.iso`
+beside `seed.iso`, labelled `VMLTOOLS`, and grants the VM access to it. The
+secret stays separate: the host copy remains `<vm>/agent.secret`, while the
+guest copy is in the secret-bearing NoCloud seed.
+
+The seed's cloud-init document writes a root-owned systemd unit. Its first-boot
+commands mount `VMLTOOLS` read-only, copy `vmlord-agent` into
+`/usr/local/lib/vmlord`, unmount the medium, and enable the service. systemd
+then runs the agent as root, which reads the guest secret and opens its first
+authenticated HvSocket session to the host. The installed copy, rather than
+the ISO, is what later boots run.
+
+This gives a cloud VM three SCSI attachments: its system disk, the NoCloud
+seed, and the tools ISO. A local-media VM receives no cloud-init configuration
+and no agent, so it deliberately remains at two attachments. If the sibling
+agent binary is absent, creation warns and follows that same no-agent path;
+it does not create a tools ISO or agent secret. Reconnect/backoff, GPU
+capabilities, and Plan9 mounts remain later work.
 
 Failures are `Error { code, message }` rather than a string. The code is what a
 peer branches on -- an unsupported version, an unauthenticated session, a
@@ -2003,9 +2031,9 @@ Business logic must never be implemented in FFI.
 
 Unsafe code belongs only inside:
 
-* platform
-* ffi
-* Windows wrappers
+* `platform`, for Windows API calls and wrappers
+* `legacy-backend`, for the temporary AppSandbox FFI
+* `vmlord-agent::vsock`, for the Linux socket ABI
 
 Everything above should expose safe Rust interfaces.
 

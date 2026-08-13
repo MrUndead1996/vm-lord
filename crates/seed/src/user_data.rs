@@ -7,7 +7,7 @@
 use vmlord_agent_protocol::auth::GUEST_SECRET_PATH;
 use vmlord_core::{SshAccess, SshPort};
 
-use crate::{SeedRequest, scalar};
+use crate::{AGENT_FILE, SeedRequest, scalar};
 
 /// The indentation a block scalar's content sits at inside `write_files`.
 const FILE_INDENT: &str = "      ";
@@ -79,6 +79,7 @@ fn write_files(request: &SeedRequest<'_>) -> String {
             &format!("{secret}\n"),
             "root:root",
         ));
+        files.push_str(&file(AGENT_SERVICE_PATH, AGENT_SERVICE));
     }
     files
 }
@@ -89,10 +90,13 @@ fn write_files(request: &SeedRequest<'_>) -> String {
 /// SSH is the only thing here, and it is one of two opposite jobs: switching
 /// the daemon off, or moving it to the port the VM was created with.
 fn runcmd(request: &SeedRequest<'_>) -> String {
-    let commands = match request.ssh {
+    let mut commands = match request.ssh {
         SshAccess::Disabled => disable_ssh(request),
         SshAccess::Enabled { .. } => apply_ssh_configuration(request),
     };
+    if request.agent_secret.is_some() {
+        commands.extend(agent_install_commands());
+    }
     if commands.is_empty() {
         return String::new();
     }
@@ -109,6 +113,40 @@ fn runcmd(request: &SeedRequest<'_>) -> String {
         ));
     }
     block
+}
+
+fn agent_install_commands() -> Vec<Vec<String>> {
+    vec![
+        vec!["mkdir".into(), "-p".into(), "/run/vmlord-tools".into()],
+        vec!["mkdir".into(), "-p".into(), "/usr/local/lib/vmlord".into()],
+        vec![
+            "mount".into(),
+            "-o".into(),
+            "ro".into(),
+            "-L".into(),
+            "VMLTOOLS".into(),
+            "/run/vmlord-tools".into(),
+        ],
+        vec![
+            "install".into(),
+            "-m".into(),
+            "0755".into(),
+            "-o".into(),
+            "root".into(),
+            "-g".into(),
+            "root".into(),
+            format!("/run/vmlord-tools/{AGENT_FILE}"),
+            "/usr/local/lib/vmlord/vmlord-agent".into(),
+        ],
+        vec!["umount".into(), "/run/vmlord-tools".into()],
+        vec!["systemctl".into(), "daemon-reload".into()],
+        vec![
+            "systemctl".into(),
+            "enable".into(),
+            "--now".into(),
+            "vmlord-agent.service".into(),
+        ],
+    ]
 }
 
 /// Stops the SSH daemon and keeps it stopped.
@@ -216,6 +254,9 @@ fn entry(path: &str, content: &str, permissions: &str, owner: Option<&str>) -> S
 /// different keys, which is a different mechanism rather than a different
 /// value, so it waits for a second distribution.
 const KEYBOARD_PATH: &str = "/etc/default/keyboard";
+
+const AGENT_SERVICE_PATH: &str = "/etc/systemd/system/vmlord-agent.service";
+const AGENT_SERVICE: &str = "[Unit]\nDescription=VMLord guest agent\nConditionPathExists=/etc/vmlord/agent.secret\n\n[Service]\nExecStart=/usr/local/lib/vmlord/vmlord-agent\nUser=root\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n";
 
 /// The content of that file.
 ///
@@ -572,6 +613,85 @@ mod tests {
                 .iter()
                 .all(|file| file["path"].as_str() != Some(GUEST_SECRET_PATH))
         );
+    }
+
+    #[test]
+    fn an_agent_seed_writes_and_enables_the_agent_service() {
+        let daemon = SshDaemon {
+            units: Vec::new(),
+            config_drop_in: "/etc/ssh/sshd_config.d/10-vmlord.conf".into(),
+            socket_drop_in: None,
+        };
+        let document = parsed(&render(&SeedRequest {
+            agent_secret: Some(AGENT_SECRET),
+            ssh: SshAccess::Disabled,
+            ssh_daemon: &daemon,
+            ..request()
+        }));
+
+        let service = file(&document, "/etc/systemd/system/vmlord-agent.service");
+        assert_eq!(service["permissions"], Value::from("0644"));
+        let content = service["content"]
+            .as_str()
+            .expect("unit content is a string");
+        for line in [
+            "ConditionPathExists=/etc/vmlord/agent.secret",
+            "ExecStart=/usr/local/lib/vmlord/vmlord-agent",
+            "User=root",
+            "Restart=always",
+            "RestartSec=5",
+            "WantedBy=multi-user.target",
+        ] {
+            assert!(content.contains(line), "unit should contain {line}");
+        }
+
+        assert_eq!(
+            commands(&document),
+            [
+                vec!["mkdir", "-p", "/run/vmlord-tools"],
+                vec!["mkdir", "-p", "/usr/local/lib/vmlord"],
+                vec!["mount", "-o", "ro", "-L", "VMLTOOLS", "/run/vmlord-tools"],
+                vec![
+                    "install",
+                    "-m",
+                    "0755",
+                    "-o",
+                    "root",
+                    "-g",
+                    "root",
+                    "/run/vmlord-tools/vmlord-agent",
+                    "/usr/local/lib/vmlord/vmlord-agent",
+                ],
+                vec!["umount", "/run/vmlord-tools"],
+                vec!["systemctl", "daemon-reload"],
+                vec!["systemctl", "enable", "--now", "vmlord-agent.service"],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_seed_without_an_agent_has_no_unit_or_commands_when_ssh_is_disabled() {
+        let daemon = SshDaemon {
+            units: Vec::new(),
+            config_drop_in: "/etc/ssh/sshd_config.d/10-vmlord.conf".into(),
+            socket_drop_in: None,
+        };
+        let document = parsed(&render(&SeedRequest {
+            agent_secret: None,
+            ssh: SshAccess::Disabled,
+            ssh_daemon: &daemon,
+            ..request()
+        }));
+
+        assert!(
+            document["write_files"]
+                .as_sequence()
+                .expect("write_files is a list")
+                .iter()
+                .all(|file| file["path"].as_str()
+                    != Some("/etc/systemd/system/vmlord-agent.service"))
+        );
+        assert_eq!(commands(&document), Vec::<Vec<String>>::new());
     }
 
     /// A value with an apostrophe is the one that breaks naive quoting.

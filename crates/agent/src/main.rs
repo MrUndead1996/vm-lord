@@ -5,11 +5,8 @@
 //! the in-guest work the host asks for -- reporting what the GPU is doing and
 //! mounting the shares GPU-PV needs.
 //!
-//! None of that exists yet. What is here is the crate the rest of it is built
-//! in and the one thing it can already answer for: which protocol revision
-//! this build speaks. That answer is worth having on its own, because
-//! installing the agent (#91) has to be verifiable from inside a guest before
-//! there is any host to connect to.
+//! The transport and opening handshake live in small modules, so the session
+//! rules can be tested against bytes without a running Linux VM.
 
 // The agent is built for the guest, never for the host. Saying so here turns
 // an accidental `--workspace` build on Windows into a sentence instead of a
@@ -17,16 +14,30 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!(
     "vmlord-agent runs in a Linux guest; build it with \
-     `cargo build -p vmlord-agent --target x86_64-unknown-linux-gnu`"
+     `cargo agent`"
 );
 
-use vmlord_agent_protocol::v1::ProtocolVersion;
+use std::{error::Error, fs, process};
 
-/// This build of the agent, as reported to the host and printed below.
+mod session;
+mod vsock;
+
+/// This build of the agent, as reported to the host during its hello.
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() {
-    let ProtocolVersion { major, minor } = ProtocolVersion::current();
+    if let Err(error) = connect_to_host() {
+        eprintln!("vmlord-agent: {error}");
+        process::exit(1);
+    }
+}
 
-    println!("vmlord-agent {AGENT_VERSION}, agent protocol {major}.{minor}");
+fn connect_to_host() -> Result<(), Box<dyn Error>> {
+    let secret = vmlord_agent_protocol::auth::Secret::from_base64(&fs::read_to_string(
+        vmlord_agent_protocol::auth::GUEST_SECRET_PATH,
+    )?)?;
+    let mut stream = vsock::connect(vsock::VMADDR_CID_HOST, vsock::AGENT_VSOCK_PORT)?;
+
+    session::run(&mut stream, &secret, AGENT_VERSION)?;
+    Ok(())
 }

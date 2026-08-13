@@ -116,6 +116,11 @@ pub(crate) fn serve<S: Read + Write>(
                 log::info!("the agent of VM \"{vm_name}\" closed its session");
                 return Ok(());
             }
+            // `Idle` is reported only before a peer starts another frame, so
+            // retrying cannot abandon a partial prefix or body. This is the
+            // normal result of the bounded socket reads that let VM shutdown
+            // interrupt a silent agent session.
+            Err(FrameError::Idle) => continue,
             Err(error) => return Err(SessionError::Frame(error)),
         };
 
@@ -393,7 +398,7 @@ mod tests {
         },
     };
 
-    use super::{SessionError, open, serve};
+    use super::{AgentSession, SessionError, open, serve};
 
     const VM: &str = "dev-linux";
 
@@ -530,6 +535,30 @@ mod tests {
         fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
             self.inbox.extend_from_slice(buffer);
             self.take();
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct IdleThenClosed {
+        idle: bool,
+    }
+
+    impl Read for IdleThenClosed {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            if self.idle {
+                self.idle = false;
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "idle guest"));
+            }
+            Ok(0)
+        }
+    }
+
+    impl Write for IdleThenClosed {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
             Ok(buffer.len())
         }
 
@@ -708,5 +737,16 @@ mod tests {
         let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
 
         serve(&mut guest, &session, VM).expect("a clean close is not a failure");
+    }
+
+    #[test]
+    fn an_idle_stream_keeps_the_session_open_until_the_agent_hangs_up() {
+        let mut stream = IdleThenClosed { idle: true };
+        let session = AgentSession {
+            version: ProtocolVersion::current(),
+            capabilities: Vec::new(),
+        };
+
+        serve(&mut stream, &session, VM).expect("an idle boundary is not a failed session");
     }
 }

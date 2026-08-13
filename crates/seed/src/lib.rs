@@ -114,6 +114,28 @@ pub fn image(seed: &Seed) -> Vec<u8> {
     )
 }
 
+/// The label the guest mounts the tools volume by.
+///
+/// A second volume rather than more files in the seed: the seed is per-VM and
+/// carries secrets, and the agent is the same binary on every VM. Uppercase
+/// for the reason `CIDATA` is.
+const TOOLS_VOLUME_ID: &str = "VMLTOOLS";
+
+/// The agent's name inside that volume, and the name the guest installs it
+/// under. Spelled here and used by `user_data`, so the volume and the command
+/// that copies out of it cannot disagree.
+pub(crate) const AGENT_FILE: &str = "vmlord-agent";
+
+/// Packs the guest agent into the read-only volume the first boot installs it
+/// from.
+///
+/// One file, because that is what the guest needs and a second one would be a
+/// second thing to keep in step with the commands in `user-data`.
+#[must_use]
+pub fn tools_image(agent: &[u8]) -> Vec<u8> {
+    iso::build(TOOLS_VOLUME_ID, &[(AGENT_FILE, agent)])
+}
+
 /// The one SSH daemon description the crate's own tests borrow.
 ///
 /// A static because `SeedRequest` borrows it and the tests build
@@ -128,6 +150,29 @@ pub(crate) static UBUNTU_SSH: std::sync::LazyLock<SshDaemon> =
 mod tests {
     use super::{SeedRequest, UBUNTU_SSH, build};
     use vmlord_core::{SshAccess, SshPort};
+
+    /// The two constants the guest finds the agent by: the label `runcmd`
+    /// mounts and the name it copies from.
+    #[test]
+    fn the_tools_image_carries_the_agent_on_a_vmltools_volume() {
+        let agent = b"\x7fELF not really, but bytes are bytes".to_vec();
+
+        let bytes = super::tools_image(&agent);
+
+        assert_eq!(&bytes[16 * 2048 + 40..16 * 2048 + 48], b"VMLTOOLS");
+        assert!(
+            bytes
+                .windows(super::AGENT_FILE.len())
+                .any(|window| window == super::AGENT_FILE.as_bytes()),
+            "the root should name the agent"
+        );
+        assert!(
+            bytes
+                .windows(agent.len())
+                .any(|window| window == agent.as_slice()),
+            "the agent should be stored whole"
+        );
+    }
 
     #[test]
     fn a_seed_carries_both_documents() {

@@ -7,14 +7,21 @@ license.workspace = true
 # The agent is a guest program, so it is not part of the workspace's default
 # build -- see `default-members` in the root manifest. Build it with:
 #
-#     cargo build -p vmlord-agent --target x86_64-unknown-linux-gnu
+#     cargo agent
 [[bin]]
 name = "vmlord-agent"
-test = false
 bench = false
 
 [dependencies]
+libc = { version = "0.2", default-features = false }
 vmlord-agent-protocol = { path = "../agent-protocol" }
 
 [lints]
-workspace = true
+# This guest crate owns its Linux socket descriptor directly. `vsock.rs` is
+# the sole module that needs unsafe calls into the kernel ABI.
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

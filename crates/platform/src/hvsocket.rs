@@ -27,8 +27,8 @@ use std::{
     io::{self, Read, Write},
     mem,
     sync::{
-        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
+        Arc, OnceLock,
     },
     time::Duration,
 };
@@ -36,13 +36,12 @@ use std::{
 use uuid::Uuid;
 use vmlord_core::RepositoryError;
 use windows::{
-    Win32::Networking::WinSock::{
-        AF_HYPERV, FD_SET, SEND_RECV_FLAGS, SO_RCVTIMEO, SO_SNDTIMEO, SOCK_STREAM, SOCKADDR,
-        SOCKET, SOCKET_ERROR, SOL_SOCKET, SOMAXCONN, TIMEVAL, WSADATA, WSAETIMEDOUT,
-        WSAGetLastError, WSAStartup, accept, bind, closesocket, listen, recv, select, send,
-        setsockopt, socket,
-    },
     core::GUID,
+    Win32::Networking::WinSock::{
+        accept, bind, closesocket, listen, recv, select, send, setsockopt, socket, WSAGetLastError,
+        WSAStartup, AF_HYPERV, FD_SET, SEND_RECV_FLAGS, SOCKADDR, SOCKET, SOCKET_ERROR,
+        SOCK_STREAM, SOL_SOCKET, SOMAXCONN, SO_SNDTIMEO, TIMEVAL, WSADATA,
+    },
 };
 
 /// The vsock port the agent connects to.
@@ -69,13 +68,12 @@ const HV_PROTOCOL_RAW: i32 = 1;
 /// costs.
 pub(crate) const ACCEPT_POLL: Duration = Duration::from_millis(250);
 
-/// How long a read waits before letting its thread check whether it should
+/// How long a read poll waits before letting its thread check whether it should
 /// still be reading.
 ///
 /// The agent talks when it has something to say and is silent otherwise, so
-/// nearly every read here times out. That is not an error and does not end the
-/// session -- see [`AgentStream::read`]. The interval is [`ACCEPT_POLL`]'s, and
-/// for the same reason: it is how long ending a session takes.
+/// nearly every poll expires. The interval is [`ACCEPT_POLL`]'s, and for the
+/// same reason: it is how long ending a session takes.
 const READ_POLL: Duration = ACCEPT_POLL;
 
 /// How long a write may block before the peer is treated as gone.
@@ -235,7 +233,6 @@ impl AgentListener {
             vm_name: self.vm_name.clone(),
             running: Arc::clone(running),
         };
-        stream.set_timeout(SO_RCVTIMEO, READ_POLL)?;
         stream.set_timeout(SO_SNDTIMEO, WRITE_TIMEOUT)?;
 
         log::info!("the agent of VM \"{}\" connected", self.vm_name);
@@ -297,36 +294,53 @@ impl AgentStream {
 }
 
 impl Read for AgentStream {
-    /// Reads what has arrived, waiting no longer than [`READ_POLL`].
+    /// Reads what has arrived, polling no longer than [`READ_POLL`].
     ///
-    /// A timeout is reported as [`io::ErrorKind::Interrupted`], which every
-    /// reader in the standard library retries: an idle agent is not a broken
-    /// one, and a frame half-read must not be abandoned because the guest
-    /// paused in the middle of it. Once the session has been told to stop, the
-    /// same timeout ends it instead -- that is the only thing that can
-    /// interrupt a socket nobody is writing to.
+    /// The wait is `select`, rather than `SO_RCVTIMEO`: HvSocket can signal a
+    /// receive timeout as a clean read, which is indistinguishable from the
+    /// guest closing its session. A poll expiry becomes
+    /// [`io::ErrorKind::Interrupted`], which every reader in the standard
+    /// library retries. Once the session has been told to stop, the same
+    /// expiry ends it instead.
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let mut readable = FD_SET {
+            fd_count: 1,
+            ..Default::default()
+        };
+        readable.fd_array[0] = self.socket;
+        let timeout = timeval(READ_POLL);
+
+        // SAFETY: `readable` names this owned socket and outlives the call, as
+        // does `timeout`. Windows ignores the first argument to `select`.
+        let ready = unsafe { select(0, Some(&mut readable), None, None, Some(&raw const timeout)) };
+        match ready {
+            0 => {
+                return idle_read(self.running.load(Ordering::Relaxed));
+            }
+            SOCKET_ERROR => return Err(io::Error::from_raw_os_error(last_error_code())),
+            _ => {}
+        }
+
         // SAFETY: `self.socket` is owned and `buffer` is valid for writes for
-        // its own length.
+        // its own length. `select` just reported it readable, so `recv` cannot
+        // wait for an idle socket.
         let read = unsafe { recv(self.socket, buffer, SEND_RECV_FLAGS(0)) };
         if read >= 0 {
             return Ok(read as usize);
         }
+        Err(io::Error::from_raw_os_error(last_error_code()))
+    }
+}
 
-        let error = last_error_code();
-        if error != WSAETIMEDOUT.0 {
-            return Err(io::Error::from_raw_os_error(error));
-        }
-        if !self.running.load(Ordering::Relaxed) {
-            return Err(io::Error::new(
-                io::ErrorKind::ConnectionAborted,
-                format!(
-                    "the agent session of VM \"{}\" was closed by VMLord",
-                    self.vm_name
-                ),
-            ));
-        }
+/// Turns a completed read poll into an interrupt or a local shutdown.
+fn idle_read(running: bool) -> io::Result<usize> {
+    if running {
         Err(io::Error::from(io::ErrorKind::Interrupted))
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "the agent session was closed by VMLord",
+        ))
     }
 }
 
@@ -405,7 +419,9 @@ fn timeval(duration: Duration) -> TIMEVAL {
 
 #[cfg(test)]
 mod tests {
-    use super::{AGENT_VSOCK_PORT, agent_service_id, vsock_service_id};
+    use std::io;
+
+    use super::{agent_service_id, idle_read, vsock_service_id, AGENT_VSOCK_PORT};
 
     #[test]
     fn a_vsock_port_becomes_the_first_field_of_its_service_guid() {
@@ -424,5 +440,19 @@ mod tests {
             format!("{:?}", agent_service_id()),
             "564D4C41-FACB-11E6-BD58-64006A7986D3"
         );
+    }
+
+    #[test]
+    fn an_idle_read_retries_while_the_connection_is_still_owned() {
+        let error = idle_read(true).expect_err("an idle socket is not readable yet");
+
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn an_idle_read_ends_when_the_connection_is_stopped() {
+        let error = idle_read(false).expect_err("a stopped connection must not keep polling");
+
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionAborted);
     }
 }

@@ -113,9 +113,11 @@ pub fn write<W: Write>(
 /// # Errors
 ///
 /// [`FrameError::Closed`] if the peer closed the connection cleanly, which is
-/// how a session ends and is not by itself a fault. [`FrameError::TooLarge`],
-/// [`FrameError::Io`] and [`FrameError::Decode`] all leave the connection
-/// unusable and must be answered by closing it.
+/// how a session ends and is not by itself a fault. [`FrameError::Idle`] means
+/// a transport timed out before the next frame began, so a caller may safely
+/// send its own frame. [`FrameError::TooLarge`], [`FrameError::Io`] and
+/// [`FrameError::Decode`] all leave the connection unusable and must be
+/// answered by closing it.
 pub fn read<R: Read>(reader: &mut R, buffer: &mut Vec<u8>) -> Result<Envelope, FrameError> {
     let mut prefix = [0u8; LENGTH_PREFIX_LEN];
     read_prefix(reader, &mut prefix)?;
@@ -150,6 +152,15 @@ fn read_prefix<R: Read>(
             }
             Ok(read) => filled += read,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error)
+                if filled == 0
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) =>
+            {
+                return Err(FrameError::Idle);
+            }
             Err(error) => return Err(FrameError::Io(error)),
         }
     }
@@ -163,6 +174,8 @@ pub enum FrameError {
     TooLarge { body_len: usize },
     /// The peer closed the connection at a frame boundary.
     Closed,
+    /// The transport timed out before the peer started another frame.
+    Idle,
     /// The transport failed.
     Io(io::Error),
     /// The bytes read are not an `Envelope`.
@@ -177,6 +190,7 @@ impl fmt::Display for FrameError {
                 "a frame body of {body_len} bytes exceeds the {MAX_BODY_LEN}-byte limit"
             ),
             Self::Closed => formatter.write_str("the agent connection was closed"),
+            Self::Idle => formatter.write_str("the agent connection is idle"),
             Self::Io(error) => write!(formatter, "the agent connection failed: {error}"),
             Self::Decode(error) => {
                 write!(formatter, "the agent sent an unreadable message: {error}")
@@ -190,7 +204,7 @@ impl Error for FrameError {
         match self {
             Self::Io(error) => Some(error),
             Self::Decode(error) => Some(error),
-            Self::TooLarge { .. } | Self::Closed => None,
+            Self::TooLarge { .. } | Self::Closed | Self::Idle => None,
         }
     }
 }
@@ -199,6 +213,14 @@ impl Error for FrameError {
 mod tests {
     use super::*;
     use crate::v1::{HeartbeatRequest, request};
+
+    struct IdleReader;
+
+    impl Read for IdleReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "idle stream"))
+        }
+    }
 
     fn heartbeat() -> Envelope {
         Envelope::request(7, request::Kind::Heartbeat(HeartbeatRequest {}))
@@ -277,6 +299,14 @@ mod tests {
             FrameError::Io(error) => assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof),
             other => panic!("expected an I/O error, got {other}"),
         }
+    }
+
+    #[test]
+    fn an_idle_stream_is_distinct_from_a_frame_that_was_started() {
+        assert!(matches!(
+            read(&mut IdleReader, &mut Vec::new()),
+            Err(FrameError::Idle)
+        ));
     }
 
     #[test]
