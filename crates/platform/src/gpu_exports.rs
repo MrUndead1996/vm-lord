@@ -17,6 +17,21 @@
 use std::path::{Component, Path, PathBuf};
 
 use vmlord_core::{GpuShare, GpuShareManifest, HostGpuAdapter, RepositoryError};
+use windows::{
+    Win32::{
+        Foundation::{CloseHandle, HANDLE},
+        Storage::FileSystem::{
+            BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
+            GetFinalPathNameByHandleW, OPEN_EXISTING,
+        },
+        System::SystemInformation::GetSystemDirectoryW,
+    },
+    core::HSTRING,
+};
+
+use crate::error::windows_error;
 
 /// Resolves a path to its canonical form, failing if it is not a directory.
 pub(crate) type Canonicalize<'a> = &'a dyn Fn(&Path) -> Result<PathBuf, RepositoryError>;
@@ -71,6 +86,135 @@ impl GpuExports {
                 .map(|(share, host_path)| GpuExport { share, host_path })
                 .collect(),
         }
+    }
+}
+
+impl GpuExports {
+    /// Every share this host justifies for `adapters`, or `None` when there is
+    /// nothing to export.
+    ///
+    /// Not a `Result`: a host with no WSL payload and no resolvable package is
+    /// a host that gets no shares, which is an answer. What went wrong on the
+    /// way to it is logged where it happened.
+    pub(crate) fn build(adapters: &[HostGpuAdapter]) -> Option<Self> {
+        let system32 = system_directory()?;
+        let canonicalize = canonical_directory;
+        let roots = ExportRoots::resolve(&system32, &canonicalize);
+
+        build_with(adapters, &roots, &canonicalize)
+    }
+}
+
+/// The longest path either call below is first asked for; both grow or fail
+/// rather than truncate. 260 is what `gpu_discovery` uses for the same call.
+const PATH_BUFFER: usize = 260;
+
+/// The host's `System32`, as Windows spells it.
+fn system_directory() -> Option<PathBuf> {
+    let mut buffer = [0_u16; PATH_BUFFER];
+    // SAFETY: `buffer` is passed as a sized slice; a zero return means the
+    // call did not fill it.
+    let length = unsafe { GetSystemDirectoryW(Some(&mut buffer)) } as usize;
+    if length == 0 || length > buffer.len() {
+        log::warn!("the system directory could not be read; nothing may be exported");
+        return None;
+    }
+
+    Some(PathBuf::from(String::from_utf16_lossy(&buffer[..length])))
+}
+
+/// A kernel handle this module owns and closes exactly once.
+struct OwnedHandle(HANDLE);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from the successful `CreateFileW` below and
+        // is closed only here.
+        let _ = unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// What `path` really is, provided it is a directory.
+///
+/// Opened **without** `FILE_FLAG_OPEN_REPARSE_POINT` on purpose: a junction or
+/// symlink is followed, and the final path is its target's, so a link leading
+/// out of an allowed root is caught by the root check instead of exporting
+/// what it points at. `..` collapses in the same answer.
+///
+/// Time of check to time of use is not fully closable here: between this call
+/// and the start, a directory could in principle be swapped, and an open
+/// handle prevents deletion but not renaming. What limits it is that the path
+/// exported afterwards is this canonical one -- a link swapped later cannot
+/// redirect it -- and that both allowed roots live under `System32`, which
+/// takes administrator rights to write to.
+fn canonical_directory(path: &Path) -> Result<PathBuf, RepositoryError> {
+    let wide = HSTRING::from(path.as_os_str().to_string_lossy().as_ref());
+    // SAFETY: `wide` outlives the call, and the returned handle is owned by
+    // `OwnedHandle` and closed exactly once. `FILE_FLAG_BACKUP_SEMANTICS` is
+    // what allows a directory to be opened at all.
+    let handle = unsafe {
+        CreateFileW(
+            &wide,
+            FILE_READ_ATTRIBUTES.0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            None,
+        )
+    }
+    .map_err(|error| windows_error("open a GPU export directory", None, error))?;
+    let handle = OwnedHandle(handle);
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: the handle is live for the call, and `information` is a
+    // correctly sized structure this call fills in.
+    unsafe { GetFileInformationByHandle(handle.0, &raw mut information) }
+        .map_err(|error| windows_error("read a GPU export directory", None, error))?;
+    if information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY.0 == 0 {
+        return Err(RepositoryError::new(format!(
+            "\"{}\" is not a directory and cannot be exported",
+            path.display()
+        )));
+    }
+
+    let mut buffer = vec![0_u16; PATH_BUFFER];
+    loop {
+        // SAFETY: the handle is live, and the buffer is passed with its own
+        // length; a return larger than that length is the required size and
+        // nothing was written.
+        let length =
+            unsafe { GetFinalPathNameByHandleW(handle.0, &mut buffer, FILE_NAME_NORMALIZED) }
+                as usize;
+        if length == 0 {
+            return Err(windows_error(
+                "resolve a GPU export directory",
+                None,
+                windows::core::Error::from_win32(),
+            ));
+        }
+        if length >= buffer.len() {
+            buffer = vec![0_u16; length + 1];
+            continue;
+        }
+
+        let resolved = String::from_utf16_lossy(&buffer[..length]);
+        return Ok(PathBuf::from(strip_extended_prefix(&resolved)));
+    }
+}
+
+/// The ordinary form of a `\\?\C:\...` answer.
+///
+/// Only a drive path is unwrapped: `\\?\UNC\...` means something different,
+/// and cutting its prefix off would produce a path that resolves nowhere.
+fn strip_extended_prefix(path: &str) -> &str {
+    let Some(rest) = path.strip_prefix(r"\\?\") else {
+        return path;
+    };
+    let mut characters = rest.chars();
+    match (characters.next(), characters.next(), characters.next()) {
+        (Some(drive), Some(':'), Some('\\')) if drive.is_ascii_alphabetic() => rest,
+        _ => path,
     }
 }
 
@@ -244,7 +388,7 @@ mod tests {
 
     use vmlord_core::{GpuShareRole, HostGpuAdapter, RepositoryError};
 
-    use super::{ExportRoots, build_with};
+    use super::{ExportRoots, build_with, strip_extended_prefix};
 
     const SYSTEM32: &str = r"C:\Windows\System32";
     const REPOSITORY: &str = r"C:\Windows\System32\DriverStore\FileRepository";
@@ -478,6 +622,77 @@ mod tests {
             GpuShareRole::DriverPackage {
                 package: "nvltsi.inf_amd64_1".to_owned()
             }
+        );
+    }
+
+    #[test]
+    fn the_extended_prefix_is_stripped_from_a_drive_path() {
+        // `GetFinalPathNameByHandleW` answers in `\\?\` form; HCS is given the
+        // ordinary path, which is what the AppSandbox backend passed and what
+        // a reader recognises in a log.
+        assert_eq!(
+            strip_extended_prefix(r"\\?\C:\Windows\System32\lxss\lib"),
+            r"C:\Windows\System32\lxss\lib"
+        );
+    }
+
+    #[test]
+    fn a_unc_answer_keeps_its_prefix() {
+        // `\\?\UNC\server\share` is not a drive path, and cutting four
+        // characters off it would produce something that resolves nowhere.
+        assert_eq!(
+            strip_extended_prefix(r"\\?\UNC\server\share"),
+            r"\\?\UNC\server\share"
+        );
+    }
+
+    #[test]
+    fn a_plain_path_is_left_alone() {
+        assert_eq!(
+            strip_extended_prefix(r"C:\Windows\System32"),
+            r"C:\Windows\System32"
+        );
+    }
+
+    #[test]
+    #[ignore = "reads the real host's directories"]
+    fn exports_built_on_this_host_are_sound() {
+        // What this can assert is self-consistency: on a host with no GPU-PV
+        // and no WSL there is nothing to export, and demanding either would be
+        // a test that is permanently red on half the machines it runs on.
+        let capabilities = crate::discover_host_gpu();
+        let Some(exports) = super::GpuExports::build(&capabilities.adapters) else {
+            println!("nothing to export on this host");
+            return;
+        };
+
+        let mut names = Vec::new();
+        for export in exports.iter() {
+            println!("{} -> {}", export.name(), export.host_path().display());
+            assert!(
+                export.host_path().is_dir(),
+                "an exported path must be a directory: {}",
+                export.host_path().display()
+            );
+            assert!(
+                export
+                    .host_path()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(r"\system32\"),
+                "an exported path must live under System32: {}",
+                export.host_path().display()
+            );
+            names.push(export.name().to_owned());
+        }
+
+        let mut unique = names.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "share names must be unique: {names:?}"
         );
     }
 }
