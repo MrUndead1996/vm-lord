@@ -1,0 +1,16 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Build automation, not part of the product. It is invoked through the Cargo
+# aliases in `.cargo/config.toml`, so it stays out of `default-members`.
+[[bin]]
+name = "xtask"
+test = false
+bench = false
+
+[lints]
+workspace = true

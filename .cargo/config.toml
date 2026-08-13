@@ -1,0 +1,33 @@
+# The Linux agent links with `rust-lld` and the musl libc that ships inside
+# `rust-std`, so building it needs no C toolchain on any host. That is what
+# makes `cargo agent` work from Windows, where no Linux `cc` exists: the
+# `x86_64-unknown-linux-gnu` target would call one and fail.
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"
+
+[alias]
+# Linux guest agent. Built for musl on every host, so the artifact is the same
+# static binary whether it came from WSL or from Windows.
+agent = ["build", "-p", "vmlord-agent", "--target", "x86_64-unknown-linux-musl"]
+agent-release = [
+    "build",
+    "-p",
+    "vmlord-agent",
+    "--target",
+    "x86_64-unknown-linux-musl",
+    "--release",
+]
+
+# Compile-check the Windows application from WSL. The GNU target exists only
+# for this: it needs no MSVC, so a Linux box can tell whether the Windows code
+# still builds. Release binaries stay MSVC -- see `cargo dist`.
+check-windows = ["check", "--target", "x86_64-pc-windows-gnu", "--all-targets"]
+
+# Windows tests, run from WSL. Cargo executes the `.exe` files directly and
+# WSL's binfmt interop hands them to Windows, so no Wine and no runner is
+# involved. Add `--no-run` to stop after compiling them.
+test-windows = ["test", "--target", "x86_64-pc-windows-gnu"]
+
+# Production build: MSVC application plus musl agent, collected into `dist/`.
+# Windows-only, because the release executable must come from MSVC.
+dist = ["run", "-p", "xtask", "--", "dist"]

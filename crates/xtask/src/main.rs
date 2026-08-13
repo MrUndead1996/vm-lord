@@ -1,0 +1,132 @@
+//! Build automation behind the Cargo aliases in `.cargo/config.toml`.
+//!
+//! Only `dist` lives here: the other aliases are single `cargo` invocations
+//! and need no program to run them.
+
+use std::{
+    env,
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, ExitCode},
+};
+
+/// The release target for the application. MSVC is the toolchain Windows
+/// itself is built against, and the one the HCS bindings expect.
+const APP_TARGET: &str = "x86_64-pc-windows-msvc";
+
+/// The release target for the guest agent. musl links statically through
+/// `rust-lld`, which is why this build needs no C toolchain on the host.
+const AGENT_TARGET: &str = "x86_64-unknown-linux-musl";
+
+/// What `dist` collects, as (target directory, file name) pairs.
+const ARTIFACTS: [(&str, &str); 4] = [
+    (APP_TARGET, "vmlord.exe"),
+    (APP_TARGET, "vmlord-com1.exe"),
+    // Staged next to the executables by `crates/vmlord/build.rs`; the legacy
+    // backend loads it by name from the application's own directory.
+    (APP_TARGET, "appsandbox_core.dll"),
+    (AGENT_TARGET, "vmlord-agent"),
+];
+
+fn main() -> ExitCode {
+    let task = env::args().nth(1);
+    let result = match task.as_deref() {
+        Some("dist") => dist(),
+        Some(other) => Err(format!("unknown task `{other}`; the only task is `dist`")),
+        None => Err("missing task; the only task is `dist`".to_owned()),
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("xtask: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Builds the release artifacts and gathers them into `dist/`.
+fn dist() -> Result<(), String> {
+    if !cfg!(windows) {
+        return Err(format!(
+            "`cargo dist` runs on Windows only: the release application is built for {APP_TARGET}, \
+             which needs the MSVC toolchain. From WSL use `cargo check-windows` and \
+             `cargo test-windows` instead."
+        ));
+    }
+
+    let workspace = workspace_root()?;
+
+    cargo(
+        &workspace,
+        &["build", "-p", "vmlord", "--release", "--target", APP_TARGET],
+    )?;
+    cargo(
+        &workspace,
+        &[
+            "build",
+            "-p",
+            "vmlord-agent",
+            "--release",
+            "--target",
+            AGENT_TARGET,
+        ],
+    )?;
+
+    let destination = workspace.join("dist");
+    if destination.exists() {
+        fs::remove_dir_all(&destination)
+            .map_err(|error| format!("cannot clear {}: {error}", destination.display()))?;
+    }
+    fs::create_dir_all(&destination)
+        .map_err(|error| format!("cannot create {}: {error}", destination.display()))?;
+
+    for (target, file) in ARTIFACTS {
+        let source = workspace
+            .join("target")
+            .join(target)
+            .join("release")
+            .join(file);
+        fs::copy(&source, destination.join(file)).map_err(|error| {
+            format!(
+                "cannot copy {} into the distribution: {error}",
+                source.display()
+            )
+        })?;
+        println!("dist: {file}");
+    }
+
+    println!("dist: written to {}", destination.display());
+    Ok(())
+}
+
+/// Runs Cargo in the workspace, failing on anything but a clean exit.
+fn cargo(workspace: &Path, arguments: &[&str]) -> Result<(), String> {
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let status = Command::new(&cargo)
+        .args(arguments)
+        .current_dir(workspace)
+        .status()
+        .map_err(|error| format!("cannot run cargo {}: {error}", arguments.join(" ")))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "cargo {} failed with {status}",
+            arguments.join(" ")
+        ))
+    }
+}
+
+/// The workspace root, reached from this crate's own manifest.
+fn workspace_root() -> Result<PathBuf, String> {
+    let manifest = env::var_os("CARGO_MANIFEST_DIR")
+        .ok_or_else(|| "CARGO_MANIFEST_DIR is unset; run this through `cargo dist`".to_owned())?;
+    PathBuf::from(manifest)
+        .ancestors()
+        .nth(2)
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "cannot locate the workspace root above crates/xtask".to_owned())
+}

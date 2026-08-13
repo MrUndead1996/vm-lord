@@ -1932,6 +1932,40 @@ Reverse dependencies are forbidden.
 
 ---
 
+# Build Targets
+
+VMLord is one repository that produces two programs for two operating systems,
+so every build names a target explicitly.
+
+| Program | Target | Built on |
+| --- | --- | --- |
+| `vmlord.exe`, `vmlord-com1.exe` | `x86_64-pc-windows-msvc` | Windows |
+| `vmlord-agent` | `x86_64-unknown-linux-musl` | Windows and Linux |
+| the application, compile-checked and tested | `x86_64-pc-windows-gnu` | WSL |
+
+MSVC is the release toolchain for the application: it is what Windows itself is
+built against, and what the HCS bindings expect. The GNU target exists only so
+that a Linux machine can tell whether the Windows code still compiles, and so
+that its tests can run; it never produces a shipped binary.
+
+The agent is built for musl rather than glibc because musl links statically
+through `rust-lld`, using the libc that ships inside `rust-std`. No C toolchain
+takes part, which is what lets Windows cross-compile the agent at all: the
+`x86_64-unknown-linux-gnu` target calls an external `cc`, and a Windows host has
+no Linux one. The result is a static binary that does not depend on the guest's
+glibc version, and it is the same artifact whether it was built from Windows or
+from WSL.
+
+The cost is that the agent cannot link against system C libraries. Nothing it
+does today needs to. Should that change -- PAM or NSS would be the likely
+reason -- the way back is `cargo-zigbuild`, which supplies a Linux cross-linker
+on Windows in exchange for a Zig installation on every developer's machine.
+
+Windows tests run from WSL without Wine: WSL's binfmt interop hands a
+`.exe` to Windows, so Cargo's default runner is enough.
+
+---
+
 # Future Components
 
 The architecture should support additional frontends without modifying the core.

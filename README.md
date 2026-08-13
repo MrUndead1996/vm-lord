@@ -100,6 +100,34 @@ backend and lists persisted VMs in an egui desktop shell. The AppSandbox legacy
 backend remains as a transitional fallback, selected only by setting
 `VMLORD_BACKEND=legacy`.
 
+## Building
+
+Every build names its target, because the repository produces a Windows
+application and a Linux guest agent. The commands are Cargo aliases, defined in
+`.cargo/config.toml`:
+
+| Command | Does | Runs on |
+| --- | --- | --- |
+| `cargo build -p vmlord` | the application, for the host toolchain | Windows |
+| `cargo agent` / `cargo agent-release` | the guest agent, `x86_64-unknown-linux-musl` | Windows, Linux |
+| `cargo check-windows` | compile-checks the application through `x86_64-pc-windows-gnu` | WSL |
+| `cargo test-windows` | builds and runs the Windows tests | WSL |
+| `cargo dist` | release build of everything, collected into `dist/` | Windows |
+
+Prerequisites:
+
+* Windows: the MSVC toolchain, and `rustup target add x86_64-unknown-linux-musl`
+  for the agent. Nothing else -- the agent links with `rust-lld` and needs no C
+  cross-compiler.
+* WSL: `rustup target add x86_64-pc-windows-gnu` and the MinGW-w64 linker
+  (`x86_64-w64-mingw32-gcc`, from `gcc-mingw-w64-x86-64` on Debian and Ubuntu).
+  Windows test binaries then run directly, through WSL's interop -- no Wine.
+
+`cargo dist` is Windows-only: release executables must come from MSVC. See
+**ARCHITECTURE.md** for why each target was chosen.
+
+## Running
+
 Build with `cargo build -p vmlord`, then launch the elevated executable with:
 
 ```powershell
