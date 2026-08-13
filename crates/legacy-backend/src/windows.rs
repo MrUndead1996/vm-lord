@@ -10,7 +10,8 @@ use libloading::Library;
 use vmlord_app::{ImagePicker, SettingsPathPicker};
 use vmlord_core::{
     AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError,
-    SshAvailability, VmCreateRequest, VmRepository, VmState, VmSummary, VmUpdateRequest,
+    SshAvailability, VmCreateRequest, VmGpuFacts, VmRepository, VmState, VmSummary,
+    VmUpdateRequest,
 };
 
 type AsbVm = *mut c_void;
@@ -430,6 +431,9 @@ impl AppSandboxBackend {
                 disk_gb: (self.api.vm_hdd_gb)(vm),
                 cpu_cores: (self.api.vm_cpu_cores)(vm),
                 gpu_mode: gpu_mode((self.api.vm_gpu_mode)(vm)),
+                // The AppSandbox FFI reports the mode a VM was configured
+                // with and nothing about what came of it.
+                gpu: VmGpuFacts::default(),
                 network_mode: network_mode((self.api.vm_network_mode)(vm)),
                 // The temporary AppSandbox FFI does not expose a guest IP address yet.
                 ip_address: None,

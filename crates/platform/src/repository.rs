@@ -14,8 +14,8 @@ use std::{
 
 use vmlord_core::{
     AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, GuestReadinessTimeouts, NetworkMode,
-    RepositoryError, SshAvailability, VmCreateRequest, VmDeleteRequest, VmRepository, VmState,
-    VmSummary, VmUpdateRequest,
+    RepositoryError, SshAvailability, VmCreateRequest, VmDeleteRequest, VmGpuFacts, VmRepository,
+    VmState, VmSummary, VmUpdateRequest,
 };
 
 use crate::{
@@ -380,8 +380,10 @@ impl HcsVmRepository {
             disk_gb,
             cpu_cores: topology.cpu_cores,
             // GPU is not wired to the native backend yet and is reported as
-            // absent rather than guessed at.
+            // absent rather than guessed at. Nothing is observed either, which
+            // is the honest answer for a backend that attaches nothing.
             gpu_mode: GpuMode::None,
+            gpu: VmGpuFacts::default(),
             network_mode,
             ip_address,
             ssh,
@@ -1147,8 +1149,8 @@ mod tests {
     use uuid::Uuid;
     use vmlord_core::{
         AgentStatus, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError, SshAuthentication,
-        SshAvailability, SshConfig, SshPort, VmDeleteRequest, VmRepository, VmState, VmSummary,
-        VmUpdateRequest,
+        SshAvailability, SshConfig, SshPort, VmDeleteRequest, VmGpuFacts, VmRepository, VmState,
+        VmSummary, VmUpdateRequest,
     };
 
     use super::{
@@ -1208,6 +1210,7 @@ mod tests {
             disk_gb: 20,
             cpu_cores: 2,
             gpu_mode: GpuMode::None,
+            gpu: VmGpuFacts::default(),
             network_mode: NetworkMode::Nat,
             ip_address: None,
             ssh: SshAvailability::Disabled,

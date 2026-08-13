@@ -20,7 +20,8 @@ use std::{
 };
 
 use vmlord_core::{
-    BuildMonitor, BuildStep, GpuMode, RepositoryError, SshAvailability, VmCreateRequest, VmSource,
+    BuildMonitor, BuildStep, GpuMode, RepositoryError, SshAvailability, VmCreateRequest, VmGpuFacts,
+    VmSource,
     VmState, VmSummary,
 };
 
@@ -162,6 +163,8 @@ impl BuildRegistry {
                 disk_gb: build.request.disk_gb,
                 cpu_cores: build.request.cpu_cores,
                 gpu_mode: GpuMode::None,
+                // Nothing has been attached to a VM that is still being built.
+                gpu: VmGpuFacts::default(),
                 network_mode: build.request.network_mode,
                 // A VM that does not exist answers nowhere.
                 ip_address: None,

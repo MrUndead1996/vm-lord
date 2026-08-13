@@ -1,6 +1,7 @@
 //! UI-independent domain types and repository boundary for VMLord.
 
 pub mod distro;
+pub mod gpu;
 pub mod logging;
 pub mod progress;
 pub mod provisioning;
@@ -8,6 +9,10 @@ pub mod settings;
 pub mod ssh;
 
 pub use distro::{DistroProfile, SshDaemon, ubuntu};
+pub use gpu::{
+    GpuAssignment, GpuFailure, GpuMode, GpuStage, GpuState, GpuStatusCode, GuestGpuDetail,
+    GuestGpuReport, NativeGpuDetail, VmGpuFacts, VmGpuStatus,
+};
 pub use logging::{LoggingError, initialize as initialize_logging};
 pub use progress::{
     BuildMonitor, BuildProgress, BuildStep, DownloadPhase, ProgressPublisher, ProgressThrottle,
@@ -88,7 +93,14 @@ pub struct VmSummary {
     pub ram_mb: u32,
     pub disk_gb: u32,
     pub cpu_cores: u32,
+    /// What the VM asks of the host's GPU: desired state, stored with the VM
+    /// and unchanged by whatever a start makes of it.
     pub gpu_mode: GpuMode,
+    /// What a backend has observed about that GPU, if anything.
+    ///
+    /// Facts, not a verdict: `vmlord_app` turns these into the
+    /// `VmGpuStatus` a person reads, so the backend never has to name a state.
+    pub gpu: VmGpuFacts,
     pub network_mode: NetworkMode,
     pub ip_address: Option<std::net::IpAddr>,
     /// Whether this VM can be reached over SSH, and with what.
@@ -118,14 +130,6 @@ pub enum AgentStatus {
     Offline,
     Online,
     Unknown,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GpuMode {
-    None,
-    Default,
-    Mirror,
-    Unknown(i32),
 }
 
 /// How a VM is attached to the network.
