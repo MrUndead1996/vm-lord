@@ -10,6 +10,8 @@ use uuid::Uuid;
 use vmlord_core::{GpuMode, NetworkMode, RepositoryError, VmCreateRequest, VmSource};
 use windows::core::GUID;
 
+use crate::gpu_exports::GpuExports;
+
 /// Builds HCS compute-system configuration documents from a validated
 /// [`VmCreateRequest`].
 pub(crate) struct HcsVmConfigBuilder;
@@ -299,10 +301,111 @@ pub(crate) fn remove_network_adapter(document: &str) -> Result<String, Repositor
     })
 }
 
+/// Returns `document` with `exports` written into its `Plan9` section.
+///
+/// The whole section is replaced rather than merged: the export set is
+/// computed once per start and is what the VM boots with, so a leftover share
+/// from a previous start is stale by definition.
+/// Nothing calls this yet: a start cannot know a VM's GPU mode until the task
+/// that applies HCS assignment records one, and that task is the caller. The
+/// allow goes away with it.
+#[allow(dead_code)]
+pub(crate) fn apply_plan9_shares(
+    document: &str,
+    exports: &GpuExports,
+) -> Result<String, RepositoryError> {
+    let mut configuration = parse(document)?;
+    let devices = write_target(&mut configuration, DEVICES_POINTER)?
+        .as_object_mut()
+        .ok_or_else(|| {
+            let error = RepositoryError::new(format!(
+                "the stored HCS configuration has no \"{DEVICES_POINTER}\" object to attach \
+                 Plan9 shares to"
+            ));
+            log::error!("{error}");
+            error
+        })?;
+
+    let shares: Vec<Plan9Share<'_>> = exports
+        .iter()
+        .map(|export| Plan9Share {
+            name: export.name(),
+            access_name: export.name(),
+            path: export.host_path(),
+            port: PLAN9_PORT,
+            flags: PLAN9_FLAG_READ_ONLY,
+        })
+        .collect();
+    let shares = serde_json::to_value(shares).map_err(|error| {
+        RepositoryError::new(format!("failed to serialize the VM's Plan9 shares: {error}"))
+    })?;
+    devices.insert(PLAN9_KEY.to_owned(), serde_json::json!({ "Shares": shares }));
+
+    serde_json::to_string(&configuration).map_err(|error| {
+        RepositoryError::new(format!(
+            "failed to serialize the HCS VM configuration with its Plan9 shares: {error}"
+        ))
+    })
+}
+
+/// Returns `document` without its `Plan9` section.
+///
+/// A VM whose GPU was switched off still has the previous start's shares in
+/// its stored configuration, and leaving them would hand the guest driver
+/// directories it no longer asks for. A document that has no such section is
+/// returned byte for byte, so a start that changes nothing writes nothing.
+/// Nothing calls this yet: a start cannot know a VM's GPU mode until the task
+/// that applies HCS assignment records one, and that task is the caller. The
+/// allow goes away with it.
+#[allow(dead_code)]
+pub(crate) fn remove_plan9_shares(document: &str) -> Result<String, RepositoryError> {
+    let mut configuration = parse(document)?;
+    let removed = configuration
+        .pointer_mut(DEVICES_POINTER)
+        .and_then(serde_json::Value::as_object_mut)
+        .and_then(|devices| devices.remove(PLAN9_KEY));
+    if removed.is_none() {
+        return Ok(document.to_owned());
+    }
+
+    serde_json::to_string(&configuration).map_err(|error| {
+        RepositoryError::new(format!(
+            "failed to serialize the HCS VM configuration without its Plan9 shares: {error}"
+        ))
+    })
+}
+
+/// One share as HCS reads it.
+#[allow(dead_code)]
+#[derive(Serialize)]
+struct Plan9Share<'a> {
+    #[serde(rename = "Name")]
+    name: &'a str,
+    /// What the guest passes as `aname=`; the same string as `Name`, because
+    /// a second name would be one more thing for the two sides to disagree
+    /// about.
+    #[serde(rename = "AccessName")]
+    access_name: &'a str,
+    #[serde(rename = "Path")]
+    path: &'a Path,
+    #[serde(rename = "Port")]
+    port: u32,
+    #[serde(rename = "Flags")]
+    flags: u32,
+}
+
 const MEMORY_SIZE_POINTER: &str = "/VirtualMachine/ComputeTopology/Memory/SizeInMB";
 const PROCESSOR_COUNT_POINTER: &str = "/VirtualMachine/ComputeTopology/Processor/Count";
 const DEVICES_POINTER: &str = "/VirtualMachine/Devices";
 const NETWORK_ADAPTERS_KEY: &str = "NetworkAdapters";
+const PLAN9_KEY: &str = "Plan9";
+/// The HvSocket port the host's Plan9 server answers on, and the one the guest
+/// agent connects to before it mounts.
+const PLAN9_PORT: u32 = 50001;
+/// Read-only. The flag values are not published in any SDK header; this is
+/// what Hyper-V honours and what the AppSandbox backend passed, and read-only
+/// is stated a second time by the guest's own `MS_RDONLY` mount.
+const PLAN9_FLAG_READ_ONLY: u32 = 1;
 
 fn parse(document: &str) -> Result<serde_json::Value, RepositoryError> {
     serde_json::from_str(document).map_err(|error| {
@@ -527,15 +630,16 @@ mod tests {
     use serde_json::{Value, json};
     use uuid::Uuid;
     use vmlord_core::{
-        CloudImage, GpuMode, NetworkMode, Password, Provisioning, SshAccess, SshPort,
+        CloudImage, GpuMode, GpuShare, NetworkMode, Password, Provisioning, SshAccess, SshPort,
         VmCreateRequest, VmSource, ubuntu,
     };
 
     use super::{
-        HcsVmConfigBuilder, VmTopology, adapter_key, apply_network_adapter, apply_topology,
-        com1_pipe_path, ensure_supported_network_mode, media_path, read_topology,
-        remove_network_adapter,
+        HcsVmConfigBuilder, VmTopology, adapter_key, apply_network_adapter, apply_plan9_shares,
+        apply_topology, com1_pipe_path, ensure_supported_network_mode, media_path, read_topology,
+        remove_network_adapter, remove_plan9_shares,
     };
+    use crate::gpu_exports::GpuExports;
 
     /// The identity a created compute system is given, fixed so that the pipe
     /// name derived from it can be written down.
@@ -1179,5 +1283,83 @@ mod tests {
                 "{document}"
             );
         }
+    }
+
+    fn document_with_devices() -> String {
+        HcsVmConfigBuilder::build(
+            &request(),
+            &PathBuf::from(r"C:\vms\test-vm\disks\system.vhdx"),
+            &PathBuf::from(r"C:\vms\test-vm\seed.iso"),
+            None,
+            VM_ID,
+        )
+        .expect("the configuration must build")
+    }
+
+    fn exports() -> GpuExports {
+        GpuExports::for_test(vec![
+            (
+                GpuShare::wsl_lib(),
+                PathBuf::from(r"C:\Windows\System32\lxss\lib"),
+            ),
+            (
+                GpuShare::driver_package("nvltsi.inf_amd64_1").unwrap(),
+                PathBuf::from(r"C:\Windows\System32\DriverStore\FileRepository\nvltsi.inf_amd64_1"),
+            ),
+        ])
+    }
+
+    #[test]
+    fn plan9_shares_are_written_read_only_on_the_agent_port() {
+        let updated =
+            apply_plan9_shares(&document_with_devices(), &exports()).expect("shares must apply");
+
+        let value: Value = serde_json::from_str(&updated).expect("valid JSON");
+        let shares = value
+            .pointer("/VirtualMachine/Devices/Plan9/Shares")
+            .and_then(Value::as_array)
+            .expect("the Plan9 section must hold an array of shares");
+        assert_eq!(shares.len(), 2);
+        assert_eq!(shares[0]["Name"], "vmlord.gpu.wsl-lib");
+        assert_eq!(shares[0]["AccessName"], "vmlord.gpu.wsl-lib");
+        assert_eq!(shares[0]["Path"], r"C:\Windows\System32\lxss\lib");
+        assert_eq!(shares[0]["Port"], 50001);
+        assert_eq!(shares[0]["Flags"], 1, "1 is read-only");
+        assert_eq!(shares[1]["Name"], "vmlord.gpu.drv.nvltsi.inf_amd64_1");
+    }
+
+    #[test]
+    fn applying_shares_twice_replaces_rather_than_appends() {
+        let document = document_with_devices();
+
+        let once = apply_plan9_shares(&document, &exports()).expect("shares must apply");
+        let twice = apply_plan9_shares(&once, &exports()).expect("shares must apply again");
+
+        assert_eq!(once, twice, "a start that changes nothing writes nothing");
+    }
+
+    #[test]
+    fn removing_shares_takes_the_whole_section() {
+        let with_shares =
+            apply_plan9_shares(&document_with_devices(), &exports()).expect("shares must apply");
+
+        let without = remove_plan9_shares(&with_shares).expect("shares must be removable");
+
+        let value: Value = serde_json::from_str(&without).expect("valid JSON");
+        assert!(
+            value.pointer("/VirtualMachine/Devices/Plan9").is_none(),
+            "a VM whose GPU was switched off must not keep the previous start's shares"
+        );
+    }
+
+    #[test]
+    fn removing_shares_from_a_document_without_any_changes_nothing() {
+        let document = document_with_devices();
+
+        assert_eq!(
+            remove_plan9_shares(&document).expect("nothing to remove"),
+            document,
+            "a document needing no change comes back byte for byte"
+        );
     }
 }
