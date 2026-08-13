@@ -4499,6 +4499,7 @@ dependencies = [
 name = "vmlord-agent"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "vmlord-agent-protocol",
 ]
 
