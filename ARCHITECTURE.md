@@ -194,8 +194,8 @@ agent-protocol (portable wire contract)
 `vmlord-agent` is the only crate that is not part of `vmlord.exe`. It is a
 Linux program that runs inside a guest, so it is excluded from the workspace's
 `default-members` and built on its own with `cargo agent`, which targets
-`x86_64-unknown-linux-musl`. Its `main` refuses to compile for any other target
-rather than link-failing later.
+`x86_64-unknown-linux-musl`. Its `main` refuses to compile for non-Linux
+targets rather than link-failing later.
 `agent-protocol` is in both sets, because both ends of the connection speak it.
 
 `legacy-backend`, `platform`, and `vmlord-agent` are the only crates that
