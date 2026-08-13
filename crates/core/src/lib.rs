@@ -10,9 +10,9 @@ pub mod ssh;
 
 pub use distro::{DistroProfile, SshDaemon, ubuntu};
 pub use gpu::{
-    GpuAssignment, GpuAvailability, GpuFailure, GpuMode, GpuStage, GpuState, GpuStatusCode,
-    GuestGpuDetail, GuestGpuReport, HostGpuAdapter, HostGpuCapabilities, NativeGpuDetail,
-    VmGpuFacts, VmGpuStatus,
+    GpuAssignment, GpuAvailability, GpuFailure, GpuMode, GpuShare, GpuShareManifest, GpuShareRole,
+    GpuStage, GpuState, GpuStatusCode, GuestGpuDetail, GuestGpuReport, HostGpuAdapter,
+    HostGpuCapabilities, NativeGpuDetail, VmGpuFacts, VmGpuStatus, WSL_LIB_SHARE,
 };
 pub use logging::{LoggingError, initialize as initialize_logging};
 pub use progress::{
