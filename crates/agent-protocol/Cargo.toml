@@ -1,0 +1,22 @@
+[package]
+name = "vmlord-agent-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+# Runtime only: the generated types are plain structs with `encode`/`decode`.
+# No gRPC stack, because the transport is one HvSocket stream per VM.
+prost = "0.14"
+
+[build-dependencies]
+prost = "0.14"
+prost-build = "0.14"
+# Compiles the `.proto` in-process. `prost-build` alone would shell out to
+# `protoc`, which nothing else in this repository needs and which the Windows
+# and Linux sides would have to install separately.
+protox = "0.9"
+
+[lints]
+workspace = true

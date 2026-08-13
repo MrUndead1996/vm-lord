@@ -4,3 +4,7 @@
 # The qcow2 fixtures are binary; no end-of-line conversion applies to them.
 *.qcow2 binary
 *.qcow binary
+
+# The compiled agent schema. Marked binary so that no end-of-line conversion
+# touches it and a diff says the schema changed instead of printing it.
+*.descriptor.bin binary

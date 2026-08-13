@@ -1,5 +1,26 @@
 [workspace]
 members = [
+    "crates/agent",
+    "crates/agent-protocol",
+    "crates/core",
+    "crates/image",
+    "crates/app",
+    "crates/keys",
+    "crates/legacy-backend",
+    "crates/platform",
+    "crates/seed",
+    "crates/ui",
+    "crates/vmlord",
+]
+# `crates/agent` is a Linux guest program and cannot be built for the host
+# target, so it stays out of the default set that `cargo build` and
+# `cargo test` operate on. It is built on its own:
+#
+#     cargo build -p vmlord-agent --target x86_64-unknown-linux-gnu
+#
+# `crates/agent-protocol` is in both sets: the host links it too.
+default-members = [
+    "crates/agent-protocol",
     "crates/core",
     "crates/image",
     "crates/app",

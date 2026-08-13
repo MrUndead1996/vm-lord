@@ -1,0 +1,159 @@
+// The wire contract between VMLord on the host and vmlord-agent in a guest.
+//
+// Not a gRPC service: the transport is a single HvSocket stream the guest
+// opens, and every message on it is an `Envelope` behind a 4-byte
+// little-endian length prefix (see `vmlord_agent_protocol::frame`). A service
+// definition would buy nothing here and would drag in an HTTP/2 stack on both
+// sides of a socket that carries one connection per VM.
+//
+// Compatibility rules for anyone editing this file:
+//
+//   * never reuse or renumber a field -- both sides of this protocol are
+//     upgraded separately, and a guest agent installed months ago is still
+//     expected to talk to today's host;
+//   * adding a message, a field, an enum value or a `oneof` arm is a minor
+//     version bump; removing or repurposing one is a major bump;
+//   * every enum keeps a zero `*_UNSPECIFIED` value, because proto3 cannot
+//     tell "absent" from "first variant" without one.
+
+syntax = "proto3";
+
+package vmlord.agent.v1;
+
+// One message on the wire, in either direction.
+//
+// The protocol is symmetric: the host sends requests to the guest (attach this
+// GPU manifest, what is your GPU doing), and the guest sends requests to the
+// host (here is my heartbeat). Both therefore use the same envelope rather
+// than a client and a server envelope that would have to be kept in step.
+message Envelope {
+  // Correlates a response with the request that caused it.
+  //
+  // Unique per originator, not globally: each side numbers its own requests
+  // from 1, and a response repeats the id of the request it answers. Zero is
+  // reserved for messages that answer nothing.
+  uint32 request_id = 1;
+
+  oneof body {
+    Request request = 2;
+    Response response = 3;
+  }
+}
+
+// Something a peer asks the other one to do.
+message Request {
+  oneof kind {
+    HelloRequest hello = 1;
+    HeartbeatRequest heartbeat = 2;
+  }
+
+  // Field 3 onwards is where the rest of the protocol lands: authentication
+  // (#87), the GPU share manifest and the guest's GPU report. Each arrives
+  // with the task that implements it, so that the shape is designed against
+  // working code rather than guessed at here.
+}
+
+// The answer to exactly one `Request`, carrying its `request_id`.
+message Response {
+  oneof kind {
+    // Answers any request that could not be carried out, including one whose
+    // `kind` this peer does not know. It is arm 1 because every request can
+    // fail, and a peer that cannot parse the request it was sent still has to
+    // be able to say so.
+    Error error = 1;
+    HelloResponse hello = 2;
+    HeartbeatResponse heartbeat = 3;
+  }
+}
+
+// The protocol revision a peer speaks.
+//
+// Two numbers rather than one: `major` is a compatibility barrier and `minor`
+// is a feature level, so that a host one release ahead of an agent can decide
+// to speak down to it instead of dropping the connection.
+message ProtocolVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+}
+
+// An optional part of the protocol a peer implements.
+//
+// Separate from the version because capabilities are not ordered: an agent
+// running on a VM with no GPU is not an older agent, it is one that has
+// nothing to say about GPUs.
+enum Capability {
+  CAPABILITY_UNSPECIFIED = 0;
+
+  // The peer can report on GPU-PV and act on a GPU share manifest.
+  CAPABILITY_GPU = 1;
+}
+
+// Opens a session: the first message the guest sends after connecting.
+message HelloRequest {
+  // The highest revision the sender speaks.
+  ProtocolVersion version = 1;
+
+  // What the sender implements beyond the base protocol.
+  //
+  // Values this build does not know are kept as their numbers rather than
+  // rejected: a newer agent announcing a capability an older host has never
+  // heard of is a session that still works, minus that capability.
+  repeated Capability capabilities = 2;
+
+  // The agent build that is speaking, for logs and diagnostics only. Never
+  // parsed to decide behaviour -- that is what `version` and `capabilities`
+  // are for.
+  string agent_version = 3;
+}
+
+// Accepts a session and states what the responder settled on.
+message HelloResponse {
+  // The revision both peers will use: the same `major` as the request, and
+  // the lower of the two `minor`s.
+  ProtocolVersion version = 1;
+
+  // The capabilities both peers have, which is the only set either may use.
+  repeated Capability capabilities = 2;
+}
+
+// Proves the session is alive and that the peer is still answering.
+//
+// Empty on purpose: whatever state the host wants from a guest belongs in a
+// message named after that state, so that a heartbeat cannot quietly become
+// the place where everything is polled from.
+message HeartbeatRequest {}
+
+message HeartbeatResponse {}
+
+// A request that failed, described so the other side can act on it.
+message Error {
+  ErrorCode code = 1;
+
+  // Free text for logs. Not shown to users as-is and never parsed: `code` is
+  // what a peer branches on.
+  string message = 2;
+}
+
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+
+  // The peer's `major` differs, so there is nothing to negotiate down to.
+  ERROR_CODE_UNSUPPORTED_VERSION = 1;
+
+  // A request arrived before the session was authenticated.
+  ERROR_CODE_UNAUTHENTICATED = 2;
+
+  // The request is well-formed but this build has no arm for it, or it needs
+  // a capability the session did not agree on.
+  ERROR_CODE_UNSUPPORTED_REQUEST = 3;
+
+  // The request is understood and its contents are not usable.
+  ERROR_CODE_INVALID_ARGUMENT = 4;
+
+  // The request is fine and the peer cannot serve it right now; retrying may
+  // work.
+  ERROR_CODE_UNAVAILABLE = 5;
+
+  // The peer failed at something that is its own fault.
+  ERROR_CODE_INTERNAL = 6;
+}
