@@ -421,6 +421,12 @@ process, so a guest keeps its address after the application is closed but has
 nothing to renew against. Moving the server into a Windows service, or keeping
 VMLord in the tray, is left for later.
 
+The server belongs to the process rather than to the pipeline that started it. A
+process builds more than one `VmStartPipeline` -- the repository has one and its
+build cycle another -- and a server per pipeline meant the second pipeline to
+start a NAT VM bound a port VMLord itself was already serving, which failed
+every start after a creation until the application was restarted.
+
 UDP 67 being served already fails the start with a diagnosis naming Internet
 Connection Sharing, the Hyper-V Default Switch and third-party DHCP servers.
 `SO_REUSEADDR` is deliberately not set: on Windows it would let VMLord take over
