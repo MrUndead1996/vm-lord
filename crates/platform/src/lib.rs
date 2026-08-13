@@ -24,6 +24,7 @@ mod enumerate;
 mod error;
 mod event;
 mod force_stop;
+mod gpu_enumerate;
 mod guest_ready;
 mod hcn;
 mod hcn_endpoint;
