@@ -52,7 +52,7 @@ fn greet<S: Read + Write>(
     let request_id = envelope.request_id;
     match body(envelope)? {
         Body::Response(response::Kind::Hello(hello)) if request_id == HELLO_REQUEST_ID => {
-            if hello.version != Some(ProtocolVersion::current()) || !hello.capabilities.is_empty() {
+            if !compatible_version(hello.version) || !hello.capabilities.is_empty() {
                 return Err(SessionError::InvalidHello);
             }
             Ok(())
@@ -115,7 +115,12 @@ fn serve<S: Read + Write>(stream: &mut S, buffer: &mut Vec<u8>) -> Result<(), Se
         let envelope = match frame::read(stream, buffer) {
             Ok(envelope) => envelope,
             Err(FrameError::Closed) => return Ok(()),
-            Err(FrameError::Io(error)) if error.kind() == std::io::ErrorKind::TimedOut => {
+            Err(FrameError::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
                 if pending_heartbeat.is_some() {
                     return Err(SessionError::Frame(FrameError::Io(error)));
                 }
@@ -154,6 +159,14 @@ fn serve<S: Read + Write>(stream: &mut S, buffer: &mut Vec<u8>) -> Result<(), Se
             Body::Response(_) => return Err(SessionError::OutOfOrder("an unsolicited response")),
         }
     }
+}
+
+fn compatible_version(version: Option<ProtocolVersion>) -> bool {
+    let current = ProtocolVersion::current();
+    matches!(
+        version,
+        Some(version) if version.major == current.major && version.minor <= current.minor
+    )
 }
 
 fn refuse_unsupported<S: Write>(
@@ -267,7 +280,7 @@ mod tests {
 
     enum ReadStep {
         Bytes(Vec<u8>),
-        Timeout,
+        WouldBlock,
     }
 
     impl ScriptedStream {
@@ -307,9 +320,9 @@ mod tests {
                     }
                     Ok(count)
                 }
-                Some(ReadStep::Timeout) => {
+                Some(ReadStep::WouldBlock) => {
                     self.reads.pop_front();
-                    Err(io::Error::new(io::ErrorKind::TimedOut, "idle host"))
+                    Err(io::Error::new(io::ErrorKind::WouldBlock, "idle host"))
                 }
                 None => Ok(0),
             }
@@ -328,10 +341,9 @@ mod tests {
     }
 
     #[test]
-    fn opens_authenticates_heartbeats_and_refuses_unsupported_host_requests() {
-        // Removing the opening state machine, mishandling a receive timeout,
-        // or accepting a host request this agent does not implement must fail
-        // this test.
+    fn would_block_after_authentication_sends_a_heartbeat() {
+        // Treating Linux's SO_RCVTIMEO EAGAIN as a session error would make
+        // an otherwise idle host never receive its heartbeat.
         let secret = Secret::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
             .expect("a valid test secret");
         let nonce = Nonce::from_wire(&[7; auth::LEN]).expect("a valid nonce");
@@ -350,7 +362,7 @@ mod tests {
                     nonce: nonce.as_bytes().to_vec(),
                 }),
             )),
-            ReadStep::Timeout,
+            ReadStep::WouldBlock,
             ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::response(
                 2,
                 response::Kind::Heartbeat(HeartbeatResponse {}),
@@ -399,5 +411,47 @@ mod tests {
             panic!("the unsupported request needs an error response");
         };
         assert_eq!(error.code(), ErrorCode::UnsupportedRequest);
+    }
+
+    #[test]
+    fn accepts_an_older_same_major_hello_response() {
+        // Rejecting a host with an older compatible minor breaks the protocol
+        // negotiation that deliberately lets new agents speak to old hosts.
+        let secret = Secret::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .expect("a valid test secret");
+        let nonce = Nonce::from_wire(&[7; auth::LEN]).expect("a valid nonce");
+        let current = ProtocolVersion::current();
+        let older = ProtocolVersion {
+            major: current.major,
+            minor: current.minor - 1,
+        };
+        let mut stream = ScriptedStream::new([
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::response(
+                1,
+                response::Kind::Hello(HelloResponse {
+                    version: Some(older),
+                    capabilities: vec![],
+                }),
+            )),
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::request(
+                1,
+                request::Kind::Authenticate(AuthenticateRequest {
+                    nonce: nonce.as_bytes().to_vec(),
+                }),
+            )),
+        ]);
+
+        run(&mut stream, &secret, "test-agent").expect("a compatible host hang-up");
+
+        let frames = stream.written_frames();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames[1].request_id, 1);
+        let Some(envelope::Body::Response(authenticate)) = &frames[1].body else {
+            panic!("the challenge needs an authentication response");
+        };
+        assert!(matches!(
+            authenticate.kind,
+            Some(response::Kind::Authenticate(_))
+        ));
     }
 }
