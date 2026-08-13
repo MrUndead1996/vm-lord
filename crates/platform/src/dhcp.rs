@@ -325,15 +325,23 @@ pub(crate) type DhcpRegistrar = Box<
     dyn Fn(&MetadataStore, &str, &EndpointAddress) -> Result<(), RepositoryError> + Send + Sync,
 >;
 
+/// The one DHCP server of the process.
+///
+/// UDP 67 can be served once per host, so the server cannot belong to whoever
+/// happens to ask for a registrar: a process builds a [`crate::VmStartPipeline`]
+/// for its repository and another one inside its build cycle, and a server per
+/// pipeline means the second one to start a NAT VM binds a port the first is
+/// already serving. That is a start that fails with VMLord itself named as the
+/// culprit, and it lasted exactly until the application was restarted.
+static SERVICE: Mutex<Option<DhcpService>> = Mutex::new(None);
+
 /// The production registrar: it starts the server on the first NAT VM and
 /// reserves the guest's address on every start after that.
 ///
-/// The service is held by the closure rather than by a global: one
-/// [`crate::VmStartPipeline`] exists per process, which is exactly the lifetime
-/// the server is meant to have.
+/// Every registrar of the process serves the same [`SERVICE`], so it makes no
+/// difference how many pipelines were built or which of them starts a VM.
 pub(crate) fn registrar() -> DhcpRegistrar {
-    let service: Arc<Mutex<Option<DhcpService>>> = Arc::new(Mutex::new(None));
-    Box::new(move |store, mac, address| register(&service, store, mac, address))
+    Box::new(|store, mac, address| register(&SERVICE, store, mac, address))
 }
 
 fn register(
@@ -537,7 +545,7 @@ mod tests {
     use arcbox_dhcp::{DhcpMessageType, DhcpPacket};
 
     use super::{DhcpService, State, bind_error, dhcp_config, endpoint_subnet, netmask, parse_mac};
-    use crate::{hcn_endpoint::EndpointAddress, subnet::Ipv4Subnet};
+    use crate::{hcn_endpoint::EndpointAddress, metadata::MetadataStore, subnet::Ipv4Subnet};
 
     /// A state serving 172.22.42.0/24, the first candidate subnet.
     fn state() -> State {
@@ -946,6 +954,33 @@ mod tests {
 
         assert_eq!(offer.message_type, Some(DhcpMessageType::Offer));
         assert_eq!(offer.yiaddr, Ipv4Addr::new(172, 22, 42, 5));
+    }
+
+    /// Guards the defect the process-wide service exists for: a registrar used
+    /// to hold a server of its own, so the first NAT start that went through
+    /// the repository's pipeline bound UDP 67 while the build cycle's pipeline
+    /// was already serving it. It failed until VMLord itself was restarted.
+    ///
+    /// Run elevated, on a host carrying the VMLord NAT network:
+    /// `cargo test-windows -p vmlord-platform -- --ignored --exact dhcp::tests::every_registrar_of_the_process_serves_the_same_dhcp_server --nocapture`
+    #[test]
+    #[ignore = "binds UDP 67 on a host carrying the VMLord NAT network"]
+    fn every_registrar_of_the_process_serves_the_same_dhcp_server() {
+        let store = MetadataStore::new(
+            std::env::temp_dir().join(format!("vmlord-dhcp-{}.json", std::process::id())),
+        );
+
+        // Two pipelines, as a running VMLord has: one for the repository's
+        // starts and one inside its build cycle.
+        let repository = super::registrar();
+        let build_cycle = super::registrar();
+
+        build_cycle(&store, "00-15-5D-01-02-03", &address("172.22.42.5", 24))
+            .expect("the first registrar should start the DHCP server");
+        repository(&store, "00-15-5D-0A-0B-0C", &address("172.22.42.6", 24)).expect(
+            "a second registrar must serve the server the first started \
+             rather than bind UDP 67 again",
+        );
     }
 
     #[test]
