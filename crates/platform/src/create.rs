@@ -1,6 +1,11 @@
 //! Transactional creation of an HCS-backed virtual machine.
 
-use std::{fs, io::Write, path::Path, time::Duration};
+use std::{
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use uuid::Uuid;
 use vmlord_agent_protocol::auth;
@@ -26,6 +31,9 @@ const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
 type VhdCreator = Box<dyn Fn(&Path, u64) -> Result<(), RepositoryError> + Send + Sync>;
 type AccessGranter = Box<dyn Fn(&str, &Path) -> Result<(), RepositoryError> + Send + Sync>;
 type SystemCreator = Box<dyn Fn(&str, &str) -> Result<(), RepositoryError> + Send + Sync>;
+type AgentReader = Box<dyn Fn() -> Option<Vec<u8>> + Send + Sync>;
+
+const AGENT_FILE_NAME: &str = "vmlord-agent";
 
 /// Makes the VM's system disk out of a cloud image: fetch the image the release
 /// means, then write it into a VHDX at the given path, sized for the VM rather
@@ -104,6 +112,7 @@ pub struct VmCreationPipeline {
     access_granter: AccessGranter,
     system_creator: SystemCreator,
     system_teardown: SystemTeardown,
+    agent_reader: AgentReader,
 }
 
 impl VmCreationPipeline {
@@ -120,6 +129,7 @@ impl VmCreationPipeline {
             access_granter: Box::new(grant_vm_access),
             system_creator: Box::new(create_hcs_system),
             system_teardown: Box::new(cleanup::teardown_compute_system),
+            agent_reader: Box::new(read_agent_beside_executable),
         }
     }
 
@@ -140,6 +150,7 @@ impl VmCreationPipeline {
             access_granter: Box::new(access_granter),
             system_creator: Box::new(system_creator),
             system_teardown: Box::new(system_teardown),
+            agent_reader: Box::new(|| Some(b"test agent".to_vec())),
         }
     }
 
@@ -171,10 +182,20 @@ impl VmCreationPipeline {
         let hcs_compute_system_id = format!("vmlord-{}", vm_id.as_simple());
         let system_disk_path = layout::system_disk_path(vm_directory);
         let seed_path = layout::seed_path(vm_directory);
+        let agent = match &request.source {
+            VmSource::CloudImage { .. } => (self.agent_reader)(),
+            VmSource::LocalMedia { .. } => None,
+        };
+        let tools_path = agent.as_ref().map(|_| layout::tools_path(vm_directory));
         // Rejects an unsupported request (name, GPU/network mode, ...) before
         // any filesystem or HCS side effect.
-        let configuration =
-            HcsVmConfigBuilder::build(request, &system_disk_path, &seed_path, vm_id)?;
+        let configuration = HcsVmConfigBuilder::build(
+            request,
+            &system_disk_path,
+            &seed_path,
+            tools_path.as_deref(),
+            vm_id,
+        )?;
         let media_path = hcs_config::media_path(request, &seed_path).to_path_buf();
 
         log::info!(
@@ -259,6 +280,7 @@ impl VmCreationPipeline {
                         &hcs_compute_system_id,
                         image,
                         provisioning,
+                        agent.as_deref(),
                     )?;
                 }
             }
@@ -278,6 +300,9 @@ impl VmCreationPipeline {
             // readable by this (elevated) process.
             (self.access_granter)(&hcs_compute_system_id, &system_disk_path)?;
             (self.access_granter)(&hcs_compute_system_id, &media_path)?;
+            if let Some(tools_path) = &tools_path {
+                (self.access_granter)(&hcs_compute_system_id, tools_path)?;
+            }
 
             monitor.check_cancelled()?;
             monitor.report(BuildStep::Registering);
@@ -353,6 +378,32 @@ fn create_hcs_system(id: &str, configuration: &str) -> Result<(), RepositoryErro
     }
 }
 
+/// Reads the guest agent bundled beside the running VMLord executable.
+///
+/// A missing binary is a packaging problem but not a reason to reject a cloud
+/// VM: its normal cloud-init provisioning can still complete without the
+/// optional agent service.
+fn read_agent_beside_executable() -> Option<Vec<u8>> {
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(error) => {
+            log::warn!("cannot locate the VMLord executable to find {AGENT_FILE_NAME}: {error}");
+            return None;
+        }
+    };
+    let agent_path: PathBuf = executable.with_file_name(AGENT_FILE_NAME);
+    match fs::read(&agent_path) {
+        Ok(agent) => Some(agent),
+        Err(error) => {
+            log::warn!(
+                "cannot read the guest agent at {}: {error}; cloud VMs will not include a tools volume",
+                agent_path.display()
+            );
+            None
+        }
+    }
+}
+
 /// Writes everything the guest's first boot reads: the VM's key pair, its
 /// agent secret, and the seed volume carrying the cloud-config documents.
 ///
@@ -366,6 +417,7 @@ fn write_provisioning(
     instance_id: &str,
     image: &CloudImage,
     provisioning: &Provisioning,
+    agent: Option<&[u8]>,
 ) -> Result<(), RepositoryError> {
     let authorized_key = match provisioning.ssh {
         SshAccess::Enabled {
@@ -384,18 +436,20 @@ fn write_provisioning(
         .map(password_hash::hash_password)
         .transpose()?;
 
+    let agent_secret = agent.map(|_| auth::Secret::generate().to_base64());
     // Minted here and written twice: once for the host, which is what verifies
     // a session, and once into the seed, which is the only way it reaches the
     // guest. It is never rotated -- a VM's secret lives as long as the VM --
     // and never travels on the agent protocol itself.
-    let agent_secret = auth::Secret::generate().to_base64();
-    let agent_secret_path = layout::agent_secret_path(vm_directory);
-    write_restricted(
-        &agent_secret_path,
-        format!("{}\n", agent_secret.as_str()).as_bytes(),
-        "the agent secret",
-    )?;
-    log::debug!("wrote the agent secret at {}", agent_secret_path.display());
+    if let Some(agent_secret) = &agent_secret {
+        let agent_secret_path = layout::agent_secret_path(vm_directory);
+        write_restricted(
+            &agent_secret_path,
+            format!("{}\n", agent_secret.as_str()).as_bytes(),
+            "the agent secret",
+        )?;
+        log::debug!("wrote the agent secret at {}", agent_secret_path.display());
+    }
 
     let seed = vmlord_seed::build(&vmlord_seed::SeedRequest {
         vm_name,
@@ -409,11 +463,20 @@ fn write_provisioning(
         timezone: &provisioning.timezone,
         admin_group: &image.profile.admin_group,
         ssh_daemon: &image.profile.ssh,
-        agent_secret: Some(&agent_secret),
+        agent_secret: agent_secret.as_ref().map(|secret| secret.as_str()),
     });
 
     write_restricted(seed_path, &vmlord_seed::image(&seed), "the cloud-init seed")?;
     log::debug!("wrote the cloud-init seed at {}", seed_path.display());
+    if let Some(agent) = agent {
+        let tools_path = layout::tools_path(vm_directory);
+        fs::write(&tools_path, vmlord_seed::tools_image(agent))
+            .map_err(|error| write_failure(&tools_path, "the cloud-init tools volume", &error))?;
+        log::debug!(
+            "wrote the cloud-init tools volume at {}",
+            tools_path.display()
+        );
+    }
     Ok(())
 }
 
@@ -620,6 +683,17 @@ mod tests {
                 }
             },
         )
+    }
+
+    fn pipeline_without_agent(
+        calls: &Calls,
+        fail_vhd: bool,
+        fail_cloud: bool,
+        fail_create: bool,
+    ) -> VmCreationPipeline {
+        let mut pipeline = pipeline(calls, fail_vhd, fail_cloud, fail_create);
+        pipeline.agent_reader = Box::new(|| None);
+        pipeline
     }
 
     /// A pipeline whose seams record the step the monitor was reporting when
@@ -1134,6 +1208,10 @@ mod tests {
 
         assert!(fixture.vm_directory.join("seed.iso").is_file());
         assert!(
+            fixture.vm_directory.join("tools.iso").is_file(),
+            "an available agent is packed into the VM's tools volume"
+        );
+        assert!(
             fixture
                 .vm_directory
                 .join("keys")
@@ -1151,6 +1229,10 @@ mod tests {
             "and the hash instead of the password, not beside it"
         );
         assert!(seed.contains(public_key.trim_end()), "and the public key");
+        assert!(
+            seed.contains("vmlord-agent.service"),
+            "the seed installs and enables the service for the attached agent"
+        );
         // The whole case for leaving the seed attached rests on this id being
         // the compute system's own, so that it never changes across boots.
         assert!(seed.contains(&format!("instance-id: '{}'", mapping.hcs_compute_system_id)));
@@ -1175,8 +1257,15 @@ mod tests {
                     mapping.hcs_compute_system_id.clone(),
                     fixture.vm_directory.join("seed.iso")
                 ),
+                (
+                    mapping.hcs_compute_system_id.clone(),
+                    fixture.vm_directory.join("tools.iso")
+                ),
             ]
         );
+
+        let configuration = fs::read_to_string(fixture.vm_directory.join("config.json")).unwrap();
+        assert!(configuration.contains("tools.iso"));
     }
 
     /// The secret exists in exactly two places: a host file the VM cannot
@@ -1213,6 +1302,43 @@ mod tests {
 
         let configuration = fs::read_to_string(fixture.vm_directory.join("config.json")).unwrap();
         assert!(!configuration.contains(stored.trim_end()));
+    }
+
+    #[test]
+    fn a_cloud_vm_without_the_agent_binary_skips_agent_provisioning() {
+        // This catches the wrong branch: packaging the service or secret when
+        // the executable was not installed leaves a guest with a unit that can
+        // never start.
+        let fixture = fixture("cloud-without-agent");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline_without_agent(&calls, false, false, false);
+
+        pipeline
+            .create(
+                &fixture.store,
+                &cloud_request("cloud-without-agent-vm"),
+                &fixture.vm_directory,
+                &monitor(),
+            )
+            .expect("a missing optional agent must not prevent cloud VM creation");
+
+        assert!(!crate::layout::tools_path(&fixture.vm_directory).exists());
+        assert!(!crate::layout::agent_secret_path(&fixture.vm_directory).exists());
+        let seed = seed_bytes(&fixture.vm_directory);
+        assert!(!seed.contains("vmlord-agent.service"), "got {seed}");
+
+        let configuration = fs::read_to_string(fixture.vm_directory.join("config.json")).unwrap();
+        let configuration_json = serde_json::from_str::<serde_json::Value>(&configuration).unwrap();
+        let attachments = configuration_json
+            .pointer("/VirtualMachine/Devices/Scsi/Primary/Attachments")
+            .and_then(serde_json::Value::as_object)
+            .unwrap();
+        assert_eq!(
+            attachments.keys().collect::<Vec<_>>(),
+            vec!["0", "1"],
+            "a cloud VM without an agent keeps only its disk and seed"
+        );
+        assert_eq!(calls.grant.lock().unwrap().len(), 2);
     }
 
     #[test]
