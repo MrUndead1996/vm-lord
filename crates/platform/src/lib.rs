@@ -57,6 +57,7 @@ pub use enumerate::{KnownVm, list_known_vms, open_by_vm_id, open_by_vm_name};
 pub use error::hresult_to_repository_error;
 pub use event::{EventWaitResult, WindowsEvent};
 pub use force_stop::VmForceStopPipeline;
+pub use gpu_discovery::discover_host_gpu;
 pub use hcn::{HcnNetwork, VMLORD_NETWORK_ID};
 pub use hcn_endpoint::{EndpointAddress, HcnEndpoint};
 pub use hcs::{

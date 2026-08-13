@@ -1,10 +1,53 @@
 //! Whether this host can give a VM a GPU, and whether a Linux guest could use
 //! it.
 
+use std::path::PathBuf;
+
 use vmlord_core::{
     GpuAvailability, GpuFailure, GpuStatusCode, HostGpuAdapter, HostGpuCapabilities,
     RepositoryError,
 };
+use windows::Win32::System::SystemInformation::GetSystemDirectoryW;
+
+use crate::{gpu_enumerate::partition_adapters, hcs};
+
+/// What this host can do for GPU-PV, right now.
+///
+/// Not a `Result`: "GPU-PV is unavailable here" is an answer rather than a
+/// failure, and a Windows error on the way to it is one of the reasons an axis
+/// can be unavailable. Nothing is cached -- the enumeration is cheap, and a
+/// driver update or a WSL install changes the answer with nothing to
+/// invalidate a cache on.
+#[must_use]
+pub fn discover_host_gpu() -> HostGpuCapabilities {
+    let service = hcs::service_available();
+    let adapters = match partition_adapters() {
+        Ok(adapters) => adapters,
+        Err(error) => {
+            log::warn!("enumerating GPU partition adapters failed: {error}");
+            Vec::new()
+        }
+    };
+
+    assemble(adapters, service, linux_payload_present())
+}
+
+/// Whether the Linux GPU userspace WSL stages is on this host.
+///
+/// Only the verdict is reported. The path is what an export is built from, and
+/// that is decided where the export is built.
+fn linux_payload_present() -> bool {
+    let mut buffer = [0_u16; 260];
+    // SAFETY: `buffer` is passed as a sized slice; a zero return means the
+    // call did not fill it.
+    let length = unsafe { GetSystemDirectoryW(Some(&mut buffer)) } as usize;
+    if length == 0 || length > buffer.len() {
+        return false;
+    }
+
+    let system32 = PathBuf::from(String::from_utf16_lossy(&buffer[..length]));
+    system32.join("lxss").join("lib").is_dir()
+}
 
 /// Turns what was observed into the two verdicts.
 ///
