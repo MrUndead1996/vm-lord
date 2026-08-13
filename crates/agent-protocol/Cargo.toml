@@ -10,6 +10,18 @@ build = "build.rs"
 # No gRPC stack, because the transport is one HvSocket stream per VM.
 prost = "0.14"
 
+# What `auth` is made of. All of it is pure Rust: the agent is linked
+# statically against musl with no C toolchain, and a crypto crate that wanted
+# OpenSSL would cost that.
+base64 = "0.23"
+getrandom = "0.3"
+hmac = "0.12"
+sha2 = "0.10"
+# Comparing a tag with `==` leaks where two tags first differ, which is enough
+# to forge one a byte at a time.
+subtle = "2.6"
+zeroize = "1.9"
+
 [build-dependencies]
 prost = "0.14"
 prost-build = "0.14"

@@ -45,12 +45,13 @@ message Request {
   oneof kind {
     HelloRequest hello = 1;
     HeartbeatRequest heartbeat = 2;
+    AuthenticateRequest authenticate = 3;
   }
 
-  // Field 3 onwards is where the rest of the protocol lands: authentication
-  // (#87), the GPU share manifest and the guest's GPU report. Each arrives
-  // with the task that implements it, so that the shape is designed against
-  // working code rather than guessed at here.
+  // Field 4 onwards is where the rest of the protocol lands: the GPU share
+  // manifest and the guest's GPU report. Each arrives with the task that
+  // implements it, so that the shape is designed against working code rather
+  // than guessed at here.
 }
 
 // The answer to exactly one `Request`, carrying its `request_id`.
@@ -63,6 +64,7 @@ message Response {
     Error error = 1;
     HelloResponse hello = 2;
     HeartbeatResponse heartbeat = 3;
+    AuthenticateResponse authenticate = 4;
   }
 }
 
@@ -114,6 +116,28 @@ message HelloResponse {
 
   // The capabilities both peers have, which is the only set either may use.
   repeated Capability capabilities = 2;
+}
+
+// Challenges the guest to prove it holds the VM's secret.
+//
+// Sent by the host once per session, after the hello exchange and before it
+// will act on anything else the guest sends. The secret itself never appears
+// in this protocol: it is minted when the VM is created and delivered through
+// the same provisioning medium as the guest's password hash and authorized
+// key, so what travels here is only a challenge over it.
+message AuthenticateRequest {
+  // 32 random bytes, drawn again for every session. Freshness is what makes a
+  // recorded answer worthless: a tag proves the secret was held when this
+  // nonce was sent, and says nothing about any other session.
+  bytes nonce = 1;
+}
+
+// Answers the challenge with a tag only a holder of the secret can produce.
+message AuthenticateResponse {
+  // HMAC-SHA-256 over a fixed domain string and the nonce, keyed by the VM's
+  // secret. 32 bytes; see `vmlord_agent_protocol::auth`, which both peers
+  // compute this with so that they cannot disagree about what is signed.
+  bytes tag = 1;
 }
 
 // Proves the session is alive and that the peer is still answering.
