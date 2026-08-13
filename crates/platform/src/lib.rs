@@ -26,6 +26,7 @@ mod event;
 mod force_stop;
 mod gpu_discovery;
 mod gpu_enumerate;
+mod gpu_exports;
 mod guest_ready;
 mod hcn;
 mod hcn_endpoint;
