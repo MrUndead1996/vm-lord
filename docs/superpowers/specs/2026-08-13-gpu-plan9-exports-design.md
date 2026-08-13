@@ -12,7 +12,9 @@ task ends at the boundary of `platform`: it builds a validated export set,
 writes it into an HCS configuration document and grants the VM access to it.
 Nothing calls that from `start.rs` yet, because a start cannot know a VM's GPU
 mode until #89 records one -- `VmComputeSystemMapping` has no such field, and
-`hcs_config::build` still rejects every mode but `None`.
+`hcs_config::build` still rejects every mode but `None`. That is what the
+`allow(dead_code)` on the module and on the two `hcs_config` functions is for,
+and #89 removes it by becoming the caller.
 
 ## Decisions
 
@@ -201,11 +203,13 @@ of it is ordinary unit-testable code:
 `hcs_config` tests cover the shape of the section, its removal, and that a
 document needing no change comes back byte for byte.
 
-One `#[ignore]`d real-host test in `crates/platform/tests/gpu_exports.rs`,
-following `tests/gpu_discovery.rs`: build a set from `discover_host_gpu()` and
-assert that every path exists, is a directory, lies under `System32`, and that
-the share names are unique. On a host without adapters it passes vacuously,
-because it is not entitled to assert that GPU-PV exists.
+One `#[ignore]`d real-host test, living in `gpu_exports.rs`'s own test module
+rather than under `crates/platform/tests/`, because the builder is
+`pub(crate)` and this task adds no public API to reach it from an integration
+test: build a set from `discover_host_gpu()` and assert that every path exists,
+is a directory, lies under `System32`, and that the share names are unique. On
+a host without adapters it passes vacuously, because it is not entitled to
+assert that GPU-PV exists.
 
 Verified with `cargo check-windows` and `cargo test-windows`.
 
