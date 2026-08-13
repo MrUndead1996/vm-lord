@@ -10,12 +10,13 @@ use vmlord_agent_protocol::{
     auth::{self, Nonce, Secret},
     frame::{self, FrameError},
     v1::{
-        AuthenticateResponse, Envelope, ErrorCode, HeartbeatResponse, HelloRequest,
-        ProtocolVersion, envelope, request, response,
+        AuthenticateResponse, Envelope, ErrorCode, HeartbeatRequest, HeartbeatResponse,
+        HelloRequest, ProtocolVersion, envelope, request, response,
     },
 };
 
 const HELLO_REQUEST_ID: u32 = 1;
+const FIRST_HEARTBEAT_REQUEST_ID: u32 = HELLO_REQUEST_ID + 1;
 
 /// Opens and serves the guest half of an agent session.
 ///
@@ -119,10 +120,27 @@ fn authenticate<S: Read + Write>(
 }
 
 fn serve<S: Read + Write>(stream: &mut S, buffer: &mut Vec<u8>) -> Result<(), SessionError> {
+    let mut next_request_id = FIRST_HEARTBEAT_REQUEST_ID;
+    let mut pending_heartbeat = None;
+
     loop {
         let envelope = match frame::read(stream, buffer) {
             Ok(envelope) => envelope,
             Err(FrameError::Closed) => return Ok(()),
+            Err(FrameError::Idle) => {
+                if pending_heartbeat.is_some() {
+                    return Err(SessionError::HeartbeatUnanswered);
+                }
+                let request_id = next_request_id;
+                next_request_id = next_request_id
+                    .checked_add(1)
+                    .ok_or(SessionError::RequestIdsExhausted)?;
+                let heartbeat =
+                    Envelope::request(request_id, request::Kind::Heartbeat(HeartbeatRequest {}));
+                frame::write(stream, &heartbeat, buffer).map_err(SessionError::Frame)?;
+                pending_heartbeat = Some(request_id);
+                continue;
+            }
             Err(error) => return Err(SessionError::Frame(error)),
         };
 
@@ -135,6 +153,11 @@ fn serve<S: Read + Write>(stream: &mut S, buffer: &mut Vec<u8>) -> Result<(), Se
             }
             Body::Request(_) | Body::UnknownRequest => {
                 refuse_unsupported(stream, request_id, buffer)?;
+            }
+            Body::Response(response::Kind::Heartbeat(_))
+                if pending_heartbeat == Some(request_id) =>
+            {
+                pending_heartbeat = None;
             }
             Body::Response(response::Kind::Error(error)) => {
                 return Err(SessionError::Refused {
@@ -207,6 +230,8 @@ pub enum SessionError {
     InvalidHello,
     OutOfOrder(&'static str),
     Malformed(String),
+    HeartbeatUnanswered,
+    RequestIdsExhausted,
 }
 
 impl fmt::Display for SessionError {
@@ -221,6 +246,10 @@ impl fmt::Display for SessionError {
             }
             Self::OutOfOrder(what) => write!(formatter, "the host sent {what}"),
             Self::Malformed(what) => write!(formatter, "the host sent {what}"),
+            Self::HeartbeatUnanswered => {
+                formatter.write_str("the host did not answer the heartbeat")
+            }
+            Self::RequestIdsExhausted => formatter.write_str("the agent exhausted its request ids"),
         }
     }
 }
@@ -232,7 +261,9 @@ impl Error for SessionError {
             Self::Refused { .. }
             | Self::InvalidHello
             | Self::OutOfOrder(_)
-            | Self::Malformed(_) => None,
+            | Self::Malformed(_)
+            | Self::HeartbeatUnanswered
+            | Self::RequestIdsExhausted => None,
         }
     }
 }
@@ -333,10 +364,9 @@ mod tests {
     }
 
     #[test]
-    fn would_block_after_authentication_ends_the_session_without_a_heartbeat() {
-        // `frame::read` cannot distinguish an idle timeout from one after it
-        // consumed part of a frame, so sending any new frame would corrupt the
-        // stream in the latter case.
+    fn would_block_before_the_next_frame_sends_a_heartbeat() {
+        // `FrameError::Idle` says no part of the next prefix was consumed, so
+        // the heartbeat is not interleaved with a host frame.
         let secret = Secret::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
             .expect("a valid test secret");
         let nonce = Nonce::from_wire(&[7; auth::LEN]).expect("a valid nonce");
@@ -358,16 +388,10 @@ mod tests {
             ReadStep::WouldBlock,
         ]);
 
-        let error = run(&mut stream, &secret, "test-agent")
-            .expect_err("a timeout must end the session before a frame can be written");
-        assert!(matches!(
-            error,
-            super::SessionError::Frame(frame::FrameError::Io(error))
-                if error.kind() == io::ErrorKind::WouldBlock
-        ));
+        run(&mut stream, &secret, "test-agent").expect("the host closes after the heartbeat");
 
         let frames = stream.written_frames();
-        assert_eq!(frames.len(), 2);
+        assert_eq!(frames.len(), 3);
         assert_eq!(
             frames[0],
             vmlord_agent_protocol::v1::Envelope::request(
@@ -387,6 +411,13 @@ mod tests {
             panic!("the challenge needs an authentication tag");
         };
         assert_eq!(authenticate.tag, auth::tag(&secret, &nonce).as_bytes());
+        assert_eq!(
+            frames[2],
+            vmlord_agent_protocol::v1::Envelope::request(
+                2,
+                request::Kind::Heartbeat(vmlord_agent_protocol::v1::HeartbeatRequest {}),
+            )
+        );
     }
 
     #[test]
