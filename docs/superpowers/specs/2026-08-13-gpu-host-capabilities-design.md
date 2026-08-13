@@ -88,10 +88,12 @@ host-wide path.
 
 ## Discovery
 
-`crates/platform/src/gpu_discovery.rs`, one public function:
+`crates/platform/src/gpu_discovery.rs`, one public function, with the SetupAPI
+walk itself in `crates/platform/src/gpu_enumerate.rs` so that the `unsafe` sits
+in one file and the verdicts in another:
 
 ```rust
-pub fn discover() -> HostGpuCapabilities
+pub fn discover_host_gpu() -> HostGpuCapabilities
 ```
 
 Not a `Result`. "GPU-PV is unavailable here" is an answer, not a failure, and a
@@ -125,8 +127,9 @@ The sequence, entirely SetupAPI and the Configuration Manager:
    route to the same answer and is not ported.
 6. `GetSystemDirectoryW` plus `\lxss\lib`, tested for existence as a directory,
    for `linux_payload`.
-7. `hcs::query_hcs_service_properties`, whose visibility widens to
-   `pub(crate)`, for the service check.
+7. A new `pub(crate) fn hcs::service_available()` that queries the service
+   properties and parses the result, so the two halves of "is HCS answering"
+   stay together in the module that owns both and neither is exported alone.
 
 Verdicts follow from the above: no adapters gives `HostNoAdapter`; an HCS query
 that errors gives `HostServiceUnavailable` and takes precedence, since a dead
@@ -134,9 +137,11 @@ service makes the adapter question moot; adapters with no resolved DriverStore
 give `HostDriverStoreMissing`; a missing `lxss\lib` gives
 `HostLinuxPayloadMissing` on the payload axis alone.
 
-`Win32_Devices_DeviceAndDriverInstallation` and `Win32_Devices_Properties` join
-the `windows` feature list in `crates/platform/Cargo.toml`. Both were verified
-present in 0.61.3, including all four `DEVPKEY` constants.
+`Win32_Devices_DeviceAndDriverInstallation`, `Win32_Devices_Properties` and
+`Win32_System_SystemInformation` join the `windows` feature list in
+`crates/platform/Cargo.toml` -- SetupAPI and the Configuration Manager, the
+`DEVPKEY` constants, and `GetSystemDirectoryW` respectively. All three were
+verified present in 0.61.3.
 
 ## Reaching it from the application
 
@@ -155,7 +160,7 @@ The default errors rather than reporting everything unavailable. The legacy
 backend does not know what the host has, and answering "no adapters" would be a
 claim it cannot make; the UI has to be able to distinguish "this backend cannot
 tell you" from "this host cannot do it". The native repository implements the
-method as `Ok(gpu_discovery::discover())`.
+method as `Ok(gpu_discovery::discover_host_gpu())`.
 
 `app` calls it through the trait, never `platform` directly, and `ui` only
 displays what `app` hands it -- no Windows API above this crate, and no
@@ -173,7 +178,7 @@ unit-testable code:
 * INF path to DriverStore directory, and decoding UTF-16 property buffers:
   empty value, missing terminator, unexpected property type.
 * A single `#[ignore]`d test in `crates/platform/tests/`, following
-  `tests/import.rs`: `discover()` runs on a real host without panicking, and
+  `tests/import.rs`: `discover_host_gpu()` runs on a real host without panicking, and
   when `assignment` is `Available` every adapter has a non-empty name and
   instance id. It cannot assert that GPU-PV exists -- on a host without one
   that test would be permanently failing or falsely green.
