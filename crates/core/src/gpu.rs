@@ -7,7 +7,7 @@
 //! derives from them ([`VmGpuStatus`]). A single field could only ever answer
 //! one of "what was asked for" and "what happened", and the UI needs both.
 
-use std::time::SystemTime;
+use std::{path::PathBuf, time::SystemTime};
 
 use serde::{Deserialize, Serialize};
 
@@ -181,6 +181,16 @@ pub enum GpuStatusCode {
     GuestReady,
     /// The guest cannot use the GPU it was given.
     GuestFailed,
+    /// The host has no GPU partition adapter.
+    HostNoAdapter,
+    /// The Host Compute Service is not answering, so nothing can be assigned
+    /// to anything.
+    HostServiceUnavailable,
+    /// The host has adapters, but no driver package could be located for any
+    /// of them.
+    HostDriverStoreMissing,
+    /// The Linux userspace a guest needs is not staged on this host.
+    HostLinuxPayloadMissing,
 }
 
 impl GpuStatusCode {
@@ -198,6 +208,10 @@ impl GpuStatusCode {
             Self::GuestDevicePresent => "gpu-guest-device-present",
             Self::GuestReady => "gpu-guest-ready",
             Self::GuestFailed => "gpu-guest-failed",
+            Self::HostNoAdapter => "gpu-host-no-adapter",
+            Self::HostServiceUnavailable => "gpu-host-service-unavailable",
+            Self::HostDriverStoreMissing => "gpu-host-driver-store-missing",
+            Self::HostLinuxPayloadMissing => "gpu-host-linux-payload-missing",
         }
     }
 }
@@ -236,5 +250,116 @@ impl VmGpuStatus {
             self.state,
             GpuState::Assigned | GpuState::GuestReady | GpuState::Degraded
         )
+    }
+}
+
+/// What this host can do for GPU-PV, as far as anything can be told without
+/// starting a VM.
+///
+/// Two axes rather than one verdict: a host with a partition adapter but no
+/// WSL payload can assign a GPU that a Linux guest will not be able to render
+/// on, which is a warning and not a refusal, and a single field could say only
+/// one of the two things.
+///
+/// An adapter, a resolved driver package and a live Host Compute Service are a
+/// precondition, never a guarantee: assignment is proven by assigning, which
+/// needs a running compute system, and this type is read before there is one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostGpuCapabilities {
+    /// Whether a GPU partition can be offered to a VM at all.
+    pub assignment: GpuAvailability,
+    /// Whether the Linux userspace a guest needs is staged on the host.
+    pub linux_payload: GpuAvailability,
+    /// The adapters behind the verdict, as the host reports them.
+    ///
+    /// Facts from device enumeration and nothing else -- no share names, no
+    /// guest paths. What is exported to a guest is decided where the export is
+    /// built, not here.
+    pub adapters: Vec<HostGpuAdapter>,
+}
+
+/// One axis of [`HostGpuCapabilities`]: usable, or not and why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GpuAvailability {
+    Available,
+    Unavailable(GpuFailure),
+}
+
+impl GpuAvailability {
+    #[must_use]
+    pub const fn is_available(&self) -> bool {
+        matches!(self, Self::Available)
+    }
+
+    /// Why this axis is unavailable, when it is.
+    #[must_use]
+    pub const fn failure(&self) -> Option<&GpuFailure> {
+        match self {
+            Self::Available => None,
+            Self::Unavailable(failure) => Some(failure),
+        }
+    }
+}
+
+/// A GPU partition adapter the host presents.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostGpuAdapter {
+    /// What Windows calls the device.
+    pub name: String,
+    /// The device instance id, which identifies this adapter across reboots.
+    pub instance_id: String,
+    /// The device interface path a compute system would name.
+    pub interface_path: String,
+    /// The driver package directory in the DriverStore, when it resolved.
+    ///
+    /// `None` is an adapter whose INF could not be located: still a real
+    /// adapter, but one with nothing to hand a guest.
+    pub driver_store: Option<PathBuf>,
+    /// The kernel service driving the adapter, for diagnostics.
+    pub service: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GpuAvailability, GpuFailure, GpuStatusCode, HostGpuCapabilities};
+
+    #[test]
+    fn host_status_codes_have_stable_strings() {
+        assert_eq!(GpuStatusCode::HostNoAdapter.as_str(), "gpu-host-no-adapter");
+        assert_eq!(
+            GpuStatusCode::HostServiceUnavailable.as_str(),
+            "gpu-host-service-unavailable"
+        );
+        assert_eq!(
+            GpuStatusCode::HostDriverStoreMissing.as_str(),
+            "gpu-host-driver-store-missing"
+        );
+        assert_eq!(
+            GpuStatusCode::HostLinuxPayloadMissing.as_str(),
+            "gpu-host-linux-payload-missing"
+        );
+    }
+
+    #[test]
+    fn an_unavailable_axis_keeps_the_reason_readable() {
+        let capabilities = HostGpuCapabilities {
+            assignment: GpuAvailability::Available,
+            linux_payload: GpuAvailability::Unavailable(GpuFailure::new(
+                GpuStatusCode::HostLinuxPayloadMissing,
+                "no WSL payload",
+            )),
+            adapters: Vec::new(),
+        };
+
+        assert!(capabilities.assignment.is_available());
+        assert!(!capabilities.linux_payload.is_available());
+        assert_eq!(
+            capabilities
+                .linux_payload
+                .failure()
+                .map(|failure| failure.code),
+            Some(GpuStatusCode::HostLinuxPayloadMissing)
+        );
+        assert!(capabilities.assignment.failure().is_none());
     }
 }

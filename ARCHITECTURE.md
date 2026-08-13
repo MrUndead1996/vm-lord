@@ -924,6 +924,48 @@ The UI only displays this. It shows the desired mode and the runtime status as
 separate rows, because a VM configured for `Mirror` whose guest has not come up
 yet is not a VM without a GPU.
 
+### GPU: what the host can do
+
+Before any VM is offered a GPU, `HostGpuCapabilities` answers what this host is
+capable of, on two independent axes. `assignment` is whether a GPU partition
+can be offered to a VM at all; `linux_payload` is whether the Linux userspace a
+guest needs is staged on the host. They are separate because a host with a
+partition adapter but no WSL can assign a GPU that a Linux guest will not
+render on -- a warning, not a refusal, and one field could not say both. Each
+axis is `Available` or `Unavailable` with a `GpuFailure`, so a reason here
+reads the way a per-VM failure does.
+
+`vmlord_platform::gpu_enumerate` walks the GPU Partition Adapter device
+interface class through SetupAPI and the Configuration Manager --
+`SetupDiGetClassDevsW`, `SetupDiEnumDeviceInterfaces`,
+`SetupDiGetDeviceInterfaceDetailW`, `SetupDiGetDevicePropertyW` and
+`CM_Get_Device_IDW` -- and resolves each adapter's driver package with
+`SetupGetInfDriverStoreLocationW`. No WMI and no spawned process is involved:
+the properties that AppSandbox read through `Win32_PNPSignedDriver` and a
+registry key come from `DEVPKEY_Device_DeviceDesc`, `DEVPKEY_Device_Service`
+and `DEVPKEY_Device_DriverInfPath` instead. Each adapter is reported with its
+name, instance id, interface path, driver package directory and kernel service,
+and an adapter whose package could not be located is still reported: it is a
+real device that simply has nothing to hand a guest.
+
+`vmlord_platform::gpu_discovery` turns that, a `System32\lxss\lib` check and an
+HCS service query into the two verdicts. Nothing is cached -- the enumeration
+is cheap, and a driver update or a WSL install changes the answer with nothing
+to invalidate a cache on. A dead Host Compute Service outranks the adapter
+question, since reporting "no adapters" when the service is not answering would
+blame the wrong thing.
+
+An adapter, a resolved driver package and a live HCS service are a
+**precondition** for GPU-PV, never a guarantee of it. Assignment is proven only
+by assigning, which needs a running compute system, and this report is read
+before there is one.
+
+`app` reads it through `VmRepository::host_gpu_capabilities`, never by calling
+`vmlord_platform` directly, and the UI only displays what it is handed. The
+method is defaulted on the trait and its default is an error rather than an
+empty report: the legacy backend cannot inspect the host, and "this backend
+cannot tell you" is a different answer from "this host cannot do it".
+
 ### VM update contract
 
 The edit workflow follows these rules:

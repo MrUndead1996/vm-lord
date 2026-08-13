@@ -617,6 +617,15 @@ fn query_hcs_service_properties() -> Result<String, RepositoryError> {
     HcsAllocatedString::new(raw)?.into_string()
 }
 
+/// Whether the Host Compute Service is answering right now.
+///
+/// The query and its parse belong together: "the service replied" and "the
+/// reply was not an error" are one question, and a caller outside this module
+/// has no business holding half of it.
+pub(crate) fn service_available() -> Result<(), RepositoryError> {
+    parse_service_result(&query_hcs_service_properties()?)
+}
+
 /// Enumerates every HCS compute system visible to this process.
 ///
 /// A null query (as opposed to an empty JSON document, which HCS rejects)
