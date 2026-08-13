@@ -78,6 +78,40 @@ impl GpuExports {
         }
     }
 
+    /// Gives the VM access to every export, keeping only those it was given.
+    ///
+    /// Called after validation and never before it: a grant is what makes a
+    /// path readable by the VM's own security principal, and handing one out
+    /// for a path that has not been proven is how a check becomes decorative.
+    ///
+    /// An export the grant refused is dropped rather than fatal. Offering a VM
+    /// a share it cannot open trades one clear line in the host's log for an
+    /// opaque mount failure inside the guest.
+    pub(crate) fn granted_to(
+        self,
+        hcs_id: &str,
+        grant: &dyn Fn(&str, &Path) -> Result<(), RepositoryError>,
+    ) -> Option<Self> {
+        let exports: Vec<GpuExport> = self
+            .exports
+            .into_iter()
+            .filter(|export| match grant(hcs_id, export.host_path()) {
+                Ok(()) => true,
+                Err(error) => {
+                    log::warn!(
+                        "not offering share \"{}\": the VM could not be given access to \"{}\": \
+                         {error}",
+                        export.name(),
+                        export.host_path().display()
+                    );
+                    false
+                }
+            })
+            .collect();
+
+        (!exports.is_empty()).then_some(Self { exports })
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(exports: Vec<(GpuShare, PathBuf)>) -> Self {
         Self {
@@ -384,11 +418,12 @@ mod tests {
     use std::{
         collections::HashMap,
         path::{Path, PathBuf},
+        sync::Mutex,
     };
 
-    use vmlord_core::{GpuShareRole, HostGpuAdapter, RepositoryError};
+    use vmlord_core::{GpuShare, GpuShareRole, HostGpuAdapter, RepositoryError};
 
-    use super::{ExportRoots, build_with, strip_extended_prefix};
+    use super::{ExportRoots, GpuExports, build_with, strip_extended_prefix};
 
     const SYSTEM32: &str = r"C:\Windows\System32";
     const REPOSITORY: &str = r"C:\Windows\System32\DriverStore\FileRepository";
@@ -622,6 +657,90 @@ mod tests {
             GpuShareRole::DriverPackage {
                 package: "nvltsi.inf_amd64_1".to_owned()
             }
+        );
+    }
+
+    #[test]
+    fn every_export_is_granted_before_it_is_offered() {
+        let granted: Mutex<Vec<(String, PathBuf)>> = Mutex::new(Vec::new());
+        let exports = GpuExports::for_test(vec![
+            (
+                GpuShare::wsl_lib(),
+                PathBuf::from(r"C:\Windows\System32\lxss\lib"),
+            ),
+            (
+                GpuShare::driver_package("nvltsi.inf_amd64_1").unwrap(),
+                PathBuf::from(format!(r"{REPOSITORY}\nvltsi.inf_amd64_1")),
+            ),
+        ]);
+
+        let survived = exports
+            .granted_to("hcs-id", &|id, path| {
+                granted
+                    .lock()
+                    .unwrap()
+                    .push((id.to_owned(), path.to_path_buf()));
+                Ok(())
+            })
+            .expect("both survive");
+
+        assert_eq!(survived.iter().count(), 2);
+        assert_eq!(
+            granted.lock().unwrap().as_slice(),
+            [
+                (
+                    "hcs-id".to_owned(),
+                    PathBuf::from(r"C:\Windows\System32\lxss\lib")
+                ),
+                (
+                    "hcs-id".to_owned(),
+                    PathBuf::from(format!(r"{REPOSITORY}\nvltsi.inf_amd64_1"))
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn an_export_the_grant_refused_is_dropped_and_the_rest_survive() {
+        let exports = GpuExports::for_test(vec![
+            (
+                GpuShare::wsl_lib(),
+                PathBuf::from(r"C:\Windows\System32\lxss\lib"),
+            ),
+            (
+                GpuShare::driver_package("nvltsi.inf_amd64_1").unwrap(),
+                PathBuf::from(format!(r"{REPOSITORY}\nvltsi.inf_amd64_1")),
+            ),
+        ]);
+
+        let survived = exports
+            .granted_to("hcs-id", &|_, path| {
+                if path.ends_with("lib") {
+                    Err(RepositoryError::new("access denied"))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect("one survives");
+
+        assert_eq!(survived.iter().count(), 1);
+        assert_eq!(
+            survived.iter().next().unwrap().name(),
+            "vmlord.gpu.drv.nvltsi.inf_amd64_1"
+        );
+    }
+
+    #[test]
+    fn a_set_no_grant_survived_is_nothing_to_export() {
+        let exports = GpuExports::for_test(vec![(
+            GpuShare::wsl_lib(),
+            PathBuf::from(r"C:\Windows\System32\lxss\lib"),
+        )]);
+
+        assert!(
+            exports
+                .granted_to("hcs-id", &|_, _| Err(RepositoryError::new("access denied")))
+                .is_none()
         );
     }
 
