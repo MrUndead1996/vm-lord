@@ -75,7 +75,7 @@ fn update_request() -> VmUpdateRequest {
         name: "dev".into(),
         ram_mb: 8192,
         cpu_cores: 8,
-        gpu_mode: GpuMode::TryAll,
+        gpu_mode: GpuMode::Mirror,
         network_mode: NetworkMode::Nat,
     }
 }

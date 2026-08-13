@@ -666,8 +666,8 @@ fn render_create_vm_dialog(
                                     );
                                     ui.selectable_value(
                                         &mut form.gpu_mode,
-                                        GpuMode::TryAll,
-                                        "Try all",
+                                        GpuMode::Mirror,
+                                        "Mirror",
                                     );
                                     ui.selectable_value(&mut form.gpu_mode, GpuMode::None, "None");
                                 });
@@ -977,7 +977,7 @@ fn render_edit_vm_dialog(
                         .selected_text(gpu_mode_label(form.gpu_mode))
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut form.gpu_mode, GpuMode::Default, "Default");
-                            ui.selectable_value(&mut form.gpu_mode, GpuMode::TryAll, "Try all");
+                            ui.selectable_value(&mut form.gpu_mode, GpuMode::Mirror, "Mirror");
                             ui.selectable_value(&mut form.gpu_mode, GpuMode::None, "None");
                         });
                     ui.end_row();
@@ -1193,7 +1193,7 @@ fn gpu_mode_label(mode: GpuMode) -> &'static str {
     match mode {
         GpuMode::None => "None",
         GpuMode::Default => "Default",
-        GpuMode::TryAll => "Try all",
+        GpuMode::Mirror => "Mirror",
         GpuMode::Unknown(_) => "Unsupported",
     }
 }
@@ -2511,14 +2511,14 @@ mod tests {
             name: "dev".into(),
             ram_mb: 8192,
             cpu_cores: 8,
-            gpu_mode: GpuMode::TryAll,
+            gpu_mode: GpuMode::Mirror,
             network_mode: NetworkMode::Nat,
             error: None,
         })
         .unwrap();
 
         assert_eq!(request.name, "dev");
-        assert_eq!(request.gpu_mode, GpuMode::TryAll);
+        assert_eq!(request.gpu_mode, GpuMode::Mirror);
         assert_eq!(request.network_mode, NetworkMode::Nat);
     }
 

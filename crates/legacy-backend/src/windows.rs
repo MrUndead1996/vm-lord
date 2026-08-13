@@ -580,7 +580,7 @@ fn gpu_mode_value(mode: GpuMode) -> Result<i32, RepositoryError> {
     match mode {
         GpuMode::None => Ok(0),
         GpuMode::Default => Ok(1),
-        GpuMode::TryAll => Ok(2),
+        GpuMode::Mirror => Ok(2),
         GpuMode::Unknown(value) => Err(RepositoryError::new(format!(
             "unsupported GPU mode: {value}"
         ))),
@@ -603,7 +603,7 @@ fn gpu_mode(value: i32) -> GpuMode {
     match value {
         0 => GpuMode::None,
         1 => GpuMode::Default,
-        2 => GpuMode::TryAll,
+        2 => GpuMode::Mirror,
         other => GpuMode::Unknown(other),
     }
 }
