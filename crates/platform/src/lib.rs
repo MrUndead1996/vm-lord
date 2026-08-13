@@ -9,6 +9,8 @@
 #[cfg(not(windows))]
 compile_error!("vmlord-platform supports Windows only");
 
+mod agent;
+mod agent_session;
 mod build;
 mod cleanup;
 mod com1_input;
@@ -29,6 +31,7 @@ mod hcs;
 mod hcs_config;
 mod host_dns;
 mod host_guest_defaults;
+mod hvsocket;
 mod import;
 mod layout;
 mod metadata;

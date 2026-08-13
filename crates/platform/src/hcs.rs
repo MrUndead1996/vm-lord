@@ -415,6 +415,18 @@ impl HcsSystem {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HcsSystemSummary {
     pub id: String,
+    /// The GUID Hyper-V runs this compute system as, when it reported one.
+    ///
+    /// A different identifier from `id`, which is the name VMLord gave the
+    /// system: the runtime id is what a partition is called on the outside --
+    /// an HvSocket address names it, and nothing else about a compute system
+    /// does. It changes on every start, so it is read here rather than
+    /// recorded.
+    ///
+    /// `None` means HCS reported no `RuntimeId`, or one that is not a GUID.
+    /// Nothing that needs it can be done for such a system, and dropping the
+    /// whole entry over it would lose a VM from the list.
+    pub runtime_id: Option<Uuid>,
     /// The state HCS reported, or `None` when the entry carried none.
     ///
     /// HCS omits `State` for a compute system that has been created but never
@@ -647,7 +659,15 @@ fn parse_enumerate_result(document: &str) -> Result<Vec<HcsSystemSummary>, Repos
                 .get("State")
                 .and_then(serde_json::Value::as_str)
                 .map(parse_system_state);
-            Some(HcsSystemSummary { id, state })
+            let runtime_id = entry
+                .get("RuntimeId")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|runtime_id| Uuid::parse_str(runtime_id).ok());
+            Some(HcsSystemSummary {
+                id,
+                state,
+                runtime_id,
+            })
         })
         .collect())
 }
@@ -974,10 +994,16 @@ mod tests {
                 HcsSystemSummary {
                     id: "8636363D-C5F9-49AA-B507-3B83F98C0D14".into(),
                     state: Some(HcsSystemState::Running),
+                    runtime_id: Some(
+                        uuid::Uuid::parse_str("8636363d-c5f9-49aa-b507-3b83f98c0d14").unwrap()
+                    ),
                 },
                 HcsSystemSummary {
                     id: "vmlord-b961b64484554b6289e8e70d6e38f181".into(),
                     state: None,
+                    runtime_id: Some(
+                        uuid::Uuid::parse_str("a811a3d9-78e5-5a7d-ba56-4b799c99f150").unwrap()
+                    ),
                 },
             ]
         );
@@ -1109,8 +1135,22 @@ mod tests {
             vec![HcsSystemSummary {
                 id: "vmlord-2".into(),
                 state: Some(HcsSystemState::Running),
+                runtime_id: None,
             }]
         );
+    }
+
+    #[test]
+    fn a_runtime_id_that_is_not_a_guid_leaves_the_system_listed_without_one() {
+        // The id is what a listing needs; the runtime id is what an HvSocket
+        // address needs, and losing the VM from the list over it would be far
+        // worse than listing it with nothing to connect to.
+        let document = r#"[{"Id":"vmlord-1","State":"Running","RuntimeId":"not-a-guid"}]"#;
+
+        let systems = parse_enumerate_result(document).unwrap();
+
+        assert_eq!(systems[0].id, "vmlord-1");
+        assert_eq!(systems[0].runtime_id, None);
     }
 
     #[test]
@@ -1129,6 +1169,7 @@ mod tests {
             vec![HcsSystemSummary {
                 id: "vmlord-1".into(),
                 state: Some(HcsSystemState::Running),
+                runtime_id: None,
             }]
         );
     }

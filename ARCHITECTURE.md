@@ -1865,6 +1865,75 @@ toolchain nothing else in the repository uses.
 
 ---
 
+## The host end of the agent socket
+
+The guest opens the connection and the host listens. A host that connected
+would have to guess when the agent inside had started and keep trying until it
+had; a guest knows exactly when it is ready, and a reconnect after a lost
+connection is then the same code path as the first connect. What the host owns
+is therefore not a connection but a standing offer.
+
+An HvSocket address is a pair of GUIDs: which partition, and which service on
+it. The partition is the compute system's *runtime id* -- the GUID Hyper-V
+gives it for as long as it runs, not the `vmlord-<uuid>` name VMLord chose --
+so it is read out of the HCS enumeration on every start rather than recorded:
+a stored one would address the previous run. `hvsocket::AgentListener` binds
+one VM's runtime id, which is why nothing on the host ever has to work out
+which VM is speaking. A wildcard bind would accept from every partition on the
+machine, WSL included, and would have to identify the peer before it could
+refuse it. The service half is derived from a vsock port -- `0x564D4C41`,
+`VMLA` in ASCII -- through the template Linux integration uses, because the
+guest is Linux and spells this address as `AF_VSOCK` to the host's context on a
+port. `Devices/HvSocket/HvSocketConfig/ServiceTable` in the VM's `config.json`
+is what makes that service exist for the VM at all, with a bind descriptor of
+SYSTEM and the administrators: the accounts that can drive HCS in the first
+place, and nobody else, may take the socket the agent is about to connect to.
+A VM created before that entry existed cannot reach its agent until it is
+recreated, since `config.json` is what a start rebuilds the compute system
+from.
+
+Nothing can interrupt a blocking socket call, so every wait is bounded: the
+accept waits a quarter of a second at a time and the read the same, and the
+thread checks between waits whether it should still be there. The interval is
+also how long stopping a VM takes to join the thread, on the thread that draws
+the window, which is why it is a fraction of a second rather than one. A read that times out is
+reported as `Interrupted`, which every reader in the standard library retries
+-- an idle agent is not a broken one, and a frame half-read must not be
+abandoned because the guest paused in the middle of it. Once the connection has
+been told to stop, that same timeout ends it instead. This is what makes
+dropping an `AgentConnection` a bounded operation: it sets the flag and joins
+the thread, and the socket never outlives the VM it was bound to.
+
+`AgentSessions` in `HcsVmRepository` is where those connections live, keyed by
+VM id beside the COM1 consoles and for the same reason: both belong to a VM's
+run, and this is the one place that sees every way a run can end. A stop, a
+forced stop, a deletion, a VM that exited on its own and VMLord itself going
+away all end a connection the same way -- the entry is removed. A VM started
+twice replaces its entry rather than gaining a second listener, because the
+older one is bound to a partition that no longer exists.
+
+`agent_session` is the conversation itself and knows nothing about Hyper-V: it
+reads and writes any stream, which is how the order of the messages is tested
+against a peer made of bytes. The guest says hello, the two settle on a
+revision and the capabilities they share, and the host then sends the challenge
+and waits for a tag over it. Requests that arrive before that tag is verified
+are refused with `ERROR_CODE_UNAUTHENTICATED` rather than dropped -- an agent
+waiting for an answer it will never get would sit there until its socket died
+-- and which requests those are is `auth::allowed_unauthenticated`'s decision,
+not the transport's. This build agrees on no capabilities at all: it announces
+none, because `CAPABILITY_GPU` is a promise the host cannot keep until the GPU
+manifest lands. After the challenge the session answers heartbeats, refuses a
+second hello, and ends when the guest hangs up at a frame boundary, which is
+not a fault.
+
+Whether a VM's agent has a session open is what `AgentStatus` in a `VmSummary`
+now reports. A running VM VMLord is not listening for at all -- one whose
+partition HCS would not name, one whose secret is missing -- is reported as
+unknown rather than offline: an agent that was never offered a socket has not
+failed to connect.
+
+---
+
 # Planned Modules
 
 ```

@@ -94,7 +94,10 @@ impl HcsVmConfigBuilder {
                     )]),
                     hv_socket: HvSocket {
                         config: HvSocketConfig {
-                            service_table: BTreeMap::new(),
+                            service_table: BTreeMap::from([(
+                                agent_service_key(),
+                                HvSocketService::agent(),
+                            )]),
                         },
                     },
                     keyboard: EmptyObject {},
@@ -111,6 +114,19 @@ impl HcsVmConfigBuilder {
             RepositoryError::new(format!("failed to serialize HCS VM configuration: {error}"))
         })
     }
+}
+
+/// The key the agent's HvSocket service is listed under.
+///
+/// A service table is keyed by service GUID, and the agent's is derived from
+/// the vsock port the guest connects to -- see `hvsocket::agent_service_id`.
+/// Listing it here is what makes the service exist for this VM: without an
+/// entry, the host cannot bind it and the guest's connect has nowhere to
+/// arrive. That is also why a VM created before this existed cannot talk to
+/// its agent until it is recreated -- `config.json` is what a start rebuilds
+/// the compute system from.
+fn agent_service_key() -> String {
+    format!("{:?}", crate::hvsocket::agent_service_id())
 }
 
 /// Returns the named pipe the VM's first serial port is wired to.
@@ -463,7 +479,31 @@ struct HvSocket {
 #[derive(Serialize)]
 struct HvSocketConfig {
     #[serde(rename = "ServiceTable")]
-    service_table: BTreeMap<String, EmptyObject>,
+    service_table: BTreeMap<String, HvSocketService>,
+}
+
+/// One HvSocket service a VM may talk on, and who may listen for it.
+#[derive(Serialize)]
+struct HvSocketService {
+    /// Who on the host may bind this service for this VM.
+    ///
+    /// SDDL, and deliberately narrow: SYSTEM and the local administrators, who
+    /// are the only accounts that can drive HCS in the first place. The
+    /// alternative -- everyone -- would let any process on the host take the
+    /// listening socket the agent is about to connect to, and while it could
+    /// not answer the challenge, the guest's agent would have nowhere left to
+    /// connect.
+    #[serde(rename = "BindSecurityDescriptor")]
+    bind_security_descriptor: &'static str,
+}
+
+impl HvSocketService {
+    /// The service the guest's agent connects to.
+    const fn agent() -> Self {
+        Self {
+            bind_security_descriptor: "D:P(A;;FA;;;SY)(A;;FA;;;BA)",
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -602,6 +642,38 @@ mod tests {
         );
     }
 
+    /// The agent's service GUID, spelled out rather than derived: this is the
+    /// address a guest's vsock connect arrives at, and a test that computed it
+    /// the way the code does would agree with any change to it.
+    const AGENT_SERVICE_KEY: &str = "564D4C41-FACB-11E6-BD58-64006A7986D3";
+
+    #[test]
+    fn every_vm_is_given_the_service_its_agent_connects_to() {
+        // Without the entry the host cannot bind the service and the guest's
+        // agent has nowhere to connect, however well the rest of the VM works.
+        let json: Value = serde_json::from_str(
+            &HcsVmConfigBuilder::build(
+                &cloud_request(),
+                Path::new(r"C:\vms\test-vm\disks\system.vhdx"),
+                Path::new(r"C:\vms\test-vm\seed.iso"),
+                VM_ID,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        let table = json
+            .pointer("/VirtualMachine/Devices/HvSocket/HvSocketConfig/ServiceTable")
+            .and_then(Value::as_object)
+            .expect("the VM should have a service table");
+        assert_eq!(table.len(), 1);
+        assert_eq!(
+            table[AGENT_SERVICE_KEY].pointer("/BindSecurityDescriptor"),
+            Some(&json!("D:P(A;;FA;;;SY)(A;;FA;;;BA)")),
+            "only SYSTEM and the administrators may listen for a VM's agent"
+        );
+    }
+
     #[test]
     fn builds_the_minimal_configuration() {
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
@@ -634,7 +706,11 @@ mod tests {
                             "1": { "Type": "Iso", "Path": "C:\\images\\installer.iso" }
                         }}},
                         "ComPorts": { "0": { "NamedPipe": com1_pipe_path(VM_ID) } },
-                        "HvSocket": { "HvSocketConfig": { "ServiceTable": {} } },
+                        "HvSocket": { "HvSocketConfig": { "ServiceTable": {
+                            AGENT_SERVICE_KEY: {
+                                "BindSecurityDescriptor": "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+                            }
+                        }}},
                         "Keyboard": {},
                         "Mouse": {}
                     },
