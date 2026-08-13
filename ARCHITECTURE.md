@@ -1850,6 +1850,29 @@ which is what keeps them from disagreeing about what is being signed. The
 crypto is RustCrypto and `getrandom`: pure Rust, so the agent stays a static
 musl binary built without a C toolchain.
 
+### Installing the guest agent
+
+A cloud-image VM gets the agent on its first boot. At creation VMLord looks for
+the statically linked `vmlord-agent` beside its own executable. When it is
+present, the creation transaction writes its bytes to a per-VM `tools.iso`
+beside `seed.iso`, labelled `VMLTOOLS`, and grants the VM access to it. The
+secret stays separate: the host copy remains `<vm>/agent.secret`, while the
+guest copy is in the secret-bearing NoCloud seed.
+
+The seed's cloud-init document writes a root-owned systemd unit. Its first-boot
+commands mount `VMLTOOLS` read-only, copy `vmlord-agent` into
+`/usr/local/lib/vmlord`, unmount the medium, and enable the service. systemd
+then runs the agent as root, which reads the guest secret and opens its first
+authenticated HvSocket session to the host. The installed copy, rather than
+the ISO, is what later boots run.
+
+This gives a cloud VM three SCSI attachments: its system disk, the NoCloud
+seed, and the tools ISO. A local-media VM receives no cloud-init configuration
+and no agent, so it deliberately remains at two attachments. If the sibling
+agent binary is absent, creation warns and follows that same no-agent path;
+it does not create a tools ISO or agent secret. Reconnect/backoff, GPU
+capabilities, and Plan9 mounts remain later work.
+
 Failures are `Error { code, message }` rather than a string. The code is what a
 peer branches on -- an unsupported version, an unauthenticated session, a
 request this build has no arm for -- and the message is for the log. `Error` is
