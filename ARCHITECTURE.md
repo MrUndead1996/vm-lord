@@ -184,7 +184,18 @@ vmlord (composition root)
   -> image (release resolution, download, qcow2)
   -> legacy-backend (dynamic C FFI, transitional fallback)
   -> appsandbox_core.dll
+
+agent-protocol (portable wire contract)
+  <- vmlord (host side, through platform)
+  <- vmlord-agent (guest side, Linux)
 ```
+
+`vmlord-agent` is the only crate that is not part of `vmlord.exe`. It is a
+Linux program that runs inside a guest, so it is excluded from the workspace's
+`default-members` and built on its own with
+`cargo build -p vmlord-agent --target x86_64-unknown-linux-gnu`. Its `main`
+refuses to compile for any other target rather than link-failing later.
+`agent-protocol` is in both sets, because both ends of the connection speak it.
 
 `legacy-backend` is the only crate that may contain `unsafe` code, raw C
 pointers, or Windows DLL loading for the temporary AppSandbox implementation.
@@ -1718,6 +1729,62 @@ building and is the only action then available: it calls
 `WorkspaceApp::cancel_create`, the build rolls itself back, and the row leaves
 the list on its own. Start, stop, edit and delete stay disabled meanwhile, since
 what exists of the VM is a directory the build still owns.
+
+---
+
+## The guest agent protocol
+
+Some things about a VM can only be known or done from inside it: whether the
+GPU the host attached is the one the guest renders on, and where the userspace
+that drives it has to be mounted. `vmlord-agent` is the program in the guest
+that answers for those, and `vmlord-agent-protocol` is the contract it and the
+host share. Both crates exist before either side of the connection does, so
+that the wire format is designed once rather than twice.
+
+The contract is Protobuf without gRPC. The transport is a single HvSocket
+stream per VM, opened by the guest; a service definition would add an HTTP/2
+stack to both ends of a socket that carries one connection and one peer. What
+is left is a schema and a framing rule: `proto/vmlord/agent/v1/agent.proto`
+holds the messages, and every one of them travels as a 4-byte little-endian
+body length followed by an encoded `Envelope`. Protobuf messages are not
+self-delimiting and a stream socket owes nobody message boundaries, so the
+length has to come from somewhere; little-endian because both ends are x86-64.
+
+Bodies are capped at one mebibyte, enforced before anything is allocated on
+either side. The messages here are status reports and manifests, so the cap is
+far above what the schema can produce and far below what a guest could use to
+exhaust the host. A prefix that exceeds it leaves the stream at a body of
+unknown length, which cannot be resynchronised: the connection is closed rather
+than skipped past.
+
+`Envelope` carries a request id and a `oneof` of `Request` or `Response`, and
+is deliberately symmetric. The host asks the guest to do things, and the guest
+reports to the host, so a client envelope and a server envelope would be two
+things to keep in step for no gain. Ids are unique per originator rather than
+globally; a response repeats the id of the request it answers.
+
+Two agreements open a session, and they answer different questions.
+`ProtocolVersion` is `major`/`minor`: a differing major means an existing
+message changed meaning and there is nothing to negotiate, while a session
+between differing minors runs at the lower one, so the older side decides how
+new the conversation can be. Capabilities are not ordered and so are not a
+version -- an agent on a VM with no GPU is not an older agent -- and only
+capabilities both peers named may be used. A capability number this build has
+never heard of is dropped rather than refused, which is what lets a newer agent
+talk to an older host at all.
+
+Failures are `Error { code, message }` rather than a string. The code is what a
+peer branches on -- an unsupported version, an unauthenticated session, a
+request this build has no arm for -- and the message is for the log. `Error` is
+the first arm of the response `oneof` because every request can fail, including
+one whose kind the responder cannot recognise.
+
+`proto/agent.descriptor.bin` is the compiled schema, checked in beside the
+`.proto`. It is what tools that read descriptor sets consume, and it makes a
+change to the wire format visible in a diff; a test fails if it stops matching
+what the `.proto` compiles to. The schema is compiled in-process by `protox`
+rather than by `protoc`, so that neither the Windows nor the Linux side needs a
+toolchain nothing else in the repository uses.
 
 ---
 
