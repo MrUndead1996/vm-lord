@@ -24,7 +24,7 @@ impl SourceManifest { pub fn parse_and_validate(bytes:&[u8],entry:&CatalogEntry)
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReadyMarker { schema_version:u32, payload_id:String, generation:Sha256Digest, payload_manifest_sha256:Sha256Digest }
-impl ReadyMarker { pub fn new(entry:&CatalogEntry)->Self{Self{schema_version:1,payload_id:entry.payload_id().into(),generation:entry.archive_sha256().clone(),payload_manifest_sha256:entry.payload_manifest_sha256().clone()}} pub fn to_json_bytes(&self)->Result<Vec<u8>,PayloadError>{let mut bytes=serde_json::to_vec(self).map_err(|e|PayloadError::InvalidManifest(e.to_string()))?;bytes.push(b'\n');Ok(bytes)} }
+impl ReadyMarker { pub fn new(entry:&CatalogEntry)->Self{Self{schema_version:1,payload_id:entry.payload_id().into(),generation:entry.archive_sha256().clone(),payload_manifest_sha256:entry.payload_manifest_sha256().clone()}} pub(crate) fn new_for(payload:&crate::ReadyGpuPayload)->Self{Self{schema_version:1,payload_id:payload.payload_id().into(),generation:payload.generation().clone(),payload_manifest_sha256:payload.payload_manifest_sha256().clone()}} pub fn to_json_bytes(&self)->Result<Vec<u8>,PayloadError>{let mut bytes=serde_json::to_vec(self).map_err(|e|PayloadError::InvalidManifest(e.to_string()))?;bytes.push(b'\n');Ok(bytes)} }
 pub(crate) fn cache_provenance(entry:&CatalogEntry,sources:&SourceManifest)->Result<Vec<u8>,PayloadError>{ let mut value=serde_json::json!({"archive_sha256":entry.archive_sha256(),"payload_id":entry.payload_id(),"payload_manifest_sha256":entry.payload_manifest_sha256(),"sources":sources.document}); let mut bytes=serde_json::to_vec(&mut value).map_err(|e|PayloadError::InvalidManifest(e.to_string()))?; bytes.push(b'\n'); Ok(bytes) }
 
 #[cfg(test)]
