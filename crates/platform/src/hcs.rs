@@ -90,6 +90,26 @@ enum WaitFailure {
     Timeout(RepositoryError),
 }
 
+/// The information HCS returned when it refused a modify operation.
+///
+/// The result document is deliberately left unparsed. Its schema varies by
+/// resource and HCS version, but it is the service's only host-specific
+/// explanation of why a best-effort GPU assignment did not happen.
+pub(crate) struct HcsModifyFailure {
+    pub(crate) hresult: u32,
+    pub(crate) result_detail: Option<String>,
+}
+
+impl HcsModifyFailure {
+    #[cfg(test)]
+    pub(crate) fn new(hresult: u32, result_detail: Option<String>) -> Self {
+        Self {
+            hresult,
+            result_detail,
+        }
+    }
+}
+
 /// Renders a wait failure the way every caller that does not classify the
 /// HRESULT itself reports it.
 fn wait_failure(timeout: Duration, failure: WaitFailure) -> RepositoryError {
@@ -377,29 +397,75 @@ impl HcsSystem {
             "detaching the adapter of endpoint {endpoint_id} from HCS compute system \"{}\"",
             self.id
         );
-        let operation = HcsOperation::new();
-        let document = HSTRING::from(detach_adapter_document(endpoint_id));
-        // SAFETY: `self.handle` and `operation.0` are valid owned handles for
-        // the duration of this call, and `document` outlives it. A null
-        // identity asks HCS to act as the calling process, which is what every
-        // other call in this module does.
-        unsafe { HcsModifyComputeSystem(self.handle, operation.0, &document, None) }.map_err(
-            |error| {
-                let error = windows_error("modify compute system", Some(&self.id), error);
-                log::error!("{error}");
-                error
-            },
-        )?;
-
-        operation
-            .wait_for_completion(DETACH_TIMEOUT)
+        self.modify(&detach_adapter_document(endpoint_id), DETACH_TIMEOUT)
             .map(|_document| ())
+            .map_err(|failure| {
+                RepositoryError::new(format!(
+                    "modify compute system \"{}\" failed with HRESULT 0x{:08X}: {}",
+                    self.id,
+                    failure.hresult,
+                    failure.result_detail.as_deref().unwrap_or("no HCS result detail")
+                ))
+            })
             .inspect_err(|error| {
                 log::error!(
                     "detaching the adapter of HCS compute system \"{}\" failed: {error}",
                     self.id
                 );
             })
+    }
+
+    /// Modifies this compute system and waits for HCS to report the outcome.
+    ///
+    /// The call is safe for platform services: this wrapper owns the operation
+    /// handle and preserves both the failing HRESULT and HCS's optional result
+    /// document for callers whose work is best effort.
+    pub(crate) fn modify(
+        &self,
+        document: &str,
+        timeout: Duration,
+    ) -> Result<String, HcsModifyFailure> {
+        let operation = HcsOperation::new();
+        let document = HSTRING::from(document);
+        // SAFETY: `self.handle` and `operation.0` are valid owned handles for
+        // the duration of this call, and `document` outlives it. A null
+        // identity asks HCS to act as the calling process, which is what every
+        // other call in this module does.
+        unsafe { HcsModifyComputeSystem(self.handle, operation.0, &document, None) }
+            .map_err(|error| HcsModifyFailure {
+                hresult: error.code().0 as u32,
+                result_detail: None,
+            })?;
+
+        let timeout_ms = timeout_milliseconds(timeout).map_err(|error| HcsModifyFailure {
+            hresult: ERROR_TIMEOUT.to_hresult().0 as u32,
+            result_detail: Some(error.to_string()),
+        })?;
+        let mut result = PWSTR::null();
+        // SAFETY: `operation.0` is an owned HCS operation handle valid for this
+        // call. A non-null result is an HCS allocation transferred immediately
+        // to `HcsAllocatedString`, which frees it on drop.
+        let native_result =
+            unsafe { HcsWaitForOperationResult(operation.0, timeout_ms, Some(&mut result)) };
+        let native_hresult = native_result
+            .as_ref()
+            .err()
+            .map_or(0, |error| error.code().0 as u32);
+        let result_detail = HcsAllocatedString::from_optional(result)
+            .map(HcsAllocatedString::into_string)
+            .transpose()
+            .map_err(|error| HcsModifyFailure {
+                hresult: native_hresult,
+                result_detail: Some(error.to_string()),
+            })?;
+
+        match native_result {
+            Ok(()) => Ok(result_detail.unwrap_or_default()),
+            Err(error) => Err(HcsModifyFailure {
+                hresult: error.code().0 as u32,
+                result_detail,
+            }),
+        }
     }
 
     /// The raw compute-system handle, for registering an event callback on it.
@@ -902,7 +968,7 @@ mod tests {
     use vmlord_core::RepositoryError;
 
     use super::{
-        HcsClient, HcsStartFailure, HcsSystemState, HcsSystemSummary, call_failure,
+        HcsClient, HcsModifyFailure, HcsStartFailure, HcsSystemState, HcsSystemSummary, call_failure,
         detach_adapter_document, hcs_service_properties_query, parse_enumerate_result,
         parse_service_result, parse_system_state, shutdown_options, unsupported_shutdown_error,
     };
@@ -933,6 +999,22 @@ mod tests {
 
         assert!(matches!(denied, HcsStartFailure::Failed(_)));
         assert!(denied.into_error().to_string().contains("0x80070005"));
+    }
+
+    #[test]
+    fn modify_failure_keeps_the_hresult_and_result_detail() {
+        // GPU-PV failures are best effort, so the caller cannot surface them by
+        // failing the start; this diagnostic is the only evidence it has.
+        let failure = HcsModifyFailure::new(
+            0x8037_010D,
+            Some(r#"{"Error":"bad GPU"}"#.into()),
+        );
+
+        assert_eq!(failure.hresult, 0x8037_010D);
+        assert_eq!(
+            failure.result_detail.as_deref(),
+            Some(r#"{"Error":"bad GPU"}"#)
+        );
     }
 
     #[test]
