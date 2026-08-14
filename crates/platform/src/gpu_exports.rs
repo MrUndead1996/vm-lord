@@ -444,7 +444,7 @@ mod tests {
 
     use vmlord_core::{GpuShare, GpuShareRole, HostGpuAdapter, RepositoryError};
 
-    use super::{ExportRoots, GpuExports, build_with, strip_extended_prefix};
+    use super::{ExportRoots, GpuExports, build_with, build_with_payload, strip_extended_prefix};
 
     const SYSTEM32: &str = r"C:\Windows\System32";
     const REPOSITORY: &str = r"C:\Windows\System32\DriverStore\FileRepository";
@@ -476,6 +476,34 @@ mod tests {
             driver_store: driver_store.map(PathBuf::from),
             service: Some("nvlddmkm".to_owned()),
         }
+    }
+
+    #[test]
+    fn payload_wsl_and_driver_package_have_distinct_roles_and_order() {
+        let vm = Path::new(r"D:\VMLord\dev-linux");
+        let payload = r"D:\VMLord\dev-linux\gpu-payload";
+        let package = format!(r"{REPOSITORY}\nvltsi.inf_amd64_1");
+        let canonicalize = canonicalizer(&[
+            (SYSTEM32, SYSTEM32), (REPOSITORY, REPOSITORY),
+            (r"C:\Windows\System32\lxss\lib", r"C:\Windows\System32\lxss\lib"),
+            (&package, &package), (r"D:\VMLord\dev-linux", r"D:\VMLord\dev-linux"), (payload, payload),
+        ]);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roles: Vec<_> = build_with_payload(&[adapter(Some(&package))], &roots, vm, &canonicalize)
+            .unwrap().manifest().shares.into_iter().map(|share| share.role).collect();
+        assert!(matches!(roles.as_slice(), [GpuShareRole::GpuPayload, GpuShareRole::WslLib, GpuShareRole::DriverPackage { .. }]));
+    }
+
+    #[test]
+    fn a_payload_directory_reparsed_outside_its_vm_is_dropped() {
+        let vm = Path::new(r"D:\VMLord\dev-linux");
+        let canonicalize = canonicalizer(&[
+            (SYSTEM32, SYSTEM32), (REPOSITORY, REPOSITORY),
+            (r"D:\VMLord\dev-linux", r"D:\VMLord\dev-linux"),
+            (r"D:\VMLord\dev-linux\gpu-payload", r"D:\attacker\payload"),
+        ]);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        assert!(build_with_payload(&[], &roots, vm, &canonicalize).is_none());
     }
 
     #[test]
