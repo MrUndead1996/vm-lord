@@ -1,4 +1,5 @@
 use crate::{CatalogEntry, PayloadError, Sha256Digest};
+use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, TryLockError},
     io::{Read, Seek, SeekFrom, Write},
@@ -173,7 +174,32 @@ impl LockedArchive {
             hashed: 0,
             total: self.entry.archive_size(),
         });
-        let actual = Sha256Digest::hash_reader(&mut self.file)?;
+        let mut hash = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        let mut hashed = 0_u64;
+        loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(PayloadError::Cancelled);
+            }
+            let count = self.file.read(&mut buffer).map_err(|error| {
+                PayloadError::io("hash partial archive", self.path.clone(), error)
+            })?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&buffer[..count]);
+            hashed = hashed.checked_add(count as u64).ok_or_else(|| {
+                PayloadError::ArchiveSizeMismatch {
+                    expected: self.entry.archive_size(),
+                    actual: u64::MAX,
+                }
+            })?;
+            progress(PayloadProgress::Verifying {
+                hashed,
+                total: self.entry.archive_size(),
+            });
+        }
+        let actual = Sha256Digest::from_bytes(hash.finalize().into())?;
         if actual != *self.entry.archive_sha256() {
             self.file.set_len(0).map_err(|error| {
                 PayloadError::io(
@@ -202,7 +228,10 @@ mod tests {
         fs,
         io::{BufRead, BufReader, Write},
         net::{TcpListener, TcpStream},
-        sync::atomic::AtomicBool,
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
         thread,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -211,7 +240,7 @@ mod tests {
         DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_GLOBAL_TIMEOUT, DOWNLOAD_RECEIVE_TIMEOUT, LockedArchive,
         production_agent,
     };
-    use crate::{PayloadCatalog, PayloadError};
+    use crate::{PayloadCatalog, PayloadError, PayloadProgress, Sha256Digest};
 
     struct FixtureServer {
         url: String,
@@ -251,7 +280,44 @@ mod tests {
     }
 
     fn entry() -> crate::CatalogEntry {
-        PayloadCatalog::from_json(br#"{"schema_version":1,"entries":[{"payload_id":"test","target":{"distribution":"ubuntu","release":"26.04","architecture":"amd64","kernel_release":"test","payload_abi":1},"archive_url":"https://example.test/payload.zip","archive_size":7,"expanded_size_limit":8,"file_count_limit":1,"archive_sha256":"0000000000000000000000000000000000000000000000000000000000000000","payload_manifest_sha256":"0000000000000000000000000000000000000000000000000000000000000000","required_renderers":["d3d12-gallium"],"mesa_policy":"bundled","sources":[{"url":"https://github.com/example/source","commit":"14794180686c2fb6307fbe359c359bec765249f3","version":"1"}],"licenses":[{"spdx":"MIT","path":"licenses/MIT.txt"}]}]}"#).unwrap().entries()[0].clone()
+        PayloadCatalog::from_json(br#"{"schema_version":1,"entries":[{"payload_id":"test","target":{"distribution":"ubuntu","release":"26.04","architecture":"amd64","kernel_release":"test","payload_abi":1},"archive_url":"https://example.test/payload.zip","archive_size":7,"expanded_size_limit":8,"file_count_limit":1,"archive_sha256":"0000000000000000000000000000000000000000000000000000000000000000","payload_manifest_sha256":"0000000000000000000000000000000000000000000000000000000000000000","required_renderers":["d3d12-gallium"],"mesa_policy":"bundled","vmlord_revision":"14794180686c2fb6307fbe359c359bec765249f3","builder_version":"vmlord-gpu-payload 1","sources":[{"url":"https://github.com/example/source","commit":"14794180686c2fb6307fbe359c359bec765249f3","version":"1"}],"licenses":[{"spdx":"MIT","path":"licenses/MIT.txt"}]}]}"#).unwrap().entries()[0].clone()
+    }
+
+    fn entry_for(bytes: &[u8]) -> crate::CatalogEntry {
+        let digest = Sha256Digest::hash_reader(bytes).unwrap();
+        let catalog = serde_json::json!({
+            "schema_version": 1,
+            "entries": [{
+                "payload_id": "test",
+                "target": {
+                    "distribution": "ubuntu",
+                    "release": "26.04",
+                    "architecture": "amd64",
+                    "kernel_release": "test",
+                    "payload_abi": 1
+                },
+                "archive_url": "https://example.test/payload.zip",
+                "archive_size": bytes.len(),
+                "expanded_size_limit": bytes.len(),
+                "file_count_limit": 1,
+                "archive_sha256": digest,
+                "payload_manifest_sha256": digest,
+                "required_renderers": ["d3d12-gallium"],
+                "mesa_policy": "bundled",
+                "vmlord_revision": "14794180686c2fb6307fbe359c359bec765249f3",
+                "builder_version": "vmlord-gpu-payload 1",
+                "sources": [{
+                    "url": "https://github.com/example/source",
+                    "commit": "14794180686c2fb6307fbe359c359bec765249f3",
+                    "version": "1"
+                }],
+                "licenses": [{"spdx": "MIT", "path": "licenses/MIT.txt"}]
+            }]
+        });
+        PayloadCatalog::from_json(&serde_json::to_vec(&catalog).unwrap())
+            .unwrap()
+            .entries()[0]
+            .clone()
     }
 
     #[test]
@@ -288,6 +354,95 @@ mod tests {
             archive.download(&|_| {}, &cancelled),
             Err(PayloadError::Cancelled)
         ));
+        drop(archive);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_verification_checks_cancellation_between_64_kib_chunks() {
+        let root = std::env::temp_dir().join(format!(
+            "vmlord-gpu-payload-verify-cancel-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bytes = vec![b'x'; 2 * 64 * 1024];
+        let mut archive = LockedArchive::acquire(&root, &entry_for(&bytes)).unwrap();
+        archive.file.write_all(&bytes).unwrap();
+        let cancelled = AtomicBool::new(false);
+        let events = Mutex::new(Vec::new());
+        let progress = |event| {
+            events.lock().unwrap().push(event);
+            if event
+                == (PayloadProgress::Verifying {
+                    hashed: 64 * 1024,
+                    total: bytes.len() as u64,
+                })
+            {
+                cancelled.store(true, Ordering::Relaxed);
+            }
+        };
+
+        assert!(matches!(
+            archive.verify(&progress, &cancelled),
+            Err(PayloadError::Cancelled)
+        ));
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                PayloadProgress::Verifying {
+                    hashed: 0,
+                    total: bytes.len() as u64,
+                },
+                PayloadProgress::Verifying {
+                    hashed: 64 * 1024,
+                    total: bytes.len() as u64,
+                }
+            ]
+        );
+        drop(archive);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_verification_reports_each_hashed_chunk_through_completion() {
+        let root = std::env::temp_dir().join(format!(
+            "vmlord-gpu-payload-verify-progress-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let bytes = vec![b'x'; 64 * 1024 + 1];
+        let mut archive = LockedArchive::acquire(&root, &entry_for(&bytes)).unwrap();
+        archive.file.write_all(&bytes).unwrap();
+        let events = Mutex::new(Vec::new());
+
+        archive
+            .verify(
+                &|event| events.lock().unwrap().push(event),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                PayloadProgress::Verifying {
+                    hashed: 0,
+                    total: bytes.len() as u64,
+                },
+                PayloadProgress::Verifying {
+                    hashed: 64 * 1024,
+                    total: bytes.len() as u64,
+                },
+                PayloadProgress::Verifying {
+                    hashed: bytes.len() as u64,
+                    total: bytes.len() as u64,
+                }
+            ]
+        );
         drop(archive);
         fs::remove_dir_all(root).unwrap();
     }

@@ -14,6 +14,8 @@
     "dzn-vulkan"
   ],
   "mesa_policy": "bundled",
+  "vmlord_revision": "14794180686c2fb6307fbe359c359bec765249f3",
+  "builder_version": "vmlord-gpu-payload 1",
   "sources": [
     {
       "url": "https://github.com/microsoft/WSL2-Linux-Kernel",

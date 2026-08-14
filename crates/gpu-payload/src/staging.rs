@@ -965,6 +965,16 @@ mod tests {
             let content = b"original content".to_vec();
             let sources = serde_json::to_vec(&serde_json::json!({
                 "schema_version": 1,
+                "target": {
+                    "distribution": "ubuntu",
+                    "release": "26.04",
+                    "architecture": "amd64",
+                    "kernel_release": "test",
+                    "payload_abi": 1
+                },
+                "mesa_policy": "bundled",
+                "vmlord_revision": SOURCE_COMMIT,
+                "builder_version": "vmlord-gpu-payload 1",
                 "sources": [{
                     "url": SOURCE_URL,
                     "commit": SOURCE_COMMIT,
@@ -1026,6 +1036,8 @@ mod tests {
                     "payload_manifest_sha256": digest(&payload),
                     "required_renderers": ["d3d12-gallium"],
                     "mesa_policy": "bundled",
+                    "vmlord_revision": SOURCE_COMMIT,
+                    "builder_version": "vmlord-gpu-payload 1",
                     "sources": [{
                         "url": SOURCE_URL,
                         "commit": SOURCE_COMMIT,

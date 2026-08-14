@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CatalogEntry, GuestTarget, PayloadError, Sha256Digest};
+use crate::{CatalogEntry, GuestTarget, MesaPolicy, PayloadError, Sha256Digest};
 
 const D3DKMTHK_PATH: &str = "include/uapi/misc/d3dkmthk.h";
 const D3DKMTHK_LICENSE: &str = "GPL-2.0 WITH Linux-syscall-note";
@@ -130,6 +130,10 @@ fn validate_path(path: &str) -> Result<(), PayloadError> {
 #[serde(deny_unknown_fields)]
 struct SourceManifestDocument {
     schema_version: u32,
+    target: GuestTarget,
+    mesa_policy: MesaPolicy,
+    vmlord_revision: String,
+    builder_version: String,
     sources: Vec<SourceRecord>,
     overlays: Vec<OverlayRecord>,
 }
@@ -169,7 +173,13 @@ impl SourceManifest {
     pub fn parse_and_validate(bytes: &[u8], entry: &CatalogEntry) -> Result<Self, PayloadError> {
         let doc: SourceManifestDocument = serde_json::from_slice(bytes)
             .map_err(|error| PayloadError::InvalidManifest(error.to_string()))?;
-        if doc.schema_version != 1 || doc.sources.len() != entry.sources().len() {
+        if doc.schema_version != 1
+            || doc.target != *entry.target()
+            || doc.mesa_policy != *entry.mesa_policy()
+            || doc.vmlord_revision != entry.vmlord_revision()
+            || doc.builder_version != entry.builder_version()
+            || doc.sources.len() != entry.sources().len()
+        {
             return Err(PayloadError::InvalidManifest(
                 "sources.json does not exactly match catalog provenance".into(),
             ));
@@ -307,9 +317,26 @@ pub(crate) fn cache_provenance(
     entry: &CatalogEntry,
     sources: &SourceManifest,
 ) -> Result<Vec<u8>, PayloadError> {
-    let mut value = serde_json::json!({"archive_sha256":entry.archive_sha256(),"payload_id":entry.payload_id(),"payload_manifest_sha256":entry.payload_manifest_sha256(),"sources":sources.document});
+    #[derive(Serialize)]
+    struct CacheProvenance<'a> {
+        schema_version: u32,
+        payload_id: &'a str,
+        archive_sha256: &'a Sha256Digest,
+        payload_manifest_sha256: &'a Sha256Digest,
+        catalog_entry: &'a CatalogEntry,
+        sources: &'a SourceManifestDocument,
+    }
+
+    let value = CacheProvenance {
+        schema_version: 1,
+        payload_id: entry.payload_id(),
+        archive_sha256: entry.archive_sha256(),
+        payload_manifest_sha256: entry.payload_manifest_sha256(),
+        catalog_entry: entry,
+        sources: &sources.document,
+    };
     let mut bytes =
-        serde_json::to_vec(&mut value).map_err(|e| PayloadError::InvalidManifest(e.to_string()))?;
+        serde_json::to_vec(&value).map_err(|e| PayloadError::InvalidManifest(e.to_string()))?;
     bytes.push(b'\n');
     Ok(bytes)
 }
@@ -319,6 +346,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::{CatalogEntry, PayloadCatalog, PayloadError, PayloadManifest, SourceManifest};
+
+    use super::cache_provenance;
 
     const ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
     const COMMIT: &str = "14794180686c2fb6307fbe359c359bec765249f3";
@@ -343,6 +372,8 @@ mod tests {
                 "payload_manifest_sha256": ZERO,
                 "required_renderers": ["d3d12-gallium"],
                 "mesa_policy": "bundled",
+                "vmlord_revision": COMMIT,
+                "builder_version": "vmlord-gpu-payload 1",
                 "sources": [{
                     "url": "https://github.com/x/y",
                     "commit": COMMIT,
@@ -386,6 +417,16 @@ mod tests {
     fn sources() -> Value {
         json!({
             "schema_version": 1,
+            "target": {
+                "distribution": "ubuntu",
+                "release": "26.04",
+                "architecture": "amd64",
+                "kernel_release": "k",
+                "payload_abi": 1
+            },
+            "mesa_policy": "bundled",
+            "vmlord_revision": COMMIT,
+            "builder_version": "vmlord-gpu-payload 1",
             "sources": [{
                 "url": "https://github.com/x/y",
                 "commit": COMMIT,
@@ -466,6 +507,66 @@ mod tests {
             SourceManifest::parse_and_validate(&serde_json::to_vec(&document).unwrap(), &entry()),
             Err(PayloadError::InvalidManifest(_))
         ));
+    }
+
+    #[test]
+    fn sources_must_match_the_catalog_target_mesa_and_build_identity() {
+        for mutation in ["target", "mesa", "revision", "builder"] {
+            let mut document = sources();
+            match mutation {
+                "target" => document["target"]["kernel_release"] = "other".into(),
+                "mesa" => document["mesa_policy"] = "distro".into(),
+                "revision" => {
+                    document["vmlord_revision"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()
+                }
+                "builder" => document["builder_version"] = "other builder".into(),
+                _ => unreachable!(),
+            }
+
+            assert!(
+                matches!(
+                    SourceManifest::parse_and_validate(
+                        &serde_json::to_vec(&document).unwrap(),
+                        &entry()
+                    ),
+                    Err(PayloadError::InvalidManifest(_))
+                ),
+                "accepted mismatched {mutation} provenance"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_provenance_contains_the_validated_catalog_entry_and_source_manifest() {
+        let entry = entry();
+        let source_document = sources();
+        let sources = SourceManifest::parse_and_validate(
+            &serde_json::to_vec(&source_document).unwrap(),
+            &entry,
+        )
+        .unwrap();
+
+        let first = cache_provenance(&entry, &sources).unwrap();
+        let second = cache_provenance(&entry, &sources).unwrap();
+        let value: Value = serde_json::from_slice(&first).unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["payload_id"], "p");
+        assert_eq!(value["archive_sha256"], entry.archive_sha256().as_hex());
+        assert_eq!(
+            value["payload_manifest_sha256"],
+            entry.payload_manifest_sha256().as_hex()
+        );
+        assert_eq!(value["catalog_entry"]["payload_id"], "p");
+        assert_eq!(value["catalog_entry"]["target"]["kernel_release"], "k");
+        assert_eq!(value["catalog_entry"]["mesa_policy"], "bundled");
+        assert_eq!(value["catalog_entry"]["vmlord_revision"], COMMIT);
+        assert_eq!(
+            value["catalog_entry"]["builder_version"],
+            "vmlord-gpu-payload 1"
+        );
+        assert_eq!(value["sources"], source_document);
     }
 
     #[test]

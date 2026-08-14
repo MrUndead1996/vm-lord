@@ -273,6 +273,9 @@ fn is_safe_component(component: &str) -> bool {
             | "COM7"
             | "COM8"
             | "COM9"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
             | "LPT1"
             | "LPT2"
             | "LPT3"
@@ -282,6 +285,9 @@ fn is_safe_component(component: &str) -> bool {
             | "LPT7"
             | "LPT8"
             | "LPT9"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
             | "CONIN$"
             | "CONOUT$"
     )
@@ -526,6 +532,16 @@ mod tests {
         let source = b"source material";
         serde_json::to_vec(&serde_json::json!({
             "schema_version": 1,
+            "target": {
+                "distribution": "ubuntu",
+                "release": "26.04",
+                "architecture": "amd64",
+                "kernel_release": "test",
+                "payload_abi": 1
+            },
+            "mesa_policy": "bundled",
+            "vmlord_revision": SOURCE_COMMIT,
+            "builder_version": "vmlord-gpu-payload 1",
             "sources": [{
                 "url": SOURCE_URL,
                 "commit": SOURCE_COMMIT,
@@ -653,6 +669,8 @@ mod tests {
                 "payload_manifest_sha256": digest(payload),
                 "required_renderers": ["d3d12-gallium"],
                 "mesa_policy": "bundled",
+                "vmlord_revision": SOURCE_COMMIT,
+                "builder_version": "vmlord-gpu-payload 1",
                 "sources": [{
                     "url": SOURCE_URL,
                     "commit": SOURCE_COMMIT,
@@ -725,6 +743,16 @@ mod tests {
         let content = b"content";
         let sources = serde_json::to_vec(&serde_json::json!({
             "schema_version": 1,
+            "target": {
+                "distribution": "ubuntu",
+                "release": "26.04",
+                "architecture": "amd64",
+                "kernel_release": "test",
+                "payload_abi": 1
+            },
+            "mesa_policy": "bundled",
+            "vmlord_revision": SOURCE_COMMIT,
+            "builder_version": "vmlord-gpu-payload 1",
             "sources": [{
                 "url": SOURCE_URL,
                 "commit": SOURCE_COMMIT,
@@ -815,6 +843,9 @@ mod tests {
             ("content/file:stream", "content/file:stream"),
             ("content/file.", "content/file."),
             ("NUL", "NUL"),
+            ("COM¹.txt", "COM¹.txt"),
+            ("LPT²", "LPT²"),
+            ("com³.log", "com³.log"),
         ] {
             let payload = payload_manifest(&[(declared, b"content"), ("sources.json", &sources)]);
             let archive = archive_bytes(&[

@@ -61,6 +61,8 @@ struct PackRecipe {
     archive_url: String,
     required_renderers: Vec<RendererCapability>,
     mesa_policy: MesaPolicy,
+    vmlord_revision: String,
+    builder_version: String,
     sources: Vec<RecipeSource>,
     overlays: Vec<RecipeOverlay>,
     licenses: Vec<RecipeLicense>,
@@ -106,6 +108,10 @@ struct RecipeLicense {
 #[serde(deny_unknown_fields)]
 struct PreparedSources {
     schema_version: u32,
+    target: GuestTarget,
+    mesa_policy: MesaPolicy,
+    vmlord_revision: String,
+    builder_version: String,
     sources: Vec<RecipeSource>,
     overlays: Vec<RecipeOverlay>,
 }
@@ -389,6 +395,8 @@ fn catalog_entry(
         "payload_manifest_sha256": payload_manifest_sha256,
         "required_renderers": recipe.required_renderers,
         "mesa_policy": recipe.mesa_policy,
+        "vmlord_revision": recipe.vmlord_revision,
+        "builder_version": recipe.builder_version,
         "sources": sources,
         "licenses": recipe.licenses,
     })
@@ -402,6 +410,10 @@ fn validate_prepared_provenance(
     let prepared: PreparedSources = serde_json::from_slice(&sources_bytes)
         .map_err(|error| PayloadError::InvalidManifest(error.to_string()))?;
     if prepared.schema_version != 1
+        || prepared.target != recipe.target
+        || prepared.mesa_policy != recipe.mesa_policy
+        || prepared.vmlord_revision != recipe.vmlord_revision
+        || prepared.builder_version != recipe.builder_version
         || prepared.sources != recipe.sources
         || prepared.overlays != recipe.overlays
     {
@@ -592,6 +604,9 @@ fn is_safe_component(component: &str) -> bool {
             | "COM7"
             | "COM8"
             | "COM9"
+            | "COM¹"
+            | "COM²"
+            | "COM³"
             | "LPT1"
             | "LPT2"
             | "LPT3"
@@ -601,6 +616,9 @@ fn is_safe_component(component: &str) -> bool {
             | "LPT7"
             | "LPT8"
             | "LPT9"
+            | "LPT¹"
+            | "LPT²"
+            | "LPT³"
             | "CONIN$"
             | "CONOUT$"
     )
@@ -631,7 +649,7 @@ mod tests {
 
     use crate::{PayloadCatalog, PayloadError, Sha256Digest};
 
-    use super::{PackRequest, pack};
+    use super::{PackRequest, pack, validate_archive_path};
 
     static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
@@ -851,19 +869,38 @@ mod tests {
     }
 
     #[test]
-    fn prepared_sources_must_match_recipe_provenance() {
-        let fixture = PreparedFixture::new("source-provenance");
-        rewrite_json(&fixture.prepared.join("sources.json"), |sources| {
-            sources["sources"][0]["commit"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
-        });
+    fn prepared_sources_must_match_entire_recipe_provenance() {
+        for mutation in ["source", "target", "mesa", "revision", "builder"] {
+            let fixture = PreparedFixture::new(&format!("source-provenance-{mutation}"));
+            rewrite_json(
+                &fixture.prepared.join("sources.json"),
+                |sources| match mutation {
+                    "source" => {
+                        sources["sources"][0]["commit"] =
+                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()
+                    }
+                    "target" => sources["target"]["kernel_release"] = "other".into(),
+                    "mesa" => sources["mesa_policy"] = "distro".into(),
+                    "revision" => {
+                        sources["vmlord_revision"] =
+                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()
+                    }
+                    "builder" => sources["builder_version"] = "other builder".into(),
+                    _ => unreachable!(),
+                },
+            );
 
-        assert!(matches!(
-            pack(fixture.request(
-                &fixture.root.join("payload.zip"),
-                &fixture.root.join("entry.json")
-            )),
-            Err(PayloadError::InvalidManifest(_))
-        ));
+            assert!(
+                matches!(
+                    pack(fixture.request(
+                        &fixture.root.join("payload.zip"),
+                        &fixture.root.join("entry.json")
+                    )),
+                    Err(PayloadError::InvalidManifest(_))
+                ),
+                "accepted mismatched {mutation} provenance"
+            );
+        }
     }
 
     #[test]
@@ -1010,6 +1047,19 @@ mod tests {
             )),
             Err(PayloadError::InvalidManifest(_))
         ));
+    }
+
+    #[test]
+    fn prepared_paths_reject_windows_superscript_device_aliases() {
+        for name in ["COM¹.txt", "LPT²", "com³.log"] {
+            assert!(
+                matches!(
+                    validate_archive_path(name),
+                    Err(PayloadError::UnsafeArchive(_))
+                ),
+                "accepted reserved Windows device alias {name}"
+            );
+        }
     }
 
     #[test]
