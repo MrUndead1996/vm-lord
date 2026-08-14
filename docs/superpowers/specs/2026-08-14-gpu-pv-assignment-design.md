@@ -9,10 +9,12 @@ failure to attach a GPU never changes an otherwise successful VM start.
 
 ## Scope
 
-This task contains the HCS command, its safe Rust boundary, a focused GPU
-assignment service, and the post-start invocation. It does not add UI state,
-persist runtime facts, retries, agent interaction, or stopped-only edits. Those
-belong to task #98.
+This task contains the HCS command, its safe Rust boundary, and a focused GPU
+assignment service ready for a post-start caller. It does not wire the service
+into `VmStartPipeline`, add UI state, persist the desired mode or runtime facts,
+add retries or agent interaction, or change stopped-only edits. Those lifecycle
+concerns belong to task #98: the native backend does not yet persist a GPU mode,
+so this task has no reliable desired mode for a pipeline call to consume.
 
 ## Components
 
@@ -27,11 +29,10 @@ the domain-facing assignment result. It owns no Windows handle and contains no
 `unsafe` code. `None` produces no request; `Unknown` is reported as an
 unsupported assignment failure without calling HCS.
 
-`VmStartPipeline` receives the service as an injectable dependency. Once HCS
-has reported a successful start, it opens the running system and asks the
-service to apply the requested mode. The result is logged. A failure does not
-drop the console session, stop the VM, retry the start, or return an error from
-`start`.
+The next lifecycle task calls the service after HCS reports a successful start
+and records the returned outcome. The service API makes that call best effort:
+a `GpuFailure` describes a failed assignment rather than requiring the caller
+to stop, retry, or otherwise alter the running VM.
 
 ## HCS request and diagnostics
 
@@ -58,7 +59,7 @@ GpuAssignmentService -- JSON --> HcsSystem safe modify operation -- unsafe --> H
         +-- success / GpuFailure <--- HRESULT + result detail -------------+
         |
         v
-VmStartPipeline logs outcome; VM start result is unchanged
+Task #98 lifecycle caller records outcome; VM start result is unchanged
 ```
 
 ## Error handling
@@ -74,7 +75,7 @@ VmStartPipeline logs outcome; VM start result is unchanged
 ## Tests
 
 Unit tests cover exact JSON for `Default` and `Mirror`, no-op/unsupported mode
-handling, and error messages containing HRESULT and result detail. Pipeline
-tests use an injected assignment service to prove a failed best-effort
-assignment still returns a successful console session after the VM starts.
+handling, and error messages containing HRESULT and result detail. The service
+is documented as best effort and returns a domain result rather than a start
+error, which lets #98 test the eventual pipeline integration independently.
 Windows compilation and the complete Windows test suite are the final checks.
