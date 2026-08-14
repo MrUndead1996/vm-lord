@@ -1,0 +1,31 @@
+use std::collections::HashSet;
+use serde::{Deserialize, Serialize};
+use crate::{CatalogEntry, GuestTarget, PayloadError, Sha256Digest};
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PreparedFile { path: String, size: u64, sha256: Sha256Digest }
+impl PreparedFile { pub fn path(&self) -> &str { &self.path } pub fn size(&self) -> u64 { self.size } pub fn sha256(&self) -> &Sha256Digest { &self.sha256 } }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct PayloadManifestDocument { schema_version: u32, payload_id: String, target: GuestTarget, files: Vec<PreparedFile> }
+#[derive(Clone, Debug)]
+pub struct PayloadManifest { files: Vec<PreparedFile> }
+impl PayloadManifest { pub fn parse_and_validate(bytes: &[u8], entry: &CatalogEntry) -> Result<Self, PayloadError> { let value: PayloadManifestDocument=serde_json::from_slice(bytes).map_err(|e|PayloadError::InvalidManifest(e.to_string()))?; if value.schema_version != 1 || value.payload_id != entry.payload_id() || value.target != *entry.target() { return Err(PayloadError::InvalidManifest("manifest identity does not match catalog".into())); } let mut paths=HashSet::new(); let mut last=""; let mut sources=false; for file in &value.files { validate_path(&file.path)?; if file.size == 0 || !paths.insert(file.path.as_str()) || (!last.is_empty() && last >= file.path.as_str()) { return Err(PayloadError::InvalidManifest("prepared file paths must be unique, sorted, and non-empty".into())); } sources |= file.path=="sources.json"; last=&file.path; } if !sources { return Err(PayloadError::InvalidManifest("payload.json must declare sources.json".into())); } Ok(Self { files:value.files }) } pub fn files(&self)->&[PreparedFile]{&self.files} }
+fn validate_path(path:&str)->Result<(),PayloadError>{ if path.is_empty()||path.contains('\\')||path.contains('\0')||path.starts_with('/')||path.split('/').any(|part|part.is_empty()||part=="."||part=="..")||path=="payload.json" { return Err(PayloadError::InvalidManifest(format!("unsafe prepared-file path: {path}"))); } Ok(()) }
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SourceManifestDocument { schema_version:u32, sources:Vec<SourceRecord>, overlays:Vec<OverlayRecord> }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SourceRecord { url:String, commit:String, version:String, #[serde(default)] paths:Vec<String>, #[serde(default)] sha256:Option<Sha256Digest> }
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct OverlayRecord { path:String, sha256:Sha256Digest, license:String, author:String }
+#[derive(Clone, Debug)]
+pub struct SourceManifest { document: SourceManifestDocument }
+impl SourceManifest { pub fn parse_and_validate(bytes:&[u8],entry:&CatalogEntry)->Result<Self,PayloadError>{let doc:SourceManifestDocument=serde_json::from_slice(bytes).map_err(|e|PayloadError::InvalidManifest(e.to_string()))?;if doc.schema_version!=1||doc.sources.is_empty(){return Err(PayloadError::InvalidManifest("sources.json must have schema 1 and sources".into()));} for expected in entry.sources(){if !doc.sources.iter().any(|source|source.url==expected.url&&source.commit==expected.commit&&source.version==expected.version){return Err(PayloadError::InvalidManifest("sources.json does not match catalog provenance".into()));}} if doc.overlays.iter().any(|overlay|overlay.author.eq_ignore_ascii_case("microsoft")||overlay.path.is_empty()||overlay.license.is_empty()){return Err(PayloadError::InvalidManifest("invalid VMLord overlay provenance".into()));} Ok(Self{document:doc})} }
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ReadyMarker { schema_version:u32, payload_id:String, generation:Sha256Digest, payload_manifest_sha256:Sha256Digest }
+impl ReadyMarker { pub fn new(entry:&CatalogEntry)->Self{Self{schema_version:1,payload_id:entry.payload_id().into(),generation:entry.archive_sha256().clone(),payload_manifest_sha256:entry.payload_manifest_sha256().clone()}} pub fn to_json_bytes(&self)->Result<Vec<u8>,PayloadError>{let mut bytes=serde_json::to_vec(self).map_err(|e|PayloadError::InvalidManifest(e.to_string()))?;bytes.push(b'\n');Ok(bytes)} }
+pub(crate) fn cache_provenance(entry:&CatalogEntry,sources:&SourceManifest)->Result<Vec<u8>,PayloadError>{ let mut value=serde_json::json!({"archive_sha256":entry.archive_sha256(),"payload_id":entry.payload_id(),"payload_manifest_sha256":entry.payload_manifest_sha256(),"sources":sources.document}); let mut bytes=serde_json::to_vec(&mut value).map_err(|e|PayloadError::InvalidManifest(e.to_string()))?; bytes.push(b'\n'); Ok(bytes) }
+
+#[cfg(test)]
+mod tests { use crate::{CatalogEntry,PayloadCatalog,PayloadManifest,PayloadError,SourceManifest}; fn entry()->CatalogEntry{PayloadCatalog::from_json(br#"{"schema_version":1,"entries":[{"payload_id":"p","target":{"distribution":"ubuntu","release":"26.04","architecture":"amd64","kernel_release":"k","payload_abi":1},"archive_url":"https://example.test/p.zip","archive_size":1,"expanded_size_limit":2,"file_count_limit":3,"archive_sha256":"0000000000000000000000000000000000000000000000000000000000000000","payload_manifest_sha256":"0000000000000000000000000000000000000000000000000000000000000000","required_renderers":["d3d12-gallium"],"mesa_policy":"bundled","sources":[{"url":"https://github.com/x/y","commit":"14794180686c2fb6307fbe359c359bec765249f3","version":"1"}],"licenses":[{"spdx":"GPL-2.0","path":"licenses/GPL-2.0.txt"}]}]}"#).unwrap().entries()[0].clone()} #[test]fn unsafe_duplicate_and_self_referential_paths_are_rejected(){for path in ["/absolute","../escape",r"content\escape","payload.json","a/../../b"]{let data=format!(r#"{{"schema_version":1,"payload_id":"p","target":{{"distribution":"ubuntu","release":"26.04","architecture":"amd64","kernel_release":"k","payload_abi":1}},"files":[{{"path":"{path}","size":1,"sha256":"0000000000000000000000000000000000000000000000000000000000000000"}}]}}"#);assert!(matches!(PayloadManifest::parse_and_validate(data.as_bytes(),&entry()),Err(PayloadError::InvalidManifest(_))));}}#[test]fn sources_are_checked_against_catalog_provenance(){assert!(SourceManifest::parse_and_validate(br#"{"schema_version":1,"sources":[],"overlays":[]}"#,&entry()).is_err());} }
