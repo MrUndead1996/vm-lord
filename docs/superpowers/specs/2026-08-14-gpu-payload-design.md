@@ -133,8 +133,8 @@ entry records:
 
 * stable payload ID and payload ABI version;
 * exact guest target tuple;
-* immutable HTTPS archive URL, byte length, archive SHA-256, and
-  `payload.json` SHA-256;
+* immutable HTTPS archive URL, compressed and expanded byte limits, file-count
+  limit, archive SHA-256, and `payload.json` SHA-256;
 * required renderer capabilities;
 * Mesa policy;
 * upstream repository URLs and exact commit IDs;
@@ -230,12 +230,13 @@ It is not the whole application cache.
 
 When a payload becomes ready, task 93 materializes a temporary generation below
 the staging directory with hard links where the cache and staging directory
-share a volume, and verified copies otherwise. It verifies the generation,
-atomically renames it to its final name, and publishes `current.json` last by a
-second atomic rename. The guest may observe an ignored temporary name, but it
-can select only the previous complete generation or the new one. Old
-generations can be removed only after they are no longer current and no
-provisioning request refers to them.
+share a volume, and verified copies otherwise. It verifies the generation and
+atomically renames it to `generations/<archive-sha256>`. It then publishes the
+unique `ready/<archive-sha256>.json` marker by a second atomic rename. The guest
+may observe an ignored temporary name, but it can select only a generation with
+its ready marker. A marker is never replaced, so publication needs no
+Windows-specific atomic-replace API. Old generations can be removed only after
+no provisioning request refers to them.
 
 The logical share role is `GpuPayload`; the guest maps it through its own
 allowlist to `/run/vmlord/gpu-payload`. The manifest contains a payload ID and
@@ -246,8 +247,8 @@ through a reparse point.
 
 The Plan9 share is read-only in both the HCS configuration and the guest mount.
 The host may publish a generation after the mount is established, but the guest
-does not act until the application sends an install request naming the
-published generation.
+does not act until the application sends an install request naming the archive
+digest and the matching ready marker exists.
 
 ## Runtime flow
 
@@ -304,6 +305,8 @@ bring-up work.
   stale GPU-only configuration.
 * Task 97 owns vendor-neutral hardware probes and reports facts rather than
   choosing UI states.
+* Task 98 wires payload preparation and guest recipes into VM lifecycle,
+  preserves best-effort start, derives runtime status, and exposes it to UI.
 * Task 99 owns end-to-end coverage and user documentation.
 
 ## Out of scope
