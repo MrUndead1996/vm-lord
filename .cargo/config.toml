@@ -31,3 +31,4 @@ test-windows = ["test", "--target", "x86_64-pc-windows-gnu"]
 # Production build: MSVC application plus musl agent, collected into `dist/`.
 # Windows-only, because the release executable must come from MSVC.
 dist = ["run", "-p", "xtask", "--", "dist"]
+gpu-payload = ["run", "-p", "xtask", "--", "gpu-payload"]

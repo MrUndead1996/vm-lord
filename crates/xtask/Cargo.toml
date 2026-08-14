@@ -13,3 +13,6 @@ bench = false
 
 [lints]
 workspace = true
+
+[dependencies]
+vmlord-gpu-payload = { path = "../gpu-payload", features = ["builder"] }

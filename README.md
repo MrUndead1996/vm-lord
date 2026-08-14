@@ -113,6 +113,7 @@ application and a Linux guest agent. The commands are Cargo aliases, defined in
 | `cargo check-windows` | compile-checks the application through `x86_64-pc-windows-gnu` | WSL |
 | `cargo test-windows` | builds and runs the Windows tests | WSL |
 | `cargo dist` | release build of everything, collected into `target/dist/` | Windows |
+| `cargo gpu-payload pack ...` | release tooling that packs a prepared GPU payload | Windows, Linux |
 
 Prerequisites:
 
