@@ -6,6 +6,8 @@ mod download;
 mod archive;
 mod cache;
 mod staging;
+#[cfg(feature = "builder")]
+pub mod builder;
 
 pub use catalog::{CatalogEntry, GuestTarget, MesaPolicy, PayloadCatalog, RendererCapability};
 pub use digest::Sha256Digest;

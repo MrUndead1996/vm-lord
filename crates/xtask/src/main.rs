@@ -10,6 +10,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, ExitCode},
 };
+mod gpu_payload;
 
 /// The release target for the application. MSVC is the toolchain Windows
 /// itself is built against, and the one the HCS bindings expect.
@@ -33,8 +34,9 @@ fn main() -> ExitCode {
     let task = env::args().nth(1);
     let result = match task.as_deref() {
         Some("dist") => dist(),
-        Some(other) => Err(format!("unknown task `{other}`; the only task is `dist`")),
-        None => Err("missing task; the only task is `dist`".to_owned()),
+        Some("gpu-payload") => gpu_payload::run(env::args().skip(2)),
+        Some(other) => Err(format!("unknown task `{other}`")),
+        None => Err("missing task".to_owned()),
     };
 
     match result {
