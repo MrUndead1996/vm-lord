@@ -123,6 +123,7 @@ pub(crate) fn extract(
         })?,
         entry,
     )?;
+    sources.validate_prepared_files(&manifest)?;
     Ok((manifest, sources))
 }
 
@@ -522,12 +523,15 @@ mod tests {
     }
 
     fn source_manifest() -> Vec<u8> {
+        let source = b"source material";
         serde_json::to_vec(&serde_json::json!({
             "schema_version": 1,
             "sources": [{
                 "url": SOURCE_URL,
                 "commit": SOURCE_COMMIT,
-                "version": "1"
+                "version": "1",
+                "paths": ["content/file"],
+                "sha256": digest(source)
             }],
             "overlays": []
         }))
@@ -535,7 +539,7 @@ mod tests {
     }
 
     fn payload_manifest(files: &[(&str, &[u8])]) -> Vec<u8> {
-        let files = files
+        let mut files = files
             .iter()
             .map(|(path, bytes)| {
                 serde_json::json!({
@@ -545,6 +549,13 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
+        let license = b"MIT license text\n";
+        files.push(serde_json::json!({
+            "path": "licenses/MIT.txt",
+            "size": license.len(),
+            "sha256": digest(license)
+        }));
+        files.sort_by(|left, right| left["path"].as_str().cmp(&right["path"].as_str()));
         serde_json::to_vec(&serde_json::json!({
             "schema_version": 1,
             "payload_id": "test",
@@ -587,6 +598,14 @@ mod tests {
                     writer.write_all(member.bytes).unwrap();
                 }
             }
+        }
+        if members.iter().any(|member| member.name == "payload.json")
+            && !members
+                .iter()
+                .any(|member| member.name == "licenses/MIT.txt")
+        {
+            writer.start_file("licenses/MIT.txt", file_options).unwrap();
+            writer.write_all(b"MIT license text\n").unwrap();
         }
         writer.finish().unwrap().into_inner()
     }
@@ -701,6 +720,58 @@ mod tests {
     }
 
     #[test]
+    fn extraction_rejects_an_overlay_with_a_digest_not_declared_by_payload() {
+        let content = b"content";
+        let sources = serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1,
+            "sources": [{
+                "url": SOURCE_URL,
+                "commit": SOURCE_COMMIT,
+                "version": "1",
+                "paths": ["content/file"],
+                "sha256": digest(b"source material")
+            }],
+            "overlays": [{
+                "path": "content/file",
+                "sha256": digest(b"different content"),
+                "license": "MIT",
+                "author": "VMLord contributors"
+            }]
+        }))
+        .unwrap();
+        let payload = payload_manifest(&[("content/file", content), ("sources.json", &sources)]);
+        let archive = archive_bytes(&[
+            Member {
+                name: "payload.json",
+                bytes: &payload,
+                kind: MemberKind::File,
+            },
+            Member {
+                name: "content/file",
+                bytes: content,
+                kind: MemberKind::File,
+            },
+            Member {
+                name: "sources.json",
+                bytes: &sources,
+                kind: MemberKind::File,
+            },
+        ]);
+
+        assert!(matches!(
+            extract_fixture(
+                &archive,
+                &payload,
+                archive.len() as u64,
+                archive.len() as u64,
+                3,
+                false,
+            ),
+            Err(PayloadError::InvalidManifest(message)) if message.contains("overlay digest")
+        ));
+    }
+
+    #[test]
     fn file_count_limit_counts_declared_files_not_payload_json() {
         let (archive, payload, _) = valid_archive(b"content");
 
@@ -709,7 +780,7 @@ mod tests {
             &payload,
             archive.len() as u64,
             archive.len() as u64,
-            2,
+            3,
             false,
         )
         .unwrap();
@@ -719,7 +790,7 @@ mod tests {
             &payload,
             archive.len() as u64,
             archive.len() as u64,
-            1,
+            2,
             false,
         )
         .unwrap_err();
@@ -727,8 +798,8 @@ mod tests {
             error,
             PayloadError::LimitExceeded {
                 subject: "archive file count",
-                limit: 1,
-                actual: 2
+                limit: 2,
+                actual: 3
             }
         ));
     }
@@ -943,7 +1014,7 @@ mod tests {
             &archive,
             &payload,
             1,
-            (large.len() + sources.len()) as u64,
+            (large.len() + b"MIT license text\n".len() + sources.len()) as u64,
             3,
             false,
         )
@@ -957,7 +1028,9 @@ mod tests {
         ));
 
         let expanded_limit = archive.len() as u64;
-        assert!(expanded_limit < (large.len() + sources.len()) as u64);
+        assert!(
+            expanded_limit < (large.len() + b"MIT license text\n".len() + sources.len()) as u64
+        );
         let expanded_error = extract_fixture(
             &archive,
             &payload,

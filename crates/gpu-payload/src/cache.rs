@@ -254,6 +254,7 @@ fn load_ready(
     let source_bytes =
         read_bounded_regular_file(&sources_path, source_size, "read cached sources manifest")?;
     let sources = SourceManifest::parse_and_validate(&source_bytes, entry)?;
+    sources.validate_prepared_files(&manifest)?;
     let provenance_path = root.join("provenance.json");
     let expected_provenance = cache_provenance(entry, &sources)?;
     let actual_provenance = read_bounded_regular_file(
@@ -809,17 +810,20 @@ mod tests {
     impl Fixture {
         fn new(label: &str) -> Self {
             let temporary = TemporaryDirectory::new(label);
+            let content = b"original content";
             let source = serde_json::to_vec(&serde_json::json!({
                 "schema_version": 1,
                 "sources": [{
                     "url": SOURCE_URL,
                     "commit": SOURCE_COMMIT,
-                    "version": "1"
+                    "version": "1",
+                    "paths": ["content/file"],
+                    "sha256": digest(content)
                 }],
                 "overlays": []
             }))
             .unwrap();
-            let content = b"original content";
+            let license = b"MIT license text\n";
             let payload = serde_json::to_vec(&serde_json::json!({
                 "schema_version": 1,
                 "payload_id": "test",
@@ -837,6 +841,11 @@ mod tests {
                         "sha256": digest(content)
                     },
                     {
+                        "path": "licenses/MIT.txt",
+                        "size": license.len(),
+                        "sha256": digest(license)
+                    },
+                    {
                         "path": "sources.json",
                         "size": source.len(),
                         "sha256": digest(&source)
@@ -844,7 +853,7 @@ mod tests {
                 ]
             }))
             .unwrap();
-            let archive = build_archive(&payload, content, &source);
+            let archive = build_archive(&payload, content, license, &source);
             let catalog = serde_json::json!({
                 "schema_version": 1,
                 "entries": [{
@@ -918,7 +927,7 @@ mod tests {
             .to_owned()
     }
 
-    fn build_archive(payload: &[u8], content: &[u8], source: &[u8]) -> Vec<u8> {
+    fn build_archive(payload: &[u8], content: &[u8], license: &[u8], source: &[u8]) -> Vec<u8> {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         let options = SimpleFileOptions::default()
             .compression_method(CompressionMethod::Deflated)
@@ -926,6 +935,7 @@ mod tests {
         for (name, bytes) in [
             ("payload.json", payload),
             ("content/file", content),
+            ("licenses/MIT.txt", license),
             ("sources.json", source),
         ] {
             writer.start_file(name, options).unwrap();

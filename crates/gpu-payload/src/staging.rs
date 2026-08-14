@@ -954,6 +954,7 @@ mod tests {
         ready: crate::ReadyGpuPayload,
         payload: Vec<u8>,
         content: Vec<u8>,
+        license: Vec<u8>,
         sources: Vec<u8>,
         staging_root: PathBuf,
     }
@@ -961,17 +962,20 @@ mod tests {
     impl Fixture {
         fn new(label: &str) -> Self {
             let temporary = TemporaryDirectory::new(label);
+            let content = b"original content".to_vec();
             let sources = serde_json::to_vec(&serde_json::json!({
                 "schema_version": 1,
                 "sources": [{
                     "url": SOURCE_URL,
                     "commit": SOURCE_COMMIT,
-                    "version": "1"
+                    "version": "1",
+                    "paths": ["content/file"],
+                    "sha256": digest(&content)
                 }],
                 "overlays": []
             }))
             .unwrap();
-            let content = b"original content".to_vec();
+            let license = b"MIT license text\n".to_vec();
             let payload = serde_json::to_vec(&serde_json::json!({
                 "schema_version": 1,
                 "payload_id": "test",
@@ -989,6 +993,11 @@ mod tests {
                         "sha256": digest(&content)
                     },
                     {
+                        "path": "licenses/MIT.txt",
+                        "size": license.len(),
+                        "sha256": digest(&license)
+                    },
+                    {
                         "path": "sources.json",
                         "size": sources.len(),
                         "sha256": digest(&sources)
@@ -996,7 +1005,7 @@ mod tests {
                 ]
             }))
             .unwrap();
-            let archive = build_archive(&payload, &content, &sources);
+            let archive = build_archive(&payload, &content, &license, &sources);
             let catalog = serde_json::json!({
                 "schema_version": 1,
                 "entries": [{
@@ -1045,6 +1054,7 @@ mod tests {
                 ready,
                 payload,
                 content,
+                license,
                 sources,
                 staging_root,
             }
@@ -1076,6 +1086,7 @@ mod tests {
             for (relative, expected) in [
                 ("payload.json", self.payload.as_slice()),
                 ("content/file", self.content.as_slice()),
+                ("licenses/MIT.txt", self.license.as_slice()),
                 ("sources.json", self.sources.as_slice()),
             ] {
                 assert_eq!(
@@ -1094,7 +1105,7 @@ mod tests {
             .to_owned()
     }
 
-    fn build_archive(payload: &[u8], content: &[u8], sources: &[u8]) -> Vec<u8> {
+    fn build_archive(payload: &[u8], content: &[u8], license: &[u8], sources: &[u8]) -> Vec<u8> {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
         let options = SimpleFileOptions::default()
             .compression_method(CompressionMethod::Deflated)
@@ -1102,6 +1113,7 @@ mod tests {
         for (name, bytes) in [
             ("payload.json", payload),
             ("content/file", content),
+            ("licenses/MIT.txt", license),
             ("sources.json", sources),
         ] {
             writer.start_file(name, options).unwrap();
