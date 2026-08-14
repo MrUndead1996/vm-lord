@@ -970,6 +970,7 @@ mod tests {
                     "commit": SOURCE_COMMIT,
                     "version": "1",
                     "paths": ["content/file"],
+                    "licenses": [{"path": "content/file", "spdx": "MIT"}],
                     "sha256": digest(&content)
                 }],
                 "overlays": []

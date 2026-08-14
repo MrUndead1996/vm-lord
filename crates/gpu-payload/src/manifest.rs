@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CatalogEntry, GuestTarget, PayloadError, Sha256Digest};
 
+const D3DKMTHK_PATH: &str = "include/uapi/misc/d3dkmthk.h";
+const D3DKMTHK_LICENSE: &str = "GPL-2.0 WITH Linux-syscall-note";
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreparedFile {
@@ -138,7 +141,15 @@ struct SourceRecord {
     commit: String,
     version: String,
     paths: Vec<String>,
+    licenses: Vec<SourceLicenseRecord>,
     sha256: Sha256Digest,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SourceLicenseRecord {
+    path: String,
+    spdx: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -169,6 +180,7 @@ impl SourceManifest {
                 || source.commit != expected.commit
                 || source.version != expected.version
                 || source.paths.is_empty()
+                || source.licenses.len() != source.paths.len()
             {
                 return Err(PayloadError::InvalidManifest(
                     "sources.json does not exactly match catalog provenance".into(),
@@ -183,6 +195,17 @@ impl SourceManifest {
                     ));
                 }
                 previous = path;
+            }
+            for (path, license) in source.paths.iter().zip(&source.licenses) {
+                validate_path(&license.path)?;
+                if license.path != *path
+                    || !license_expression_is_declared(&license.spdx, entry)
+                    || (license.path == D3DKMTHK_PATH && license.spdx != D3DKMTHK_LICENSE)
+                {
+                    return Err(PayloadError::InvalidManifest(
+                        "selected source paths must carry their declared licenses".into(),
+                    ));
+                }
             }
         }
 
@@ -230,6 +253,22 @@ impl SourceManifest {
             }
         }
         Ok(())
+    }
+}
+
+fn license_expression_is_declared(expression: &str, entry: &CatalogEntry) -> bool {
+    let declared = |identifier: &str| {
+        !identifier.is_empty()
+            && entry
+                .licenses()
+                .iter()
+                .any(|license| license.spdx == identifier)
+    };
+    match expression.split_once(" WITH ") {
+        Some((license, exception)) => {
+            !exception.contains(" WITH ") && declared(license) && declared(exception)
+        }
+        None => declared(expression),
     }
 }
 
@@ -310,8 +349,11 @@ mod tests {
                     "version": "1"
                 }],
                 "licenses": [{
-                    "spdx": "GPL-2.0-only",
+                    "spdx": "GPL-2.0",
                     "path": "licenses/GPL-2.0.txt"
+                }, {
+                    "spdx": "Linux-syscall-note",
+                    "path": "licenses/Linux-syscall-note.txt"
                 }]
             }]
         });
@@ -348,7 +390,17 @@ mod tests {
                 "url": "https://github.com/x/y",
                 "commit": COMMIT,
                 "version": "1",
-                "paths": ["drivers/hv/dxgkrnl"],
+                "paths": [
+                    "drivers/hv/dxgkrnl",
+                    "include/uapi/misc/d3dkmthk.h"
+                ],
+                "licenses": [{
+                    "path": "drivers/hv/dxgkrnl",
+                    "spdx": "GPL-2.0"
+                }, {
+                    "path": "include/uapi/misc/d3dkmthk.h",
+                    "spdx": "GPL-2.0 WITH Linux-syscall-note"
+                }],
                 "sha256": ZERO
             }],
             "overlays": []
@@ -386,6 +438,7 @@ mod tests {
     fn payload_manifest_schema_rejects_unknown_fields() {
         let mut document: Value = serde_json::from_slice(&payload(vec![
             file("licenses/GPL-2.0.txt"),
+            file("licenses/Linux-syscall-note.txt"),
             file("sources.json"),
         ]))
         .unwrap();
@@ -405,6 +458,7 @@ mod tests {
             "commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "version": "extra",
             "paths": ["extra"],
+            "licenses": [{"path": "extra", "spdx": "GPL-2.0"}],
             "sha256": ZERO
         }));
 
@@ -415,8 +469,8 @@ mod tests {
     }
 
     #[test]
-    fn every_source_requires_selected_paths_and_a_digest() {
-        for missing in ["paths", "sha256"] {
+    fn every_source_requires_selected_paths_licenses_and_a_digest() {
+        for missing in ["paths", "licenses", "sha256"] {
             let mut document = sources();
             document["sources"][0]
                 .as_object_mut()
@@ -430,6 +484,50 @@ mod tests {
                 Err(PayloadError::InvalidManifest(_))
             ));
         }
+    }
+
+    #[test]
+    fn every_selected_source_path_has_an_associated_declared_license() {
+        SourceManifest::parse_and_validate(&serde_json::to_vec(&sources()).unwrap(), &entry())
+            .unwrap();
+
+        for mutation in ["missing", "misassociated", "undeclared"] {
+            let mut document = sources();
+            match mutation {
+                "missing" => {
+                    document["sources"][0]["licenses"]
+                        .as_array_mut()
+                        .unwrap()
+                        .pop();
+                }
+                "misassociated" => {
+                    document["sources"][0]["licenses"][0]["path"] =
+                        "include/uapi/misc/d3dkmthk.h".into();
+                }
+                "undeclared" => {
+                    document["sources"][0]["licenses"][0]["spdx"] = "Proprietary".into();
+                }
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                SourceManifest::parse_and_validate(
+                    &serde_json::to_vec(&document).unwrap(),
+                    &entry()
+                ),
+                Err(PayloadError::InvalidManifest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn d3dkmthk_requires_the_linux_syscall_license_exception() {
+        let mut document = sources();
+        document["sources"][0]["licenses"][1]["spdx"] = "GPL-2.0".into();
+
+        assert!(matches!(
+            SourceManifest::parse_and_validate(&serde_json::to_vec(&document).unwrap(), &entry()),
+            Err(PayloadError::InvalidManifest(_))
+        ));
     }
 
     #[test]
@@ -465,6 +563,7 @@ mod tests {
             &payload(vec![
                 file("content/overlay"),
                 file("licenses/GPL-2.0.txt"),
+                file("licenses/Linux-syscall-note.txt"),
                 file("sources.json"),
             ]),
             &entry(),
@@ -482,7 +581,7 @@ mod tests {
             document["overlays"] = json!([{
                 "path": path,
                 "sha256": sha256,
-                "license": "GPL-2.0-only",
+                "license": "GPL-2.0",
                 "author": "VMLord contributors"
             }]);
             let sources = SourceManifest::parse_and_validate(

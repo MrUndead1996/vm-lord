@@ -74,8 +74,16 @@ struct RecipeSource {
     version: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     paths: Vec<String>,
+    licenses: Vec<RecipeSourceLicense>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sha256: Option<Sha256Digest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecipeSourceLicense {
+    path: String,
+    spdx: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]

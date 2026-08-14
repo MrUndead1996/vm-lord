@@ -20,7 +20,18 @@
       "commit": "14794180686c2fb6307fbe359c359bec765249f3",
       "version": "linux-msft-wsl-6.6.87.2",
       "paths": [
-        "drivers/hv/dxgkrnl"
+        "drivers/hv/dxgkrnl",
+        "include/uapi/misc/d3dkmthk.h"
+      ],
+      "licenses": [
+        {
+          "path": "drivers/hv/dxgkrnl",
+          "spdx": "GPL-2.0"
+        },
+        {
+          "path": "include/uapi/misc/d3dkmthk.h",
+          "spdx": "GPL-2.0 WITH Linux-syscall-note"
+        }
       ],
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
     }
@@ -29,13 +40,13 @@
     {
       "path": "content/dxgkrnl/dxgmodule.c",
       "sha256": "e0bc87eb6ac6970ea1b5314141b2a7de6d218f7c4ebf868afed313f0f2b74e63",
-      "license": "GPL-2.0-only",
+      "license": "GPL-2.0",
       "author": "VMLord contributors"
     }
   ],
   "licenses": [
     {
-      "spdx": "GPL-2.0-only",
+      "spdx": "GPL-2.0",
       "path": "licenses/GPL-2.0.txt"
     },
     {

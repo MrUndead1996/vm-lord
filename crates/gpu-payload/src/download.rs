@@ -4,7 +4,12 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
 };
+
+const DOWNLOAD_GLOBAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const DOWNLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const DOWNLOAD_RECEIVE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PayloadProgress {
@@ -25,6 +30,9 @@ pub(crate) struct LockedArchive {
 fn production_agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .https_only(true)
+        .timeout_global(Some(DOWNLOAD_GLOBAL_TIMEOUT))
+        .timeout_connect(Some(DOWNLOAD_CONNECT_TIMEOUT))
+        .timeout_recv_body(Some(DOWNLOAD_RECEIVE_TIMEOUT))
         .build()
         .into()
 }
@@ -199,7 +207,10 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{LockedArchive, production_agent};
+    use super::{
+        DOWNLOAD_CONNECT_TIMEOUT, DOWNLOAD_GLOBAL_TIMEOUT, DOWNLOAD_RECEIVE_TIMEOUT, LockedArchive,
+        production_agent,
+    };
     use crate::{PayloadCatalog, PayloadError};
 
     struct FixtureServer {
@@ -288,6 +299,18 @@ mod tests {
         let error = production_agent().get(server.url()).call().unwrap_err();
 
         assert!(matches!(error, ureq::Error::RequireHttpsOnly(_)));
+    }
+
+    #[test]
+    fn the_production_agent_bounds_the_whole_download_and_network_phases() {
+        let agent = production_agent();
+        let config = agent.config();
+        let timeouts = config.timeouts();
+
+        assert!(config.https_only());
+        assert_eq!(timeouts.global, Some(DOWNLOAD_GLOBAL_TIMEOUT));
+        assert_eq!(timeouts.connect, Some(DOWNLOAD_CONNECT_TIMEOUT));
+        assert_eq!(timeouts.recv_body, Some(DOWNLOAD_RECEIVE_TIMEOUT));
     }
 
     #[test]
