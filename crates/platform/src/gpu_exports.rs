@@ -32,6 +32,7 @@ use windows::{
 };
 
 use crate::error::windows_error;
+use crate::layout::gpu_payload_staging_directory;
 
 /// Resolves a path to its canonical form, failing if it is not a directory.
 pub(crate) type Canonicalize<'a> = &'a dyn Fn(&Path) -> Result<PathBuf, RepositoryError>;
@@ -130,12 +131,12 @@ impl GpuExports {
     /// Not a `Result`: a host with no WSL payload and no resolvable package is
     /// a host that gets no shares, which is an answer. What went wrong on the
     /// way to it is logged where it happened.
-    pub(crate) fn build(adapters: &[HostGpuAdapter]) -> Option<Self> {
+    pub(crate) fn build(adapters: &[HostGpuAdapter], vm_directory: &Path) -> Option<Self> {
         let system32 = system_directory()?;
         let canonicalize = canonical_directory;
         let roots = ExportRoots::resolve(&system32, &canonicalize);
 
-        build_with(adapters, &roots, &canonicalize)
+        build_with_payload(adapters, &roots, vm_directory, &canonicalize)
     }
 }
 
@@ -379,6 +380,26 @@ pub(crate) fn build_with(
         });
     }
 
+    (!exports.is_empty()).then_some(GpuExports { exports })
+}
+
+/// Adds only the exact staging child of a canonical VM directory.
+pub(crate) fn build_with_payload(
+    adapters: &[HostGpuAdapter],
+    roots: &ExportRoots,
+    vm_directory: &Path,
+    canonicalize: Canonicalize<'_>,
+) -> Option<GpuExports> {
+    let mut exports = build_with(adapters, roots, canonicalize)
+        .map(|exports| exports.exports)
+        .unwrap_or_default();
+    let candidate = gpu_payload_staging_directory(vm_directory);
+    if let (Ok(vm), Ok(payload)) = (canonicalize(vm_directory), canonicalize(&candidate))
+        && is_within(&vm, &payload)
+        && payload != vm
+    {
+        exports.insert(0, GpuExport { share: GpuShare::payload(), host_path: payload });
+    }
     (!exports.is_empty()).then_some(GpuExports { exports })
 }
 
@@ -780,7 +801,7 @@ mod tests {
         // and no WSL there is nothing to export, and demanding either would be
         // a test that is permanently red on half the machines it runs on.
         let capabilities = crate::discover_host_gpu();
-        let Some(exports) = super::GpuExports::build(&capabilities.adapters) else {
+        let Some(exports) = super::GpuExports::build(&capabilities.adapters, Path::new(r"C:\VMLord\ignored")) else {
             println!("nothing to export on this host");
             return;
         };
