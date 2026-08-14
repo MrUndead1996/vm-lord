@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     fs::{self, File, TryLockError},
-    io::{Read, Write},
+    io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
@@ -146,7 +146,7 @@ pub(crate) fn prepare_verified_archive(
     )?;
 
     loop {
-        match fs::rename(temporary.path(), &final_directory) {
+        match rename_noreplace(temporary.path(), &final_directory) {
             Ok(()) => {
                 temporary.disarm();
                 let ready = load_ready(entry, &final_directory, progress, cancel);
@@ -538,7 +538,7 @@ fn quarantine(source: &Path, entry: &CatalogEntry) -> Result<Option<PathBuf>, Pa
     let root = source.parent().expect("cache entries have a parent");
     loop {
         let destination = unique_operation_path(root, entry, "corrupt");
-        match fs::rename(source, &destination) {
+        match rename_noreplace(source, &destination) {
             Ok(()) => return Ok(Some(destination)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -564,6 +564,126 @@ fn unique_operation_path(root: &Path, entry: &CatalogEntry, kind: &str) -> PathB
 
 fn path_exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
+}
+
+fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    match platform::rename_noreplace(source, destination) {
+        Err(error) if fs::symlink_metadata(destination).is_ok() => {
+            Err(io::Error::new(io::ErrorKind::AlreadyExists, error))
+        }
+        result => result,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+mod platform {
+    use std::{
+        ffi::{CString, c_char, c_int, c_uint},
+        io,
+        os::unix::ffi::OsStrExt,
+        path::Path,
+    };
+
+    const AT_FDCWD: c_int = -100;
+    const RENAME_NOREPLACE: c_uint = 1;
+
+    unsafe extern "C" {
+        fn renameat2(
+            old_directory: c_int,
+            old_path: *const c_char,
+            new_directory: c_int,
+            new_path: *const c_char,
+            flags: c_uint,
+        ) -> c_int;
+    }
+
+    pub(super) fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+        let source = CString::new(source.as_os_str().as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source path contains NUL"))?;
+        let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL")
+        })?;
+        // SAFETY: Both paths are live NUL-terminated C strings for the duration of the call.
+        let result = unsafe {
+            renameat2(
+                AT_FDCWD,
+                source.as_ptr(),
+                AT_FDCWD,
+                destination.as_ptr(),
+                RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+mod platform {
+    use std::{
+        io,
+        os::windows::ffi::OsStrExt,
+        path::{Path, absolute},
+    };
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn MoveFileExW(source: *const u16, destination: *const u16, flags: u32) -> i32;
+    }
+
+    pub(super) fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+        let source = verbatim_path(source)?;
+        let destination = verbatim_path(destination)?;
+        // SAFETY: Both vectors are NUL-terminated UTF-16 strings and remain live for the call.
+        let result = unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) };
+        if result != 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    fn verbatim_path(path: &Path) -> io::Result<Vec<u16>> {
+        let absolute = absolute(path)?;
+        let encoded = absolute.as_os_str().encode_wide().collect::<Vec<_>>();
+        if encoded.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "path contains NUL",
+            ));
+        }
+        let mut verbatim = Vec::with_capacity(encoded.len() + 8);
+        if encoded.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16])
+            || encoded.starts_with(&[b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16])
+        {
+            verbatim.extend(encoded);
+        } else if encoded.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+            verbatim.extend("\\\\?\\UNC\\".encode_utf16());
+            verbatim.extend_from_slice(&encoded[2..]);
+        } else {
+            verbatim.extend("\\\\?\\".encode_utf16());
+            verbatim.extend(encoded);
+        }
+        verbatim.push(0);
+        Ok(verbatim)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+mod platform {
+    use std::{io, path::Path};
+
+    pub(super) fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "atomic no-replace rename is unsupported on this platform",
+        ))
+    }
 }
 
 struct DigestLock {
@@ -614,15 +734,16 @@ impl OperationPath {
 impl Drop for OperationPath {
     fn drop(&mut self) {
         if self.armed {
-            let metadata = fs::symlink_metadata(&self.path);
-            if let Ok(metadata) = metadata
-                && (metadata.file_type().is_symlink() || is_reparse_point(&metadata))
-            {
-                if fs::remove_dir(&self.path).is_err() {
+            if let Ok(metadata) = fs::symlink_metadata(&self.path) {
+                if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+                    if fs::remove_dir(&self.path).is_err() {
+                        let _ = fs::remove_file(&self.path);
+                    }
+                } else if metadata.is_dir() {
+                    let _ = fs::remove_dir_all(&self.path);
+                } else {
                     let _ = fs::remove_file(&self.path);
                 }
-            } else {
-                let _ = fs::remove_dir_all(&self.path);
             }
         }
     }
@@ -645,7 +766,9 @@ mod tests {
 
     use crate::{PayloadCatalog, PayloadError, PayloadProgress, Sha256Digest};
 
-    use super::{PrepareRequest, prepare, prepare_verified_archive};
+    use super::{
+        OperationPath, PrepareRequest, prepare, prepare_verified_archive, rename_noreplace,
+    };
 
     const SOURCE_URL: &str = "https://github.com/example/source";
     const SOURCE_COMMIT: &str = "14794180686c2fb6307fbe359c359bec765249f3";
@@ -982,5 +1105,32 @@ mod tests {
         }
         assert!(fixture.final_directory().is_dir());
         assert_no_operation_directories(&fixture);
+    }
+
+    #[test]
+    fn no_replace_rename_preserves_an_existing_empty_directory() {
+        let temporary = TemporaryDirectory::new("rename-no-replace");
+        let source = temporary.path().join("source");
+        let destination = temporary.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("marker"), b"source").unwrap();
+        fs::create_dir(&destination).unwrap();
+
+        let error = rename_noreplace(&source, &destination).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(source.join("marker")).unwrap(), b"source");
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn operation_cleanup_removes_a_quarantined_regular_file() {
+        let temporary = TemporaryDirectory::new("regular-file-cleanup");
+        let quarantine = temporary.path().join("digest.corrupt-1-1");
+        fs::write(&quarantine, b"corrupt").unwrap();
+
+        drop(OperationPath::new(quarantine.clone()));
+
+        assert!(fs::symlink_metadata(quarantine).is_err());
     }
 }
