@@ -3,6 +3,9 @@
 debug
 target
 
+# Local isolated worktrees used during feature development.
+.worktrees/
+
 # Assembled by `cargo dist`
 dist
 
