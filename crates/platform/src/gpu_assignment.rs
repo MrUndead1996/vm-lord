@@ -68,7 +68,10 @@ pub(crate) fn assignment_failure(failure: HcsModifyFailure) -> GpuFailure {
         .unwrap_or_default();
     GpuFailure::new(
         GpuStatusCode::AssignmentFailed,
-        format!("HCS GPU assignment failed with HRESULT 0x{:08X}{detail}", failure.hresult),
+        format!(
+            "HCS GPU assignment failed with HRESULT 0x{:08X}{detail}",
+            failure.hresult
+        ),
     )
 }
 

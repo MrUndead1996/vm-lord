@@ -404,7 +404,10 @@ impl HcsSystem {
                     "modify compute system \"{}\" failed with HRESULT 0x{:08X}: {}",
                     self.id,
                     failure.hresult,
-                    failure.result_detail.as_deref().unwrap_or("no HCS result detail")
+                    failure
+                        .result_detail
+                        .as_deref()
+                        .unwrap_or("no HCS result detail")
                 ))
             })
             .inspect_err(|error| {
@@ -431,11 +434,12 @@ impl HcsSystem {
         // the duration of this call, and `document` outlives it. A null
         // identity asks HCS to act as the calling process, which is what every
         // other call in this module does.
-        unsafe { HcsModifyComputeSystem(self.handle, operation.0, &document, None) }
-            .map_err(|error| HcsModifyFailure {
+        unsafe { HcsModifyComputeSystem(self.handle, operation.0, &document, None) }.map_err(
+            |error| HcsModifyFailure {
                 hresult: error.code().0 as u32,
                 result_detail: None,
-            })?;
+            },
+        )?;
 
         let timeout_ms = timeout_milliseconds(timeout).map_err(|error| HcsModifyFailure {
             hresult: ERROR_TIMEOUT.to_hresult().0 as u32,
@@ -968,9 +972,10 @@ mod tests {
     use vmlord_core::RepositoryError;
 
     use super::{
-        HcsClient, HcsModifyFailure, HcsStartFailure, HcsSystemState, HcsSystemSummary, call_failure,
-        detach_adapter_document, hcs_service_properties_query, parse_enumerate_result,
-        parse_service_result, parse_system_state, shutdown_options, unsupported_shutdown_error,
+        HcsClient, HcsModifyFailure, HcsStartFailure, HcsSystemState, HcsSystemSummary,
+        call_failure, detach_adapter_document, hcs_service_properties_query,
+        parse_enumerate_result, parse_service_result, parse_system_state, shutdown_options,
+        unsupported_shutdown_error,
     };
 
     #[test]
@@ -1005,10 +1010,7 @@ mod tests {
     fn modify_failure_keeps_the_hresult_and_result_detail() {
         // GPU-PV failures are best effort, so the caller cannot surface them by
         // failing the start; this diagnostic is the only evidence it has.
-        let failure = HcsModifyFailure::new(
-            0x8037_010D,
-            Some(r#"{"Error":"bad GPU"}"#.into()),
-        );
+        let failure = HcsModifyFailure::new(0x8037_010D, Some(r#"{"Error":"bad GPU"}"#.into()));
 
         assert_eq!(failure.hresult, 0x8037_010D);
         assert_eq!(

@@ -966,6 +966,17 @@ method is defaulted on the trait and its default is an error rather than an
 empty report: the legacy backend cannot inspect the host, and "this backend
 cannot tell you" is a different answer from "this host cannot do it".
 
+`vmlord_platform::gpu_assignment` is the narrow boundary that proves
+assignment on a running compute system. It maps `Default` and `Mirror` to an
+`HcsModifyComputeSystem` `Update` of `VirtualMachine/ComputeTopology/Gpu` and
+waits for HCS to finish it. The service is safe: its only native call is behind
+`HcsSystem::modify`, which retains the failed HRESULT and the raw HCS result
+detail rather than guessing at a version-specific error schema. It returns a
+`GpuFailure`, so a lifecycle caller can record an unsuccessful assignment
+without stopping the VM or retrying it. The service has no lifecycle caller
+yet: storing the desired mode, invoking it after start, reporting runtime facts
+and rendering them are the next task's work.
+
 ### GPU: what is exported to a guest
 
 A GPU partition is useless to a Linux guest without the host's driver package
