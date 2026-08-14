@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "url": "https://github.com/microsoft/WSL2-Linux-Kernel",
+      "commit": "14794180686c2fb6307fbe359c359bec765249f3",
+      "version": "linux-msft-wsl-6.6.87.2",
+      "paths": [
+        "drivers/hv/dxgkrnl"
+      ],
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "overlays": [
+    {
+      "path": "content/dxgkrnl/dxgmodule.c",
+      "sha256": "e0bc87eb6ac6970ea1b5314141b2a7de6d218f7c4ebf868afed313f0f2b74e63",
+      "license": "GPL-2.0-only",
+      "author": "VMLord contributors"
+    }
+  ]
+}

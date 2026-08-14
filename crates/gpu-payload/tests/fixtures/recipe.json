@@ -1,0 +1,46 @@
+{
+  "schema_version": 1,
+  "payload_id": "ubuntu-26.04-amd64-test-v1",
+  "target": {
+    "distribution": "ubuntu",
+    "release": "26.04",
+    "architecture": "amd64",
+    "kernel_release": "test",
+    "payload_abi": 1
+  },
+  "archive_url": "https://downloads.example.test/vmlord/ubuntu-26.04-amd64-test-v1.zip",
+  "required_renderers": [
+    "d3d12-gallium",
+    "dzn-vulkan"
+  ],
+  "mesa_policy": "bundled",
+  "sources": [
+    {
+      "url": "https://github.com/microsoft/WSL2-Linux-Kernel",
+      "commit": "14794180686c2fb6307fbe359c359bec765249f3",
+      "version": "linux-msft-wsl-6.6.87.2",
+      "paths": [
+        "drivers/hv/dxgkrnl"
+      ],
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+  ],
+  "overlays": [
+    {
+      "path": "content/dxgkrnl/dxgmodule.c",
+      "sha256": "e0bc87eb6ac6970ea1b5314141b2a7de6d218f7c4ebf868afed313f0f2b74e63",
+      "license": "GPL-2.0-only",
+      "author": "VMLord contributors"
+    }
+  ],
+  "licenses": [
+    {
+      "spdx": "GPL-2.0-only",
+      "path": "licenses/GPL-2.0.txt"
+    },
+    {
+      "spdx": "Linux-syscall-note",
+      "path": "licenses/Linux-syscall-note.txt"
+    }
+  ]
+}
