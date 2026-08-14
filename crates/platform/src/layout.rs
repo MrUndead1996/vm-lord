@@ -44,6 +44,11 @@ pub(crate) fn configuration_path(vm_directory: &Path) -> PathBuf {
     vm_directory.join(CONFIGURATION_FILE_NAME)
 }
 
+/// The exact per-VM directory that may contain staged GPU payload generations.
+pub(crate) fn gpu_payload_staging_directory(vm_directory: &Path) -> PathBuf {
+    vm_directory.join("gpu-payload")
+}
+
 /// Returns the path of the VM's serial-console capture.
 ///
 /// Beside `config.json` rather than under `disks/`: it describes what the VM

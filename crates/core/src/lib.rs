@@ -12,7 +12,7 @@ pub use distro::{DistroProfile, SshDaemon, ubuntu};
 pub use gpu::{
     GpuAssignment, GpuAvailability, GpuFailure, GpuMode, GpuShare, GpuShareManifest, GpuShareRole,
     GpuStage, GpuState, GpuStatusCode, GuestGpuDetail, GuestGpuReport, HostGpuAdapter,
-    HostGpuCapabilities, NativeGpuDetail, VmGpuFacts, VmGpuStatus, WSL_LIB_SHARE,
+    HostGpuCapabilities, NativeGpuDetail, VmGpuFacts, VmGpuStatus, GPU_PAYLOAD_SHARE, WSL_LIB_SHARE,
 };
 pub use logging::{LoggingError, initialize as initialize_logging};
 pub use progress::{

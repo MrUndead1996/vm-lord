@@ -346,6 +346,8 @@ pub struct GpuShare {
 /// produced it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GpuShareRole {
+    /// One exact, per-VM prepared GPU payload generation directory.
+    GpuPayload,
     /// The host's WSL Linux userspace.
     WslLib,
     /// One driver package, named by its DriverStore folder.
@@ -354,6 +356,8 @@ pub enum GpuShareRole {
 
 /// The share name the host's WSL Linux userspace is offered under.
 pub const WSL_LIB_SHARE: &str = "vmlord.gpu.wsl-lib";
+/// The share name for the immutable prepared GPU payload staging directory.
+pub const GPU_PAYLOAD_SHARE: &str = "vmlord.gpu.payload";
 
 /// What every driver package share's name starts with.
 const DRIVER_PACKAGE_SHARE_PREFIX: &str = "vmlord.gpu.drv.";
@@ -365,6 +369,11 @@ const DRIVER_PACKAGE_SHARE_PREFIX: &str = "vmlord.gpu.drv.";
 const MAX_PACKAGE_NAME: usize = 96;
 
 impl GpuShare {
+    /// The per-VM immutable GPU payload generation share.
+    #[must_use]
+    pub fn payload() -> Self {
+        Self { name: GPU_PAYLOAD_SHARE.to_owned(), role: GpuShareRole::GpuPayload }
+    }
     /// The share for the host's WSL Linux userspace.
     #[must_use]
     pub fn wsl_lib() -> Self {
