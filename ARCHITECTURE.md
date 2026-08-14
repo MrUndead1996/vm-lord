@@ -982,7 +982,8 @@ and rendering them are the next task's work.
 A GPU partition is useless to a Linux guest without the host's driver package
 and the WSL Linux userspace beside it, and the way in is a Plan9 share.
 `vmlord_platform::gpu_exports` decides what may be shared, and the answer is
-two directories and nothing else: `System32\DriverStore\FileRepository`, for
+two system directories plus one exact per-VM staging directory:
+`System32\DriverStore\FileRepository`, for
 the driver packages behind the host's adapters, and `System32\lxss\lib`, for
 the Linux userspace WSL stages.
 
@@ -1021,6 +1022,23 @@ share's flag on the host and by the guest's own `MS_RDONLY` mount. The set is
 computed once per start and written before the compute system is prepared,
 which is what makes it immutable for the lifetime of a boot -- changing a GPU
 mode takes a full VM restart.
+
+### GPU: guest payload
+
+`vmlord-gpu-payload` is portable: it validates an exact guest target tuple,
+downloads and verifies content-addressed ZIP archives, and exposes only an
+opaque `ReadyGpuPayload` after every cache hit has been rehashed. Its embedded
+schema-v1 production catalog is intentionally empty until tasks 95 and 96
+produce a compiled and probed Ubuntu recipe. Release tooling creates sorted ZIP
+content and deterministic provenance without making the archive digest
+self-referential.
+
+Ready content is materialized below a VM's exact `gpu-payload` child as
+`generations/<digest>` followed by `ready/<digest>.json`. The third logical
+share, `GpuPayload` / `vmlord.gpu.payload`, exports only that canonical child;
+it never broadens either System32 root or exposes the cache. Task 94 owns the
+wire and guest mount, tasks 95–96 own recipes, and task 98 owns lifecycle/UI
+orchestration.
 
 ### VM update contract
 
