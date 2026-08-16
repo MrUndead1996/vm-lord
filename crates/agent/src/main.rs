@@ -36,8 +36,11 @@ use std::{
 
 use vmlord_agent_protocol::{auth::Secret, backoff::Backoff};
 
+mod command;
+mod gpu_kernel;
 mod gpu_mountinfo;
 mod gpu_mounts;
+mod gpu_recipe;
 mod gpu_targets;
 mod session;
 mod vsock;
@@ -167,6 +170,7 @@ fn connect_to_host(secret: &Secret) -> bool {
         AGENT_VERSION,
         &mut opened,
         gpu_mounts::attach,
+        || gpu_kernel::apply(&STOPPING),
     ) {
         Ok(()) => eprintln!("vmlord-agent: the host closed the session"),
         Err(error) => eprintln!("vmlord-agent: {error}"),

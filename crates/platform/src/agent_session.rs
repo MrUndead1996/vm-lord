@@ -24,9 +24,10 @@ use vmlord_agent_protocol::{
     frame::{self, FrameError},
     handshake::{self, CURRENT_VERSION, VersionMismatch},
     v1::{
-        AttachGpuSharesRequest, AttachGpuSharesResponse, AuthenticateRequest, Capability, Envelope,
-        ErrorCode, GpuMountState, GpuShareRole, HeartbeatResponse, HelloResponse, ProtocolVersion,
-        envelope, request, response,
+        ApplyGpuRecipeRequest, ApplyGpuRecipeResponse, AttachGpuSharesRequest,
+        AttachGpuSharesResponse, AuthenticateRequest, Capability, Envelope, ErrorCode,
+        GpuMountState, GpuRecipeStageState, GpuShareRole, HeartbeatResponse, HelloResponse,
+        ProtocolVersion, envelope, request, response,
     },
 };
 use vmlord_core::{GpuShareManifest, GpuShareRole as CoreShareRole};
@@ -50,6 +51,12 @@ const CHALLENGE_REQUEST_ID: u32 = 1;
 /// One manifest per session and one id for it: the host has nothing else to
 /// ask a guest, and a counter would be a counter of one.
 const ATTACH_REQUEST_ID: u32 = CHALLENGE_REQUEST_ID + 1;
+
+/// The id the host asks for the guest's GPU recipe with.
+///
+/// One recipe per session, after the manifest of the same session: the module
+/// is built out of the payload the guest has just been told to mount.
+const APPLY_REQUEST_ID: u32 = ATTACH_REQUEST_ID + 1;
 
 /// What a session agreed on when it opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,6 +125,7 @@ pub(crate) fn serve<S: Read + Write>(
     );
 
     let mut pending_manifest = attach_shares(stream, session, shares, vm_name, &mut buffer)?;
+    let mut pending_recipe = None;
 
     loop {
         let envelope = match frame::read(stream, &mut buffer) {
@@ -145,6 +153,13 @@ pub(crate) fn serve<S: Read + Write>(
             {
                 pending_manifest = None;
                 report_mounts(&report, vm_name);
+                pending_recipe = apply_recipe(stream, vm_name, &mut buffer)?;
+            }
+            Body::Response(response::Kind::ApplyGpuRecipe(report))
+                if pending_recipe == Some(request_id) =>
+            {
+                pending_recipe = None;
+                report_recipe(&report, vm_name);
             }
             // A response to a request this side did not send, or one it has
             // already had an answer to. Worth a line and nothing more: there is
@@ -204,6 +219,28 @@ fn attach_shares<S: Read + Write>(
     Ok(Some(ATTACH_REQUEST_ID))
 }
 
+/// Asks the guest to apply its GPU recipe, and says which id asked.
+///
+/// After the mounts of the same session, because the module is built out of
+/// the payload the guest has just mounted. Once per session, for the same
+/// reason the manifest is sent once: the guest reconciles rather than
+/// rebuilds, and a retry loop around a kernel build is how a guest ends up
+/// compiling continuously.
+fn apply_recipe<S: Read + Write>(
+    stream: &mut S,
+    vm_name: &str,
+    buffer: &mut Vec<u8>,
+) -> Result<Option<u32>, SessionError> {
+    let request = Envelope::request(
+        APPLY_REQUEST_ID,
+        request::Kind::ApplyGpuRecipe(ApplyGpuRecipeRequest {}),
+    );
+    frame::write(stream, &request, buffer).map_err(SessionError::Frame)?;
+    log::debug!("VMLord asked the agent of VM \"{vm_name}\" to apply its GPU recipe");
+
+    Ok(Some(APPLY_REQUEST_ID))
+}
+
 /// One share in the form the wire carries it.
 ///
 /// The roles are the same two facts on both sides, so the mapping is total
@@ -250,6 +287,34 @@ fn report_mounts(report: &AttachGpuSharesResponse, vm_name: &str) {
             "the agent of VM \"{vm_name}\" could not tell the dynamic linker about its GPU \
              libraries"
         );
+    }
+}
+
+/// Says what the guest's recipe did, at the volume each stage earns.
+///
+/// Nothing is kept and nothing is retried: the next session applies the recipe
+/// again, and deriving a GPU status from these facts is the application
+/// layer's work.
+fn report_recipe(report: &ApplyGpuRecipeResponse, vm_name: &str) {
+    for stage in &report.stages {
+        match stage.state() {
+            GpuRecipeStageState::Ok => log::debug!(
+                "the agent of VM \"{vm_name}\" finished GPU recipe stage {:?}: {}",
+                stage.step(),
+                stage.message
+            ),
+            GpuRecipeStageState::Skipped => log::debug!(
+                "the agent of VM \"{vm_name}\" skipped GPU recipe stage {:?}: {}",
+                stage.step(),
+                stage.message
+            ),
+            state => log::warn!(
+                "the agent of VM \"{vm_name}\" did not finish GPU recipe stage {:?} ({state:?}): \
+                 {}",
+                stage.step(),
+                stage.message
+            ),
+        }
     }
 }
 
@@ -416,6 +481,13 @@ fn answer(request_id: u32, kind: &request::Kind, vm_name: &str) -> Envelope {
             ErrorCode::UnsupportedRequest,
             "a GPU share manifest is the host's to send",
         ),
+        // Likewise: the recipe is the guest's to apply and the host's to ask
+        // for, and there is no GPU recipe for a Windows host to run.
+        request::Kind::ApplyGpuRecipe(_) => Envelope::error(
+            request_id,
+            ErrorCode::UnsupportedRequest,
+            "a GPU recipe is the host's to ask for",
+        ),
     }
 }
 
@@ -512,9 +584,10 @@ mod tests {
         auth::{Nonce, Secret, tag},
         frame::{self, LENGTH_PREFIX_LEN},
         v1::{
-            AttachGpuSharesResponse, AuthenticateResponse, Capability, Envelope, ErrorCode,
-            GpuMount, GpuMountState, GpuShareRole, HeartbeatRequest, HelloRequest, ProtocolVersion,
-            envelope, request, response,
+            ApplyGpuRecipeResponse, AttachGpuSharesResponse, AuthenticateResponse, Capability,
+            Envelope, ErrorCode, GpuMount, GpuMountState, GpuRecipeStage, GpuRecipeStageState,
+            GpuRecipeStep, GpuShareRole, HeartbeatRequest, HelloRequest, ProtocolVersion, envelope,
+            request, response,
         },
     };
     use vmlord_core::GpuShareManifest;
@@ -934,6 +1007,91 @@ mod tests {
                     package: String::new(),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn a_session_asks_for_the_recipe_once_the_shares_are_attached() {
+        // The recipe follows the mounts and never precedes them: a module
+        // built out of a payload that is not mounted yet would fail for a
+        // reason that has nothing to do with the guest.
+        let secret = Secret::generate();
+        let mut guest = Guest::opening_with(
+            Secret::from_base64(&secret.to_base64()).expect("the secret"),
+            hello(ProtocolVersion::current(), &[Capability::Gpu]),
+        );
+        let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
+        let manifest = GpuShareManifest {
+            shares: vec![vmlord_core::GpuShare::payload()],
+        };
+        // What a guest that mounted its payload and applied its recipe sends.
+        guest.say(&Envelope::response(
+            super::ATTACH_REQUEST_ID,
+            response::Kind::AttachGpuShares(AttachGpuSharesResponse {
+                mounts: vec![GpuMount {
+                    share: "vmlord.gpu.payload".to_owned(),
+                    state: i32::from(GpuMountState::Mounted),
+                    path: "/opt/vmlord/gpu-payload".to_owned(),
+                    message: "mounted".to_owned(),
+                }],
+                libraries_refreshed: true,
+            }),
+        ));
+        guest.say(&Envelope::response(
+            super::APPLY_REQUEST_ID,
+            response::Kind::ApplyGpuRecipe(ApplyGpuRecipeResponse {
+                stages: vec![GpuRecipeStage {
+                    step: i32::from(GpuRecipeStep::Device),
+                    state: i32::from(GpuRecipeStageState::Ok),
+                    message: "/dev/dxg is a usable device".to_owned(),
+                }],
+            }),
+        ));
+
+        serve(&mut guest, &session, Some(&manifest), VM).expect("a session the agent closed");
+
+        let asked = guest.answer_to(super::APPLY_REQUEST_ID);
+        let Some(envelope::Body::Request(ref request)) = asked.body else {
+            panic!("the recipe should have been asked for as a request");
+        };
+        assert!(matches!(
+            request.kind,
+            Some(request::Kind::ApplyGpuRecipe(_))
+        ));
+        assert_eq!(
+            guest
+                .received
+                .iter()
+                .filter(|envelope| matches!(
+                    envelope.body,
+                    Some(envelope::Body::Request(ref request))
+                        if matches!(request.kind, Some(request::Kind::ApplyGpuRecipe(_)))
+                ))
+                .count(),
+            1,
+            "one recipe per session"
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_shares_asks_for_no_recipe() {
+        // A guest with no GPU shares has no payload to build a module from.
+        let secret = Secret::generate();
+        let mut guest = Guest::opening_with(
+            Secret::from_base64(&secret.to_base64()).expect("the secret"),
+            hello(ProtocolVersion::current(), &[Capability::Gpu]),
+        );
+        let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
+
+        serve(&mut guest, &session, None, VM).expect("a session the agent closed");
+
+        assert!(
+            !guest.received.iter().any(|envelope| matches!(
+                envelope.body,
+                Some(envelope::Body::Request(ref request))
+                    if matches!(request.kind, Some(request::Kind::ApplyGpuRecipe(_)))
+            )),
+            "a VM with no manifest is asked for no recipe"
         );
     }
 

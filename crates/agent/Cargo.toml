@@ -14,6 +14,10 @@ bench = false
 
 [dependencies]
 libc = { version = "0.2", default-features = false }
+# The payload states what it was built for in its own `sources.json`, and the
+# guest is what compares that with itself. Pure Rust with no C library behind
+# it, so `cargo agent` still cross-compiles to musl with no toolchain.
+serde_json = "1.0"
 vmlord-agent-protocol = { path = "../agent-protocol" }
 
 [lints]

@@ -11,9 +11,9 @@ use vmlord_agent_protocol::{
     frame::{self, FrameError},
     handshake::{self, CURRENT_VERSION},
     v1::{
-        AttachGpuSharesResponse, AuthenticateResponse, Capability, Envelope, ErrorCode, GpuMount,
-        GpuShare, HeartbeatRequest, HeartbeatResponse, HelloRequest, ProtocolVersion, envelope,
-        request, response,
+        ApplyGpuRecipeResponse, AttachGpuSharesResponse, AuthenticateResponse, Capability,
+        Envelope, ErrorCode, GpuMount, GpuRecipeStage, GpuShare, HeartbeatRequest,
+        HeartbeatResponse, HelloRequest, ProtocolVersion, envelope, request, response,
     },
 };
 
@@ -38,10 +38,12 @@ pub struct Session {
 
 /// Opens and serves the guest half of an agent session.
 ///
-/// `attach` is what a GPU share manifest is carried out with. It is a
-/// parameter rather than a call into the mounting module because the order of
-/// the messages around it has to be testable against a peer made of bytes, and
-/// mounting a Hyper-V Plan9 share needs a Hyper-V host underneath.
+/// `attach` is what a GPU share manifest is carried out with, and `apply` is
+/// what the guest's GPU recipe is run by. They are parameters rather than
+/// calls into the modules that implement them because the order of the
+/// messages around them has to be testable against a peer made of bytes, and
+/// neither mounting a Hyper-V Plan9 share nor building a kernel module can
+/// happen under a `cargo test`.
 ///
 /// The session that was agreed on is returned so the caller can tell a
 /// connection that reached an authenticated session from one that did not:
@@ -56,18 +58,24 @@ pub struct Session {
 /// [`SessionError`] if the connection failed, the host answered the hello with
 /// something this build never offered, or the host sent something that has no
 /// place where it arrived.
-pub fn run<S: Read + Write, A: FnMut(&[GpuShare]) -> (Vec<GpuMount>, bool)>(
+pub fn run<S, A, R>(
     stream: &mut S,
     secret: &Secret,
     version: &str,
     opened: &mut Option<Session>,
     attach: A,
-) -> Result<(), SessionError> {
+    apply: R,
+) -> Result<(), SessionError>
+where
+    S: Read + Write,
+    A: FnMut(&[GpuShare]) -> (Vec<GpuMount>, bool),
+    R: FnMut() -> Vec<GpuRecipeStage>,
+{
     let mut buffer = Vec::new();
     let session = greet(stream, version, &mut buffer)?;
     authenticate(stream, secret, &mut buffer)?;
     let session = opened.insert(session);
-    serve(stream, session, attach, &mut buffer)
+    serve(stream, session, attach, apply, &mut buffer)
 }
 
 fn greet<S: Read + Write>(
@@ -153,12 +161,18 @@ fn authenticate<S: Read + Write>(
     frame::write(stream, &answer, buffer).map_err(SessionError::Frame)
 }
 
-fn serve<S: Read + Write, A: FnMut(&[GpuShare]) -> (Vec<GpuMount>, bool)>(
+fn serve<S, A, R>(
     stream: &mut S,
     session: &Session,
     mut attach: A,
+    mut apply: R,
     buffer: &mut Vec<u8>,
-) -> Result<(), SessionError> {
+) -> Result<(), SessionError>
+where
+    S: Read + Write,
+    A: FnMut(&[GpuShare]) -> (Vec<GpuMount>, bool),
+    R: FnMut() -> Vec<GpuRecipeStage>,
+{
     let mut next_request_id = FIRST_HEARTBEAT_REQUEST_ID;
     let mut pending_heartbeat = None;
 
@@ -204,6 +218,20 @@ fn serve<S: Read + Write, A: FnMut(&[GpuShare]) -> (Vec<GpuMount>, bool)>(
                         mounts,
                         libraries_refreshed,
                     }),
+                );
+                frame::write(stream, &report, buffer).map_err(SessionError::Frame)?;
+            }
+            // A recipe is minutes of work rather than seconds, and it is still
+            // answered from here: the host sends nothing that needs an answer
+            // meanwhile, and a second thread would be two conversations on one
+            // socket for a report that was asked for.
+            Body::Request(request::Kind::ApplyGpuRecipe(_))
+                if session.capabilities.contains(&Capability::Gpu) =>
+            {
+                let stages = apply();
+                let report = Envelope::response(
+                    request_id,
+                    response::Kind::ApplyGpuRecipe(ApplyGpuRecipeResponse { stages }),
                 );
                 frame::write(stream, &report, buffer).map_err(SessionError::Frame)?;
             }
@@ -288,6 +316,7 @@ fn kind_name(kind: &request::Kind) -> &'static str {
         request::Kind::Authenticate(_) => "an authentication challenge out of order",
         request::Kind::Heartbeat(_) => "a heartbeat request out of order",
         request::Kind::AttachGpuShares(_) => "a GPU share manifest out of order",
+        request::Kind::ApplyGpuRecipe(_) => "a GPU recipe request out of order",
     }
 }
 
@@ -351,9 +380,10 @@ mod tests {
         auth::{self, Nonce, Secret},
         frame,
         v1::{
-            AttachGpuSharesRequest, AuthenticateRequest, Capability, ErrorCode, GpuMount,
-            GpuMountState, GpuShare, GpuShareRole, HelloRequest, HelloResponse, ProtocolVersion,
-            envelope, request, response,
+            ApplyGpuRecipeRequest, AttachGpuSharesRequest, AuthenticateRequest, Capability,
+            ErrorCode, GpuMount, GpuMountState, GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep,
+            GpuShare, GpuShareRole, HelloRequest, HelloResponse, ProtocolVersion, envelope,
+            request, response,
         },
     };
 
@@ -365,6 +395,14 @@ mod tests {
     /// it to mount a Plan9 share.
     fn refuse_to_mount(_shares: &[GpuShare]) -> (Vec<GpuMount>, bool) {
         (Vec::new(), false)
+    }
+
+    /// A recipe that does nothing, for the tests about message order.
+    ///
+    /// Every one of them would otherwise ask a machine that is not an Ubuntu
+    /// guest to build a kernel module.
+    fn apply_nothing() -> Vec<GpuRecipeStage> {
+        Vec::new()
     }
 
     /// A host peer that returns the exact bytes and timeout a session expects.
@@ -476,6 +514,7 @@ mod tests {
             "test-agent",
             &mut opened,
             refuse_to_mount,
+            apply_nothing,
         )
         .expect("the host closes after the heartbeat");
 
@@ -547,6 +586,7 @@ mod tests {
             "test-agent",
             &mut None,
             refuse_to_mount,
+            apply_nothing,
         )
         .expect_err("a timeout after a partial frame must end the session");
         assert!(matches!(
@@ -593,6 +633,7 @@ mod tests {
             "test-agent",
             &mut None,
             refuse_to_mount,
+            apply_nothing,
         )
         .expect("the host closes after the refusal");
 
@@ -643,6 +684,7 @@ mod tests {
             "test-agent",
             &mut opened,
             refuse_to_mount,
+            apply_nothing,
         )
         .expect("a compatible host hang-up");
         assert_eq!(opened.expect("a session that authenticated").version, older);
@@ -684,6 +726,7 @@ mod tests {
             "test-agent",
             &mut opened,
             refuse_to_mount,
+            apply_nothing,
         )
         .expect_err("a capability the agent did not announce must not be served");
 
@@ -746,6 +789,7 @@ mod tests {
                     true,
                 )
             },
+            apply_nothing,
         )
         .expect("the host closes after its manifest was answered");
 
@@ -762,6 +806,115 @@ mod tests {
         assert!(report.libraries_refreshed);
         assert_eq!(report.mounts.len(), 1);
         assert_eq!(report.mounts[0].path, "/usr/lib/wsl/lib");
+    }
+
+    #[test]
+    fn an_apply_on_a_gpu_session_is_carried_out_and_reported_back() {
+        // The host reads this answer to find out what the guest's recipe did,
+        // so it has to arrive as the response to the request that asked.
+        let secret = Secret::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .expect("a valid test secret");
+        let nonce = Nonce::from_wire(&[7; auth::LEN]).expect("a valid nonce");
+        let mut stream = ScriptedStream::new([
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::response(
+                1,
+                response::Kind::Hello(HelloResponse {
+                    version: Some(ProtocolVersion::current()),
+                    capabilities: vec![i32::from(Capability::Gpu)],
+                }),
+            )),
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::request(
+                1,
+                request::Kind::Authenticate(AuthenticateRequest {
+                    nonce: nonce.as_bytes().to_vec(),
+                }),
+            )),
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::request(
+                5,
+                request::Kind::ApplyGpuRecipe(ApplyGpuRecipeRequest {}),
+            )),
+        ]);
+
+        let mut applied = 0;
+        run(
+            &mut stream,
+            &secret,
+            "test-agent",
+            &mut None,
+            refuse_to_mount,
+            || {
+                applied += 1;
+                vec![GpuRecipeStage {
+                    step: i32::from(GpuRecipeStep::Device),
+                    state: i32::from(GpuRecipeStageState::Ok),
+                    message: "/dev/dxg is a usable device".to_owned(),
+                }]
+            },
+        )
+        .expect("the host closes after its recipe was answered");
+
+        assert_eq!(applied, 1);
+        let frames = stream.written_frames();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[2].request_id, 5);
+        let Some(envelope::Body::Response(response)) = &frames[2].body else {
+            panic!("an apply needs a response");
+        };
+        let Some(response::Kind::ApplyGpuRecipe(report)) = &response.kind else {
+            panic!("an apply needs a recipe report");
+        };
+        assert_eq!(report.stages.len(), 1);
+        assert_eq!(report.stages[0].step(), GpuRecipeStep::Device);
+    }
+
+    #[test]
+    fn an_apply_on_a_session_without_the_gpu_capability_is_refused() {
+        // The capability is what says the two builds agreed this session may
+        // carry a recipe at all. Building a kernel module for a session that
+        // never agreed on one would make the negotiation decorative.
+        let secret = Secret::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .expect("a valid test secret");
+        let nonce = Nonce::from_wire(&[7; auth::LEN]).expect("a valid nonce");
+        let mut stream = ScriptedStream::new([
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::response(
+                1,
+                response::Kind::Hello(HelloResponse {
+                    version: Some(ProtocolVersion::current()),
+                    capabilities: vec![],
+                }),
+            )),
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::request(
+                1,
+                request::Kind::Authenticate(AuthenticateRequest {
+                    nonce: nonce.as_bytes().to_vec(),
+                }),
+            )),
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::request(
+                5,
+                request::Kind::ApplyGpuRecipe(ApplyGpuRecipeRequest {}),
+            )),
+        ]);
+
+        run(
+            &mut stream,
+            &secret,
+            "test-agent",
+            &mut None,
+            refuse_to_mount,
+            || panic!("a recipe that was never agreed on must not be applied"),
+        )
+        .expect("the host closes after the refusal");
+
+        let frames = stream.written_frames();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[2].request_id, 5);
+        let Some(envelope::Body::Response(response)) = &frames[2].body else {
+            panic!("the apply needs a response");
+        };
+        let Some(response::Kind::Error(error)) = &response.kind else {
+            panic!("the apply needs an error response");
+        };
+        assert_eq!(error.code(), ErrorCode::UnsupportedRequest);
     }
 
     #[test]
@@ -800,6 +953,7 @@ mod tests {
             |_shares: &[GpuShare]| {
                 panic!("a manifest that was never agreed on must not be mounted")
             },
+            apply_nothing,
         )
         .expect("the host closes after the refusal");
 
@@ -844,6 +998,7 @@ mod tests {
             "test-agent",
             &mut opened,
             refuse_to_mount,
+            apply_nothing,
         )
         .expect_err("a revision this agent never claimed must not be served");
 
@@ -874,6 +1029,7 @@ mod tests {
             "test-agent",
             &mut opened,
             refuse_to_mount,
+            apply_nothing,
         )
         .expect_err("a host that hangs up before its challenge ends the session");
 
