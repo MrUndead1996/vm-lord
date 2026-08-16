@@ -173,6 +173,7 @@ fn connect_to_host(secret: &Secret) -> bool {
         &mut opened,
         gpu_mounts::attach,
         || gpu_kernel::apply(&STOPPING),
+        || gpu_render::probe(&STOPPING),
     ) {
         Ok(()) => eprintln!("vmlord-agent: the host closed the session"),
         Err(error) => eprintln!("vmlord-agent: {error}"),

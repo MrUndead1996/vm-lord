@@ -13,7 +13,8 @@ use vmlord_agent_protocol::{
     v1::{
         ApplyGpuRecipeResponse, AttachGpuSharesResponse, AuthenticateResponse, Capability,
         Envelope, ErrorCode, GpuMount, GpuRecipeStage, GpuShare, HeartbeatRequest,
-        HeartbeatResponse, HelloRequest, ProtocolVersion, envelope, request, response,
+        HeartbeatResponse, HelloRequest, ProbeGpuResponse, ProtocolVersion, envelope, request,
+        response,
     },
 };
 
@@ -38,12 +39,13 @@ pub struct Session {
 
 /// Opens and serves the guest half of an agent session.
 ///
-/// `attach` is what a GPU share manifest is carried out with, and `apply` is
-/// what the guest's GPU recipe is run by. They are parameters rather than
-/// calls into the modules that implement them because the order of the
-/// messages around them has to be testable against a peer made of bytes, and
-/// neither mounting a Hyper-V Plan9 share nor building a kernel module can
-/// happen under a `cargo test`.
+/// `attach` is what a GPU share manifest is carried out with, `apply` is what
+/// the guest's GPU recipe is run by, and `probe` is what looks at whether any
+/// of it renders. They are parameters rather than calls into the modules that
+/// implement them because the order of the messages around them has to be
+/// testable against a peer made of bytes, and neither mounting a Hyper-V Plan9
+/// share, building a kernel module nor holding a GL context can happen under a
+/// `cargo test`.
 ///
 /// The session that was agreed on is returned so the caller can tell a
 /// connection that reached an authenticated session from one that did not:
@@ -58,24 +60,26 @@ pub struct Session {
 /// [`SessionError`] if the connection failed, the host answered the hello with
 /// something this build never offered, or the host sent something that has no
 /// place where it arrived.
-pub fn run<S, A, R>(
+pub fn run<S, A, R, P>(
     stream: &mut S,
     secret: &Secret,
     version: &str,
     opened: &mut Option<Session>,
     attach: A,
     apply: R,
+    probe: P,
 ) -> Result<(), SessionError>
 where
     S: Read + Write,
     A: FnMut(&[GpuShare]) -> (Vec<GpuMount>, bool),
     R: FnMut() -> Vec<GpuRecipeStage>,
+    P: FnMut() -> ProbeGpuResponse,
 {
     let mut buffer = Vec::new();
     let session = greet(stream, version, &mut buffer)?;
     authenticate(stream, secret, &mut buffer)?;
     let session = opened.insert(session);
-    serve(stream, session, attach, apply, &mut buffer)
+    serve(stream, session, attach, apply, probe, &mut buffer)
 }
 
 fn greet<S: Read + Write>(
@@ -161,17 +165,19 @@ fn authenticate<S: Read + Write>(
     frame::write(stream, &answer, buffer).map_err(SessionError::Frame)
 }
 
-fn serve<S, A, R>(
+fn serve<S, A, R, P>(
     stream: &mut S,
     session: &Session,
     mut attach: A,
     mut apply: R,
+    mut probe: P,
     buffer: &mut Vec<u8>,
 ) -> Result<(), SessionError>
 where
     S: Read + Write,
     A: FnMut(&[GpuShare]) -> (Vec<GpuMount>, bool),
     R: FnMut() -> Vec<GpuRecipeStage>,
+    P: FnMut() -> ProbeGpuResponse,
 {
     let mut next_request_id = FIRST_HEARTBEAT_REQUEST_ID;
     let mut pending_heartbeat = None;
@@ -233,6 +239,15 @@ where
                     request_id,
                     response::Kind::ApplyGpuRecipe(ApplyGpuRecipeResponse { stages }),
                 );
+                frame::write(stream, &report, buffer).map_err(SessionError::Frame)?;
+            }
+            // The probe follows the recipe and answers from the same place: it
+            // runs two short programs rather than a build, and a thread of its
+            // own would be two conversations on one socket.
+            Body::Request(request::Kind::ProbeGpu(_))
+                if session.capabilities.contains(&Capability::Gpu) =>
+            {
+                let report = Envelope::response(request_id, response::Kind::ProbeGpu(probe()));
                 frame::write(stream, &report, buffer).map_err(SessionError::Frame)?;
             }
             Body::Request(_) | Body::UnknownRequest => {
@@ -382,9 +397,10 @@ mod tests {
         frame,
         v1::{
             ApplyGpuRecipeRequest, AttachGpuSharesRequest, AuthenticateRequest, Capability,
-            ErrorCode, GpuMount, GpuMountState, GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep,
-            GpuShare, GpuShareRole, HelloRequest, HelloResponse, ProtocolVersion, envelope,
-            request, response,
+            ErrorCode, GpuMount, GpuMountState, GpuProbeCheck, GpuProbeCheckState, GpuProbeStep,
+            GpuProbeVerdict, GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep, GpuShare,
+            GpuShareRole, HelloRequest, HelloResponse, ProbeGpuRequest, ProbeGpuResponse,
+            ProtocolVersion, envelope, request, response,
         },
     };
 
@@ -404,6 +420,14 @@ mod tests {
     /// guest to build a kernel module.
     fn apply_nothing() -> Vec<GpuRecipeStage> {
         Vec::new()
+    }
+
+    /// A probe that looks at nothing, for the tests about message order.
+    ///
+    /// Every one of them would otherwise ask a machine that was given no GPU
+    /// to install two packages and render with them.
+    fn probe_nothing() -> ProbeGpuResponse {
+        ProbeGpuResponse::default()
     }
 
     /// A host peer that returns the exact bytes and timeout a session expects.
@@ -516,6 +540,7 @@ mod tests {
             &mut opened,
             refuse_to_mount,
             apply_nothing,
+            probe_nothing,
         )
         .expect("the host closes after the heartbeat");
 
@@ -588,6 +613,7 @@ mod tests {
             &mut None,
             refuse_to_mount,
             apply_nothing,
+            probe_nothing,
         )
         .expect_err("a timeout after a partial frame must end the session");
         assert!(matches!(
@@ -635,6 +661,7 @@ mod tests {
             &mut None,
             refuse_to_mount,
             apply_nothing,
+            probe_nothing,
         )
         .expect("the host closes after the refusal");
 
@@ -686,6 +713,7 @@ mod tests {
             &mut opened,
             refuse_to_mount,
             apply_nothing,
+            probe_nothing,
         )
         .expect("a compatible host hang-up");
         assert_eq!(opened.expect("a session that authenticated").version, older);
@@ -728,6 +756,7 @@ mod tests {
             &mut opened,
             refuse_to_mount,
             apply_nothing,
+            probe_nothing,
         )
         .expect_err("a capability the agent did not announce must not be served");
 
@@ -791,6 +820,7 @@ mod tests {
                 )
             },
             apply_nothing,
+            probe_nothing,
         )
         .expect("the host closes after its manifest was answered");
 
@@ -851,6 +881,7 @@ mod tests {
                     message: "/dev/dxg is a usable device".to_owned(),
                 }]
             },
+            probe_nothing,
         )
         .expect("the host closes after its recipe was answered");
 
@@ -866,6 +897,123 @@ mod tests {
         };
         assert_eq!(report.stages.len(), 1);
         assert_eq!(report.stages[0].step(), GpuRecipeStep::Device);
+    }
+
+    #[test]
+    fn a_probe_on_a_gpu_session_is_carried_out_and_reported_back() {
+        // The host reads this answer to find out whether the guest renders, so
+        // it has to arrive as the response to the request that asked.
+        let secret = Secret::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .expect("a valid test secret");
+        let nonce = Nonce::from_wire(&[7; auth::LEN]).expect("a valid nonce");
+        let mut stream = ScriptedStream::new([
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::response(
+                1,
+                response::Kind::Hello(HelloResponse {
+                    version: Some(ProtocolVersion::current()),
+                    capabilities: vec![i32::from(Capability::Gpu)],
+                }),
+            )),
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::request(
+                1,
+                request::Kind::Authenticate(AuthenticateRequest {
+                    nonce: nonce.as_bytes().to_vec(),
+                }),
+            )),
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::request(
+                6,
+                request::Kind::ProbeGpu(ProbeGpuRequest {}),
+            )),
+        ]);
+
+        let mut probed = 0;
+        run(
+            &mut stream,
+            &secret,
+            "test-agent",
+            &mut None,
+            refuse_to_mount,
+            apply_nothing,
+            || {
+                probed += 1;
+                ProbeGpuResponse {
+                    verdict: i32::from(GpuProbeVerdict::Renders),
+                    checks: vec![GpuProbeCheck {
+                        step: i32::from(GpuProbeStep::Opengl),
+                        state: i32::from(GpuProbeCheckState::Ok),
+                        message: "GL renders on D3D12 (NVIDIA GeForce RTX 4070)".to_owned(),
+                    }],
+                    renderer: "D3D12 (NVIDIA GeForce RTX 4070)".to_owned(),
+                    driver: "dxgkrnl".to_owned(),
+                    render_node: String::new(),
+                }
+            },
+        )
+        .expect("the host closes after its probe was answered");
+
+        assert_eq!(probed, 1);
+        let frames = stream.written_frames();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[2].request_id, 6);
+        let Some(envelope::Body::Response(response)) = &frames[2].body else {
+            panic!("a probe needs a response");
+        };
+        let Some(response::Kind::ProbeGpu(report)) = &response.kind else {
+            panic!("a probe needs a probe report");
+        };
+        assert_eq!(report.verdict(), GpuProbeVerdict::Renders);
+        assert_eq!(report.checks[0].step(), GpuProbeStep::Opengl);
+    }
+
+    #[test]
+    fn a_probe_on_a_session_without_the_gpu_capability_is_refused() {
+        // The capability is what says the two builds agreed this session may
+        // carry a probe at all. Installing packages for a session that never
+        // agreed on one would make the negotiation decorative.
+        let secret = Secret::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .expect("a valid test secret");
+        let nonce = Nonce::from_wire(&[7; auth::LEN]).expect("a valid nonce");
+        let mut stream = ScriptedStream::new([
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::response(
+                1,
+                response::Kind::Hello(HelloResponse {
+                    version: Some(ProtocolVersion::current()),
+                    capabilities: vec![],
+                }),
+            )),
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::request(
+                1,
+                request::Kind::Authenticate(AuthenticateRequest {
+                    nonce: nonce.as_bytes().to_vec(),
+                }),
+            )),
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::request(
+                6,
+                request::Kind::ProbeGpu(ProbeGpuRequest {}),
+            )),
+        ]);
+
+        run(
+            &mut stream,
+            &secret,
+            "test-agent",
+            &mut None,
+            refuse_to_mount,
+            apply_nothing,
+            || panic!("a probe that was never agreed on must not be run"),
+        )
+        .expect("the host closes after the refusal");
+
+        let frames = stream.written_frames();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[2].request_id, 6);
+        let Some(envelope::Body::Response(response)) = &frames[2].body else {
+            panic!("the probe needs a response");
+        };
+        let Some(response::Kind::Error(error)) = &response.kind else {
+            panic!("the probe needs an error response");
+        };
+        assert_eq!(error.code(), ErrorCode::UnsupportedRequest);
     }
 
     #[test]
@@ -903,6 +1051,7 @@ mod tests {
             &mut None,
             refuse_to_mount,
             || panic!("a recipe that was never agreed on must not be applied"),
+            probe_nothing,
         )
         .expect("the host closes after the refusal");
 
@@ -955,6 +1104,7 @@ mod tests {
                 panic!("a manifest that was never agreed on must not be mounted")
             },
             apply_nothing,
+            probe_nothing,
         )
         .expect("the host closes after the refusal");
 
@@ -1000,6 +1150,7 @@ mod tests {
             &mut opened,
             refuse_to_mount,
             apply_nothing,
+            probe_nothing,
         )
         .expect_err("a revision this agent never claimed must not be served");
 
@@ -1031,6 +1182,7 @@ mod tests {
             &mut opened,
             refuse_to_mount,
             apply_nothing,
+            probe_nothing,
         )
         .expect_err("a host that hangs up before its challenge ends the session");
 
