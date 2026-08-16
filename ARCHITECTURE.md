@@ -1028,17 +1028,86 @@ mode takes a full VM restart.
 `vmlord-gpu-payload` is portable: it validates an exact guest target tuple,
 downloads and verifies content-addressed ZIP archives, and exposes only an
 opaque `ReadyGpuPayload` after every cache hit has been rehashed. Its embedded
-schema-v1 production catalog is intentionally empty until tasks 95 and 96
-produce a compiled and probed Ubuntu recipe. Release tooling creates sorted ZIP
-content and deterministic provenance without making the archive digest
-self-referential.
+schema-v1 production catalog is still empty: what the guest does with a payload
+is written below, but an entry needs an archive that has been packed with
+`cargo xtask gpu-payload pack` and published somewhere with its digest, which
+is neither code nor a decision any of these tasks makes. Release tooling
+creates sorted ZIP content and deterministic provenance without making the
+archive digest self-referential.
 
 Ready content is materialized below a VM's exact `gpu-payload` child as
 `generations/<digest>` followed by `ready/<digest>.json`. The third logical
 share, `GpuPayload` / `vmlord.gpu.payload`, exports only that canonical child;
 it never broadens either System32 root or exposes the cache. The guest mounts
-that share at `/opt/vmlord/gpu-payload`; tasks 95–96 own what is inside it, and
-task 98 owns lifecycle and UI orchestration.
+that share at `/opt/vmlord/gpu-payload`; what the guest makes of it is the
+recipe below, and task 98 owns lifecycle and UI orchestration.
+
+### GPU: the guest's Ubuntu recipe
+
+A mounted payload is a directory of sources, and what a guest actually needs is
+`/dev/dxg`. The recipe is what turns one into the other: the host asks for it
+once per session, right after the attach report, and the agent answers with a
+list of stages. `ApplyGpuRecipeRequest` is empty on purpose -- everything the
+guest needs to decide is in the guest or in the payload it was told to mount
+one message earlier, and a field here would be the host dictating something it
+cannot know better. The schema gains messages and enum values only, so the
+revision moves to **1.3**.
+
+`ApplyGpuRecipeResponse` is stages and never a verdict, for the same reason
+`VmGpuFacts` is not a `VmGpuStatus`: "the module built and `/dev/dxg` never
+appeared" and "the headers would not install" are one word apart in a summary
+and are different problems. Every step is reported, including the ones that
+never ran -- a report that stopped at the failure would leave the host guessing
+whether the rest was skipped or the agent hung up. The userspace of the next
+task and the probe after it add values to `GpuRecipeStep` rather than messages
+of their own.
+
+The build dependencies -- `dkms`, `build-essential` and
+`linux-headers-$(uname -r)` -- come from the guest's own apt, not from the
+payload. AppSandbox did the opposite, staging an apt closure per (release,
+kernel) pair into the rootfs, and it cost an apt resolver on a Windows host,
+hundreds of megabytes per kernel, and a payload that goes stale the moment the
+guest upgrades its kernel. VMLord provisions its Ubuntu guests through
+cloud-init over NAT, so a guest that cannot reach `archive.ubuntu.com` is
+already a guest that did not finish provisioning. The consequence is stated
+rather than hidden: no network means a failed `BUILD_DEPENDENCIES` stage and a
+`Degraded` GPU, never a VM that fails to start.
+
+Distribution, release and architecture are the hard gate; the kernel is not.
+DKMS builds against the headers of the *running* kernel, so the payload's
+`kernel_release` records what the recipe was proven on rather than what it
+requires -- requiring it would mean the unattended kernel upgrade Ubuntu
+performs on its own kills GPU-PV until someone repacks a payload on the host.
+DKMS's own `AUTOINSTALL=yes` is what carries the module across that upgrade
+with VMLord not involved at all.
+
+The stages run in order, and the first failure ends the run:
+`DISTRIBUTION` (a guest with no recipe is skipped, with the reason),
+`PAYLOAD` (the mount, its `sources.json` target and the `dkms.conf` that names
+the package), `BUILD_DEPENDENCIES`, `MODULE_SOURCE` (copied to `/usr/src`,
+because the payload is read-only over 9p and DKMS writes beside its sources),
+`MODULE_BUILD`, `MODULE_LOAD` (`/etc/modules-load.d/vmlord-dxgkrnl.conf` and
+`modprobe`, because a module loaded only by hand is gone after the next reboot)
+and `DEVICE`. A guest that already has the module loaded and a `/dev/dxg` that
+opens short-circuits the three build stages, which is what makes every start
+after the first cost nothing and need no network.
+
+`apt-get`, `dkms` and `modprobe` are the three programs the agent runs beside
+`ldconfig`, all distribution-owned operations with no library form. Each runs
+through one helper with a wall-clock budget -- 300 s for apt, 900 s for a
+build, 30 s for the rest -- in a process group of its own, so a budget that
+runs out takes the whole tree with it rather than waiting on a child holding
+the pipe. Between stages the recipe checks the shutdown flag and abandons the
+rest as skipped: systemd is holding the guest open for this process to exit.
+The whole thing runs inline in the session, where the attach already does; the
+host tolerates the silence, because its read timeout is an `Idle` it keeps
+waiting through, and a background thread would be two conversations on one
+socket for a report that was asked for.
+
+What the recipe expects inside a payload is therefore fixed: `sources.json`
+beside `licenses/`, and `content/dxgkrnl/` holding `dkms.conf`, `Kbuild`, the
+out-of-tree compat header and the sources vendored from
+microsoft/WSL2-Linux-Kernel.
 
 ### VM update contract
 
