@@ -26,12 +26,28 @@ compile_error!(
      `cargo agent`"
 );
 
-use std::{error::Error, fs, process, thread};
+use std::{
+    error::Error,
+    fs, process,
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
+    time::Duration,
+};
 
 use vmlord_agent_protocol::{auth::Secret, backoff::Backoff};
 
+mod gpu_mountinfo;
+mod gpu_mounts;
+mod gpu_targets;
 mod session;
 mod vsock;
+
+/// Set by the signal handler when the guest is going down.
+///
+/// An `AtomicBool` and nothing else, because a signal handler may call almost
+/// nothing: the unmounting it leads to happens on the main thread, once the
+/// session that was open has ended.
+static STOPPING: AtomicBool = AtomicBool::new(false);
 
 /// This build of the agent, as reported to the host during its hello.
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -48,7 +64,40 @@ fn main() {
         }
     };
 
+    listen_for_shutdown();
     serve_host(&secret);
+
+    // A guest that is going down takes its GPU mounts with it: the shares
+    // behind them belong to a host that is about to stop serving this VM, and
+    // a mount left behind would be a directory that answers `EIO` to whatever
+    // reads it next.
+    gpu_mounts::detach_all();
+}
+
+/// Asks to be told when the guest is shutting this agent down.
+///
+/// `SIGTERM` is what `systemctl stop` and a guest shutdown send, and `SIGINT`
+/// is what a person running the agent by hand sends. Neither is a failure, so
+/// both end the loop rather than the process: the unmounting afterwards is the
+/// point of noticing them at all.
+fn listen_for_shutdown() {
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        let handler = stop as *const () as libc::sighandler_t;
+        // SAFETY: `handler` is a plain function pointer with the C signature
+        // `signal` expects, and all it does is store into a static, which is
+        // the one thing a handler may safely do.
+        let previous = unsafe { libc::signal(signal, handler) };
+        if previous == libc::SIG_ERR {
+            eprintln!(
+                "vmlord-agent: signal {signal} could not be handled: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+extern "C" fn stop(_signal: libc::c_int) {
+    STOPPING.store(true, Ordering::Relaxed);
 }
 
 fn read_secret() -> Result<Secret, Box<dyn Error>> {
@@ -59,16 +108,38 @@ fn read_secret() -> Result<Secret, Box<dyn Error>> {
 
 /// Keeps a session open with the host for as long as this guest runs.
 ///
-/// Never returns. Every way a connection can end is a connection to open
-/// again: the host may not be listening yet, may have been closed, may be
-/// restarting, or may be a VMLord too new to speak this agent's protocol -- and
-/// all of those are answered by asking again later, so none of them is worth a
-/// different code path.
-fn serve_host(secret: &Secret) -> ! {
+/// Every way a connection can end is a connection to open again: the host may
+/// not be listening yet, may have been closed, may be restarting, or may be a
+/// VMLord too new to speak this agent's protocol -- and all of those are
+/// answered by asking again later, so none of them is worth a different code
+/// path. The one thing that ends the loop is the guest itself shutting the
+/// agent down.
+fn serve_host(secret: &Secret) {
     let mut backoff = Backoff::new();
-    loop {
+    while !STOPPING.load(Ordering::Relaxed) {
         let authenticated = connect_to_host(secret);
-        thread::sleep(backoff.after(authenticated));
+        // A shutdown that arrived during the session must not be waited out:
+        // systemd is holding the guest open for this process to exit.
+        if STOPPING.load(Ordering::Relaxed) {
+            break;
+        }
+        wait_before_connecting_again(backoff.after(authenticated));
+    }
+}
+
+/// Waits out the backoff in slices short enough to shut down in.
+///
+/// `thread::sleep` resumes after a signal rather than returning, so a delay at
+/// the cap would keep a guest that is shutting down waiting for half a minute
+/// before its mounts are taken away.
+fn wait_before_connecting_again(delay: Duration) {
+    const SLICE: Duration = Duration::from_millis(250);
+
+    let mut waited = Duration::ZERO;
+    while waited < delay && !STOPPING.load(Ordering::Relaxed) {
+        let slice = SLICE.min(delay - waited);
+        thread::sleep(slice);
+        waited += slice;
     }
 }
 
@@ -90,7 +161,13 @@ fn connect_to_host(secret: &Secret) -> bool {
     };
 
     let mut opened = None;
-    match session::run(&mut stream, secret, AGENT_VERSION, &mut opened) {
+    match session::run(
+        &mut stream,
+        secret,
+        AGENT_VERSION,
+        &mut opened,
+        gpu_mounts::attach,
+    ) {
         Ok(()) => eprintln!("vmlord-agent: the host closed the session"),
         Err(error) => eprintln!("vmlord-agent: {error}"),
     }
