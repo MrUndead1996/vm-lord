@@ -27,7 +27,7 @@ use std::{
 
 use uuid::Uuid;
 use vmlord_agent_protocol::{auth::Secret, backoff::Backoff};
-use vmlord_core::RepositoryError;
+use vmlord_core::{GpuShareManifest, RepositoryError};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -99,6 +99,13 @@ impl AgentConnection {
     /// be bound says so to the caller instead of failing silently a second
     /// later.
     ///
+    /// `shares` is what this VM's guest is told to mount, and it belongs to
+    /// the run rather than to a connection: the Plan9 section of a compute
+    /// system is written before it is started and is immutable for the
+    /// lifetime of a boot, so every session of this run delivers the same
+    /// manifest. `None` is a VM VMLord has nothing to say about GPU to, which
+    /// is a session with no manifest rather than one with an empty manifest.
+    ///
     /// # Errors
     ///
     /// [`RepositoryError`] if the secret cannot be read, the listener cannot be
@@ -108,6 +115,7 @@ impl AgentConnection {
         mapping: &VmComputeSystemMapping,
         runtime_id: Uuid,
         secret_path: &Path,
+        shares: Option<GpuShareManifest>,
     ) -> Result<Self, RepositoryError> {
         let vm_name = mapping.vm_name.clone();
         let secret = read_secret(secret_path, &vm_name)?;
@@ -121,7 +129,16 @@ impl AgentConnection {
                 let vm_name = vm_name.clone();
                 let online = Arc::clone(&online);
                 let running = Arc::clone(&running);
-                move || serve(&listener, &secret, &vm_name, &online, &running)
+                move || {
+                    serve(
+                        &listener,
+                        &secret,
+                        shares.as_ref(),
+                        &vm_name,
+                        &online,
+                        &running,
+                    )
+                }
             })
             .map_err(|error| {
                 let error = RepositoryError::new(format!(
@@ -195,6 +212,7 @@ impl Drop for AgentConnection {
 fn serve(
     listener: &AgentListener,
     secret: &Secret,
+    shares: Option<&GpuShareManifest>,
     vm_name: &str,
     online: &AtomicBool,
     running: &Arc<AtomicBool>,
@@ -215,7 +233,7 @@ fn serve(
         let authenticated = match agent_session::open(&mut stream, secret, vm_name) {
             Ok(session) => {
                 online.store(true, Ordering::Relaxed);
-                let outcome = agent_session::serve(&mut stream, &session, vm_name);
+                let outcome = agent_session::serve(&mut stream, &session, shares, vm_name);
                 online.store(false, Ordering::Relaxed);
                 if let Err(error) = outcome {
                     report(vm_name, &error);

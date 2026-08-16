@@ -11,8 +11,9 @@ use vmlord_agent_protocol::{
     frame::{self, FrameError},
     handshake::{self, CURRENT_VERSION},
     v1::{
-        AuthenticateResponse, Capability, Envelope, ErrorCode, HeartbeatRequest, HeartbeatResponse,
-        HelloRequest, ProtocolVersion, envelope, request, response,
+        AttachGpuSharesResponse, AuthenticateResponse, Capability, Envelope, ErrorCode, GpuMount,
+        GpuShare, HeartbeatRequest, HeartbeatResponse, HelloRequest, ProtocolVersion, envelope,
+        request, response,
     },
 };
 
@@ -21,10 +22,10 @@ const FIRST_HEARTBEAT_REQUEST_ID: u32 = HELLO_REQUEST_ID + 1;
 
 /// What this build of the agent implements beyond the base protocol.
 ///
-/// Empty: the guest has nothing optional to offer yet. `Capability::Gpu` lands
-/// with the GPU manifest the agent acts on, and announcing it before then would
-/// entitle the host to send messages nothing here answers.
-const AGENT_CAPABILITIES: &[Capability] = &[];
+/// `Capability::Gpu` is announced unconditionally, because it says what this
+/// build can do rather than what its VM has: an agent on a VM with no GPU is
+/// asked for no manifest, and one that was given shares can mount them.
+const AGENT_CAPABILITIES: &[Capability] = &[Capability::Gpu];
 
 /// What a session agreed on when it opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -36,6 +37,11 @@ pub struct Session {
 }
 
 /// Opens and serves the guest half of an agent session.
+///
+/// `attach` is what a GPU share manifest is carried out with. It is a
+/// parameter rather than a call into the mounting module because the order of
+/// the messages around it has to be testable against a peer made of bytes, and
+/// mounting a Hyper-V Plan9 share needs a Hyper-V host underneath.
 ///
 /// The session that was agreed on is returned so the caller can tell a
 /// connection that reached an authenticated session from one that did not:
@@ -50,17 +56,18 @@ pub struct Session {
 /// [`SessionError`] if the connection failed, the host answered the hello with
 /// something this build never offered, or the host sent something that has no
 /// place where it arrived.
-pub fn run<S: Read + Write>(
+pub fn run<S: Read + Write, A: FnMut(&[GpuShare]) -> (Vec<GpuMount>, bool)>(
     stream: &mut S,
     secret: &Secret,
     version: &str,
     opened: &mut Option<Session>,
+    attach: A,
 ) -> Result<(), SessionError> {
     let mut buffer = Vec::new();
     let session = greet(stream, version, &mut buffer)?;
     authenticate(stream, secret, &mut buffer)?;
-    *opened = Some(session);
-    serve(stream, &mut buffer)
+    let session = opened.insert(session);
+    serve(stream, session, attach, &mut buffer)
 }
 
 fn greet<S: Read + Write>(
@@ -146,7 +153,12 @@ fn authenticate<S: Read + Write>(
     frame::write(stream, &answer, buffer).map_err(SessionError::Frame)
 }
 
-fn serve<S: Read + Write>(stream: &mut S, buffer: &mut Vec<u8>) -> Result<(), SessionError> {
+fn serve<S: Read + Write, A: FnMut(&[GpuShare]) -> (Vec<GpuMount>, bool)>(
+    stream: &mut S,
+    session: &Session,
+    mut attach: A,
+    buffer: &mut Vec<u8>,
+) -> Result<(), SessionError> {
     let mut next_request_id = FIRST_HEARTBEAT_REQUEST_ID;
     let mut pending_heartbeat = None;
 
@@ -177,6 +189,23 @@ fn serve<S: Read + Write>(stream: &mut S, buffer: &mut Vec<u8>) -> Result<(), Se
                 let heartbeat =
                     Envelope::response(request_id, response::Kind::Heartbeat(HeartbeatResponse {}));
                 frame::write(stream, &heartbeat, buffer).map_err(SessionError::Frame)?;
+            }
+            // A manifest is the host's to send and the guest's to carry out,
+            // and it is answered from the same place a heartbeat is: mounting
+            // takes seconds, and a session that answered nothing meanwhile
+            // would be a session with two conversations in it.
+            Body::Request(request::Kind::AttachGpuShares(manifest))
+                if session.capabilities.contains(&Capability::Gpu) =>
+            {
+                let (mounts, libraries_refreshed) = attach(&manifest.shares);
+                let report = Envelope::response(
+                    request_id,
+                    response::Kind::AttachGpuShares(AttachGpuSharesResponse {
+                        mounts,
+                        libraries_refreshed,
+                    }),
+                );
+                frame::write(stream, &report, buffer).map_err(SessionError::Frame)?;
             }
             Body::Request(_) | Body::UnknownRequest => {
                 refuse_unsupported(stream, request_id, buffer)?;
@@ -258,6 +287,7 @@ fn kind_name(kind: &request::Kind) -> &'static str {
         request::Kind::Hello(_) => "a hello request out of order",
         request::Kind::Authenticate(_) => "an authentication challenge out of order",
         request::Kind::Heartbeat(_) => "a heartbeat request out of order",
+        request::Kind::AttachGpuShares(_) => "a GPU share manifest out of order",
     }
 }
 
@@ -321,12 +351,21 @@ mod tests {
         auth::{self, Nonce, Secret},
         frame,
         v1::{
-            AuthenticateRequest, ErrorCode, HelloRequest, HelloResponse, ProtocolVersion, envelope,
-            request, response,
+            AttachGpuSharesRequest, AuthenticateRequest, Capability, ErrorCode, GpuMount,
+            GpuMountState, GpuShare, GpuShareRole, HelloRequest, HelloResponse, ProtocolVersion,
+            envelope, request, response,
         },
     };
 
     use super::run;
+
+    /// An attach that mounts nothing, for the tests about message order.
+    ///
+    /// Every one of them would otherwise ask a machine with no Hyper-V under
+    /// it to mount a Plan9 share.
+    fn refuse_to_mount(_shares: &[GpuShare]) -> (Vec<GpuMount>, bool) {
+        (Vec::new(), false)
+    }
 
     /// A host peer that returns the exact bytes and timeout a session expects.
     struct ScriptedStream {
@@ -431,8 +470,14 @@ mod tests {
         ]);
 
         let mut opened = None;
-        run(&mut stream, &secret, "test-agent", &mut opened)
-            .expect("the host closes after the heartbeat");
+        run(
+            &mut stream,
+            &secret,
+            "test-agent",
+            &mut opened,
+            refuse_to_mount,
+        )
+        .expect("the host closes after the heartbeat");
 
         let frames = stream.written_frames();
         assert_eq!(frames.len(), 3);
@@ -442,7 +487,7 @@ mod tests {
                 1,
                 request::Kind::Hello(HelloRequest {
                     version: Some(ProtocolVersion::current()),
-                    capabilities: vec![],
+                    capabilities: vec![i32::from(Capability::Gpu)],
                     agent_version: "test-agent".to_owned(),
                 }),
             )
@@ -496,8 +541,14 @@ mod tests {
             ReadStep::WouldBlock,
         ]);
 
-        let error = run(&mut stream, &secret, "test-agent", &mut None)
-            .expect_err("a timeout after a partial frame must end the session");
+        let error = run(
+            &mut stream,
+            &secret,
+            "test-agent",
+            &mut None,
+            refuse_to_mount,
+        )
+        .expect_err("a timeout after a partial frame must end the session");
         assert!(matches!(
             error,
             super::SessionError::Frame(frame::FrameError::Io(error))
@@ -536,8 +587,14 @@ mod tests {
             }),
         ]);
 
-        run(&mut stream, &secret, "test-agent", &mut None)
-            .expect("the host closes after the refusal");
+        run(
+            &mut stream,
+            &secret,
+            "test-agent",
+            &mut None,
+            refuse_to_mount,
+        )
+        .expect("the host closes after the refusal");
 
         let frames = stream.written_frames();
         assert_eq!(frames.len(), 3);
@@ -580,7 +637,14 @@ mod tests {
         ]);
 
         let mut opened = None;
-        run(&mut stream, &secret, "test-agent", &mut opened).expect("a compatible host hang-up");
+        run(
+            &mut stream,
+            &secret,
+            "test-agent",
+            &mut opened,
+            refuse_to_mount,
+        )
+        .expect("a compatible host hang-up");
         assert_eq!(opened.expect("a session that authenticated").version, older);
 
         let frames = stream.written_frames();
@@ -606,20 +670,149 @@ mod tests {
                 1,
                 response::Kind::Hello(HelloResponse {
                     version: Some(ProtocolVersion::current()),
-                    capabilities: vec![i32::from(vmlord_agent_protocol::v1::Capability::Gpu)],
+                    // A number no build here can name, which is what a host
+                    // one release ahead would answer with.
+                    capabilities: vec![97],
                 }),
             ),
         )]);
 
         let mut opened = None;
-        let error = run(&mut stream, &secret, "test-agent", &mut opened)
-            .expect_err("a capability the agent did not announce must not be served");
+        let error = run(
+            &mut stream,
+            &secret,
+            "test-agent",
+            &mut opened,
+            refuse_to_mount,
+        )
+        .expect_err("a capability the agent did not announce must not be served");
 
         assert!(matches!(error, super::SessionError::InvalidHello(_)));
         assert_eq!(opened, None);
         // The hello and nothing else: no tag is handed to a host whose session
         // this agent has already refused.
         assert_eq!(stream.written_frames().len(), 1);
+    }
+
+    #[test]
+    fn a_manifest_on_a_gpu_session_is_carried_out_and_reported_back() {
+        // The host reads this answer to find out what the guest has mounted,
+        // so it has to arrive as the response to the request that asked.
+        let secret = Secret::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .expect("a valid test secret");
+        let nonce = Nonce::from_wire(&[7; auth::LEN]).expect("a valid nonce");
+        let manifest = vec![GpuShare {
+            name: "vmlord.gpu.wsl-lib".to_owned(),
+            role: i32::from(GpuShareRole::WslLib),
+            package: String::new(),
+        }];
+        let mut stream = ScriptedStream::new([
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::response(
+                1,
+                response::Kind::Hello(HelloResponse {
+                    version: Some(ProtocolVersion::current()),
+                    capabilities: vec![i32::from(Capability::Gpu)],
+                }),
+            )),
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::request(
+                1,
+                request::Kind::Authenticate(AuthenticateRequest {
+                    nonce: nonce.as_bytes().to_vec(),
+                }),
+            )),
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::request(
+                4,
+                request::Kind::AttachGpuShares(AttachGpuSharesRequest {
+                    shares: manifest.clone(),
+                }),
+            )),
+        ]);
+
+        let mut attached = Vec::new();
+        run(
+            &mut stream,
+            &secret,
+            "test-agent",
+            &mut None,
+            |shares: &[GpuShare]| {
+                attached.extend_from_slice(shares);
+                (
+                    vec![GpuMount {
+                        share: "vmlord.gpu.wsl-lib".to_owned(),
+                        state: i32::from(GpuMountState::Mounted),
+                        path: "/usr/lib/wsl/lib".to_owned(),
+                        message: "mounted".to_owned(),
+                    }],
+                    true,
+                )
+            },
+        )
+        .expect("the host closes after its manifest was answered");
+
+        assert_eq!(attached, manifest);
+        let frames = stream.written_frames();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[2].request_id, 4);
+        let Some(envelope::Body::Response(response)) = &frames[2].body else {
+            panic!("the manifest needs a response");
+        };
+        let Some(response::Kind::AttachGpuShares(report)) = &response.kind else {
+            panic!("the manifest needs a mount report");
+        };
+        assert!(report.libraries_refreshed);
+        assert_eq!(report.mounts.len(), 1);
+        assert_eq!(report.mounts[0].path, "/usr/lib/wsl/lib");
+    }
+
+    #[test]
+    fn a_manifest_on_a_session_without_the_gpu_capability_is_refused() {
+        // The capability is what says the two builds agreed this session may
+        // carry a manifest at all. Mounting one that was never agreed on would
+        // make the negotiation decorative.
+        let secret = Secret::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .expect("a valid test secret");
+        let nonce = Nonce::from_wire(&[7; auth::LEN]).expect("a valid nonce");
+        let mut stream = ScriptedStream::new([
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::response(
+                1,
+                response::Kind::Hello(HelloResponse {
+                    version: Some(ProtocolVersion::current()),
+                    capabilities: vec![],
+                }),
+            )),
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::request(
+                1,
+                request::Kind::Authenticate(AuthenticateRequest {
+                    nonce: nonce.as_bytes().to_vec(),
+                }),
+            )),
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::request(
+                4,
+                request::Kind::AttachGpuShares(AttachGpuSharesRequest { shares: vec![] }),
+            )),
+        ]);
+
+        run(
+            &mut stream,
+            &secret,
+            "test-agent",
+            &mut None,
+            |_shares: &[GpuShare]| {
+                panic!("a manifest that was never agreed on must not be mounted")
+            },
+        )
+        .expect("the host closes after the refusal");
+
+        let frames = stream.written_frames();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[2].request_id, 4);
+        let Some(envelope::Body::Response(response)) = &frames[2].body else {
+            panic!("the manifest needs a response");
+        };
+        let Some(response::Kind::Error(error)) = &response.kind else {
+            panic!("the manifest needs an error response");
+        };
+        assert_eq!(error.code(), ErrorCode::UnsupportedRequest);
     }
 
     #[test]
@@ -645,8 +838,14 @@ mod tests {
         )]);
 
         let mut opened = None;
-        let error = run(&mut stream, &secret, "test-agent", &mut opened)
-            .expect_err("a revision this agent never claimed must not be served");
+        let error = run(
+            &mut stream,
+            &secret,
+            "test-agent",
+            &mut opened,
+            refuse_to_mount,
+        )
+        .expect_err("a revision this agent never claimed must not be served");
 
         assert!(matches!(error, super::SessionError::InvalidHello(_)));
         assert_eq!(opened, None);
@@ -669,8 +868,14 @@ mod tests {
         )]);
 
         let mut opened = None;
-        run(&mut stream, &secret, "test-agent", &mut opened)
-            .expect_err("a host that hangs up before its challenge ends the session");
+        run(
+            &mut stream,
+            &secret,
+            "test-agent",
+            &mut opened,
+            refuse_to_mount,
+        )
+        .expect_err("a host that hangs up before its challenge ends the session");
 
         assert_eq!(opened, None);
     }

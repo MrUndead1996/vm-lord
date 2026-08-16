@@ -14,9 +14,9 @@ use std::{
 
 use uuid::Uuid;
 use vmlord_core::{
-    AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, GuestReadinessTimeouts,
-    HostGpuCapabilities, NetworkMode, RepositoryError, SshAvailability, VmCreateRequest,
-    VmDeleteRequest, VmGpuFacts, VmRepository, VmState, VmSummary, VmUpdateRequest,
+    AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, GuestReadinessTimeouts, HostGpuCapabilities,
+    NetworkMode, RepositoryError, SshAvailability, VmCreateRequest, VmDeleteRequest, VmGpuFacts,
+    VmRepository, VmState, VmSummary, VmUpdateRequest,
 };
 
 use crate::{
@@ -418,6 +418,10 @@ impl HcsVmRepository {
             mapping,
             runtime_id,
             &layout::agent_secret_path(&vm_directory),
+            // No manifest yet: the shares a VM is started with are computed
+            // and written into its compute system by the lifecycle task, and
+            // until they are there is nothing to tell a guest to mount.
+            None,
         ) {
             Ok(connection) => self.agent_sessions.insert(connection),
             Err(error) => log::warn!(

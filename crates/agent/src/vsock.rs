@@ -69,6 +69,17 @@ pub fn connect(cid: u32, port: u32) -> io::Result<VsockStream> {
     Ok(stream)
 }
 
+impl VsockStream {
+    /// The descriptor, for a caller that hands it to something else.
+    ///
+    /// Borrowed rather than given away: the 9p mount takes its own reference
+    /// to the file, so the stream still closes its copy when it is dropped.
+    #[must_use]
+    pub const fn as_raw_fd(&self) -> RawFd {
+        self.descriptor
+    }
+}
+
 impl Read for VsockStream {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         // SAFETY: `buffer` is a valid mutable byte slice for this call.

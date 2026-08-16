@@ -46,12 +46,12 @@ message Request {
     HelloRequest hello = 1;
     HeartbeatRequest heartbeat = 2;
     AuthenticateRequest authenticate = 3;
+    AttachGpuSharesRequest attach_gpu_shares = 4;
   }
 
-  // Field 4 onwards is where the rest of the protocol lands: the GPU share
-  // manifest and the guest's GPU report. Each arrives with the task that
-  // implements it, so that the shape is designed against working code rather
-  // than guessed at here.
+  // Field 5 onwards is where the rest of the protocol lands: the guest's GPU
+  // report. It arrives with the task that implements it, so that the shape is
+  // designed against working code rather than guessed at here.
 }
 
 // The answer to exactly one `Request`, carrying its `request_id`.
@@ -65,6 +65,7 @@ message Response {
     HelloResponse hello = 2;
     HeartbeatResponse heartbeat = 3;
     AuthenticateResponse authenticate = 4;
+    AttachGpuSharesResponse attach_gpu_shares = 5;
   }
 }
 
@@ -148,6 +149,100 @@ message AuthenticateResponse {
 message HeartbeatRequest {}
 
 message HeartbeatResponse {}
+
+// Hands the guest the Plan9 shares its VM was given, for it to mount.
+//
+// Sent once per session, after the challenge, on a session that agreed
+// `CAPABILITY_GPU`. A reconnecting agent is sent the manifest again: the host
+// cannot tell a guest that lost its socket from one that rebooted, and the
+// guest reconciles rather than mounts, so re-sending costs a message and
+// saves the host from having to know which happened.
+message AttachGpuSharesRequest {
+  // Every share the VM has, not the ones that changed. The guest unmounts
+  // what this list no longer names, which a delta could not express without
+  // both ends agreeing on what was sent last.
+  repeated GpuShare shares = 1;
+}
+
+// One Plan9 share, as the guest is told about it.
+//
+// A role and never a host path: where a share is mounted is the guest's
+// decision, taken from its own allowlist, so a host cannot dictate a path
+// into a guest filesystem and its topology stays on the host.
+message GpuShare {
+  // What the share is called on the host, which is also `aname=` when the
+  // guest mounts it. Restricted to `[A-Za-z0-9._-]` by whatever named it,
+  // because it travels in a comma-separated mount option string.
+  string name = 1;
+
+  GpuShareRole role = 2;
+
+  // The DriverStore folder the package came from, for
+  // `GPU_SHARE_ROLE_DRIVER_PACKAGE` and empty for every other role. It is
+  // what distinguishes one package share from the next, and the guest
+  // validates it before it becomes part of a path.
+  string package = 3;
+}
+
+// What the guest is meant to make of a share.
+//
+// An enum rather than a convention about the name, so that an agent installed
+// months ago is never asked to derive meaning from a string a newer host
+// invented.
+enum GpuShareRole {
+  GPU_SHARE_ROLE_UNSPECIFIED = 0;
+
+  // The host's WSL Linux userspace.
+  GPU_SHARE_ROLE_WSL_LIB = 1;
+
+  // One driver package, named by `GpuShare.package`.
+  GPU_SHARE_ROLE_DRIVER_PACKAGE = 2;
+
+  // The VM's own prepared GPU payload generation.
+  GPU_SHARE_ROLE_GPU_PAYLOAD = 3;
+}
+
+// What the guest made of the manifest, share by share.
+message AttachGpuSharesResponse {
+  // One entry per share of the request, in the order they arrived.
+  repeated GpuMount mounts = 1;
+
+  // Whether the dynamic linker was told about the mounted directories that
+  // hold shared objects. Separate from the mounts because a set of mounts
+  // that all succeeded is still unusable if `ldconfig` did not run.
+  bool libraries_refreshed = 2;
+}
+
+// What became of one share in the guest.
+message GpuMount {
+  // The share's name, repeated from the request so the host does not have to
+  // match this list against that one by position.
+  string share = 1;
+
+  GpuMountState state = 2;
+
+  // Where the share is mounted, and empty when it is not.
+  string path = 3;
+
+  // Free text for the host's log. `state` is what a peer branches on.
+  string message = 4;
+}
+
+enum GpuMountState {
+  GPU_MOUNT_STATE_UNSPECIFIED = 0;
+
+  // The share is mounted at `path` and reads back.
+  GPU_MOUNT_STATE_MOUNTED = 1;
+
+  // The guest has no target for this share: a role this build does not know,
+  // a package name it will not put in a path, or a target another share of
+  // the same manifest already claimed.
+  GPU_MOUNT_STATE_REFUSED = 2;
+
+  // The guest has a target for it and could not mount it, or mounted it and
+  // could not read it back.
+  GPU_MOUNT_STATE_FAILED = 3;
+}
 
 // A request that failed, described so the other side can act on it.
 message Error {
