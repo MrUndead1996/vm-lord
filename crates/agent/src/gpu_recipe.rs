@@ -13,7 +13,7 @@ use vmlord_agent_protocol::v1::{GpuRecipeStage, GpuRecipeStageState, GpuRecipeSt
 /// The order is the report's order, and the report is what the host logs, so
 /// it is written once here rather than implied by the sequence of calls in
 /// `gpu_kernel`.
-pub const STEPS: [GpuRecipeStep; 7] = [
+pub const STEPS: [GpuRecipeStep; 10] = [
     GpuRecipeStep::Distribution,
     GpuRecipeStep::Payload,
     GpuRecipeStep::BuildDependencies,
@@ -21,6 +21,9 @@ pub const STEPS: [GpuRecipeStep; 7] = [
     GpuRecipeStep::ModuleBuild,
     GpuRecipeStep::ModuleLoad,
     GpuRecipeStep::Device,
+    GpuRecipeStep::Userspace,
+    GpuRecipeStep::VulkanIcd,
+    GpuRecipeStep::Environment,
 ];
 
 /// What a recipe run has found out so far.
@@ -239,6 +242,148 @@ pub fn parse_dkms_conf(text: &str) -> Result<DkmsPackage, String> {
     }
 }
 
+/// Where a payload's userspace comes from.
+///
+/// The host has already checked this value against the catalog entry it
+/// downloaded the payload for; the guest honours it rather than deciding
+/// again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MesaPolicy {
+    /// The distribution's own Mesa, installed from the guest's apt.
+    Distro,
+    /// The Mesa tree the payload carries.
+    Bundled,
+}
+
+/// Reads `mesa_policy` out of a payload's `sources.json`.
+///
+/// Read here rather than folded into [`PayloadTarget`] on purpose: a policy
+/// this build has never heard of must fail the userspace stage it belongs to,
+/// not the payload stage after which a kernel module would have built and
+/// `/dev/dxg` would have worked.
+pub fn parse_mesa_policy(json: &str) -> Result<MesaPolicy, String> {
+    let document: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| format!("sources.json is unreadable: {error}"))?;
+    match document
+        .get("mesa_policy")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("distro") => Ok(MesaPolicy::Distro),
+        Some("bundled") => Ok(MesaPolicy::Bundled),
+        Some(other) => Err(format!(
+            "vmlord-agent has no recipe for the mesa policy {other}"
+        )),
+        None => Err("sources.json names no mesa policy".to_owned()),
+    }
+}
+
+/// The multiarch directory a Debian architecture's libraries live under.
+///
+/// Derived from the guest rather than written as a constant: an agent that
+/// hard-codes one architecture's library path is one that silently installs
+/// nothing on the other.
+pub fn library_triplet(architecture: &str) -> Option<&'static str> {
+    match architecture {
+        "amd64" => Some("x86_64-linux-gnu"),
+        "arm64" => Some("aarch64-linux-gnu"),
+        _ => None,
+    }
+}
+
+/// The Vulkan ICD documents among the names of a directory's entries.
+///
+/// Names from the payload and never a constant: AppSandbox's own notes record
+/// a README promising `microsoft_icd.x86_64.json` where Mesa shipped
+/// `dzn_icd.x86_64.json`, and a hard-coded name is a stage that reports
+/// success on a file it never found.
+pub fn icd_documents(names: &[String]) -> Vec<String> {
+    let mut documents: Vec<String> = names
+        .iter()
+        .filter(|name| name.ends_with(".json"))
+        .cloned()
+        .collect();
+    documents.sort();
+    documents
+}
+
+/// Which of the two files the environment is written into.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shell {
+    /// A systemd user-environment generator, which prints `NAME=VALUE`.
+    Generator,
+    /// A `profile.d` script, which is sourced and therefore exports.
+    Profile,
+}
+
+/// The userspace a process in this guest should be pointed at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Environment {
+    /// Directories to put on `LD_LIBRARY_PATH`, in order. The first is also
+    /// what the script checks for before setting anything.
+    pub library_paths: Vec<String>,
+    /// The ICD document to pin, when one was registered.
+    pub icd: Option<String>,
+}
+
+/// The variables that do not depend on what the payload turned out to carry.
+///
+/// `GALLIUM_DRIVER` and `MESA_LOADER_DRIVER_OVERRIDE` are both there because
+/// the first is direct gallium selection on the GLX path and the second is the
+/// DRI loader EGL and Wayland clients go through: setting one gives an
+/// accelerated GLX and llvmpipe on EGL.
+const FIXED: [(&str, &str); 3] = [
+    ("GALLIUM_DRIVER", "d3d12"),
+    ("MESA_LOADER_DRIVER_OVERRIDE", "d3d12"),
+    ("__GLX_VENDOR_LIBRARY_NAME", "mesa"),
+];
+
+/// The script that points a process at this userspace, when there is a GPU.
+///
+/// A script with the probe inside rather than a file of finished values: the
+/// file outlives a reboot and `/dev/dxg` does not, and a VM restarted without
+/// a GPU and a static `MESA_LOADER_DRIVER_OVERRIDE=d3d12` is a guest where GL
+/// stops working entirely.
+pub fn environment_document(form: Shell, environment: &Environment) -> String {
+    let libraries = environment.library_paths.join(":");
+    let guard = environment
+        .library_paths
+        .first()
+        .cloned()
+        .unwrap_or_default();
+
+    let mut document = String::from("#!/bin/sh\n# Written by vmlord-agent. Do not edit.\n#\n");
+    document.push_str("# The GPU is checked on every start: this file outlives a reboot and\n");
+    document.push_str("# /dev/dxg does not.\n");
+    document.push_str(&format!("if [ -e /dev/dxg ] && [ -d {guard} ]; then\n"));
+
+    match form {
+        Shell::Generator => {
+            document.push_str(&format!("    echo \"LD_LIBRARY_PATH={libraries}\"\n"));
+            for (name, value) in FIXED {
+                document.push_str(&format!("    echo \"{name}={value}\"\n"));
+            }
+            if let Some(icd) = &environment.icd {
+                document.push_str(&format!("    echo \"VK_DRIVER_FILES={icd}\"\n"));
+            }
+        }
+        Shell::Profile => {
+            document.push_str(&format!(
+                "    LD_LIBRARY_PATH=\"{libraries}${{LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}}\"\n"
+            ));
+            document.push_str("    export LD_LIBRARY_PATH\n");
+            for (name, value) in FIXED {
+                document.push_str(&format!("    export {name}={value}\n"));
+            }
+            if let Some(icd) = &environment.icd {
+                document.push_str(&format!("    export VK_DRIVER_FILES={icd}\n"));
+            }
+        }
+    }
+
+    document.push_str("fi\n");
+    document
+}
+
 /// Whether `/proc/modules` says the module is loaded.
 pub fn module_is_loaded(proc_modules: &str, module: &str) -> bool {
     proc_modules
@@ -264,9 +409,10 @@ mod tests {
     use vmlord_agent_protocol::v1::{GpuRecipeStageState, GpuRecipeStep};
 
     use super::{
-        Applicability, DkmsPackage, GpuRecipe, GuestFacts, PayloadTarget, Report, STEPS,
-        applicability, dkms_reports_installed, module_is_loaded, parse_dkms_conf, parse_os_release,
-        parse_payload_target, recipe_for,
+        Applicability, DkmsPackage, Environment, GpuRecipe, GuestFacts, MesaPolicy, PayloadTarget,
+        Report, STEPS, Shell, applicability, dkms_reports_installed, environment_document,
+        icd_documents, library_triplet, module_is_loaded, parse_dkms_conf, parse_mesa_policy,
+        parse_os_release, parse_payload_target, recipe_for,
     };
 
     fn ubuntu_guest() -> GuestFacts {
@@ -478,5 +624,161 @@ mod tests {
             "7.0.0-14-generic"
         ));
         assert!(!dkms_reports_installed("", &package, "7.0.0-14-generic"));
+    }
+
+    #[test]
+    fn a_payload_names_the_mesa_policy_it_was_built_with() {
+        assert_eq!(
+            parse_mesa_policy(r#"{"mesa_policy": "bundled"}"#),
+            Ok(MesaPolicy::Bundled)
+        );
+        assert_eq!(
+            parse_mesa_policy(r#"{"mesa_policy":"distro","target":{}}"#),
+            Ok(MesaPolicy::Distro)
+        );
+    }
+
+    #[test]
+    fn a_policy_this_build_does_not_know_is_an_error_and_not_a_guess() {
+        // A payload built newer than this agent must fail the stage it belongs
+        // to rather than be treated as one of the policies that exist today.
+        for document in [r#"{"mesa_policy": "flatpak"}"#, "{}", "not json"] {
+            assert!(parse_mesa_policy(document).is_err(), "{document}");
+        }
+    }
+
+    #[test]
+    fn every_architecture_with_a_recipe_has_a_library_path() {
+        assert_eq!(library_triplet("amd64"), Some("x86_64-linux-gnu"));
+        assert_eq!(library_triplet("arm64"), Some("aarch64-linux-gnu"));
+        assert_eq!(library_triplet("riscv64"), None);
+        assert_eq!(library_triplet(""), None);
+    }
+
+    #[test]
+    fn the_icd_documents_of_a_directory_are_its_json_files_in_order() {
+        // The names come from the payload rather than a constant: Mesa has
+        // shipped this file under more than one name.
+        let names = [
+            "dzn_icd.x86_64.json".to_owned(),
+            "README".to_owned(),
+            "lvp_icd.x86_64.json".to_owned(),
+            "notes.json.bak".to_owned(),
+        ];
+
+        assert_eq!(
+            icd_documents(&names),
+            vec![
+                "dzn_icd.x86_64.json".to_owned(),
+                "lvp_icd.x86_64.json".to_owned()
+            ]
+        );
+        assert!(icd_documents(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_generator_prints_what_a_session_inherits() {
+        let document = environment_document(
+            Shell::Generator,
+            &Environment {
+                library_paths: vec![
+                    "/opt/vmlord/wsl-mesa/lib/x86_64-linux-gnu".to_owned(),
+                    "/usr/lib/wsl/lib".to_owned(),
+                ],
+                icd: Some("/etc/vulkan/icd.d/dzn_icd.x86_64.json".to_owned()),
+            },
+        );
+
+        assert!(document.starts_with("#!/bin/sh\n"), "{document}");
+        // The probe runs on every start: this file outlives a reboot and
+        // /dev/dxg does not.
+        assert!(document.contains("[ -e /dev/dxg ]"), "{document}");
+        assert!(
+            document.contains("[ -d /opt/vmlord/wsl-mesa/lib/x86_64-linux-gnu ]"),
+            "{document}"
+        );
+        assert!(
+            document.contains(
+                "echo \"LD_LIBRARY_PATH=/opt/vmlord/wsl-mesa/lib/x86_64-linux-gnu:/usr/lib/wsl/lib\""
+            ),
+            "{document}"
+        );
+        // Both, always: the first is gallium selection on the GLX path, the
+        // second is the DRI loader EGL and Wayland clients use.
+        assert!(
+            document.contains("echo \"GALLIUM_DRIVER=d3d12\""),
+            "{document}"
+        );
+        assert!(
+            document.contains("echo \"MESA_LOADER_DRIVER_OVERRIDE=d3d12\""),
+            "{document}"
+        );
+        assert!(
+            document.contains("echo \"__GLX_VENDOR_LIBRARY_NAME=mesa\""),
+            "{document}"
+        );
+        assert!(
+            document.contains("echo \"VK_DRIVER_FILES=/etc/vulkan/icd.d/dzn_icd.x86_64.json\""),
+            "{document}"
+        );
+    }
+
+    #[test]
+    fn the_profile_script_exports_and_never_exits_the_shell_it_is_sourced_by() {
+        let document = environment_document(
+            Shell::Profile,
+            &Environment {
+                library_paths: vec!["/usr/lib/wsl/lib".to_owned()],
+                icd: None,
+            },
+        );
+
+        // Sourced by /etc/profile: an `exit` here would end the login shell.
+        assert!(!document.contains("exit"), "{document}");
+        assert!(
+            document.contains(
+                "LD_LIBRARY_PATH=\"/usr/lib/wsl/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}\""
+            ),
+            "{document}"
+        );
+        assert!(document.contains("export LD_LIBRARY_PATH"), "{document}");
+        assert!(document.contains("export GALLIUM_DRIVER=d3d12"), "{document}");
+        // Nothing was registered, so nothing is pinned.
+        assert!(!document.contains("VK_DRIVER_FILES"), "{document}");
+    }
+
+    #[test]
+    fn the_same_environment_writes_the_same_document() {
+        // What makes the second start of a VM report the stage as skipped.
+        let environment = Environment {
+            library_paths: vec!["/usr/lib/wsl/lib".to_owned()],
+            icd: None,
+        };
+
+        assert_eq!(
+            environment_document(Shell::Generator, &environment),
+            environment_document(Shell::Generator, &environment)
+        );
+        assert_ne!(
+            environment_document(Shell::Generator, &environment),
+            environment_document(Shell::Profile, &environment)
+        );
+    }
+
+    #[test]
+    fn the_userspace_steps_a_failed_device_never_reached_carry_its_reason() {
+        let mut report = Report::new();
+        report.ok(GpuRecipeStep::Distribution, "ubuntu");
+        report.failed(GpuRecipeStep::Device, "/dev/dxg is missing");
+
+        let stages = report.finish("/dev/dxg never appeared");
+
+        assert_eq!(stages.len(), STEPS.len());
+        for stage in &stages[STEPS.len() - 3..] {
+            assert_eq!(stage.state(), GpuRecipeStageState::Skipped);
+            assert_eq!(stage.message, "/dev/dxg never appeared");
+        }
+        assert_eq!(stages[STEPS.len() - 3].step(), GpuRecipeStep::Userspace);
+        assert_eq!(stages[STEPS.len() - 1].step(), GpuRecipeStep::Environment);
     }
 }

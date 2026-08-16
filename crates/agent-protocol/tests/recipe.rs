@@ -65,6 +65,42 @@ fn an_apply_request_carries_nothing_and_still_arrives() {
 }
 
 #[test]
-fn the_recipe_report_belongs_to_revision_one_three() {
-    assert_eq!((CURRENT_VERSION.major, CURRENT_VERSION.minor), (1, 3));
+fn the_userspace_steps_belong_to_revision_one_four() {
+    // Enum values only, so an agent from 1.3 simply never sends these and a
+    // host from 1.3 logs a step it has no name for rather than misreading one.
+    assert_eq!((CURRENT_VERSION.major, CURRENT_VERSION.minor), (1, 4));
+
+    let report = Envelope::response(
+        9,
+        response::Kind::ApplyGpuRecipe(ApplyGpuRecipeResponse {
+            stages: vec![
+                GpuRecipeStage {
+                    step: i32::from(GpuRecipeStep::Userspace),
+                    state: i32::from(GpuRecipeStageState::Ok),
+                    message: "staged mesa from the payload".to_owned(),
+                },
+                GpuRecipeStage {
+                    step: i32::from(GpuRecipeStep::VulkanIcd),
+                    state: i32::from(GpuRecipeStageState::Skipped),
+                    message: "the payload carries no Vulkan driver".to_owned(),
+                },
+                GpuRecipeStage {
+                    step: i32::from(GpuRecipeStep::Environment),
+                    state: i32::from(GpuRecipeStageState::Ok),
+                    message: "wrote the generator and the profile script".to_owned(),
+                },
+            ],
+        }),
+    );
+
+    let decoded = Envelope::decode(report.encode_to_vec().as_slice()).expect("a decodable report");
+    let Some(envelope::Body::Response(response)) = decoded.body else {
+        panic!("a report is a response");
+    };
+    let Some(response::Kind::ApplyGpuRecipe(report)) = response.kind else {
+        panic!("a report is a recipe report");
+    };
+    assert_eq!(report.stages[0].step(), GpuRecipeStep::Userspace);
+    assert_eq!(report.stages[1].step(), GpuRecipeStep::VulkanIcd);
+    assert_eq!(report.stages[2].step(), GpuRecipeStep::Environment);
 }

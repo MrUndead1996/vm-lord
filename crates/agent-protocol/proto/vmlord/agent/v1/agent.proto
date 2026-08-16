@@ -307,6 +307,17 @@ enum GpuRecipeStep {
 
   // The device node the module is there to create.
   GPU_RECIPE_STEP_DEVICE = 7;
+
+  // The Mesa userspace the payload's policy calls for: the distribution's
+  // own, or the tree the payload carries.
+  GPU_RECIPE_STEP_USERSPACE = 8;
+
+  // The Vulkan driver a payload may carry, registered where the loader
+  // looks for it.
+  GPU_RECIPE_STEP_VULKAN_ICD = 9;
+
+  // What makes a process in this guest pick that userspace.
+  GPU_RECIPE_STEP_ENVIRONMENT = 10;
 }
 
 enum GpuRecipeStageState {

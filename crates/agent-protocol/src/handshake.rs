@@ -16,7 +16,7 @@ use crate::v1::{Capability, ProtocolVersion};
 /// `major` changes when an existing message changes meaning; `minor` changes
 /// when something is added. A guest agent is upgraded on its own schedule, so
 /// this is the number a session negotiates against, never the crate version.
-pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 3 };
+pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 4 };
 
 impl ProtocolVersion {
     /// The revision this build implements.
