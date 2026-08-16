@@ -12,6 +12,7 @@
 //! format shows up in a diff.
 
 pub mod auth;
+pub mod backoff;
 pub mod envelope;
 pub mod frame;
 pub mod handshake;

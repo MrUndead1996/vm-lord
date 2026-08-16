@@ -1997,8 +1997,69 @@ This gives a cloud VM three SCSI attachments: its system disk, the NoCloud
 seed, and the tools ISO. A local-media VM receives no cloud-init configuration
 and no agent, so it deliberately remains at two attachments. If the sibling
 agent binary is absent, creation warns and follows that same no-agent path;
-it does not create a tools ISO or agent secret. Reconnect/backoff, GPU
-capabilities, and Plan9 mounts remain later work.
+it does not create a tools ISO or agent secret. GPU capabilities and Plan9
+mounts remain later work.
+
+### Reconnecting
+
+The agent outlives any one connection, and the reconnect is its own rather than
+the unit's. `Restart=always` is what recovers from a crash; it is the wrong
+instrument for a host that is not there, because a fixed `RestartSec` cannot
+back off -- a VMLord closed for an hour would be polled seven hundred times --
+and a process that exits because the host hung up is not a failure, however it
+reads in `systemctl`. So `vmlord-agent` reads its secret once and then repeats:
+connect, run a session, wait, connect again. The only thing that ends it is a
+secret that cannot be read, because a VM's secret is minted at creation and
+never rotated: nothing that happens while the guest runs can turn an unusable
+one into a usable one.
+
+The wait comes from `backoff`, which both ends of the socket share so that they
+cannot drift apart: one second, doubling, capped at thirty. The rule is
+deliberately not a table of error classes -- a refused connect, a host that hung
+up mid-handshake, a revision that could not be negotiated and a tag the host
+would not take are all "the peer is not talking to me", and the only question a
+retry answers is how soon to ask again. **A session that authenticated is what
+starts the wait over**, because it is the one thing that proves the other side
+is there. The cap is therefore the bound on how long after a VMLord restart a
+VM's agent comes back.
+
+The host applies the same rule from its side. Its accept loop takes the next
+connection as soon as a session ends, which is exactly right for an agent
+reconnecting on that backoff, but a peer that connects and drops without ever
+authenticating would otherwise be served as fast as the thread can loop. After
+such a session the loop waits, on the same backoff, in `ACCEPT_POLL`-sized
+slices with the running flag read between them -- stopping a VM joins that
+thread, and must stay bounded by the poll rather than by the longest wait.
+
+A reconnect re-binds nothing and modifies nothing. The listener belongs to the
+VM's run and stays bound to the runtime id that run was given; no HCS call, no
+device assignment and no configuration write is on this path. Nor is anything
+resumed: a new connection is a new hello, a new nonce and a new challenge, and
+since the challenge is what makes a recorded answer worthless there is nothing
+from the previous session worth carrying over. VMLord restarting is the same
+story from the other end, and is what `initialize` already does -- it puts the
+standing offer back up for every VM that is running, and the agent inside each
+one connects to it on the next turn of its loop.
+
+### Confirming what the other side agreed to
+
+The host picks the session's revision and capability set out of the two hellos;
+the guest checks that what came back is something it offered. `confirm_version`
+accepts the guest's own major with a minor no higher than the guest's, and
+`confirm_capabilities` accepts a subset of what the guest announced -- an
+unknown capability number included, because in an *agreed* set a number this
+build cannot name is not a capability to drop but a peer expecting messages
+nothing here answers. Both live beside `negotiate_version` and
+`agreed_capabilities` in `handshake`, which is what keeps the two ends from
+disagreeing about what was agreed. Either failure ends the connection: there is
+no third round in this handshake, and the reconnect above is what a peer that
+answered unofferably gets instead.
+
+The guest keeps the confirmed pair for the life of its session, which is what
+decides later whether it may act on a GPU manifest at all. Today both ends
+announce nothing -- `CAPABILITY_GPU` is a promise neither can keep until that
+manifest lands -- so every session agrees on the empty set and the pair is only
+logged.
 
 Failures are `Error { code, message }` rather than a string. The code is what a
 peer branches on -- an unsupported version, an unauthenticated session, a

@@ -22,10 +22,11 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
 use uuid::Uuid;
-use vmlord_agent_protocol::auth::Secret;
+use vmlord_agent_protocol::{auth::Secret, backoff::Backoff};
 use vmlord_core::RepositoryError;
 use zeroize::Zeroizing;
 
@@ -179,6 +180,18 @@ impl Drop for AgentConnection {
 /// the one already proved it holds the secret. A reconnecting agent is served
 /// by the next turn of this loop, which is what makes losing a connection
 /// survivable without anything here knowing that it was lost.
+///
+/// Nothing on that turn touches Hyper-V. The listener stays bound to the
+/// runtime id of the run it was created for, and a reconnect is a new session
+/// on it rather than a VM that has to be modified: what a guest proved in the
+/// session before is worth nothing to the next one anyway, since the challenge
+/// it answered was drawn for that session alone.
+///
+/// A connection that never authenticates is the one thing this loop slows down
+/// for. VMLord's own agent reconnects on a backoff of its own, so a peer that
+/// connects and drops as fast as this thread can accept is a broken agent or
+/// something else on the machine that found the service, and serving it at that
+/// rate would cost a busy thread per VM.
 fn serve(
     listener: &AgentListener,
     secret: &Secret,
@@ -186,10 +199,12 @@ fn serve(
     online: &AtomicBool,
     running: &Arc<AtomicBool>,
 ) {
+    let mut backoff = Backoff::new();
+
     while running.load(Ordering::Relaxed) {
         let mut stream = match listener.accept(ACCEPT_POLL, running) {
             Ok(Some(stream)) => stream,
-            // Nobody connected in the last second, which is what a guest that
+            // Nobody connected in the last poll, which is what a guest that
             // has not finished booting looks like.
             Ok(None) => continue,
             // The listener is broken rather than idle: retrying it in a loop
@@ -197,7 +212,7 @@ fn serve(
             Err(_) => break,
         };
 
-        match agent_session::open(&mut stream, secret, vm_name) {
+        let authenticated = match agent_session::open(&mut stream, secret, vm_name) {
             Ok(session) => {
                 online.store(true, Ordering::Relaxed);
                 let outcome = agent_session::serve(&mut stream, &session, vm_name);
@@ -205,9 +220,31 @@ fn serve(
                 if let Err(error) = outcome {
                     report(vm_name, &error);
                 }
+                true
             }
-            Err(error) => report(vm_name, &error),
-        }
+            Err(error) => {
+                report(vm_name, &error);
+                false
+            }
+        };
+        // Dropped before the wait: a guest reconnecting during it must not find
+        // the socket of the session that just ended still open.
+        drop(stream);
+        wait_before_offering_again(backoff.after(authenticated), running);
+    }
+}
+
+/// Waits out the backoff, in slices short enough to stop a VM in.
+///
+/// The wait is spent in [`ACCEPT_POLL`]-sized pieces with the running flag read
+/// between them, because dropping an `AgentConnection` joins this thread and
+/// must stay bounded by that poll rather than by the longest backoff.
+fn wait_before_offering_again(delay: Duration, running: &AtomicBool) {
+    let mut waited = Duration::ZERO;
+    while waited < delay && running.load(Ordering::Relaxed) {
+        let slice = ACCEPT_POLL.min(delay - waited);
+        thread::sleep(slice);
+        waited += slice;
     }
 }
 
@@ -265,6 +302,7 @@ mod tests {
             Arc,
             atomic::{AtomicBool, Ordering},
         },
+        time::{Duration, Instant},
     };
 
     use uuid::Uuid;
@@ -351,6 +389,29 @@ mod tests {
 
         assert_eq!(sessions.is_online(first), None);
         assert_eq!(sessions.is_online(second), None);
+    }
+
+    #[test]
+    fn a_backoff_wait_lasts_as_long_as_it_was_given() {
+        let running = AtomicBool::new(true);
+        let delay = Duration::from_millis(120);
+
+        let started = Instant::now();
+        super::wait_before_offering_again(delay, &running);
+
+        assert!(started.elapsed() >= delay);
+    }
+
+    #[test]
+    fn a_backoff_wait_ends_when_the_connection_is_told_to_stop() {
+        // Stopping a VM joins this thread, so a wait that ran to the end would
+        // freeze the caller for as long as the longest backoff.
+        let running = AtomicBool::new(false);
+
+        let started = Instant::now();
+        super::wait_before_offering_again(Duration::from_secs(30), &running);
+
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]
