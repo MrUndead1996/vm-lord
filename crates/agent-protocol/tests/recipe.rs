@@ -6,12 +6,9 @@
 //! reading it.
 
 use prost::Message;
-use vmlord_agent_protocol::{
-    handshake::CURRENT_VERSION,
-    v1::{
-        ApplyGpuRecipeRequest, ApplyGpuRecipeResponse, Envelope, GpuRecipeStage,
-        GpuRecipeStageState, GpuRecipeStep, envelope, request, response,
-    },
+use vmlord_agent_protocol::v1::{
+    ApplyGpuRecipeRequest, ApplyGpuRecipeResponse, Envelope, GpuRecipeStage, GpuRecipeStageState,
+    GpuRecipeStep, envelope, request, response,
 };
 
 #[test]
@@ -65,11 +62,11 @@ fn an_apply_request_carries_nothing_and_still_arrives() {
 }
 
 #[test]
-fn the_userspace_steps_belong_to_revision_one_four() {
-    // Enum values only, so an agent from 1.3 simply never sends these and a
-    // host from 1.3 logs a step it has no name for rather than misreading one.
-    assert_eq!((CURRENT_VERSION.major, CURRENT_VERSION.minor), (1, 4));
-
+fn the_userspace_steps_travel_beside_the_kernel_ones() {
+    // Enum values only, so an agent from an older minor simply never sends
+    // these and a host from one logs a step it has no name for rather than
+    // misreading one. What revision this build speaks is asserted once, in
+    // `probe.rs`, beside the newest thing that moved it.
     let report = Envelope::response(
         9,
         response::Kind::ApplyGpuRecipe(ApplyGpuRecipeResponse {
