@@ -24,25 +24,32 @@ use vmlord_agent_protocol::{
     frame::{self, FrameError},
     handshake::{self, CURRENT_VERSION, VersionMismatch},
     v1::{
-        AuthenticateRequest, Capability, Envelope, ErrorCode, HeartbeatResponse, HelloResponse,
-        ProtocolVersion, envelope, request, response,
+        AttachGpuSharesRequest, AttachGpuSharesResponse, AuthenticateRequest, Capability, Envelope,
+        ErrorCode, GpuMountState, GpuShareRole, HeartbeatResponse, HelloResponse, ProtocolVersion,
+        envelope, request, response,
     },
 };
+use vmlord_core::{GpuShareManifest, GpuShareRole as CoreShareRole};
 
 /// What this build of the host implements beyond the base protocol.
 ///
-/// Empty: the host has nothing optional to offer yet. `Capability::Gpu` lands
-/// with the GPU manifest that needs it, and announcing it before then would be
-/// a promise this side cannot keep -- an agent that saw it agreed on would be
-/// entitled to send GPU messages nothing here would answer.
-const HOST_CAPABILITIES: &[Capability] = &[];
+/// `Capability::Gpu` is what lets a session carry a share manifest. It is
+/// announced whether or not the VM on this connection has any shares: the
+/// capability says what the two builds can do, and a VM with no GPU is simply
+/// a session no manifest is sent on.
+const HOST_CAPABILITIES: &[Capability] = &[Capability::Gpu];
 
 /// The id the host numbers its challenge with.
 ///
 /// Request ids are per originator, so the host's numbering is its own and
-/// starts here. Nothing else on this side asks the guest anything yet, so one
-/// constant is the whole of it.
+/// starts here.
 const CHALLENGE_REQUEST_ID: u32 = 1;
+
+/// The id the host sends a GPU share manifest with.
+///
+/// One manifest per session and one id for it: the host has nothing else to
+/// ask a guest, and a counter would be a counter of one.
+const ATTACH_REQUEST_ID: u32 = CHALLENGE_REQUEST_ID + 1;
 
 /// What a session agreed on when it opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,6 +107,7 @@ pub(crate) fn open<S: Read + Write>(
 pub(crate) fn serve<S: Read + Write>(
     stream: &mut S,
     session: &AgentSession,
+    shares: Option<&GpuShareManifest>,
     vm_name: &str,
 ) -> Result<(), SessionError> {
     let mut buffer = Vec::new();
@@ -108,6 +116,8 @@ pub(crate) fn serve<S: Read + Write>(
         session.version.major,
         session.version.minor
     );
+
+    let mut pending_manifest = attach_shares(stream, session, shares, vm_name, &mut buffer)?;
 
     loop {
         let envelope = match frame::read(stream, &mut buffer) {
@@ -130,15 +140,116 @@ pub(crate) fn serve<S: Read + Write>(
                 let answer = answer(request_id, &kind, vm_name);
                 frame::write(stream, &answer, &mut buffer).map_err(SessionError::Frame)?;
             }
-            // Nothing is outstanding: this side asks the guest nothing once the
-            // challenge is answered. A response here is the agent talking to a
-            // request that no longer exists, which is worth a line and nothing
-            // more -- there is no id to fail.
+            Body::Response(response::Kind::AttachGpuShares(report))
+                if pending_manifest == Some(request_id) =>
+            {
+                pending_manifest = None;
+                report_mounts(&report, vm_name);
+            }
+            // A response to a request this side did not send, or one it has
+            // already had an answer to. Worth a line and nothing more: there is
+            // no id left to fail, and the session is otherwise intact.
             Body::Response(_) => log::warn!(
                 "the agent of VM \"{vm_name}\" answered request {request_id}, which VMLord \
                  never sent"
             ),
         }
+    }
+}
+
+/// Hands the guest the shares its VM was given, and says which id asked.
+///
+/// Once per session rather than once per VM: the host cannot tell an agent
+/// that lost its socket from one whose VM rebooted, and the guest reconciles
+/// against what it already has, so re-sending costs a message and saves this
+/// side from having to know which happened. Nothing here touches HCS -- the
+/// shares were written into the compute system's configuration before it was
+/// started, and this is only the guest being told what they are for.
+///
+/// `None` comes back when there was nothing to send or nobody to send it to,
+/// which is a session that simply never waits for a report.
+fn attach_shares<S: Read + Write>(
+    stream: &mut S,
+    session: &AgentSession,
+    shares: Option<&GpuShareManifest>,
+    vm_name: &str,
+    buffer: &mut Vec<u8>,
+) -> Result<Option<u32>, SessionError> {
+    let Some(manifest) = shares else {
+        return Ok(None);
+    };
+    if !session.capabilities.contains(&Capability::Gpu) {
+        // An agent too old to have the capability cannot mount anything, and
+        // sending it a manifest would be a request it would refuse.
+        log::warn!(
+            "the agent of VM \"{vm_name}\" does not speak the GPU capability, so its {} \
+             share(s) are exported but not mounted",
+            manifest.shares.len()
+        );
+        return Ok(None);
+    }
+
+    let request = Envelope::request(
+        ATTACH_REQUEST_ID,
+        request::Kind::AttachGpuShares(AttachGpuSharesRequest {
+            shares: manifest.shares.iter().map(wire_share).collect(),
+        }),
+    );
+    frame::write(stream, &request, buffer).map_err(SessionError::Frame)?;
+    log::debug!(
+        "VMLord offered the agent of VM \"{vm_name}\" {} GPU share(s)",
+        manifest.shares.len()
+    );
+
+    Ok(Some(ATTACH_REQUEST_ID))
+}
+
+/// One share in the form the wire carries it.
+///
+/// The roles are the same two facts on both sides, so the mapping is total
+/// rather than fallible: a role `vmlord_core` has and this does not would fail
+/// to compile here, which is where it should fail.
+fn wire_share(share: &vmlord_core::GpuShare) -> vmlord_agent_protocol::v1::GpuShare {
+    let (role, package) = match &share.role {
+        CoreShareRole::WslLib => (GpuShareRole::WslLib, String::new()),
+        CoreShareRole::GpuPayload => (GpuShareRole::GpuPayload, String::new()),
+        CoreShareRole::DriverPackage { package } => (GpuShareRole::DriverPackage, package.clone()),
+    };
+
+    vmlord_agent_protocol::v1::GpuShare {
+        name: share.name.clone(),
+        role: i32::from(role),
+        package,
+    }
+}
+
+/// Says what the guest made of the manifest, at the volume each answer earns.
+///
+/// A share the guest refused is the two builds disagreeing about what a share
+/// is, and a share it could not mount is one that is exported and broken.
+/// Neither ends the session: GPU is best effort, and a VM with half a GPU
+/// userspace is still a running VM.
+fn report_mounts(report: &AttachGpuSharesResponse, vm_name: &str) {
+    for mount in &report.mounts {
+        match mount.state() {
+            GpuMountState::Mounted => log::debug!(
+                "the agent of VM \"{vm_name}\" mounted {} at {}",
+                mount.share,
+                mount.path
+            ),
+            state => log::warn!(
+                "the agent of VM \"{vm_name}\" did not mount {} ({state:?}): {}",
+                mount.share,
+                mount.message
+            ),
+        }
+    }
+
+    if !report.libraries_refreshed && !report.mounts.is_empty() {
+        log::warn!(
+            "the agent of VM \"{vm_name}\" could not tell the dynamic linker about its GPU \
+             libraries"
+        );
     }
 }
 
@@ -297,6 +408,14 @@ fn answer(request_id: u32, kind: &request::Kind, vm_name: &str) -> Envelope {
             ErrorCode::UnsupportedRequest,
             "this build of VMLord does not answer challenges from a guest",
         ),
+        // The manifest travels the other way. A guest that sends one is asking
+        // the host to mount host directories, which is not what the message
+        // means and not something this side would do.
+        request::Kind::AttachGpuShares(_) => Envelope::error(
+            request_id,
+            ErrorCode::UnsupportedRequest,
+            "a GPU share manifest is the host's to send",
+        ),
     }
 }
 
@@ -393,10 +512,12 @@ mod tests {
         auth::{Nonce, Secret, tag},
         frame::{self, LENGTH_PREFIX_LEN},
         v1::{
-            AuthenticateResponse, Capability, Envelope, ErrorCode, HeartbeatRequest, HelloRequest,
-            ProtocolVersion, envelope, request, response,
+            AttachGpuSharesResponse, AuthenticateResponse, Capability, Envelope, ErrorCode,
+            GpuMount, GpuMountState, GpuShareRole, HeartbeatRequest, HelloRequest, ProtocolVersion,
+            envelope, request, response,
         },
     };
+    use vmlord_core::GpuShareManifest;
 
     use super::{AgentSession, SessionError, open, serve};
 
@@ -642,9 +763,23 @@ mod tests {
     }
 
     #[test]
-    fn a_capability_the_host_does_not_have_is_not_agreed() {
-        // The agent of a VM with a GPU announces one; this build of the host
-        // implements nothing optional, so the session agrees on nothing.
+    fn a_capability_the_agent_does_not_have_is_not_agreed() {
+        // The host announces the GPU capability on every session; an agent
+        // installed before it existed announces nothing, and the intersection
+        // of the two is what the session may carry.
+        let secret = Secret::generate();
+        let mut guest = Guest::opening_with(
+            Secret::from_base64(&secret.to_base64()).expect("the secret"),
+            hello(ProtocolVersion::current(), &[]),
+        );
+
+        let session = open(&mut guest, &secret, VM).expect("a session with an older agent");
+
+        assert!(session.capabilities.is_empty());
+    }
+
+    #[test]
+    fn an_agent_that_can_mount_shares_agrees_on_the_gpu_capability() {
         let secret = Secret::generate();
         let mut guest = Guest::opening_with(
             Secret::from_base64(&secret.to_base64()).expect("the secret"),
@@ -653,7 +788,7 @@ mod tests {
 
         let session = open(&mut guest, &secret, VM).expect("a session with a GPU-capable agent");
 
-        assert!(session.capabilities.is_empty());
+        assert_eq!(session.capabilities, vec![Capability::Gpu]);
     }
 
     #[test]
@@ -696,7 +831,7 @@ mod tests {
             .after_answer(&[heartbeat(11)]);
         let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
 
-        serve(&mut guest, &session, VM).expect("a session the agent closed");
+        serve(&mut guest, &session, None, VM).expect("a session the agent closed");
 
         let Some(envelope::Body::Response(ref response)) = guest.answer_to(11).body else {
             panic!("the heartbeat should have been answered");
@@ -711,7 +846,7 @@ mod tests {
             .after_answer(&[hello(ProtocolVersion::current(), &[])]);
         let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
 
-        serve(&mut guest, &session, VM).expect("a session the agent closed");
+        serve(&mut guest, &session, None, VM).expect("a session the agent closed");
 
         // The hello and its refusal share a request id, so the last answer to
         // it is the one `serve` gave.
@@ -736,7 +871,96 @@ mod tests {
         let mut guest = Guest::new(Secret::from_base64(&secret.to_base64()).expect("the secret"));
         let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
 
-        serve(&mut guest, &session, VM).expect("a clean close is not a failure");
+        serve(&mut guest, &session, None, VM).expect("a clean close is not a failure");
+    }
+
+    #[test]
+    fn a_session_hands_a_gpu_capable_agent_its_manifest() {
+        // The shares are already in the compute system's configuration; this
+        // message is the only way the guest learns what they are for.
+        let secret = Secret::generate();
+        let mut guest = Guest::opening_with(
+            Secret::from_base64(&secret.to_base64()).expect("the secret"),
+            hello(ProtocolVersion::current(), &[Capability::Gpu]),
+        );
+        let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
+        let manifest = GpuShareManifest {
+            shares: vec![
+                vmlord_core::GpuShare::wsl_lib(),
+                vmlord_core::GpuShare::driver_package("nv_dispi.inf_amd64_1234")
+                    .expect("a package name the host accepts"),
+                vmlord_core::GpuShare::payload(),
+            ],
+        };
+        // The answer a guest that mounted them all would send.
+        guest.say(&Envelope::response(
+            super::ATTACH_REQUEST_ID,
+            response::Kind::AttachGpuShares(AttachGpuSharesResponse {
+                mounts: vec![GpuMount {
+                    share: "vmlord.gpu.wsl-lib".to_owned(),
+                    state: i32::from(GpuMountState::Mounted),
+                    path: "/usr/lib/wsl/lib".to_owned(),
+                    message: "mounted".to_owned(),
+                }],
+                libraries_refreshed: true,
+            }),
+        ));
+
+        serve(&mut guest, &session, Some(&manifest), VM).expect("a session the agent closed");
+
+        let offered = guest.answer_to(super::ATTACH_REQUEST_ID);
+        let Some(envelope::Body::Request(ref request)) = offered.body else {
+            panic!("the manifest should have been sent as a request");
+        };
+        let Some(request::Kind::AttachGpuShares(ref attach)) = request.kind else {
+            panic!("the manifest should have been an attach request");
+        };
+        assert_eq!(
+            attach.shares,
+            vec![
+                vmlord_agent_protocol::v1::GpuShare {
+                    name: "vmlord.gpu.wsl-lib".to_owned(),
+                    role: i32::from(GpuShareRole::WslLib),
+                    package: String::new(),
+                },
+                vmlord_agent_protocol::v1::GpuShare {
+                    name: "vmlord.gpu.drv.nv_dispi.inf_amd64_1234".to_owned(),
+                    role: i32::from(GpuShareRole::DriverPackage),
+                    package: "nv_dispi.inf_amd64_1234".to_owned(),
+                },
+                vmlord_agent_protocol::v1::GpuShare {
+                    name: "vmlord.gpu.payload".to_owned(),
+                    role: i32::from(GpuShareRole::GpuPayload),
+                    package: String::new(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn an_agent_without_the_gpu_capability_is_sent_no_manifest() {
+        // It has no arm for the message, so sending one would earn a refusal
+        // and tell the host nothing it did not already know from the hello.
+        let secret = Secret::generate();
+        let mut guest = Guest::opening_with(
+            Secret::from_base64(&secret.to_base64()).expect("the secret"),
+            hello(ProtocolVersion::current(), &[]),
+        );
+        let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
+        let manifest = GpuShareManifest {
+            shares: vec![vmlord_core::GpuShare::wsl_lib()],
+        };
+
+        serve(&mut guest, &session, Some(&manifest), VM).expect("a session the agent closed");
+
+        assert!(
+            !guest.received.iter().any(|envelope| matches!(
+                envelope.body,
+                Some(envelope::Body::Request(ref request))
+                    if matches!(request.kind, Some(request::Kind::AttachGpuShares(_)))
+            )),
+            "an agent that cannot mount shares must not be sent a manifest"
+        );
     }
 
     #[test]
@@ -747,6 +971,6 @@ mod tests {
             capabilities: Vec::new(),
         };
 
-        serve(&mut stream, &session, VM).expect("an idle boundary is not a failed session");
+        serve(&mut stream, &session, None, VM).expect("an idle boundary is not a failed session");
     }
 }
