@@ -1036,9 +1036,9 @@ self-referential.
 Ready content is materialized below a VM's exact `gpu-payload` child as
 `generations/<digest>` followed by `ready/<digest>.json`. The third logical
 share, `GpuPayload` / `vmlord.gpu.payload`, exports only that canonical child;
-it never broadens either System32 root or exposes the cache. Task 94 owns the
-wire and guest mount, tasks 95–96 own recipes, and task 98 owns lifecycle/UI
-orchestration.
+it never broadens either System32 root or exposes the cache. The guest mounts
+that share at `/opt/vmlord/gpu-payload`; tasks 95–96 own what is inside it, and
+task 98 owns lifecycle and UI orchestration.
 
 ### VM update contract
 
@@ -1997,8 +1997,8 @@ This gives a cloud VM three SCSI attachments: its system disk, the NoCloud
 seed, and the tools ISO. A local-media VM receives no cloud-init configuration
 and no agent, so it deliberately remains at two attachments. If the sibling
 agent binary is absent, creation warns and follows that same no-agent path;
-it does not create a tools ISO or agent secret. GPU capabilities and Plan9
-mounts remain later work.
+it does not create a tools ISO or agent secret. The installed agent is what
+mounts a VM's GPU shares once the host hands it a manifest.
 
 ### Reconnecting
 
@@ -2055,11 +2055,84 @@ disagreeing about what was agreed. Either failure ends the connection: there is
 no third round in this handshake, and the reconnect above is what a peer that
 answered unofferably gets instead.
 
-The guest keeps the confirmed pair for the life of its session, which is what
-decides later whether it may act on a GPU manifest at all. Today both ends
-announce nothing -- `CAPABILITY_GPU` is a promise neither can keep until that
-manifest lands -- so every session agrees on the empty set and the pair is only
-logged.
+The guest keeps the confirmed pair for the life of its session, and that is
+what decides whether it may act on a GPU manifest at all. Both ends now
+announce `CAPABILITY_GPU` -- the host can send a manifest and the guest can
+mount one -- so a session between two current builds agrees on it, and one with
+an agent installed before it existed agrees on nothing and is sent no manifest.
+
+### Handing a guest its GPU shares
+
+The exports a VM was started with are in its compute system's configuration;
+what the guest is told is `AttachGpuSharesRequest`, and it is the only way the
+guest learns what those shares are for. The message carries the manifest whole
+-- every share, not the ones that changed -- because the guest reconciles
+against what it already has, and a delta would need both ends to agree about
+what was sent last. Each share is a name and a role, never a host path, and a
+driver package carries the DriverStore folder name that distinguishes it. The
+answer is `AttachGpuSharesResponse`: one `GpuMount` per share saying `MOUNTED`,
+`REFUSED` or `FAILED`, and whether the dynamic linker was told about the
+result. Refused and failed are different facts -- the first says the two builds
+disagree about what a share is, the second says the share is there and broken --
+and `libraries_refreshed` is separate from the mounts because a set of mounts
+that all succeeded is unusable if `ldconfig` did not run.
+
+A manifest is delivered once per session rather than once per VM, after the
+challenge and only on a session that agreed `CAPABILITY_GPU`. The host cannot
+tell an agent that lost its socket from one whose VM rebooted, so it re-sends
+on every session and lets the guest work out that there is nothing to do. That
+path touches no HCS call: the `Devices/Plan9` section was written before the
+compute system was started and is immutable for the lifetime of a boot, so
+`AgentConnection` carries the manifest of the run and every session of that run
+delivers the same one.
+
+The guest decides where a share goes, from a table with one entry per role:
+`WslLib` at `/usr/lib/wsl/lib`, `DriverPackage` at
+`/usr/lib/wsl/drivers/<package>` and `GpuPayload` at `/opt/vmlord/gpu-payload`.
+The first two are WSL's own paths, which is where the Mesa D3D12 driver and a
+vendor's DriverStore libraries expect to find each other; the payload is
+VMLord's own and lives under `/opt`. The package name is the only part a host
+contributes to a path, and the guest validates it again -- non-empty, bounded,
+neither `.` nor `..`, `[A-Za-z0-9._-]` throughout -- because a path assembled
+from a peer's string is exactly where "the other side already checked it" stops
+being true. A share that fails is refused and the rest of the manifest is still
+mounted.
+
+Each mount is the only way a Hyper-V Plan9 share can be mounted from Linux: an
+`AF_VSOCK` connection to CID 2 on port 50001, where HCS's Plan9 server listens,
+handed to the kernel's 9p client as `trans=fd,rfdno=N,wfdno=N` with
+`aname=<share>` selecting the share. That is why a share name is restricted to
+characters that cannot be read as structure in a comma-separated option string.
+The flags are `MS_RDONLY | MS_NODEV | MS_NOSUID`, so read-only is stated twice
+and independently -- by the share's flag on the host and by the mount in the
+guest -- and the descriptor is closed once `mount` returns, because the kernel
+took its own reference.
+
+The attach is a reconcile against `/proc/self/mountinfo` rather than a mount. A
+target already carrying the share the manifest names is left alone if it reads
+back; one carrying a different share, or a mount that no longer reads back, is
+lazily unmounted and mounted again at most once; a 9p mount under one of the
+three roots that the manifest no longer names is unmounted. The health check is
+a directory read rather than a `stat`, because a 9p mount whose transport died
+still answers a `stat` from the dentry cache. Reading the mount table rather
+than a list the process kept is also what lets an agent that was upgraded and
+restarted clean up its predecessor's mounts.
+
+Mounted directories that hold shared objects are written into
+`/etc/ld.so.conf.d/vmlord-gpu.conf` and `ldconfig` is run. The file is
+rewritten from the current set every time, which is what makes the attach
+idempotent and what makes a share that went away lose its line. `ldconfig` is
+the one external program the agent runs: there is no library form of it, and
+writing `/etc/ld.so.cache` by hand would be a second implementation of a format
+the distribution owns.
+
+`SIGTERM` ends the loop rather than the process. The agent then unmounts every
+9p mount under its three roots, removes its `ld.so.conf.d` file and runs
+`ldconfig` once more, all best effort: a guest that is going down is not helped
+by an agent that refuses to exit because a mount was busy. The handler itself
+only sets a flag, because a signal handler may call almost nothing, and the
+backoff wait is spent in slices so that a shutdown is not held for the half
+minute a wait at the cap would take.
 
 Failures are `Error { code, message }` rather than a string. The code is what a
 peer branches on -- an unsupported version, an unauthenticated session, a
@@ -2131,11 +2204,11 @@ and waits for a tag over it. Requests that arrive before that tag is verified
 are refused with `ERROR_CODE_UNAUTHENTICATED` rather than dropped -- an agent
 waiting for an answer it will never get would sit there until its socket died
 -- and which requests those are is `auth::allowed_unauthenticated`'s decision,
-not the transport's. This build agrees on no capabilities at all: it announces
-none, because `CAPABILITY_GPU` is a promise the host cannot keep until the GPU
-manifest lands. After the challenge the session answers heartbeats, refuses a
-second hello, and ends when the guest hangs up at a frame boundary, which is
-not a fault.
+not the transport's. This build announces `CAPABILITY_GPU`, so a session with a
+current agent agrees on it and is the one a share manifest may be sent on.
+After the challenge the session hands the guest that manifest when the VM has
+one, answers heartbeats, refuses a second hello, and ends when the guest hangs
+up at a frame boundary, which is not a fault.
 
 Whether a VM's agent has a session open is what `AgentStatus` in a `VmSummary`
 now reports. A running VM VMLord is not listening for at all -- one whose
