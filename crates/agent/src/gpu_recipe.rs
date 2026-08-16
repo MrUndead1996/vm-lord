@@ -6,6 +6,77 @@
 //! recipe testable on a machine that is neither Ubuntu nor a Hyper-V guest,
 //! while `gpu_kernel` keeps the parts that need one.
 
+use vmlord_agent_protocol::v1::{GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep};
+
+/// Every step of the recipe, in the order it is attempted.
+///
+/// The order is the report's order, and the report is what the host logs, so
+/// it is written once here rather than implied by the sequence of calls in
+/// `gpu_kernel`.
+pub const STEPS: [GpuRecipeStep; 7] = [
+    GpuRecipeStep::Distribution,
+    GpuRecipeStep::Payload,
+    GpuRecipeStep::BuildDependencies,
+    GpuRecipeStep::ModuleSource,
+    GpuRecipeStep::ModuleBuild,
+    GpuRecipeStep::ModuleLoad,
+    GpuRecipeStep::Device,
+];
+
+/// What a recipe run has found out so far.
+///
+/// Collected rather than sent as it goes, because a stage list is one answer
+/// to one request: the host asked what the recipe did, not to be narrated at.
+#[derive(Default)]
+pub struct Report {
+    recorded: Vec<GpuRecipeStage>,
+}
+
+impl Report {
+    pub fn new() -> Self {
+        Self {
+            recorded: Vec::with_capacity(STEPS.len()),
+        }
+    }
+
+    pub fn ok(&mut self, step: GpuRecipeStep, message: impl Into<String>) {
+        self.record(step, GpuRecipeStageState::Ok, message.into());
+    }
+
+    pub fn skipped(&mut self, step: GpuRecipeStep, message: impl Into<String>) {
+        self.record(step, GpuRecipeStageState::Skipped, message.into());
+    }
+
+    pub fn failed(&mut self, step: GpuRecipeStep, message: impl Into<String>) {
+        self.record(step, GpuRecipeStageState::Failed, message.into());
+    }
+
+    /// Keeps the first answer a step was given.
+    ///
+    /// Nothing should record a step twice; if something does, the report must
+    /// not grow a second copy of a step the host reads once.
+    fn record(&mut self, step: GpuRecipeStep, state: GpuRecipeStageState, message: String) {
+        if self.recorded.iter().any(|stage| stage.step() == step) {
+            return;
+        }
+        self.recorded.push(GpuRecipeStage {
+            step: i32::from(step),
+            state: i32::from(state),
+            message,
+        });
+    }
+
+    /// The whole report: what happened, and `reason` for what never ran.
+    pub fn finish(mut self, reason: &str) -> Vec<GpuRecipeStage> {
+        for step in STEPS {
+            self.skipped(step, reason);
+        }
+        self.recorded
+            .sort_by_key(|stage| STEPS.iter().position(|step| *step == stage.step()));
+        self.recorded
+    }
+}
+
 /// What the guest says it is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GuestFacts {
@@ -190,9 +261,11 @@ pub fn dkms_reports_installed(status: &str, package: &DkmsPackage, kernel: &str)
 
 #[cfg(test)]
 mod tests {
+    use vmlord_agent_protocol::v1::{GpuRecipeStageState, GpuRecipeStep};
+
     use super::{
-        Applicability, DkmsPackage, GpuRecipe, GuestFacts, PayloadTarget, applicability,
-        dkms_reports_installed, module_is_loaded, parse_dkms_conf, parse_os_release,
+        Applicability, DkmsPackage, GpuRecipe, GuestFacts, PayloadTarget, Report, STEPS,
+        applicability, dkms_reports_installed, module_is_loaded, parse_dkms_conf, parse_os_release,
         parse_payload_target, recipe_for,
     };
 
@@ -212,6 +285,57 @@ mod tests {
             architecture: architecture.to_owned(),
             kernel_release: kernel.to_owned(),
         }
+    }
+
+    #[test]
+    fn a_finished_report_has_every_step_exactly_once_and_in_order() {
+        let mut report = Report::new();
+        report.ok(GpuRecipeStep::Distribution, "ubuntu 26.04 amd64");
+
+        let stages = report.finish("the recipe stopped before this stage");
+
+        assert_eq!(stages.len(), STEPS.len());
+        for (stage, step) in stages.iter().zip(STEPS) {
+            assert_eq!(stage.step(), step);
+        }
+        assert_eq!(stages[0].state(), GpuRecipeStageState::Ok);
+        assert_eq!(stages[1].state(), GpuRecipeStageState::Skipped);
+        assert_eq!(stages[1].message, "the recipe stopped before this stage");
+    }
+
+    #[test]
+    fn the_steps_a_recipe_never_reached_carry_the_reason_it_stopped() {
+        // A report that stopped at the failure would leave the host guessing
+        // whether the rest was skipped or the agent hung up.
+        let mut report = Report::new();
+        report.ok(GpuRecipeStep::Distribution, "ubuntu");
+        report.ok(GpuRecipeStep::Payload, "dxgkrnl 2.0.3");
+        report.failed(GpuRecipeStep::BuildDependencies, "apt-get exited with 100");
+
+        let stages = report.finish("the build dependencies were not installed");
+
+        assert_eq!(stages[2].state(), GpuRecipeStageState::Failed);
+        assert!(stages[2].message.contains("100"));
+        for stage in &stages[3..] {
+            assert_eq!(stage.state(), GpuRecipeStageState::Skipped);
+            assert_eq!(stage.message, "the build dependencies were not installed");
+        }
+    }
+
+    #[test]
+    fn a_stage_recorded_twice_keeps_the_first_answer() {
+        let mut report = Report::new();
+        report.ok(GpuRecipeStep::Device, "/dev/dxg opens");
+        report.failed(GpuRecipeStep::Device, "gone");
+
+        let stages = report.finish("unreached");
+
+        let device: Vec<_> = stages
+            .iter()
+            .filter(|stage| stage.step() == GpuRecipeStep::Device)
+            .collect();
+        assert_eq!(device.len(), 1);
+        assert_eq!(device[0].state(), GpuRecipeStageState::Ok);
     }
 
     #[test]
