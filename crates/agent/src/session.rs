@@ -317,6 +317,7 @@ fn kind_name(kind: &request::Kind) -> &'static str {
         request::Kind::Heartbeat(_) => "a heartbeat request out of order",
         request::Kind::AttachGpuShares(_) => "a GPU share manifest out of order",
         request::Kind::ApplyGpuRecipe(_) => "a GPU recipe request out of order",
+        request::Kind::ProbeGpu(_) => "a GPU probe request out of order",
     }
 }
 

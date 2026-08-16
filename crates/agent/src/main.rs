@@ -40,6 +40,7 @@ mod command;
 mod gpu_kernel;
 mod gpu_mountinfo;
 mod gpu_mounts;
+mod gpu_probe;
 mod gpu_recipe;
 mod gpu_targets;
 mod session;
