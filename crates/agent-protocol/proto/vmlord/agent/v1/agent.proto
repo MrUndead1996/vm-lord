@@ -47,9 +47,10 @@ message Request {
     HeartbeatRequest heartbeat = 2;
     AuthenticateRequest authenticate = 3;
     AttachGpuSharesRequest attach_gpu_shares = 4;
+    ApplyGpuRecipeRequest apply_gpu_recipe = 5;
   }
 
-  // Field 5 onwards is where the rest of the protocol lands: the guest's GPU
+  // Field 6 onwards is where the rest of the protocol lands: the guest's GPU
   // report. It arrives with the task that implements it, so that the shape is
   // designed against working code rather than guessed at here.
 }
@@ -66,6 +67,7 @@ message Response {
     HeartbeatResponse heartbeat = 3;
     AuthenticateResponse authenticate = 4;
     AttachGpuSharesResponse attach_gpu_shares = 5;
+    ApplyGpuRecipeResponse apply_gpu_recipe = 6;
   }
 }
 
@@ -242,6 +244,83 @@ enum GpuMountState {
   // The guest has a target for it and could not mount it, or mounted it and
   // could not read it back.
   GPU_MOUNT_STATE_FAILED = 3;
+}
+
+// Asks the guest to apply its distribution's GPU recipe.
+//
+// Sent once per session, after the manifest the guest mounted, on a session
+// that agreed `CAPABILITY_GPU`. Empty on purpose: everything the guest needs
+// to decide is either in the guest -- `/etc/os-release`, `uname` -- or in the
+// payload it was told to mount one message earlier, and a field here would be
+// the host dictating something it cannot know better than the guest does.
+message ApplyGpuRecipeRequest {}
+
+// What the guest's recipe did, stage by stage.
+//
+// A list of stages and never a verdict: "the module built and /dev/dxg never
+// appeared" and "the headers would not install" are one word apart in a
+// summary and are different problems. Deriving a state from these facts
+// belongs to the host's application layer.
+message ApplyGpuRecipeResponse {
+  // Every step of the recipe, in the order it is attempted, including the
+  // ones that never ran. A report that stopped at the failure would leave the
+  // host guessing whether the rest was skipped or the agent hung up.
+  repeated GpuRecipeStage stages = 1;
+}
+
+message GpuRecipeStage {
+  GpuRecipeStep step = 1;
+
+  GpuRecipeStageState state = 2;
+
+  // Free text for the host's log: the reason a stage was skipped, or the tail
+  // of what the program that failed had to say. `state` is what a peer
+  // branches on.
+  string message = 3;
+}
+
+// One step of a guest's GPU recipe.
+//
+// The kernel steps arrive with the recipe that has them; a distribution that
+// needs a different sequence gets its own values rather than a
+// reinterpretation of these.
+enum GpuRecipeStep {
+  GPU_RECIPE_STEP_UNSPECIFIED = 0;
+
+  // Whether this guest is one the agent has a recipe for at all.
+  GPU_RECIPE_STEP_DISTRIBUTION = 1;
+
+  // The mounted payload: its provenance, its target and its module sources.
+  GPU_RECIPE_STEP_PAYLOAD = 2;
+
+  // The compiler, DKMS and the running kernel's headers.
+  GPU_RECIPE_STEP_BUILD_DEPENDENCIES = 3;
+
+  // The module sources, staged where the build framework expects them.
+  GPU_RECIPE_STEP_MODULE_SOURCE = 4;
+
+  // Building and installing the module for the running kernel.
+  GPU_RECIPE_STEP_MODULE_BUILD = 5;
+
+  // Loading the module now and on every boot after this one.
+  GPU_RECIPE_STEP_MODULE_LOAD = 6;
+
+  // The device node the module is there to create.
+  GPU_RECIPE_STEP_DEVICE = 7;
+}
+
+enum GpuRecipeStageState {
+  GPU_RECIPE_STAGE_STATE_UNSPECIFIED = 0;
+
+  // The stage did what it is for.
+  GPU_RECIPE_STAGE_STATE_OK = 1;
+
+  // The stage did not have to run: the guest already satisfies it, or the
+  // recipe stopped before reaching it.
+  GPU_RECIPE_STAGE_STATE_SKIPPED = 2;
+
+  // The stage ran and did not succeed.
+  GPU_RECIPE_STAGE_STATE_FAILED = 3;
 }
 
 // A request that failed, described so the other side can act on it.
