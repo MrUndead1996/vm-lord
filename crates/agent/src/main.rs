@@ -37,6 +37,7 @@ use std::{
 use vmlord_agent_protocol::{auth::Secret, backoff::Backoff};
 
 mod command;
+mod gpu_kernel;
 mod gpu_mountinfo;
 mod gpu_mounts;
 mod gpu_recipe;
