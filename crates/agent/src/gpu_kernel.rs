@@ -10,7 +10,7 @@
 
 use std::{
     fs, io,
-    os::unix::fs::FileTypeExt,
+    os::unix::fs::{FileTypeExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
     time::Duration,
@@ -21,10 +21,12 @@ use vmlord_agent_protocol::v1::{GpuRecipeStage, GpuRecipeStep};
 use crate::{
     command::{self, Outcome},
     gpu_recipe::{
-        Applicability, DkmsPackage, GuestFacts, Report, applicability, dkms_reports_installed,
-        module_is_loaded, parse_dkms_conf, parse_os_release, parse_payload_target, recipe_for,
+        Applicability, DkmsPackage, Environment, GuestFacts, MesaPolicy, Report, Shell,
+        applicability, dkms_reports_installed, environment_document, icd_documents,
+        library_triplet, module_is_loaded, parse_dkms_conf, parse_mesa_policy, parse_os_release,
+        parse_payload_target, recipe_for,
     },
-    gpu_targets::PAYLOAD,
+    gpu_targets::{PAYLOAD, WSL_LIB},
 };
 
 /// The kernel module this recipe exists to deliver.
@@ -41,6 +43,29 @@ const MODULES_LOAD: &str = "/etc/modules-load.d/vmlord-dxgkrnl.conf";
 
 /// Where DKMS expects to find the sources of a package.
 const DKMS_SOURCES: &str = "/usr/src";
+
+/// Where a bundled Mesa tree is staged, out of the payload that carries it.
+///
+/// A copy rather than the read-only 9p mount it came from: the mount lives as
+/// long as the agent's session, and the linker cache, the `ld.so.conf.d` line
+/// and the ICD symlink all outlive a reboot.
+const MESA_PREFIX: &str = "/opt/vmlord/wsl-mesa";
+
+/// Where the linker is told about a bundled Mesa.
+///
+/// Its own file, never the one `gpu_mounts` rewrites from the current set of
+/// mounts: sharing one would mean that dropping a GPU share erases a line that
+/// has nothing to do with shares.
+const MESA_LD_CONF: &str = "/etc/ld.so.conf.d/vmlord-wsl-mesa.conf";
+
+/// Where the Vulkan loader looks for the drivers of a system.
+const VULKAN_ICD: &str = "/etc/vulkan/icd.d";
+
+/// What a systemd user session and everything started from it inherits.
+const GENERATOR: &str = "/etc/systemd/user-environment-generators/50-vmlord-gpu";
+
+/// What a login shell picks up, which in an MVP guest means SSH.
+const PROFILE: &str = "/etc/profile.d/vmlord-gpu.sh";
 
 /// Where DKMS leaves the log of a build that failed.
 const DKMS_TREE: &str = "/var/lib/dkms";
@@ -110,8 +135,14 @@ fn run_stages(report: &mut Report, stopping: &AtomicBool) -> Result<(), String> 
     }
 
     load_stage(report)?;
-    device_stage(report);
-    Ok(())
+    device_stage(report)?;
+    halted(stopping)?;
+
+    let userspace = userspace_stage(report, &guest)?;
+    halted(stopping)?;
+    let icd = vulkan_stage(report, &userspace)?;
+    halted(stopping)?;
+    environment_stage(report, &userspace, icd)
 }
 
 /// Stops the recipe when the guest is going down.
@@ -407,15 +438,262 @@ fn load_stage(report: &mut Report) -> Result<(), String> {
 }
 
 /// Looks at the device node the module exists to create.
-fn device_stage(report: &mut Report) {
+///
+/// The stage that decides whether the userspace half runs at all: a guest
+/// whose device never appeared must not be configured for a driver that
+/// cannot open it.
+fn device_stage(report: &mut Report) -> Result<(), String> {
     if device_is_usable() {
         report.ok(GpuRecipeStep::Device, format!("{DEVICE} is a usable device"));
+        return Ok(());
+    }
+
+    let reason = format!("{DEVICE} is missing, is not a character device, or will not open");
+    report.failed(GpuRecipeStep::Device, reason.clone());
+    Err(reason)
+}
+
+/// The userspace this guest ended up with, and where it lives.
+struct Userspace {
+    policy: MesaPolicy,
+    /// Where a bundled Mesa was staged; nothing under `distro`.
+    prefix: Option<PathBuf>,
+    /// The directories a process has to load libraries from, in order.
+    library_paths: Vec<String>,
+}
+
+/// Installs or stages the Mesa the payload's policy calls for.
+fn userspace_stage(report: &mut Report, guest: &GuestFacts) -> Result<Userspace, String> {
+    let policy =
+        parse_mesa_policy(&read(&Path::new(PAYLOAD).join("sources.json"))).map_err(|error| {
+            report.failed(GpuRecipeStep::Userspace, error.clone());
+            error
+        })?;
+    let Some(triplet) = library_triplet(&guest.architecture) else {
+        let reason = format!(
+            "vmlord-agent has no library path for architecture {}",
+            guest.architecture
+        );
+        report.failed(GpuRecipeStep::Userspace, reason.clone());
+        return Err(reason);
+    };
+
+    match policy {
+        MesaPolicy::Distro => {
+            distribution_mesa(report, triplet)?;
+            Ok(Userspace {
+                policy,
+                prefix: None,
+                library_paths: vec![WSL_LIB.to_owned()],
+            })
+        }
+        MesaPolicy::Bundled => {
+            let prefix = bundled_mesa(report, triplet)?;
+            Ok(Userspace {
+                policy,
+                library_paths: vec![format!("{MESA_PREFIX}/lib/{triplet}"), WSL_LIB.to_owned()],
+                prefix: Some(prefix),
+            })
+        }
+    }
+}
+
+/// Installs the distribution's own Mesa, and only what is missing.
+///
+/// Ubuntu's Mesa carries the d3d12 gallium driver and is not built with
+/// `microsoft-experimental`, so Vulkan under this policy is lavapipe. That is
+/// a fact for the host's log and not a refusal: the payload's author chose the
+/// policy, and whether GL alone is enough is the probe's question.
+fn distribution_mesa(report: &mut Report, triplet: &str) -> Result<(), String> {
+    let driver = PathBuf::from(format!("/usr/lib/{triplet}/dri/d3d12_dri.so"));
+    let loader = PathBuf::from(format!("/usr/lib/{triplet}/libvulkan.so.1"));
+    if driver.exists() && loader.exists() {
+        report.skipped(
+            GpuRecipeStep::Userspace,
+            format!(
+                "the distribution's Mesa is already installed; {} is present",
+                driver.display()
+            ),
+        );
+        return Ok(());
+    }
+
+    let mut outcome = apt_mesa();
+    if !outcome.succeeded() {
+        // A cloud image's package lists are as old as the image.
+        let _ = command::run(
+            "apt-get",
+            &["update"],
+            &[("DEBIAN_FRONTEND", "noninteractive")],
+            APT_BUDGET,
+        );
+        outcome = apt_mesa();
+    }
+
+    if outcome.succeeded() {
+        report.ok(
+            GpuRecipeStep::Userspace,
+            "installed the distribution's Mesa: d3d12 gallium for GL, and lavapipe for Vulkan, \
+             because Ubuntu does not build the dzn driver"
+                .to_owned(),
+        );
+        Ok(())
     } else {
-        report.failed(
-            GpuRecipeStep::Device,
-            format!("{DEVICE} is missing, is not a character device, or will not open"),
+        let reason = failure("apt-get install", &outcome);
+        report.failed(GpuRecipeStep::Userspace, reason.clone());
+        Err(reason)
+    }
+}
+
+fn apt_mesa() -> Outcome {
+    command::run(
+        "apt-get",
+        &[
+            "install",
+            "-y",
+            "libgl1-mesa-dri",
+            "mesa-vulkan-drivers",
+            "libvulkan1",
+        ],
+        &[("DEBIAN_FRONTEND", "noninteractive")],
+        APT_BUDGET,
+    )
+}
+
+/// Stages the Mesa tree the payload carries, and tells the linker about it.
+fn bundled_mesa(report: &mut Report, triplet: &str) -> Result<PathBuf, String> {
+    let source = Path::new(PAYLOAD).join("content").join("mesa");
+    let prefix = PathBuf::from(MESA_PREFIX);
+    if !source.is_dir() {
+        let reason = format!(
+            "the payload's policy is bundled and {} is not there",
+            source.display()
+        );
+        report.failed(GpuRecipeStep::Userspace, reason.clone());
+        return Err(reason);
+    }
+
+    let changed = copy_tree(&source, &prefix).map_err(|error| {
+        let reason = format!("{MESA_PREFIX} could not be staged: {error}");
+        report.failed(GpuRecipeStep::Userspace, reason.clone());
+        reason
+    })?;
+
+    let libraries = format!("{MESA_PREFIX}/lib/{triplet}");
+    let line = format!("# Written by vmlord-agent. Do not edit.\n{libraries}\n");
+    if let Err(error) = write_if_different(Path::new(MESA_LD_CONF), &line) {
+        let reason = format!("{MESA_LD_CONF} could not be written: {error}");
+        report.failed(GpuRecipeStep::Userspace, reason.clone());
+        return Err(reason);
+    }
+    let _ = command::run("ldconfig", &[], &[], SHORT_BUDGET);
+
+    if changed {
+        report.ok(
+            GpuRecipeStep::Userspace,
+            format!(
+                "staged the payload's Mesa at {MESA_PREFIX} and told the linker about {libraries}"
+            ),
+        );
+    } else {
+        report.skipped(
+            GpuRecipeStep::Userspace,
+            format!("{MESA_PREFIX} already holds this payload's Mesa"),
         );
     }
+    Ok(prefix)
+}
+
+/// Registers the Vulkan driver a payload carries, when it carries one.
+///
+/// A payload with GL and no Vulkan is a legitimate payload, so nothing here
+/// fails on an absent ICD: whether a guest has enough of a renderer is the
+/// probe's judgement, not a stage's.
+fn vulkan_stage(report: &mut Report, userspace: &Userspace) -> Result<Option<String>, String> {
+    let Some(prefix) = &userspace.prefix else {
+        report.skipped(
+            GpuRecipeStep::VulkanIcd,
+            "the distribution registers its own Vulkan drivers".to_owned(),
+        );
+        return Ok(None);
+    };
+
+    let directory = prefix.join("share/vulkan/icd.d");
+    let names: Vec<String> = fs::read_dir(&directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    let documents = icd_documents(&names);
+    if documents.is_empty() {
+        report.skipped(
+            GpuRecipeStep::VulkanIcd,
+            format!(
+                "the payload carries no Vulkan driver in {}",
+                directory.display()
+            ),
+        );
+        return Ok(None);
+    }
+
+    let mut registered = Vec::with_capacity(documents.len());
+    for document in &documents {
+        let link = Path::new(VULKAN_ICD).join(document);
+        if let Err(error) = symlink_if_different(&directory.join(document), &link) {
+            let reason = format!("{} could not be registered: {error}", link.display());
+            report.failed(GpuRecipeStep::VulkanIcd, reason.clone());
+            return Err(reason);
+        }
+        registered.push(link.to_string_lossy().into_owned());
+    }
+
+    report.ok(
+        GpuRecipeStep::VulkanIcd,
+        format!("registered {} in {VULKAN_ICD}", documents.join(", ")),
+    );
+    Ok(registered.into_iter().next())
+}
+
+/// Writes what makes a process in this guest pick that userspace.
+fn environment_stage(
+    report: &mut Report,
+    userspace: &Userspace,
+    icd: Option<String>,
+) -> Result<(), String> {
+    let environment = Environment {
+        library_paths: userspace.library_paths.clone(),
+        icd,
+    };
+
+    let mut changed = false;
+    for (path, form) in [(GENERATOR, Shell::Generator), (PROFILE, Shell::Profile)] {
+        match write_script_if_different(Path::new(path), &environment_document(form, &environment)) {
+            Ok(written) => changed |= written,
+            Err(error) => {
+                let reason = format!("{path} could not be written: {error}");
+                report.failed(GpuRecipeStep::Environment, reason.clone());
+                return Err(reason);
+            }
+        }
+    }
+
+    let policy = match userspace.policy {
+        MesaPolicy::Distro => "the distribution's Mesa",
+        MesaPolicy::Bundled => "the payload's Mesa",
+    };
+    if changed {
+        report.ok(
+            GpuRecipeStep::Environment,
+            format!("{GENERATOR} and {PROFILE} now point a process at {policy}"),
+        );
+    } else {
+        report.skipped(
+            GpuRecipeStep::Environment,
+            format!("{GENERATOR} and {PROFILE} already point a process at {policy}"),
+        );
+    }
+    Ok(())
 }
 
 /// Whether `/dev/dxg` is there and answers.
@@ -468,6 +746,36 @@ fn write_if_different(path: &Path, content: &str) -> io::Result<()> {
     fs::write(path, content)
 }
 
+/// Points `link` at `target`, and says whether anything changed.
+fn symlink_if_different(target: &Path, link: &Path) -> io::Result<bool> {
+    if fs::read_link(link).is_ok_and(|present| present == target) {
+        return Ok(false);
+    }
+    if let Some(directory) = link.parent() {
+        fs::create_dir_all(directory)?;
+    }
+    match fs::remove_file(link) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    std::os::unix::fs::symlink(target, link)?;
+    Ok(true)
+}
+
+/// Writes an executable script only when the file does not already hold it.
+fn write_script_if_different(path: &Path, content: &str) -> io::Result<bool> {
+    if fs::read_to_string(path).is_ok_and(|present| present == content) {
+        return Ok(false);
+    }
+    if let Some(directory) = path.parent() {
+        fs::create_dir_all(directory)?;
+    }
+    fs::write(path, content)?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    Ok(true)
+}
+
 /// A file that may not be there, as the empty string.
 ///
 /// Every caller treats "missing" and "empty" the same way -- as a fact that is
@@ -495,7 +803,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::copy_tree;
+    use super::{copy_tree, symlink_if_different};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -551,5 +859,33 @@ mod tests {
             fs::read(destination.join("dkms.conf")).unwrap(),
             b"PACKAGE_VERSION=2.0.4\n"
         );
+    }
+
+    #[test]
+    fn an_icd_symlink_is_written_once_and_then_left_alone() {
+        // The stage is skipped on a second session only if re-registering an
+        // ICD that is already registered changes nothing.
+        let directory = temporary("icd");
+        let target = directory.join("dzn_icd.x86_64.json");
+        let link = directory.join("registered.json");
+        fs::write(&target, b"{}\n").unwrap();
+
+        assert!(symlink_if_different(&target, &link).unwrap());
+        assert!(!symlink_if_different(&target, &link).unwrap());
+        assert_eq!(fs::read(&link).unwrap(), b"{}\n");
+    }
+
+    #[test]
+    fn an_icd_symlink_pointing_elsewhere_is_replaced() {
+        let directory = temporary("icd-replaced");
+        let old = directory.join("old.json");
+        let new = directory.join("new.json");
+        let link = directory.join("registered.json");
+        fs::write(&old, b"old\n").unwrap();
+        fs::write(&new, b"new\n").unwrap();
+        symlink_if_different(&old, &link).unwrap();
+
+        assert!(symlink_if_different(&new, &link).unwrap());
+        assert_eq!(fs::read(&link).unwrap(), b"new\n");
     }
 }
