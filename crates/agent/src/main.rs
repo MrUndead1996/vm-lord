@@ -42,6 +42,7 @@ mod gpu_mountinfo;
 mod gpu_mounts;
 mod gpu_probe;
 mod gpu_recipe;
+mod gpu_render;
 mod gpu_targets;
 mod session;
 mod vsock;
