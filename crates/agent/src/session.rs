@@ -9,8 +9,9 @@ use std::{
 use vmlord_agent_protocol::{
     auth::{self, Nonce, Secret},
     frame::{self, FrameError},
+    handshake::{self, CURRENT_VERSION},
     v1::{
-        AuthenticateResponse, Envelope, ErrorCode, HeartbeatRequest, HeartbeatResponse,
+        AuthenticateResponse, Capability, Envelope, ErrorCode, HeartbeatRequest, HeartbeatResponse,
         HelloRequest, ProtocolVersion, envelope, request, response,
     },
 };
@@ -18,18 +19,47 @@ use vmlord_agent_protocol::{
 const HELLO_REQUEST_ID: u32 = 1;
 const FIRST_HEARTBEAT_REQUEST_ID: u32 = HELLO_REQUEST_ID + 1;
 
+/// What this build of the agent implements beyond the base protocol.
+///
+/// Empty: the guest has nothing optional to offer yet. `Capability::Gpu` lands
+/// with the GPU manifest the agent acts on, and announcing it before then would
+/// entitle the host to send messages nothing here answers.
+const AGENT_CAPABILITIES: &[Capability] = &[];
+
+/// What a session agreed on when it opened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Session {
+    /// The revision both peers speak, which is the lower of the two minors.
+    pub version: ProtocolVersion,
+    /// The capabilities both peers have, which is the only set either may use.
+    pub capabilities: Vec<Capability>,
+}
+
 /// Opens and serves the guest half of an agent session.
+///
+/// The session that was agreed on is returned so the caller can tell a
+/// connection that reached an authenticated session from one that did not:
+/// that is the difference between a host that is there and a host that is not,
+/// and it is what the reconnect backoff is decided on.
 ///
 /// A clean host hang-up ends the session successfully. Other connection or
 /// protocol failures end it with [`SessionError`].
+///
+/// # Errors
+///
+/// [`SessionError`] if the connection failed, the host answered the hello with
+/// something this build never offered, or the host sent something that has no
+/// place where it arrived.
 pub fn run<S: Read + Write>(
     stream: &mut S,
     secret: &Secret,
     version: &str,
+    opened: &mut Option<Session>,
 ) -> Result<(), SessionError> {
     let mut buffer = Vec::new();
-    greet(stream, version, &mut buffer)?;
+    let session = greet(stream, version, &mut buffer)?;
     authenticate(stream, secret, &mut buffer)?;
+    *opened = Some(session);
     serve(stream, &mut buffer)
 }
 
@@ -37,12 +67,12 @@ fn greet<S: Read + Write>(
     stream: &mut S,
     version: &str,
     buffer: &mut Vec<u8>,
-) -> Result<(), SessionError> {
+) -> Result<Session, SessionError> {
     let hello = Envelope::request(
         HELLO_REQUEST_ID,
         request::Kind::Hello(HelloRequest {
-            version: Some(ProtocolVersion::current()),
-            capabilities: Vec::new(),
+            version: Some(CURRENT_VERSION),
+            capabilities: AGENT_CAPABILITIES.iter().copied().map(i32::from).collect(),
             agent_version: version.to_owned(),
         }),
     );
@@ -52,10 +82,7 @@ fn greet<S: Read + Write>(
     let request_id = envelope.request_id;
     match body(envelope)? {
         Body::Response(response::Kind::Hello(hello)) if request_id == HELLO_REQUEST_ID => {
-            if !compatible_version(hello.version) || !hello.capabilities.is_empty() {
-                return Err(SessionError::InvalidHello);
-            }
-            Ok(())
+            confirm(hello)
         }
         Body::Response(response::Kind::Error(error)) => Err(SessionError::Refused {
             code: error.code(),
@@ -170,12 +197,24 @@ fn serve<S: Read + Write>(stream: &mut S, buffer: &mut Vec<u8>) -> Result<(), Se
     }
 }
 
-fn compatible_version(version: Option<ProtocolVersion>) -> bool {
-    let current = ProtocolVersion::current();
-    matches!(
+/// Reads the host's answer to the hello as the session it agreed to.
+///
+/// Both halves are checked against what this build announced rather than
+/// merely recorded: a revision the agent never claimed to speak and a
+/// capability it never offered are each a host expecting messages nothing here
+/// has an arm for, and there is no round of this handshake left to settle that
+/// in.
+fn confirm(hello: vmlord_agent_protocol::v1::HelloResponse) -> Result<Session, SessionError> {
+    let chosen = hello.version.unwrap_or_default();
+    let version = handshake::confirm_version(CURRENT_VERSION, chosen)
+        .map_err(|mismatch| SessionError::InvalidHello(mismatch.to_string()))?;
+    let capabilities = handshake::confirm_capabilities(AGENT_CAPABILITIES, &hello.capabilities)
+        .map_err(|unoffered| SessionError::InvalidHello(unoffered.to_string()))?;
+
+    Ok(Session {
         version,
-        Some(version) if version.major == current.major && version.minor <= current.minor
-    )
+        capabilities,
+    })
 }
 
 fn refuse_unsupported<S: Write>(
@@ -227,7 +266,7 @@ fn kind_name(kind: &request::Kind) -> &'static str {
 pub enum SessionError {
     Frame(FrameError),
     Refused { code: ErrorCode, message: String },
-    InvalidHello,
+    InvalidHello(String),
     OutOfOrder(&'static str),
     Malformed(String),
     HeartbeatUnanswered,
@@ -241,8 +280,11 @@ impl fmt::Display for SessionError {
             Self::Refused { code, message } => {
                 write!(formatter, "the host refused ({code:?}): {message}")
             }
-            Self::InvalidHello => {
-                formatter.write_str("the host accepted a different agent protocol session")
+            Self::InvalidHello(why) => {
+                write!(
+                    formatter,
+                    "the host opened a session this agent cannot serve: {why}"
+                )
             }
             Self::OutOfOrder(what) => write!(formatter, "the host sent {what}"),
             Self::Malformed(what) => write!(formatter, "the host sent {what}"),
@@ -259,7 +301,7 @@ impl Error for SessionError {
         match self {
             Self::Frame(error) => Some(error),
             Self::Refused { .. }
-            | Self::InvalidHello
+            | Self::InvalidHello(_)
             | Self::OutOfOrder(_)
             | Self::Malformed(_)
             | Self::HeartbeatUnanswered
@@ -388,7 +430,9 @@ mod tests {
             ReadStep::WouldBlock,
         ]);
 
-        run(&mut stream, &secret, "test-agent").expect("the host closes after the heartbeat");
+        let mut opened = None;
+        run(&mut stream, &secret, "test-agent", &mut opened)
+            .expect("the host closes after the heartbeat");
 
         let frames = stream.written_frames();
         assert_eq!(frames.len(), 3);
@@ -452,7 +496,7 @@ mod tests {
             ReadStep::WouldBlock,
         ]);
 
-        let error = run(&mut stream, &secret, "test-agent")
+        let error = run(&mut stream, &secret, "test-agent", &mut None)
             .expect_err("a timeout after a partial frame must end the session");
         assert!(matches!(
             error,
@@ -492,7 +536,8 @@ mod tests {
             }),
         ]);
 
-        run(&mut stream, &secret, "test-agent").expect("the host closes after the refusal");
+        run(&mut stream, &secret, "test-agent", &mut None)
+            .expect("the host closes after the refusal");
 
         let frames = stream.written_frames();
         assert_eq!(frames.len(), 3);
@@ -534,7 +579,9 @@ mod tests {
             )),
         ]);
 
-        run(&mut stream, &secret, "test-agent").expect("a compatible host hang-up");
+        let mut opened = None;
+        run(&mut stream, &secret, "test-agent", &mut opened).expect("a compatible host hang-up");
+        assert_eq!(opened.expect("a session that authenticated").version, older);
 
         let frames = stream.written_frames();
         assert_eq!(frames.len(), 2);
@@ -546,5 +593,85 @@ mod tests {
             authenticate.kind,
             Some(response::Kind::Authenticate(_))
         ));
+    }
+
+    #[test]
+    fn a_capability_the_agent_never_offered_ends_the_session() {
+        // Serving a session that agreed on a capability this build has no arm
+        // for leaves the host waiting for answers that never come.
+        let secret = Secret::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .expect("a valid test secret");
+        let mut stream = ScriptedStream::new([ScriptedStream::frame(
+            vmlord_agent_protocol::v1::Envelope::response(
+                1,
+                response::Kind::Hello(HelloResponse {
+                    version: Some(ProtocolVersion::current()),
+                    capabilities: vec![i32::from(vmlord_agent_protocol::v1::Capability::Gpu)],
+                }),
+            ),
+        )]);
+
+        let mut opened = None;
+        let error = run(&mut stream, &secret, "test-agent", &mut opened)
+            .expect_err("a capability the agent did not announce must not be served");
+
+        assert!(matches!(error, super::SessionError::InvalidHello(_)));
+        assert_eq!(opened, None);
+        // The hello and nothing else: no tag is handed to a host whose session
+        // this agent has already refused.
+        assert_eq!(stream.written_frames().len(), 1);
+    }
+
+    #[test]
+    fn a_host_that_answers_with_a_newer_minor_ends_the_session() {
+        // The host picks the revision from the two hellos, so a minor above
+        // this build's is a host that answered with messages it never heard
+        // this agent claim to speak.
+        let secret = Secret::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .expect("a valid test secret");
+        let current = ProtocolVersion::current();
+        let newer = ProtocolVersion {
+            major: current.major,
+            minor: current.minor + 1,
+        };
+        let mut stream = ScriptedStream::new([ScriptedStream::frame(
+            vmlord_agent_protocol::v1::Envelope::response(
+                1,
+                response::Kind::Hello(HelloResponse {
+                    version: Some(newer),
+                    capabilities: vec![],
+                }),
+            ),
+        )]);
+
+        let mut opened = None;
+        let error = run(&mut stream, &secret, "test-agent", &mut opened)
+            .expect_err("a revision this agent never claimed must not be served");
+
+        assert!(matches!(error, super::SessionError::InvalidHello(_)));
+        assert_eq!(opened, None);
+    }
+
+    #[test]
+    fn a_connection_that_never_authenticates_reports_no_session() {
+        // The reconnect loop resets its backoff on an authenticated session,
+        // so a hang-up during the handshake must not look like one.
+        let secret = Secret::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .expect("a valid test secret");
+        let mut stream = ScriptedStream::new([ScriptedStream::frame(
+            vmlord_agent_protocol::v1::Envelope::response(
+                1,
+                response::Kind::Hello(HelloResponse {
+                    version: Some(ProtocolVersion::current()),
+                    capabilities: vec![],
+                }),
+            ),
+        )]);
+
+        let mut opened = None;
+        run(&mut stream, &secret, "test-agent", &mut opened)
+            .expect_err("a host that hangs up before its challenge ends the session");
+
+        assert_eq!(opened, None);
     }
 }

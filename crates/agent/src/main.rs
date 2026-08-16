@@ -38,6 +38,6 @@ fn connect_to_host() -> Result<(), Box<dyn Error>> {
     )?)?;
     let mut stream = vsock::connect(vsock::VMADDR_CID_HOST, vsock::AGENT_VSOCK_PORT)?;
 
-    session::run(&mut stream, &secret, AGENT_VERSION)?;
+    session::run(&mut stream, &secret, AGENT_VERSION, &mut None)?;
     Ok(())
 }
