@@ -1059,9 +1059,10 @@ userspace ones below.
 appeared" and "the headers would not install" are one word apart in a summary
 and are different problems. Every step is reported, including the ones that
 never ran -- a report that stopped at the failure would leave the host guessing
-whether the rest was skipped or the agent hung up. The userspace of the next
-task and the probe after it add values to `GpuRecipeStep` rather than messages
-of their own.
+whether the rest was skipped or the agent hung up. The userspace stages add
+values to `GpuRecipeStep` rather than messages of their own; the probe that
+follows them is a message of its own, because it answers a different question
+-- what was done, against what works.
 
 The build dependencies -- `dkms`, `build-essential` and
 `linux-headers-$(uname -r)` -- come from the guest's own apt, not from the
@@ -1135,6 +1136,48 @@ beside `licenses/`, `content/dxgkrnl/` holding `dkms.conf`, `Kbuild`, the
 out-of-tree compat header and the sources vendored from
 microsoft/WSL2-Linux-Kernel, and, when the policy is `bundled`,
 `content/mesa/` holding the prefix that is staged at `/opt/vmlord/wsl-mesa`.
+
+### GPU: the guest probe
+
+A recipe says what was done, and every one of its stages can report `OK` on a
+guest where nothing draws. The probe is the other question: the host asks for
+it once per session, right after the recipe report, and the guest answers with
+one verdict and a list of checks. The schema gains `ProbeGpuRequest` and
+`ProbeGpuResponse`, so the revision moved to **1.5**.
+
+The verdict is the guest's, and it is the one thing on this message the host
+does not re-derive: the guest is the only side that saw the output of the
+programs it ran. `RENDERS` needs one hardware renderer from either API and not
+both -- Ubuntu does not build Mesa with `microsoft-experimental`, so under the
+`distro` policy Vulkan is lavapipe and GL is the only hardware path such a
+guest has. `DEVICE_ONLY` is a `/dev/dxg` that opens with nothing above it, and
+`NO_DEVICE` is the one check that ends the probe early.
+
+Hardware is decided by a deny list -- `llvmpipe`, `softpipe`, `swrast`,
+`lavapipe`, `SwiftShader` -- and never an allow list of the drivers this build
+knows: an allow list reports "no hardware renderer" on the first stack nobody
+wrote code against, and a new software rasteriser counting as hardware once is
+the milder failure. Vulkan adds one fact of its own: a `deviceType` of
+`PHYSICAL_DEVICE_TYPE_CPU` is software whatever the device calls itself.
+
+The operation on the hardware is an external program, because the agent is a
+static musl binary that can neither link nor `dlopen` `libEGL`. The programs
+are Mesa's and Khronos's own -- `eglinfo` from `mesa-utils` and
+`vulkaninfo --summary` from `vulkan-tools` -- installed present-first by the
+`TOOLS` check and run through `/etc/profile.d/vmlord-gpu.sh`, the same file a
+person gets over SSH: setting those variables again inside the agent would be
+a second copy of the recipe's decision, and running through the file is what
+proves the file. Vendor tools are quoted when the mounted WSL userspace
+carries one and never decide anything, which is the difference between a probe
+that is vendor-neutral and one that only knows one vendor.
+
+The checks are `DEVICE`, `KERNEL_MODULE`, `LIBRARIES` (including the
+`libd3d12.so` and `libdxcore.so` that `d3d12_dri.so` opens out of the host's
+mounted userspace), `TOOLS`, `OPENGL`, `VULKAN` and `VENDOR`. Only a failed
+`DEVICE` ends the run: a missing library is a fact worth reporting and never a
+veto over a guest that turns out to draw anyway. The host logs the verdict and
+every check and keeps nothing -- the next session probes again, and deriving a
+`VmGpuFacts` from a verdict is the application layer's work.
 
 ### VM update contract
 

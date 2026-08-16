@@ -26,8 +26,9 @@ use vmlord_agent_protocol::{
     v1::{
         ApplyGpuRecipeRequest, ApplyGpuRecipeResponse, AttachGpuSharesRequest,
         AttachGpuSharesResponse, AuthenticateRequest, Capability, Envelope, ErrorCode,
-        GpuMountState, GpuRecipeStageState, GpuShareRole, HeartbeatResponse, HelloResponse,
-        ProtocolVersion, envelope, request, response,
+        GpuMountState, GpuProbeCheckState, GpuProbeVerdict, GpuRecipeStageState, GpuShareRole,
+        HeartbeatResponse, HelloResponse, ProbeGpuRequest, ProbeGpuResponse, ProtocolVersion,
+        envelope, request, response,
     },
 };
 use vmlord_core::{GpuShareManifest, GpuShareRole as CoreShareRole};
@@ -57,6 +58,12 @@ const ATTACH_REQUEST_ID: u32 = CHALLENGE_REQUEST_ID + 1;
 /// One recipe per session, after the manifest of the same session: the module
 /// is built out of the payload the guest has just been told to mount.
 const APPLY_REQUEST_ID: u32 = ATTACH_REQUEST_ID + 1;
+
+/// The id the host asks a guest to probe its GPU with.
+///
+/// One probe per session, after the recipe of the same session: the probe asks
+/// about a userspace the recipe has just installed.
+const PROBE_REQUEST_ID: u32 = APPLY_REQUEST_ID + 1;
 
 /// What a session agreed on when it opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,6 +133,7 @@ pub(crate) fn serve<S: Read + Write>(
 
     let mut pending_manifest = attach_shares(stream, session, shares, vm_name, &mut buffer)?;
     let mut pending_recipe = None;
+    let mut pending_probe = None;
 
     loop {
         let envelope = match frame::read(stream, &mut buffer) {
@@ -160,6 +168,13 @@ pub(crate) fn serve<S: Read + Write>(
             {
                 pending_recipe = None;
                 report_recipe(&report, vm_name);
+                pending_probe = probe_gpu(stream, vm_name, &mut buffer)?;
+            }
+            Body::Response(response::Kind::ProbeGpu(report))
+                if pending_probe == Some(request_id) =>
+            {
+                pending_probe = None;
+                report_probe(&report, vm_name);
             }
             // A response to a request this side did not send, or one it has
             // already had an answer to. Worth a line and nothing more: there is
@@ -241,6 +256,27 @@ fn apply_recipe<S: Read + Write>(
     Ok(Some(APPLY_REQUEST_ID))
 }
 
+/// Asks the guest whether anything renders, and says which id asked.
+///
+/// After the recipe of the same session, because what it looks at is what the
+/// recipe has just installed. Once per session, for the same reason the recipe
+/// is asked for once: the answer describes a moment, and the next session asks
+/// again.
+fn probe_gpu<S: Read + Write>(
+    stream: &mut S,
+    vm_name: &str,
+    buffer: &mut Vec<u8>,
+) -> Result<Option<u32>, SessionError> {
+    let request = Envelope::request(
+        PROBE_REQUEST_ID,
+        request::Kind::ProbeGpu(ProbeGpuRequest {}),
+    );
+    frame::write(stream, &request, buffer).map_err(SessionError::Frame)?;
+    log::debug!("VMLord asked the agent of VM \"{vm_name}\" to probe its GPU");
+
+    Ok(Some(PROBE_REQUEST_ID))
+}
+
 /// One share in the form the wire carries it.
 ///
 /// The roles are the same two facts on both sides, so the mapping is total
@@ -313,6 +349,38 @@ fn report_recipe(report: &ApplyGpuRecipeResponse, vm_name: &str) {
                  {}",
                 stage.step(),
                 stage.message
+            ),
+        }
+    }
+}
+
+/// Says what the guest found, at the volume each check earns.
+///
+/// Nothing is kept: the next session probes again, and turning a verdict into
+/// a `VmGpuFacts` is the application layer's work.
+fn report_probe(report: &ProbeGpuResponse, vm_name: &str) {
+    match report.verdict() {
+        GpuProbeVerdict::Renders => log::info!(
+            "the agent of VM \"{vm_name}\" renders on {}",
+            report.renderer
+        ),
+        verdict => {
+            log::warn!("the agent of VM \"{vm_name}\" does not render on its GPU ({verdict:?})")
+        }
+    }
+
+    for check in &report.checks {
+        match check.state() {
+            GpuProbeCheckState::Ok | GpuProbeCheckState::Skipped => log::debug!(
+                "the agent of VM \"{vm_name}\" GPU check {:?} ({:?}): {}",
+                check.step(),
+                check.state(),
+                check.message
+            ),
+            state => log::warn!(
+                "the agent of VM \"{vm_name}\" failed GPU check {:?} ({state:?}): {}",
+                check.step(),
+                check.message
             ),
         }
     }
@@ -488,6 +556,13 @@ fn answer(request_id: u32, kind: &request::Kind, vm_name: &str) -> Envelope {
             ErrorCode::UnsupportedRequest,
             "a GPU recipe is the host's to ask for",
         ),
+        // Likewise: the probe is the guest's to run and the host's to ask for,
+        // and there is no GPU to probe on this side of the socket.
+        request::Kind::ProbeGpu(_) => Envelope::error(
+            request_id,
+            ErrorCode::UnsupportedRequest,
+            "a GPU probe is the host's to ask for",
+        ),
     }
 }
 
@@ -585,9 +660,10 @@ mod tests {
         frame::{self, LENGTH_PREFIX_LEN},
         v1::{
             ApplyGpuRecipeResponse, AttachGpuSharesResponse, AuthenticateResponse, Capability,
-            Envelope, ErrorCode, GpuMount, GpuMountState, GpuRecipeStage, GpuRecipeStageState,
-            GpuRecipeStep, GpuShareRole, HeartbeatRequest, HelloRequest, ProtocolVersion, envelope,
-            request, response,
+            Envelope, ErrorCode, GpuMount, GpuMountState, GpuProbeCheck, GpuProbeCheckState,
+            GpuProbeStep, GpuProbeVerdict, GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep,
+            GpuShareRole, HeartbeatRequest, HelloRequest, ProbeGpuResponse, ProtocolVersion,
+            envelope, request, response,
         },
     };
     use vmlord_core::GpuShareManifest;
@@ -1070,6 +1146,102 @@ mod tests {
                 .count(),
             1,
             "one recipe per session"
+        );
+    }
+
+    #[test]
+    fn a_session_probes_once_the_recipe_has_answered() {
+        // The probe follows the recipe and never precedes it: it asks about a
+        // userspace the recipe has just installed.
+        let secret = Secret::generate();
+        let mut guest = Guest::opening_with(
+            Secret::from_base64(&secret.to_base64()).expect("the secret"),
+            hello(ProtocolVersion::current(), &[Capability::Gpu]),
+        );
+        let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
+        let manifest = GpuShareManifest {
+            shares: vec![vmlord_core::GpuShare::payload()],
+        };
+        guest.say(&Envelope::response(
+            super::ATTACH_REQUEST_ID,
+            response::Kind::AttachGpuShares(AttachGpuSharesResponse {
+                mounts: vec![GpuMount {
+                    share: "vmlord.gpu.payload".to_owned(),
+                    state: i32::from(GpuMountState::Mounted),
+                    path: "/opt/vmlord/gpu-payload".to_owned(),
+                    message: "mounted".to_owned(),
+                }],
+                libraries_refreshed: true,
+            }),
+        ));
+        guest.say(&Envelope::response(
+            super::APPLY_REQUEST_ID,
+            response::Kind::ApplyGpuRecipe(ApplyGpuRecipeResponse {
+                stages: vec![GpuRecipeStage {
+                    step: i32::from(GpuRecipeStep::Device),
+                    state: i32::from(GpuRecipeStageState::Ok),
+                    message: "/dev/dxg is a usable device".to_owned(),
+                }],
+            }),
+        ));
+        guest.say(&Envelope::response(
+            super::PROBE_REQUEST_ID,
+            response::Kind::ProbeGpu(ProbeGpuResponse {
+                verdict: i32::from(GpuProbeVerdict::Renders),
+                checks: vec![GpuProbeCheck {
+                    step: i32::from(GpuProbeStep::Opengl),
+                    state: i32::from(GpuProbeCheckState::Ok),
+                    message: "GL renders on D3D12 (NVIDIA GeForce RTX 4070)".to_owned(),
+                }],
+                renderer: "D3D12 (NVIDIA GeForce RTX 4070)".to_owned(),
+                driver: "dxgkrnl".to_owned(),
+                render_node: String::new(),
+            }),
+        ));
+
+        serve(&mut guest, &session, Some(&manifest), VM).expect("a session the agent closed");
+
+        let asked = guest.answer_to(super::PROBE_REQUEST_ID);
+        let Some(envelope::Body::Request(ref request)) = asked.body else {
+            panic!("the probe should have been asked for as a request");
+        };
+        assert!(matches!(request.kind, Some(request::Kind::ProbeGpu(_))));
+        assert_eq!(
+            guest
+                .received
+                .iter()
+                .filter(|envelope| matches!(
+                    envelope.body,
+                    Some(envelope::Body::Request(ref request))
+                        if matches!(request.kind, Some(request::Kind::ProbeGpu(_)))
+                ))
+                .count(),
+            1,
+            "one probe per session"
+        );
+    }
+
+    #[test]
+    fn a_session_that_never_applied_a_recipe_never_probes() {
+        // A guest with no shares has no payload, no recipe and nothing to
+        // render with; asking it to probe would install two packages on a VM
+        // that was never given a GPU.
+        let secret = Secret::generate();
+        let mut guest = Guest::opening_with(
+            Secret::from_base64(&secret.to_base64()).expect("the secret"),
+            hello(ProtocolVersion::current(), &[Capability::Gpu]),
+        );
+        let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
+
+        serve(&mut guest, &session, None, VM).expect("a session the agent closed");
+
+        assert!(
+            !guest.received.iter().any(|envelope| matches!(
+                envelope.body,
+                Some(envelope::Body::Request(ref request))
+                    if matches!(request.kind, Some(request::Kind::ProbeGpu(_)))
+            )),
+            "a VM with no manifest is asked for no probe"
         );
     }
 

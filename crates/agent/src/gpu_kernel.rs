@@ -157,7 +157,7 @@ fn halted(stopping: &AtomicBool) -> Result<(), String> {
 }
 
 /// What this guest is, from its own files.
-fn guest_facts() -> Result<GuestFacts, String> {
+pub fn guest_facts() -> Result<GuestFacts, String> {
     let (distribution, release) = parse_os_release(&read(Path::new("/etc/os-release")))
         .ok_or_else(|| "/etc/os-release names no distribution".to_owned())?;
     let (kernel_release, machine) = uname()?;
@@ -700,7 +700,10 @@ fn environment_stage(
 ///
 /// Opened rather than merely stat'd: that is what separates a node the kernel
 /// created from one left behind by a module that is no longer there.
-fn device_is_usable() -> bool {
+///
+/// Read by the probe as well as the recipe: the recipe ran minutes ago, and a
+/// device that has since gone is exactly what a probe exists to notice.
+pub fn device_is_usable() -> bool {
     let Ok(metadata) = fs::metadata(DEVICE) else {
         return false;
     };
@@ -781,12 +784,12 @@ fn write_script_if_different(path: &Path, content: &str) -> io::Result<bool> {
 /// Every caller treats "missing" and "empty" the same way -- as a fact that is
 /// not there to be read -- and an `io::Error` here would be a second way of
 /// saying the same stage did not apply.
-fn read(path: &Path) -> String {
+pub fn read(path: &Path) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
 /// One line about a program that did not succeed.
-fn failure(what: &str, outcome: &Outcome) -> String {
+pub fn failure(what: &str, outcome: &Outcome) -> String {
     let ending = match outcome.ending {
         command::Ending::Exited(code) => format!("exited with {code}"),
         command::Ending::TimedOut => "outran its time budget".to_owned(),

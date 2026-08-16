@@ -48,11 +48,8 @@ message Request {
     AuthenticateRequest authenticate = 3;
     AttachGpuSharesRequest attach_gpu_shares = 4;
     ApplyGpuRecipeRequest apply_gpu_recipe = 5;
+    ProbeGpuRequest probe_gpu = 6;
   }
-
-  // Field 6 onwards is where the rest of the protocol lands: the guest's GPU
-  // report. It arrives with the task that implements it, so that the shape is
-  // designed against working code rather than guessed at here.
 }
 
 // The answer to exactly one `Request`, carrying its `request_id`.
@@ -68,6 +65,7 @@ message Response {
     AuthenticateResponse authenticate = 4;
     AttachGpuSharesResponse attach_gpu_shares = 5;
     ApplyGpuRecipeResponse apply_gpu_recipe = 6;
+    ProbeGpuResponse probe_gpu = 7;
   }
 }
 
@@ -332,6 +330,109 @@ enum GpuRecipeStageState {
 
   // The stage ran and did not succeed.
   GPU_RECIPE_STAGE_STATE_FAILED = 3;
+}
+
+// Asks the guest whether anything renders on the GPU it was given.
+//
+// Sent once per session, after the recipe report of the same session, on a
+// session that agreed `CAPABILITY_GPU`. Empty for the reason
+// `ApplyGpuRecipeRequest` is: what there is to look at is in the guest, and a
+// field here would be the host dictating something it cannot know better.
+message ProbeGpuRequest {}
+
+// What the guest found when it looked.
+message ProbeGpuResponse {
+  // What the guest makes of what it saw. The guest decides it, because the
+  // guest is the only side that saw the output of the programs it ran; a host
+  // that re-derived a verdict from the checks could disagree with the peer
+  // that produced them.
+  GpuProbeVerdict verdict = 1;
+
+  // Every check, in the order it is attempted, including the ones that never
+  // ran. A report that stopped at the failure would leave the host guessing
+  // whether the rest was skipped or the agent hung up.
+  repeated GpuProbeCheck checks = 2;
+
+  // What the hardware renderer calls itself, when one answered, and empty
+  // when none did.
+  string renderer = 3;
+
+  // What the guest kernel driver calls itself, when it says.
+  string driver = 4;
+
+  // The DRM render node the guest has, such as `/dev/dri/renderD128`, and
+  // empty when it has none. The d3d12 path needs no render node, so this is a
+  // fact for diagnostics and never a requirement.
+  string render_node = 5;
+}
+
+message GpuProbeCheck {
+  GpuProbeStep step = 1;
+
+  GpuProbeCheckState state = 2;
+
+  // Free text for the host's log: what was found, or what the program that
+  // failed had to say. `state` is what a peer branches on.
+  string message = 3;
+}
+
+// One thing the probe looks at.
+enum GpuProbeStep {
+  GPU_PROBE_STEP_UNSPECIFIED = 0;
+
+  // The device node, opened rather than merely found.
+  GPU_PROBE_STEP_DEVICE = 1;
+
+  // The kernel module behind that device.
+  GPU_PROBE_STEP_KERNEL_MODULE = 2;
+
+  // The libraries a renderer has to be able to open.
+  GPU_PROBE_STEP_LIBRARIES = 3;
+
+  // The programs the two renderer checks run.
+  GPU_PROBE_STEP_TOOLS = 4;
+
+  // A bounded OpenGL operation on the device.
+  GPU_PROBE_STEP_OPENGL = 5;
+
+  // A bounded Vulkan operation on the device.
+  GPU_PROBE_STEP_VULKAN = 6;
+
+  // Whatever the vendor's own tool has to say. Diagnostics only: it never
+  // decides the verdict.
+  GPU_PROBE_STEP_VENDOR = 7;
+}
+
+// The three values of a check.
+//
+// The same three a recipe stage has and deliberately not the same enum: a
+// recipe stage is work that was done and a check is a fact that was looked
+// at, and a value added to one must not appear in the other.
+enum GpuProbeCheckState {
+  GPU_PROBE_CHECK_STATE_UNSPECIFIED = 0;
+
+  // What the check looked for is there.
+  GPU_PROBE_CHECK_STATE_OK = 1;
+
+  // The check did not run, and the message says why.
+  GPU_PROBE_CHECK_STATE_SKIPPED = 2;
+
+  // The check ran and what it looked for is not there.
+  GPU_PROBE_CHECK_STATE_FAILED = 3;
+}
+
+// What the guest makes of its GPU.
+enum GpuProbeVerdict {
+  GPU_PROBE_VERDICT_UNSPECIFIED = 0;
+
+  // The device node is not there, or will not open.
+  GPU_PROBE_VERDICT_NO_DEVICE = 1;
+
+  // The device opened and no hardware renderer answered.
+  GPU_PROBE_VERDICT_DEVICE_ONLY = 2;
+
+  // At least one hardware renderer answered, which is what makes a GPU a GPU.
+  GPU_PROBE_VERDICT_RENDERS = 3;
 }
 
 // A request that failed, described so the other side can act on it.

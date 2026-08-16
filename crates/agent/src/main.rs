@@ -40,7 +40,9 @@ mod command;
 mod gpu_kernel;
 mod gpu_mountinfo;
 mod gpu_mounts;
+mod gpu_probe;
 mod gpu_recipe;
+mod gpu_render;
 mod gpu_targets;
 mod session;
 mod vsock;
@@ -171,6 +173,7 @@ fn connect_to_host(secret: &Secret) -> bool {
         &mut opened,
         gpu_mounts::attach,
         || gpu_kernel::apply(&STOPPING),
+        || gpu_render::probe(&STOPPING),
     ) {
         Ok(()) => eprintln!("vmlord-agent: the host closed the session"),
         Err(error) => eprintln!("vmlord-agent: {error}"),
