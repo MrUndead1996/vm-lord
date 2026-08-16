@@ -1051,7 +1051,8 @@ list of stages. `ApplyGpuRecipeRequest` is empty on purpose -- everything the
 guest needs to decide is in the guest or in the payload it was told to mount
 one message earlier, and a field here would be the host dictating something it
 cannot know better. The schema gains messages and enum values only, so the
-revision moves to **1.3**.
+revision moved to **1.3** with the kernel stages and to **1.4** with the
+userspace ones below.
 
 `ApplyGpuRecipeResponse` is stages and never a verdict, for the same reason
 `VmGpuFacts` is not a `VmGpuStatus`: "the module built and `/dev/dxg` never
@@ -1104,10 +1105,36 @@ host tolerates the silence, because its read timeout is an `Idle` it keeps
 waiting through, and a background thread would be two conversations on one
 socket for a report that was asked for.
 
+The userspace half is three more stages of the same report. `USERSPACE` honours
+the payload's own `mesa_policy`, which it reads itself rather than through the
+payload stage: a policy from a payload built newer than the agent must fail the
+stage it belongs to, not one after which a kernel module would have built.
+Under `distro` it installs `libgl1-mesa-dri`, `mesa-vulkan-drivers` and
+`libvulkan1` from the guest's apt, and only when the d3d12 DRI module and the
+Vulkan loader are not already there; Ubuntu does not build Mesa with
+`microsoft-experimental`, so Vulkan under that policy is lavapipe, which the
+stage says rather than hides. Under `bundled` it copies the payload's Mesa to
+`/opt/vmlord/wsl-mesa` and names it in `/etc/ld.so.conf.d/vmlord-wsl-mesa.conf`
+-- a copy, because the 9p mount lives as long as the agent's session while the
+linker cache and the ICD symlink outlive a reboot.
+
+`VULKAN_ICD` symlinks whatever `*.json` the payload's `share/vulkan/icd.d`
+holds into `/etc/vulkan/icd.d`, by the names the payload uses; a payload with
+no Vulkan driver is skipped and never failed. `ENVIRONMENT` writes
+`/etc/systemd/user-environment-generators/50-vmlord-gpu` and
+`/etc/profile.d/vmlord-gpu.sh` from one builder -- scripts that probe
+`/dev/dxg` on every start rather than a file of finished values, because the
+file survives a reboot into `GpuMode::None` and the device does not.
+
+`DEVICE` is what gates all three: a guest whose device node never appeared is
+one that must not be configured for a driver that cannot open it, so the
+userspace stages are reported as skipped with that reason.
+
 What the recipe expects inside a payload is therefore fixed: `sources.json`
-beside `licenses/`, and `content/dxgkrnl/` holding `dkms.conf`, `Kbuild`, the
+beside `licenses/`, `content/dxgkrnl/` holding `dkms.conf`, `Kbuild`, the
 out-of-tree compat header and the sources vendored from
-microsoft/WSL2-Linux-Kernel.
+microsoft/WSL2-Linux-Kernel, and, when the policy is `bundled`,
+`content/mesa/` holding the prefix that is staged at `/opt/vmlord/wsl-mesa`.
 
 ### VM update contract
 
