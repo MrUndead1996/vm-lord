@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: GPL-2.0
+# Out-of-tree build for dxgkrnl.
+#
+# Upstream builds this driver in tree, where Kconfig selects the objects and
+# the uapi header is reachable through the kernel's own include path. Neither
+# holds here: a distribution kernel knows nothing about CONFIG_DXGKRNL, and its
+# headers do not carry d3dkmthk.h, so the payload ships both and points the
+# compiler at them.
+
+obj-m += dxgkrnl.o
+
+dxgkrnl-y := dxgmodule.o hmgr.o misc.o dxgadapter.o ioctl.o dxgvmbus.o \
+	dxgprocess.o dxgsyncfile.o
+
+ccflags-y += -I$(src)/include -include $(src)/dxgkrnl_compat.h

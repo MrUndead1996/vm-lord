@@ -1,0 +1,68 @@
+{
+  "schema_version": 1,
+  "payload_id": "ubuntu-26.04-amd64-7.0.0-28-v1",
+  "target": {
+    "distribution": "ubuntu",
+    "release": "26.04",
+    "architecture": "amd64",
+    "kernel_release": "7.0.0-28-generic",
+    "payload_abi": 1
+  },
+  "archive_url": "https://payloads.vmlord.invalid/ubuntu-26.04-amd64-7.0.0-28-v1.zip",
+  "required_renderers": ["d3d12-gallium"],
+  "mesa_policy": "distro",
+  "builder_version": "vmlord-gpu-payload 0.1.0",
+  "source": {
+    "url": "https://github.com/microsoft/WSL2-Linux-Kernel",
+    "branch": "linux-msft-wsl-6.18.y",
+    "commit": "14794180686c2fb6307fbe359c359bec765249f3",
+    "version": "linux-msft-wsl-6.18.y",
+    "paths": [
+      {
+        "path": "drivers/hv/dxgkrnl",
+        "spdx": "GPL-2.0",
+        "kind": "directory",
+        "files": ["*.c", "*.h"],
+        "destination": "content/dxgkrnl"
+      },
+      {
+        "path": "include/uapi/misc/d3dkmthk.h",
+        "spdx": "GPL-2.0 WITH Linux-syscall-note",
+        "kind": "file",
+        "destination": "content/dxgkrnl/include/uapi/misc/d3dkmthk.h"
+      }
+    ]
+  },
+  "licenses": [
+    {
+      "spdx": "GPL-2.0",
+      "path": "licenses/GPL-2.0.txt",
+      "upstream": "LICENSES/preferred/GPL-2.0"
+    },
+    {
+      "spdx": "Linux-syscall-note",
+      "path": "licenses/Linux-syscall-note.txt",
+      "upstream": "LICENSES/exceptions/Linux-syscall-note"
+    }
+  ],
+  "overlays": [
+    {
+      "file": "Kbuild",
+      "path": "content/dxgkrnl/Kbuild",
+      "license": "GPL-2.0",
+      "author": "VMLord contributors"
+    },
+    {
+      "file": "dkms.conf",
+      "path": "content/dxgkrnl/dkms.conf",
+      "license": "GPL-2.0",
+      "author": "VMLord contributors"
+    },
+    {
+      "file": "dxgkrnl_compat.h",
+      "path": "content/dxgkrnl/dxgkrnl_compat.h",
+      "license": "GPL-2.0",
+      "author": "VMLord contributors"
+    }
+  ]
+}
