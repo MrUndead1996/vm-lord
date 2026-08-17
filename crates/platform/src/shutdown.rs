@@ -1,6 +1,6 @@
 //! Gracefully shutting down an HCS-backed virtual machine.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use vmlord_core::RepositoryError;
 
@@ -11,7 +11,10 @@ use crate::{HcsSystem, hcs::HCS_ACCESS_ALL, metadata::MetadataStore};
 /// bound only guards against a wedged Host Compute Service.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 
-type SystemShutter = Box<dyn Fn(&str) -> Result<(), RepositoryError>>;
+/// `Send + Sync` because the wait belongs on a thread of its own: a shutdown
+/// request is delivered by [`crate::shutdown_workers::ShutdownWorkers`], which
+/// shares the pipeline with the worker carrying it.
+type SystemShutter = Arc<dyn Fn(&str) -> Result<(), RepositoryError> + Send + Sync>;
 
 /// Requests a graceful guest shutdown of VMs known to [`MetadataStore`].
 pub struct VmShutdownPipeline {
@@ -23,14 +26,16 @@ impl VmShutdownPipeline {
     #[must_use]
     pub fn production() -> Self {
         Self {
-            system_shutter: Box::new(shut_down_hcs_system),
+            system_shutter: Arc::new(shut_down_hcs_system),
         }
     }
 
     #[cfg(test)]
-    fn for_test(shutter: impl Fn(&str) -> Result<(), RepositoryError> + 'static) -> Self {
+    fn for_test(
+        shutter: impl Fn(&str) -> Result<(), RepositoryError> + Send + Sync + 'static,
+    ) -> Self {
         Self {
-            system_shutter: Box::new(shutter),
+            system_shutter: Arc::new(shutter),
         }
     }
 
@@ -40,6 +45,10 @@ impl VmShutdownPipeline {
     /// the guest has powered off: a guest without integration services, or one
     /// refusing the request, keeps running. Callers that must guarantee the VM
     /// stops need to fall back to a forced stop.
+    ///
+    /// This blocks until HCS answers, for up to [`SHUTDOWN_TIMEOUT`], so it
+    /// belongs on a thread of its own: [`crate::HcsVmRepository`] calls it from
+    /// a shutdown worker rather than from the thread the UI runs on.
     pub fn shutdown(&self, store: &MetadataStore, vm_name: &str) -> Result<(), RepositoryError> {
         let mapping = store.find_by_vm_name(vm_name)?.ok_or_else(|| {
             let error = RepositoryError::new(format!("no HCS mapping found for VM \"{vm_name}\""));
