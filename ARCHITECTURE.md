@@ -966,9 +966,9 @@ Every start of a VM that asks for a GPU runs the same six steps, in
    nothing else; the shipped catalog is empty until a payload is published, so
    this is the path every host takes today.
 2. **Exports.** The host's partition adapters are enumerated and turned into
-   Plan9 shares, each granted to the VM's own security principal before it is
-   offered -- a share the VM cannot open is worse than one it was never told
-   about.
+   Plan9 shares. VM access is asked for on each and the answer is not acted on:
+   these paths are under `System32`, where the grant is always refused, and a
+   Plan9 share does not need one.
 3. **Configuration.** The shares are written into the configuration the compute
    system is built from, in memory. They are never written back to the stored
    `config.json`: they name this host's paths and this run's staging directory,
@@ -1116,9 +1116,15 @@ A candidate that fails any of this is dropped with a log line and the rest are
 still offered, and a set with nothing in it is `None` rather than an error: GPU
 is applied best effort and never blocks a start. `HcsGrantVmAccess` runs only
 after a path has passed -- a grant before the check is what makes the check
-decorative -- and an export the grant refused is dropped too, because offering
-a VM a share it cannot open trades a clear line in the host log for an opaque
-mount failure in the guest.
+decorative -- but its answer is not acted on. Every one of these paths lives
+under `System32`, whose DACLs belong to TrustedInstaller, so the grant is
+refused there however elevated VMLord is, and a Plan9 share does not need it:
+the share is served by the host's own Plan9 server rather than opened by the
+VM's security principal, which is what makes it different from the VHDX files a
+start grants separately. The AppSandbox backend asks for the same grants on the
+same paths and ignores the answer. Dropping a share over the refusal is what
+this used to do, and it removed the guest's entire GPU userspace on every real
+host.
 
 What the guest is told is a `GpuShareManifest`: for each share, a name and a
 role -- `WslLib`, or `DriverPackage` with the package's folder name. Never a

@@ -69,10 +69,10 @@ pub(crate) fn prepare(
         );
         Vec::new()
     });
-    // Granted before anything is offered: a share the VM cannot open is worse
-    // than one it was never told about, and `granted_to` drops the ones it
-    // could not grant so that only openable shares reach the configuration.
-    let exports = GpuExports::build(&adapters, vm_directory).and_then(|exports| {
+    // The grants are asked for before anything is offered, and every one of
+    // them is expected to be refused: these paths live under `System32`. See
+    // `GpuExports::granted_to` for why that is not a problem.
+    let exports = GpuExports::build(&adapters, vm_directory).map(|exports| {
         exports.granted_to(&mapping.hcs_compute_system_id, &|id, path| {
             HcsClient::new().grant_vm_access(id, path)
         })

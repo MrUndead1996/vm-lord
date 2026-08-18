@@ -148,10 +148,19 @@ cannot redirect the export, and that both roots live under `System32`, which
 takes administrator rights to write to.
 
 `HcsGrantVmAccess` runs only after a candidate has passed all of the above, and
-only against the canonical path. A grant that fails removes its export from the
-set: handing a VM a share it cannot open trades a clear line in the host log
-for an opaque mount failure in the guest. The order is fixed -- build,
-validate, grant, write the section.
+only against the canonical path. The order is fixed -- build, validate, grant,
+write the section.
+
+> **Superseded by TASK-98.** This design said a failed grant removes its export
+> from the set, reasoning that handing a VM a share it cannot open trades a
+> clear line in the host log for an opaque mount failure in the guest. The
+> first real host disproved it: every one of these paths is under `System32`,
+> whose DACLs belong to TrustedInstaller, so the grant is refused for all of
+> them however elevated VMLord is -- and the rule removed the guest's entire GPU
+> userspace. A Plan9 share does not need the grant: it is served by the host's
+> own Plan9 server rather than opened by the VM's security principal, which is
+> what makes it different from the VHDX files a start grants separately. The
+> grant is now asked for and its answer logged at debug only.
 
 The grant is injected as a function, the way `VmStartPipeline` injects
 `access_granter`, so the module is testable without a live HCS.
@@ -198,7 +207,7 @@ of it is ordinary unit-testable code:
 * uniqueness of share names;
 * the manifest projected from a built set, which is where "only a name and a
   role leave the host" is asserted;
-* a failing grant removing its export while the others survive.
+* a failing grant leaving every export in place (see the note above).
 
 `hcs_config` tests cover the shape of the section, its removal, and that a
 document needing no change comes back byte for byte.

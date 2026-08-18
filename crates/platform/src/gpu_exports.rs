@@ -79,38 +79,44 @@ impl GpuExports {
         }
     }
 
-    /// Gives the VM access to every export, keeping only those it was given.
+    /// Asks for VM access to every export, and offers all of them either way.
     ///
     /// Called after validation and never before it: a grant is what makes a
     /// path readable by the VM's own security principal, and handing one out
     /// for a path that has not been proven is how a check becomes decorative.
     ///
-    /// An export the grant refused is dropped rather than fatal. Offering a VM
-    /// a share it cannot open trades one clear line in the host's log for an
-    /// opaque mount failure inside the guest.
+    /// The grant is best effort, and a refusal is expected rather than
+    /// exceptional. Every GPU share lives under `System32`, whose DACLs belong
+    /// to TrustedInstaller, so `HcsGrantVmAccess` is refused there however
+    /// elevated VMLord is. It does not need to succeed: a Plan9 share is
+    /// served by the host's own Plan9 server rather than opened by the VM's
+    /// security principal, which is the difference between these shares and
+    /// the VHDX files a start grants separately. The AppSandbox backend asks
+    /// for the same grants on the same paths and ignores the answer, and its
+    /// guests render.
+    ///
+    /// Dropping a share over a refusal is what this used to do, and it removed
+    /// the guest's entire GPU userspace on every real host.
     pub(crate) fn granted_to(
         self,
         hcs_id: &str,
         grant: &dyn Fn(&str, &Path) -> Result<(), RepositoryError>,
-    ) -> Option<Self> {
-        let exports: Vec<GpuExport> = self
-            .exports
-            .into_iter()
-            .filter(|export| match grant(hcs_id, export.host_path()) {
-                Ok(()) => true,
-                Err(error) => {
-                    log::warn!(
-                        "not offering share \"{}\": the VM could not be given access to \"{}\": \
-                         {error}",
-                        export.name(),
-                        export.host_path().display()
-                    );
-                    false
-                }
-            })
-            .collect();
+    ) -> Self {
+        for export in &self.exports {
+            if let Err(error) = grant(hcs_id, export.host_path()) {
+                // Debug, not warn: this is the ordinary answer for a path
+                // under `System32`, and a warning per share per start would be
+                // a log that reports the expected as a fault.
+                log::debug!(
+                    "share \"{}\" is offered without an explicit grant: the VM could not be \
+                     given access to \"{}\": {error}",
+                    export.name(),
+                    export.host_path().display()
+                );
+            }
+        }
 
-        (!exports.is_empty()).then_some(Self { exports })
+        self
     }
 
     #[cfg(test)]
@@ -777,8 +783,7 @@ mod tests {
                     .unwrap()
                     .push((id.to_owned(), path.to_path_buf()));
                 Ok(())
-            })
-            .expect("both survive");
+            });
 
         assert_eq!(survived.iter().count(), 2);
         assert_eq!(
@@ -797,7 +802,13 @@ mod tests {
     }
 
     #[test]
-    fn an_export_the_grant_refused_is_dropped_and_the_rest_survive() {
+    fn an_export_the_grant_refused_is_still_offered() {
+        // Every GPU share lives under `System32`, whose DACLs belong to
+        // TrustedInstaller, so `HcsGrantVmAccess` is refused there however
+        // elevated VMLord is. It does not matter: a Plan9 share is read by the
+        // host's own Plan9 server, not opened by the VM's security principal,
+        // and dropping the share over the refusal removes the guest's whole
+        // GPU userspace to no purpose.
         let exports = GpuExports::for_test(vec![
             (
                 GpuShare::wsl_lib(),
@@ -816,28 +827,22 @@ mod tests {
                 } else {
                     Ok(())
                 }
-            })
-            .expect("one survives");
+            });
 
-        assert_eq!(survived.iter().count(), 1);
-        assert_eq!(
-            survived.iter().next().unwrap().name(),
-            "vmlord.gpu.drv.nvltsi.inf_amd64_1"
-        );
+        assert_eq!(survived.iter().count(), 2);
     }
 
     #[test]
-    fn a_set_no_grant_survived_is_nothing_to_export() {
+    fn a_set_no_grant_survived_is_still_offered_in_full() {
         let exports = GpuExports::for_test(vec![(
             GpuShare::wsl_lib(),
             PathBuf::from(r"C:\Windows\System32\lxss\lib"),
         )]);
 
-        assert!(
-            exports
-                .granted_to("hcs-id", &|_, _| Err(RepositoryError::new("access denied")))
-                .is_none()
-        );
+        let survived =
+            exports.granted_to("hcs-id", &|_, _| Err(RepositoryError::new("access denied")));
+
+        assert_eq!(survived.iter().count(), 1);
     }
 
     #[test]
