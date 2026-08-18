@@ -22,7 +22,8 @@ use windows::{
             FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
             GetFinalPathNameByHandleW, OPEN_EXISTING,
         },
-        System::SystemInformation::GetSystemDirectoryW,
+        System::{Com::CoTaskMemFree, SystemInformation::GetSystemDirectoryW},
+        UI::Shell::{FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, SHGetKnownFolderPath},
     },
     core::HSTRING,
 };
@@ -144,7 +145,11 @@ impl GpuExports {
     ) -> Option<Self> {
         let system32 = system_directory()?;
         let canonicalize = canonical_directory;
-        let roots = ExportRoots::resolve(&system32, &canonicalize);
+        let roots = ExportRoots::resolve(
+            &system32,
+            program_files_directory().as_deref(),
+            &canonicalize,
+        );
 
         build_with_payload(adapters, &roots, vm_directory, payload, &canonicalize)
     }
@@ -166,6 +171,28 @@ fn system_directory() -> Option<PathBuf> {
     }
 
     Some(PathBuf::from(String::from_utf16_lossy(&buffer[..length])))
+}
+
+/// The host's `Program Files`, as Windows spells it.
+///
+/// Asked of the shell rather than read from `%ProgramFiles%`: the environment
+/// variable is inherited and can be anything, and this decides what gets
+/// exported to a VM.
+pub(crate) fn program_files_directory() -> Option<PathBuf> {
+    // SAFETY: the call takes no borrowed memory, and the buffer it returns is
+    // the caller's to free.
+    let path = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, None) }
+        .inspect_err(|error| log::debug!("Program Files could not be read: {error}"))
+        .ok()?;
+    // SAFETY: a successful call returns a NUL-terminated wide string.
+    let directory = unsafe { path.to_string() }
+        .inspect_err(|error| log::debug!("Program Files is not valid UTF-16: {error}"))
+        .ok()
+        .map(PathBuf::from);
+    // SAFETY: `path` came from the call above and is freed exactly once.
+    unsafe { CoTaskMemFree(Some(path.as_ptr().cast())) };
+
+    directory
 }
 
 /// A kernel handle this module owns and closes exactly once.
@@ -273,15 +300,39 @@ fn strip_extended_prefix(path: &str) -> &str {
 pub(crate) struct ExportRoots {
     driver_packages: Option<PathBuf>,
     wsl_lib: Option<PathBuf>,
+    /// The WSL package's own `lib`, which holds the Microsoft D3D12 userspace.
+    ///
+    /// Its own root rather than a second candidate under `System32`: the Store
+    /// and standalone WSL install it beside the package, and it is checked
+    /// against Program Files for the same reason the others are checked
+    /// against `System32`.
+    wsl_d3d12: Option<PathBuf>,
 }
 
 impl ExportRoots {
-    pub(crate) fn resolve(system32: &Path, canonicalize: Canonicalize<'_>) -> Self {
+    pub(crate) fn resolve(
+        system32: &Path,
+        program_files: Option<&Path>,
+        canonicalize: Canonicalize<'_>,
+    ) -> Self {
+        let wsl_d3d12 = program_files.and_then(|program_files| {
+            let Ok(program_files) = canonicalize(program_files) else {
+                log::debug!("Program Files could not be resolved; no D3D12 share");
+                return None;
+            };
+            resolve_root(
+                &program_files,
+                &program_files.join("WSL").join("lib"),
+                canonicalize,
+            )
+        });
+
         let Ok(system32) = canonicalize(system32) else {
             log::warn!("the system directory could not be resolved; nothing may be exported");
             return Self {
                 driver_packages: None,
                 wsl_lib: None,
+                wsl_d3d12,
             };
         };
 
@@ -292,23 +343,24 @@ impl ExportRoots {
                 canonicalize,
             ),
             wsl_lib: resolve_root(&system32, &system32.join("lxss").join("lib"), canonicalize),
+            wsl_d3d12,
         }
     }
 }
 
 fn resolve_root(
-    system32: &Path,
+    root: &Path,
     candidate: &Path,
     canonicalize: Canonicalize<'_>,
 ) -> Option<PathBuf> {
     match canonicalize(candidate) {
-        Ok(resolved) if is_within(system32, &resolved) => Some(resolved),
+        Ok(resolved) if is_within(root, &resolved) => Some(resolved),
         Ok(resolved) => {
             log::warn!(
                 "refusing to export from \"{}\": it resolves to \"{}\", outside \"{}\"",
                 candidate.display(),
                 resolved.display(),
-                system32.display()
+                root.display()
             );
             None
         }
@@ -324,14 +376,23 @@ fn resolve_root(
 
 /// Every share `adapters` justify, in the order a guest should mount them.
 ///
-/// The WSL payload comes first: a driver package without it renders nothing,
-/// and a partial set is what a guest gets when something below is dropped.
+/// The WSL userspace comes first: a driver package without it renders nothing,
+/// and a partial set is what a guest gets when something below is dropped. Of
+/// its two halves the Microsoft one leads, so that a name present in both
+/// resolves to the library a renderer links against.
 pub(crate) fn build_with(
     adapters: &[HostGpuAdapter],
     roots: &ExportRoots,
     canonicalize: Canonicalize<'_>,
 ) -> Option<GpuExports> {
     let mut exports: Vec<GpuExport> = Vec::new();
+
+    if let Some(wsl_d3d12) = &roots.wsl_d3d12 {
+        exports.push(GpuExport {
+            share: GpuShare::wsl_d3d12(),
+            host_path: wsl_d3d12.clone(),
+        });
+    }
 
     if let Some(wsl_lib) = &roots.wsl_lib {
         exports.push(GpuExport {
@@ -486,6 +547,8 @@ mod tests {
 
     const SYSTEM32: &str = r"C:\Windows\System32";
     const REPOSITORY: &str = r"C:\Windows\System32\DriverStore\FileRepository";
+    const PROGRAM_FILES: &str = r"C:\Program Files";
+    const WSL_LIB_PACKAGE: &str = r"C:\Program Files\WSL\lib";
 
     /// A canonicalizer over a fixed table: anything not in it does not exist,
     /// and an entry mapping elsewhere is a reparse point pointing there.
@@ -517,6 +580,80 @@ mod tests {
     }
 
     #[test]
+    fn the_wsl_packages_libraries_become_their_own_share() {
+        let canonicalize = canonicalizer(&[
+            (SYSTEM32, SYSTEM32),
+            (REPOSITORY, REPOSITORY),
+            (PROGRAM_FILES, PROGRAM_FILES),
+            (WSL_LIB_PACKAGE, WSL_LIB_PACKAGE),
+        ]);
+        let roots = ExportRoots::resolve(
+            Path::new(SYSTEM32),
+            Some(Path::new(PROGRAM_FILES)),
+            &canonicalize,
+        );
+
+        let roles: Vec<_> = build_with(&[], &roots, &canonicalize)
+            .expect("the D3D12 directory alone is worth exporting")
+            .manifest()
+            .shares
+            .into_iter()
+            .map(|share| share.role)
+            .collect();
+
+        assert!(
+            roles.contains(&GpuShareRole::WslD3d12),
+            "the Microsoft libraries are what a renderer needs: {roles:?}"
+        );
+    }
+
+    #[test]
+    fn a_host_with_no_wsl_package_offers_no_d3d12_share() {
+        // An inbox WSL keeps everything under System32, and a host with no WSL
+        // at all has neither directory. Both are a guest with less, not an
+        // error.
+        let canonicalize = canonicalizer(&[
+            (SYSTEM32, SYSTEM32),
+            (REPOSITORY, REPOSITORY),
+            (
+                r"C:\Windows\System32\lxss\lib",
+                r"C:\Windows\System32\lxss\lib",
+            ),
+        ]);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
+
+        let roles: Vec<_> = build_with(&[], &roots, &canonicalize)
+            .expect("the WSL directory is still there")
+            .manifest()
+            .shares
+            .into_iter()
+            .map(|share| share.role)
+            .collect();
+
+        assert_eq!(roles, vec![GpuShareRole::WslLib]);
+    }
+
+    #[test]
+    fn a_d3d12_directory_reparsed_outside_program_files_is_dropped() {
+        // The same rule the System32 roots follow: a root that canonicalizes
+        // out of its parent is a redirection, and everything under it would
+        // inherit it.
+        let canonicalize = canonicalizer(&[
+            (SYSTEM32, SYSTEM32),
+            (REPOSITORY, REPOSITORY),
+            (PROGRAM_FILES, PROGRAM_FILES),
+            (WSL_LIB_PACKAGE, r"D:\attacker\lib"),
+        ]);
+        let roots = ExportRoots::resolve(
+            Path::new(SYSTEM32),
+            Some(Path::new(PROGRAM_FILES)),
+            &canonicalize,
+        );
+
+        assert!(build_with(&[], &roots, &canonicalize).is_none());
+    }
+
+    #[test]
     fn payload_wsl_and_driver_package_have_distinct_roles_and_order() {
         let vm = Path::new(r"D:\VMLord\dev-linux");
         let payload = r"D:\VMLord\dev-linux\gpu-payload\generations\e7664769";
@@ -532,7 +669,7 @@ mod tests {
             (r"D:\VMLord\dev-linux", r"D:\VMLord\dev-linux"),
             (payload, payload),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
         let roles: Vec<_> =
             build_with_payload(
                 &[adapter(Some(&package))],
@@ -572,7 +709,7 @@ mod tests {
             (r"D:\VMLord\dev-linux", r"D:\VMLord\dev-linux"),
             (generation, generation),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         let exports =
             build_with_payload(&[], &roots, vm, Some(Path::new(generation)), &canonicalize)
@@ -599,7 +736,7 @@ mod tests {
             (&package, &package),
             (r"D:\VMLord\dev-linux", r"D:\VMLord\dev-linux"),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         let exports = build_with_payload(&[adapter(Some(&package))], &roots, vm, None, &canonicalize)
             .expect("the host still has a driver package to offer");
@@ -621,7 +758,7 @@ mod tests {
             (r"D:\VMLord\dev-linux", r"D:\VMLord\dev-linux"),
             (r"D:\VMLord\dev-linux\gpu-payload", r"D:\attacker\payload"),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
         assert!(
             build_with_payload(
                 &[],
@@ -646,7 +783,7 @@ mod tests {
                 r"D:\VMLord\dev-linux\attacker\payload",
             ),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         assert!(
             build_with_payload(
@@ -672,7 +809,7 @@ mod tests {
             ),
             (&package, &package),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         let exports =
             build_with(&[adapter(Some(&package))], &roots, &canonicalize).expect("two shares");
@@ -709,7 +846,7 @@ mod tests {
             (REPOSITORY, REPOSITORY),
             (&package, &package),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         let exports =
             build_with(&[adapter(Some(&package))], &roots, &canonicalize).expect("one share");
@@ -729,7 +866,7 @@ mod tests {
             (REPOSITORY, REPOSITORY),
             (outside, outside),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         assert!(build_with(&[adapter(Some(outside))], &roots, &canonicalize).is_none());
     }
@@ -744,7 +881,7 @@ mod tests {
             (REPOSITORY, REPOSITORY),
             (&package, r"D:\attacker\payload"),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         assert!(build_with(&[adapter(Some(&package))], &roots, &canonicalize).is_none());
     }
@@ -759,7 +896,7 @@ mod tests {
             (REPOSITORY, REPOSITORY),
             (package, package),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         assert!(build_with(&[adapter(Some(package))], &roots, &canonicalize).is_none());
     }
@@ -772,7 +909,7 @@ mod tests {
             (REPOSITORY, r"D:\attacker"),
             (&package, r"D:\attacker\nvltsi.inf_amd64_1"),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         assert!(
             build_with(&[adapter(Some(&package))], &roots, &canonicalize).is_none(),
@@ -787,7 +924,7 @@ mod tests {
             (REPOSITORY, REPOSITORY),
             (r"C:\Windows\System32\lxss\lib", r"E:\elsewhere\lib"),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         assert!(build_with(&[], &roots, &canonicalize).is_none());
     }
@@ -802,7 +939,7 @@ mod tests {
             (&package, &package),
             (&same_folder_other_case, &same_folder_other_case),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         let exports = build_with(
             &[
@@ -830,7 +967,7 @@ mod tests {
             (REPOSITORY, REPOSITORY),
             (&package, &package),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         assert!(build_with(&[adapter(Some(&package))], &roots, &canonicalize).is_none());
     }
@@ -847,7 +984,7 @@ mod tests {
             ),
             (&package, &package),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         let manifest = build_with(&[adapter(Some(&package))], &roots, &canonicalize)
             .expect("two shares")

@@ -114,7 +114,11 @@ mod tests {
         };
         // No system roots: this test is about the per-VM child alone, and a
         // system directory that does not resolve leaves `ExportRoots` empty.
-        let roots = ExportRoots::resolve(&temporary.path().join("no-system32"), &canonicalize);
+        let roots = ExportRoots::resolve(
+            &temporary.path().join("no-system32"),
+            None,
+            &canonicalize,
+        );
 
         // A generation is what the guest mounts: `sources.json` lives at the
         // root of the share, and staging writes it inside the generation.
