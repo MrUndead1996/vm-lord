@@ -1,7 +1,7 @@
 //! Turning a catalog entry into the payload directory a VM exports.
 //!
 //! Three steps that belong together and nowhere else: pick the entry for the
-//! target an agent reported, prepare that generation in the shared cache, and
+//! guest this VM was built from, prepare that generation in the shared cache, and
 //! stage it into the VM's own `gpu-payload` child -- the exact directory
 //! `gpu_exports` canonicalizes and offers as `vmlord.gpu.payload`.
 //!
@@ -14,7 +14,7 @@
 use std::{path::Path, path::PathBuf, sync::atomic::AtomicBool};
 
 use vmlord_gpu_payload::{
-    GuestTarget, PayloadCatalog, PayloadError, PayloadProgress, PrepareRequest, StagedGpuPayload,
+    GuestSelector, PayloadCatalog, PayloadError, PayloadProgress, PrepareRequest, StagedGpuPayload,
     ensure_staging_root, local_archive_path, prepare, stage_payload,
 };
 
@@ -29,8 +29,8 @@ pub struct StageGpuPayloadRequest<'a> {
     pub cache_root: &'a Path,
     /// The VM's own directory. Its `gpu-payload` child is what gets filled.
     pub vm_directory: &'a Path,
-    /// The exact guest tuple the agent reported.
-    pub target: &'a GuestTarget,
+    /// The guest this payload is for, as the host knows it before boot.
+    pub guest: GuestSelector<'a>,
     pub progress: &'a dyn Fn(PayloadProgress),
     pub cancel: &'a AtomicBool,
 }
@@ -42,14 +42,14 @@ pub(crate) fn prepare_staging_root(vm_directory: &Path) -> Result<PathBuf, Paylo
     Ok(root)
 }
 
-/// Stages the payload for `target` into the VM's `gpu-payload` child.
+/// Stages the payload for `guest` into the VM's `gpu-payload` child.
 ///
 /// A failure here is a failure of GPU support and not of the VM: assignment is
 /// best effort by design, so the caller decides what a [`PayloadError`] means
 /// for a start and nothing in this module touches lifecycle.
 pub fn stage_for_vm(request: StageGpuPayloadRequest<'_>) -> Result<StagedGpuPayload, PayloadError> {
     let catalog = PayloadCatalog::embedded()?;
-    let entry = catalog.select(request.target)?;
+    let entry = catalog.select_for_guest(&request.guest)?;
     let archive = local_archive_path(request.executable_directory, entry.payload_id());
     let ready = prepare(PrepareRequest {
         entry,
@@ -71,7 +71,7 @@ mod tests {
     };
 
     use vmlord_core::{GpuShare, RepositoryError};
-    use vmlord_gpu_payload::{GuestTarget, PayloadError};
+    use vmlord_gpu_payload::{GuestSelector, PayloadError};
 
     use super::{StageGpuPayloadRequest, prepare_staging_root, stage_for_vm};
     use crate::gpu_exports::{ExportRoots, build_with_payload};
@@ -129,7 +129,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unsupported_target_stages_nothing() {
+    fn a_guest_the_catalog_has_nothing_for_stages_nothing() {
         let temporary = TemporaryDirectory::new("unsupported");
         let vm = temporary.path().join("dev-linux");
         fs::create_dir(&vm).unwrap();
@@ -138,12 +138,16 @@ mod tests {
             executable_directory: temporary.path(),
             cache_root: &temporary.path().join("cache"),
             vm_directory: &vm,
-            target: &GuestTarget::ubuntu_26_04_amd64("7.0.0-28-generic"),
+            guest: GuestSelector {
+                distribution: "ubuntu",
+                release: "26.04",
+                architecture: "amd64",
+            },
             progress: &|_| {},
             cancel: &AtomicBool::new(false),
         });
 
-        assert!(matches!(result, Err(PayloadError::UnsupportedTarget(_))));
+        assert!(matches!(result, Err(PayloadError::NoPayloadForGuest { .. })));
         assert_eq!(fs::read_dir(&vm).unwrap().count(), 0);
     }
 }

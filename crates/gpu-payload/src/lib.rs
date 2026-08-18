@@ -10,7 +10,9 @@ mod staging;
 #[cfg(feature = "builder")]
 pub mod builder;
 
-pub use catalog::{CatalogEntry, GuestTarget, MesaPolicy, PayloadCatalog, RendererCapability};
+pub use catalog::{
+    CatalogEntry, GuestSelector, GuestTarget, MesaPolicy, PayloadCatalog, RendererCapability,
+};
 pub use digest::Sha256Digest;
 pub use error::PayloadError;
 pub use manifest::{PayloadManifest, PreparedFile, ReadyMarker, SourceManifest};
