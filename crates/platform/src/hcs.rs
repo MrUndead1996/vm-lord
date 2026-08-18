@@ -910,8 +910,13 @@ impl HcsClient {
         let wide_path = HSTRING::from(path.as_os_str().to_string_lossy().as_ref());
         // SAFETY: `hcs_id` and `wide_path` remain valid for the duration of the call.
         unsafe { HcsGrantVmAccess(&hcs_id, &wide_path) }.map_err(|error| {
+            // Returned rather than logged at error: whether a refusal matters
+            // is the caller's to say. It is fatal for the files a compute
+            // system attaches, which Hyper-V opens as the VM itself, and
+            // expected for the GPU shares under `System32`, which no grant can
+            // cover and none of which needs one.
             let error = windows_error("grant VM access", Some(id), error);
-            log::error!("{error}");
+            log::debug!("{error}");
             error
         })
     }

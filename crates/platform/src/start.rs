@@ -530,7 +530,17 @@ impl VmStartPipeline {
             );
         }
         for path in &paths {
-            (self.access_granter)(&mapping.hcs_compute_system_id, path)?;
+            // Fatal here, unlike the GPU shares: Hyper-V opens an attachment as
+            // the VM itself, so a file it was not granted is a start that fails
+            // with `ERROR_ACCESS_DENIED` deep inside HCS instead of here.
+            (self.access_granter)(&mapping.hcs_compute_system_id, path).inspect_err(|error| {
+                log::error!(
+                    "VM \"{}\" cannot be started: it could not be granted access to \"{}\": \
+                     {error}",
+                    mapping.vm_name,
+                    path.display()
+                );
+            })?;
         }
 
         Ok(())
