@@ -521,7 +521,18 @@ git commit -m "TASK-107: Report both halves of the Linux GPU userspace"
 
 ### Task 4: One merged `/usr/lib/wsl/lib` in the guest
 
-**Write the Task 0 answer at the top of this task before starting it.**
+**Task 0 answer: overlay works.** A read-only overlay with two lowerdirs and no
+upperdir mounted over a 9p lowerdir and returned the union of both directories:
+
+```
+overlay on .../merged type overlay (ro,relatime,lowerdir=.../b:/mnt/c/Windows/System32/lxss/lib,redirect_dir=on)
+```
+
+Measured on WSL2's own 6.6 kernel against its `/mnt/c` 9p mount rather than
+inside a VMLord guest, because no guest was running. That is the same kernel
+family and the same filesystem on the lower side, so it settles the mechanism;
+what it does not settle is the Ubuntu guest kernel specifically, which Task 5
+observes on the real host. The symlink alternative is dropped.
 
 **Files:**
 - Modify: `crates/agent/src/gpu_targets.rs` (paths and the role mapping)

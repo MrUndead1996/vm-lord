@@ -10,16 +10,25 @@ use std::path::{Path, PathBuf};
 
 use vmlord_agent_protocol::v1::{GpuShare, GpuShareRole};
 
-/// Where the host's WSL Linux userspace is mounted.
+/// Where the guest finds the WSL Linux userspace, whole.
 ///
 /// WSL's own path, because the Mesa D3D12 driver and the vendor libraries in a
-/// DriverStore package expect to find each other where WSL puts them.
+/// DriverStore package expect to find each other where WSL puts them. Not a
+/// mount target and deliberately absent from the roles below: it is composed
+/// from the two mounts underneath it, and a manifest that could claim it would
+/// hide half of its own contents.
 pub const WSL_LIB: &str = "/usr/lib/wsl/lib";
 
-/// Where the WSL package's Microsoft D3D12 userspace is mounted.
+/// Where the vendor's half of that userspace is mounted.
 ///
-/// Beside the vendor's libraries rather than among them: they are two
-/// read-only mounts and one cannot be created inside the other.
+/// `System32\lxss\lib` on the host, which on every host that installs WSL
+/// from the Store holds the GPU vendor's libraries and nothing else.
+pub const WSL_HOST_LIB: &str = "/usr/lib/wsl/host-lib";
+
+/// Where the Microsoft half is mounted.
+///
+/// Beside the vendor's rather than among them: they are two read-only mounts
+/// and nothing can be created inside one.
 pub const WSL_D3D12: &str = "/usr/lib/wsl/d3d12";
 
 /// The directory each driver package is mounted below, one per package.
@@ -121,7 +130,7 @@ fn target(share: &GpuShare) -> Result<PathBuf, Refusal> {
     }
 
     match share.role() {
-        GpuShareRole::WslLib => Ok(PathBuf::from(WSL_LIB)),
+        GpuShareRole::WslLib => Ok(PathBuf::from(WSL_HOST_LIB)),
         GpuShareRole::WslD3d12 => Ok(PathBuf::from(WSL_D3D12)),
         GpuShareRole::GpuPayload => Ok(PathBuf::from(PAYLOAD)),
         GpuShareRole::DriverPackage => {
@@ -163,7 +172,7 @@ fn is_path_component(package: &str) -> bool {
 /// list this process kept, so it needs a rule for telling its own mounts from
 /// everything else the guest has mounted.
 pub fn is_managed(path: &Path) -> bool {
-    path == Path::new(WSL_LIB)
+    path == Path::new(WSL_HOST_LIB)
         || path == Path::new(WSL_D3D12)
         || path == Path::new(PAYLOAD)
         || path.parent() == Some(Path::new(DRIVER_ROOT))
@@ -173,7 +182,9 @@ pub fn is_managed(path: &Path) -> bool {
 mod tests {
     use vmlord_agent_protocol::v1::{GpuShare, GpuShareRole};
 
-    use super::{Planned, Refusal, is_managed, plan};
+    use super::{
+        Planned, Refusal, WSL_D3D12, WSL_HOST_LIB, WSL_LIB, is_managed, plan,
+    };
     use std::path::{Path, PathBuf};
 
     fn share(name: &str, role: GpuShareRole, package: &str) -> GpuShare {
@@ -203,7 +214,7 @@ mod tests {
             vec![
                 Planned::Mount {
                     share: "vmlord.gpu.wsl-lib".to_owned(),
-                    path: PathBuf::from("/usr/lib/wsl/lib"),
+                    path: PathBuf::from(WSL_HOST_LIB),
                 },
                 Planned::Mount {
                     share: "vmlord.gpu.payload".to_owned(),
@@ -215,6 +226,37 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn the_two_userspace_shares_mount_beside_each_other_and_not_on_the_merged_view() {
+        let planned = plan(&[
+            share("vmlord.gpu.wsl-lib", GpuShareRole::WslLib, ""),
+            share("vmlord.gpu.wsl-d3d12", GpuShareRole::WslD3d12, ""),
+        ]);
+
+        let paths: Vec<_> = planned
+            .iter()
+            .filter_map(|planned| match planned {
+                Planned::Mount { path, .. } => Some(path.to_string_lossy().into_owned()),
+                Planned::Refused { .. } => None,
+            })
+            .collect();
+
+        assert_eq!(paths, vec![WSL_HOST_LIB.to_owned(), WSL_D3D12.to_owned()]);
+        assert!(
+            !paths.iter().any(|path| path == WSL_LIB),
+            "the merged view is built over the mounts, never mounted on"
+        );
+    }
+
+    #[test]
+    fn the_merged_view_is_not_one_this_agent_unmounts_as_a_share() {
+        // `is_managed` reads the 9p mount table, and the merged view is an
+        // overlay: it is taken away by name where it is made, not here.
+        assert!(is_managed(Path::new(WSL_HOST_LIB)));
+        assert!(is_managed(Path::new(WSL_D3D12)));
+        assert!(!is_managed(Path::new(WSL_LIB)));
     }
 
     #[test]
@@ -307,7 +349,7 @@ mod tests {
             vec![
                 Planned::Mount {
                     share: "vmlord.gpu.wsl-lib".to_owned(),
-                    path: PathBuf::from("/usr/lib/wsl/lib"),
+                    path: PathBuf::from(WSL_HOST_LIB),
                 },
                 Planned::Refused {
                     share: "vmlord.gpu.wsl-lib.again".to_owned(),
@@ -321,7 +363,8 @@ mod tests {
     fn only_the_agents_own_targets_are_managed() {
         // The cleanup unmounts what this says yes to, so a path outside the
         // three roots must never be one of them.
-        assert!(is_managed(Path::new("/usr/lib/wsl/lib")));
+        assert!(is_managed(Path::new(WSL_HOST_LIB)));
+        assert!(is_managed(Path::new(WSL_D3D12)));
         assert!(is_managed(Path::new("/opt/vmlord/gpu-payload")));
         assert!(is_managed(Path::new("/usr/lib/wsl/drivers/nv_dispi.inf")));
 
