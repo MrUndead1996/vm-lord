@@ -674,9 +674,9 @@ it booted with, so the application layer accepts the edit and warns that it
 applies after a restart rather than refusing it. An edit also carries the
 network mode, which is recorded in the VM's mapping rather than in its
 `config.json` and reaches the VM the same way: the next start writes or removes
-the `NetworkAdapters` section to match. GPU modes other than `None` are
-rejected until their own task lands, as are the `External` and `Internal`
-network modes.
+the `NetworkAdapters` section to match. The GPU mode is recorded in the mapping
+the same way, and may only be changed while the VM is stopped. The `External`
+and `Internal` network modes are still rejected until their own task lands.
 
 `VmSummary`'s memory and processor counts come from the same stored
 configuration. `disk_gb` comes from the `MetadataStore` mapping, where creation
@@ -956,6 +956,87 @@ The UI only displays this. It shows the desired mode and the runtime status as
 separate rows, because a VM configured for `Mirror` whose guest has not come up
 yet is not a VM without a GPU.
 
+### GPU: the shape of a start
+
+Every start of a VM that asks for a GPU runs the same six steps, in
+`VmStartPipeline`, before and around the start it already performed:
+
+1. **Staging.** The payload for the VM's guest is staged into the VM's own
+   `gpu-payload` directory. A failure here removes exactly one share and
+   nothing else; the shipped catalog is empty until a payload is published, so
+   this is the path every host takes today.
+2. **Exports.** The host's partition adapters are enumerated and turned into
+   Plan9 shares, each granted to the VM's own security principal before it is
+   offered -- a share the VM cannot open is worse than one it was never told
+   about.
+3. **Configuration.** The shares are written into the configuration the compute
+   system is built from, in memory. They are never written back to the stored
+   `config.json`: they name this host's paths and this run's staging directory,
+   and a compute system's Plan9 section is fixed for the lifetime of a boot
+   anyway.
+4. **Start.** The compute system is prepared, the console is opened, and the
+   system runs. Unchanged by GPU.
+5. **Assignment.** `HcsModifyComputeSystem` attaches the adapters the mode asks
+   for, once, against the running system. A failure is recorded and changes
+   nothing else: the VM is running, and GPU never decides that.
+6. **Manifest.** What the guest is to mount is left where the agent listener
+   reads it, and every session of that run is offered the same manifest.
+
+None of this is retried -- not staging, not assignment, not a partial outcome.
+A second attempt at a modify HCS refused is a second refusal, and a loop around
+one is how a VM spends its life asking for a GPU it will not get.
+
+The steps live in the start pipeline rather than in the repository, because the
+build cycle starts VMs through the same pipeline: a VM created with a GPU gets
+one on its first boot as well as on every later start.
+
+Staging unpacks an archive on a cold cache and hashes the staged tree on every
+start, so a start became a thread of its own -- `StartRegistry`, modelled on the
+`BuildRegistry` that background creation already uses. `start_vm` refuses
+synchronously only what is cheap and certain (an unknown VM, a build or a start
+already in flight) and hands the rest to the thread; a VM with a start in flight
+lists as `VmState::Starting`, and what the thread produced -- the console
+session and the compute-system handle -- is taken over on the next refresh.
+
+### GPU: what a run knows about itself
+
+`GpuRuns` is one in-memory map, keyed by VM id, holding what has been observed
+about each running VM's GPU and the manifest its guest is to be offered. Three
+threads meet there -- the one starting the VM, the one serving its agent, and
+the refresh that lists VMs -- and one entry with one lifetime is what keeps
+them from disagreeing. Every point that ends a run forgets its entry: stop,
+force stop, delete, the HCS release event, and process shutdown.
+
+Nothing is persisted. A `VmGpuStatus` describes a moment, and facts recorded by
+a process that is gone are confirmed by nothing -- the VM may have crashed, the
+guest may have lost the device. Re-observing is cheap: a reconnecting agent
+runs the same attach, recipe and probe exchange within seconds.
+
+What cannot be re-observed is the assignment, which happens once, right after
+the system starts. A VM reclaimed from a previous process therefore reports
+`GpuAssignment::Unknown` and the stable code `gpu-assignment-unknown` -- "this
+VM was started before VMLord, so what is attached to it is not known" -- rather
+than `gpu-assignment-pending`, which would be a lie about the stage. It lasts
+until the guest's first report.
+
+### GPU: where partial comes from
+
+HCS reports nothing about partiality: it either accepted the update or it did
+not. Partiality is therefore derived from export coverage, which is its only
+honest source. With N adapters enumerated and M driver-package shares built,
+`M < N` is a partial assignment -- some adapters are attached but the guest
+cannot mount their drivers -- and a payload that could not be staged is partial
+too, with its own wording. Full coverage is complete, and a host with no
+partition adapter at all is a failure rather than something partly done.
+
+A VM's guest triple -- distribution, release, architecture -- is recorded in its
+mapping at creation, from the cloud image it was built from. A VM from
+installation media has none, because VMLord promises nothing about the system
+inside it, and gets the WSL and driver shares without a payload. The kernel is
+deliberately not part of the key: the host chooses a payload before the guest
+has booted, and the guest's own recipe treats the kernel as soft because DKMS
+rebuilds the module for whatever kernel is running.
+
 ### GPU: what the host can do
 
 Before any VM is offered a GPU, `HostGpuCapabilities` answers what this host is
@@ -1004,10 +1085,11 @@ assignment on a running compute system. It maps `Default` and `Mirror` to an
 waits for HCS to finish it. The service is safe: its only native call is behind
 `HcsSystem::modify`, which retains the failed HRESULT and the raw HCS result
 detail rather than guessing at a version-specific error schema. It returns a
-`GpuFailure`, so a lifecycle caller can record an unsuccessful assignment
-without stopping the VM or retrying it. The service has no lifecycle caller
-yet: storing the desired mode, invoking it after start, reporting runtime facts
-and rendering them are the next task's work.
+`GpuFailure`, so its caller records an unsuccessful assignment without stopping
+the VM or retrying it. `gpu_assignment::assign_to_system` names the compute
+system by id rather than taking an open handle, so a start can attach a GPU
+without holding one across the steps before it -- and so the step can be
+substituted in the tests of a start, which have no compute system to open.
 
 ### GPU: what is exported to a guest
 
@@ -1095,11 +1177,19 @@ that share at `/opt/vmlord/gpu-payload`; what the guest makes of it is the
 recipe below, and task 98 owns lifecycle and UI orchestration.
 
 `platform::gpu_staging` is what fills that child: given the executable's
-directory, the shared cache root, a VM directory and the guest tuple an agent
-reported, it selects the entry, prepares the generation and stages it into
-`layout::gpu_payload_staging_directory` -- the same path `gpu_exports` will
-canonicalize. It is called by nothing yet, for the reason `gpu_exports` is: a
-start does not know a VM's GPU mode until assignment records one.
+directory, the shared cache root, a VM directory and the guest triple recorded
+with the VM, it selects the entry, prepares the generation and stages it into
+`layout::gpu_payload_staging_directory` -- the same path `gpu_exports`
+canonicalizes. `gpu_prepare` calls it as the first step of every start of a VM
+that asks for a GPU.
+
+The catalog is selected by distribution, release and architecture, and never by
+kernel: the host chooses a payload before the guest that will run it has
+booted, so the exact `kernel_release` cannot be known. Where a triple has
+several entries the newest proven kernel wins. This is safe because the guest
+does the same thing from the other side -- its recipe treats distribution,
+release and architecture as the hard gate and the kernel as soft, since DKMS
+builds against the running kernel's headers.
 
 ### GPU: the guest's Ubuntu recipe
 
@@ -1246,8 +1336,13 @@ The edit workflow follows these rules:
   start, and the application layer says so.
 * RAM must be at least 512 MiB and aligned to 2 MiB steps.
 * CPU core count must be at least 1.
-* GPU modes other than `None` are rejected by the native backend until their own
-  migration task lands.
+* The GPU mode may only be changed while the VM is stopped, and only the mode:
+  the refusal fires when the requested mode differs from the stored one under a
+  VM that is not stopped, so an edit of RAM or CPU on a running VM is unaffected.
+  The mode is applied while the compute system is prepared and started, so a
+  change under a live VM would leave a stored mode that does not describe the
+  GPU the guest actually has. The UI disables the control and gives the reason,
+  rather than offering a change the backend will refuse.
 * Network mode accepts `None` and `Nat`; `External` and `Internal` are rejected
   with a message naming the task that will add them.
 * Disk size is read-only in the current backend contract and requires recreating
