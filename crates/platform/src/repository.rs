@@ -569,9 +569,11 @@ impl HcsVmRepository {
             runtime_id,
             &layout::agent_secret_path(&vm_directory),
             // No manifest yet: the shares a VM is started with are computed
-            // and written into its compute system by the lifecycle task, and
-            // until they are there is nothing to tell a guest to mount.
+            // and written into its compute system by the start that prepared
+            // it, and a VM reclaimed from a previous process was prepared by
+            // nobody here.
             None,
+            self.gpu_facts.clone(),
         ) {
             Ok(connection) => self.agent_sessions.insert(connection),
             Err(error) => log::warn!(
