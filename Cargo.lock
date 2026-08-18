@@ -4639,6 +4639,7 @@ dependencies = [
  "uuid",
  "vmlord-agent-protocol",
  "vmlord-core",
+ "vmlord-gpu-payload",
  "vmlord-image",
  "vmlord-keys",
  "vmlord-seed",
