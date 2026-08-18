@@ -1082,7 +1082,10 @@ cannot tell you" is a different answer from "this host cannot do it".
 `vmlord_platform::gpu_assignment` is the narrow boundary that proves
 assignment on a running compute system. It maps `Default` and `Mirror` to an
 `HcsModifyComputeSystem` `Update` of `VirtualMachine/ComputeTopology/Gpu` and
-waits for HCS to finish it. The service is safe: its only native call is behind
+waits for HCS to finish it. The settings carry `AllowVendorExtension`, which is
+what lets HCS attach a vendor's own partition extension: without it a host with
+an NVIDIA adapter refuses the update with HRESULT 0xC0350008 and an empty result
+detail. The service is safe: its only native call is behind
 `HcsSystem::modify`, which retains the failed HRESULT and the raw HCS result
 detail rather than guessing at a version-specific error schema. It returns a
 `GpuFailure`, so its caller records an unsuccessful assignment without stopping

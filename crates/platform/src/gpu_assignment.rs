@@ -74,7 +74,14 @@ pub(crate) fn assignment_document(mode: GpuMode) -> Result<Option<String>, GpuFa
     serde_json::to_string(&serde_json::json!({
         "ResourcePath": "VirtualMachine/ComputeTopology/Gpu",
         "RequestType": "Update",
-        "Settings": { "AssignmentMode": assignment_mode },
+        // `AllowVendorExtension` is what lets HCS attach a vendor's own GPU
+        // partition extension. Without it a host with an NVIDIA adapter
+        // refuses the update with HRESULT 0xC0350008 and an empty result
+        // detail; the AppSandbox backend has always sent it.
+        "Settings": {
+            "AssignmentMode": assignment_mode,
+            "AllowVendorExtension": true,
+        },
     }))
     .map(Some)
     .map_err(|error| {
@@ -119,6 +126,24 @@ mod tests {
         assert_eq!(value["ResourcePath"], "VirtualMachine/ComputeTopology/Gpu");
         assert_eq!(value["RequestType"], "Update");
         assert_eq!(value["Settings"]["AssignmentMode"], "Default");
+    }
+
+    #[test]
+    fn every_mode_allows_the_vendors_own_extension() {
+        // Without it the first real host refused the update outright, with
+        // HRESULT 0xC0350008 and an empty result detail. The AppSandbox
+        // backend sends it on both modes and its guests render; nothing else
+        // about the two documents differs.
+        for mode in [GpuMode::Default, GpuMode::Mirror] {
+            let document = assignment_document(mode).unwrap().unwrap();
+            let value: serde_json::Value = serde_json::from_str(&document).unwrap();
+
+            assert_eq!(
+                value["Settings"]["AllowVendorExtension"],
+                true,
+                "a vendor GPU needs its own extension to be attachable: {mode:?}"
+            );
+        }
     }
 
     #[test]
