@@ -531,8 +531,10 @@ overlay on .../merged type overlay (ro,relatime,lowerdir=.../b:/mnt/c/Windows/Sy
 Measured on WSL2's own 6.6 kernel against its `/mnt/c` 9p mount rather than
 inside a VMLord guest, because no guest was running. That is the same kernel
 family and the same filesystem on the lower side, so it settles the mechanism;
-what it does not settle is the Ubuntu guest kernel specifically, which Task 5
-observes on the real host. The symlink alternative is dropped.
+what it did not settle was the Ubuntu guest kernel specifically. Task 5 settled
+that too: on the real host the guest's `Libraries` check stopped failing, so
+`/usr/lib/wsl/lib` was composed and both halves were readable through it. The
+symlink alternative is dropped.
 
 **Files:**
 - Modify: `crates/agent/src/gpu_targets.rs` (paths and the role mapping)
