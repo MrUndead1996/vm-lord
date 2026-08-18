@@ -48,7 +48,7 @@ pub fn stage_for_vm(request: StageGpuPayloadRequest<'_>) -> Result<StagedGpuPayl
     let ready = prepare(PrepareRequest {
         entry,
         cache_root: request.cache_root,
-        local_archive: Some(&archive),
+        archive: &archive,
         progress: request.progress,
         cancel: request.cancel,
     })?;
