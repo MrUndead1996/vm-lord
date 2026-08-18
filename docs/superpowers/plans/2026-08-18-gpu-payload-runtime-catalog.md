@@ -122,7 +122,7 @@ git rm crates/gpu-payload/src/download.rs
 
 In `crates/gpu-payload/src/lib.rs`, replace `mod download;` with `mod progress;` and `pub use download::PayloadProgress;` with `pub use progress::PayloadProgress;`.
 
-In `crates/gpu-payload/Cargo.toml`, delete the `ureq` line. Leave `url` — Task 3 removes it with `archive_url`.
+In `crates/gpu-payload/Cargo.toml`, delete the `ureq` line. Leave `url` — Task 2 removes it with `archive_url`.
 
 - [ ] **Step 5: Make the archive required in `prepare`**
 
