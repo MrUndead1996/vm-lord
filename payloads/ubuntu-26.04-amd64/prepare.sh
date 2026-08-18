@@ -63,12 +63,6 @@ mkdir -p "$output"
 output="$(cd "$output" && pwd)"
 work="${work:-$output/upstream}"
 
-repository="$(git -C "$SPEC_DIR" rev-parse --show-toplevel)"
-revision="$(git -C "$repository" rev-parse HEAD)"
-if [[ -n "$(git -C "$repository" status --porcelain)" ]]; then
-	echo "warning: working tree is dirty, so $revision does not describe what is being packed" >&2
-fi
-
 url="$(jq -r '.source.url' "$SPEC")"
 branch="$(jq -r '.source.branch' "$SPEC")"
 commit="$(jq -r '.source.commit' "$SPEC")"
@@ -102,5 +96,4 @@ python3 "$SPEC_DIR/prepare.py" \
 	--overlays "$SPEC_DIR/overlays" \
 	--licenses "$SPEC_DIR" \
 	--checkout "$checkout" \
-	--revision "$revision" \
 	--output "$output"

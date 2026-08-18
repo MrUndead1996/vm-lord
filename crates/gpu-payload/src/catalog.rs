@@ -1,8 +1,7 @@
 use crate::{PayloadError, Sha256Digest};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use url::Url;
-const CATALOG_SCHEMA_VERSION: u32 = 1;
+use std::{collections::HashSet, ffi::OsStr, fs, path::Path};
+const ENTRY_SCHEMA_VERSION: u32 = 2;
 const PAYLOAD_ABI_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
@@ -61,31 +60,23 @@ pub struct License {
     pub path: String,
 }
 #[derive(Clone, Debug, Deserialize)]
-struct CatalogDocument {
-    schema_version: u32,
-    entries: Vec<CatalogEntryDocument>,
-}
-#[derive(Clone, Debug, Deserialize)]
 struct CatalogEntryDocument {
+    schema_version: u32,
     payload_id: String,
     target: GuestTarget,
-    archive_url: String,
-    archive_size: u64,
     expanded_size_limit: u64,
     file_count_limit: u64,
     archive_sha256: Sha256Digest,
     payload_manifest_sha256: Sha256Digest,
     required_renderers: Vec<RendererCapability>,
     mesa_policy: MesaPolicy,
-    vmlord_revision: String,
-    builder_version: String,
     sources: Vec<Source>,
     licenses: Vec<License>,
 }
 /// A catalog entry that has passed all catalog validation.
 ///
-/// Entries cannot be deserialized independently because doing so would bypass
-/// [`PayloadCatalog::from_json`] and its validation boundary.
+/// Entries cannot be deserialized directly because doing so would bypass
+/// [`CatalogEntry::from_json`] and its validation boundary.
 ///
 /// ```compile_fail
 /// let _: vmlord_gpu_payload::CatalogEntry = serde_json::from_str("{}").unwrap();
@@ -94,16 +85,12 @@ struct CatalogEntryDocument {
 pub struct CatalogEntry {
     payload_id: String,
     target: GuestTarget,
-    archive_url: String,
-    archive_size: u64,
     expanded_size_limit: u64,
     file_count_limit: u64,
     archive_sha256: Sha256Digest,
     payload_manifest_sha256: Sha256Digest,
     required_renderers: Vec<RendererCapability>,
     mesa_policy: MesaPolicy,
-    vmlord_revision: String,
-    builder_version: String,
     sources: Vec<Source>,
     licenses: Vec<License>,
 }
@@ -112,16 +99,12 @@ impl From<CatalogEntryDocument> for CatalogEntry {
         Self {
             payload_id: value.payload_id,
             target: value.target,
-            archive_url: value.archive_url,
-            archive_size: value.archive_size,
             expanded_size_limit: value.expanded_size_limit,
             file_count_limit: value.file_count_limit,
             archive_sha256: value.archive_sha256,
             payload_manifest_sha256: value.payload_manifest_sha256,
             required_renderers: value.required_renderers,
             mesa_policy: value.mesa_policy,
-            vmlord_revision: value.vmlord_revision,
-            builder_version: value.builder_version,
             sources: value.sources,
             licenses: value.licenses,
         }
@@ -135,22 +118,14 @@ impl CatalogEntry {
             || self.target.architecture.is_empty()
             || self.target.kernel_release.is_empty()
             || self.target.payload_abi != PAYLOAD_ABI_VERSION
-            || self.archive_size == 0
-            || self.expanded_size_limit < self.archive_size
+            || self.expanded_size_limit == 0
             || self.file_count_limit == 0
             || self.required_renderers.is_empty()
-            || self.vmlord_revision.len() != 40
-            || !self
-                .vmlord_revision
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-            || self.builder_version.is_empty()
         {
             return Err(PayloadError::InvalidCatalog(
                 "missing or invalid required catalog field".into(),
             ));
         }
-        validate_url(&self.archive_url)?;
         if self.sources.is_empty()
             || self.sources.iter().any(|source| {
                 source.url.is_empty()
@@ -181,12 +156,6 @@ impl CatalogEntry {
     pub fn target(&self) -> &GuestTarget {
         &self.target
     }
-    pub fn archive_url(&self) -> &str {
-        &self.archive_url
-    }
-    pub fn archive_size(&self) -> u64 {
-        self.archive_size
-    }
     pub fn expanded_size_limit(&self) -> u64 {
         self.expanded_size_limit
     }
@@ -205,12 +174,6 @@ impl CatalogEntry {
     pub fn mesa_policy(&self) -> &MesaPolicy {
         &self.mesa_policy
     }
-    pub fn vmlord_revision(&self) -> &str {
-        &self.vmlord_revision
-    }
-    pub fn builder_version(&self) -> &str {
-        &self.builder_version
-    }
     pub fn sources(&self) -> &[Source] {
         &self.sources
     }
@@ -221,24 +184,83 @@ impl CatalogEntry {
 pub struct PayloadCatalog {
     entries: Vec<CatalogEntry>,
 }
-impl PayloadCatalog {
+impl CatalogEntry {
+    /// Reads one entry document, as `cargo xtask gpu-payload pack` writes it
+    /// and as a release carries it beside its archive.
+    ///
+    /// The entry is a release artifact rather than a build artifact waiting to
+    /// be pasted into a larger document, so it carries a schema version of its
+    /// own instead of borrowing a catalog's.
     pub fn from_json(bytes: &[u8]) -> Result<Self, PayloadError> {
-        let doc: CatalogDocument = serde_json::from_slice(bytes)
+        let document: CatalogEntryDocument = serde_json::from_slice(bytes)
             .map_err(|error| PayloadError::InvalidCatalog(error.to_string()))?;
-        if doc.schema_version != CATALOG_SCHEMA_VERSION {
+        if document.schema_version != ENTRY_SCHEMA_VERSION {
             return Err(PayloadError::InvalidCatalog(
-                "unknown catalog schema version".into(),
+                "unknown catalog entry schema version".into(),
             ));
         }
-        let entries = doc
-            .entries
-            .into_iter()
-            .map(CatalogEntry::from)
-            .collect::<Vec<_>>();
+        let entry = Self::from(document);
+        entry.validate()?;
+        Ok(entry)
+    }
+}
+impl PayloadCatalog {
+    /// The catalog a release carries beside its executable.
+    ///
+    /// `directory` is the one holding the executable; naming its `gpu-payload`
+    /// child is `release.rs`'s job. A child that is not there, cannot be
+    /// listed, or holds no entry is an empty catalog rather than an error: a
+    /// build without a payload is a build without GPU support, and GPU support
+    /// is best effort.
+    ///
+    /// A file that *is* there and is wrong fails the whole catalog. That is a
+    /// broken release, and a silent absence is the worst way to learn of one.
+    /// An archive nothing claims is ignored, because failing over a leftover
+    /// file would be a rule worse than the problem.
+    pub fn from_release_directory(directory: &Path) -> Result<Self, PayloadError> {
+        let payloads = crate::release::local_payload_directory(directory);
+        let Ok(listing) = fs::read_dir(&payloads) else {
+            return Self::from_entries(Vec::new());
+        };
+        let mut entries = Vec::new();
+        for item in listing {
+            let Ok(item) = item else {
+                continue;
+            };
+            let path = item.path();
+            if path.extension().and_then(OsStr::to_str) != Some("json") {
+                continue;
+            }
+            let bytes = fs::read(&path)
+                .map_err(|error| PayloadError::io("read GPU payload entry", path.clone(), error))?;
+            let entry = CatalogEntry::from_json(&bytes)?;
+            if path.file_stem().and_then(OsStr::to_str) != Some(entry.payload_id()) {
+                return Err(PayloadError::InvalidCatalog(format!(
+                    "{} does not name its payload ID {}",
+                    path.display(),
+                    entry.payload_id()
+                )));
+            }
+            let archive = crate::local_archive_path(directory, entry.payload_id());
+            if !archive.is_file() {
+                return Err(PayloadError::InvalidCatalog(format!(
+                    "payload {} has no archive at {}",
+                    entry.payload_id(),
+                    archive.display()
+                )));
+            }
+            entries.push(entry);
+        }
+        Self::from_entries(entries)
+    }
+    /// The catalog a set of read entries forms.
+    ///
+    /// Uniqueness is checked once, here: two entries for one guest would make
+    /// selection depend on the order a directory happened to list.
+    fn from_entries(entries: Vec<CatalogEntry>) -> Result<Self, PayloadError> {
         let mut ids = HashSet::new();
         let mut targets = HashSet::new();
         for entry in &entries {
-            entry.validate()?;
             if !ids.insert(entry.payload_id.clone()) || !targets.insert(entry.target.clone()) {
                 return Err(PayloadError::InvalidCatalog(
                     "duplicate payload ID or target".into(),
@@ -246,30 +268,6 @@ impl PayloadCatalog {
             }
         }
         Ok(Self { entries })
-    }
-    /// Reads one entry as `cargo xtask gpu-payload pack` writes it.
-    ///
-    /// `pack` emits a bare entry object rather than a catalog document, and
-    /// what makes an entry trustworthy is [`Self::from_json`]'s validation --
-    /// so the entry is wrapped in the document it belongs to and read through
-    /// exactly that. Both the builder and the release build use this, so the
-    /// file has one reading rather than two that can drift apart.
-    pub fn from_entry_json(bytes: &[u8]) -> Result<CatalogEntry, PayloadError> {
-        let entry: serde_json::Value = serde_json::from_slice(bytes)
-            .map_err(|error| PayloadError::InvalidCatalog(error.to_string()))?;
-        let document = serde_json::to_vec(&serde_json::json!({
-            "schema_version": CATALOG_SCHEMA_VERSION,
-            "entries": [entry],
-        }))
-        .map_err(|error| PayloadError::InvalidCatalog(error.to_string()))?;
-        Self::from_json(&document)?
-            .entries
-            .into_iter()
-            .next()
-            .ok_or_else(|| PayloadError::InvalidCatalog("empty catalog entry".into()))
-    }
-    pub fn embedded() -> Result<Self, PayloadError> {
-        Self::from_json(include_bytes!("../catalog/catalog.json"))
     }
     pub fn entries(&self) -> &[CatalogEntry] {
         &self.entries
@@ -320,36 +318,70 @@ fn kernel_order(release: &str) -> Vec<u64> {
         .filter_map(|part| part.parse().ok())
         .collect()
 }
-fn validate_url(value: &str) -> Result<Url, PayloadError> {
-    let url = Url::parse(value)
-        .map_err(|error| PayloadError::InvalidCatalog(format!("invalid archive URL: {error}")))?;
-    if url.scheme() != "https"
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(PayloadError::InvalidCatalog(
-            "archive URL must be immutable HTTPS without credentials, query, or fragment".into(),
-        ));
-    }
-    Ok(url)
+
+/// One entry as a test writes it: the schema version is this module's to know,
+/// so a test states only what it is testing.
+#[cfg(test)]
+pub(crate) fn test_entry(mut value: serde_json::Value) -> CatalogEntry {
+    value["schema_version"] = ENTRY_SCHEMA_VERSION.into();
+    CatalogEntry::from_json(&serde_json::to_vec(&value).unwrap())
+        .expect("the test entry must be a valid entry document")
 }
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
     use super::kernel_order;
-    use crate::{GuestSelector, GuestTarget, PayloadCatalog, PayloadError};
+    use crate::{CatalogEntry, GuestSelector, GuestTarget, PayloadCatalog, PayloadError};
+
+    static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
+
+    struct TemporaryDirectory(PathBuf);
+
+    impl TemporaryDirectory {
+        fn new(label: &str) -> Self {
+            let sequence = NEXT_TEMPORARY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "vmlord-gpu-payload-catalog-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TemporaryDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Writes the pair a release carries for one payload.
+    fn write_pair(directory: &Path, payload_id: &str, entry: &str) {
+        let payloads = directory.join("gpu-payload");
+        fs::create_dir_all(&payloads).unwrap();
+        fs::write(payloads.join(format!("{payload_id}.json")), entry).unwrap();
+        fs::write(payloads.join(format!("{payload_id}.zip")), b"archive").unwrap();
+    }
     const Z: &str = "0000000000000000000000000000000000000000000000000000000000000000";
     const C: &str = "14794180686c2fb6307fbe359c359bec765249f3";
     fn catalog() -> String {
         format!(
-            r#"{{"schema_version":1,"entries":[{{"payload_id":"ubuntu-26.04-amd64-7.0.0-14-v1","target":{{"distribution":"ubuntu","release":"26.04","architecture":"amd64","kernel_release":"7.0.0-14-generic","payload_abi":1}},"archive_url":"https://downloads.example.test/payload.zip","archive_size":1,"expanded_size_limit":2,"file_count_limit":3,"archive_sha256":"{Z}","payload_manifest_sha256":"{Z}","required_renderers":["d3d12-gallium","dzn-vulkan"],"mesa_policy":"bundled","vmlord_revision":"{C}","builder_version":"vmlord-gpu-payload 1","sources":[{{"url":"https://github.com/microsoft/WSL2-Linux-Kernel","commit":"{C}","version":"1"}}],"licenses":[{{"spdx":"GPL-2.0","path":"licenses/GPL-2.0.txt"}}]}}]}}"#
+            r#"{{"schema_version":2,"payload_id":"ubuntu-26.04-amd64-7.0.0-14-v1","target":{{"distribution":"ubuntu","release":"26.04","architecture":"amd64","kernel_release":"7.0.0-14-generic","payload_abi":1}},"expanded_size_limit":2,"file_count_limit":3,"archive_sha256":"{Z}","payload_manifest_sha256":"{Z}","required_renderers":["d3d12-gallium","dzn-vulkan"],"mesa_policy":"bundled","sources":[{{"url":"https://github.com/microsoft/WSL2-Linux-Kernel","commit":"{C}","version":"1"}}],"licenses":[{{"spdx":"GPL-2.0","path":"licenses/GPL-2.0.txt"}}]}}"#
         )
     }
     #[test]
     fn a_catalog_selects_only_the_exact_kernel_tuple() {
-        let c = PayloadCatalog::from_json(catalog().as_bytes()).unwrap();
+        let c = catalog_with(&[catalog()]);
         assert_eq!(
             c.select(&GuestTarget::ubuntu_26_04_amd64("7.0.0-14-generic"))
                 .unwrap()
@@ -363,15 +395,19 @@ mod tests {
     }
     fn entry_json(distribution: &str, release: &str, architecture: &str, kernel: &str) -> String {
         format!(
-            r#"{{"payload_id":"{distribution}-{release}-{architecture}-{kernel}","target":{{"distribution":"{distribution}","release":"{release}","architecture":"{architecture}","kernel_release":"{kernel}","payload_abi":1}},"archive_url":"https://downloads.example.test/payload.zip","archive_size":1,"expanded_size_limit":2,"file_count_limit":3,"archive_sha256":"{Z}","payload_manifest_sha256":"{Z}","required_renderers":["d3d12-gallium"],"mesa_policy":"bundled","vmlord_revision":"{C}","builder_version":"vmlord-gpu-payload 1","sources":[{{"url":"https://github.com/microsoft/WSL2-Linux-Kernel","commit":"{C}","version":"1"}}],"licenses":[{{"spdx":"GPL-2.0","path":"licenses/GPL-2.0.txt"}}]}}"#
+            r#"{{"schema_version":2,"payload_id":"{distribution}-{release}-{architecture}-{kernel}","target":{{"distribution":"{distribution}","release":"{release}","architecture":"{architecture}","kernel_release":"{kernel}","payload_abi":1}},"expanded_size_limit":2,"file_count_limit":3,"archive_sha256":"{Z}","payload_manifest_sha256":"{Z}","required_renderers":["d3d12-gallium"],"mesa_policy":"bundled","sources":[{{"url":"https://github.com/microsoft/WSL2-Linux-Kernel","commit":"{C}","version":"1"}}],"licenses":[{{"spdx":"GPL-2.0","path":"licenses/GPL-2.0.txt"}}]}}"#
         )
     }
     fn catalog_with(entries: &[String]) -> PayloadCatalog {
-        let document = format!(
-            r#"{{"schema_version":1,"entries":[{}]}}"#,
-            entries.join(",")
-        );
-        PayloadCatalog::from_json(document.as_bytes()).expect("the catalog must parse")
+        PayloadCatalog::from_entries(
+            entries
+                .iter()
+                .map(|entry| {
+                    CatalogEntry::from_json(entry.as_bytes()).expect("the entry must parse")
+                })
+                .collect(),
+        )
+        .expect("the catalog must be well formed")
     }
     fn ubuntu_2604() -> GuestSelector<'static> {
         GuestSelector {
@@ -440,31 +476,13 @@ mod tests {
         );
     }
     #[test]
-    fn production_urls_cannot_carry_mutable_or_secret_structure() {
-        for url in [
-            "http://downloads.example.test/payload.zip",
-            "https://user:secret@downloads.example.test/payload.zip",
-            "https://downloads.example.test/payload.zip?latest=1",
-            "https://downloads.example.test/payload.zip#latest",
-        ] {
-            assert!(matches!(
-                PayloadCatalog::from_json(
-                    catalog()
-                        .replace("https://downloads.example.test/payload.zip", url)
-                        .as_bytes()
-                ),
-                Err(PayloadError::InvalidCatalog(_))
-            ));
-        }
-    }
-    #[test]
     fn target_dimensions_must_all_be_non_empty() {
         for dimension in ["distribution", "release", "architecture", "kernel_release"] {
             let mut document: serde_json::Value = serde_json::from_str(&catalog()).unwrap();
-            document["entries"][0]["target"][dimension] = "".into();
+            document["target"][dimension] = "".into();
             assert!(
                 matches!(
-                    PayloadCatalog::from_json(&serde_json::to_vec(&document).unwrap()),
+                    CatalogEntry::from_json(&serde_json::to_vec(&document).unwrap()),
                     Err(PayloadError::InvalidCatalog(_))
                 ),
                 "accepted an empty {dimension} target dimension"
@@ -475,82 +493,115 @@ mod tests {
     fn a_catalog_entry_requires_at_least_one_source() {
         let empty_sources=catalog().replace(&format!(r#"[{{"url":"https://github.com/microsoft/WSL2-Linux-Kernel","commit":"{C}","version":"1"}}]"#), "[]");
         assert!(matches!(
-            PayloadCatalog::from_json(empty_sources.as_bytes()),
+            CatalogEntry::from_json(empty_sources.as_bytes()),
             Err(PayloadError::InvalidCatalog(_))
         ));
     }
 
     #[test]
-    fn catalog_provenance_requires_vmlord_revision_and_builder_version() {
-        for field in ["vmlord_revision", "builder_version"] {
-            let mut document: serde_json::Value = serde_json::from_str(&catalog()).unwrap();
-            document["entries"][0]
-                .as_object_mut()
-                .unwrap()
-                .remove(field);
+    fn an_entry_at_another_schema_version_is_refused() {
+        let mut document: serde_json::Value = serde_json::from_str(&catalog()).unwrap();
+        document["schema_version"] = 1.into();
 
-            assert!(
-                matches!(
-                    PayloadCatalog::from_json(&serde_json::to_vec(&document).unwrap()),
-                    Err(PayloadError::InvalidCatalog(_))
-                ),
-                "accepted a catalog without {field}"
-            );
-        }
-    }
-    #[test]
-    fn the_embedded_catalog_is_valid_and_offers_the_guests_it_names() {
-        // Validation is the point: every entry goes through the same checks a
-        // packed one does, and a catalog compiled into the application is the
-        // only one it trusts, so a malformed entry has to fail the build
-        // rather than a host.
-        let catalog = PayloadCatalog::embedded().expect("the shipped catalog must parse");
-
-        for entry in catalog.entries() {
-            let target = entry.target();
-            assert!(
-                catalog
-                    .select_for_guest(&GuestSelector {
-                        distribution: &target.distribution,
-                        release: &target.release,
-                        architecture: &target.architecture,
-                    })
-                    .is_ok(),
-                "an entry that cannot be selected for its own guest is unreachable: {}",
-                entry.payload_id()
-            );
-        }
+        assert!(matches!(
+            CatalogEntry::from_json(&serde_json::to_vec(&document).unwrap()),
+            Err(PayloadError::InvalidCatalog(_))
+        ));
     }
 
     #[test]
-    fn a_packed_entry_is_read_through_the_same_validation_as_the_catalog() {
-        let document: serde_json::Value = serde_json::from_str(&catalog()).unwrap();
-        let entry = serde_json::to_vec(&document["entries"][0]).unwrap();
+    fn a_release_directory_is_read_as_the_catalog_it_holds() {
+        let temporary = TemporaryDirectory::new("pair");
+        write_pair(
+            temporary.path(),
+            "ubuntu-26.04-amd64-7.0.0-14-generic",
+            &entry_json("ubuntu", "26.04", "amd64", "7.0.0-14-generic"),
+        );
+
+        let catalog = PayloadCatalog::from_release_directory(temporary.path())
+            .expect("a valid pair must be read");
 
         assert_eq!(
-            PayloadCatalog::from_entry_json(&entry)
-                .unwrap()
+            catalog
+                .select_for_guest(&ubuntu_2604())
+                .expect("the entry is for this guest")
                 .payload_id(),
-            "ubuntu-26.04-amd64-7.0.0-14-v1"
+            "ubuntu-26.04-amd64-7.0.0-14-generic"
         );
     }
 
     #[test]
-    fn a_packed_entry_that_fails_catalog_validation_is_refused() {
-        let mut document: serde_json::Value = serde_json::from_str(&catalog()).unwrap();
-        document["entries"][0]["archive_url"] = "http://downloads.example.test/payload.zip".into();
-        let entry = serde_json::to_vec(&document["entries"][0]).unwrap();
+    fn a_build_that_ships_no_payload_has_an_empty_catalog_and_not_an_error() {
+        let temporary = TemporaryDirectory::new("empty");
+        // Three shapes of nothing: no directory at all, an empty one, and one
+        // holding an archive no entry claims.
+        let absent = PayloadCatalog::from_release_directory(&temporary.path().join("absent"));
+        fs::create_dir(temporary.path().join("gpu-payload")).unwrap();
+        let empty = PayloadCatalog::from_release_directory(temporary.path());
+        fs::write(
+            temporary.path().join("gpu-payload").join("stray.zip"),
+            b"archive",
+        )
+        .unwrap();
+        let stray = PayloadCatalog::from_release_directory(temporary.path());
 
-        assert!(matches!(
-            PayloadCatalog::from_entry_json(&entry),
-            Err(PayloadError::InvalidCatalog(_))
-        ));
+        for catalog in [absent, empty, stray] {
+            let catalog = catalog.expect("a release without a payload is a release without GPU");
+            assert!(catalog.entries().is_empty());
+            assert!(matches!(
+                catalog.select_for_guest(&ubuntu_2604()),
+                Err(PayloadError::NoPayloadForGuest { .. })
+            ));
+        }
     }
 
     #[test]
-    fn a_whole_catalog_document_is_not_an_entry() {
+    fn an_entry_file_that_is_there_and_wrong_fails_the_catalog() {
+        let valid = entry_json("ubuntu", "26.04", "amd64", "7.0.0-14-generic");
+
+        let unreadable = TemporaryDirectory::new("broken-json");
+        write_pair(unreadable.path(), "a", "{not json");
+        assert!(PayloadCatalog::from_release_directory(unreadable.path()).is_err());
+
+        let misnamed = TemporaryDirectory::new("broken-name");
+        write_pair(misnamed.path(), "wrong-name", &valid);
+        assert!(PayloadCatalog::from_release_directory(misnamed.path()).is_err());
+
+        let archiveless = TemporaryDirectory::new("broken-pair");
+        write_pair(
+            archiveless.path(),
+            "ubuntu-26.04-amd64-7.0.0-14-generic",
+            &valid,
+        );
+        fs::remove_file(
+            archiveless
+                .path()
+                .join("gpu-payload")
+                .join("ubuntu-26.04-amd64-7.0.0-14-generic.zip"),
+        )
+        .unwrap();
+        assert!(PayloadCatalog::from_release_directory(archiveless.path()).is_err());
+    }
+
+    #[test]
+    fn two_entries_for_one_guest_fail_rather_than_depend_on_directory_order() {
+        let temporary = TemporaryDirectory::new("duplicate");
+        let first = entry_json("ubuntu", "26.04", "amd64", "7.0.0-14-generic");
+        write_pair(
+            temporary.path(),
+            "ubuntu-26.04-amd64-7.0.0-14-generic",
+            &first,
+        );
+        let mut second: serde_json::Value = serde_json::from_str(&first).unwrap();
+        second["payload_id"] = "second".into();
+        write_pair(
+            temporary.path(),
+            "second",
+            &serde_json::to_string(&second).unwrap(),
+        );
+
         assert!(matches!(
-            PayloadCatalog::from_entry_json(catalog().as_bytes()),
+            PayloadCatalog::from_release_directory(temporary.path()),
             Err(PayloadError::InvalidCatalog(_))
         ));
     }

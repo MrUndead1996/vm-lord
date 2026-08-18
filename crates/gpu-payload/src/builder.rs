@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use crate::{
-    GuestTarget, MesaPolicy, PayloadCatalog, PayloadError, PayloadManifest, RendererCapability,
+    CatalogEntry, GuestTarget, MesaPolicy, PayloadError, PayloadManifest, RendererCapability,
     Sha256Digest, SourceManifest,
 };
 
@@ -58,11 +58,8 @@ struct PackRecipe {
     schema_version: u32,
     payload_id: String,
     target: GuestTarget,
-    archive_url: String,
     required_renderers: Vec<RendererCapability>,
     mesa_policy: MesaPolicy,
-    vmlord_revision: String,
-    builder_version: String,
     sources: Vec<RecipeSource>,
     overlays: Vec<RecipeOverlay>,
     licenses: Vec<RecipeLicense>,
@@ -110,8 +107,6 @@ struct PreparedSources {
     schema_version: u32,
     target: GuestTarget,
     mesa_policy: MesaPolicy,
-    vmlord_revision: String,
-    builder_version: String,
     sources: Vec<RecipeSource>,
     overlays: Vec<RecipeOverlay>,
 }
@@ -210,14 +205,14 @@ pub fn pack(request: PackRequest<'_>) -> Result<BuiltArtifact, PayloadError> {
                 PayloadError::InvalidManifest("expanded payload size overflow".into())
             })
         })?;
-    // Catalog limits are defensive ceilings. Tiny ZIPs can be larger than their
-    // expanded members because of headers, while catalog validation requires the
-    // expanded ceiling to be at least the archive length.
+    // Catalog limits are defensive ceilings, and the archive's own length is
+    // the floor under this one: a tiny ZIP can be larger than its expanded
+    // members because of headers, and a ceiling below that would refuse the
+    // payload this very run just built.
     let expanded_size_limit = expanded_bytes.max(archive_size);
     let file_count = u64::try_from(files.len()).unwrap_or(u64::MAX);
     let entry = catalog_entry(
         &recipe,
-        archive_size,
         expanded_size_limit,
         file_count,
         &archive_sha256,
@@ -227,7 +222,7 @@ pub fn pack(request: PackRequest<'_>) -> Result<BuiltArtifact, PayloadError> {
         .map_err(|error| PayloadError::InvalidCatalog(error.to_string()))?;
     // Validated from the exact bytes that are about to be written, so what
     // the file says and what was checked cannot differ.
-    let validated_entry = PayloadCatalog::from_entry_json(&entry_bytes)?;
+    let validated_entry = CatalogEntry::from_json(&entry_bytes)?;
     PayloadManifest::parse_and_validate(&manifest_bytes, &validated_entry)?;
     let sources_bytes = read_prepared_file(&files, "sources.json")?;
     SourceManifest::parse_and_validate(&sources_bytes, &validated_entry)?;
@@ -363,7 +358,6 @@ fn write_archive(
 
 fn catalog_entry(
     recipe: &PackRecipe,
-    archive_size: u64,
     expanded_size: u64,
     file_count: u64,
     archive_sha256: &Sha256Digest,
@@ -381,18 +375,15 @@ fn catalog_entry(
         })
         .collect::<Vec<_>>();
     serde_json::json!({
+        "schema_version": 2,
         "payload_id": recipe.payload_id,
         "target": recipe.target,
-        "archive_url": recipe.archive_url,
-        "archive_size": archive_size,
         "expanded_size_limit": expanded_size,
         "file_count_limit": file_count,
         "archive_sha256": archive_sha256,
         "payload_manifest_sha256": payload_manifest_sha256,
         "required_renderers": recipe.required_renderers,
         "mesa_policy": recipe.mesa_policy,
-        "vmlord_revision": recipe.vmlord_revision,
-        "builder_version": recipe.builder_version,
         "sources": sources,
         "licenses": recipe.licenses,
     })
@@ -408,8 +399,6 @@ fn validate_prepared_provenance(
     if prepared.schema_version != 1
         || prepared.target != recipe.target
         || prepared.mesa_policy != recipe.mesa_policy
-        || prepared.vmlord_revision != recipe.vmlord_revision
-        || prepared.builder_version != recipe.builder_version
         || prepared.sources != recipe.sources
         || prepared.overlays != recipe.overlays
     {
@@ -643,7 +632,7 @@ mod tests {
 
     use zip::{CompressionMethod, ZipArchive};
 
-    use crate::{PayloadCatalog, PayloadError, Sha256Digest};
+    use crate::{CatalogEntry, PayloadError, Sha256Digest};
 
     use super::{PackRequest, pack, validate_archive_path};
 
@@ -745,12 +734,7 @@ mod tests {
     }
 
     fn emitted_entry(path: &Path) -> crate::CatalogEntry {
-        let entry: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        let catalog = serde_json::json!({"schema_version": 1, "entries": [entry]});
-        PayloadCatalog::from_json(&serde_json::to_vec(&catalog).unwrap())
-            .unwrap()
-            .entries()[0]
-            .clone()
+        CatalogEntry::from_json(&fs::read(path).unwrap()).expect("pack must write a valid entry")
     }
 
     #[test]
@@ -866,7 +850,7 @@ mod tests {
 
     #[test]
     fn prepared_sources_must_match_entire_recipe_provenance() {
-        for mutation in ["source", "target", "mesa", "revision", "builder"] {
+        for mutation in ["source", "target", "mesa"] {
             let fixture = PreparedFixture::new(&format!("source-provenance-{mutation}"));
             rewrite_json(
                 &fixture.prepared.join("sources.json"),
@@ -877,11 +861,6 @@ mod tests {
                     }
                     "target" => sources["target"]["kernel_release"] = "other".into(),
                     "mesa" => sources["mesa_policy"] = "distro".into(),
-                    "revision" => {
-                        sources["vmlord_revision"] =
-                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()
-                    }
-                    "builder" => sources["builder_version"] = "other builder".into(),
                     _ => unreachable!(),
                 },
             );
@@ -1071,29 +1050,6 @@ mod tests {
 
         assert_eq!(built.expanded_size(), actual_expanded);
         assert!(emitted_entry(&catalog_entry).expanded_size_limit() >= actual_expanded);
-    }
-
-    #[test]
-    fn recipe_archive_url_must_be_immutable_https() {
-        for (index, url) in [
-            "http://downloads.example.test/payload.zip",
-            "https://user:secret@downloads.example.test/payload.zip",
-            "https://downloads.example.test/payload.zip?latest=1",
-            "https://downloads.example.test/payload.zip#latest",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let fixture = PreparedFixture::new(&format!("immutable-url-{index}"));
-            fixture.rewrite_recipe(|recipe| recipe["archive_url"] = url.into());
-            assert!(matches!(
-                pack(fixture.request(
-                    &fixture.root.join("payload.zip"),
-                    &fixture.root.join("entry.json")
-                )),
-                Err(PayloadError::InvalidCatalog(_))
-            ));
-        }
     }
 
     #[test]

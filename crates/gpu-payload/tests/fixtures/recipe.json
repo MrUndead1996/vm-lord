@@ -8,14 +8,11 @@
     "kernel_release": "test",
     "payload_abi": 1
   },
-  "archive_url": "https://downloads.example.test/vmlord/ubuntu-26.04-amd64-test-v1.zip",
   "required_renderers": [
     "d3d12-gallium",
     "dzn-vulkan"
   ],
   "mesa_policy": "bundled",
-  "vmlord_revision": "14794180686c2fb6307fbe359c359bec765249f3",
-  "builder_version": "vmlord-gpu-payload 1",
   "sources": [
     {
       "url": "https://github.com/microsoft/WSL2-Linux-Kernel",

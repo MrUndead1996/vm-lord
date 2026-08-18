@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     CatalogEntry, PayloadError, PayloadManifest, PayloadProgress, Sha256Digest, SourceManifest,
-    archive, download::LockedArchive, manifest::cache_provenance,
+    archive, manifest::cache_provenance,
 };
 
 const PAYLOAD_MANIFEST_LIMIT: u64 = 1024 * 1024;
@@ -20,16 +20,13 @@ static NEXT_OPERATION: AtomicU64 = AtomicU64::new(0);
 pub struct PrepareRequest<'a> {
     pub entry: &'a CatalogEntry,
     pub cache_root: &'a Path,
-    /// The archive this build ships beside its executable, when it has one.
+    /// The archive this release ships for the entry.
     ///
-    /// A path naming a regular file is prepared from without any network
-    /// access at all. A path naming nothing falls back to `archive_url`: a
-    /// build that shipped without its payload is not broken, only online. A
-    /// file that is present and does not match the entry is an error --
-    /// falling back would put a host on the network exactly when someone
-    /// arranged for it not to be, and would hide a substituted release
-    /// artifact behind a successful start.
-    pub local_archive: Option<&'a Path>,
+    /// Required, because there is no second source. A file that is not there
+    /// is an error and not a reason to look elsewhere: the catalog yields an
+    /// entry only when its archive is beside it, so a missing file here means
+    /// the release changed under a running application.
+    pub archive: &'a Path,
     pub progress: &'a dyn Fn(PayloadProgress),
     pub cancel: &'a AtomicBool,
 }
@@ -91,29 +88,13 @@ pub fn prepare(request: PrepareRequest<'_>) -> Result<ReadyGpuPayload, PayloadEr
         }
     }
 
-    let ready = match request.local_archive.filter(|path| path.is_file()) {
-        Some(archive) => prepare_verified_archive(
-            request.entry,
-            archive,
-            &root,
-            request.progress,
-            request.cancel,
-        ),
-        None => {
-            let mut locked = LockedArchive::acquire(&root, request.entry)?;
-            locked.download(request.progress, request.cancel)?;
-            locked.verify(request.progress, request.cancel)?;
-            let archive_path = locked.path().to_owned();
-            drop(locked);
-            prepare_verified_archive(
-                request.entry,
-                &archive_path,
-                &root,
-                request.progress,
-                request.cancel,
-            )
-        }
-    };
+    let ready = prepare_verified_archive(
+        request.entry,
+        request.archive,
+        &root,
+        request.progress,
+        request.cancel,
+    );
     drop(quarantines);
     ready
 }
@@ -150,8 +131,12 @@ pub(crate) fn prepare_verified_archive(
             error,
         )
     })?;
+    // The archive's length is a property of the file we hold, not a claim in
+    // the entry: the digest below pins it either way, and one measurement
+    // cannot disagree with itself.
+    let archive_length = require_regular_file(archive, "read release archive")?;
     let cached_archive = temporary.path().join("archive.zip");
-    copy_and_flush(archive, &cached_archive, entry.archive_size(), cancel)?;
+    copy_and_flush(archive, &cached_archive, archive_length, cancel)?;
     verify_digest(
         &cached_archive,
         entry.archive_sha256(),
@@ -159,7 +144,14 @@ pub(crate) fn prepare_verified_archive(
         cancel,
     )?;
     let (_, sources) =
-        archive::extract(entry, &cached_archive, &files_directory, progress, cancel)?;
+        archive::extract(
+            entry,
+            &cached_archive,
+            archive_length,
+            &files_directory,
+            progress,
+            cancel,
+        )?;
     write_and_flush(
         &temporary.path().join("provenance.json"),
         &cache_provenance(entry, &sources)?,
@@ -213,15 +205,9 @@ fn load_ready(
 
     let archive_path = root.join("archive.zip");
     let archive_size = require_regular_file(&archive_path, "verify cached archive")?;
-    if archive_size != entry.archive_size() {
-        return Err(PayloadError::ArchiveSizeMismatch {
-            expected: entry.archive_size(),
-            actual: archive_size,
-        });
-    }
     progress(PayloadProgress::Verifying {
         hashed: 0,
-        total: entry.archive_size(),
+        total: archive_size,
     });
     verify_digest(
         &archive_path,
@@ -786,7 +772,7 @@ mod tests {
 
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-    use crate::{PayloadCatalog, PayloadError, PayloadProgress, Sha256Digest};
+    use crate::{PayloadError, Sha256Digest};
 
     use super::{
         OperationPath, PrepareRequest, prepare, prepare_verified_archive, rename_noreplace,
@@ -842,8 +828,6 @@ mod tests {
                     "payload_abi": 1
                 },
                 "mesa_policy": "bundled",
-                "vmlord_revision": SOURCE_COMMIT,
-                "builder_version": "vmlord-gpu-payload 1",
                 "sources": [{
                     "url": SOURCE_URL,
                     "commit": SOURCE_COMMIT,
@@ -886,9 +870,7 @@ mod tests {
             }))
             .unwrap();
             let archive = build_archive(&payload, content, license, &source);
-            let catalog = serde_json::json!({
-                "schema_version": 1,
-                "entries": [{
+            let entry_document = serde_json::json!({
                     "payload_id": "test",
                     "target": {
                         "distribution": "ubuntu",
@@ -897,28 +879,20 @@ mod tests {
                         "kernel_release": "test",
                         "payload_abi": 1
                     },
-                    "archive_url": "https://offline.invalid/payload.zip",
-                    "archive_size": archive.len(),
                     "expanded_size_limit": archive.len(),
                     "file_count_limit": 3,
                     "archive_sha256": digest(&archive),
                     "payload_manifest_sha256": digest(&payload),
                     "required_renderers": ["d3d12-gallium"],
                     "mesa_policy": "bundled",
-                    "vmlord_revision": SOURCE_COMMIT,
-                    "builder_version": "vmlord-gpu-payload 1",
                     "sources": [{
                         "url": SOURCE_URL,
                         "commit": SOURCE_COMMIT,
                         "version": "1"
                     }],
-                    "licenses": [{"spdx": "MIT", "path": "licenses/MIT.txt"}]
-                }]
+                "licenses": [{"spdx": "MIT", "path": "licenses/MIT.txt"}]
             });
-            let entry = PayloadCatalog::from_json(&serde_json::to_vec(&catalog).unwrap())
-                .unwrap()
-                .entries()[0]
-                .clone();
+            let entry = crate::test_entry(entry_document);
             let archive_path = temporary.path().join("fixture.zip");
             fs::write(&archive_path, &archive).unwrap();
             Self {
@@ -991,27 +965,24 @@ mod tests {
     }
 
     #[test]
-    fn warm_cache_is_verified_under_digest_lock_without_network_access() {
+    fn a_warm_cache_is_returned_without_reading_the_archive_again() {
         let fixture = Fixture::new("offline-hit");
         fixture.prepare_local().unwrap();
-        let connected = AtomicBool::new(false);
-        let progress = |event| {
-            if event == PayloadProgress::Connecting {
-                connected.store(true, Ordering::Relaxed);
-            }
-        };
+        // The archive is removed once the cache is warm: a hit must not need
+        // it, and a miss would fail loudly on the missing file rather than
+        // quietly re-preparing.
+        fs::remove_file(&fixture.archive_path).unwrap();
 
         let ready = prepare(PrepareRequest {
             entry: &fixture.entry,
             cache_root: &fixture.cache_root(),
-            local_archive: None,
-            progress: &progress,
+            archive: &fixture.archive_path,
+            progress: &|_| {},
             cancel: &AtomicBool::new(false),
         })
         .unwrap();
 
         assert_eq!(ready.generation(), fixture.entry.archive_sha256());
-        assert!(!connected.load(Ordering::Relaxed));
         assert!(
             fixture
                 .version_root()
@@ -1096,25 +1067,18 @@ mod tests {
             .open(&lock_path)
             .unwrap();
         lock.try_lock().unwrap();
-        let connected = AtomicBool::new(false);
-        let progress = |event| {
-            if event == PayloadProgress::Connecting {
-                connected.store(true, Ordering::Relaxed);
-            }
-        };
 
         let result = prepare(PrepareRequest {
             entry: &fixture.entry,
             cache_root: &fixture.cache_root(),
-            local_archive: None,
-            progress: &progress,
+            archive: &fixture.archive_path,
+            progress: &|_| {},
             cancel: &AtomicBool::new(false),
         });
 
         assert!(
             matches!(result, Err(PayloadError::AlreadyInProgress { path }) if path == lock_path)
         );
-        assert!(!connected.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -1181,62 +1145,42 @@ mod tests {
     }
 
     #[test]
-    fn a_local_archive_is_prepared_without_reaching_the_network() {
+    fn the_shipped_archive_is_prepared_into_its_generation() {
         let fixture = Fixture::new("local-source");
-        let connected = AtomicBool::new(false);
-        let progress = |event| {
-            if matches!(
-                event,
-                PayloadProgress::Connecting | PayloadProgress::Downloading { .. }
-            ) {
-                connected.store(true, Ordering::Relaxed);
-            }
-        };
 
         let ready = prepare(PrepareRequest {
             entry: &fixture.entry,
             cache_root: &fixture.cache_root(),
-            local_archive: Some(&fixture.archive_path),
-            progress: &progress,
+            archive: &fixture.archive_path,
+            progress: &|_| {},
             cancel: &AtomicBool::new(false),
         })
         .unwrap();
 
         assert_eq!(ready.generation(), fixture.entry.archive_sha256());
-        assert!(!connected.load(Ordering::Relaxed));
     }
 
     #[test]
-    fn a_local_archive_that_does_not_match_the_entry_fails_instead_of_downloading() {
+    fn an_archive_that_does_not_match_its_entry_fails() {
         let fixture = Fixture::new("local-corrupt");
         let corrupt = fixture.temporary.path().join("corrupt.zip");
         let mut bytes = fixture.archive.clone();
         bytes[0] ^= 0xFF;
         fs::write(&corrupt, &bytes).unwrap();
-        let connected = AtomicBool::new(false);
-        let progress = |event| {
-            if matches!(
-                event,
-                PayloadProgress::Connecting | PayloadProgress::Downloading { .. }
-            ) {
-                connected.store(true, Ordering::Relaxed);
-            }
-        };
 
         let result = prepare(PrepareRequest {
             entry: &fixture.entry,
             cache_root: &fixture.cache_root(),
-            local_archive: Some(&corrupt),
-            progress: &progress,
+            archive: &corrupt,
+            progress: &|_| {},
             cancel: &AtomicBool::new(false),
         });
 
         assert!(matches!(result, Err(PayloadError::DigestMismatch { .. })));
-        assert!(!connected.load(Ordering::Relaxed));
     }
 
     #[test]
-    fn a_truncated_local_archive_fails_on_its_length() {
+    fn a_truncated_archive_fails_on_its_digest() {
         let fixture = Fixture::new("local-short");
         let short = fixture.temporary.path().join("short.zip");
         fs::write(&short, &fixture.archive[..fixture.archive.len() - 1]).unwrap();
@@ -1244,40 +1188,49 @@ mod tests {
         let result = prepare(PrepareRequest {
             entry: &fixture.entry,
             cache_root: &fixture.cache_root(),
-            local_archive: Some(&short),
+            archive: &short,
             progress: &|_| {},
             cancel: &AtomicBool::new(false),
         });
 
-        assert!(matches!(
-            result,
-            Err(PayloadError::ArchiveSizeMismatch { .. })
-        ));
+        assert!(matches!(result, Err(PayloadError::DigestMismatch { .. })));
     }
 
     #[test]
-    fn a_missing_local_archive_falls_back_to_the_published_url() {
-        let fixture = Fixture::new("local-absent");
-        let absent = fixture.temporary.path().join("absent.zip");
-        let connected = AtomicBool::new(false);
-        let progress = |event| {
-            if event == PayloadProgress::Connecting {
-                connected.store(true, Ordering::Relaxed);
-            }
-        };
+    fn an_archive_of_the_right_length_and_the_wrong_bytes_is_caught_by_its_digest() {
+        let fixture = Fixture::new("same-length");
+        let corrupt = fixture.temporary.path().join("same-length.zip");
+        let mut bytes = fixture.archive.clone();
+        // Same length, different content: with no declared size left, the
+        // digest is the whole check, and it must be enough.
+        *bytes.last_mut().unwrap() ^= 0xff;
+        fs::write(&corrupt, &bytes).unwrap();
 
-        // The fixture's `archive_url` is `https://offline.invalid/payload.zip`,
-        // so the fallback is taken and then fails: that it was taken at all is
-        // the fact under test.
         let result = prepare(PrepareRequest {
             entry: &fixture.entry,
             cache_root: &fixture.cache_root(),
-            local_archive: Some(&absent),
-            progress: &progress,
+            archive: &corrupt,
+            progress: &|_| {},
             cancel: &AtomicBool::new(false),
         });
 
-        assert!(matches!(result, Err(PayloadError::Http(_))));
-        assert!(connected.load(Ordering::Relaxed));
+        assert!(matches!(result, Err(PayloadError::DigestMismatch { .. })));
+        assert_no_operation_directories(&fixture);
+    }
+
+    #[test]
+    fn an_archive_that_is_not_there_is_an_error_and_not_a_fallback() {
+        let fixture = Fixture::new("local-absent");
+        let absent = fixture.temporary.path().join("absent.zip");
+
+        let result = prepare(PrepareRequest {
+            entry: &fixture.entry,
+            cache_root: &fixture.cache_root(),
+            archive: &absent,
+            progress: &|_| {},
+            cancel: &AtomicBool::new(false),
+        });
+
+        assert!(matches!(result, Err(PayloadError::Io { .. })));
     }
 }

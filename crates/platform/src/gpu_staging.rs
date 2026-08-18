@@ -42,13 +42,13 @@ pub(crate) fn prepare_staging_root(vm_directory: &Path) -> Result<PathBuf, Paylo
 /// best effort by design, so the caller decides what a [`PayloadError`] means
 /// for a start and nothing in this module touches lifecycle.
 pub fn stage_for_vm(request: StageGpuPayloadRequest<'_>) -> Result<StagedGpuPayload, PayloadError> {
-    let catalog = PayloadCatalog::embedded()?;
+    let catalog = PayloadCatalog::from_release_directory(request.executable_directory)?;
     let entry = catalog.select_for_guest(&request.guest)?;
     let archive = local_archive_path(request.executable_directory, entry.payload_id());
     let ready = prepare(PrepareRequest {
         entry,
         cache_root: request.cache_root,
-        local_archive: Some(&archive),
+        archive: &archive,
         progress: request.progress,
         cancel: request.cancel,
     })?;
@@ -146,8 +146,9 @@ mod tests {
             executable_directory: temporary.path(),
             cache_root: &temporary.path().join("cache"),
             vm_directory: &vm,
-            // A guest the shipped catalog cannot have an entry for, so that
-            // this test says what it means whatever the catalog ships.
+            // The executable directory is a temporary one with no
+            // `gpu-payload` child, so the catalog is empty -- a build that
+            // ships no payload stages nothing and starts the VM anyway.
             guest: GuestSelector {
                 distribution: "ubuntu",
                 release: "1.04",

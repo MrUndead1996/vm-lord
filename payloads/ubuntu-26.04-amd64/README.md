@@ -22,21 +22,18 @@ wants:
 cargo dist --gpu-payload target/gpu-payload
 ```
 
-`dist` re-reads `catalog-entry.json`, checks `payload.zip` against the size and
-digest it claims, and copies the archive to `gpu-payload/<payload_id>.zip`
-beside `vmlord.exe`, which is where the application looks for it. The entry
-itself does not travel: the catalog the application trusts is the one compiled
-into it. Without the argument `dist` builds a release with no payload and says
-so.
+`dist` re-reads `catalog-entry.json` through the crate's own validation, hashes
+`payload.zip` against the digest that entry claims, and copies **both** files
+beside `vmlord.exe` — `gpu-payload/<payload_id>.json` and
+`gpu-payload/<payload_id>.zip`. That pair is the catalog: the application has
+none compiled into it and assembles one from that directory at startup. Without
+the argument `dist` builds a release with no payload and says so, and such a
+release simply starts VMs without GPU support.
 
 `prepare.sh` fetches the pinned upstream commit (cached under
 `<output>/upstream`, so a second run costs nothing), lays the tree out, and
 writes `recipe.json` and `prepared/sources.json`. `pack` writes the archive and
 the catalog entry that describes it.
-
-Commit before building. `vmlord_revision` is this repository's `HEAD`, and a
-dirty tree means the revision in the payload describes something other than
-what was packed; `prepare.sh` warns and continues rather than deciding for you.
 
 ## What the spec holds
 
@@ -81,14 +78,6 @@ under this policy would be a false statement in the provenance.
 
 Switching to `bundled` means building Mesa for the guest, shipping it under
 `content/mesa`, and adding `dzn-vulkan` back.
-
-## Before this can be published
-
-`archive_url` points at `payloads.vmlord.invalid`. The catalog requires an
-immutable HTTPS URL, and there is nowhere to publish yet, so the placeholder is
-deliberate and the embedded `catalog.json` stays empty. Publishing means
-hosting the archive, putting its real URL in the spec, rebuilding, and pasting
-`catalog-entry.json` into `crates/gpu-payload/catalog/catalog.json`.
 
 ## Proven on
 

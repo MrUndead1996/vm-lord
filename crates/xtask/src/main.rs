@@ -104,7 +104,7 @@ fn dist(gpu_payloads: Vec<PathBuf>) -> Result<(), String> {
     }
     for source in &gpu_payloads {
         let payload_id = gpu_payload::stage_release_payload(source, &destination)?;
-        println!("dist: gpu-payload/{payload_id}.zip");
+        println!("dist: gpu-payload/{payload_id}.zip and gpu-payload/{payload_id}.json");
     }
 
     println!("dist: written to {}", destination.display());
