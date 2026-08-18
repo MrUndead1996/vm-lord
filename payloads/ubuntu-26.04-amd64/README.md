@@ -15,6 +15,20 @@ cargo run -p xtask -- gpu-payload pack \
     --catalog-entry target/gpu-payload/catalog-entry.json
 ```
 
+The two outputs travel together. `target/gpu-payload` is what `cargo dist`
+wants:
+
+```sh
+cargo dist --gpu-payload target/gpu-payload
+```
+
+`dist` re-reads `catalog-entry.json`, checks `payload.zip` against the size and
+digest it claims, and copies the archive to `gpu-payload/<payload_id>.zip`
+beside `vmlord.exe`, which is where the application looks for it. The entry
+itself does not travel: the catalog the application trusts is the one compiled
+into it. Without the argument `dist` builds a release with no payload and says
+so.
+
 `prepare.sh` fetches the pinned upstream commit (cached under
 `<output>/upstream`, so a second run costs nothing), lays the tree out, and
 writes `recipe.json` and `prepared/sources.json`. `pack` writes the archive and
