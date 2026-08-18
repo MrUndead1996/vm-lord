@@ -229,8 +229,19 @@ fn apply_ssh_configuration(request: &SeedRequest<'_>) -> Vec<Vec<String>> {
 /// setting, so without it the socket would listen on the distribution's port
 /// *and* on the chosen one, and the VM would answer where it was not supposed
 /// to.
+///
+/// Both address families are then named, because clearing the list threw both
+/// of the distribution's own entries away. Ubuntu's `ssh.socket` listens on
+/// `0.0.0.0:22` and `[::]:22` *and* sets `BindIPv6Only=ipv6-only`, which a
+/// drop-in that only replaces the addresses leaves in force -- so a bare
+/// `ListenStream=<n>` binds one IPv6 socket that refuses every IPv4 connection,
+/// which is how a guest ended up answering nothing on the address VMLord
+/// reaches it at (#105). Naming both is right whatever that setting says: with
+/// `ipv6-only` they are the two listeners the guest needs, and without it the
+/// IPv4 entry is the redundant half of a dual-stack socket rather than a
+/// second one.
 fn socket_settings(port: SshPort) -> String {
-    format!("[Socket]\nListenStream=\nListenStream={port}\n")
+    format!("[Socket]\nListenStream=\nListenStream=0.0.0.0:{port}\nListenStream=[::]:{port}\n")
 }
 
 /// Whether the SSH daemon accepts a password.
@@ -533,12 +544,47 @@ mod tests {
             );
             assert_eq!(
                 file(&document, SOCKET_DROP_IN)["content"],
-                Value::from(format!("[Socket]\nListenStream=\nListenStream={port}\n")),
-                "the empty entry clears the port the unit already listens on"
+                Value::from(format!(
+                    "[Socket]\nListenStream=\nListenStream=0.0.0.0:{port}\n\
+                     ListenStream=[::]:{port}\n"
+                )),
+                "the empty entry clears the ports the unit already listens on, \
+                 and both families are named because clearing took both away"
             );
             assert_eq!(
                 file(&document, SSHD_DROP_IN)["permissions"],
                 Value::from("0644")
+            );
+        }
+    }
+
+    /// The bug behind the bug: Ubuntu's socket unit sets
+    /// `BindIPv6Only=ipv6-only` and names one listener per family, so a drop-in
+    /// that clears the list and gives back a bare port number leaves the guest
+    /// answering on IPv6 alone -- and VMLord reaches its guests over IPv4.
+    #[test]
+    fn the_socket_listens_on_ipv4_whatever_port_it_is_moved_to() {
+        for port in [22, 222, 65535] {
+            let document = parsed(&render(&SeedRequest {
+                ssh: SshAccess::Enabled {
+                    deploy_key: true,
+                    port: SshPort::new(port).unwrap(),
+                },
+                ..request()
+            }));
+
+            let settings = file(&document, SOCKET_DROP_IN)["content"]
+                .as_str()
+                .expect("the drop-in is a string")
+                .to_owned();
+
+            assert!(
+                settings.contains(&format!("ListenStream=0.0.0.0:{port}\n")),
+                "port {port} has no IPv4 listener: {settings:?}"
+            );
+            assert!(
+                settings.contains(&format!("ListenStream=[::]:{port}\n")),
+                "port {port} has no IPv6 listener: {settings:?}"
             );
         }
     }

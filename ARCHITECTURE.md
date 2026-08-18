@@ -1605,7 +1605,16 @@ a descriptor that is already bound, so `sshd_config`'s `Port` is read and then
 ignored; a distribution whose daemon opens its own port names no socket unit,
 and then the drop-in is the whole story. The empty `ListenStream=` is not a
 stray line either -- systemd appends to list settings, so without it the guest
-would answer on the distribution's port as well as the chosen one. The daemon's
+would answer on the distribution's port as well as the chosen one -- and the
+drop-in then names one listener per address family, `0.0.0.0:<n>` and
+`[::]:<n>`, because clearing the list threw away both of the entries Ubuntu's
+own unit ships. That unit also sets `BindIPv6Only=ipv6-only`, which a drop-in
+replacing only the addresses leaves in force, so a bare `ListenStream=<n>` binds
+a single IPv6 socket and refuses every IPv4 connection -- which is what VMLord
+makes, and what a guest created on port 22 refused (#105). Naming both is right
+whichever way that setting goes: with `ipv6-only` they are the two listeners the
+guest needs, and without it the IPv4 entry is the redundant half of a dual-stack
+socket rather than a second one. The daemon's
 drop-in is numbered `10-` because `sshd_config` reads `sshd_config.d/*.conf` in
 name order and the *first* value of a keyword wins, which puts VMLord ahead of
 cloud-init's own `50-cloud-init.conf`. The default port is written out like any

@@ -2005,8 +2005,8 @@ fn a_vm_is_created_from_a_real_cloud_image() {
     // choice stops being VMLord's own bookkeeping.
     assert!(text.contains("Port 2222"), "sshd is given the chosen port");
     assert!(
-        text.contains("ListenStream=2222"),
-        "so is the socket that does the listening"
+        text.contains("ListenStream=0.0.0.0:2222") && text.contains("ListenStream=[::]:2222"),
+        "so is the socket that does the listening, on both address families"
     );
 
     let document = document.expect("the configuration should be written and valid JSON");
