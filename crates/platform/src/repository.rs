@@ -28,7 +28,7 @@ use crate::{
     cleanup,
     com1_terminal::{Com1Launcher, Com1Sessions},
     cycle::{CycleOutcome, VmBuildCycle},
-    gpu_facts::GpuFacts,
+    gpu_runs::GpuRuns,
     guest_ready::ReadinessTimeouts,
     hcn::HcnNetwork,
     hcn_endpoint::{EndpointAddress, HcnEndpoint},
@@ -85,7 +85,7 @@ pub struct HcsVmRepository {
     /// run can end.
     agent_sessions: AgentSessions,
     /// What has been observed about each running VM's GPU, in memory only.
-    gpu_facts: GpuFacts,
+    gpu_runs: GpuRuns,
     /// Opens interactive SSH sessions into running guests. Nothing is kept
     /// beside it: a session belongs to whoever asked for it, not to VMLord.
     ssh_launcher: Arc<SshLauncher>,
@@ -120,24 +120,32 @@ impl HcsVmRepository {
         let storage_root = storage_root.into();
         let events = VmEventSink::default();
         let com1_launcher = Com1Launcher::production();
+        // Built before the pipelines, because both a build and a start record
+        // what they did to a VM's GPU in it, and they have to be the same one.
+        let gpu_runs = GpuRuns::default();
         Self {
             client: HcsClient::new(),
             store: MetadataStore::new(storage_root.join(MAPPING_FILE_NAME)),
-            storage_root,
+            storage_root: storage_root.clone(),
             connections: VmConnections::with_events(events.clone()),
             cycle: Arc::new(VmBuildCycle::production(
                 cloud_disk,
                 com1_launcher.clone(),
                 ReadinessTimeouts::default(),
+                gpu_runs.clone(),
+                &storage_root,
             )),
             readiness_timeouts: ReadinessTimeouts::default(),
             builds: Arc::new(BuildRegistry::default()),
-            start: Arc::new(VmStartPipeline::production(com1_launcher.clone())),
+            start: Arc::new(
+                VmStartPipeline::production(com1_launcher.clone())
+                    .for_vms_under(&storage_root, gpu_runs.clone()),
+            ),
             starts: Arc::new(StartRegistry::default()),
             com1_launcher,
             com1_sessions: Com1Sessions::default(),
             agent_sessions: AgentSessions::default(),
-            gpu_facts: GpuFacts::default(),
+            gpu_runs,
             ssh_launcher: Arc::new(SshLauncher::production()),
             ssh_launches: SshLaunches::default(),
             shutdown: Arc::new(VmShutdownPipeline::production()),
@@ -363,7 +371,7 @@ impl HcsVmRepository {
                     // partition its listener is bound to stops existing as HCS
                     // tears the compute system down.
                     self.agent_sessions.cancel(finished.vm_id);
-                    self.gpu_facts.forget(finished.vm_id);
+                    self.gpu_runs.forget(finished.vm_id);
                     // The console is left alone: the guest is still writing the
                     // messages it prints on its way down, and the pipe closing
                     // is what ends the capture. The guest powers off on its own
@@ -564,9 +572,9 @@ impl HcsVmRepository {
         // else, so nothing here saw what was attached to it. Reporting "not
         // yet" would be a different sentence, and a false one.
         if mapping.gpu_mode != GpuMode::None
-            && self.gpu_facts.snapshot(mapping.vm_id).assignment.is_none()
+            && self.gpu_runs.snapshot(mapping.vm_id).assignment.is_none()
         {
-            self.gpu_facts
+            self.gpu_runs
                 .record_assignment(mapping.vm_id, GpuAssignment::Unknown);
         }
 
@@ -574,12 +582,11 @@ impl HcsVmRepository {
             mapping,
             runtime_id,
             &layout::agent_secret_path(&vm_directory),
-            // No manifest yet: the shares a VM is started with are computed
-            // and written into its compute system by the start that prepared
-            // it, and a VM reclaimed from a previous process was prepared by
-            // nobody here.
-            None,
-            self.gpu_facts.clone(),
+            // What the start of this run prepared, if this process ran it. A
+            // VM reclaimed from a previous process was prepared by nobody
+            // here, and has nothing to be told to mount.
+            self.gpu_runs.shares(mapping.vm_id),
+            self.gpu_runs.clone(),
         ) {
             Ok(connection) => self.agent_sessions.insert(connection),
             Err(error) => log::warn!(
@@ -623,7 +630,7 @@ impl HcsVmRepository {
             disk_gb,
             cpu_cores: topology.cpu_cores,
             gpu_mode,
-            gpu: self.gpu_facts.snapshot(vm_id),
+            gpu: self.gpu_runs.snapshot(vm_id),
             network_mode,
             ip_address,
             ssh,
@@ -1224,7 +1231,7 @@ impl VmRepository for HcsVmRepository {
         // was torn down under its guest.
         self.com1_sessions.cancel(mapping.vm_id);
         self.agent_sessions.cancel(mapping.vm_id);
-        self.gpu_facts.forget(mapping.vm_id);
+        self.gpu_runs.forget(mapping.vm_id);
         self.connections.remove(mapping.vm_id);
         Ok(())
     }
@@ -1250,7 +1257,7 @@ impl VmRepository for HcsVmRepository {
         // be removed.
         self.com1_sessions.cancel(mapping.vm_id);
         self.agent_sessions.cancel(mapping.vm_id);
-        self.gpu_facts.forget(mapping.vm_id);
+        self.gpu_runs.forget(mapping.vm_id);
         let vm_directory = layout::vm_directory(&self.storage_root, &request.name)?;
         self.delete.delete(
             &self.store,
@@ -1368,7 +1375,7 @@ impl VmRepository for HcsVmRepository {
             // a pipe that will never deliver again.
             self.com1_sessions.cancel(vm_id);
             self.agent_sessions.cancel(vm_id);
-            self.gpu_facts.forget(vm_id);
+            self.gpu_runs.forget(vm_id);
             self.connections.remove(vm_id);
         }
         if drained.service_disconnected && !self.service_disconnect_reported {
@@ -1419,7 +1426,7 @@ impl Drop for HcsVmRepository {
         // Each listener's thread is joined as it goes, so no socket outlives
         // the process that bound it.
         self.agent_sessions.cancel_all();
-        self.gpu_facts.forget_all();
+        self.gpu_runs.forget_all();
         // Joined rather than abandoned: HCS has either been asked to run each
         // system or has not, and a thread left behind would outlive the
         // process that owns what it is about to produce.
@@ -2562,7 +2569,7 @@ mod tests {
             gpu_mode: GpuMode::Default,
             ..mapping(NetworkMode::None)
         };
-        repository.gpu_facts.record_guest(
+        repository.gpu_runs.record_guest(
             mapping.vm_id,
             GuestGpuReport::Ready(GuestGpuDetail {
                 driver: Some("dxgkrnl".into()),
@@ -2600,10 +2607,10 @@ mod tests {
         let repository = repository();
         let mapping = mapping(NetworkMode::None);
         repository
-            .gpu_facts
+            .gpu_runs
             .record_assignment(mapping.vm_id, GpuAssignment::Unknown);
 
-        repository.gpu_facts.forget(mapping.vm_id);
+        repository.gpu_runs.forget(mapping.vm_id);
 
         let summary = repository.summary(KnownVm {
             mapping,

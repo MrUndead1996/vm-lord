@@ -45,6 +45,15 @@ pub(crate) fn configuration_path(vm_directory: &Path) -> PathBuf {
 }
 
 /// The exact per-VM directory that may contain staged GPU payload generations.
+/// The payload cache shared by every VM under `storage_root`.
+///
+/// One cache and not one per VM: a generation is content-addressed, so two VMs
+/// on the same payload share the files rather than each unpacking their own
+/// copy of them.
+pub(crate) fn gpu_payload_cache_root(storage_root: &Path) -> PathBuf {
+    storage_root.join("cache")
+}
+
 pub(crate) fn gpu_payload_staging_directory(vm_directory: &Path) -> PathBuf {
     vm_directory.join("gpu-payload")
 }

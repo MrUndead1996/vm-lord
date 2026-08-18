@@ -1,11 +1,17 @@
-//! What has been observed about each running VM's GPU, while it runs.
+//! What this process knows about each running VM's GPU, while it runs.
 //!
-//! Two threads write here -- the one that starts a VM and the one that serves
-//! its agent -- and the refresh that lists VMs reads. Nothing is persisted:
-//! `VmGpuStatus` describes a moment, and facts recorded by a process that is
-//! gone are confirmed by nothing. A VM whose agent reconnects re-observes them
-//! within seconds, which is cheaper than being wrong about a GPU that was
-//! taken away while VMLord was not running.
+//! Two things per VM, kept together because they belong to the same run and
+//! end with it: what has been observed, and what the guest is to be offered.
+//! Three threads meet here -- the one that starts a VM, the one that serves
+//! its agent, and the refresh that lists VMs -- so one entry with one lifetime
+//! is what keeps them from disagreeing.
+//!
+//! Nothing is persisted. `VmGpuStatus` describes a moment, and facts recorded
+//! by a process that is gone are confirmed by nothing; a VM whose agent
+//! reconnects re-observes them within seconds, which is cheaper than being
+//! wrong about a GPU that was taken away while VMLord was not running. The
+//! manifest is per-boot for a harder reason: a compute system's Plan9 section
+//! is written when the system is built and cannot change while it runs.
 
 use std::{
     collections::BTreeMap,
@@ -14,30 +20,42 @@ use std::{
 };
 
 use uuid::Uuid;
-use vmlord_core::{GpuAssignment, GuestGpuReport, VmGpuFacts};
+use vmlord_core::{GpuAssignment, GpuShareManifest, GuestGpuReport, VmGpuFacts};
 
-/// The GPU facts of every VM this process has observed anything about.
+/// One VM's GPU, for the run it is in the middle of.
+#[derive(Clone, Default)]
+struct GpuRun {
+    facts: VmGpuFacts,
+    /// What the guest is offered on every session of this run.
+    ///
+    /// `None` is a VM nothing has been prepared for -- one with no GPU, or one
+    /// this process did not start. It is not an empty manifest: a session with
+    /// nothing to say about GPU sends no manifest at all.
+    shares: Option<GpuShareManifest>,
+}
+
+/// The GPU of every VM this process knows anything about right now.
 ///
 /// Cloned into the threads that write; a clone shares the map rather than
 /// copying it.
 #[derive(Clone, Default)]
-pub(crate) struct GpuFacts(Arc<Mutex<BTreeMap<Uuid, VmGpuFacts>>>);
+pub(crate) struct GpuRuns(Arc<Mutex<BTreeMap<Uuid, GpuRun>>>);
 
-impl GpuFacts {
+impl GpuRuns {
     /// Records what the host side did for a VM.
     pub(crate) fn record_assignment(&self, vm_id: Uuid, assignment: GpuAssignment) {
-        let mut facts = self.lock();
-        let entry = facts.entry(vm_id).or_default();
-        entry.assignment = Some(assignment);
-        entry.observed_at = Some(SystemTime::now());
+        let mut runs = self.lock();
+        let entry = runs.entry(vm_id).or_default();
+        entry.facts.assignment = Some(assignment);
+        entry.facts.observed_at = Some(SystemTime::now());
     }
 
     /// Records what a VM's guest said about the GPU it was given.
     pub(crate) fn record_guest(&self, vm_id: Uuid, report: GuestGpuReport) {
-        let mut facts = self.lock();
-        let entry = facts.entry(vm_id).or_default();
-        entry.guest = Some(report);
-        entry.observed_at = Some(SystemTime::now());
+        let mut runs = self.lock();
+        let entry = runs.entry(vm_id).or_default();
+        entry.facts.guest = Some(report);
+        entry.facts.observed_at = Some(SystemTime::now());
     }
 
     /// Drops everything observed about one VM, for a run that is over.
@@ -55,14 +73,31 @@ impl GpuFacts {
         self.lock().clear();
     }
 
+    /// Records what a start prepared for a VM's guest to mount.
+    ///
+    /// Written once per run, by the start that built it. Every session of that
+    /// run offers the same manifest, because the shares were written into the
+    /// compute system before it was started and cannot change while it runs.
+    pub(crate) fn record_shares(&self, vm_id: Uuid, shares: GpuShareManifest) {
+        self.lock().entry(vm_id).or_default().shares = Some(shares);
+    }
+
+    /// What this VM's guest is to be offered, if anything.
+    pub(crate) fn shares(&self, vm_id: Uuid) -> Option<GpuShareManifest> {
+        self.lock().get(&vm_id)?.shares.clone()
+    }
+
     /// What has been observed about one VM, which may be nothing.
     pub(crate) fn snapshot(&self, vm_id: Uuid) -> VmGpuFacts {
-        self.lock().get(&vm_id).cloned().unwrap_or_default()
+        self.lock()
+            .get(&vm_id)
+            .map(|run| run.facts.clone())
+            .unwrap_or_default()
     }
 
     /// Recovers a poisoned lock rather than propagating the panic: a thread
     /// that died must not take the list of VMs down with it.
-    fn lock(&self) -> MutexGuard<'_, BTreeMap<Uuid, VmGpuFacts>> {
+    fn lock(&self) -> MutexGuard<'_, BTreeMap<Uuid, GpuRun>> {
         self.0
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -71,7 +106,7 @@ impl GpuFacts {
 
 #[cfg(test)]
 mod tests {
-    use super::GpuFacts;
+    use super::GpuRuns;
     use uuid::Uuid;
     use vmlord_core::{
         GpuAssignment, GpuFailure, GpuStatusCode, GuestGpuDetail, GuestGpuReport, NativeGpuDetail,
@@ -79,7 +114,7 @@ mod tests {
 
     #[test]
     fn a_vm_nothing_was_observed_about_has_nothing_to_report() {
-        let facts = GpuFacts::default();
+        let facts = GpuRuns::default();
 
         assert_eq!(facts.snapshot(Uuid::from_u128(1)).assignment, None);
         assert_eq!(
@@ -91,7 +126,7 @@ mod tests {
 
     #[test]
     fn what_each_side_observed_is_kept_beside_the_other() {
-        let facts = GpuFacts::default();
+        let facts = GpuRuns::default();
         let vm = Uuid::from_u128(1);
 
         facts.record_assignment(
@@ -120,7 +155,7 @@ mod tests {
 
     #[test]
     fn an_observation_is_dated_as_it_is_written() {
-        let facts = GpuFacts::default();
+        let facts = GpuRuns::default();
         let vm = Uuid::from_u128(1);
 
         facts.record_assignment(vm, GpuAssignment::Unknown);
@@ -136,7 +171,7 @@ mod tests {
 
     #[test]
     fn a_vm_whose_run_is_over_leaves_nothing_behind() {
-        let facts = GpuFacts::default();
+        let facts = GpuRuns::default();
         let vm = Uuid::from_u128(1);
         facts.record_guest(vm, GuestGpuReport::Ready(GuestGpuDetail::default()));
 
@@ -151,7 +186,7 @@ mod tests {
 
     #[test]
     fn forgetting_one_vm_leaves_the_others_alone() {
-        let facts = GpuFacts::default();
+        let facts = GpuRuns::default();
         facts.record_assignment(Uuid::from_u128(1), GpuAssignment::Unknown);
         facts.record_assignment(Uuid::from_u128(2), GpuAssignment::Unknown);
 
@@ -162,7 +197,7 @@ mod tests {
 
     #[test]
     fn a_vmlord_that_is_going_away_forgets_every_vm() {
-        let facts = GpuFacts::default();
+        let facts = GpuRuns::default();
         facts.record_assignment(Uuid::from_u128(1), GpuAssignment::Unknown);
         facts.record_assignment(Uuid::from_u128(2), GpuAssignment::Unknown);
 

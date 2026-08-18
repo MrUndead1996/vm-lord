@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use vmlord_core::{GpuFailure, GpuMode, GpuStatusCode};
 
-use crate::hcs::{HcsModifyFailure, HcsSystem};
+use crate::hcs::{HCS_ACCESS_ALL, HcsModifyFailure, HcsSystem};
 
 /// Bounds an assignment operation that HCS accepted but did not complete.
 const GPU_ASSIGNMENT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -28,6 +28,33 @@ impl GpuAssignmentService {
             .map(|_result| ())
             .map_err(assignment_failure)
     }
+}
+
+/// Applies `mode` to the compute system named `hcs_id`, once.
+///
+/// Named by id rather than handed a system, so that a start can attach a GPU
+/// without holding one open across the steps before it -- and so that the step
+/// can be substituted in the tests of a start, which have no compute system to
+/// open.
+///
+/// A system HCS no longer knows is a failure of the GPU and not of the VM: it
+/// was running a moment ago, and what is lost is the adapter.
+pub(crate) fn assign_to_system(hcs_id: &str, mode: GpuMode) -> Result<(), GpuFailure> {
+    let system = HcsSystem::open_if_present(hcs_id, HCS_ACCESS_ALL)
+        .map_err(|error| {
+            GpuFailure::new(
+                GpuStatusCode::AssignmentFailed,
+                format!("the compute system could not be opened to attach a GPU: {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            GpuFailure::new(
+                GpuStatusCode::AssignmentFailed,
+                "the compute system was gone before its GPU could be attached",
+            )
+        })?;
+
+    GpuAssignmentService.assign(&system, mode)
 }
 
 /// Builds the HCS GPU-resource update for a supported desired mode.

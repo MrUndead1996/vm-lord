@@ -32,7 +32,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     agent_session::{self, GuestGpuSink, SessionError},
-    gpu_facts::GpuFacts,
+    gpu_runs::GpuRuns,
     hvsocket::{ACCEPT_POLL, AgentListener},
     metadata::VmComputeSystemMapping,
 };
@@ -122,7 +122,7 @@ impl AgentConnection {
         runtime_id: Uuid,
         secret_path: &Path,
         shares: Option<GpuShareManifest>,
-        facts: GpuFacts,
+        facts: GpuRuns,
     ) -> Result<Self, RepositoryError> {
         let vm_name = mapping.vm_name.clone();
         let vm_id = mapping.vm_id;

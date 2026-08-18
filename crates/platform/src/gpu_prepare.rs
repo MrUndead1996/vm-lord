@@ -1,24 +1,26 @@
 //! Everything a VM's GPU needs before its compute system is started.
 //!
-//! Staging, exports, the access grants and the configuration edit belong
-//! together because they are one decision seen four times: how much of what
-//! this host has can actually be handed to this guest. What comes out is the
-//! manifest the agent will offer and the assignment fact the status is read
-//! from.
+//! Staging, exports and the access grants belong together because they are
+//! one decision seen three times: how much of what this host has can actually
+//! be handed to this guest. What comes out is the shares to write into the
+//! configuration the system is built from, the manifest the agent will offer,
+//! and the assignment fact the status is read from.
 //!
 //! All of it happens before the start, and none of it may be repeated during
 //! one: a compute system's Plan9 section is written when the system is built
-//! and is immutable for the lifetime of a boot.
+//! and is immutable for the lifetime of a boot. The shares are therefore never
+//! written back to the stored `config.json` -- they name this host's paths and
+//! this run's staging directory, which is exactly as long as they are true.
 //!
 //! Nothing here fails a start. Every way this can go wrong leaves a VM running
 //! with less GPU than it asked for, which is an ordinary outcome that
 //! [`vmlord_core::VmGpuStatus`] has words for.
 
-use std::{fs, path::Path, sync::atomic::AtomicBool};
+use std::{path::Path, sync::atomic::AtomicBool};
 
 use vmlord_core::{
     GpuAssignment, GpuFailure, GpuMode, GpuShareManifest, GpuShareRole, GpuStatusCode,
-    HostGpuAdapter, NativeGpuDetail, RepositoryError,
+    HostGpuAdapter, NativeGpuDetail,
 };
 
 use crate::{
@@ -26,13 +28,15 @@ use crate::{
     gpu_enumerate::partition_adapters,
     gpu_exports::GpuExports,
     gpu_staging::{StageGpuPayloadRequest, stage_for_vm},
-    hcs_config::apply_plan9_shares,
-    layout::configuration_path,
     metadata::VmComputeSystemMapping,
 };
 
 /// What a VM's GPU needs, ready for the system to be started with.
 pub(crate) struct PreparedGpu {
+    /// The shares to write into the configuration this system is built from.
+    ///
+    /// `None` is a host that justified none, which is still a VM that starts.
+    pub(crate) exports: Option<GpuExports>,
     /// What the guest will be told to mount, and what the agent listener
     /// offers on every session of this run.
     pub(crate) manifest: GpuShareManifest,
@@ -40,8 +44,7 @@ pub(crate) struct PreparedGpu {
     pub(crate) assignment: GpuAssignment,
 }
 
-/// Stages the payload, builds and grants the exports, and writes them into the
-/// stored configuration.
+/// Stages the payload, then builds and grants the exports.
 ///
 /// `None` is a VM that asks for no GPU: there is nothing to prepare and
 /// nothing to say about it. Everything else answers with something, a host
@@ -66,9 +69,9 @@ pub(crate) fn prepare(
         );
         Vec::new()
     });
-    // Granted before anything is written: a share the VM cannot open is worse
-    // than one it was never offered, and `granted_to` drops the ones it could
-    // not grant so that only openable shares reach the configuration.
+    // Granted before anything is offered: a share the VM cannot open is worse
+    // than one it was never told about, and `granted_to` drops the ones it
+    // could not grant so that only openable shares reach the configuration.
     let exports = GpuExports::build(&adapters, vm_directory).and_then(|exports| {
         exports.granted_to(&mapping.hcs_compute_system_id, &|id, path| {
             HcsClient::new().grant_vm_access(id, path)
@@ -76,34 +79,13 @@ pub(crate) fn prepare(
     });
 
     let assignment = coverage(&adapters, exports.as_ref(), payload_staged, mapping.gpu_mode);
-    let Some(exports) = exports else {
-        // Nothing to write and nothing to mount. The adapters may still be
-        // attached below, which is a guest that sees a device and renders on
-        // nothing -- exactly what `coverage` has just said.
-        return Some(PreparedGpu {
-            manifest: GpuShareManifest::default(),
-            assignment,
-        });
-    };
-
-    let manifest = exports.manifest();
-    if let Err(error) = write_shares(vm_directory, &exports) {
-        log::warn!(
-            "the GPU shares of VM \"{}\" could not be written into its configuration: {error}",
-            mapping.vm_name
-        );
-        return Some(PreparedGpu {
-            // The guest is told nothing, because the shares it would be told
-            // about are not in the compute system it is about to boot.
-            manifest: GpuShareManifest::default(),
-            assignment: GpuAssignment::Failed(GpuFailure::new(
-                GpuStatusCode::AssignmentFailed,
-                format!("the GPU shares could not be written into the configuration: {error}"),
-            )),
-        });
-    }
+    let manifest = exports
+        .as_ref()
+        .map(GpuExports::manifest)
+        .unwrap_or_default();
 
     Some(PreparedGpu {
+        exports,
         manifest,
         assignment,
     })
@@ -205,24 +187,6 @@ fn stage(
             false
         }
     }
-}
-
-/// Rewrites the stored configuration with this run's shares.
-fn write_shares(vm_directory: &Path, exports: &GpuExports) -> Result<(), RepositoryError> {
-    let path = configuration_path(vm_directory);
-    let document = fs::read_to_string(&path).map_err(|error| {
-        RepositoryError::new(format!(
-            "failed to read the HCS configuration at {}: {error}",
-            path.display()
-        ))
-    })?;
-    let updated = apply_plan9_shares(&document, exports)?;
-    fs::write(&path, updated).map_err(|error| {
-        RepositoryError::new(format!(
-            "failed to write the HCS configuration at {}: {error}",
-            path.display()
-        ))
-    })
 }
 
 #[cfg(test)]
