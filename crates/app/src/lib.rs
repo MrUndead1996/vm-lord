@@ -5,9 +5,9 @@ pub mod gpu;
 use std::{collections::HashMap, fmt, path::PathBuf, time::SystemTime};
 
 use vmlord_core::{
-    AppSettings, Diagnostic, DiagnosticLevel, GuestDefaults, RepositoryError, SettingsError,
-    SettingsStore, VmCreateRequest, VmDeleteRequest, VmGpuStatus, VmRepository, VmState, VmSummary,
-    VmUpdateRequest,
+    AppSettings, Diagnostic, DiagnosticLevel, GuestDefaults, HostGpuCapabilities, RepositoryError,
+    SettingsError, SettingsStore, VmCreateRequest, VmDeleteRequest, VmGpuStatus, VmRepository,
+    VmState, VmSummary, VmUpdateRequest,
 };
 
 pub use gpu::derive_status as derive_gpu_status;
@@ -101,6 +101,16 @@ pub struct WorkspaceApp {
     /// keeps the time its facts were taken instead of ageing forward under a
     /// UI that redraws sixty times a second.
     gpu_status: HashMap<String, VmGpuStatus>,
+    /// What this host can do for GPU-PV, read once when the backend comes up.
+    ///
+    /// `None` is a backend that could not answer, which is not the same as a
+    /// host that cannot do it, and the two must not read the same way to a
+    /// person choosing a GPU mode.
+    ///
+    /// Not re-read on refresh: the read walks SetupAPI and the filesystem, a
+    /// form redraws sixty times a second, and a host does not change between
+    /// two openings of a dialog.
+    host_gpu: Option<HostGpuCapabilities>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -121,6 +131,7 @@ impl WorkspaceApp {
             status: BackendStatus::Starting,
             vms: Vec::new(),
             gpu_status: HashMap::new(),
+            host_gpu: None,
             diagnostics: Vec::new(),
         }
     }
@@ -234,6 +245,7 @@ impl WorkspaceApp {
             Ok(()) => {
                 log::info!("VM backend initialized");
                 self.status = BackendStatus::Ready;
+                self.host_gpu = self.read_host_gpu();
                 self.refresh();
                 return;
             }
@@ -243,6 +255,26 @@ impl WorkspaceApp {
             }
         }
         self.collect_diagnostics();
+    }
+
+    /// What the host can do for GPU-PV, as the backend reported it at startup.
+    ///
+    /// `None` means nobody could be asked -- a backend that does not implement
+    /// the call at all. Claiming a GPU is unavailable where we merely could not
+    /// ask would be a different answer, and the wrong one.
+    #[must_use]
+    pub fn host_gpu_capabilities(&self) -> Option<&HostGpuCapabilities> {
+        self.host_gpu.as_ref()
+    }
+
+    fn read_host_gpu(&self) -> Option<HostGpuCapabilities> {
+        match self.repository.host_gpu_capabilities() {
+            Ok(capabilities) => Some(capabilities),
+            Err(error) => {
+                log::info!("this backend does not report host GPU capabilities: {error}");
+                None
+            }
+        }
     }
 
     pub fn refresh(&mut self) {
@@ -690,7 +722,7 @@ mod tests {
     };
 
     use super::*;
-    use vmlord_core::{DiagnosticLevel, Language, LogLevel, VmState};
+    use vmlord_core::{DiagnosticLevel, HostGpuCapabilities, Language, LogLevel, VmState};
 
     /// A backend that works: every test names only what it changes about it.
     #[derive(Default)]
@@ -701,6 +733,10 @@ mod tests {
         /// What the VM asks of the GPU, and what the backend saw of it.
         gpu_mode: vmlord_core::GpuMode,
         gpu: vmlord_core::VmGpuFacts,
+        /// Whether this backend can answer for the host at all, and how often
+        /// it has been asked.
+        reports_host_gpu: bool,
+        host_gpu_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         actions: Vec<String>,
         /// What the backend has to say next, which a real one accumulates while
         /// it works and hands over when it is asked.
@@ -708,6 +744,21 @@ mod tests {
     }
 
     impl VmRepository for FakeRepository {
+        fn host_gpu_capabilities(&self) -> Result<HostGpuCapabilities, RepositoryError> {
+            self.host_gpu_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if !self.reports_host_gpu {
+                return Err(RepositoryError::new(
+                    "host GPU capabilities are not supported by this backend",
+                ));
+            }
+            Ok(HostGpuCapabilities {
+                assignment: vmlord_core::GpuAvailability::Available,
+                linux_payload: vmlord_core::GpuAvailability::Available,
+                adapters: Vec::new(),
+            })
+        }
+
         fn initialize(&mut self) -> Result<(), RepositoryError> {
             if self.should_fail {
                 Err(RepositoryError::new("unavailable"))
@@ -1253,4 +1304,57 @@ mod tests {
             diagnostic.level == DiagnosticLevel::Warning && diagnostic.message.contains("disks")
         }));
     }
+    #[test]
+    fn the_host_is_read_once_when_the_backend_comes_up() {
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut application = WorkspaceApp::new(Box::new(FakeRepository {
+            reports_host_gpu: true,
+            host_gpu_reads: std::sync::Arc::clone(&reads),
+            ..FakeRepository::default()
+        }));
+
+        application.start();
+        application.refresh();
+        application.refresh();
+
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "SetupAPI and the filesystem are not walked once per frame"
+        );
+        assert!(application.host_gpu_capabilities().is_some());
+    }
+
+    #[test]
+    fn a_backend_that_cannot_answer_leaves_the_host_unknown() {
+        let mut application = WorkspaceApp::new(Box::new(FakeRepository::default()));
+
+        application.start();
+
+        assert!(
+            application.host_gpu_capabilities().is_none(),
+            "\"this backend cannot tell you\" is not \"this host cannot do it\""
+        );
+    }
+
+    #[test]
+    fn a_backend_that_never_came_up_is_never_asked_about_the_host() {
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut application = WorkspaceApp::new(Box::new(FakeRepository {
+            should_fail: true,
+            reports_host_gpu: true,
+            host_gpu_reads: std::sync::Arc::clone(&reads),
+            ..FakeRepository::default()
+        }));
+
+        application.start();
+
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a backend that could not initialize has nothing to say about the host"
+        );
+        assert!(application.host_gpu_capabilities().is_none());
+    }
+
 }
