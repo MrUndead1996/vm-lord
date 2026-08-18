@@ -43,28 +43,55 @@ pub struct DistroProfile {
 /// to a JSON file later.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SshDaemon {
-    /// The systemd units that carry the daemon.
-    ///
-    /// Debian-family systems socket-activate `ssh.socket` and keep
-    /// `ssh.service` beside it, while Fedora and SUSE name both `sshd`. A VM
-    /// created with SSH turned off has these disabled on the first boot, and
-    /// one created with a port has them restarted after the drop-ins below are
-    /// written.
-    pub units: Vec<String>,
+    /// The systemd units that carry the daemon, and how they carry it.
+    pub units: SshUnits,
     /// The drop-in file that overrides the daemon's own configuration.
     ///
     /// A file of VMLord's own rather than an edit of `sshd_config`: a drop-in
     /// is written whole, so nothing has to be found, matched or replaced inside
     /// a file the distribution owns and may change between releases.
     pub config_drop_in: String,
-    /// The drop-in that overrides the listening socket, on distributions that
-    /// socket-activate the daemon.
-    ///
-    /// `None` where the daemon opens its own port, in which case
-    /// [`Self::config_drop_in`] is the whole story. Where a socket does the
-    /// listening, `sshd_config`'s `Port` is ignored -- the daemon is handed a
-    /// file descriptor that is already bound -- so both files have to agree.
-    pub socket_drop_in: Option<String>,
+}
+
+/// Which units a distribution's SSH daemon is made of.
+///
+/// The two shapes are different enough that one flat list of unit names could
+/// not describe either honestly: where a socket owns the listening port, the
+/// port lives in the socket's drop-in and the service must never be started by
+/// hand beside it; where the daemon opens its own port, there is no socket at
+/// all and `sshd_config` is the whole story. Spelling that as a choice keeps
+/// the impossible combinations -- a socket drop-in with no socket unit, a
+/// profile naming no units whatsoever -- out of the type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SshUnits {
+    /// The daemon opens its own port. Fedora and SUSE name this unit `sshd`.
+    Service { unit: String },
+    /// The socket owns the port and activates the daemon on demand, which is
+    /// how Debian-family systems have run it since Ubuntu 22.10.
+    SocketActivated {
+        socket: String,
+        /// The drop-in that moves the socket's listener.
+        ///
+        /// A socket-activated `sshd` is handed a descriptor that is already
+        /// bound, so `sshd_config`'s `Port` is read and then ignored: this file
+        /// is what actually decides where the guest answers.
+        socket_drop_in: String,
+        service: String,
+    },
+}
+
+impl SshUnits {
+    /// Every unit that has to be switched off for the guest to run no daemon,
+    /// the socket first: it is the one holding the port open.
+    #[must_use]
+    pub fn all(&self) -> Vec<&str> {
+        match self {
+            Self::Service { unit } => vec![unit],
+            Self::SocketActivated {
+                socket, service, ..
+            } => vec![socket, service],
+        }
+    }
 }
 
 /// Ubuntu's official cloud images.
@@ -87,16 +114,19 @@ pub fn ubuntu() -> DistroProfile {
         default_user: "ubuntu".into(),
         admin_group: "sudo".into(),
         ssh: SshDaemon {
-            units: vec!["ssh.socket".into(), "ssh.service".into()],
+            units: SshUnits::SocketActivated {
+                socket: "ssh.socket".into(),
+                // Ubuntu socket-activates the daemon since 22.10, and the unit
+                // lives under `/lib`, so the override goes under `/etc` where
+                // systemd looks for it second.
+                socket_drop_in: "/etc/systemd/system/ssh.socket.d/10-vmlord.conf".into(),
+                service: "ssh.service".into(),
+            },
             // `sshd_config` ends with `Include /etc/ssh/sshd_config.d/*.conf`
             // read in name order, and the *first* value of a keyword wins --
             // so the number decides who wins, and `10-` puts VMLord ahead of
             // cloud-init's own `50-cloud-init.conf`.
             config_drop_in: "/etc/ssh/sshd_config.d/10-vmlord.conf".into(),
-            // Ubuntu socket-activates the daemon since 22.10, and the unit
-            // lives under `/lib`, so the override goes under `/etc` where
-            // systemd looks for it second.
-            socket_drop_in: Some("/etc/systemd/system/ssh.socket.d/10-vmlord.conf".into()),
         },
     }
 }
@@ -135,7 +165,7 @@ impl DistroProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::{DistroProfile, ubuntu};
+    use super::{DistroProfile, SshUnits, ubuntu};
 
     #[test]
     fn a_profile_builds_the_image_url_and_the_checksums_url_in_one_directory() {
@@ -156,7 +186,7 @@ mod tests {
 
     #[test]
     fn a_profile_names_the_units_that_carry_its_ssh_daemon() {
-        assert_eq!(ubuntu().ssh.units, ["ssh.socket", "ssh.service"]);
+        assert_eq!(ubuntu().ssh.units.all(), ["ssh.socket", "ssh.service"]);
     }
 
     /// Ubuntu listens through `ssh.socket`, so a port stated only in
@@ -167,9 +197,24 @@ mod tests {
 
         assert_eq!(ssh.config_drop_in, "/etc/ssh/sshd_config.d/10-vmlord.conf");
         assert_eq!(
-            ssh.socket_drop_in.as_deref(),
-            Some("/etc/systemd/system/ssh.socket.d/10-vmlord.conf")
+            ssh.units,
+            SshUnits::SocketActivated {
+                socket: "ssh.socket".into(),
+                socket_drop_in: "/etc/systemd/system/ssh.socket.d/10-vmlord.conf".into(),
+                service: "ssh.service".into(),
+            }
         );
+    }
+
+    /// A daemon that opens its own port has one unit and nothing to override
+    /// beside it.
+    #[test]
+    fn a_profile_without_socket_activation_names_only_its_service() {
+        let units = SshUnits::Service {
+            unit: "sshd.service".into(),
+        };
+
+        assert_eq!(units.all(), ["sshd.service"]);
     }
 
     #[test]

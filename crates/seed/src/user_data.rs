@@ -5,7 +5,7 @@
 //! is a comment to YAML and the format marker to cloud-init.
 
 use vmlord_agent_protocol::auth::GUEST_SECRET_PATH;
-use vmlord_core::{SshAccess, SshPort};
+use vmlord_core::{SshAccess, SshPort, SshUnits};
 
 use crate::{AGENT_FILE, SeedRequest, scalar};
 
@@ -66,8 +66,8 @@ fn write_files(request: &SeedRequest<'_>) -> String {
             &request.ssh_daemon.config_drop_in,
             &format!("Port {port}\n"),
         ));
-        if let Some(path) = &request.ssh_daemon.socket_drop_in {
-            files.push_str(&file(path, &socket_settings(port)));
+        if let SshUnits::SocketActivated { socket_drop_in, .. } = &request.ssh_daemon.units {
+            files.push_str(&file(socket_drop_in, &socket_settings(port)));
         }
     }
     if let Some(secret) = request.agent_secret {
@@ -156,10 +156,7 @@ fn agent_install_commands() -> Vec<Vec<String>> {
 /// unit that does not exist on a given release makes `systemctl` return
 /// non-zero, which `runcmd` does not treat as fatal.
 fn disable_ssh(request: &SeedRequest<'_>) -> Vec<Vec<String>> {
-    let units = &request.ssh_daemon.units;
-    if units.is_empty() {
-        return Vec::new();
-    }
+    let units = request.ssh_daemon.units.all();
 
     log::debug!("the seed disables the SSH daemon: {}", units.join(", "));
     let mut command = vec![
@@ -167,39 +164,62 @@ fn disable_ssh(request: &SeedRequest<'_>) -> Vec<Vec<String>> {
         "disable".to_owned(),
         "--now".to_owned(),
     ];
-    command.extend(units.iter().cloned());
+    command.extend(units.into_iter().map(ToOwned::to_owned));
     vec![command]
 }
 
 /// Makes the daemon read the drop-ins `write_files` has just left behind.
 ///
-/// `daemon-reload` first, because a socket unit's override is only a file until
-/// systemd has re-read it. Then `try-restart` -- not `restart` -- once per
-/// unit: it restarts a unit that is running and does nothing to one that is
-/// not, which is the whole difference between moving a guest's listener and
-/// creating a second one. Ubuntu 24.04 listens through `ssh.socket` and leaves
-/// `ssh.service` to be activated on demand; 22.04 ships the same socket unit
-/// but does not enable it and runs the service directly. A plain `restart`
-/// would start whichever of the two the release deliberately leaves alone, and
-/// the guest would end up with a socket and a daemon competing for one port.
+/// `daemon-reload` first, because a unit's override is only a file until
+/// systemd has re-read it. What follows depends on how the distribution runs
+/// the daemon, because the two shapes fail in opposite ways.
 ///
-/// One command per unit rather than one naming all of them, for the reason
-/// `runcmd` tolerates a failure: a name a release does not have must not take
-/// the other units down with it. The order is the profile's, socket first.
+/// Where the daemon opens its own port, `try-restart` is the whole answer: it
+/// restarts a running daemon and does nothing to one the release keeps stopped.
+///
+/// Where a socket owns the port, the service must not be restarted at all --
+/// and `try-restart` is not enough to promise that. A socket-activated
+/// `ssh.service` is inactive only until *something connects*, and on a guest
+/// created with the default port something does: the image already listens on
+/// 22 from `sockets.target`, so VMLord's own readiness probe and its
+/// `cloud-init status --wait` connect during the first boot and activate the
+/// service before this command ever runs. `try-restart` then restarts a daemon
+/// that is now standalone, binding the port out of `sshd_config` while the
+/// socket still holds it -- two listeners fighting over one port, which is
+/// exactly what a guest created on 22 used to end up with (#105).
+///
+/// So the socket-activated branch decides in the guest, where the answer is
+/// known: if the socket is the listener, the service is *stopped* -- the next
+/// connection brings it back through the socket -- and only then is the socket
+/// restarted onto its new port. Stopping first is not an ordering preference:
+/// restarting the socket while the service holds the port is the same fight
+/// from the other side. Releases that ship the socket unit without enabling it
+/// -- Ubuntu 22.04 does -- take the `else`, and their running service is
+/// restarted as before.
+///
+/// One `sh -c` rather than a list of commands because the decision is one:
+/// `runcmd` has no way to spell "and only if the first answered yes", and
+/// splitting it would mean guessing on the host what only the guest can see.
 fn apply_ssh_configuration(request: &SeedRequest<'_>) -> Vec<Vec<String>> {
-    let units = &request.ssh_daemon.units;
-    if units.is_empty() {
-        return Vec::new();
-    }
-
     let mut commands = vec![vec!["systemctl".to_owned(), "daemon-reload".to_owned()]];
-    commands.extend(units.iter().map(|unit| {
-        vec![
+    commands.push(match &request.ssh_daemon.units {
+        SshUnits::Service { unit } => vec![
             "systemctl".to_owned(),
             "try-restart".to_owned(),
             unit.to_owned(),
-        ]
-    }));
+        ],
+        SshUnits::SocketActivated {
+            socket, service, ..
+        } => vec![
+            "sh".to_owned(),
+            "-c".to_owned(),
+            format!(
+                "if systemctl is-active --quiet {socket}; \
+                 then systemctl stop {service}; systemctl restart {socket}; \
+                 else systemctl try-restart {service}; fi"
+            ),
+        ],
+    });
     commands
 }
 
@@ -278,7 +298,7 @@ mod tests {
     use super::{GUEST_SECRET_PATH, render};
     use crate::{SeedRequest, UBUNTU_SSH};
     use serde_yaml_ng::Value;
-    use vmlord_core::{SshAccess, SshDaemon, SshPort};
+    use vmlord_core::{SshAccess, SshDaemon, SshPort, SshUnits};
 
     const HASH: &str = "$6$rounds=4096$salt$hash";
     const KEY: &str = "ssh-ed25519 AAAAC3Nz vmlord";
@@ -523,32 +543,65 @@ mod tests {
         }
     }
 
-    /// A file written into `/etc` changes nothing until systemd has read it and
-    /// the daemon has been restarted -- and the socket goes first, because it
-    /// owns the listening port. `try-restart` leaves a unit the release keeps
-    /// stopped alone, so the guest never ends up with two listeners.
+    /// A file written into `/etc` changes nothing until systemd has read it,
+    /// and on a socket-activated release the service must be stopped rather
+    /// than restarted: the socket owns the port, and a service restarted beside
+    /// it binds the same port a second time.
     #[test]
-    fn the_daemon_is_reloaded_and_restarted_so_the_port_takes_effect() {
+    fn a_socket_activated_daemon_is_moved_by_its_socket_alone() {
         let document = parsed(&render(&request()));
 
         assert_eq!(
             commands(&document),
             [
                 vec!["systemctl", "daemon-reload"],
-                vec!["systemctl", "try-restart", "ssh.socket"],
-                vec!["systemctl", "try-restart", "ssh.service"],
+                vec![
+                    "sh",
+                    "-c",
+                    "if systemctl is-active --quiet ssh.socket; \
+                     then systemctl stop ssh.service; systemctl restart ssh.socket; \
+                     else systemctl try-restart ssh.service; fi",
+                ],
             ]
         );
     }
 
+    /// The bug this shape exists for: a VM created on 22 answers on 22 from
+    /// `sockets.target`, so VMLord itself activates the service before the seed
+    /// reconfigures it. Whatever the port, the seed must never hand the guest a
+    /// command that restarts that service into a second listener.
+    #[test]
+    fn no_port_makes_the_seed_restart_a_socket_activated_service() {
+        for port in [22, 222, 65535] {
+            let document = parsed(&render(&SeedRequest {
+                ssh: SshAccess::Enabled {
+                    deploy_key: true,
+                    port: SshPort::new(port).unwrap(),
+                },
+                ..request()
+            }));
+            let commands = commands(&document);
+
+            assert!(
+                !commands
+                    .iter()
+                    .any(|command| command.contains(&"try-restart".to_owned())
+                        && command.contains(&"ssh.service".to_owned())),
+                "port {port} restarts the service beside its socket: {commands:?}"
+            );
+        }
+    }
+
     /// A distribution whose daemon opens its own port names no socket unit, and
-    /// then there is nothing to override.
+    /// then there is nothing to override and nothing to fight over: the running
+    /// daemon is simply restarted onto the port its own configuration now says.
     #[test]
     fn a_profile_without_socket_activation_gets_no_socket_drop_in() {
         let daemon = SshDaemon {
-            units: vec!["sshd.service".into()],
+            units: SshUnits::Service {
+                unit: "sshd.service".into(),
+            },
             config_drop_in: "/etc/ssh/sshd_config.d/10-vmlord.conf".into(),
-            socket_drop_in: None,
         };
         let document = parsed(&render(&SeedRequest {
             ssh_daemon: &daemon,
@@ -618,9 +671,10 @@ mod tests {
     #[test]
     fn an_agent_seed_writes_and_enables_the_agent_service() {
         let daemon = SshDaemon {
-            units: Vec::new(),
+            units: SshUnits::Service {
+                unit: "sshd.service".into(),
+            },
             config_drop_in: "/etc/ssh/sshd_config.d/10-vmlord.conf".into(),
-            socket_drop_in: None,
         };
         let document = parsed(&render(&SeedRequest {
             agent_secret: Some(AGENT_SECRET),
@@ -648,6 +702,7 @@ mod tests {
         assert_eq!(
             commands(&document),
             [
+                vec!["systemctl", "disable", "--now", "sshd.service"],
                 vec!["mkdir", "-p", "/run/vmlord-tools"],
                 vec!["mkdir", "-p", "/usr/local/lib/vmlord"],
                 vec!["mount", "-o", "ro", "-L", "VMLTOOLS", "/run/vmlord-tools"],
@@ -672,9 +727,10 @@ mod tests {
     #[test]
     fn a_seed_without_an_agent_has_no_unit_or_commands_when_ssh_is_disabled() {
         let daemon = SshDaemon {
-            units: Vec::new(),
+            units: SshUnits::Service {
+                unit: "sshd.service".into(),
+            },
             config_drop_in: "/etc/ssh/sshd_config.d/10-vmlord.conf".into(),
-            socket_drop_in: None,
         };
         let document = parsed(&render(&SeedRequest {
             agent_secret: None,
@@ -691,7 +747,11 @@ mod tests {
                 .all(|file| file["path"].as_str()
                     != Some("/etc/systemd/system/vmlord-agent.service"))
         );
-        assert_eq!(commands(&document), Vec::<Vec<String>>::new());
+        assert_eq!(
+            commands(&document),
+            [vec!["systemctl", "disable", "--now", "sshd.service"]],
+            "a guest that runs no agent still has its daemon switched off"
+        );
     }
 
     /// A value with an apostrophe is the one that breaks naive quoting.

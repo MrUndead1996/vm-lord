@@ -1545,25 +1545,59 @@ filesystem is a VMLord promise, so it is stated rather than left to cloud-init's
 defaults.
 
 SSH is the one thing in the document with two opposite shapes, and both come out
-of `DistroProfile::ssh`, an `SshDaemon` -- unit names and two file paths -- so
-that the generator knows no distribution by name:
+of `DistroProfile::ssh`, an `SshDaemon` -- a `config_drop_in` path and an
+`SshUnits`, which is either `Service { unit }` for a daemon that opens its own
+port or `SocketActivated { socket, socket_drop_in, service }` where a socket unit
+owns it -- so that the generator knows no distribution by name. The two are a
+choice rather than a list of unit names with an optional path beside it, because
+the impossible combinations (a socket drop-in with no socket unit, a profile
+naming no units at all) were states the generator had to check for and no
+distribution could ever be in:
 
-* `SshAccess::Disabled` adds a `runcmd` that disables the daemon's units. A
-  cloud image ships it enabled, and silence would make the choice void. Nothing
-  is configured: the drop-ins below would be settings for a daemon being
-  switched off.
+* `SshAccess::Disabled` adds a `runcmd` that disables every unit the profile
+  names, socket first. A cloud image ships the daemon enabled, and silence would
+  make the choice void. Nothing is configured: the drop-ins below would be
+  settings for a daemon being switched off.
 * `SshAccess::Enabled { port, .. }` writes those drop-ins -- `Port <n>` for the
   daemon, and `[Socket]` with an empty `ListenStream=` followed by
   `ListenStream=<n>` for the socket unit, where the distribution has one -- and
-  then runs `systemctl daemon-reload` followed by one `try-restart` per unit, in
-  the order the profile lists them, the socket first.
+  then runs `systemctl daemon-reload` followed by one command that makes the
+  running guest read them.
 
-`try-restart` rather than `restart` because it restarts a unit that is running
-and does nothing to one that is not. Ubuntu 24.04 listens through `ssh.socket`
-and leaves `ssh.service` to be activated on demand; 22.04 ships the same socket
-unit without enabling it and runs the service directly. A plain `restart` would
-start whichever of the two the release deliberately leaves alone, and the guest
-would end up with a socket and a daemon competing for one port.
+That last command is where the two shapes part. A daemon that opens its own port
+is simply `try-restart`ed: that restarts a running daemon and does nothing to one
+the release deliberately keeps stopped.
+
+Where a socket owns the port, the service must not be restarted at all, and
+`try-restart` is not enough to promise that. A socket-activated `ssh.service` is
+inactive only until something connects -- and on a guest created with the default
+port, something does: the image already listens on 22 from `sockets.target`, so
+VMLord's own readiness probe and its `cloud-init status --wait` connect during
+the first boot and activate the service before `runcmd` is reached. `try-restart`
+then restarts a service that is now standalone, which binds the port out of
+`sshd_config` while `ssh.socket` still holds it. That is how a VM created on port
+22 ended up with `ssh.service` running as `sshd -D [listener]` beside its own
+socket, answering on `::` alone and refusing every IPv4 connection VMLord made
+(#105) -- while the same VM on port 222 was fine, because nothing could connect
+early enough to activate anything.
+
+So the socket-activated branch decides in the guest, as one `sh -c` command:
+
+```sh
+if systemctl is-active --quiet ssh.socket; \
+   then systemctl stop ssh.service; systemctl restart ssh.socket; \
+   else systemctl try-restart ssh.service; fi
+```
+
+If the socket is the listener, the service is *stopped* -- the next connection
+brings it back through the socket, which is what socket activation is for -- and
+only then is the socket restarted onto its new port. Stopping first is not an
+ordering preference: restarting the socket while the service still holds the port
+is the same collision from the other side. Releases that ship the socket unit
+without enabling it -- Ubuntu 22.04 does -- take the `else` and have their
+running service restarted, exactly as before. The decision is one command rather
+than several because `runcmd` cannot spell "only if the previous one answered
+yes", and the answer is knowable only in the guest.
 
 Both files are written because either alone would be wrong somewhere: Ubuntu has
 socket-activated the daemon since 22.10, and a socket-activated `sshd` is handed
@@ -1944,6 +1978,14 @@ image ships its daemon on 22 and the seed moves it -- and would then ask the
 question on a port nothing listens on. A configuration that cannot be connected
 with is refused before the first phase rather than after the address timeout: it
 is not going to become connectable in ninety seconds.
+
+A VM created on port 22 is the case where that reasoning runs out: the port the
+seed configures is the port the image already listens on, so the probe answers
+from `sockets.target` onwards and the wait sits through the first boot inside
+`cloud-init status --wait` instead. That is honest -- `--wait` is the question,
+the probe only avoids a pointless first attempt -- but it does mean VMLord's own
+connection activates a socket-activated `ssh.service` mid-boot, which is why the
+seed's restart command must never restart that service (#105, above).
 
 How far the wait can get depends on how the VM lets VMLord in, so the two
 authentication modes end differently and say so:
