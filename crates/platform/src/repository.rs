@@ -187,18 +187,8 @@ impl HcsVmRepository {
     /// refused, because a state this check gets wrong cannot be undone once
     /// deletion runs.
     fn refuse_if_live(&self, mapping: &VmComputeSystemMapping) -> Result<(), RepositoryError> {
-        let state = list_known_vms(&self.client, &self.store)?
-            .into_iter()
-            .find(|known| known.mapping.vm_id == mapping.vm_id)
-            .and_then(|known| known.state);
-
-        let description = match &state {
-            None | Some(HcsSystemState::Created) | Some(HcsSystemState::Stopped) => {
-                return Ok(());
-            }
-            Some(HcsSystemState::Running) => "running".to_string(),
-            Some(HcsSystemState::Paused) => "paused".to_string(),
-            Some(HcsSystemState::Other(other)) => format!("in state \"{other}\""),
+        let Some(description) = self.live_description(mapping)? else {
+            return Ok(());
         };
 
         let error = RepositoryError::new(format!(
@@ -207,6 +197,29 @@ impl HcsVmRepository {
         ));
         log::error!("{error}");
         Err(error)
+    }
+
+    /// How this VM is live, when it is, in words a refusal can be built from.
+    ///
+    /// `None` is a VM nothing is attached to: stopped, created but never run,
+    /// or unknown to HCS. Shared by everything that may only act on a VM that
+    /// is not running, so that two refusals cannot disagree about what running
+    /// means.
+    fn live_description(
+        &self,
+        mapping: &VmComputeSystemMapping,
+    ) -> Result<Option<String>, RepositoryError> {
+        let state = list_known_vms(&self.client, &self.store)?
+            .into_iter()
+            .find(|known| known.mapping.vm_id == mapping.vm_id)
+            .and_then(|known| known.state);
+
+        Ok(match &state {
+            None | Some(HcsSystemState::Created) | Some(HcsSystemState::Stopped) => None,
+            Some(HcsSystemState::Running) => Some("running".to_string()),
+            Some(HcsSystemState::Paused) => Some("paused".to_string()),
+            Some(HcsSystemState::Other(other)) => Some(format!("in state \"{other}\"")),
+        })
     }
 
     /// What HCS says about this VM right now.
@@ -562,6 +575,7 @@ impl HcsVmRepository {
         } = known;
         // Read before `mapping.vm_name` is moved into the summary below.
         let network_mode = mapping.network_mode;
+        let gpu_mode = mapping.gpu_mode;
         let ssh = SshAvailability::from(mapping.ssh.clone());
         let topology = self.topology(&mapping).unwrap_or(VmTopology {
             ram_mb: 0,
@@ -583,10 +597,7 @@ impl HcsVmRepository {
             ram_mb: topology.ram_mb,
             disk_gb,
             cpu_cores: topology.cpu_cores,
-            // GPU is not wired to the native backend yet and is reported as
-            // absent rather than guessed at. Nothing is observed either, which
-            // is the honest answer for a backend that attaches nothing.
-            gpu_mode: GpuMode::None,
+            gpu_mode,
             gpu: VmGpuFacts::default(),
             network_mode,
             ip_address,
@@ -867,6 +878,57 @@ fn record_network_mode(
     Ok(())
 }
 
+fn record_gpu_mode(
+    store: &MetadataStore,
+    mapping: &VmComputeSystemMapping,
+    gpu_mode: GpuMode,
+) -> Result<(), RepositoryError> {
+    if mapping.gpu_mode == gpu_mode {
+        return Ok(());
+    }
+
+    store.insert(VmComputeSystemMapping {
+        gpu_mode,
+        ..mapping.clone()
+    })?;
+    log::info!(
+        "VM \"{}\" ({}) now asks for GPU mode {gpu_mode:?}; the change applies the next \
+         time it starts",
+        mapping.vm_name,
+        mapping.vm_id
+    );
+    Ok(())
+}
+
+/// Refuses a GPU mode change under a VM that is not stopped.
+///
+/// The mode is applied while the compute system is prepared and started, so a
+/// change under a live VM would leave a stored mode that does not describe the
+/// GPU the guest actually has. RAM and CPU are different: they are read from
+/// the configuration on the next start, and nothing claims they are in effect
+/// before then, so an edit of those on a running VM stays allowed.
+///
+/// `live` is how the VM is live, or `None` for one that is not.
+fn refuse_gpu_mode_change(
+    vm_name: &str,
+    requested: GpuMode,
+    stored: GpuMode,
+    live: Option<&str>,
+) -> Result<(), RepositoryError> {
+    if requested == stored {
+        return Ok(());
+    }
+    let Some(description) = live else {
+        return Ok(());
+    };
+
+    let error = RepositoryError::new(format!(
+        "VM \"{vm_name}\" is {description}; stop it before changing its GPU mode"
+    ));
+    log::error!("{error}");
+    Err(error)
+}
+
 impl VmRepository for HcsVmRepository {
     /// Brings up the Host Compute Service and the shared network, and reclaims
     /// the VMs a previous VMLord process left running.
@@ -1003,12 +1065,12 @@ impl VmRepository for HcsVmRepository {
         self.builds.refuse_if_building(&request.name)?;
 
         let mapping = self.mapping(&request.name)?;
-        if request.gpu_mode != GpuMode::None {
-            return Err(RepositoryError::new(format!(
-                "the HCS backend does not support GPU mode {:?} yet",
-                request.gpu_mode
-            )));
-        }
+        refuse_gpu_mode_change(
+            &mapping.vm_name,
+            request.gpu_mode,
+            mapping.gpu_mode,
+            self.live_description(&mapping)?.as_deref(),
+        )?;
         hcs_config::ensure_supported_network_mode(request.network_mode)?;
 
         let document = self.read_configuration(&mapping.vm_name)?;
@@ -1032,6 +1094,7 @@ impl VmRepository for HcsVmRepository {
         })?;
 
         record_network_mode(&self.store, &mapping, request.network_mode)?;
+        record_gpu_mode(&self.store, &mapping, request.gpu_mode)?;
 
         log::info!(
             "VM \"{}\" ({}) now requests {} MiB and {} CPU core(s); \
@@ -1415,7 +1478,8 @@ mod tests {
 
     use super::{
         HcsSystemState, HcsVmRepository, OS_TYPE, console_failure_diagnostics, guest_ip,
-        launch_running_consoles, merge_with_builds, record_network_mode,
+        launch_running_consoles, merge_with_builds, record_gpu_mode, record_network_mode,
+        refuse_gpu_mode_change,
     };
     use crate::{
         Com1Launcher, Com1LogMode, KnownVm, MetadataStore, VmComputeSystemMapping,
@@ -2204,6 +2268,75 @@ mod tests {
 
         assert_eq!(store.find_by_vm_name("dev").unwrap().unwrap(), mapping);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_changed_gpu_mode_is_recorded_in_the_mapping() {
+        let (root, store) = temp_store("gpu-mode-changed");
+        let mapping = mapping(NetworkMode::None);
+        store.insert(mapping.clone()).unwrap();
+
+        record_gpu_mode(&store, &mapping, GpuMode::Mirror).unwrap();
+
+        let stored = store.find_by_vm_name("dev").unwrap().unwrap();
+        assert_eq!(stored.gpu_mode, GpuMode::Mirror);
+        // Nothing else about the VM may move with its GPU mode.
+        assert_eq!(stored.vm_id, mapping.vm_id);
+        assert_eq!(stored.network_mode, mapping.network_mode);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_unchanged_gpu_mode_leaves_the_mapping_alone() {
+        let (root, store) = temp_store("gpu-mode-unchanged");
+        let mapping = mapping(NetworkMode::Nat);
+        store.insert(mapping.clone()).unwrap();
+
+        record_gpu_mode(&store, &mapping, GpuMode::None).unwrap();
+
+        assert_eq!(store.find_by_vm_name("dev").unwrap().unwrap(), mapping);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_stopped_vm_may_change_its_gpu_mode() {
+        refuse_gpu_mode_change("dev", GpuMode::Mirror, GpuMode::None, None)
+            .expect("a stopped VM gets its new mode on its next start");
+    }
+
+    #[test]
+    fn a_running_vm_may_not_change_its_gpu_mode() {
+        let error = refuse_gpu_mode_change("dev", GpuMode::Mirror, GpuMode::None, Some("running"))
+            .expect_err("the mode is applied at start, so it may not change under a running VM");
+
+        assert!(
+            error.to_string().contains("stop it"),
+            "the refusal has to say what to do about it: {error}"
+        );
+    }
+
+    #[test]
+    fn a_running_vm_may_still_be_edited_as_long_as_its_gpu_mode_stands() {
+        refuse_gpu_mode_change("dev", GpuMode::Mirror, GpuMode::Mirror, Some("running"))
+            .expect("only the GPU mode is frozen while a VM runs, not the whole form");
+    }
+
+    #[test]
+    fn a_summary_reports_the_gpu_mode_the_mapping_records() {
+        // The edit form is filled from `VmSummary`, so a summary that always
+        // said `None` would make an unrelated edit switch the GPU off.
+        let repository = repository();
+
+        let summary = repository.summary(KnownVm {
+            mapping: VmComputeSystemMapping {
+                gpu_mode: GpuMode::Mirror,
+                ..mapping(NetworkMode::None)
+            },
+            state: None,
+            runtime_id: None,
+        });
+
+        assert_eq!(summary.gpu_mode, GpuMode::Mirror);
     }
 
     #[test]
