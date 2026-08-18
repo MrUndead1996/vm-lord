@@ -69,6 +69,21 @@ pub fn connect(cid: u32, port: u32) -> io::Result<VsockStream> {
     Ok(stream)
 }
 
+/// Ends `descriptor` in both directions, waking whoever is reading it.
+///
+/// This is what a signal handler calls: `shutdown` is safe to make from one,
+/// and a read blocked on the connection returns as soon as it is made, which
+/// is what lets the agent stop when the guest asks it to rather than when
+/// systemd runs out of patience. Failures are ignored because the only caller
+/// is on its way out and a descriptor that is already gone needs no ending.
+pub fn wake(descriptor: RawFd) {
+    // SAFETY: `shutdown` takes a descriptor and a flag, and a descriptor that
+    // is not an open socket makes it fail rather than misbehave.
+    unsafe {
+        libc::shutdown(descriptor, libc::SHUT_RDWR);
+    }
+}
+
 impl VsockStream {
     /// The descriptor, for a caller that hands it to something else.
     ///

@@ -29,7 +29,8 @@ compile_error!(
 use std::{
     error::Error,
     fs, process,
-    sync::atomic::{AtomicBool, Ordering},
+    os::fd::RawFd,
+    sync::atomic::{AtomicBool, AtomicI32, Ordering},
     thread,
     time::Duration,
 };
@@ -53,6 +54,22 @@ mod vsock;
 /// nothing: the unmounting it leads to happens on the main thread, once the
 /// session that was open has ended.
 static STOPPING: AtomicBool = AtomicBool::new(false);
+
+/// The connection to the host, for the signal handler to wake, or `-1`.
+///
+/// A flag on its own is not enough to stop this agent: between requests it
+/// sits in a read on this connection, and a signal does not end that read --
+/// the handler is installed with the BSD semantics `signal` gives it, so the
+/// kernel restarts the call, and the socket's own timeout only turns the wait
+/// into another wait. The read has to be given something to return, and
+/// `shutdown` is what gives it one: it ends the connection under the read,
+/// which comes back at once reporting a peer that is gone. Without it a
+/// `systemctl stop` waits out the unit's stop timeout and the guest takes a
+/// minute and a half to go down.
+static WAKE_DESCRIPTOR: AtomicI32 = AtomicI32::new(NO_DESCRIPTOR);
+
+/// What [`WAKE_DESCRIPTOR`] holds while no connection is open.
+const NO_DESCRIPTOR: RawFd = -1;
 
 /// This build of the agent, as reported to the host during its hello.
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -102,7 +119,13 @@ fn listen_for_shutdown() {
 }
 
 extern "C" fn stop(_signal: libc::c_int) {
-    STOPPING.store(true, Ordering::Relaxed);
+    STOPPING.store(true, Ordering::SeqCst);
+    // `shutdown` is one of the few calls a handler may make, and it is the
+    // one that turns the flag above into something a blocked read notices.
+    let descriptor = WAKE_DESCRIPTOR.load(Ordering::SeqCst);
+    if descriptor != NO_DESCRIPTOR {
+        vsock::wake(descriptor);
+    }
 }
 
 fn read_secret() -> Result<Secret, Box<dyn Error>> {
@@ -121,11 +144,11 @@ fn read_secret() -> Result<Secret, Box<dyn Error>> {
 /// agent down.
 fn serve_host(secret: &Secret) {
     let mut backoff = Backoff::new();
-    while !STOPPING.load(Ordering::Relaxed) {
+    while !STOPPING.load(Ordering::SeqCst) {
         let authenticated = connect_to_host(secret);
         // A shutdown that arrived during the session must not be waited out:
         // systemd is holding the guest open for this process to exit.
-        if STOPPING.load(Ordering::Relaxed) {
+        if STOPPING.load(Ordering::SeqCst) {
             break;
         }
         wait_before_connecting_again(backoff.after(authenticated));
@@ -141,7 +164,7 @@ fn wait_before_connecting_again(delay: Duration) {
     const SLICE: Duration = Duration::from_millis(250);
 
     let mut waited = Duration::ZERO;
-    while waited < delay && !STOPPING.load(Ordering::Relaxed) {
+    while waited < delay && !STOPPING.load(Ordering::SeqCst) {
         let slice = SLICE.min(delay - waited);
         thread::sleep(slice);
         waited += slice;
@@ -165,6 +188,16 @@ fn connect_to_host(secret: &Secret) -> bool {
         }
     };
 
+    // From here until the stream is given up, a shutdown signal ends this
+    // connection rather than only setting the flag.
+    WAKE_DESCRIPTOR.store(stream.as_raw_fd(), Ordering::SeqCst);
+    // A signal that arrived while the socket was being connected saw no
+    // descriptor to wake, so the session it would have ended is not started.
+    if STOPPING.load(Ordering::SeqCst) {
+        WAKE_DESCRIPTOR.store(NO_DESCRIPTOR, Ordering::SeqCst);
+        return false;
+    }
+
     let mut opened = None;
     match session::run(
         &mut stream,
@@ -179,6 +212,10 @@ fn connect_to_host(secret: &Secret) -> bool {
         Err(error) => eprintln!("vmlord-agent: {error}"),
     }
 
+    // Before the stream is dropped, so that the handler never shuts down a
+    // descriptor the kernel has since handed to something else.
+    WAKE_DESCRIPTOR.store(NO_DESCRIPTOR, Ordering::SeqCst);
+
     match &opened {
         Some(session) => {
             eprintln!(
@@ -190,5 +227,72 @@ fn connect_to_host(secret: &Secret) -> bool {
             true
         }
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{STOPPING, WAKE_DESCRIPTOR, listen_for_shutdown};
+    use std::sync::atomic::Ordering;
+
+    /// The bug this covers is a guest that took a minute and a half to stop:
+    /// the flag was set, the session was blocked in a read that nothing woke,
+    /// and systemd killed the agent when its stop timeout ran out.
+    #[test]
+    fn a_shutdown_signal_wakes_the_connection_it_arrives_on() {
+        let mut pair = [0; 2];
+        // SAFETY: `pair` is a two-element array of the type `socketpair`
+        // fills, and the constants describe a local stream socket pair.
+        let created = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM,
+                0,
+                pair.as_mut_ptr().cast(),
+            )
+        };
+        assert_eq!(created, 0, "a socket pair for the test");
+
+        // A read that is never woken is the bug itself, so it is given a
+        // deadline: this test fails on a regression instead of hanging on it.
+        let timeout = libc::timeval {
+            tv_sec: 5,
+            tv_usec: 0,
+        };
+        // SAFETY: `timeout` is an initialized `timeval` described by the
+        // pointer and length given.
+        let limited = unsafe {
+            libc::setsockopt(
+                pair[0],
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                (&raw const timeout).cast(),
+                std::mem::size_of_val(&timeout) as libc::socklen_t,
+            )
+        };
+        assert_eq!(limited, 0, "a read deadline for the test");
+
+        listen_for_shutdown();
+        WAKE_DESCRIPTOR.store(pair[0], Ordering::SeqCst);
+
+        // `raise` runs the handler on this thread, which is where the agent's
+        // own reads block.
+        // SAFETY: `raise` takes a signal number and no pointers.
+        assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
+
+        assert!(STOPPING.load(Ordering::SeqCst), "the flag is set");
+
+        let mut byte = [0u8; 1];
+        // SAFETY: `byte` is a valid mutable buffer of the length given.
+        let read = unsafe { libc::read(pair[0], byte.as_mut_ptr().cast(), byte.len()) };
+        assert_eq!(
+            read, 0,
+            "a read on the woken connection ends instead of blocking"
+        );
+
+        for descriptor in pair {
+            // SAFETY: both descriptors are owned by this test and closed once.
+            unsafe { libc::close(descriptor) };
+        }
     }
 }
