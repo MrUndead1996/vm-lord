@@ -31,7 +31,10 @@ use vmlord_agent_protocol::{
         envelope, request, response,
     },
 };
-use vmlord_core::{GpuShareManifest, GpuShareRole as CoreShareRole};
+use vmlord_core::{
+    GpuFailure, GpuShareManifest, GpuShareRole as CoreShareRole, GpuStatusCode, GuestGpuDetail,
+    GuestGpuReport,
+};
 
 /// What this build of the host implements beyond the base protocol.
 ///
@@ -65,6 +68,15 @@ const APPLY_REQUEST_ID: u32 = ATTACH_REQUEST_ID + 1;
 /// about a userspace the recipe has just installed.
 const PROBE_REQUEST_ID: u32 = APPLY_REQUEST_ID + 1;
 
+/// Where a session hands what the guest said about its GPU.
+///
+/// A callback rather than a channel: `serve` is tested against a peer made of
+/// bytes, and a sink that collects into a vector is the whole test harness.
+/// One report per session is the usual number -- the guest is asked once --
+/// but nothing here limits it, because a session that ends up saying two
+/// things has said two things.
+pub(crate) type GuestGpuSink<'a> = &'a dyn Fn(GuestGpuReport);
+
 /// What a session agreed on when it opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AgentSession {
@@ -72,6 +84,13 @@ pub(crate) struct AgentSession {
     pub(crate) version: ProtocolVersion,
     /// The capabilities both peers have, which is the only set either may use.
     pub(crate) capabilities: Vec<Capability>,
+    /// The agent build that is speaking, for logs only.
+    ///
+    /// Kept because an agent is installed once, at a VM's first boot, and then
+    /// outlives any number of host rebuilds. Which build is answering is
+    /// otherwise invisible, and guessing at it costs a real-host round trip
+    /// every time.
+    pub(crate) build: String,
 }
 
 /// Runs the hello exchange and the challenge, in that order.
@@ -98,8 +117,9 @@ pub(crate) fn open<S: Read + Write>(
     authenticate(stream, secret, vm_name, &mut buffer)?;
 
     log::info!(
-        "the agent of VM \"{vm_name}\" opened a session on protocol {}.{} with {} \
-         agreed capability(ies)",
+        "the agent of VM \"{vm_name}\" is build \"{}\" and opened a session on protocol \
+         {}.{} with {} agreed capability(ies)",
+        session.build,
         session.version.major,
         session.version.minor,
         session.capabilities.len()
@@ -123,6 +143,7 @@ pub(crate) fn serve<S: Read + Write>(
     session: &AgentSession,
     shares: Option<&GpuShareManifest>,
     vm_name: &str,
+    sink: GuestGpuSink<'_>,
 ) -> Result<(), SessionError> {
     let mut buffer = Vec::new();
     log::debug!(
@@ -167,14 +188,18 @@ pub(crate) fn serve<S: Read + Write>(
                 if pending_recipe == Some(request_id) =>
             {
                 pending_recipe = None;
-                report_recipe(&report, vm_name);
-                pending_probe = probe_gpu(stream, vm_name, &mut buffer)?;
+                // A recipe that did not finish ends the guest's GPU here:
+                // nothing renders on a module that was not built, and a probe
+                // would only be a second way of saying so.
+                if report_recipe(&report, vm_name, sink) {
+                    pending_probe = probe_gpu(stream, vm_name, &mut buffer)?;
+                }
             }
             Body::Response(response::Kind::ProbeGpu(report))
                 if pending_probe == Some(request_id) =>
             {
                 pending_probe = None;
-                report_probe(&report, vm_name);
+                report_probe(&report, vm_name, sink);
             }
             // A response to a request this side did not send, or one it has
             // already had an answer to. Worth a line and nothing more: there is
@@ -285,6 +310,7 @@ fn probe_gpu<S: Read + Write>(
 fn wire_share(share: &vmlord_core::GpuShare) -> vmlord_agent_protocol::v1::GpuShare {
     let (role, package) = match &share.role {
         CoreShareRole::WslLib => (GpuShareRole::WslLib, String::new()),
+        CoreShareRole::WslD3d12 => (GpuShareRole::WslD3d12, String::new()),
         CoreShareRole::GpuPayload => (GpuShareRole::GpuPayload, String::new()),
         CoreShareRole::DriverPackage { package } => (GpuShareRole::DriverPackage, package.clone()),
     };
@@ -331,7 +357,11 @@ fn report_mounts(report: &AttachGpuSharesResponse, vm_name: &str) {
 /// Nothing is kept and nothing is retried: the next session applies the recipe
 /// again, and deriving a GPU status from these facts is the application
 /// layer's work.
-fn report_recipe(report: &ApplyGpuRecipeResponse, vm_name: &str) {
+fn report_recipe(
+    report: &ApplyGpuRecipeResponse,
+    vm_name: &str,
+    sink: GuestGpuSink<'_>,
+) -> bool {
     for stage in &report.stages {
         match stage.state() {
             GpuRecipeStageState::Ok => log::debug!(
@@ -339,7 +369,11 @@ fn report_recipe(report: &ApplyGpuRecipeResponse, vm_name: &str) {
                 stage.step(),
                 stage.message
             ),
-            GpuRecipeStageState::Skipped => log::debug!(
+            // Info, unlike a stage that finished: a step that did not run is
+            // how a recipe reports "there was nothing for me to do here", and
+            // a guest that ends up with no device after a recipe that failed
+            // nowhere is explained by exactly these lines.
+            GpuRecipeStageState::Skipped => log::info!(
                 "the agent of VM \"{vm_name}\" skipped GPU recipe stage {:?}: {}",
                 stage.step(),
                 stage.message
@@ -352,13 +386,32 @@ fn report_recipe(report: &ApplyGpuRecipeResponse, vm_name: &str) {
             ),
         }
     }
+
+    let Some(broken) = report.stages.iter().find(|stage| {
+        !matches!(
+            stage.state(),
+            GpuRecipeStageState::Ok | GpuRecipeStageState::Skipped
+        )
+    }) else {
+        return true;
+    };
+
+    sink(GuestGpuReport::Failed(GpuFailure::new(
+        GpuStatusCode::GuestFailed,
+        format!(
+            "the guest's GPU recipe stopped at {:?}: {}",
+            broken.step(),
+            broken.message
+        ),
+    )));
+    false
 }
 
 /// Says what the guest found, at the volume each check earns.
 ///
 /// Nothing is kept: the next session probes again, and turning a verdict into
 /// a `VmGpuFacts` is the application layer's work.
-fn report_probe(report: &ProbeGpuResponse, vm_name: &str) {
+fn report_probe(report: &ProbeGpuResponse, vm_name: &str, sink: GuestGpuSink<'_>) {
     match report.verdict() {
         GpuProbeVerdict::Renders => log::info!(
             "the agent of VM \"{vm_name}\" renders on {}",
@@ -384,6 +437,24 @@ fn report_probe(report: &ProbeGpuResponse, vm_name: &str) {
             ),
         }
     }
+
+    // The verdict is the guest's to give: it is the only side that saw the
+    // output of the programs it ran, and a host that re-derived one from the
+    // checks could disagree with the peer that produced them.
+    let detail = GuestGpuDetail {
+        driver: (!report.driver.is_empty()).then(|| report.driver.clone()),
+        render_node: (!report.render_node.is_empty()).then(|| report.render_node.clone()),
+    };
+    sink(match report.verdict() {
+        GpuProbeVerdict::Renders => GuestGpuReport::Ready(detail),
+        GpuProbeVerdict::DeviceOnly => GuestGpuReport::DevicePresent(detail),
+        // `Unspecified` is an agent answering with a verdict this build does
+        // not know, which is not a working GPU either.
+        verdict => GuestGpuReport::Failed(GpuFailure::new(
+            GpuStatusCode::GuestFailed,
+            format!("the guest reports no usable GPU ({verdict:?})"),
+        )),
+    });
 }
 
 /// Settles the protocol revision and the capabilities of a new session.
@@ -425,8 +496,7 @@ fn greet<S: Read + Write>(
     let capabilities = handshake::agreed_capabilities(HOST_CAPABILITIES, &hello.capabilities);
 
     log::debug!(
-        "the agent of VM \"{vm_name}\" is build \"{}\" and speaks protocol {}.{}",
-        hello.agent_version,
+        "the agent of VM \"{vm_name}\" speaks protocol {}.{}",
         remote.major,
         remote.minor
     );
@@ -442,6 +512,7 @@ fn greet<S: Read + Write>(
     Ok(AgentSession {
         version,
         capabilities,
+        build: hello.agent_version,
     })
 }
 
@@ -666,7 +737,9 @@ mod tests {
             envelope, request, response,
         },
     };
-    use vmlord_core::GpuShareManifest;
+    use std::sync::Mutex;
+
+    use vmlord_core::{GpuShareManifest, GpuStatusCode, GuestGpuDetail, GuestGpuReport};
 
     use super::{AgentSession, SessionError, open, serve};
 
@@ -837,13 +910,17 @@ mod tests {
         }
     }
 
+    /// A stamp of the shape a real agent sends: version plus the revision it
+    /// was built from, which is the part that tells two builds apart.
+    const AGENT_BUILD: &str = "0.1.0+e02e08e129b8";
+
     fn hello(version: ProtocolVersion, capabilities: &[Capability]) -> Envelope {
         Envelope::request(
             7,
             request::Kind::Hello(HelloRequest {
                 version: Some(version),
                 capabilities: capabilities.iter().copied().map(i32::from).collect(),
-                agent_version: "0.1.0".to_owned(),
+                agent_version: AGENT_BUILD.to_owned(),
             }),
         )
     }
@@ -872,6 +949,11 @@ mod tests {
 
         assert_eq!(session.version, ProtocolVersion::current());
         assert!(session.capabilities.is_empty());
+        assert_eq!(
+            session.build, AGENT_BUILD,
+            "the build the guest named is what the session log reports, and it \
+             is the only way to tell which agent a VM is running"
+        );
         let Some(envelope::Body::Response(ref response)) = guest.answer_to(7).body else {
             panic!("the hello should have been answered");
         };
@@ -980,7 +1062,7 @@ mod tests {
             .after_answer(&[heartbeat(11)]);
         let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
 
-        serve(&mut guest, &session, None, VM).expect("a session the agent closed");
+        serve(&mut guest, &session, None, VM, &|_| {}).expect("a session the agent closed");
 
         let Some(envelope::Body::Response(ref response)) = guest.answer_to(11).body else {
             panic!("the heartbeat should have been answered");
@@ -995,7 +1077,7 @@ mod tests {
             .after_answer(&[hello(ProtocolVersion::current(), &[])]);
         let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
 
-        serve(&mut guest, &session, None, VM).expect("a session the agent closed");
+        serve(&mut guest, &session, None, VM, &|_| {}).expect("a session the agent closed");
 
         // The hello and its refusal share a request id, so the last answer to
         // it is the one `serve` gave.
@@ -1020,7 +1102,7 @@ mod tests {
         let mut guest = Guest::new(Secret::from_base64(&secret.to_base64()).expect("the secret"));
         let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
 
-        serve(&mut guest, &session, None, VM).expect("a clean close is not a failure");
+        serve(&mut guest, &session, None, VM, &|_| {}).expect("a clean close is not a failure");
     }
 
     #[test]
@@ -1055,7 +1137,7 @@ mod tests {
             }),
         ));
 
-        serve(&mut guest, &session, Some(&manifest), VM).expect("a session the agent closed");
+        serve(&mut guest, &session, Some(&manifest), VM, &|_| {}).expect("a session the agent closed");
 
         let offered = guest.answer_to(super::ATTACH_REQUEST_ID);
         let Some(envelope::Body::Request(ref request)) = offered.body else {
@@ -1124,7 +1206,7 @@ mod tests {
             }),
         ));
 
-        serve(&mut guest, &session, Some(&manifest), VM).expect("a session the agent closed");
+        serve(&mut guest, &session, Some(&manifest), VM, &|_| {}).expect("a session the agent closed");
 
         let asked = guest.answer_to(super::APPLY_REQUEST_ID);
         let Some(envelope::Body::Request(ref request)) = asked.body else {
@@ -1146,6 +1228,157 @@ mod tests {
                 .count(),
             1,
             "one recipe per session"
+        );
+    }
+
+    /// A guest that mounted its shares, applied its recipe and answered the
+    /// probe with `verdict`, and what the session made of it.
+    ///
+    /// The whole conversation rather than the probe alone: the probe is asked
+    /// for only after a recipe that finished, so a fixture that skipped the
+    /// earlier answers would test a request the host never sends.
+    fn reports_of_a_guest(recipe: ApplyGpuRecipeResponse, probe: Option<ProbeGpuResponse>) -> Vec<GuestGpuReport> {
+        let secret = Secret::generate();
+        let mut guest = Guest::opening_with(
+            Secret::from_base64(&secret.to_base64()).expect("the secret"),
+            hello(ProtocolVersion::current(), &[Capability::Gpu]),
+        );
+        let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
+        let manifest = GpuShareManifest {
+            shares: vec![vmlord_core::GpuShare::payload()],
+        };
+        guest.say(&Envelope::response(
+            super::ATTACH_REQUEST_ID,
+            response::Kind::AttachGpuShares(AttachGpuSharesResponse {
+                mounts: vec![GpuMount {
+                    share: "vmlord.gpu.payload".to_owned(),
+                    state: i32::from(GpuMountState::Mounted),
+                    path: "/opt/vmlord/gpu-payload".to_owned(),
+                    message: "mounted".to_owned(),
+                }],
+                libraries_refreshed: true,
+            }),
+        ));
+        guest.say(&Envelope::response(
+            super::APPLY_REQUEST_ID,
+            response::Kind::ApplyGpuRecipe(recipe),
+        ));
+        if let Some(probe) = probe {
+            guest.say(&Envelope::response(
+                super::PROBE_REQUEST_ID,
+                response::Kind::ProbeGpu(probe),
+            ));
+        }
+
+        let reports = Mutex::new(Vec::new());
+        serve(&mut guest, &session, Some(&manifest), VM, &|report| {
+            reports
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(report);
+        })
+        .expect("a session the agent closed");
+
+        reports.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn a_recipe_that_finished() -> ApplyGpuRecipeResponse {
+        ApplyGpuRecipeResponse {
+            stages: vec![GpuRecipeStage {
+                step: i32::from(GpuRecipeStep::Device),
+                state: i32::from(GpuRecipeStageState::Ok),
+                message: "/dev/dxg is a usable device".to_owned(),
+            }],
+        }
+    }
+
+    fn a_probe_with(verdict: GpuProbeVerdict, driver: &str, render_node: &str) -> ProbeGpuResponse {
+        ProbeGpuResponse {
+            verdict: i32::from(verdict),
+            checks: Vec::new(),
+            renderer: String::new(),
+            driver: driver.to_owned(),
+            render_node: render_node.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_guest_that_renders_is_reported_as_ready() {
+        let reports = reports_of_a_guest(
+            a_recipe_that_finished(),
+            Some(a_probe_with(
+                GpuProbeVerdict::Renders,
+                "dxgkrnl",
+                "/dev/dri/renderD128",
+            )),
+        );
+
+        assert_eq!(
+            reports,
+            vec![GuestGpuReport::Ready(GuestGpuDetail {
+                driver: Some("dxgkrnl".into()),
+                render_node: Some("/dev/dri/renderD128".into()),
+            })]
+        );
+    }
+
+    #[test]
+    fn a_guest_that_only_opened_the_device_is_present_rather_than_ready() {
+        let reports = reports_of_a_guest(
+            a_recipe_that_finished(),
+            Some(a_probe_with(GpuProbeVerdict::DeviceOnly, "dxgkrnl", "")),
+        );
+
+        let [GuestGpuReport::DevicePresent(detail)] = &reports[..] else {
+            panic!("a device that renders nothing is not a ready GPU: {reports:?}");
+        };
+        assert_eq!(detail.driver.as_deref(), Some("dxgkrnl"));
+        assert_eq!(
+            detail.render_node, None,
+            "an empty field on the wire is an absent fact, not an empty name"
+        );
+    }
+
+    #[test]
+    fn a_guest_without_a_device_has_failed() {
+        let reports = reports_of_a_guest(
+            a_recipe_that_finished(),
+            Some(a_probe_with(GpuProbeVerdict::NoDevice, "", "")),
+        );
+
+        let [GuestGpuReport::Failed(failure)] = &reports[..] else {
+            panic!("a guest with no device has no GPU: {reports:?}");
+        };
+        assert_eq!(failure.code, GpuStatusCode::GuestFailed);
+    }
+
+    #[test]
+    fn a_recipe_that_broke_reports_the_stage_it_broke_at_and_is_never_probed() {
+        let reports = reports_of_a_guest(
+            ApplyGpuRecipeResponse {
+                stages: vec![
+                    GpuRecipeStage {
+                        step: i32::from(GpuRecipeStep::Payload),
+                        state: i32::from(GpuRecipeStageState::Ok),
+                        message: "the payload applies to this guest".to_owned(),
+                    },
+                    GpuRecipeStage {
+                        step: i32::from(GpuRecipeStep::ModuleBuild),
+                        state: i32::from(GpuRecipeStageState::Failed),
+                        message: "dkms build returned 1".to_owned(),
+                    },
+                ],
+            },
+            None,
+        );
+
+        let [GuestGpuReport::Failed(failure)] = &reports[..] else {
+            panic!("a recipe that did not finish is a failure: {reports:?}");
+        };
+        assert!(
+            failure.message.contains("dkms build returned 1"),
+            "the guest's own words carry the detail: {}",
+            failure.message
         );
     }
 
@@ -1199,7 +1432,7 @@ mod tests {
             }),
         ));
 
-        serve(&mut guest, &session, Some(&manifest), VM).expect("a session the agent closed");
+        serve(&mut guest, &session, Some(&manifest), VM, &|_| {}).expect("a session the agent closed");
 
         let asked = guest.answer_to(super::PROBE_REQUEST_ID);
         let Some(envelope::Body::Request(ref request)) = asked.body else {
@@ -1233,7 +1466,7 @@ mod tests {
         );
         let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
 
-        serve(&mut guest, &session, None, VM).expect("a session the agent closed");
+        serve(&mut guest, &session, None, VM, &|_| {}).expect("a session the agent closed");
 
         assert!(
             !guest.received.iter().any(|envelope| matches!(
@@ -1255,7 +1488,7 @@ mod tests {
         );
         let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
 
-        serve(&mut guest, &session, None, VM).expect("a session the agent closed");
+        serve(&mut guest, &session, None, VM, &|_| {}).expect("a session the agent closed");
 
         assert!(
             !guest.received.iter().any(|envelope| matches!(
@@ -1281,7 +1514,7 @@ mod tests {
             shares: vec![vmlord_core::GpuShare::wsl_lib()],
         };
 
-        serve(&mut guest, &session, Some(&manifest), VM).expect("a session the agent closed");
+        serve(&mut guest, &session, Some(&manifest), VM, &|_| {}).expect("a session the agent closed");
 
         assert!(
             !guest.received.iter().any(|envelope| matches!(
@@ -1299,8 +1532,9 @@ mod tests {
         let session = AgentSession {
             version: ProtocolVersion::current(),
             capabilities: Vec::new(),
+            build: String::new(),
         };
 
-        serve(&mut stream, &session, None, VM).expect("an idle boundary is not a failed session");
+        serve(&mut stream, &session, None, VM, &|_| {}).expect("an idle boundary is not a failed session");
     }
 }

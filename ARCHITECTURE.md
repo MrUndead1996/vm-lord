@@ -674,9 +674,9 @@ it booted with, so the application layer accepts the edit and warns that it
 applies after a restart rather than refusing it. An edit also carries the
 network mode, which is recorded in the VM's mapping rather than in its
 `config.json` and reaches the VM the same way: the next start writes or removes
-the `NetworkAdapters` section to match. GPU modes other than `None` are
-rejected until their own task lands, as are the `External` and `Internal`
-network modes.
+the `NetworkAdapters` section to match. The GPU mode is recorded in the mapping
+the same way, and may only be changed while the VM is stopped. The `External`
+and `Internal` network modes are still rejected until their own task lands.
 
 `VmSummary`'s memory and processor counts come from the same stored
 configuration. `disk_gb` comes from the `MetadataStore` mapping, where creation
@@ -956,6 +956,87 @@ The UI only displays this. It shows the desired mode and the runtime status as
 separate rows, because a VM configured for `Mirror` whose guest has not come up
 yet is not a VM without a GPU.
 
+### GPU: the shape of a start
+
+Every start of a VM that asks for a GPU runs the same six steps, in
+`VmStartPipeline`, before and around the start it already performed:
+
+1. **Staging.** The payload for the VM's guest is staged into the VM's own
+   `gpu-payload` directory. A failure here removes exactly one share and
+   nothing else; the shipped catalog is empty until a payload is published, so
+   this is the path every host takes today.
+2. **Exports.** The host's partition adapters are enumerated and turned into
+   Plan9 shares. VM access is asked for on each and the answer is not acted on:
+   these paths are under `System32`, where the grant is always refused, and a
+   Plan9 share does not need one.
+3. **Configuration.** The shares are written into the configuration the compute
+   system is built from, in memory. They are never written back to the stored
+   `config.json`: they name this host's paths and this run's staging directory,
+   and a compute system's Plan9 section is fixed for the lifetime of a boot
+   anyway.
+4. **Start.** The compute system is prepared, the console is opened, and the
+   system runs. Unchanged by GPU.
+5. **Assignment.** `HcsModifyComputeSystem` attaches the adapters the mode asks
+   for, once, against the running system. A failure is recorded and changes
+   nothing else: the VM is running, and GPU never decides that.
+6. **Manifest.** What the guest is to mount is left where the agent listener
+   reads it, and every session of that run is offered the same manifest.
+
+None of this is retried -- not staging, not assignment, not a partial outcome.
+A second attempt at a modify HCS refused is a second refusal, and a loop around
+one is how a VM spends its life asking for a GPU it will not get.
+
+The steps live in the start pipeline rather than in the repository, because the
+build cycle starts VMs through the same pipeline: a VM created with a GPU gets
+one on its first boot as well as on every later start.
+
+Staging unpacks an archive on a cold cache and hashes the staged tree on every
+start, so a start became a thread of its own -- `StartRegistry`, modelled on the
+`BuildRegistry` that background creation already uses. `start_vm` refuses
+synchronously only what is cheap and certain (an unknown VM, a build or a start
+already in flight) and hands the rest to the thread; a VM with a start in flight
+lists as `VmState::Starting`, and what the thread produced -- the console
+session and the compute-system handle -- is taken over on the next refresh.
+
+### GPU: what a run knows about itself
+
+`GpuRuns` is one in-memory map, keyed by VM id, holding what has been observed
+about each running VM's GPU and the manifest its guest is to be offered. Three
+threads meet there -- the one starting the VM, the one serving its agent, and
+the refresh that lists VMs -- and one entry with one lifetime is what keeps
+them from disagreeing. Every point that ends a run forgets its entry: stop,
+force stop, delete, the HCS release event, and process shutdown.
+
+Nothing is persisted. A `VmGpuStatus` describes a moment, and facts recorded by
+a process that is gone are confirmed by nothing -- the VM may have crashed, the
+guest may have lost the device. Re-observing is cheap: a reconnecting agent
+runs the same attach, recipe and probe exchange within seconds.
+
+What cannot be re-observed is the assignment, which happens once, right after
+the system starts. A VM reclaimed from a previous process therefore reports
+`GpuAssignment::Unknown` and the stable code `gpu-assignment-unknown` -- "this
+VM was started before VMLord, so what is attached to it is not known" -- rather
+than `gpu-assignment-pending`, which would be a lie about the stage. It lasts
+until the guest's first report.
+
+### GPU: where partial comes from
+
+HCS reports nothing about partiality: it either accepted the update or it did
+not. Partiality is therefore derived from export coverage, which is its only
+honest source. With N adapters enumerated and M driver-package shares built,
+`M < N` is a partial assignment -- some adapters are attached but the guest
+cannot mount their drivers -- and a payload that could not be staged is partial
+too, with its own wording. Full coverage is complete, and a host with no
+partition adapter at all is a failure rather than something partly done.
+
+A VM's guest triple -- distribution, release, architecture -- is recorded in its
+mapping at creation, from the cloud image it was built from. A VM from
+installation media has none, because VMLord promises nothing about the system
+inside it, and gets the WSL and driver shares without a payload. The kernel is
+deliberately not part of the key: the host chooses a payload before the guest
+has booted, and the guest's own recipe treats the kernel as soft because DKMS
+rebuilds the module for whatever kernel is running.
+
 ### GPU: what the host can do
 
 Before any VM is offered a GPU, `HostGpuCapabilities` answers what this host is
@@ -980,8 +1061,11 @@ name, instance id, interface path, driver package directory and kernel service,
 and an adapter whose package could not be located is still reported: it is a
 real device that simply has nothing to hand a guest.
 
-`vmlord_platform::gpu_discovery` turns that, a `System32\lxss\lib` check and an
-HCS service query into the two verdicts. Nothing is cached -- the enumeration
+`vmlord_platform::gpu_discovery` turns that, a check of both halves of the
+Linux userspace and an HCS service query into the two verdicts. Both halves,
+because a host with only `System32\lxss\lib` looks installed and cannot
+render, and the failure names the half that is missing rather than saying
+"install WSL" to someone who has. Nothing is cached -- the enumeration
 is cheap, and a driver update or a WSL install changes the answer with nothing
 to invalidate a cache on. A dead Host Compute Service outranks the adapter
 question, since reporting "no adapters" when the service is not answering would
@@ -1001,23 +1085,39 @@ cannot tell you" is a different answer from "this host cannot do it".
 `vmlord_platform::gpu_assignment` is the narrow boundary that proves
 assignment on a running compute system. It maps `Default` and `Mirror` to an
 `HcsModifyComputeSystem` `Update` of `VirtualMachine/ComputeTopology/Gpu` and
-waits for HCS to finish it. The service is safe: its only native call is behind
+waits for HCS to finish it. The settings carry `AllowVendorExtension`, which is
+what lets HCS attach a vendor's own partition extension: without it a host with
+an NVIDIA adapter refuses the update with HRESULT 0xC0350008 and an empty result
+detail. The service is safe: its only native call is behind
 `HcsSystem::modify`, which retains the failed HRESULT and the raw HCS result
 detail rather than guessing at a version-specific error schema. It returns a
-`GpuFailure`, so a lifecycle caller can record an unsuccessful assignment
-without stopping the VM or retrying it. The service has no lifecycle caller
-yet: storing the desired mode, invoking it after start, reporting runtime facts
-and rendering them are the next task's work.
+`GpuFailure`, so its caller records an unsuccessful assignment without stopping
+the VM or retrying it. `gpu_assignment::assign_to_system` names the compute
+system by id rather than taking an open handle, so a start can attach a GPU
+without holding one across the steps before it -- and so the step can be
+substituted in the tests of a start, which have no compute system to open.
 
 ### GPU: what is exported to a guest
 
 A GPU partition is useless to a Linux guest without the host's driver package
 and the WSL Linux userspace beside it, and the way in is a Plan9 share.
 `vmlord_platform::gpu_exports` decides what may be shared, and the answer is
-two system directories plus one exact per-VM staging directory:
-`System32\DriverStore\FileRepository`, for
-the driver packages behind the host's adapters, and `System32\lxss\lib`, for
-the Linux userspace WSL stages.
+three system directories plus one exact per-VM staging directory:
+`System32\DriverStore\FileRepository`, for the driver packages behind the
+host's adapters, and the two directories the Linux userspace is split across.
+
+That userspace is one directory only on a host whose WSL is the inbox one.
+Where WSL comes from the Store or the standalone installer, `System32\lxss\lib`
+holds what the GPU driver puts there -- the vendor's libraries, and on the
+first real host nothing else -- while the Microsoft half the renderer actually
+links against, `libd3d12.so`, `libd3d12core.so` and `libdxcore.so`, is
+installed beside the package as `Program Files\WSL\lib`. A guest given only
+the first half has vendor libraries with nothing to drive them, which is
+exactly what the first real host produced. So there are two roots and two
+roles, and the second is checked against `Program Files` for the same reason
+the others are checked against `System32`. `Program Files` is asked of the
+shell rather than read from `%ProgramFiles%`: the environment variable is
+inherited and this decides what a VM is shown.
 
 Every candidate is canonicalized before it is judged -- opened as a directory
 handle, without `FILE_FLAG_OPEN_REPARSE_POINT`, and resolved with
@@ -1034,12 +1134,19 @@ A candidate that fails any of this is dropped with a log line and the rest are
 still offered, and a set with nothing in it is `None` rather than an error: GPU
 is applied best effort and never blocks a start. `HcsGrantVmAccess` runs only
 after a path has passed -- a grant before the check is what makes the check
-decorative -- and an export the grant refused is dropped too, because offering
-a VM a share it cannot open trades a clear line in the host log for an opaque
-mount failure in the guest.
+decorative -- but its answer is not acted on. Every one of these paths lives
+under `System32`, whose DACLs belong to TrustedInstaller, so the grant is
+refused there however elevated VMLord is, and a Plan9 share does not need it:
+the share is served by the host's own Plan9 server rather than opened by the
+VM's security principal, which is what makes it different from the VHDX files a
+start grants separately. The AppSandbox backend asks for the same grants on the
+same paths and ignores the answer. Dropping a share over the refusal is what
+this used to do, and it removed the guest's entire GPU userspace on every real
+host.
 
 What the guest is told is a `GpuShareManifest`: for each share, a name and a
-role -- `WslLib`, or `DriverPackage` with the package's folder name. Never a
+role -- `WslLib`, `WslD3d12`, or `DriverPackage` with the package's folder
+name. Never a
 host path. Where a share is mounted is the guest's decision, taken from its own
 allowlist, so the host cannot dictate a path into a guest filesystem and the
 host's topology does not travel. Share names are `vmlord.gpu.wsl-lib` and
@@ -1095,11 +1202,26 @@ that share at `/opt/vmlord/gpu-payload`; what the guest makes of it is the
 recipe below, and task 98 owns lifecycle and UI orchestration.
 
 `platform::gpu_staging` is what fills that child: given the executable's
-directory, the shared cache root, a VM directory and the guest tuple an agent
-reported, it selects the entry, prepares the generation and stages it into
-`layout::gpu_payload_staging_directory` -- the same path `gpu_exports` will
-canonicalize. It is called by nothing yet, for the reason `gpu_exports` is: a
-start does not know a VM's GPU mode until assignment records one.
+directory, the shared cache root, a VM directory and the guest triple recorded
+with the VM, it selects the entry, prepares the generation and stages it into
+`layout::gpu_payload_staging_directory`. `gpu_prepare` calls it as the first
+step of every start of a VM that asks for a GPU.
+
+What is exported is the **generation** staging produced, not the staging root:
+the root also holds the `ready` markers and lock files that make a swap atomic,
+while the guest reads `sources.json` at the root of the share it mounts.
+Offering the root gives a guest a directory it finds no payload in, which is
+what the first real host reported as nine skipped recipe stages. The export is
+accepted only if it canonicalizes to something strictly inside this VM's
+staging root.
+
+The catalog is selected by distribution, release and architecture, and never by
+kernel: the host chooses a payload before the guest that will run it has
+booted, so the exact `kernel_release` cannot be known. Where a triple has
+several entries the newest proven kernel wins. This is safe because the guest
+does the same thing from the other side -- its recipe treats distribution,
+release and architecture as the hard gate and the kernel as soft, since DKMS
+builds against the running kernel's headers.
 
 ### GPU: the guest's Ubuntu recipe
 
@@ -1246,8 +1368,13 @@ The edit workflow follows these rules:
   start, and the application layer says so.
 * RAM must be at least 512 MiB and aligned to 2 MiB steps.
 * CPU core count must be at least 1.
-* GPU modes other than `None` are rejected by the native backend until their own
-  migration task lands.
+* The GPU mode may only be changed while the VM is stopped, and only the mode:
+  the refusal fires when the requested mode differs from the stored one under a
+  VM that is not stopped, so an edit of RAM or CPU on a running VM is unaffected.
+  The mode is applied while the compute system is prepared and started, so a
+  change under a live VM would leave a stored mode that does not describe the
+  GPU the guest actually has. The UI disables the control and gives the reason,
+  rather than offering a change the backend will refuse.
 * Network mode accepts `None` and `Nat`; `External` and `Internal` are rejected
   with a message naming the task that will add them.
 * Disk size is read-only in the current backend contract and requires recreating
@@ -2357,11 +2484,25 @@ compute system was started and is immutable for the lifetime of a boot, so
 delivers the same one.
 
 The guest decides where a share goes, from a table with one entry per role:
-`WslLib` at `/usr/lib/wsl/lib`, `DriverPackage` at
-`/usr/lib/wsl/drivers/<package>` and `GpuPayload` at `/opt/vmlord/gpu-payload`.
-The first two are WSL's own paths, which is where the Mesa D3D12 driver and a
-vendor's DriverStore libraries expect to find each other; the payload is
-VMLord's own and lives under `/opt`. The package name is the only part a host
+`WslLib` at `/usr/lib/wsl/host-lib`, `WslD3d12` at `/usr/lib/wsl/d3d12`,
+`DriverPackage` at `/usr/lib/wsl/drivers/<package>` and `GpuPayload` at
+`/opt/vmlord/gpu-payload`. The drivers are at WSL's own path, which is where a
+vendor's DriverStore libraries are expected; the payload is VMLord's own and
+lives under `/opt`.
+
+`/usr/lib/wsl/lib` -- the path Mesa's D3D12 driver, the probe and anyone
+running `eglinfo` by hand expect to find whole -- is not in that table and
+cannot be claimed by a manifest. It is composed after the mounts, as a
+read-only overlay whose lower layers are the two halves above, Microsoft's
+first so that a name present in both resolves to the library a renderer links
+against. An overlay rather than a directory of symlinks because every share is
+mounted `MS_RDONLY` and nothing can be created inside one; a merged directory
+rather than a second `ld.so.conf` line because a half-populated
+`/usr/lib/wsl/lib` is what neither the probe nor a person finds complete. It is
+remounted rather than repaired on each attach, so a half the manifest dropped
+leaves it, and the linker is told about the merged directory rather than about
+two fragments of one. It is also unmounted by name on shutdown, since the mount
+table this agent reads holds 9p mounts and this one is an overlay. The package name is the only part a host
 contributes to a path, and the guest validates it again -- non-empty, bounded,
 neither `.` nor `..`, `[A-Za-z0-9._-]` throughout -- because a path assembled
 from a peer's string is exactly where "the other side already checked it" stops
@@ -2381,10 +2522,10 @@ took its own reference.
 The attach is a reconcile against `/proc/self/mountinfo` rather than a mount. A
 target already carrying the share the manifest names is left alone if it reads
 back; one carrying a different share, or a mount that no longer reads back, is
-lazily unmounted and mounted again at most once; a 9p mount under one of the
-three roots that the manifest no longer names is unmounted. The health check is
-a directory read rather than a `stat`, because a 9p mount whose transport died
-still answers a `stat` from the dentry cache. Reading the mount table rather
+lazily unmounted and mounted again at most once; a 9p mount at one of the
+allowlisted targets that the manifest no longer names is unmounted. The health
+check is a directory read rather than a `stat`, because a 9p mount whose
+transport died still answers a `stat` from the dentry cache. Reading the mount table rather
 than a list the process kept is also what lets an agent that was upgraded and
 restarted clean up its predecessor's mounts.
 
@@ -2397,7 +2538,8 @@ writing `/etc/ld.so.cache` by hand would be a second implementation of a format
 the distribution owns.
 
 `SIGTERM` ends the loop rather than the process. The agent then unmounts every
-9p mount under its three roots, removes its `ld.so.conf.d` file and runs
+9p mount under its allowlisted targets, unmounts the merged
+`/usr/lib/wsl/lib` by name, removes its `ld.so.conf.d` file and runs
 `ldconfig` once more, all best effort: a guest that is going down is not helped
 by an agent that refuses to exit because a mount was busy. The handler itself
 sets a flag and shuts down the connection the agent is on, because a signal

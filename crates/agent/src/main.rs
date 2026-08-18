@@ -72,7 +72,13 @@ static WAKE_DESCRIPTOR: AtomicI32 = AtomicI32::new(NO_DESCRIPTOR);
 const NO_DESCRIPTOR: RawFd = -1;
 
 /// This build of the agent, as reported to the host during its hello.
-const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+///
+/// The version and the revision it was built from. The version alone is the
+/// same string on every build there has ever been, so a host reading it could
+/// not tell a fresh agent from the one a VM was created with -- and an agent
+/// is installed once, at first boot, and then outlives any number of host
+/// rebuilds.
+const AGENT_VERSION: &str = env!("VMLORD_AGENT_BUILD");
 
 fn main() {
     let secret = match read_secret() {

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use vmlord_core::{GpuFailure, GpuMode, GpuStatusCode};
 
-use crate::hcs::{HcsModifyFailure, HcsSystem};
+use crate::hcs::{HCS_ACCESS_ALL, HcsModifyFailure, HcsSystem};
 
 /// Bounds an assignment operation that HCS accepted but did not complete.
 const GPU_ASSIGNMENT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -30,6 +30,33 @@ impl GpuAssignmentService {
     }
 }
 
+/// Applies `mode` to the compute system named `hcs_id`, once.
+///
+/// Named by id rather than handed a system, so that a start can attach a GPU
+/// without holding one open across the steps before it -- and so that the step
+/// can be substituted in the tests of a start, which have no compute system to
+/// open.
+///
+/// A system HCS no longer knows is a failure of the GPU and not of the VM: it
+/// was running a moment ago, and what is lost is the adapter.
+pub(crate) fn assign_to_system(hcs_id: &str, mode: GpuMode) -> Result<(), GpuFailure> {
+    let system = HcsSystem::open_if_present(hcs_id, HCS_ACCESS_ALL)
+        .map_err(|error| {
+            GpuFailure::new(
+                GpuStatusCode::AssignmentFailed,
+                format!("the compute system could not be opened to attach a GPU: {error}"),
+            )
+        })?
+        .ok_or_else(|| {
+            GpuFailure::new(
+                GpuStatusCode::AssignmentFailed,
+                "the compute system was gone before its GPU could be attached",
+            )
+        })?;
+
+    GpuAssignmentService.assign(&system, mode)
+}
+
 /// Builds the HCS GPU-resource update for a supported desired mode.
 pub(crate) fn assignment_document(mode: GpuMode) -> Result<Option<String>, GpuFailure> {
     let assignment_mode = match mode {
@@ -47,7 +74,14 @@ pub(crate) fn assignment_document(mode: GpuMode) -> Result<Option<String>, GpuFa
     serde_json::to_string(&serde_json::json!({
         "ResourcePath": "VirtualMachine/ComputeTopology/Gpu",
         "RequestType": "Update",
-        "Settings": { "AssignmentMode": assignment_mode },
+        // `AllowVendorExtension` is what lets HCS attach a vendor's own GPU
+        // partition extension. Without it a host with an NVIDIA adapter
+        // refuses the update with HRESULT 0xC0350008 and an empty result
+        // detail; the AppSandbox backend has always sent it.
+        "Settings": {
+            "AssignmentMode": assignment_mode,
+            "AllowVendorExtension": true,
+        },
     }))
     .map(Some)
     .map_err(|error| {
@@ -92,6 +126,24 @@ mod tests {
         assert_eq!(value["ResourcePath"], "VirtualMachine/ComputeTopology/Gpu");
         assert_eq!(value["RequestType"], "Update");
         assert_eq!(value["Settings"]["AssignmentMode"], "Default");
+    }
+
+    #[test]
+    fn every_mode_allows_the_vendors_own_extension() {
+        // Without it the first real host refused the update outright, with
+        // HRESULT 0xC0350008 and an empty result detail. The AppSandbox
+        // backend sends it on both modes and its guests render; nothing else
+        // about the two documents differs.
+        for mode in [GpuMode::Default, GpuMode::Mirror] {
+            let document = assignment_document(mode).unwrap().unwrap();
+            let value: serde_json::Value = serde_json::from_str(&document).unwrap();
+
+            assert_eq!(
+                value["Settings"]["AllowVendorExtension"],
+                true,
+                "a vendor GPU needs its own extension to be attachable: {mode:?}"
+            );
+        }
     }
 
     #[test]

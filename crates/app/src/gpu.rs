@@ -91,6 +91,19 @@ pub fn derive_status(
                 reason.message.clone(),
             );
         }
+        // Nothing was observed, so there is nothing to call partial or
+        // complete; whatever the guest says stands on its own.
+        GpuAssignment::Unknown if facts.guest.is_none() => {
+            return status(
+                GpuState::WaitingForGuest,
+                GpuStage::Guest,
+                GpuStatusCode::AssignmentUnknown,
+                "This VM was started before VMLord, so what is attached to it is not \
+                 known; waiting for the guest to report."
+                    .into(),
+            );
+        }
+        GpuAssignment::Unknown => None,
         GpuAssignment::Partial { reason, .. } => Some(reason),
         GpuAssignment::Complete(_) => None,
     };
@@ -146,7 +159,7 @@ fn native_detail(facts: &VmGpuFacts) -> Option<vmlord_core::NativeGpuDetail> {
         GpuAssignment::Complete(detail) | GpuAssignment::Partial { detail, .. } => {
             Some(detail.clone())
         }
-        GpuAssignment::Failed(_) => None,
+        GpuAssignment::Unknown | GpuAssignment::Failed(_) => None,
     }
 }
 
@@ -348,6 +361,42 @@ mod tests {
         assert_eq!(status.state, GpuState::Failed);
         assert_eq!(status.stage, GpuStage::Guest);
         assert_eq!(status.message, "the guest kernel has no dxgkrnl module");
+    }
+
+    #[test]
+    fn a_run_this_process_did_not_start_says_so_rather_than_claiming_to_be_waiting() {
+        let facts = VmGpuFacts {
+            assignment: Some(GpuAssignment::Unknown),
+            ..VmGpuFacts::default()
+        };
+
+        let status = derive_status(GpuMode::Mirror, running(), &facts, NOW);
+
+        assert_eq!(status.state, GpuState::WaitingForGuest);
+        assert_eq!(status.stage, GpuStage::Guest);
+        assert_eq!(status.code, GpuStatusCode::AssignmentUnknown);
+        assert_eq!(
+            status.native, None,
+            "nothing was observed, so there is no adapter to report"
+        );
+    }
+
+    #[test]
+    fn an_unobserved_assignment_still_lets_the_guest_report_for_itself() {
+        let facts = VmGpuFacts {
+            assignment: Some(GpuAssignment::Unknown),
+            guest: Some(GuestGpuReport::Ready(rendering())),
+            ..VmGpuFacts::default()
+        };
+
+        let status = derive_status(GpuMode::Default, running(), &facts, NOW);
+
+        assert_eq!(
+            status.state,
+            GpuState::GuestReady,
+            "a guest that renders is ready whether or not this process attached the GPU"
+        );
+        assert_eq!(status.code, GpuStatusCode::GuestReady);
     }
 
     #[test]

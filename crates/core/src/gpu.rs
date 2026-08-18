@@ -54,6 +54,14 @@ pub struct VmGpuFacts {
 /// What the host side of GPU-PV did for a VM, once it has done anything.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GpuAssignment {
+    /// This VMLord process did not start this VM, so what is attached to it
+    /// was never observed.
+    ///
+    /// Its own variant rather than the absence of a fact: "nothing has been
+    /// attached yet" and "something was attached and nobody here saw it" are
+    /// different sentences to a reader, and only the second one is true of a
+    /// VM reclaimed from a previous run.
+    Unknown,
     /// Everything the mode asked for was attached.
     Complete(NativeGpuDetail),
     /// Some of what the mode asked for was attached, and why the rest was not.
@@ -169,6 +177,9 @@ pub enum GpuStatusCode {
     ModeUnsupported,
     /// The host side has not reported yet.
     AssignmentPending,
+    /// The VM was started before this VMLord process, so what is attached to
+    /// it is not known.
+    AssignmentUnknown,
     /// The host attached the GPU; the guest agent has not reported yet.
     GuestPending,
     /// The host could not attach the GPU.
@@ -202,6 +213,7 @@ impl GpuStatusCode {
             Self::VmNotRunning => "gpu-vm-not-running",
             Self::ModeUnsupported => "gpu-mode-unsupported",
             Self::AssignmentPending => "gpu-assignment-pending",
+            Self::AssignmentUnknown => "gpu-assignment-unknown",
             Self::GuestPending => "gpu-guest-pending",
             Self::AssignmentFailed => "gpu-assignment-failed",
             Self::AssignmentPartial => "gpu-assignment-partial",
@@ -352,12 +364,16 @@ pub enum GpuShareRole {
     WslLib,
     /// One driver package, named by its DriverStore folder.
     DriverPackage { package: String },
+    /// The Microsoft D3D12 userspace from the WSL package.
+    WslD3d12,
 }
 
 /// The share name the host's WSL Linux userspace is offered under.
 pub const WSL_LIB_SHARE: &str = "vmlord.gpu.wsl-lib";
 /// The share name for the immutable prepared GPU payload staging directory.
 pub const GPU_PAYLOAD_SHARE: &str = "vmlord.gpu.payload";
+/// The share name the Microsoft D3D12 userspace is offered under.
+pub const WSL_D3D12_SHARE: &str = "vmlord.gpu.wsl-d3d12";
 
 /// What every driver package share's name starts with.
 const DRIVER_PACKAGE_SHARE_PREFIX: &str = "vmlord.gpu.drv.";
@@ -380,6 +396,20 @@ impl GpuShare {
         Self {
             name: WSL_LIB_SHARE.to_owned(),
             role: GpuShareRole::WslLib,
+        }
+    }
+
+    /// The share for the Microsoft D3D12 userspace.
+    ///
+    /// Separate from [`Self::wsl_lib`] because the two are separate
+    /// directories on every host that installs WSL from the Store: one holds
+    /// the vendor's libraries and the other the Microsoft ones, and a guest
+    /// needs both to render.
+    #[must_use]
+    pub fn wsl_d3d12() -> Self {
+        Self {
+            name: WSL_D3D12_SHARE.to_owned(),
+            role: GpuShareRole::WslD3d12,
         }
     }
 
@@ -416,7 +446,7 @@ impl GpuShare {
 mod tests {
     use super::{
         GpuAvailability, GpuFailure, GpuShare, GpuShareRole, GpuStatusCode, HostGpuCapabilities,
-        WSL_LIB_SHARE,
+        WSL_D3D12_SHARE, WSL_LIB_SHARE,
     };
 
     #[test]
@@ -465,6 +495,20 @@ mod tests {
 
         assert_eq!(share.name, WSL_LIB_SHARE);
         assert_eq!(share.role, GpuShareRole::WslLib);
+    }
+
+    #[test]
+    fn the_d3d12_share_is_its_own_role_under_its_own_name() {
+        let share = GpuShare::wsl_d3d12();
+
+        assert_eq!(share.role, GpuShareRole::WslD3d12);
+        assert_eq!(share.name, WSL_D3D12_SHARE);
+        assert_ne!(
+            share.name,
+            GpuShare::wsl_lib().name,
+            "two sources of one userspace are two shares, and a guest tells them \
+             apart by name"
+        );
     }
 
     #[test]

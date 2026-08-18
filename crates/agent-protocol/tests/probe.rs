@@ -15,10 +15,17 @@ use vmlord_agent_protocol::{
 };
 
 #[test]
-fn a_probe_report_belongs_to_revision_one_five() {
+fn a_probe_report_belongs_to_revision_one_five_or_later() {
     // Messages and enum values only, so an agent from 1.4 is simply never
-    // asked and a host from 1.4 never has to read one.
-    assert_eq!((CURRENT_VERSION.major, CURRENT_VERSION.minor), (1, 5));
+    // asked and a host from 1.4 never has to read one. Later minors add more
+    // of the same kind, which is why this is a floor rather than an equality:
+    // the revision that introduced the report is 1.5 and nothing since has
+    // changed what one means.
+    assert_eq!(CURRENT_VERSION.major, 1);
+    assert!(
+        CURRENT_VERSION.minor >= 5,
+        "probe reports exist from 1.5 onwards, not in {CURRENT_VERSION:?}"
+    );
 }
 
 #[test]

@@ -19,7 +19,7 @@ use crate::{
     cleanup::{self, SystemTeardown},
     hcs_config::{self, HcsVmConfigBuilder},
     layout,
-    metadata::{MetadataStore, VmComputeSystemMapping},
+    metadata::{MetadataStore, VmComputeSystemMapping, guest_target_key},
     password_hash,
     vhd::create_dynamic_vhdx,
     vm_key,
@@ -233,6 +233,11 @@ impl VmCreationPipeline {
                 VmSource::LocalMedia { .. } => None,
                 VmSource::CloudImage { provisioning, .. } => provisioning.ssh_config(),
             },
+            gpu_mode: request.gpu_mode,
+            // The same three facts for the same reason: a payload is chosen
+            // before the guest that will use it has booted, and only the
+            // creation knows what system was installed.
+            guest_target: guest_target_key(&request.source),
         };
 
         let mut guard = CreationGuard {
@@ -1177,6 +1182,50 @@ mod tests {
             gpu_mode: GpuMode::None,
             network_mode: NetworkMode::None,
         }
+    }
+
+    #[test]
+    fn a_created_vm_records_the_gpu_mode_and_the_guest_it_was_built_from() {
+        let fixture = fixture("cloud-gpu");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+        let request = VmCreateRequest {
+            gpu_mode: GpuMode::Mirror,
+            ..cloud_request("cloud-gpu-vm")
+        };
+
+        let mapping = pipeline
+            .create(&fixture.store, &request, &fixture.vm_directory, &monitor())
+            .expect("creation must succeed");
+
+        assert_eq!(mapping.gpu_mode, GpuMode::Mirror);
+        let target = mapping
+            .guest_target
+            .expect("a cloud image names the guest it provisions");
+        assert_eq!(target.distribution, "ubuntu");
+        assert_eq!(target.release, "24.04");
+        assert_eq!(target.architecture, "amd64");
+    }
+
+    #[test]
+    fn a_vm_built_from_installation_media_names_no_guest_to_stage_a_payload_for() {
+        let fixture = fixture("media-gpu");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+        let request = VmCreateRequest {
+            gpu_mode: GpuMode::Default,
+            ..fixture.request.clone()
+        };
+
+        let mapping = pipeline
+            .create(&fixture.store, &request, &fixture.vm_directory, &monitor())
+            .expect("creation must succeed");
+
+        assert_eq!(mapping.gpu_mode, GpuMode::Default);
+        assert_eq!(
+            mapping.guest_target, None,
+            "VMLord promises nothing about the system inside installation media"
+        );
     }
 
     /// The bytes of the seed volume the pipeline wrote.

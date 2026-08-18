@@ -14,9 +14,9 @@ use std::{
 
 use uuid::Uuid;
 use vmlord_core::{
-    AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, GuestReadinessTimeouts, HostGpuCapabilities,
-    NetworkMode, RepositoryError, SshAvailability, VmCreateRequest, VmDeleteRequest, VmGpuFacts,
-    VmRepository, VmState, VmSummary, VmUpdateRequest,
+    AgentStatus, Diagnostic, DiagnosticLevel, GpuAssignment, GpuMode, GuestReadinessTimeouts,
+    HostGpuCapabilities, NetworkMode, RepositoryError, SshAvailability, VmCreateRequest,
+    VmDeleteRequest, VmRepository, VmState, VmSummary, VmUpdateRequest,
 };
 
 use crate::{
@@ -28,6 +28,7 @@ use crate::{
     cleanup,
     com1_terminal::{Com1Launcher, Com1Sessions},
     cycle::{CycleOutcome, VmBuildCycle},
+    gpu_runs::GpuRuns,
     guest_ready::ReadinessTimeouts,
     hcn::HcnNetwork,
     hcn_endpoint::{EndpointAddress, HcnEndpoint},
@@ -38,6 +39,7 @@ use crate::{
     shutdown_workers::ShutdownWorkers,
     ssh_launches::SshLaunches,
     ssh_terminal::SshLauncher,
+    start_registry::StartRegistry,
     vhd, watch,
     watch::VmEventSink,
 };
@@ -66,7 +68,11 @@ pub struct HcsVmRepository {
     readiness_timeouts: ReadinessTimeouts,
     /// The VMs being created right now.
     builds: Arc<BuildRegistry>,
-    start: VmStartPipeline,
+    /// Starts VMs. Shared rather than owned because a start now runs on a
+    /// thread of its own.
+    start: Arc<VmStartPipeline>,
+    /// The VMs being started right now.
+    starts: Arc<StartRegistry>,
     /// Opens the COM1 console of a VM that is starting or already running.
     com1_launcher: Com1Launcher,
     /// The consoles VMLord currently owns, one per running VM.
@@ -78,6 +84,8 @@ pub struct HcsVmRepository {
     /// up when that run ends, and this is the only place that sees every way a
     /// run can end.
     agent_sessions: AgentSessions,
+    /// What has been observed about each running VM's GPU, in memory only.
+    gpu_runs: GpuRuns,
     /// Opens interactive SSH sessions into running guests. Nothing is kept
     /// beside it: a session belongs to whoever asked for it, not to VMLord.
     ssh_launcher: Arc<SshLauncher>,
@@ -112,22 +120,32 @@ impl HcsVmRepository {
         let storage_root = storage_root.into();
         let events = VmEventSink::default();
         let com1_launcher = Com1Launcher::production();
+        // Built before the pipelines, because both a build and a start record
+        // what they did to a VM's GPU in it, and they have to be the same one.
+        let gpu_runs = GpuRuns::default();
         Self {
             client: HcsClient::new(),
             store: MetadataStore::new(storage_root.join(MAPPING_FILE_NAME)),
-            storage_root,
+            storage_root: storage_root.clone(),
             connections: VmConnections::with_events(events.clone()),
             cycle: Arc::new(VmBuildCycle::production(
                 cloud_disk,
                 com1_launcher.clone(),
                 ReadinessTimeouts::default(),
+                gpu_runs.clone(),
+                &storage_root,
             )),
             readiness_timeouts: ReadinessTimeouts::default(),
             builds: Arc::new(BuildRegistry::default()),
-            start: VmStartPipeline::production(com1_launcher.clone()),
+            start: Arc::new(
+                VmStartPipeline::production(com1_launcher.clone())
+                    .for_vms_under(&storage_root, gpu_runs.clone()),
+            ),
+            starts: Arc::new(StartRegistry::default()),
             com1_launcher,
             com1_sessions: Com1Sessions::default(),
             agent_sessions: AgentSessions::default(),
+            gpu_runs,
             ssh_launcher: Arc::new(SshLauncher::production()),
             ssh_launches: SshLaunches::default(),
             shutdown: Arc::new(VmShutdownPipeline::production()),
@@ -187,18 +205,8 @@ impl HcsVmRepository {
     /// refused, because a state this check gets wrong cannot be undone once
     /// deletion runs.
     fn refuse_if_live(&self, mapping: &VmComputeSystemMapping) -> Result<(), RepositoryError> {
-        let state = list_known_vms(&self.client, &self.store)?
-            .into_iter()
-            .find(|known| known.mapping.vm_id == mapping.vm_id)
-            .and_then(|known| known.state);
-
-        let description = match &state {
-            None | Some(HcsSystemState::Created) | Some(HcsSystemState::Stopped) => {
-                return Ok(());
-            }
-            Some(HcsSystemState::Running) => "running".to_string(),
-            Some(HcsSystemState::Paused) => "paused".to_string(),
-            Some(HcsSystemState::Other(other)) => format!("in state \"{other}\""),
+        let Some(description) = self.live_description(mapping)? else {
+            return Ok(());
         };
 
         let error = RepositoryError::new(format!(
@@ -207,6 +215,29 @@ impl HcsVmRepository {
         ));
         log::error!("{error}");
         Err(error)
+    }
+
+    /// How this VM is live, when it is, in words a refusal can be built from.
+    ///
+    /// `None` is a VM nothing is attached to: stopped, created but never run,
+    /// or unknown to HCS. Shared by everything that may only act on a VM that
+    /// is not running, so that two refusals cannot disagree about what running
+    /// means.
+    fn live_description(
+        &self,
+        mapping: &VmComputeSystemMapping,
+    ) -> Result<Option<String>, RepositoryError> {
+        let state = list_known_vms(&self.client, &self.store)?
+            .into_iter()
+            .find(|known| known.mapping.vm_id == mapping.vm_id)
+            .and_then(|known| known.state);
+
+        Ok(match &state {
+            None | Some(HcsSystemState::Created) | Some(HcsSystemState::Stopped) => None,
+            Some(HcsSystemState::Running) => Some("running".to_string()),
+            Some(HcsSystemState::Paused) => Some("paused".to_string()),
+            Some(HcsSystemState::Other(other)) => Some(format!("in state \"{other}\"")),
+        })
     }
 
     /// What HCS says about this VM right now.
@@ -340,6 +371,7 @@ impl HcsVmRepository {
                     // partition its listener is bound to stops existing as HCS
                     // tears the compute system down.
                     self.agent_sessions.cancel(finished.vm_id);
+                    self.gpu_runs.forget(finished.vm_id);
                     // The console is left alone: the guest is still writing the
                     // messages it prints on its way down, and the pipe closing
                     // is what ends the capture. The guest powers off on its own
@@ -536,14 +568,25 @@ impl HcsVmRepository {
             }
         };
 
+        // A VM this process is only now discovering was started by somebody
+        // else, so nothing here saw what was attached to it. Reporting "not
+        // yet" would be a different sentence, and a false one.
+        if mapping.gpu_mode != GpuMode::None
+            && self.gpu_runs.snapshot(mapping.vm_id).assignment.is_none()
+        {
+            self.gpu_runs
+                .record_assignment(mapping.vm_id, GpuAssignment::Unknown);
+        }
+
         match AgentConnection::start(
             mapping,
             runtime_id,
             &layout::agent_secret_path(&vm_directory),
-            // No manifest yet: the shares a VM is started with are computed
-            // and written into its compute system by the lifecycle task, and
-            // until they are there is nothing to tell a guest to mount.
-            None,
+            // What the start of this run prepared, if this process ran it. A
+            // VM reclaimed from a previous process was prepared by nobody
+            // here, and has nothing to be told to mount.
+            self.gpu_runs.shares(mapping.vm_id),
+            self.gpu_runs.clone(),
         ) {
             Ok(connection) => self.agent_sessions.insert(connection),
             Err(error) => log::warn!(
@@ -562,6 +605,8 @@ impl HcsVmRepository {
         } = known;
         // Read before `mapping.vm_name` is moved into the summary below.
         let network_mode = mapping.network_mode;
+        let gpu_mode = mapping.gpu_mode;
+        let vm_id = mapping.vm_id;
         let ssh = SshAvailability::from(mapping.ssh.clone());
         let topology = self.topology(&mapping).unwrap_or(VmTopology {
             ram_mb: 0,
@@ -573,6 +618,7 @@ impl HcsVmRepository {
             &mapping,
             state,
             self.agent_sessions.is_online(mapping.vm_id),
+            self.starts.contains(&mapping.vm_name),
         );
         let ip_address = self.guest_address(&mapping, state);
 
@@ -583,11 +629,8 @@ impl HcsVmRepository {
             ram_mb: topology.ram_mb,
             disk_gb,
             cpu_cores: topology.cpu_cores,
-            // GPU is not wired to the native backend yet and is reported as
-            // absent rather than guessed at. Nothing is observed either, which
-            // is the honest answer for a backend that attaches nothing.
-            gpu_mode: GpuMode::None,
-            gpu: VmGpuFacts::default(),
+            gpu_mode,
+            gpu: self.gpu_runs.snapshot(vm_id),
             network_mode,
             ip_address,
             ssh,
@@ -798,8 +841,13 @@ fn vm_state(
     mapping: &VmComputeSystemMapping,
     state: Option<HcsSystemState>,
     agent_online: Option<bool>,
+    starting: bool,
 ) -> VmState {
     match state {
+        // A start in flight outranks anything HCS says short of running: the
+        // compute system is still being prepared, and reporting the VM as
+        // stopped would offer a start it is already in the middle of.
+        _ if starting && !matches!(state, Some(HcsSystemState::Running)) => VmState::Starting,
         Some(HcsSystemState::Running) => VmState::Running {
             agent_status: match agent_online {
                 Some(true) => AgentStatus::Online,
@@ -865,6 +913,57 @@ fn record_network_mode(
         network_mode
     );
     Ok(())
+}
+
+fn record_gpu_mode(
+    store: &MetadataStore,
+    mapping: &VmComputeSystemMapping,
+    gpu_mode: GpuMode,
+) -> Result<(), RepositoryError> {
+    if mapping.gpu_mode == gpu_mode {
+        return Ok(());
+    }
+
+    store.insert(VmComputeSystemMapping {
+        gpu_mode,
+        ..mapping.clone()
+    })?;
+    log::info!(
+        "VM \"{}\" ({}) now asks for GPU mode {gpu_mode:?}; the change applies the next \
+         time it starts",
+        mapping.vm_name,
+        mapping.vm_id
+    );
+    Ok(())
+}
+
+/// Refuses a GPU mode change under a VM that is not stopped.
+///
+/// The mode is applied while the compute system is prepared and started, so a
+/// change under a live VM would leave a stored mode that does not describe the
+/// GPU the guest actually has. RAM and CPU are different: they are read from
+/// the configuration on the next start, and nothing claims they are in effect
+/// before then, so an edit of those on a running VM stays allowed.
+///
+/// `live` is how the VM is live, or `None` for one that is not.
+fn refuse_gpu_mode_change(
+    vm_name: &str,
+    requested: GpuMode,
+    stored: GpuMode,
+    live: Option<&str>,
+) -> Result<(), RepositoryError> {
+    if requested == stored {
+        return Ok(());
+    }
+    let Some(description) = live else {
+        return Ok(());
+    };
+
+    let error = RepositoryError::new(format!(
+        "VM \"{vm_name}\" is {description}; stop it before changing its GPU mode"
+    ));
+    log::error!("{error}");
+    Err(error)
 }
 
 impl VmRepository for HcsVmRepository {
@@ -1001,14 +1100,15 @@ impl VmRepository for HcsVmRepository {
     fn update_vm(&mut self, request: VmUpdateRequest) -> Result<(), RepositoryError> {
         self.require_initialized()?;
         self.builds.refuse_if_building(&request.name)?;
+        self.starts.refuse_if_starting(&request.name)?;
 
         let mapping = self.mapping(&request.name)?;
-        if request.gpu_mode != GpuMode::None {
-            return Err(RepositoryError::new(format!(
-                "the HCS backend does not support GPU mode {:?} yet",
-                request.gpu_mode
-            )));
-        }
+        refuse_gpu_mode_change(
+            &mapping.vm_name,
+            request.gpu_mode,
+            mapping.gpu_mode,
+            self.live_description(&mapping)?.as_deref(),
+        )?;
         hcs_config::ensure_supported_network_mode(request.network_mode)?;
 
         let document = self.read_configuration(&mapping.vm_name)?;
@@ -1032,6 +1132,7 @@ impl VmRepository for HcsVmRepository {
         })?;
 
         record_network_mode(&self.store, &mapping, request.network_mode)?;
+        record_gpu_mode(&self.store, &mapping, request.gpu_mode)?;
 
         log::info!(
             "VM \"{}\" ({}) now requests {} MiB and {} CPU core(s); \
@@ -1044,18 +1145,50 @@ impl VmRepository for HcsVmRepository {
         Ok(())
     }
 
+    /// Starts VM `name`, on a thread of its own.
+    ///
+    /// Returning `Ok` means the start is under way, not that the VM is
+    /// running: a start with a GPU stages a payload first, which unpacks an
+    /// archive and hashes the staged tree, and neither can happen on the
+    /// thread that draws the window. What the thread produces is taken over on
+    /// the next refresh -- see [`HcsVmRepository::take_diagnostics`] -- and
+    /// what it could not do arrives there as a diagnostic.
+    ///
+    /// Everything that can be refused cheaply and certainly is refused here,
+    /// before the thread, so an obvious mistake is the return value of the call
+    /// that made it rather than a diagnostic a moment later.
     fn start_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
         self.require_initialized()?;
         self.builds.refuse_if_building(name)?;
+        self.starts.refuse_if_starting(name)?;
 
-        let vm_directory = layout::vm_directory(&self.storage_root, name)?;
-        let session = self.start.start(&self.store, name, &vm_directory)?;
+        // Read here rather than on the thread: a VM VMLord does not know, or
+        // one whose directory cannot be named, is the return value of the call
+        // that asked for it instead of a diagnostic a moment later.
         let mapping = self.mapping(name)?;
-        // Before the local session drops: dropping it is what tells a reader
-        // that the start it was opened for is over.
-        self.com1_sessions.insert(session);
-        self.hold_started_system(&mapping);
-        Ok(())
+        let vm_directory = layout::vm_directory(&self.storage_root, name)?;
+        let store = self.store.clone();
+        let start = Arc::clone(&self.start);
+        let diagnostics = Arc::clone(&self.diagnostics);
+
+        self.starts.start(name, move || {
+            match start.start(&store, &mapping.vm_name, &vm_directory) {
+                Ok(session) => Some(StartedVm { mapping, session }),
+                Err(error) => {
+                    let message =
+                        format!("VM \"{}\" could not be started: {error}", mapping.vm_name);
+                    log::error!("{message}");
+                    diagnostics
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(Diagnostic {
+                            level: DiagnosticLevel::Error,
+                            message,
+                        });
+                    None
+                }
+            }
+        })
     }
 
     /// Asks the guest of `name` to shut down, without waiting for the answer.
@@ -1098,6 +1231,7 @@ impl VmRepository for HcsVmRepository {
         // was torn down under its guest.
         self.com1_sessions.cancel(mapping.vm_id);
         self.agent_sessions.cancel(mapping.vm_id);
+        self.gpu_runs.forget(mapping.vm_id);
         self.connections.remove(mapping.vm_id);
         Ok(())
     }
@@ -1110,6 +1244,10 @@ impl VmRepository for HcsVmRepository {
     fn delete_vm(&mut self, request: VmDeleteRequest) -> Result<(), RepositoryError> {
         self.require_initialized()?;
         self.builds.refuse_if_building(&request.name)?;
+        // A VM in the middle of starting is not a VM to remove: its thread is
+        // about to hand over a console and a compute system for a VM that
+        // would no longer exist.
+        self.starts.refuse_if_starting(&request.name)?;
 
         let mapping = self.mapping(&request.name)?;
         self.refuse_if_live(&mapping)?;
@@ -1119,6 +1257,7 @@ impl VmRepository for HcsVmRepository {
         // be removed.
         self.com1_sessions.cancel(mapping.vm_id);
         self.agent_sessions.cancel(mapping.vm_id);
+        self.gpu_runs.forget(mapping.vm_id);
         let vm_directory = layout::vm_directory(&self.storage_root, &request.name)?;
         self.delete.delete(
             &self.store,
@@ -1219,6 +1358,11 @@ impl VmRepository for HcsVmRepository {
         // the place what it started can be taken over.
         let started = self.builds.take_started();
         self.adopt_started(started);
+        // The same call for the same reason: a start that has ended has a
+        // console session and a compute system to hand over, and both are
+        // reachable only here.
+        let started = self.starts.take_started();
+        self.adopt_started(started);
         // The same call, for the same reason: a shutdown request that has been
         // answered has handles to give up, and they are reachable only here.
         self.finish_shutdowns();
@@ -1231,6 +1375,7 @@ impl VmRepository for HcsVmRepository {
             // a pipe that will never deliver again.
             self.com1_sessions.cancel(vm_id);
             self.agent_sessions.cancel(vm_id);
+            self.gpu_runs.forget(vm_id);
             self.connections.remove(vm_id);
         }
         if drained.service_disconnected && !self.service_disconnect_reported {
@@ -1281,6 +1426,11 @@ impl Drop for HcsVmRepository {
         // Each listener's thread is joined as it goes, so no socket outlives
         // the process that bound it.
         self.agent_sessions.cancel_all();
+        self.gpu_runs.forget_all();
+        // Joined rather than abandoned: HCS has either been asked to run each
+        // system or has not, and a thread left behind would outlive the
+        // process that owns what it is about to produce.
+        self.starts.join_all();
         self.builds.cancel_all_and_join();
         // A request still being delivered holds a handle to a compute system
         // this repository is about to drop.
@@ -1415,8 +1565,14 @@ mod tests {
 
     use super::{
         HcsSystemState, HcsVmRepository, OS_TYPE, console_failure_diagnostics, guest_ip,
-        launch_running_consoles, merge_with_builds, record_network_mode,
+        GpuAssignment, launch_running_consoles, merge_with_builds, record_gpu_mode,
+        record_network_mode,
+        refuse_gpu_mode_change,
     };
+    use std::sync::atomic::AtomicBool;
+
+    use vmlord_core::{GuestGpuDetail, GuestGpuReport};
+
     use crate::{
         Com1Launcher, Com1LogMode, KnownVm, MetadataStore, VmComputeSystemMapping,
         agent::AgentConnection,
@@ -1644,6 +1800,8 @@ mod tests {
             endpoint_id: None,
             network_mode,
             ssh: None,
+            gpu_mode: GpuMode::None,
+            guest_target: None,
         }
     }
 
@@ -1658,6 +1816,8 @@ mod tests {
                 endpoint_id: None,
                 network_mode: NetworkMode::None,
                 ssh: None,
+                gpu_mode: GpuMode::None,
+                guest_target: None,
             },
             state,
             runtime_id: None,
@@ -2200,6 +2360,282 @@ mod tests {
 
         assert_eq!(store.find_by_vm_name("dev").unwrap().unwrap(), mapping);
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// A repository with one stopped VM and a start held on a flag.
+    ///
+    /// The start is a substitute rather than the real pipeline: what these
+    /// tests are about is what the rest of VMLord does while a start is in
+    /// flight, and a real one would need a compute system.
+    ///
+    /// The flag is released by [`Held::release`] before anything is asserted,
+    /// because dropping the repository joins the start thread -- a failed
+    /// assertion with the flag still set would hang the suite instead of
+    /// failing it.
+    struct Held {
+        root: std::path::PathBuf,
+        repository: HcsVmRepository,
+        release: Arc<AtomicBool>,
+    }
+
+    impl Held {
+        fn new(label: &str) -> Self {
+            let (root, store) = temp_store(label);
+            store
+                .insert(mapping(NetworkMode::None))
+                .expect("the mapping should be stored");
+            let mut repository = repository();
+            repository.store = store;
+            repository.initialized = true;
+            let release = Arc::new(AtomicBool::new(false));
+            let held = Arc::clone(&release);
+            repository
+                .starts
+                .start("dev", move || {
+                    while !held.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::thread::yield_now();
+                    }
+                    None
+                })
+                .expect("the start should be accepted");
+            Self {
+                root,
+                repository,
+                release,
+            }
+        }
+
+        fn release(&self) {
+            self.release.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.repository.starts.join_all();
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.release
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn a_vm_whose_start_is_in_flight_is_listed_as_starting() {
+        let held = Held::new("start-listed");
+
+        let summary = held.repository.summary(KnownVm {
+            mapping: mapping(NetworkMode::None),
+            state: None,
+            runtime_id: None,
+        });
+        held.release();
+
+        assert_eq!(
+            summary.state,
+            VmState::Starting,
+            "a VM being prepared is not a stopped VM offering another start"
+        );
+    }
+
+    #[test]
+    fn a_vm_that_is_already_running_is_not_relisted_as_starting() {
+        let held = Held::new("start-running");
+
+        let summary = held.repository.summary(KnownVm {
+            mapping: mapping(NetworkMode::None),
+            state: Some(HcsSystemState::Running),
+            runtime_id: None,
+        });
+        held.release();
+
+        assert!(
+            matches!(summary.state, VmState::Running { .. }),
+            "HCS reports it running, which is the later fact: {:?}",
+            summary.state
+        );
+    }
+
+    #[test]
+    fn a_vm_being_started_may_not_be_deleted() {
+        let mut held = Held::new("start-delete");
+
+        let outcome = held.repository.delete_vm(VmDeleteRequest {
+            name: "dev".into(),
+            delete_disks: true,
+        });
+        held.release();
+
+        let error = outcome.expect_err("a VM in the middle of starting is not one to remove");
+        assert!(error.to_string().contains("starting"), "{error}");
+    }
+
+    #[test]
+    fn a_vm_being_started_may_not_be_edited() {
+        let mut held = Held::new("start-update");
+
+        let outcome = held.repository.update_vm(update_request());
+        held.release();
+
+        let error = outcome.expect_err("the configuration a start is reading must not move");
+        assert!(error.to_string().contains("starting"), "{error}");
+    }
+
+    #[test]
+    fn a_vm_being_started_may_not_be_started_again() {
+        let mut held = Held::new("start-twice");
+
+        let outcome = held.repository.start_vm("dev");
+        held.release();
+
+        let error =
+            outcome.expect_err("two threads must not prepare the same configuration at once");
+        assert!(error.to_string().contains("starting"), "{error}");
+    }
+
+    #[test]
+    fn a_start_of_a_vm_vmlord_does_not_know_is_refused_before_any_thread() {
+        let (root, store) = temp_store("start-unknown");
+        let mut repository = repository();
+        repository.store = store;
+        repository.initialized = true;
+
+        let error = repository
+            .start_vm("nothing-of-this-name")
+            .expect_err("an unknown VM is the return value of the call that asked for it");
+
+        assert!(error.to_string().contains("nothing-of-this-name"), "{error}");
+        assert!(
+            !repository.starts.contains("nothing-of-this-name"),
+            "a refusal starts no thread"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_changed_gpu_mode_is_recorded_in_the_mapping() {
+        let (root, store) = temp_store("gpu-mode-changed");
+        let mapping = mapping(NetworkMode::None);
+        store.insert(mapping.clone()).unwrap();
+
+        record_gpu_mode(&store, &mapping, GpuMode::Mirror).unwrap();
+
+        let stored = store.find_by_vm_name("dev").unwrap().unwrap();
+        assert_eq!(stored.gpu_mode, GpuMode::Mirror);
+        // Nothing else about the VM may move with its GPU mode.
+        assert_eq!(stored.vm_id, mapping.vm_id);
+        assert_eq!(stored.network_mode, mapping.network_mode);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_unchanged_gpu_mode_leaves_the_mapping_alone() {
+        let (root, store) = temp_store("gpu-mode-unchanged");
+        let mapping = mapping(NetworkMode::Nat);
+        store.insert(mapping.clone()).unwrap();
+
+        record_gpu_mode(&store, &mapping, GpuMode::None).unwrap();
+
+        assert_eq!(store.find_by_vm_name("dev").unwrap().unwrap(), mapping);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_stopped_vm_may_change_its_gpu_mode() {
+        refuse_gpu_mode_change("dev", GpuMode::Mirror, GpuMode::None, None)
+            .expect("a stopped VM gets its new mode on its next start");
+    }
+
+    #[test]
+    fn a_running_vm_may_not_change_its_gpu_mode() {
+        let error = refuse_gpu_mode_change("dev", GpuMode::Mirror, GpuMode::None, Some("running"))
+            .expect_err("the mode is applied at start, so it may not change under a running VM");
+
+        assert!(
+            error.to_string().contains("stop it"),
+            "the refusal has to say what to do about it: {error}"
+        );
+    }
+
+    #[test]
+    fn a_running_vm_may_still_be_edited_as_long_as_its_gpu_mode_stands() {
+        refuse_gpu_mode_change("dev", GpuMode::Mirror, GpuMode::Mirror, Some("running"))
+            .expect("only the GPU mode is frozen while a VM runs, not the whole form");
+    }
+
+    #[test]
+    fn a_summary_carries_what_was_observed_about_the_vms_gpu() {
+        let repository = repository();
+        let mapping = VmComputeSystemMapping {
+            gpu_mode: GpuMode::Default,
+            ..mapping(NetworkMode::None)
+        };
+        repository.gpu_runs.record_guest(
+            mapping.vm_id,
+            GuestGpuReport::Ready(GuestGpuDetail {
+                driver: Some("dxgkrnl".into()),
+                render_node: Some("/dev/dri/renderD128".into()),
+            }),
+        );
+
+        let summary = repository.summary(KnownVm {
+            mapping,
+            state: None,
+            runtime_id: None,
+        });
+
+        assert!(
+            matches!(summary.gpu.guest, Some(GuestGpuReport::Ready(_))),
+            "the facts a session recorded have to reach the list that reads them"
+        );
+    }
+
+    #[test]
+    fn a_summary_of_a_vm_nothing_was_observed_about_carries_nothing() {
+        let repository = repository();
+
+        let summary = repository.summary(KnownVm {
+            mapping: mapping(NetworkMode::None),
+            state: None,
+            runtime_id: None,
+        });
+
+        assert_eq!(summary.gpu, vmlord_core::VmGpuFacts::default());
+    }
+
+    #[test]
+    fn a_run_that_is_over_leaves_no_gpu_facts_behind() {
+        let repository = repository();
+        let mapping = mapping(NetworkMode::None);
+        repository
+            .gpu_runs
+            .record_assignment(mapping.vm_id, GpuAssignment::Unknown);
+
+        repository.gpu_runs.forget(mapping.vm_id);
+
+        let summary = repository.summary(KnownVm {
+            mapping,
+            state: None,
+            runtime_id: None,
+        });
+        assert_eq!(summary.gpu.assignment, None);
+    }
+
+    #[test]
+    fn a_summary_reports_the_gpu_mode_the_mapping_records() {
+        // The edit form is filled from `VmSummary`, so a summary that always
+        // said `None` would make an unrelated edit switch the GPU off.
+        let repository = repository();
+
+        let summary = repository.summary(KnownVm {
+            mapping: VmComputeSystemMapping {
+                gpu_mode: GpuMode::Mirror,
+                ..mapping(NetworkMode::None)
+            },
+            state: None,
+            runtime_id: None,
+        });
+
+        assert_eq!(summary.gpu_mode, GpuMode::Mirror);
     }
 
     #[test]

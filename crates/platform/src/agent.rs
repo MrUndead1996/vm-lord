@@ -31,7 +31,8 @@ use vmlord_core::{GpuShareManifest, RepositoryError};
 use zeroize::Zeroizing;
 
 use crate::{
-    agent_session::{self, SessionError},
+    agent_session::{self, GuestGpuSink, SessionError},
+    gpu_runs::GpuRuns,
     hvsocket::{ACCEPT_POLL, AgentListener},
     metadata::VmComputeSystemMapping,
 };
@@ -99,6 +100,11 @@ impl AgentConnection {
     /// be bound says so to the caller instead of failing silently a second
     /// later.
     ///
+    /// `facts` is where what the guest says about its GPU is recorded. The
+    /// registry is shared rather than owned because the list of VMs reads it on
+    /// every refresh, and a report that stayed on this thread would be a report
+    /// only the log ever saw.
+    ///
     /// `shares` is what this VM's guest is told to mount, and it belongs to
     /// the run rather than to a connection: the Plan9 section of a compute
     /// system is written before it is started and is immutable for the
@@ -116,8 +122,10 @@ impl AgentConnection {
         runtime_id: Uuid,
         secret_path: &Path,
         shares: Option<GpuShareManifest>,
+        facts: GpuRuns,
     ) -> Result<Self, RepositoryError> {
         let vm_name = mapping.vm_name.clone();
+        let vm_id = mapping.vm_id;
         let secret = read_secret(secret_path, &vm_name)?;
         let listener = AgentListener::bind(&vm_name, runtime_id)?;
 
@@ -137,6 +145,7 @@ impl AgentConnection {
                         &vm_name,
                         &online,
                         &running,
+                        &|report| facts.record_guest(vm_id, report),
                     )
                 }
             })
@@ -216,6 +225,7 @@ fn serve(
     vm_name: &str,
     online: &AtomicBool,
     running: &Arc<AtomicBool>,
+    sink: GuestGpuSink<'_>,
 ) {
     let mut backoff = Backoff::new();
 
@@ -233,7 +243,7 @@ fn serve(
         let authenticated = match agent_session::open(&mut stream, secret, vm_name) {
             Ok(session) => {
                 online.store(true, Ordering::Relaxed);
-                let outcome = agent_session::serve(&mut stream, &session, shares, vm_name);
+                let outcome = agent_session::serve(&mut stream, &session, shares, vm_name, sink);
                 online.store(false, Ordering::Relaxed);
                 if let Err(error) = outcome {
                     report(vm_name, &error);

@@ -13,6 +13,19 @@ pub struct GuestTarget {
     pub kernel_release: String,
     pub payload_abi: u32,
 }
+/// A guest as the host knows it before that guest has booted.
+///
+/// Three fields and not four: `kernel_release` is a property of a running
+/// kernel, and the host chooses a payload before there is one. The guest
+/// checks applicability itself and DKMS rebuilds the module for whatever
+/// kernel it runs, so the catalog's kernel records what a payload was proven
+/// on rather than what it requires.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuestSelector<'a> {
+    pub distribution: &'a str,
+    pub release: &'a str,
+    pub architecture: &'a str,
+}
 impl GuestTarget {
     pub fn ubuntu_26_04_amd64(kernel_release: impl Into<String>) -> Self {
         Self {
@@ -267,6 +280,45 @@ impl PayloadCatalog {
             .find(|entry| entry.target == *target)
             .ok_or_else(|| PayloadError::UnsupportedTarget(target.clone()))
     }
+    /// The entry for a guest, ignoring the kernel that guest runs.
+    ///
+    /// When a triple has several entries the newest proven kernel wins: it was
+    /// built against the most recent headers, and an older one buys nothing.
+    pub fn select_for_guest(
+        &self,
+        guest: &GuestSelector<'_>,
+    ) -> Result<&CatalogEntry, PayloadError> {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .target
+                    .distribution
+                    .eq_ignore_ascii_case(guest.distribution)
+                    && entry.target.release == guest.release
+                    && entry
+                        .target
+                        .architecture
+                        .eq_ignore_ascii_case(guest.architecture)
+            })
+            .max_by_key(|entry| kernel_order(&entry.target.kernel_release))
+            .ok_or_else(|| PayloadError::NoPayloadForGuest {
+                distribution: guest.distribution.to_owned(),
+                release: guest.release.to_owned(),
+                architecture: guest.architecture.to_owned(),
+            })
+    }
+}
+/// A kernel release as numbers, so that 14 sorts above 9.
+///
+/// Every run of digits in order and nothing else: `7.0.0-14-generic` and
+/// `7.0.0-14-lowlatency` are one kernel in two flavours, and a flavour must
+/// not decide which payload is newer.
+fn kernel_order(release: &str) -> Vec<u64> {
+    release
+        .split(|character: char| !character.is_ascii_digit())
+        .filter_map(|part| part.parse().ok())
+        .collect()
 }
 fn validate_url(value: &str) -> Result<Url, PayloadError> {
     let url = Url::parse(value)
@@ -286,7 +338,8 @@ fn validate_url(value: &str) -> Result<Url, PayloadError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::{GuestTarget, PayloadCatalog, PayloadError};
+    use super::kernel_order;
+    use crate::{GuestSelector, GuestTarget, PayloadCatalog, PayloadError};
     const Z: &str = "0000000000000000000000000000000000000000000000000000000000000000";
     const C: &str = "14794180686c2fb6307fbe359c359bec765249f3";
     fn catalog() -> String {
@@ -307,6 +360,84 @@ mod tests {
             c.select(&GuestTarget::ubuntu_26_04_amd64("other")),
             Err(PayloadError::UnsupportedTarget(_))
         ));
+    }
+    fn entry_json(distribution: &str, release: &str, architecture: &str, kernel: &str) -> String {
+        format!(
+            r#"{{"payload_id":"{distribution}-{release}-{architecture}-{kernel}","target":{{"distribution":"{distribution}","release":"{release}","architecture":"{architecture}","kernel_release":"{kernel}","payload_abi":1}},"archive_url":"https://downloads.example.test/payload.zip","archive_size":1,"expanded_size_limit":2,"file_count_limit":3,"archive_sha256":"{Z}","payload_manifest_sha256":"{Z}","required_renderers":["d3d12-gallium"],"mesa_policy":"bundled","vmlord_revision":"{C}","builder_version":"vmlord-gpu-payload 1","sources":[{{"url":"https://github.com/microsoft/WSL2-Linux-Kernel","commit":"{C}","version":"1"}}],"licenses":[{{"spdx":"GPL-2.0","path":"licenses/GPL-2.0.txt"}}]}}"#
+        )
+    }
+    fn catalog_with(entries: &[String]) -> PayloadCatalog {
+        let document = format!(
+            r#"{{"schema_version":1,"entries":[{}]}}"#,
+            entries.join(",")
+        );
+        PayloadCatalog::from_json(document.as_bytes()).expect("the catalog must parse")
+    }
+    fn ubuntu_2604() -> GuestSelector<'static> {
+        GuestSelector {
+            distribution: "ubuntu",
+            release: "26.04",
+            architecture: "amd64",
+        }
+    }
+    #[test]
+    fn a_guest_selects_an_entry_whatever_kernel_it_runs() {
+        let catalog = catalog_with(&[entry_json("ubuntu", "26.04", "amd64", "7.0.0-14-generic")]);
+        assert_eq!(
+            catalog
+                .select_for_guest(&ubuntu_2604())
+                .expect("the triple matches, so the kernel must not decide")
+                .target()
+                .kernel_release,
+            "7.0.0-14-generic"
+        );
+    }
+    #[test]
+    fn the_newest_proven_kernel_wins_when_a_triple_has_several_entries() {
+        let catalog = catalog_with(&[
+            entry_json("ubuntu", "26.04", "amd64", "7.0.0-9-generic"),
+            entry_json("ubuntu", "26.04", "amd64", "7.0.0-14-generic"),
+        ]);
+        assert_eq!(
+            catalog
+                .select_for_guest(&ubuntu_2604())
+                .expect("one of the two entries must be chosen")
+                .target()
+                .kernel_release,
+            "7.0.0-14-generic",
+            "14 is newer than 9, which sorting the text would get wrong"
+        );
+    }
+    #[test]
+    fn a_guest_with_no_entry_is_told_which_guest_had_none() {
+        let catalog = catalog_with(&[entry_json("ubuntu", "26.04", "amd64", "7.0.0-14-generic")]);
+        let error = catalog
+            .select_for_guest(&GuestSelector {
+                release: "24.04",
+                ..ubuntu_2604()
+            })
+            .expect_err("no entry matches this release");
+        assert!(
+            error.to_string().contains("24.04"),
+            "the error has to name the guest it found nothing for: {error}"
+        );
+    }
+    #[test]
+    fn an_empty_catalog_has_nothing_for_anyone() {
+        assert!(
+            catalog_with(&[]).select_for_guest(&ubuntu_2604()).is_err(),
+            "the shipped catalog is empty today, so this is the ordinary answer"
+        );
+    }
+    #[test]
+    fn kernel_order_reads_the_numbers_and_not_the_text() {
+        assert!(kernel_order("7.0.0-14-generic") > kernel_order("7.0.0-9-generic"));
+        assert!(kernel_order("7.1.0-1-generic") > kernel_order("7.0.0-99-generic"));
+        assert_eq!(
+            kernel_order("7.0.0-14-generic"),
+            kernel_order("7.0.0-14-lowlatency"),
+            "a flavour is not a newer kernel"
+        );
     }
     #[test]
     fn production_urls_cannot_carry_mutable_or_secret_structure() {
@@ -368,8 +499,27 @@ mod tests {
         }
     }
     #[test]
-    fn an_empty_embedded_catalog_is_valid_until_a_tested_recipe_is_published() {
-        assert!(PayloadCatalog::embedded().unwrap().entries().is_empty());
+    fn the_embedded_catalog_is_valid_and_offers_the_guests_it_names() {
+        // Validation is the point: every entry goes through the same checks a
+        // packed one does, and a catalog compiled into the application is the
+        // only one it trusts, so a malformed entry has to fail the build
+        // rather than a host.
+        let catalog = PayloadCatalog::embedded().expect("the shipped catalog must parse");
+
+        for entry in catalog.entries() {
+            let target = entry.target();
+            assert!(
+                catalog
+                    .select_for_guest(&GuestSelector {
+                        distribution: &target.distribution,
+                        release: &target.release,
+                        architecture: &target.architecture,
+                    })
+                    .is_ok(),
+                "an entry that cannot be selected for its own guest is unreachable: {}",
+                entry.payload_id()
+            );
+        }
     }
 
     #[test]

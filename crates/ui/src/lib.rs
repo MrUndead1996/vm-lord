@@ -9,13 +9,19 @@ use eframe::egui;
 use vmlord_app::{BackendStatus, VmAction, WorkspaceApp};
 use vmlord_core::{
     AgentStatus, AppSettings, BuildProgress, BuildStep, CloudImage, DiagnosticLevel, DownloadPhase,
-    GpuMode, GpuState, GuestDefaults, GuestReadinessTimeouts, Language, LogLevel, NetworkMode,
-    Password,
+    GpuMode, GpuState, GuestDefaults, GuestReadinessTimeouts, HostGpuCapabilities, Language,
+    LogLevel, NetworkMode, Password,
     Provisioning, SshAccess, SshPort, VmCreateRequest, VmDeleteRequest, VmGpuStatus, VmSource,
     VmState, VmSummary, VmUpdateRequest, ubuntu,
 };
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// What a warning beside a form field is painted in.
+///
+/// A warning and not an error: everything it marks is a choice the backend
+/// will accept and carry out with less than was asked for.
+const WARNING_COLOR: egui::Color32 = egui::Color32::from_rgb(0xE0, 0xA0, 0x30);
 const VM_TABLE_COLUMN_COUNT: f32 = 9.0;
 
 /// The releases the create form offers, newest first.
@@ -183,6 +189,9 @@ struct EditVmForm {
     cpu_cores: u32,
     gpu_mode: GpuMode,
     network_mode: NetworkMode,
+    /// What the VM was doing when the form was opened, which decides whether
+    /// its GPU mode may be touched at all.
+    state: VmState,
     error: Option<String>,
 }
 
@@ -194,6 +203,7 @@ impl EditVmForm {
             cpu_cores: vm.cpu_cores,
             gpu_mode: vm.gpu_mode,
             network_mode: vm.network_mode,
+            state: vm.state.clone(),
             error: None,
         }
     }
@@ -403,12 +413,14 @@ impl eframe::App for VmlordUi {
             .create_vm_form
             .as_ref()
             .and_then(|form| self.application.ssh_key_path(form.name.trim()));
+        let host_gpu = self.application.host_gpu_capabilities();
         let create_dialog_action = self.create_vm_form.as_mut().and_then(|form| {
             render_create_vm_dialog(
                 context,
                 form,
                 self.application.vms(),
                 ssh_key_path.as_deref(),
+                host_gpu,
             )
         });
         match create_dialog_action {
@@ -488,10 +500,11 @@ impl eframe::App for VmlordUi {
             None => {}
         }
 
+        let host_gpu = self.application.host_gpu_capabilities();
         let edit_dialog_action = self
             .edit_vm_form
             .as_mut()
-            .and_then(|form| render_edit_vm_dialog(context, form));
+            .and_then(|form| render_edit_vm_dialog(context, form, host_gpu));
         match edit_dialog_action {
             Some(EditVmDialogAction::Cancel) => self.edit_vm_form = None,
             Some(EditVmDialogAction::Submit(request)) => {
@@ -543,6 +556,7 @@ fn render_create_vm_dialog(
     form: &mut CreateVmForm,
     existing_vms: &[VmSummary],
     ssh_key_path: Option<&Path>,
+    host_gpu: Option<&HostGpuCapabilities>,
 ) -> Option<CreateVmDialogAction> {
     let mut open = true;
     let mut action = None;
@@ -677,6 +691,13 @@ fn render_create_vm_dialog(
                                     ui.selectable_value(&mut form.gpu_mode, GpuMode::None, "None");
                                 });
                             ui.end_row();
+
+                            for warning in gpu_capability_warnings(host_gpu, form.gpu_mode)
+                            {
+                                ui.label("");
+                                ui.colored_label(WARNING_COLOR, warning);
+                                ui.end_row();
+                            }
 
                             ui.label("Network");
                             egui::ComboBox::from_id_salt("create-vm-network")
@@ -943,6 +964,7 @@ fn render_settings_dialog(
 fn render_edit_vm_dialog(
     context: &egui::Context,
     form: &mut EditVmForm,
+    host_gpu: Option<&HostGpuCapabilities>,
 ) -> Option<EditVmDialogAction> {
     let mut open = true;
     let mut action = None;
@@ -954,7 +976,9 @@ fn render_edit_vm_dialog(
         .show(context, |ui| {
             ui.label("Changes are saved to the VM configuration and take effect the next time the VM starts.");
             ui.small(
-                "RAM and CPU are editable. GPU and network are not wired to the native backend yet. Disk size and VM name stay fixed and currently require recreating the VM.",
+                "RAM, CPU and GPU are editable; the GPU mode only while the VM is stopped. \
+                 Network is not wired to the native backend yet. Disk size and VM name stay \
+                 fixed and currently require recreating the VM.",
             );
             ui.add_space(8.0);
 
@@ -978,14 +1002,34 @@ fn render_edit_vm_dialog(
                     ui.end_row();
 
                     ui.label("GPU");
-                    egui::ComboBox::from_id_salt("edit-vm-gpu")
-                        .selected_text(gpu_mode_label(form.gpu_mode))
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut form.gpu_mode, GpuMode::Default, "Default");
-                            ui.selectable_value(&mut form.gpu_mode, GpuMode::Mirror, "Mirror");
-                            ui.selectable_value(&mut form.gpu_mode, GpuMode::None, "None");
-                        });
+                    let locked = gpu_mode_locked(&form.state);
+                    ui.add_enabled_ui(locked.is_none(), |ui| {
+                        let combo = egui::ComboBox::from_id_salt("edit-vm-gpu")
+                            .selected_text(gpu_mode_label(form.gpu_mode))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut form.gpu_mode,
+                                    GpuMode::Default,
+                                    "Default",
+                                );
+                                ui.selectable_value(&mut form.gpu_mode, GpuMode::Mirror, "Mirror");
+                                ui.selectable_value(&mut form.gpu_mode, GpuMode::None, "None");
+                            });
+                        // The reason before the click rather than after it: the
+                        // backend refuses this change under a live VM, and a
+                        // control that looks available and is not is worse than
+                        // one that says why.
+                        if let Some(reason) = locked {
+                            combo.response.on_disabled_hover_text(reason);
+                        }
+                    });
                     ui.end_row();
+
+                    for warning in gpu_capability_warnings(host_gpu, form.gpu_mode) {
+                        ui.label("");
+                        ui.colored_label(WARNING_COLOR, warning);
+                        ui.end_row();
+                    }
 
                     ui.label("Network");
                     egui::ComboBox::from_id_salt("edit-vm-network")
@@ -1205,7 +1249,75 @@ fn gpu_status_detail(status: Option<&VmGpuStatus>) -> String {
     let Some(status) = status else {
         return "Unknown".into();
     };
-    format!("{}: {}", gpu_state_label(status.state), status.message)
+
+    let mut detail = format!("{}: {}", gpu_state_label(status.state), status.message);
+    if let Some(adapter) = status.native.as_ref().and_then(|native| native.adapter.as_ref()) {
+        detail.push_str(&format!(" Adapter: {adapter}."));
+    }
+    if let Some(node) = status
+        .guest
+        .as_ref()
+        .and_then(|guest| guest.render_node.as_ref())
+    {
+        detail.push_str(&format!(" Render node: {node}."));
+    }
+    // The stable code, so that what is on screen can be found in the log. Only
+    // where something is wrong: a working GPU needs no identifier to match a
+    // line nobody is looking for.
+    if matches!(status.state, GpuState::Failed | GpuState::Degraded) {
+        detail.push_str(&format!(" ({})", status.code));
+    }
+    detail
+}
+
+/// What is worth saying about this host before a VM asks it for a GPU.
+///
+/// Warnings and never refusals: GPU is applied best effort, so a host that
+/// cannot deliver produces a VM that starts and says why, not a form that
+/// cannot be submitted.
+///
+/// `None` capabilities say nothing at all. A backend that could not be asked
+/// has not reported an absence, and claiming the GPU is unavailable where we
+/// merely could not ask would be a different answer.
+fn gpu_capability_warnings(
+    capabilities: Option<&HostGpuCapabilities>,
+    mode: GpuMode,
+) -> Vec<String> {
+    if matches!(mode, GpuMode::None) {
+        return Vec::new();
+    }
+    let Some(capabilities) = capabilities else {
+        return Vec::new();
+    };
+
+    let mut warnings = Vec::new();
+    if !capabilities.assignment.is_available() {
+        warnings.push(
+            "This host presents no GPU partition adapter, so the VM will start without a GPU."
+                .to_owned(),
+        );
+    }
+    if !capabilities.linux_payload.is_available() {
+        warnings.push(
+            "The Linux GPU userspace is not installed on this host, so the guest will see the \
+             device but will not render on it."
+                .to_owned(),
+        );
+    }
+    warnings
+}
+
+/// Why the GPU mode cannot be changed right now, when it cannot.
+///
+/// The mode is applied while the compute system is prepared and started, so a
+/// change under a live VM would leave a stored mode that does not describe the
+/// GPU the guest actually has. RAM and CPU are different: they are read from
+/// the configuration on the next start, and nothing claims otherwise.
+fn gpu_mode_locked(state: &VmState) -> Option<&'static str> {
+    match state {
+        VmState::Stopped => None,
+        _ => Some("Stop the VM to change its GPU mode."),
+    }
 }
 
 fn gpu_state_label(state: GpuState) -> &'static str {
@@ -1955,7 +2067,10 @@ fn vm_state(state: VmState) -> &'static str {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
-    use vmlord_core::{SshAuthentication, SshAvailability, SshConfig, VmGpuFacts};
+    use vmlord_core::{
+        GpuAvailability, GpuFailure, GpuStatusCode, SshAuthentication, SshAvailability, SshConfig,
+        VmGpuFacts,
+    };
 
     use super::*;
 
@@ -2547,6 +2662,7 @@ mod tests {
             gpu_mode: GpuMode::Mirror,
             network_mode: NetworkMode::Nat,
             error: None,
+            state: VmState::Stopped,
         })
         .unwrap();
 
@@ -2564,6 +2680,7 @@ mod tests {
             gpu_mode: GpuMode::Default,
             network_mode: NetworkMode::Nat,
             error: None,
+            state: VmState::Stopped,
         })
         .unwrap_err();
 
@@ -2572,4 +2689,147 @@ mod tests {
             "RAM must be an even number of MiB and at least 512 MiB."
         );
     }
+    fn host(assignment: GpuAvailability, linux_payload: GpuAvailability) -> HostGpuCapabilities {
+        HostGpuCapabilities {
+            assignment,
+            linux_payload,
+            adapters: Vec::new(),
+        }
+    }
+
+    fn unavailable(code: GpuStatusCode, message: &str) -> GpuAvailability {
+        GpuAvailability::Unavailable(GpuFailure::new(code, message))
+    }
+
+    #[test]
+    fn a_vm_without_a_gpu_is_warned_about_nothing() {
+        let capabilities = host(
+            unavailable(GpuStatusCode::HostNoAdapter, "no adapter"),
+            GpuAvailability::Available,
+        );
+
+        assert!(
+            gpu_capability_warnings(Some(&capabilities), GpuMode::None).is_empty(),
+            "a VM with no GPU has no reason to read about the DriverStore"
+        );
+    }
+
+    #[test]
+    fn a_host_without_an_adapter_warns_and_does_not_refuse() {
+        let capabilities = host(
+            unavailable(GpuStatusCode::HostNoAdapter, "no adapter"),
+            GpuAvailability::Available,
+        );
+
+        let warnings = gpu_capability_warnings(Some(&capabilities), GpuMode::Default);
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("without a GPU"), "{}", warnings[0]);
+    }
+
+    #[test]
+    fn a_host_without_the_linux_payload_warns_about_the_guest_and_not_the_host() {
+        let capabilities = host(
+            GpuAvailability::Available,
+            unavailable(GpuStatusCode::HostLinuxPayloadMissing, "no payload"),
+        );
+
+        let warnings = gpu_capability_warnings(Some(&capabilities), GpuMode::Mirror);
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("render"), "{}", warnings[0]);
+    }
+
+    #[test]
+    fn a_host_that_is_short_of_both_says_both() {
+        let capabilities = host(
+            unavailable(GpuStatusCode::HostNoAdapter, "no adapter"),
+            unavailable(GpuStatusCode::HostLinuxPayloadMissing, "no payload"),
+        );
+
+        assert_eq!(
+            gpu_capability_warnings(Some(&capabilities), GpuMode::Default).len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_backend_that_could_not_be_asked_says_nothing_at_all() {
+        assert!(
+            gpu_capability_warnings(None, GpuMode::Default).is_empty(),
+            "claiming a GPU is unavailable where we could not ask is worse than silence"
+        );
+    }
+
+    #[test]
+    fn the_gpu_mode_is_locked_while_the_vm_is_not_stopped() {
+        assert!(
+            gpu_mode_locked(&VmState::Running {
+                agent_status: AgentStatus::Online
+            })
+            .is_some()
+        );
+        assert!(gpu_mode_locked(&VmState::Starting).is_some());
+        assert!(gpu_mode_locked(&VmState::Stopped).is_none());
+    }
+
+    fn status_of(state: GpuState, code: GpuStatusCode, message: &str) -> VmGpuStatus {
+        VmGpuStatus {
+            state,
+            stage: vmlord_core::GpuStage::Guest,
+            code,
+            message: message.into(),
+            native: Some(vmlord_core::NativeGpuDetail {
+                adapter: Some("NVIDIA RTX 4070".into()),
+                adapters: 1,
+            }),
+            guest: Some(vmlord_core::GuestGpuDetail {
+                driver: Some("dxgkrnl".into()),
+                render_node: Some("/dev/dri/renderD128".into()),
+            }),
+            observed_at: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn an_active_gpu_names_the_adapter_and_the_render_node() {
+        let detail = gpu_status_detail(Some(&status_of(
+            GpuState::GuestReady,
+            GpuStatusCode::GuestReady,
+            "The guest renders on the GPU.",
+        )));
+
+        assert!(detail.contains("NVIDIA RTX 4070"), "{detail}");
+        assert!(detail.contains("/dev/dri/renderD128"), "{detail}");
+        assert!(
+            !detail.contains("gpu-guest-ready"),
+            "a working GPU needs no identifier to match a line nobody looks for: {detail}"
+        );
+    }
+
+    #[test]
+    fn a_failed_gpu_shows_the_code_the_log_uses() {
+        let detail = gpu_status_detail(Some(&status_of(
+            GpuState::Failed,
+            GpuStatusCode::GuestFailed,
+            "the guest kernel has no dxgkrnl module",
+        )));
+
+        assert!(
+            detail.contains("gpu-guest-failed"),
+            "the screen and the log have to be matchable: {detail}"
+        );
+    }
+
+    #[test]
+    fn a_degraded_gpu_shows_its_code_too() {
+        let detail = gpu_status_detail(Some(&status_of(
+            GpuState::Degraded,
+            GpuStatusCode::AssignmentPartial,
+            "one of two adapters",
+        )));
+
+        assert!(detail.contains("gpu-assignment-partial"), "{detail}");
+    }
+
 }

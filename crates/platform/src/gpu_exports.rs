@@ -9,11 +9,6 @@
 //! resolve to that exact direct child, not merely another descendant of the
 //! VM directory. What is exported afterwards is the canonical path, not the
 //! one discovery reported.
-//!
-//! Nothing in the running application calls this yet: a start cannot know a
-//! VM's GPU mode until the task that applies HCS assignment records one, and
-//! that task is this module's caller. The allow below goes away with it.
-#![allow(dead_code)]
 
 use std::path::{Component, Path, PathBuf};
 
@@ -27,7 +22,8 @@ use windows::{
             FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
             GetFinalPathNameByHandleW, OPEN_EXISTING,
         },
-        System::SystemInformation::GetSystemDirectoryW,
+        System::{Com::CoTaskMemFree, SystemInformation::GetSystemDirectoryW},
+        UI::Shell::{FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, SHGetKnownFolderPath},
     },
     core::HSTRING,
 };
@@ -53,6 +49,10 @@ impl GpuExport {
 
     pub(crate) fn host_path(&self) -> &Path {
         &self.host_path
+    }
+
+    pub(crate) fn share(&self) -> &GpuShare {
+        &self.share
     }
 }
 
@@ -80,38 +80,44 @@ impl GpuExports {
         }
     }
 
-    /// Gives the VM access to every export, keeping only those it was given.
+    /// Asks for VM access to every export, and offers all of them either way.
     ///
     /// Called after validation and never before it: a grant is what makes a
     /// path readable by the VM's own security principal, and handing one out
     /// for a path that has not been proven is how a check becomes decorative.
     ///
-    /// An export the grant refused is dropped rather than fatal. Offering a VM
-    /// a share it cannot open trades one clear line in the host's log for an
-    /// opaque mount failure inside the guest.
+    /// The grant is best effort, and a refusal is expected rather than
+    /// exceptional. Every GPU share lives under `System32`, whose DACLs belong
+    /// to TrustedInstaller, so `HcsGrantVmAccess` is refused there however
+    /// elevated VMLord is. It does not need to succeed: a Plan9 share is
+    /// served by the host's own Plan9 server rather than opened by the VM's
+    /// security principal, which is the difference between these shares and
+    /// the VHDX files a start grants separately. The AppSandbox backend asks
+    /// for the same grants on the same paths and ignores the answer, and its
+    /// guests render.
+    ///
+    /// Dropping a share over a refusal is what this used to do, and it removed
+    /// the guest's entire GPU userspace on every real host.
     pub(crate) fn granted_to(
         self,
         hcs_id: &str,
         grant: &dyn Fn(&str, &Path) -> Result<(), RepositoryError>,
-    ) -> Option<Self> {
-        let exports: Vec<GpuExport> = self
-            .exports
-            .into_iter()
-            .filter(|export| match grant(hcs_id, export.host_path()) {
-                Ok(()) => true,
-                Err(error) => {
-                    log::warn!(
-                        "not offering share \"{}\": the VM could not be given access to \"{}\": \
-                         {error}",
-                        export.name(),
-                        export.host_path().display()
-                    );
-                    false
-                }
-            })
-            .collect();
+    ) -> Self {
+        for export in &self.exports {
+            if let Err(error) = grant(hcs_id, export.host_path()) {
+                // Debug, not warn: this is the ordinary answer for a path
+                // under `System32`, and a warning per share per start would be
+                // a log that reports the expected as a fault.
+                log::debug!(
+                    "share \"{}\" is offered without an explicit grant: the VM could not be \
+                     given access to \"{}\": {error}",
+                    export.name(),
+                    export.host_path().display()
+                );
+            }
+        }
 
-        (!exports.is_empty()).then_some(Self { exports })
+        self
     }
 
     #[cfg(test)]
@@ -132,12 +138,20 @@ impl GpuExports {
     /// Not a `Result`: a host with no WSL payload and no resolvable package is
     /// a host that gets no shares, which is an answer. What went wrong on the
     /// way to it is logged where it happened.
-    pub(crate) fn build(adapters: &[HostGpuAdapter], vm_directory: &Path) -> Option<Self> {
+    pub(crate) fn build(
+        adapters: &[HostGpuAdapter],
+        vm_directory: &Path,
+        payload: Option<&Path>,
+    ) -> Option<Self> {
         let system32 = system_directory()?;
         let canonicalize = canonical_directory;
-        let roots = ExportRoots::resolve(&system32, &canonicalize);
+        let roots = ExportRoots::resolve(
+            &system32,
+            program_files_directory().as_deref(),
+            &canonicalize,
+        );
 
-        build_with_payload(adapters, &roots, vm_directory, &canonicalize)
+        build_with_payload(adapters, &roots, vm_directory, payload, &canonicalize)
     }
 }
 
@@ -157,6 +171,28 @@ fn system_directory() -> Option<PathBuf> {
     }
 
     Some(PathBuf::from(String::from_utf16_lossy(&buffer[..length])))
+}
+
+/// The host's `Program Files`, as Windows spells it.
+///
+/// Asked of the shell rather than read from `%ProgramFiles%`: the environment
+/// variable is inherited and can be anything, and this decides what gets
+/// exported to a VM.
+pub(crate) fn program_files_directory() -> Option<PathBuf> {
+    // SAFETY: the call takes no borrowed memory, and the buffer it returns is
+    // the caller's to free.
+    let path = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, None) }
+        .inspect_err(|error| log::debug!("Program Files could not be read: {error}"))
+        .ok()?;
+    // SAFETY: a successful call returns a NUL-terminated wide string.
+    let directory = unsafe { path.to_string() }
+        .inspect_err(|error| log::debug!("Program Files is not valid UTF-16: {error}"))
+        .ok()
+        .map(PathBuf::from);
+    // SAFETY: `path` came from the call above and is freed exactly once.
+    unsafe { CoTaskMemFree(Some(path.as_ptr().cast())) };
+
+    directory
 }
 
 /// A kernel handle this module owns and closes exactly once.
@@ -264,15 +300,39 @@ fn strip_extended_prefix(path: &str) -> &str {
 pub(crate) struct ExportRoots {
     driver_packages: Option<PathBuf>,
     wsl_lib: Option<PathBuf>,
+    /// The WSL package's own `lib`, which holds the Microsoft D3D12 userspace.
+    ///
+    /// Its own root rather than a second candidate under `System32`: the Store
+    /// and standalone WSL install it beside the package, and it is checked
+    /// against Program Files for the same reason the others are checked
+    /// against `System32`.
+    wsl_d3d12: Option<PathBuf>,
 }
 
 impl ExportRoots {
-    pub(crate) fn resolve(system32: &Path, canonicalize: Canonicalize<'_>) -> Self {
+    pub(crate) fn resolve(
+        system32: &Path,
+        program_files: Option<&Path>,
+        canonicalize: Canonicalize<'_>,
+    ) -> Self {
+        let wsl_d3d12 = program_files.and_then(|program_files| {
+            let Ok(program_files) = canonicalize(program_files) else {
+                log::debug!("Program Files could not be resolved; no D3D12 share");
+                return None;
+            };
+            resolve_root(
+                &program_files,
+                &program_files.join("WSL").join("lib"),
+                canonicalize,
+            )
+        });
+
         let Ok(system32) = canonicalize(system32) else {
             log::warn!("the system directory could not be resolved; nothing may be exported");
             return Self {
                 driver_packages: None,
                 wsl_lib: None,
+                wsl_d3d12,
             };
         };
 
@@ -283,23 +343,24 @@ impl ExportRoots {
                 canonicalize,
             ),
             wsl_lib: resolve_root(&system32, &system32.join("lxss").join("lib"), canonicalize),
+            wsl_d3d12,
         }
     }
 }
 
 fn resolve_root(
-    system32: &Path,
+    root: &Path,
     candidate: &Path,
     canonicalize: Canonicalize<'_>,
 ) -> Option<PathBuf> {
     match canonicalize(candidate) {
-        Ok(resolved) if is_within(system32, &resolved) => Some(resolved),
+        Ok(resolved) if is_within(root, &resolved) => Some(resolved),
         Ok(resolved) => {
             log::warn!(
                 "refusing to export from \"{}\": it resolves to \"{}\", outside \"{}\"",
                 candidate.display(),
                 resolved.display(),
-                system32.display()
+                root.display()
             );
             None
         }
@@ -315,14 +376,23 @@ fn resolve_root(
 
 /// Every share `adapters` justify, in the order a guest should mount them.
 ///
-/// The WSL payload comes first: a driver package without it renders nothing,
-/// and a partial set is what a guest gets when something below is dropped.
+/// The WSL userspace comes first: a driver package without it renders nothing,
+/// and a partial set is what a guest gets when something below is dropped. Of
+/// its two halves the Microsoft one leads, so that a name present in both
+/// resolves to the library a renderer links against.
 pub(crate) fn build_with(
     adapters: &[HostGpuAdapter],
     roots: &ExportRoots,
     canonicalize: Canonicalize<'_>,
 ) -> Option<GpuExports> {
     let mut exports: Vec<GpuExport> = Vec::new();
+
+    if let Some(wsl_d3d12) = &roots.wsl_d3d12 {
+        exports.push(GpuExport {
+            share: GpuShare::wsl_d3d12(),
+            host_path: wsl_d3d12.clone(),
+        });
+    }
 
     if let Some(wsl_lib) = &roots.wsl_lib {
         exports.push(GpuExport {
@@ -389,19 +459,37 @@ pub(crate) fn build_with(
     (!exports.is_empty()).then_some(GpuExports { exports })
 }
 
-/// Adds only the exact staging child of a canonical VM directory.
+/// Adds `payload`, provided it really lies inside this VM's staging root.
+///
+/// `payload` is the generation directory staging produced, not the staging
+/// root itself: the root also holds the `ready` markers and lock files that
+/// make a swap atomic, while the guest reads `sources.json` at the root of the
+/// share it mounts. Naming the root would offer a guest a directory it finds
+/// no payload in.
+///
+/// `None` is a VM nothing was staged for, which is a set of shares without a
+/// payload rather than no shares at all.
 pub(crate) fn build_with_payload(
     adapters: &[HostGpuAdapter],
     roots: &ExportRoots,
     vm_directory: &Path,
+    payload: Option<&Path>,
     canonicalize: Canonicalize<'_>,
 ) -> Option<GpuExports> {
     let mut exports = build_with(adapters, roots, canonicalize)
         .map(|exports| exports.exports)
         .unwrap_or_default();
-    let candidate = gpu_payload_staging_directory(vm_directory);
-    if let (Ok(vm), Ok(payload)) = (canonicalize(vm_directory), canonicalize(&candidate))
-        && same_path(&vm.join("gpu-payload"), &payload)
+    if let Some(candidate) = payload
+        && let (Ok(vm), Ok(payload)) = (canonicalize(vm_directory), canonicalize(candidate))
+        // Inside the VM's own staging root and deeper than it. Outside is a
+        // reparse point aiming somewhere this VM has no business reading, and
+        // the root itself holds the `ready` markers and locks of a swap rather
+        // than a payload -- a guest mounting it would find no `sources.json`.
+        // The check is against canonical paths, so a junction cannot pass it
+        // and export elsewhere.
+        && let staging = gpu_payload_staging_directory(&vm)
+        && payload != staging
+        && is_within(&staging, &payload)
     {
         exports.insert(
             0,
@@ -459,6 +547,8 @@ mod tests {
 
     const SYSTEM32: &str = r"C:\Windows\System32";
     const REPOSITORY: &str = r"C:\Windows\System32\DriverStore\FileRepository";
+    const PROGRAM_FILES: &str = r"C:\Program Files";
+    const WSL_LIB_PACKAGE: &str = r"C:\Program Files\WSL\lib";
 
     /// A canonicalizer over a fixed table: anything not in it does not exist,
     /// and an entry mapping elsewhere is a reparse point pointing there.
@@ -490,9 +580,83 @@ mod tests {
     }
 
     #[test]
+    fn the_wsl_packages_libraries_become_their_own_share() {
+        let canonicalize = canonicalizer(&[
+            (SYSTEM32, SYSTEM32),
+            (REPOSITORY, REPOSITORY),
+            (PROGRAM_FILES, PROGRAM_FILES),
+            (WSL_LIB_PACKAGE, WSL_LIB_PACKAGE),
+        ]);
+        let roots = ExportRoots::resolve(
+            Path::new(SYSTEM32),
+            Some(Path::new(PROGRAM_FILES)),
+            &canonicalize,
+        );
+
+        let roles: Vec<_> = build_with(&[], &roots, &canonicalize)
+            .expect("the D3D12 directory alone is worth exporting")
+            .manifest()
+            .shares
+            .into_iter()
+            .map(|share| share.role)
+            .collect();
+
+        assert!(
+            roles.contains(&GpuShareRole::WslD3d12),
+            "the Microsoft libraries are what a renderer needs: {roles:?}"
+        );
+    }
+
+    #[test]
+    fn a_host_with_no_wsl_package_offers_no_d3d12_share() {
+        // An inbox WSL keeps everything under System32, and a host with no WSL
+        // at all has neither directory. Both are a guest with less, not an
+        // error.
+        let canonicalize = canonicalizer(&[
+            (SYSTEM32, SYSTEM32),
+            (REPOSITORY, REPOSITORY),
+            (
+                r"C:\Windows\System32\lxss\lib",
+                r"C:\Windows\System32\lxss\lib",
+            ),
+        ]);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
+
+        let roles: Vec<_> = build_with(&[], &roots, &canonicalize)
+            .expect("the WSL directory is still there")
+            .manifest()
+            .shares
+            .into_iter()
+            .map(|share| share.role)
+            .collect();
+
+        assert_eq!(roles, vec![GpuShareRole::WslLib]);
+    }
+
+    #[test]
+    fn a_d3d12_directory_reparsed_outside_program_files_is_dropped() {
+        // The same rule the System32 roots follow: a root that canonicalizes
+        // out of its parent is a redirection, and everything under it would
+        // inherit it.
+        let canonicalize = canonicalizer(&[
+            (SYSTEM32, SYSTEM32),
+            (REPOSITORY, REPOSITORY),
+            (PROGRAM_FILES, PROGRAM_FILES),
+            (WSL_LIB_PACKAGE, r"D:\attacker\lib"),
+        ]);
+        let roots = ExportRoots::resolve(
+            Path::new(SYSTEM32),
+            Some(Path::new(PROGRAM_FILES)),
+            &canonicalize,
+        );
+
+        assert!(build_with(&[], &roots, &canonicalize).is_none());
+    }
+
+    #[test]
     fn payload_wsl_and_driver_package_have_distinct_roles_and_order() {
         let vm = Path::new(r"D:\VMLord\dev-linux");
-        let payload = r"D:\VMLord\dev-linux\gpu-payload";
+        let payload = r"D:\VMLord\dev-linux\gpu-payload\generations\e7664769";
         let package = format!(r"{REPOSITORY}\nvltsi.inf_amd64_1");
         let canonicalize = canonicalizer(&[
             (SYSTEM32, SYSTEM32),
@@ -505,10 +669,16 @@ mod tests {
             (r"D:\VMLord\dev-linux", r"D:\VMLord\dev-linux"),
             (payload, payload),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
         let roles: Vec<_> =
-            build_with_payload(&[adapter(Some(&package))], &roots, vm, &canonicalize)
-                .unwrap()
+            build_with_payload(
+                &[adapter(Some(&package))],
+                &roots,
+                vm,
+                Some(Path::new(payload)),
+                &canonicalize,
+            )
+            .unwrap()
                 .manifest()
                 .shares
                 .into_iter()
@@ -525,6 +695,61 @@ mod tests {
     }
 
     #[test]
+    fn the_staged_generation_is_what_the_payload_share_offers() {
+        // The guest reads `sources.json` at the root of the share. Staging
+        // writes it inside `generations/<digest>`, beside the `ready` markers
+        // and lock files that make the swap atomic, so the share has to name
+        // the generation rather than the staging root the guest would find
+        // nothing in.
+        let vm = Path::new(r"D:\VMLord\dev-linux");
+        let generation = r"D:\VMLord\dev-linux\gpu-payload\generations\e7664769";
+        let canonicalize = canonicalizer(&[
+            (SYSTEM32, SYSTEM32),
+            (REPOSITORY, REPOSITORY),
+            (r"D:\VMLord\dev-linux", r"D:\VMLord\dev-linux"),
+            (generation, generation),
+        ]);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
+
+        let exports =
+            build_with_payload(&[], &roots, vm, Some(Path::new(generation)), &canonicalize)
+                .expect("a staged generation is something to export");
+
+        let payload = exports
+            .iter()
+            .find(|export| matches!(export.share().role, GpuShareRole::GpuPayload))
+            .expect("the payload share must be offered");
+        assert_eq!(payload.host_path(), Path::new(generation));
+    }
+
+    #[test]
+    fn a_vm_with_nothing_staged_is_offered_no_payload_share() {
+        let vm = Path::new(r"D:\VMLord\dev-linux");
+        let package = format!(r"{REPOSITORY}\nvltsi.inf_amd64_1");
+        let canonicalize = canonicalizer(&[
+            (SYSTEM32, SYSTEM32),
+            (REPOSITORY, REPOSITORY),
+            (
+                r"C:\Windows\System32\lxss\lib",
+                r"C:\Windows\System32\lxss\lib",
+            ),
+            (&package, &package),
+            (r"D:\VMLord\dev-linux", r"D:\VMLord\dev-linux"),
+        ]);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
+
+        let exports = build_with_payload(&[adapter(Some(&package))], &roots, vm, None, &canonicalize)
+            .expect("the host still has a driver package to offer");
+
+        assert!(
+            !exports
+                .iter()
+                .any(|export| matches!(export.share().role, GpuShareRole::GpuPayload)),
+            "a payload that was never staged is not a share"
+        );
+    }
+
+    #[test]
     fn a_payload_directory_reparsed_outside_its_vm_is_dropped() {
         let vm = Path::new(r"D:\VMLord\dev-linux");
         let canonicalize = canonicalizer(&[
@@ -533,8 +758,17 @@ mod tests {
             (r"D:\VMLord\dev-linux", r"D:\VMLord\dev-linux"),
             (r"D:\VMLord\dev-linux\gpu-payload", r"D:\attacker\payload"),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
-        assert!(build_with_payload(&[], &roots, vm, &canonicalize).is_none());
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
+        assert!(
+            build_with_payload(
+                &[],
+                &roots,
+                vm,
+                Some(&vm.join("gpu-payload")),
+                &canonicalize
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -549,9 +783,18 @@ mod tests {
                 r"D:\VMLord\dev-linux\attacker\payload",
             ),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
-        assert!(build_with_payload(&[], &roots, vm, &canonicalize).is_none());
+        assert!(
+            build_with_payload(
+                &[],
+                &roots,
+                vm,
+                Some(&vm.join("gpu-payload")),
+                &canonicalize
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -566,7 +809,7 @@ mod tests {
             ),
             (&package, &package),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         let exports =
             build_with(&[adapter(Some(&package))], &roots, &canonicalize).expect("two shares");
@@ -603,7 +846,7 @@ mod tests {
             (REPOSITORY, REPOSITORY),
             (&package, &package),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         let exports =
             build_with(&[adapter(Some(&package))], &roots, &canonicalize).expect("one share");
@@ -623,7 +866,7 @@ mod tests {
             (REPOSITORY, REPOSITORY),
             (outside, outside),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         assert!(build_with(&[adapter(Some(outside))], &roots, &canonicalize).is_none());
     }
@@ -638,7 +881,7 @@ mod tests {
             (REPOSITORY, REPOSITORY),
             (&package, r"D:\attacker\payload"),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         assert!(build_with(&[adapter(Some(&package))], &roots, &canonicalize).is_none());
     }
@@ -653,7 +896,7 @@ mod tests {
             (REPOSITORY, REPOSITORY),
             (package, package),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         assert!(build_with(&[adapter(Some(package))], &roots, &canonicalize).is_none());
     }
@@ -666,7 +909,7 @@ mod tests {
             (REPOSITORY, r"D:\attacker"),
             (&package, r"D:\attacker\nvltsi.inf_amd64_1"),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         assert!(
             build_with(&[adapter(Some(&package))], &roots, &canonicalize).is_none(),
@@ -681,7 +924,7 @@ mod tests {
             (REPOSITORY, REPOSITORY),
             (r"C:\Windows\System32\lxss\lib", r"E:\elsewhere\lib"),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         assert!(build_with(&[], &roots, &canonicalize).is_none());
     }
@@ -696,7 +939,7 @@ mod tests {
             (&package, &package),
             (&same_folder_other_case, &same_folder_other_case),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         let exports = build_with(
             &[
@@ -724,7 +967,7 @@ mod tests {
             (REPOSITORY, REPOSITORY),
             (&package, &package),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         assert!(build_with(&[adapter(Some(&package))], &roots, &canonicalize).is_none());
     }
@@ -741,7 +984,7 @@ mod tests {
             ),
             (&package, &package),
         ]);
-        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
         let manifest = build_with(&[adapter(Some(&package))], &roots, &canonicalize)
             .expect("two shares")
@@ -778,8 +1021,7 @@ mod tests {
                     .unwrap()
                     .push((id.to_owned(), path.to_path_buf()));
                 Ok(())
-            })
-            .expect("both survive");
+            });
 
         assert_eq!(survived.iter().count(), 2);
         assert_eq!(
@@ -798,7 +1040,13 @@ mod tests {
     }
 
     #[test]
-    fn an_export_the_grant_refused_is_dropped_and_the_rest_survive() {
+    fn an_export_the_grant_refused_is_still_offered() {
+        // Every GPU share lives under `System32`, whose DACLs belong to
+        // TrustedInstaller, so `HcsGrantVmAccess` is refused there however
+        // elevated VMLord is. It does not matter: a Plan9 share is read by the
+        // host's own Plan9 server, not opened by the VM's security principal,
+        // and dropping the share over the refusal removes the guest's whole
+        // GPU userspace to no purpose.
         let exports = GpuExports::for_test(vec![
             (
                 GpuShare::wsl_lib(),
@@ -817,28 +1065,22 @@ mod tests {
                 } else {
                     Ok(())
                 }
-            })
-            .expect("one survives");
+            });
 
-        assert_eq!(survived.iter().count(), 1);
-        assert_eq!(
-            survived.iter().next().unwrap().name(),
-            "vmlord.gpu.drv.nvltsi.inf_amd64_1"
-        );
+        assert_eq!(survived.iter().count(), 2);
     }
 
     #[test]
-    fn a_set_no_grant_survived_is_nothing_to_export() {
+    fn a_set_no_grant_survived_is_still_offered_in_full() {
         let exports = GpuExports::for_test(vec![(
             GpuShare::wsl_lib(),
             PathBuf::from(r"C:\Windows\System32\lxss\lib"),
         )]);
 
-        assert!(
-            exports
-                .granted_to("hcs-id", &|_, _| Err(RepositoryError::new("access denied")))
-                .is_none()
-        );
+        let survived =
+            exports.granted_to("hcs-id", &|_, _| Err(RepositoryError::new("access denied")));
+
+        assert_eq!(survived.iter().count(), 1);
     }
 
     #[test]
@@ -878,7 +1120,11 @@ mod tests {
         // a test that is permanently red on half the machines it runs on.
         let capabilities = crate::discover_host_gpu();
         let Some(exports) =
-            super::GpuExports::build(&capabilities.adapters, Path::new(r"C:\VMLord\ignored"))
+            super::GpuExports::build(
+                &capabilities.adapters,
+                Path::new(r"C:\VMLord\ignored"),
+                None,
+            )
         else {
             println!("nothing to export on this host");
             return;

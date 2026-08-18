@@ -3,16 +3,20 @@
 use std::{
     fs,
     path::{Path, PathBuf},
+    sync::atomic::AtomicBool,
     time::Duration,
 };
 
 use uuid::Uuid;
-use vmlord_core::{NetworkMode, RepositoryError};
+use vmlord_core::{GpuAssignment, GpuFailure, GpuMode, NetworkMode, RepositoryError};
 
 use crate::{
     Com1LogMode, HcsClient, HcsSystem, cleanup,
     com1_terminal::{Com1Launcher, Com1Session},
     dhcp::{self, DhcpRegistrar},
+    gpu_assignment,
+    gpu_prepare::{self, PreparedGpu},
+    gpu_runs::GpuRuns,
     hcn::HcnNetwork,
     hcn_endpoint::{EndpointAddress, HcnEndpoint},
     hcs::{HCS_ACCESS_ALL, HcsStartFailure, HcsSystemState},
@@ -60,6 +64,12 @@ type EndpointProvider = Box<
         + Sync,
 >;
 
+/// Prepares a VM's GPU before its compute system is built.
+type GpuPreparer =
+    Box<dyn Fn(&VmComputeSystemMapping, &Path) -> Option<PreparedGpu> + Send + Sync>;
+/// Attaches the adapters a mode asks for to a compute system that is running.
+type GpuAssigner = Box<dyn Fn(&str, GpuMode) -> Result<(), GpuFailure> + Send + Sync>;
+
 /// Starts VMs created by [`crate::VmCreationPipeline`].
 pub struct VmStartPipeline {
     com1: Com1Launcher,
@@ -68,6 +78,11 @@ pub struct VmStartPipeline {
     system_starter: SystemStarter,
     endpoint_provider: EndpointProvider,
     dhcp_registrar: DhcpRegistrar,
+    gpu_preparer: GpuPreparer,
+    gpu_assigner: GpuAssigner,
+    /// Where what a start observes about a VM's GPU is recorded, and where the
+    /// manifest its agent will be offered is left.
+    gpu_runs: GpuRuns,
 }
 
 impl VmStartPipeline {
@@ -84,7 +99,45 @@ impl VmStartPipeline {
             system_starter: Box::new(start_hcs_system),
             endpoint_provider: Box::new(ensure_endpoint),
             dhcp_registrar: dhcp::registrar(),
+            // A pipeline nobody has given a place to record GPU in starts VMs
+            // without one. `for_vms_under` is what the application builds.
+            gpu_preparer: Box::new(|_mapping, _vm_directory| None),
+            gpu_assigner: Box::new(gpu_assignment::assign_to_system),
+            gpu_runs: GpuRuns::default(),
         }
+    }
+
+    /// The same pipeline, applying GPU-PV to the VMs under `storage_root`.
+    ///
+    /// Separate from [`Self::production`] because what a start observes about
+    /// a GPU has to be recorded where the list of VMs reads it, and only the
+    /// repository owns that. A pipeline built without this one still starts
+    /// VMs; it simply attaches no GPU to them.
+    #[must_use]
+    pub(crate) fn for_vms_under(mut self, storage_root: &Path, gpu_runs: GpuRuns) -> Self {
+        // Read once, here rather than per start: the executable does not move
+        // while VMLord runs, and a start that could not name its own directory
+        // is a start with no payload rather than one that fails.
+        let executable_directory = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .unwrap_or_default();
+        let cache_root = layout::gpu_payload_cache_root(storage_root);
+
+        self.gpu_preparer = Box::new(move |mapping, vm_directory| {
+            gpu_prepare::prepare(
+                mapping,
+                vm_directory,
+                &executable_directory,
+                &cache_root,
+                // Nothing cancels a start: HCS has either been asked to run the
+                // system or has not, and a half-staged payload is a share that
+                // is simply not offered.
+                &AtomicBool::new(false),
+            )
+        });
+        self.gpu_runs = gpu_runs;
+        self
     }
 
     #[cfg(test)]
@@ -113,7 +166,29 @@ impl VmStartPipeline {
             system_starter: Box::new(system_starter),
             endpoint_provider: Box::new(endpoint_provider),
             dhcp_registrar: Box::new(dhcp_registrar),
+            // A VM with no GPU is what every test of the start itself is
+            // about; the GPU steps have tests of their own below.
+            gpu_preparer: Box::new(|_mapping, _vm_directory| None),
+            gpu_assigner: Box::new(|_hcs_id, _mode| Ok(())),
+            gpu_runs: GpuRuns::default(),
         }
+    }
+
+    /// The same pipeline with its GPU steps substituted.
+    #[cfg(test)]
+    fn with_gpu(
+        mut self,
+        gpu_preparer: impl Fn(&VmComputeSystemMapping, &Path) -> Option<PreparedGpu>
+        + Send
+        + Sync
+        + 'static,
+        gpu_assigner: impl Fn(&str, GpuMode) -> Result<(), GpuFailure> + Send + Sync + 'static,
+        gpu_runs: GpuRuns,
+    ) -> Self {
+        self.gpu_preparer = Box::new(gpu_preparer);
+        self.gpu_assigner = Box::new(gpu_assigner);
+        self.gpu_runs = gpu_runs;
+        self
     }
 
     /// Starts the VM named `vm_name`, whose configuration lives under
@@ -161,6 +236,13 @@ impl VmStartPipeline {
         // After reading the configuration, so that a VM whose stored state is
         // unusable never opens a window for a start that cannot happen.
         let stored = self.read_configuration(&mapping, vm_directory)?;
+
+        // Before anything is granted or built: the shares below become part of
+        // the compute system, and a system's Plan9 section is fixed for the
+        // lifetime of a boot. Prepared once even though the start below may be
+        // retried -- staging, enumeration and assignment are never repeated.
+        let prepared = self.prepare_gpu(&mapping, vm_directory);
+
         let (configuration, endpoint) = self.attach_network(
             store,
             &mapping,
@@ -169,11 +251,13 @@ impl VmStartPipeline {
             mapping.endpoint_id,
             EndpointPolicy::Reuse,
         )?;
+        let configuration = with_gpu_shares(&mapping, configuration, prepared.as_ref());
         self.grant_access_to_attachments(&mapping, &configuration)?;
 
         let failure = match self.open_console_and_start(&mapping, vm_directory, &configuration) {
             Ok(session) => {
                 log::info!("started VM \"{}\" ({})", mapping.vm_name, mapping.vm_id);
+                self.attach_gpu(&mapping, prepared.as_ref());
                 return Ok(session);
             }
             Err(failure) => failure,
@@ -208,6 +292,7 @@ impl VmStartPipeline {
             Some(endpoint),
             EndpointPolicy::Replace,
         )?;
+        let configuration = with_gpu_shares(&mapping, configuration, prepared.as_ref());
         self.grant_access_to_attachments(&mapping, &configuration)?;
         let session = self
             .open_console_and_start(&mapping, vm_directory, &configuration)
@@ -218,7 +303,70 @@ impl VmStartPipeline {
             })?;
 
         log::info!("started VM \"{}\" ({})", mapping.vm_name, mapping.vm_id);
+        self.attach_gpu(&mapping, prepared.as_ref());
         Ok(session)
+    }
+
+    /// Works out what this VM's GPU can be, and records what was found.
+    ///
+    /// The fact is recorded before the VM starts, so that a start which then
+    /// fails still leaves an honest answer behind rather than the silence of a
+    /// GPU nobody looked at.
+    fn prepare_gpu(
+        &self,
+        mapping: &VmComputeSystemMapping,
+        vm_directory: &Path,
+    ) -> Option<PreparedGpu> {
+        let prepared = (self.gpu_preparer)(mapping, vm_directory)?;
+        self.gpu_runs
+            .record_assignment(mapping.vm_id, prepared.assignment.clone());
+        self.gpu_runs
+            .record_shares(mapping.vm_id, prepared.manifest.clone());
+        Some(prepared)
+    }
+
+    /// Attaches the adapters the VM's mode asks for, once, best effort.
+    ///
+    /// Called only after the system is running, because assignment modifies a
+    /// live compute system. A failure replaces the fact recorded before the
+    /// start and changes nothing else: the VM is running, and GPU never
+    /// decides that.
+    ///
+    /// Not retried, here or anywhere: a second attempt at a modify HCS refused
+    /// is a second refusal, and a loop around it is how a VM spends its life
+    /// asking for a GPU it will not get.
+    fn attach_gpu(&self, mapping: &VmComputeSystemMapping, prepared: Option<&PreparedGpu>) {
+        let Some(prepared) = prepared else {
+            return;
+        };
+        // Nothing could be handed over at all, and the reason is already
+        // recorded. Attaching adapters whose drivers the guest cannot reach
+        // would not make that less true.
+        if matches!(prepared.assignment, GpuAssignment::Failed(_)) {
+            log::info!(
+                "VM \"{}\" is not asked to attach any GPU adapter, because none could be \
+                 handed to it",
+                mapping.vm_name
+            );
+            return;
+        }
+
+        match (self.gpu_assigner)(&mapping.hcs_compute_system_id, mapping.gpu_mode) {
+            Ok(()) => log::info!(
+                "VM \"{}\" has its GPU attached in mode {:?}",
+                mapping.vm_name,
+                mapping.gpu_mode
+            ),
+            Err(failure) => {
+                log::warn!(
+                    "VM \"{}\" is running without the GPU it asked for: {}",
+                    mapping.vm_name,
+                    failure.message
+                );
+                self.gpu_runs
+                    .record_assignment(mapping.vm_id, GpuAssignment::Failed(failure));
+            }
+        }
     }
 
     /// Brings the compute system into shape, opens the VM's console, and only
@@ -393,7 +541,17 @@ impl VmStartPipeline {
             );
         }
         for path in &paths {
-            (self.access_granter)(&mapping.hcs_compute_system_id, path)?;
+            // Fatal here, unlike the GPU shares: Hyper-V opens an attachment as
+            // the VM itself, so a file it was not granted is a start that fails
+            // with `ERROR_ACCESS_DENIED` deep inside HCS instead of here.
+            (self.access_granter)(&mapping.hcs_compute_system_id, path).inspect_err(|error| {
+                log::error!(
+                    "VM \"{}\" cannot be started: it could not be granted access to \"{}\": \
+                     {error}",
+                    mapping.vm_name,
+                    path.display()
+                );
+            })?;
         }
 
         Ok(())
@@ -430,6 +588,33 @@ fn attachment_paths(document: &str) -> Result<Vec<PathBuf>, RepositoryError> {
                 .map(PathBuf::from)
         })
         .collect())
+}
+
+/// Writes this run's GPU shares into the configuration the system is built
+/// from, or leaves it alone when there are none.
+///
+/// A configuration that will not take them is logged and used as it stands: a
+/// VM that starts without its shares is a VM whose guest finds no GPU
+/// userspace, which is worse than a GPU and better than no VM.
+fn with_gpu_shares(
+    mapping: &VmComputeSystemMapping,
+    configuration: String,
+    prepared: Option<&PreparedGpu>,
+) -> String {
+    let Some(exports) = prepared.and_then(|prepared| prepared.exports.as_ref()) else {
+        return configuration;
+    };
+
+    match hcs_config::apply_plan9_shares(&configuration, exports) {
+        Ok(updated) => updated,
+        Err(error) => {
+            log::warn!(
+                "VM \"{}\" starts without its GPU shares: {error}",
+                mapping.vm_name
+            );
+            configuration
+        }
+    }
 }
 
 fn grant_vm_access(id: &str, path: &Path) -> Result<(), RepositoryError> {
@@ -666,11 +851,11 @@ mod tests {
     };
 
     use uuid::Uuid;
-    use vmlord_core::{NetworkMode, RepositoryError};
+    use vmlord_core::{GpuAssignment, GpuFailure, NetworkMode, RepositoryError};
 
     use super::{
-        EndpointPolicy, ExistingSystemPlan, HcsSystemState, VmNetworkAdapter, VmStartPipeline,
-        attachment_paths, plan_for_existing,
+        EndpointPolicy, ExistingSystemPlan, GpuRuns, HcsSystemState, PreparedGpu, VmNetworkAdapter,
+        VmStartPipeline, attachment_paths, plan_for_existing,
     };
     use crate::{
         Com1Launcher,
@@ -812,6 +997,15 @@ mod tests {
         busy_starts: usize,
     }
 
+    impl Behavior {
+        fn start_fails() -> Self {
+            Self {
+                fail_start: true,
+                ..Self::default()
+            }
+        }
+    }
+
     struct Fixture {
         _root: TempRoot,
         store: MetadataStore,
@@ -862,6 +1056,8 @@ mod tests {
             endpoint_id,
             network_mode,
             ssh: None,
+            gpu_mode: vmlord_core::GpuMode::None,
+            guest_target: None,
         };
         let store = MetadataStore::new(root.0.join("vm-mapping.json"));
         store
@@ -1501,6 +1697,234 @@ mod tests {
 
         assert!(error.to_string().contains("injected start failure"));
         assert_eq!(calls.start.lock().unwrap().len(), 1);
+    }
+
+    /// A prepared GPU with one share and the given assignment.
+    fn prepared(assignment: GpuAssignment) -> PreparedGpu {
+        let exports = crate::gpu_exports::GpuExports::for_test(vec![(
+            vmlord_core::GpuShare::wsl_lib(),
+            PathBuf::from("C:\\Windows\\System32\\lxss\\lib"),
+        )]);
+        PreparedGpu {
+            manifest: exports.manifest(),
+            exports: Some(exports),
+            assignment,
+        }
+    }
+
+    fn complete() -> GpuAssignment {
+        GpuAssignment::Complete(vmlord_core::NativeGpuDetail {
+            adapter: Some("nvidia".into()),
+            adapters: 1,
+        })
+    }
+
+    #[test]
+    fn a_prepared_gpu_reaches_the_configuration_the_system_is_built_from() {
+        let fixture = fixture("gpu-shares");
+        let calls = fixture.calls.clone();
+        let runs = GpuRuns::default();
+        let pipeline = pipeline(&calls, Behavior::default()).with_gpu(
+            move |_mapping, _directory| Some(prepared(complete())),
+            |_id, _mode| Ok(()),
+            runs.clone(),
+        );
+
+        pipeline
+            .start(&fixture.store, "dev", &fixture.vm_directory)
+            .expect("the start must succeed");
+
+        let (_id, configuration) = calls.start.lock().unwrap()[0].clone();
+        assert!(
+            configuration.contains("vmlord.gpu.wsl-lib"),
+            "the shares have to be in the system that is built, not beside it: {configuration}"
+        );
+    }
+
+    #[test]
+    fn a_prepared_gpu_is_never_written_back_to_the_stored_configuration() {
+        // The shares name this host's paths and this run's staging directory.
+        // Persisting them would describe a boot that is over.
+        let fixture = fixture("gpu-not-stored");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, Behavior::default()).with_gpu(
+            move |_mapping, _directory| Some(prepared(complete())),
+            |_id, _mode| Ok(()),
+            GpuRuns::default(),
+        );
+
+        pipeline
+            .start(&fixture.store, "dev", &fixture.vm_directory)
+            .expect("the start must succeed");
+
+        let stored = fs::read_to_string(fixture.vm_directory.join("config.json")).unwrap();
+        assert!(
+            !stored.contains("vmlord.gpu.wsl-lib"),
+            "a per-boot section has no place in the stored configuration: {stored}"
+        );
+    }
+
+    #[test]
+    fn a_start_records_what_it_prepared_before_the_system_runs() {
+        let fixture = fixture("gpu-recorded");
+        let calls = fixture.calls.clone();
+        let runs = GpuRuns::default();
+        let pipeline = pipeline(&calls, Behavior::default()).with_gpu(
+            move |_mapping, _directory| Some(prepared(complete())),
+            |_id, _mode| Ok(()),
+            runs.clone(),
+        );
+
+        pipeline
+            .start(&fixture.store, "dev", &fixture.vm_directory)
+            .expect("the start must succeed");
+
+        assert!(matches!(
+            runs.snapshot(fixture.mapping.vm_id).assignment,
+            Some(GpuAssignment::Complete(_))
+        ));
+        assert!(
+            runs.shares(fixture.mapping.vm_id).is_some(),
+            "the manifest the agent will be offered is left where the listener reads it"
+        );
+    }
+
+    #[test]
+    fn a_vm_without_a_gpu_has_nothing_recorded_about_one() {
+        let fixture = fixture("gpu-none");
+        let calls = fixture.calls.clone();
+        let runs = GpuRuns::default();
+        let pipeline = pipeline(&calls, Behavior::default()).with_gpu(
+            |_mapping, _directory| None,
+            |_id, _mode| Ok(()),
+            runs.clone(),
+        );
+
+        pipeline
+            .start(&fixture.store, "dev", &fixture.vm_directory)
+            .expect("the start must succeed");
+
+        assert_eq!(
+            runs.snapshot(fixture.mapping.vm_id).assignment,
+            None,
+            "a VM that asks for no GPU is not a VM whose GPU failed"
+        );
+        assert_eq!(runs.shares(fixture.mapping.vm_id), None);
+    }
+
+    #[test]
+    fn a_gpu_that_could_not_be_attached_does_not_fail_the_start() {
+        let fixture = fixture("gpu-assign-failed");
+        let calls = fixture.calls.clone();
+        let runs = GpuRuns::default();
+        let pipeline = pipeline(&calls, Behavior::default()).with_gpu(
+            move |_mapping, _directory| Some(prepared(complete())),
+            |_id, _mode| {
+                Err(GpuFailure::new(
+                    vmlord_core::GpuStatusCode::AssignmentFailed,
+                    "HCS refused the update",
+                ))
+            },
+            runs.clone(),
+        );
+
+        pipeline
+            .start(&fixture.store, "dev", &fixture.vm_directory)
+            .expect("GPU is best effort and never fails a start");
+
+        let GpuAssignment::Failed(failure) = runs
+            .snapshot(fixture.mapping.vm_id)
+            .assignment
+            .expect("the start recorded something")
+        else {
+            panic!("the assigner refused, so the fact has to say so");
+        };
+        assert!(failure.message.contains("HCS refused"), "{failure:?}");
+    }
+
+    #[test]
+    fn a_gpu_is_attached_exactly_once_and_never_retried() {
+        let fixture = fixture("gpu-once");
+        let calls = fixture.calls.clone();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&attempts);
+        let pipeline = pipeline(&calls, Behavior::default()).with_gpu(
+            move |_mapping, _directory| Some(prepared(complete())),
+            move |_id, _mode| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Err(GpuFailure::new(
+                    vmlord_core::GpuStatusCode::AssignmentFailed,
+                    "HCS refused the update",
+                ))
+            },
+            GpuRuns::default(),
+        );
+
+        pipeline
+            .start(&fixture.store, "dev", &fixture.vm_directory)
+            .expect("the start must succeed");
+
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            1,
+            "a GPU that would not attach is not attached again"
+        );
+    }
+
+    #[test]
+    fn a_host_that_could_hand_over_nothing_is_not_asked_to_attach_anything() {
+        let fixture = fixture("gpu-nothing");
+        let calls = fixture.calls.clone();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&attempts);
+        let pipeline = pipeline(&calls, Behavior::default()).with_gpu(
+            move |_mapping, _directory| {
+                Some(PreparedGpu {
+                    exports: None,
+                    manifest: vmlord_core::GpuShareManifest::default(),
+                    assignment: GpuAssignment::Failed(GpuFailure::new(
+                        vmlord_core::GpuStatusCode::HostNoAdapter,
+                        "this host presents no GPU partition adapter",
+                    )),
+                })
+            },
+            move |_id, _mode| {
+                counted.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            },
+            GpuRuns::default(),
+        );
+
+        pipeline
+            .start(&fixture.store, "dev", &fixture.vm_directory)
+            .expect("the start must succeed");
+
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            0,
+            "there is nothing on this host to attach"
+        );
+    }
+
+    #[test]
+    fn a_start_that_failed_still_leaves_what_it_found_out_about_the_gpu() {
+        let fixture = fixture("gpu-start-failed");
+        let calls = fixture.calls.clone();
+        let runs = GpuRuns::default();
+        let pipeline = pipeline(&calls, Behavior::start_fails()).with_gpu(
+            move |_mapping, _directory| Some(prepared(complete())),
+            |_id, _mode| Ok(()),
+            runs.clone(),
+        );
+
+        pipeline
+            .start(&fixture.store, "dev", &fixture.vm_directory)
+            .expect_err("this start fails");
+
+        assert!(
+            runs.snapshot(fixture.mapping.vm_id).assignment.is_some(),
+            "what was found out before the start is worth more than the silence after it"
+        );
     }
 
     #[test]

@@ -315,6 +315,8 @@ mod tests {
             endpoint_id: None,
             network_mode: NetworkMode::Nat,
             ssh,
+            gpu_mode: vmlord_core::GpuMode::None,
+            guest_target: None,
         }
     }
 

@@ -1,20 +1,14 @@
 //! Turning a catalog entry into the payload directory a VM exports.
 //!
 //! Three steps that belong together and nowhere else: pick the entry for the
-//! target an agent reported, prepare that generation in the shared cache, and
+//! guest this VM was built from, prepare that generation in the shared cache, and
 //! stage it into the VM's own `gpu-payload` child -- the exact directory
 //! `gpu_exports` canonicalizes and offers as `vmlord.gpu.payload`.
-//!
-//! Nothing in the running application calls this yet, for the reason
-//! `gpu_exports` states: a start cannot know a VM's GPU mode until the task
-//! that applies HCS assignment records one, and that task is this module's
-//! caller. The allow below goes away with it.
-#![allow(dead_code)]
 
 use std::{path::Path, path::PathBuf, sync::atomic::AtomicBool};
 
 use vmlord_gpu_payload::{
-    GuestTarget, PayloadCatalog, PayloadError, PayloadProgress, PrepareRequest, StagedGpuPayload,
+    GuestSelector, PayloadCatalog, PayloadError, PayloadProgress, PrepareRequest, StagedGpuPayload,
     ensure_staging_root, local_archive_path, prepare, stage_payload,
 };
 
@@ -29,8 +23,8 @@ pub struct StageGpuPayloadRequest<'a> {
     pub cache_root: &'a Path,
     /// The VM's own directory. Its `gpu-payload` child is what gets filled.
     pub vm_directory: &'a Path,
-    /// The exact guest tuple the agent reported.
-    pub target: &'a GuestTarget,
+    /// The guest this payload is for, as the host knows it before boot.
+    pub guest: GuestSelector<'a>,
     pub progress: &'a dyn Fn(PayloadProgress),
     pub cancel: &'a AtomicBool,
 }
@@ -42,14 +36,14 @@ pub(crate) fn prepare_staging_root(vm_directory: &Path) -> Result<PathBuf, Paylo
     Ok(root)
 }
 
-/// Stages the payload for `target` into the VM's `gpu-payload` child.
+/// Stages the payload for `guest` into the VM's `gpu-payload` child.
 ///
 /// A failure here is a failure of GPU support and not of the VM: assignment is
 /// best effort by design, so the caller decides what a [`PayloadError`] means
 /// for a start and nothing in this module touches lifecycle.
 pub fn stage_for_vm(request: StageGpuPayloadRequest<'_>) -> Result<StagedGpuPayload, PayloadError> {
     let catalog = PayloadCatalog::embedded()?;
-    let entry = catalog.select(request.target)?;
+    let entry = catalog.select_for_guest(&request.guest)?;
     let archive = local_archive_path(request.executable_directory, entry.payload_id());
     let ready = prepare(PrepareRequest {
         entry,
@@ -71,7 +65,7 @@ mod tests {
     };
 
     use vmlord_core::{GpuShare, RepositoryError};
-    use vmlord_gpu_payload::{GuestTarget, PayloadError};
+    use vmlord_gpu_payload::{GuestSelector, PayloadError};
 
     use super::{StageGpuPayloadRequest, prepare_staging_root, stage_for_vm};
     use crate::gpu_exports::{ExportRoots, build_with_payload};
@@ -103,7 +97,7 @@ mod tests {
     }
 
     #[test]
-    fn the_staging_root_is_the_child_the_payload_share_exports() {
+    fn a_staged_generation_is_what_the_payload_share_exports() {
         let temporary = TemporaryDirectory::new("root");
         let vm = temporary.path().join("dev-linux");
         fs::create_dir(&vm).unwrap();
@@ -114,22 +108,36 @@ mod tests {
         assert!(root.join("generations").is_dir());
         assert!(root.join("ready").is_dir());
 
-        // The same directory has to be the one the Plan9 export accepts:
-        // staging that filled anything else would be invisible to the guest.
         let canonicalize = |path: &Path| {
             fs::canonicalize(path)
                 .map_err(|error| RepositoryError::new(format!("{}: {error}", path.display())))
         };
         // No system roots: this test is about the per-VM child alone, and a
         // system directory that does not resolve leaves `ExportRoots` empty.
-        let roots = ExportRoots::resolve(&temporary.path().join("no-system32"), &canonicalize);
-        let exports = build_with_payload(&[], &roots, &vm, &canonicalize).unwrap();
+        let roots = ExportRoots::resolve(
+            &temporary.path().join("no-system32"),
+            None,
+            &canonicalize,
+        );
 
+        // A generation is what the guest mounts: `sources.json` lives at the
+        // root of the share, and staging writes it inside the generation.
+        let generation = root.join("generations").join("e7664769");
+        fs::create_dir_all(&generation).unwrap();
+        let exports =
+            build_with_payload(&[], &roots, &vm, Some(&generation), &canonicalize).unwrap();
         assert_eq!(exports.manifest().shares[0], GpuShare::payload());
+
+        // The staging root itself is not: a guest mounting it would find
+        // `generations` and `ready` and no payload.
+        assert!(
+            build_with_payload(&[], &roots, &vm, Some(&root), &canonicalize).is_none(),
+            "the staging root holds the machinery of a swap, not a payload"
+        );
     }
 
     #[test]
-    fn an_unsupported_target_stages_nothing() {
+    fn a_guest_the_catalog_has_nothing_for_stages_nothing() {
         let temporary = TemporaryDirectory::new("unsupported");
         let vm = temporary.path().join("dev-linux");
         fs::create_dir(&vm).unwrap();
@@ -138,12 +146,18 @@ mod tests {
             executable_directory: temporary.path(),
             cache_root: &temporary.path().join("cache"),
             vm_directory: &vm,
-            target: &GuestTarget::ubuntu_26_04_amd64("7.0.0-28-generic"),
+            // A guest the shipped catalog cannot have an entry for, so that
+            // this test says what it means whatever the catalog ships.
+            guest: GuestSelector {
+                distribution: "ubuntu",
+                release: "1.04",
+                architecture: "amd64",
+            },
             progress: &|_| {},
             cancel: &AtomicBool::new(false),
         });
 
-        assert!(matches!(result, Err(PayloadError::UnsupportedTarget(_))));
+        assert!(matches!(result, Err(PayloadError::NoPayloadForGuest { .. })));
         assert_eq!(fs::read_dir(&vm).unwrap().count(), 0);
     }
 }
