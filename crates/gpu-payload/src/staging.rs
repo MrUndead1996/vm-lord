@@ -1028,8 +1028,7 @@ mod tests {
                         "kernel_release": "test",
                         "payload_abi": 1
                     },
-                    "archive_size": archive.len(),
-                    "expanded_size_limit": 1_000_000,
+                                        "expanded_size_limit": 1_000_000,
                     "file_count_limit": 3,
                     "archive_sha256": digest(&archive),
                     "payload_manifest_sha256": digest(&payload),

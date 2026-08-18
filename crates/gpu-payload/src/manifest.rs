@@ -364,7 +364,6 @@ mod tests {
                     "kernel_release": "k",
                     "payload_abi": 1
                 },
-                "archive_size": 1,
                 "expanded_size_limit": 2,
                 "file_count_limit": 4,
                 "archive_sha256": ZERO,

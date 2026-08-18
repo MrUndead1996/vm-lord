@@ -382,7 +382,6 @@ fn catalog_entry(
     serde_json::json!({
         "payload_id": recipe.payload_id,
         "target": recipe.target,
-        "archive_size": archive_size,
         "expanded_size_limit": expanded_size,
         "file_count_limit": file_count,
         "archive_sha256": archive_sha256,

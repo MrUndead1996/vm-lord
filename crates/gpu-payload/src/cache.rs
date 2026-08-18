@@ -131,8 +131,12 @@ pub(crate) fn prepare_verified_archive(
             error,
         )
     })?;
+    // The archive's length is a property of the file we hold, not a claim in
+    // the entry: the digest below pins it either way, and one measurement
+    // cannot disagree with itself.
+    let archive_length = require_regular_file(archive, "read release archive")?;
     let cached_archive = temporary.path().join("archive.zip");
-    copy_and_flush(archive, &cached_archive, entry.archive_size(), cancel)?;
+    copy_and_flush(archive, &cached_archive, archive_length, cancel)?;
     verify_digest(
         &cached_archive,
         entry.archive_sha256(),
@@ -140,7 +144,14 @@ pub(crate) fn prepare_verified_archive(
         cancel,
     )?;
     let (_, sources) =
-        archive::extract(entry, &cached_archive, &files_directory, progress, cancel)?;
+        archive::extract(
+            entry,
+            &cached_archive,
+            archive_length,
+            &files_directory,
+            progress,
+            cancel,
+        )?;
     write_and_flush(
         &temporary.path().join("provenance.json"),
         &cache_provenance(entry, &sources)?,
@@ -194,15 +205,9 @@ fn load_ready(
 
     let archive_path = root.join("archive.zip");
     let archive_size = require_regular_file(&archive_path, "verify cached archive")?;
-    if archive_size != entry.archive_size() {
-        return Err(PayloadError::ArchiveSizeMismatch {
-            expected: entry.archive_size(),
-            actual: archive_size,
-        });
-    }
     progress(PayloadProgress::Verifying {
         hashed: 0,
-        total: entry.archive_size(),
+        total: archive_size,
     });
     verify_digest(
         &archive_path,
@@ -878,7 +883,6 @@ mod tests {
                         "kernel_release": "test",
                         "payload_abi": 1
                     },
-                    "archive_size": archive.len(),
                     "expanded_size_limit": archive.len(),
                     "file_count_limit": 3,
                     "archive_sha256": digest(&archive),
@@ -1186,7 +1190,7 @@ mod tests {
     }
 
     #[test]
-    fn a_truncated_local_archive_fails_on_its_length() {
+    fn a_truncated_archive_fails_on_its_digest() {
         let fixture = Fixture::new("local-short");
         let short = fixture.temporary.path().join("short.zip");
         fs::write(&short, &fixture.archive[..fixture.archive.len() - 1]).unwrap();
@@ -1199,10 +1203,29 @@ mod tests {
             cancel: &AtomicBool::new(false),
         });
 
-        assert!(matches!(
-            result,
-            Err(PayloadError::ArchiveSizeMismatch { .. })
-        ));
+        assert!(matches!(result, Err(PayloadError::DigestMismatch { .. })));
+    }
+
+    #[test]
+    fn an_archive_of_the_right_length_and_the_wrong_bytes_is_caught_by_its_digest() {
+        let fixture = Fixture::new("same-length");
+        let corrupt = fixture.temporary.path().join("same-length.zip");
+        let mut bytes = fixture.archive.clone();
+        // Same length, different content: with no declared size left, the
+        // digest is the whole check, and it must be enough.
+        *bytes.last_mut().unwrap() ^= 0xff;
+        fs::write(&corrupt, &bytes).unwrap();
+
+        let result = prepare(PrepareRequest {
+            entry: &fixture.entry,
+            cache_root: &fixture.cache_root(),
+            archive: &corrupt,
+            progress: &|_| {},
+            cancel: &AtomicBool::new(false),
+        });
+
+        assert!(matches!(result, Err(PayloadError::DigestMismatch { .. })));
+        assert_no_operation_directories(&fixture);
     }
 
     #[test]

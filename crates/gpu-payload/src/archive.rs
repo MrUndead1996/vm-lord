@@ -26,6 +26,7 @@ struct InspectedEntry {
 pub(crate) fn extract(
     entry: &CatalogEntry,
     archive: &Path,
+    archive_length: u64,
     destination: &Path,
     progress: &dyn Fn(PayloadProgress),
     cancel: &AtomicBool,
@@ -55,7 +56,7 @@ pub(crate) fn extract(
     }
     let manifest = PayloadManifest::parse_and_validate(&payload_bytes, entry)?;
     validate_manifest_limits(&manifest, entry)?;
-    let inspected = inspect_entries(&mut zip, entry)?;
+    let inspected = inspect_entries(&mut zip, entry, archive_length)?;
 
     let declared: HashMap<_, _> = manifest
         .files()
@@ -175,6 +176,7 @@ fn read_central_names(archive: &Path, directory_start: u64) -> Result<Vec<Vec<u8
 fn inspect_entries(
     zip: &mut ZipArchive<File>,
     entry: &CatalogEntry,
+    archive_length: u64,
 ) -> Result<Vec<InspectedEntry>, PayloadError> {
     let mut seen = HashSet::new();
     let mut prepared_count = 0_u64;
@@ -200,7 +202,7 @@ fn inspect_entries(
             compressed_size,
             member.compressed_size(),
             "compressed size",
-            entry.archive_size(),
+            archive_length,
         )?;
 
         if raw_name == "payload.json" {
@@ -646,7 +648,6 @@ mod tests {
     fn entry(
         archive: &[u8],
         payload: &[u8],
-        archive_size_limit: u64,
         expanded_size_limit: u64,
         file_count_limit: u64,
     ) -> crate::CatalogEntry {
@@ -661,7 +662,6 @@ mod tests {
                     "kernel_release": "test",
                     "payload_abi": 1
                 },
-                "archive_size": archive_size_limit,
                 "expanded_size_limit": expanded_size_limit,
                 "file_count_limit": file_count_limit,
                 "archive_sha256": digest(archive),
@@ -687,7 +687,7 @@ mod tests {
     fn extract_fixture(
         archive: &[u8],
         payload: &[u8],
-        archive_size_limit: u64,
+        archive_length: u64,
         expanded_size_limit: u64,
         file_count_limit: u64,
         cancelled: bool,
@@ -697,16 +697,11 @@ mod tests {
         let destination = temporary.path().join("files");
         fs::write(&archive_path, archive).unwrap();
         fs::create_dir(&destination).unwrap();
-        let entry = entry(
-            archive,
-            payload,
-            archive_size_limit,
-            expanded_size_limit,
-            file_count_limit,
-        );
+        let entry = entry(archive, payload, expanded_size_limit, file_count_limit);
         extract(
             &entry,
             &archive_path,
+            archive_length,
             &destination,
             &|_| {},
             &AtomicBool::new(cancelled),
@@ -1084,13 +1079,7 @@ mod tests {
     #[test]
     fn wrong_payload_digest_declared_size_and_cancellation_are_rejected() {
         let (archive, payload, sources) = valid_archive(b"content");
-        let wrong_digest_entry = entry(
-            &archive,
-            b"different payload bytes",
-            archive.len() as u64,
-            archive.len() as u64,
-            3,
-        );
+        let wrong_digest_entry = entry(&archive, b"different payload bytes", archive.len() as u64, 3);
         let temporary = TemporaryDirectory::new("wrong-digest");
         let archive_path = temporary.path().join("archive.zip");
         let destination = temporary.path().join("files");
@@ -1100,6 +1089,7 @@ mod tests {
             extract(
                 &wrong_digest_entry,
                 &archive_path,
+                archive.len() as u64,
                 &destination,
                 &|_| {},
                 &AtomicBool::new(false)

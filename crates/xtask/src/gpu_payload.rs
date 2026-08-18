@@ -99,14 +99,6 @@ pub(crate) fn stage_release_payload(source: &Path, destination: &Path) -> Result
 
     let archive = fs::read(&archive_path)
         .map_err(|error| format!("cannot read {}: {error}", archive_path.display()))?;
-    let size = archive.len() as u64;
-    if size != entry.archive_size() {
-        return Err(format!(
-            "{} is {size} bytes; its entry says {}",
-            archive_path.display(),
-            entry.archive_size()
-        ));
-    }
     let digest = Sha256Digest::hash_reader(archive.as_slice())
         .map_err(|error| format!("cannot hash {}: {error}", archive_path.display()))?;
     if digest != *entry.archive_sha256() {

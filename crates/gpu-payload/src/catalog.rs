@@ -68,7 +68,6 @@ struct CatalogDocument {
 struct CatalogEntryDocument {
     payload_id: String,
     target: GuestTarget,
-    archive_size: u64,
     expanded_size_limit: u64,
     file_count_limit: u64,
     archive_sha256: Sha256Digest,
@@ -92,7 +91,6 @@ struct CatalogEntryDocument {
 pub struct CatalogEntry {
     payload_id: String,
     target: GuestTarget,
-    archive_size: u64,
     expanded_size_limit: u64,
     file_count_limit: u64,
     archive_sha256: Sha256Digest,
@@ -109,7 +107,6 @@ impl From<CatalogEntryDocument> for CatalogEntry {
         Self {
             payload_id: value.payload_id,
             target: value.target,
-            archive_size: value.archive_size,
             expanded_size_limit: value.expanded_size_limit,
             file_count_limit: value.file_count_limit,
             archive_sha256: value.archive_sha256,
@@ -131,8 +128,7 @@ impl CatalogEntry {
             || self.target.architecture.is_empty()
             || self.target.kernel_release.is_empty()
             || self.target.payload_abi != PAYLOAD_ABI_VERSION
-            || self.archive_size == 0
-            || self.expanded_size_limit < self.archive_size
+            || self.expanded_size_limit == 0
             || self.file_count_limit == 0
             || self.required_renderers.is_empty()
             || self.vmlord_revision.len() != 40
@@ -175,9 +171,6 @@ impl CatalogEntry {
     }
     pub fn target(&self) -> &GuestTarget {
         &self.target
-    }
-    pub fn archive_size(&self) -> u64 {
-        self.archive_size
     }
     pub fn expanded_size_limit(&self) -> u64 {
         self.expanded_size_limit
@@ -321,7 +314,7 @@ mod tests {
     const C: &str = "14794180686c2fb6307fbe359c359bec765249f3";
     fn catalog() -> String {
         format!(
-            r#"{{"schema_version":1,"entries":[{{"payload_id":"ubuntu-26.04-amd64-7.0.0-14-v1","target":{{"distribution":"ubuntu","release":"26.04","architecture":"amd64","kernel_release":"7.0.0-14-generic","payload_abi":1}},"archive_size":1,"expanded_size_limit":2,"file_count_limit":3,"archive_sha256":"{Z}","payload_manifest_sha256":"{Z}","required_renderers":["d3d12-gallium","dzn-vulkan"],"mesa_policy":"bundled","vmlord_revision":"{C}","builder_version":"vmlord-gpu-payload 1","sources":[{{"url":"https://github.com/microsoft/WSL2-Linux-Kernel","commit":"{C}","version":"1"}}],"licenses":[{{"spdx":"GPL-2.0","path":"licenses/GPL-2.0.txt"}}]}}]}}"#
+            r#"{{"schema_version":1,"entries":[{{"payload_id":"ubuntu-26.04-amd64-7.0.0-14-v1","target":{{"distribution":"ubuntu","release":"26.04","architecture":"amd64","kernel_release":"7.0.0-14-generic","payload_abi":1}},"expanded_size_limit":2,"file_count_limit":3,"archive_sha256":"{Z}","payload_manifest_sha256":"{Z}","required_renderers":["d3d12-gallium","dzn-vulkan"],"mesa_policy":"bundled","vmlord_revision":"{C}","builder_version":"vmlord-gpu-payload 1","sources":[{{"url":"https://github.com/microsoft/WSL2-Linux-Kernel","commit":"{C}","version":"1"}}],"licenses":[{{"spdx":"GPL-2.0","path":"licenses/GPL-2.0.txt"}}]}}]}}"#
         )
     }
     #[test]
@@ -340,7 +333,7 @@ mod tests {
     }
     fn entry_json(distribution: &str, release: &str, architecture: &str, kernel: &str) -> String {
         format!(
-            r#"{{"payload_id":"{distribution}-{release}-{architecture}-{kernel}","target":{{"distribution":"{distribution}","release":"{release}","architecture":"{architecture}","kernel_release":"{kernel}","payload_abi":1}},"archive_size":1,"expanded_size_limit":2,"file_count_limit":3,"archive_sha256":"{Z}","payload_manifest_sha256":"{Z}","required_renderers":["d3d12-gallium"],"mesa_policy":"bundled","vmlord_revision":"{C}","builder_version":"vmlord-gpu-payload 1","sources":[{{"url":"https://github.com/microsoft/WSL2-Linux-Kernel","commit":"{C}","version":"1"}}],"licenses":[{{"spdx":"GPL-2.0","path":"licenses/GPL-2.0.txt"}}]}}"#
+            r#"{{"payload_id":"{distribution}-{release}-{architecture}-{kernel}","target":{{"distribution":"{distribution}","release":"{release}","architecture":"{architecture}","kernel_release":"{kernel}","payload_abi":1}},"expanded_size_limit":2,"file_count_limit":3,"archive_sha256":"{Z}","payload_manifest_sha256":"{Z}","required_renderers":["d3d12-gallium"],"mesa_policy":"bundled","vmlord_revision":"{C}","builder_version":"vmlord-gpu-payload 1","sources":[{{"url":"https://github.com/microsoft/WSL2-Linux-Kernel","commit":"{C}","version":"1"}}],"licenses":[{{"spdx":"GPL-2.0","path":"licenses/GPL-2.0.txt"}}]}}"#
         )
     }
     fn catalog_with(entries: &[String]) -> PayloadCatalog {
