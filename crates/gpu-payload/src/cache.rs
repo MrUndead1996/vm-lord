@@ -772,7 +772,7 @@ mod tests {
 
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-    use crate::{PayloadCatalog, PayloadError, Sha256Digest};
+    use crate::{PayloadError, Sha256Digest};
 
     use super::{
         OperationPath, PrepareRequest, prepare, prepare_verified_archive, rename_noreplace,
@@ -870,9 +870,7 @@ mod tests {
             }))
             .unwrap();
             let archive = build_archive(&payload, content, license, &source);
-            let catalog = serde_json::json!({
-                "schema_version": 1,
-                "entries": [{
+            let entry_document = serde_json::json!({
                     "payload_id": "test",
                     "target": {
                         "distribution": "ubuntu",
@@ -892,13 +890,9 @@ mod tests {
                         "commit": SOURCE_COMMIT,
                         "version": "1"
                     }],
-                    "licenses": [{"spdx": "MIT", "path": "licenses/MIT.txt"}]
-                }]
+                "licenses": [{"spdx": "MIT", "path": "licenses/MIT.txt"}]
             });
-            let entry = PayloadCatalog::from_json(&serde_json::to_vec(&catalog).unwrap())
-                .unwrap()
-                .entries()[0]
-                .clone();
+            let entry = crate::test_entry(entry_document);
             let archive_path = temporary.path().join("fixture.zip");
             fs::write(&archive_path, &archive).unwrap();
             Self {

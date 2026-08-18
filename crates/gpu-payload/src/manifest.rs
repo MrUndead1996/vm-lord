@@ -341,7 +341,7 @@ pub(crate) fn cache_provenance(
 mod tests {
     use serde_json::{Value, json};
 
-    use crate::{CatalogEntry, PayloadCatalog, PayloadError, PayloadManifest, SourceManifest};
+    use crate::{CatalogEntry, PayloadError, PayloadManifest, SourceManifest};
 
     use super::cache_provenance;
 
@@ -349,9 +349,7 @@ mod tests {
     const COMMIT: &str = "14794180686c2fb6307fbe359c359bec765249f3";
 
     fn entry() -> CatalogEntry {
-        let catalog = json!({
-            "schema_version": 1,
-            "entries": [{
+        let entry_document = json!({
                 "payload_id": "p",
                 "target": {
                     "distribution": "ubuntu",
@@ -378,12 +376,8 @@ mod tests {
                     "spdx": "Linux-syscall-note",
                     "path": "licenses/Linux-syscall-note.txt"
                 }]
-            }]
         });
-        PayloadCatalog::from_json(&serde_json::to_vec(&catalog).unwrap())
-            .unwrap()
-            .entries()[0]
-            .clone()
+        crate::test_entry(entry_document)
     }
 
     fn file(path: &str) -> Value {

@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 use vmlord_gpu_payload::{
-    PayloadCatalog, Sha256Digest,
+    CatalogEntry, Sha256Digest,
     builder::{PackRequest, pack},
     local_archive_path,
 };
@@ -90,7 +90,7 @@ pub(crate) fn stage_release_payload(source: &Path, destination: &Path) -> Result
     let archive_path = source.join("payload.zip");
     let entry_bytes = fs::read(&entry_path)
         .map_err(|error| format!("cannot read {}: {error}", entry_path.display()))?;
-    let entry = PayloadCatalog::from_entry_json(&entry_bytes).map_err(|error| {
+    let entry = CatalogEntry::from_json(&entry_bytes).map_err(|error| {
         format!(
             "{} is not a packed catalog entry: {error}",
             entry_path.display()

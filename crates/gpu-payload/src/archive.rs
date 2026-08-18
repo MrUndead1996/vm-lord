@@ -476,7 +476,7 @@ mod tests {
 
     use zip::{CompressionMethod, System, ZipWriter, write::SimpleFileOptions};
 
-    use crate::{PayloadCatalog, PayloadError, Sha256Digest};
+    use crate::{PayloadError, Sha256Digest};
 
     use super::{extract, stream_member};
 
@@ -649,9 +649,7 @@ mod tests {
         expanded_size_limit: u64,
         file_count_limit: u64,
     ) -> crate::CatalogEntry {
-        let json = serde_json::json!({
-            "schema_version": 1,
-            "entries": [{
+        let entry_document = serde_json::json!({
                 "payload_id": "test",
                 "target": {
                     "distribution": "ubuntu",
@@ -672,12 +670,8 @@ mod tests {
                     "version": "1"
                 }],
                 "licenses": [{"spdx": "MIT", "path": "licenses/MIT.txt"}]
-            }]
         });
-        PayloadCatalog::from_json(&serde_json::to_vec(&json).unwrap())
-            .unwrap()
-            .entries()[0]
-            .clone()
+        crate::test_entry(entry_document)
     }
 
     fn extract_fixture(
