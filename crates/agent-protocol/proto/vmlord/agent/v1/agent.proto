@@ -200,6 +200,11 @@ enum GpuShareRole {
 
   // The VM's own prepared GPU payload generation.
   GPU_SHARE_ROLE_GPU_PAYLOAD = 3;
+
+  // The Microsoft D3D12 userspace, which the WSL package installs beside
+  // itself rather than into System32. On hosts old enough to have kept
+  // everything in one place there is no such share and no such directory.
+  GPU_SHARE_ROLE_WSL_D3D12 = 4;
 }
 
 // What the guest made of the manifest, share by share.

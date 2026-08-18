@@ -65,9 +65,8 @@ directory is worth the extra machinery.
 
 ## Global Constraints
 
-- This work has no Vikunja task yet. **Create one under the GPU-PV epic (#11)
-  before the first commit** and use its number in every commit subject:
-  `TASK-<No>: comment`.
+- Tracked as Vikunja **#107** under the GPU-PV epic (#11). Every commit subject
+  is `TASK-107: comment`.
 - The protocol gains an enum value, so `CURRENT_VERSION` goes from `1.5` to
   `1.6`. Major stays `1`: an agent that does not know the new role decodes it as
   `GPU_SHARE_ROLE_UNSPECIFIED` and refuses that one share, which is a session
@@ -236,7 +235,7 @@ Expected: PASS.
 
 ```bash
 git add crates/agent-protocol crates/core/src/gpu.rs crates/platform/src/agent_session.rs
-git commit -m "TASK-<No>: Give the Microsoft D3D12 userspace a share role"
+git commit -m "TASK-107: Give the Microsoft D3D12 userspace a share role"
 ```
 
 ---
@@ -431,7 +430,7 @@ Expected: PASS, no warnings.
 
 ```bash
 git add crates/platform/Cargo.toml crates/platform/src/gpu_exports.rs
-git commit -m "TASK-<No>: Export the WSL package's D3D12 libraries"
+git commit -m "TASK-107: Export the WSL package's D3D12 libraries"
 ```
 
 ---
@@ -515,7 +514,7 @@ Expected: PASS.
 
 ```bash
 git add crates/platform/src/gpu_discovery.rs
-git commit -m "TASK-<No>: Report both halves of the Linux GPU userspace"
+git commit -m "TASK-107: Report both halves of the Linux GPU userspace"
 ```
 
 ---
@@ -622,7 +621,7 @@ Expected: PASS, and the agent still cross-compiles for musl with no C toolchain.
 
 ```bash
 git add crates/agent/src
-git commit -m "TASK-<No>: Present one WSL userspace directory to the guest"
+git commit -m "TASK-107: Present one WSL userspace directory to the guest"
 ```
 
 ---
@@ -662,7 +661,7 @@ on hosts that install WSL from the Store.
 
 ```bash
 git add ARCHITECTURE.md docs/superpowers/specs
-git commit -m "TASK-<No>: Record the two sources of the WSL userspace"
+git commit -m "TASK-107: Record the two sources of the WSL userspace"
 ```
 
 ---

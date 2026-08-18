@@ -16,6 +16,12 @@ use vmlord_agent_protocol::v1::{GpuShare, GpuShareRole};
 /// DriverStore package expect to find each other where WSL puts them.
 pub const WSL_LIB: &str = "/usr/lib/wsl/lib";
 
+/// Where the WSL package's Microsoft D3D12 userspace is mounted.
+///
+/// Beside the vendor's libraries rather than among them: they are two
+/// read-only mounts and one cannot be created inside the other.
+pub const WSL_D3D12: &str = "/usr/lib/wsl/d3d12";
+
 /// The directory each driver package is mounted below, one per package.
 pub const DRIVER_ROOT: &str = "/usr/lib/wsl/drivers";
 
@@ -116,6 +122,7 @@ fn target(share: &GpuShare) -> Result<PathBuf, Refusal> {
 
     match share.role() {
         GpuShareRole::WslLib => Ok(PathBuf::from(WSL_LIB)),
+        GpuShareRole::WslD3d12 => Ok(PathBuf::from(WSL_D3D12)),
         GpuShareRole::GpuPayload => Ok(PathBuf::from(PAYLOAD)),
         GpuShareRole::DriverPackage => {
             if !is_path_component(&share.package) {
@@ -157,6 +164,7 @@ fn is_path_component(package: &str) -> bool {
 /// everything else the guest has mounted.
 pub fn is_managed(path: &Path) -> bool {
     path == Path::new(WSL_LIB)
+        || path == Path::new(WSL_D3D12)
         || path == Path::new(PAYLOAD)
         || path.parent() == Some(Path::new(DRIVER_ROOT))
 }

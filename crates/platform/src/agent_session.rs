@@ -302,6 +302,7 @@ fn probe_gpu<S: Read + Write>(
 fn wire_share(share: &vmlord_core::GpuShare) -> vmlord_agent_protocol::v1::GpuShare {
     let (role, package) = match &share.role {
         CoreShareRole::WslLib => (GpuShareRole::WslLib, String::new()),
+        CoreShareRole::WslD3d12 => (GpuShareRole::WslD3d12, String::new()),
         CoreShareRole::GpuPayload => (GpuShareRole::GpuPayload, String::new()),
         CoreShareRole::DriverPackage { package } => (GpuShareRole::DriverPackage, package.clone()),
     };
