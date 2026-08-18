@@ -34,10 +34,6 @@ so.
 writes `recipe.json` and `prepared/sources.json`. `pack` writes the archive and
 the catalog entry that describes it.
 
-Commit before building. `vmlord_revision` is this repository's `HEAD`, and a
-dirty tree means the revision in the payload describes something other than
-what was packed; `prepare.sh` warns and continues rather than deciding for you.
-
 ## What the spec holds
 
 `payload.spec.json` is the single source of truth. The builder reads provenance

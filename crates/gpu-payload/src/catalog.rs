@@ -74,8 +74,6 @@ struct CatalogEntryDocument {
     payload_manifest_sha256: Sha256Digest,
     required_renderers: Vec<RendererCapability>,
     mesa_policy: MesaPolicy,
-    vmlord_revision: String,
-    builder_version: String,
     sources: Vec<Source>,
     licenses: Vec<License>,
 }
@@ -97,8 +95,6 @@ pub struct CatalogEntry {
     payload_manifest_sha256: Sha256Digest,
     required_renderers: Vec<RendererCapability>,
     mesa_policy: MesaPolicy,
-    vmlord_revision: String,
-    builder_version: String,
     sources: Vec<Source>,
     licenses: Vec<License>,
 }
@@ -113,8 +109,6 @@ impl From<CatalogEntryDocument> for CatalogEntry {
             payload_manifest_sha256: value.payload_manifest_sha256,
             required_renderers: value.required_renderers,
             mesa_policy: value.mesa_policy,
-            vmlord_revision: value.vmlord_revision,
-            builder_version: value.builder_version,
             sources: value.sources,
             licenses: value.licenses,
         }
@@ -131,12 +125,6 @@ impl CatalogEntry {
             || self.expanded_size_limit == 0
             || self.file_count_limit == 0
             || self.required_renderers.is_empty()
-            || self.vmlord_revision.len() != 40
-            || !self
-                .vmlord_revision
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
-            || self.builder_version.is_empty()
         {
             return Err(PayloadError::InvalidCatalog(
                 "missing or invalid required catalog field".into(),
@@ -189,12 +177,6 @@ impl CatalogEntry {
     }
     pub fn mesa_policy(&self) -> &MesaPolicy {
         &self.mesa_policy
-    }
-    pub fn vmlord_revision(&self) -> &str {
-        &self.vmlord_revision
-    }
-    pub fn builder_version(&self) -> &str {
-        &self.builder_version
     }
     pub fn sources(&self) -> &[Source] {
         &self.sources
@@ -314,7 +296,7 @@ mod tests {
     const C: &str = "14794180686c2fb6307fbe359c359bec765249f3";
     fn catalog() -> String {
         format!(
-            r#"{{"schema_version":1,"entries":[{{"payload_id":"ubuntu-26.04-amd64-7.0.0-14-v1","target":{{"distribution":"ubuntu","release":"26.04","architecture":"amd64","kernel_release":"7.0.0-14-generic","payload_abi":1}},"expanded_size_limit":2,"file_count_limit":3,"archive_sha256":"{Z}","payload_manifest_sha256":"{Z}","required_renderers":["d3d12-gallium","dzn-vulkan"],"mesa_policy":"bundled","vmlord_revision":"{C}","builder_version":"vmlord-gpu-payload 1","sources":[{{"url":"https://github.com/microsoft/WSL2-Linux-Kernel","commit":"{C}","version":"1"}}],"licenses":[{{"spdx":"GPL-2.0","path":"licenses/GPL-2.0.txt"}}]}}]}}"#
+            r#"{{"schema_version":1,"entries":[{{"payload_id":"ubuntu-26.04-amd64-7.0.0-14-v1","target":{{"distribution":"ubuntu","release":"26.04","architecture":"amd64","kernel_release":"7.0.0-14-generic","payload_abi":1}},"expanded_size_limit":2,"file_count_limit":3,"archive_sha256":"{Z}","payload_manifest_sha256":"{Z}","required_renderers":["d3d12-gallium","dzn-vulkan"],"mesa_policy":"bundled","sources":[{{"url":"https://github.com/microsoft/WSL2-Linux-Kernel","commit":"{C}","version":"1"}}],"licenses":[{{"spdx":"GPL-2.0","path":"licenses/GPL-2.0.txt"}}]}}]}}"#
         )
     }
     #[test]
@@ -333,7 +315,7 @@ mod tests {
     }
     fn entry_json(distribution: &str, release: &str, architecture: &str, kernel: &str) -> String {
         format!(
-            r#"{{"payload_id":"{distribution}-{release}-{architecture}-{kernel}","target":{{"distribution":"{distribution}","release":"{release}","architecture":"{architecture}","kernel_release":"{kernel}","payload_abi":1}},"expanded_size_limit":2,"file_count_limit":3,"archive_sha256":"{Z}","payload_manifest_sha256":"{Z}","required_renderers":["d3d12-gallium"],"mesa_policy":"bundled","vmlord_revision":"{C}","builder_version":"vmlord-gpu-payload 1","sources":[{{"url":"https://github.com/microsoft/WSL2-Linux-Kernel","commit":"{C}","version":"1"}}],"licenses":[{{"spdx":"GPL-2.0","path":"licenses/GPL-2.0.txt"}}]}}"#
+            r#"{{"payload_id":"{distribution}-{release}-{architecture}-{kernel}","target":{{"distribution":"{distribution}","release":"{release}","architecture":"{architecture}","kernel_release":"{kernel}","payload_abi":1}},"expanded_size_limit":2,"file_count_limit":3,"archive_sha256":"{Z}","payload_manifest_sha256":"{Z}","required_renderers":["d3d12-gallium"],"mesa_policy":"bundled","sources":[{{"url":"https://github.com/microsoft/WSL2-Linux-Kernel","commit":"{C}","version":"1"}}],"licenses":[{{"spdx":"GPL-2.0","path":"licenses/GPL-2.0.txt"}}]}}"#
         )
     }
     fn catalog_with(entries: &[String]) -> PayloadCatalog {
@@ -432,24 +414,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn catalog_provenance_requires_vmlord_revision_and_builder_version() {
-        for field in ["vmlord_revision", "builder_version"] {
-            let mut document: serde_json::Value = serde_json::from_str(&catalog()).unwrap();
-            document["entries"][0]
-                .as_object_mut()
-                .unwrap()
-                .remove(field);
-
-            assert!(
-                matches!(
-                    PayloadCatalog::from_json(&serde_json::to_vec(&document).unwrap()),
-                    Err(PayloadError::InvalidCatalog(_))
-                ),
-                "accepted a catalog without {field}"
-            );
-        }
-    }
     #[test]
     fn the_embedded_catalog_is_valid_and_offers_the_guests_it_names() {
         // Validation is the point: every entry goes through the same checks a

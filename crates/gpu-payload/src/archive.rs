@@ -542,8 +542,6 @@ mod tests {
                 "payload_abi": 1
             },
             "mesa_policy": "bundled",
-            "vmlord_revision": SOURCE_COMMIT,
-            "builder_version": "vmlord-gpu-payload 1",
             "sources": [{
                 "url": SOURCE_URL,
                 "commit": SOURCE_COMMIT,
@@ -668,8 +666,6 @@ mod tests {
                 "payload_manifest_sha256": digest(payload),
                 "required_renderers": ["d3d12-gallium"],
                 "mesa_policy": "bundled",
-                "vmlord_revision": SOURCE_COMMIT,
-                "builder_version": "vmlord-gpu-payload 1",
                 "sources": [{
                     "url": SOURCE_URL,
                     "commit": SOURCE_COMMIT,
@@ -745,8 +741,6 @@ mod tests {
                 "payload_abi": 1
             },
             "mesa_policy": "bundled",
-            "vmlord_revision": SOURCE_COMMIT,
-            "builder_version": "vmlord-gpu-payload 1",
             "sources": [{
                 "url": SOURCE_URL,
                 "commit": SOURCE_COMMIT,

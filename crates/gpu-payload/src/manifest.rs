@@ -132,8 +132,6 @@ struct SourceManifestDocument {
     schema_version: u32,
     target: GuestTarget,
     mesa_policy: MesaPolicy,
-    vmlord_revision: String,
-    builder_version: String,
     sources: Vec<SourceRecord>,
     overlays: Vec<OverlayRecord>,
 }
@@ -176,8 +174,6 @@ impl SourceManifest {
         if doc.schema_version != 1
             || doc.target != *entry.target()
             || doc.mesa_policy != *entry.mesa_policy()
-            || doc.vmlord_revision != entry.vmlord_revision()
-            || doc.builder_version != entry.builder_version()
             || doc.sources.len() != entry.sources().len()
         {
             return Err(PayloadError::InvalidManifest(
@@ -370,8 +366,6 @@ mod tests {
                 "payload_manifest_sha256": ZERO,
                 "required_renderers": ["d3d12-gallium"],
                 "mesa_policy": "bundled",
-                "vmlord_revision": COMMIT,
-                "builder_version": "vmlord-gpu-payload 1",
                 "sources": [{
                     "url": "https://github.com/x/y",
                     "commit": COMMIT,
@@ -423,8 +417,6 @@ mod tests {
                 "payload_abi": 1
             },
             "mesa_policy": "bundled",
-            "vmlord_revision": COMMIT,
-            "builder_version": "vmlord-gpu-payload 1",
             "sources": [{
                 "url": "https://github.com/x/y",
                 "commit": COMMIT,
@@ -508,16 +500,12 @@ mod tests {
     }
 
     #[test]
-    fn sources_must_match_the_catalog_target_mesa_and_build_identity() {
-        for mutation in ["target", "mesa", "revision", "builder"] {
+    fn sources_must_match_the_catalog_target_and_mesa_policy() {
+        for mutation in ["target", "mesa"] {
             let mut document = sources();
             match mutation {
                 "target" => document["target"]["kernel_release"] = "other".into(),
                 "mesa" => document["mesa_policy"] = "distro".into(),
-                "revision" => {
-                    document["vmlord_revision"] = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()
-                }
-                "builder" => document["builder_version"] = "other builder".into(),
                 _ => unreachable!(),
             }
 
@@ -559,11 +547,6 @@ mod tests {
         assert_eq!(value["catalog_entry"]["payload_id"], "p");
         assert_eq!(value["catalog_entry"]["target"]["kernel_release"], "k");
         assert_eq!(value["catalog_entry"]["mesa_policy"], "bundled");
-        assert_eq!(value["catalog_entry"]["vmlord_revision"], COMMIT);
-        assert_eq!(
-            value["catalog_entry"]["builder_version"],
-            "vmlord-gpu-payload 1"
-        );
         assert_eq!(value["sources"], source_document);
     }
 

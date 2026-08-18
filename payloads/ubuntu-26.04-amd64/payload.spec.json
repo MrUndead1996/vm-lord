@@ -10,7 +10,6 @@
   },
   "required_renderers": ["d3d12-gallium"],
   "mesa_policy": "distro",
-  "builder_version": "vmlord-gpu-payload 0.1.0",
   "source": {
     "url": "https://github.com/microsoft/WSL2-Linux-Kernel",
     "branch": "linux-msft-wsl-6.18.y",

@@ -60,8 +60,6 @@ struct PackRecipe {
     target: GuestTarget,
     required_renderers: Vec<RendererCapability>,
     mesa_policy: MesaPolicy,
-    vmlord_revision: String,
-    builder_version: String,
     sources: Vec<RecipeSource>,
     overlays: Vec<RecipeOverlay>,
     licenses: Vec<RecipeLicense>,
@@ -109,8 +107,6 @@ struct PreparedSources {
     schema_version: u32,
     target: GuestTarget,
     mesa_policy: MesaPolicy,
-    vmlord_revision: String,
-    builder_version: String,
     sources: Vec<RecipeSource>,
     overlays: Vec<RecipeOverlay>,
 }
@@ -209,14 +205,14 @@ pub fn pack(request: PackRequest<'_>) -> Result<BuiltArtifact, PayloadError> {
                 PayloadError::InvalidManifest("expanded payload size overflow".into())
             })
         })?;
-    // Catalog limits are defensive ceilings. Tiny ZIPs can be larger than their
-    // expanded members because of headers, while catalog validation requires the
-    // expanded ceiling to be at least the archive length.
+    // Catalog limits are defensive ceilings, and the archive's own length is
+    // the floor under this one: a tiny ZIP can be larger than its expanded
+    // members because of headers, and a ceiling below that would refuse the
+    // payload this very run just built.
     let expanded_size_limit = expanded_bytes.max(archive_size);
     let file_count = u64::try_from(files.len()).unwrap_or(u64::MAX);
     let entry = catalog_entry(
         &recipe,
-        archive_size,
         expanded_size_limit,
         file_count,
         &archive_sha256,
@@ -362,7 +358,6 @@ fn write_archive(
 
 fn catalog_entry(
     recipe: &PackRecipe,
-    archive_size: u64,
     expanded_size: u64,
     file_count: u64,
     archive_sha256: &Sha256Digest,
@@ -388,8 +383,6 @@ fn catalog_entry(
         "payload_manifest_sha256": payload_manifest_sha256,
         "required_renderers": recipe.required_renderers,
         "mesa_policy": recipe.mesa_policy,
-        "vmlord_revision": recipe.vmlord_revision,
-        "builder_version": recipe.builder_version,
         "sources": sources,
         "licenses": recipe.licenses,
     })
@@ -405,8 +398,6 @@ fn validate_prepared_provenance(
     if prepared.schema_version != 1
         || prepared.target != recipe.target
         || prepared.mesa_policy != recipe.mesa_policy
-        || prepared.vmlord_revision != recipe.vmlord_revision
-        || prepared.builder_version != recipe.builder_version
         || prepared.sources != recipe.sources
         || prepared.overlays != recipe.overlays
     {
@@ -863,7 +854,7 @@ mod tests {
 
     #[test]
     fn prepared_sources_must_match_entire_recipe_provenance() {
-        for mutation in ["source", "target", "mesa", "revision", "builder"] {
+        for mutation in ["source", "target", "mesa"] {
             let fixture = PreparedFixture::new(&format!("source-provenance-{mutation}"));
             rewrite_json(
                 &fixture.prepared.join("sources.json"),
@@ -874,11 +865,6 @@ mod tests {
                     }
                     "target" => sources["target"]["kernel_release"] = "other".into(),
                     "mesa" => sources["mesa_policy"] = "distro".into(),
-                    "revision" => {
-                        sources["vmlord_revision"] =
-                            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()
-                    }
-                    "builder" => sources["builder_version"] = "other builder".into(),
                     _ => unreachable!(),
                 },
             );

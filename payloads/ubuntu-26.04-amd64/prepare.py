@@ -28,15 +28,12 @@ def main() -> None:
     parser.add_argument("--overlays", type=Path, required=True)
     parser.add_argument("--licenses", type=Path, required=True)
     parser.add_argument("--checkout", type=Path, required=True)
-    parser.add_argument("--revision", required=True)
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
 
     spec = json.loads(arguments.spec.read_text())
     if spec["schema_version"] != SCHEMA_VERSION:
         raise SystemExit(f"unknown payload spec schema version: {spec['schema_version']}")
-    if len(arguments.revision) != 40 or not all(c in "0123456789abcdef" for c in arguments.revision):
-        raise SystemExit(f"vmlord revision is not a full commit: {arguments.revision}")
 
     prepared = arguments.output / "prepared"
     if prepared.exists():
@@ -50,8 +47,6 @@ def main() -> None:
     provenance = {
         "target": spec["target"],
         "mesa_policy": spec["mesa_policy"],
-        "vmlord_revision": arguments.revision,
-        "builder_version": spec["builder_version"],
         "sources": [source_record(spec, arguments.checkout)],
         "overlays": [overlay_record(overlay, prepared) for overlay in spec["overlays"]],
     }
