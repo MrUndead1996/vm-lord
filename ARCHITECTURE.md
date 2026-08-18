@@ -2330,9 +2330,15 @@ the distribution owns.
 9p mount under its three roots, removes its `ld.so.conf.d` file and runs
 `ldconfig` once more, all best effort: a guest that is going down is not helped
 by an agent that refuses to exit because a mount was busy. The handler itself
-only sets a flag, because a signal handler may call almost nothing, and the
-backoff wait is spent in slices so that a shutdown is not held for the half
-minute a wait at the cap would take.
+sets a flag and shuts down the connection the agent is on, because a signal
+handler may call almost nothing and those are two of the things it may do. The
+flag alone would not be enough: between requests the agent sits in a read on
+that connection, `signal` installs a handler the kernel restarts a read across,
+and the socket's own idle timeout only leads to another read. `shutdown` is
+what gives the read something to return, and without it a stop waited out the
+unit's stop timeout and took a minute and a half. The backoff wait is spent in
+slices for the same reason, so that a shutdown between connections is not held
+for the half minute a wait at the cap would take.
 
 Failures are `Error { code, message }` rather than a string. The code is what a
 peer branches on -- an unsupported version, an unauthenticated session, a
