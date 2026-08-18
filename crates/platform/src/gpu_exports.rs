@@ -137,12 +137,16 @@ impl GpuExports {
     /// Not a `Result`: a host with no WSL payload and no resolvable package is
     /// a host that gets no shares, which is an answer. What went wrong on the
     /// way to it is logged where it happened.
-    pub(crate) fn build(adapters: &[HostGpuAdapter], vm_directory: &Path) -> Option<Self> {
+    pub(crate) fn build(
+        adapters: &[HostGpuAdapter],
+        vm_directory: &Path,
+        payload: Option<&Path>,
+    ) -> Option<Self> {
         let system32 = system_directory()?;
         let canonicalize = canonical_directory;
         let roots = ExportRoots::resolve(&system32, &canonicalize);
 
-        build_with_payload(adapters, &roots, vm_directory, &canonicalize)
+        build_with_payload(adapters, &roots, vm_directory, payload, &canonicalize)
     }
 }
 
@@ -394,19 +398,37 @@ pub(crate) fn build_with(
     (!exports.is_empty()).then_some(GpuExports { exports })
 }
 
-/// Adds only the exact staging child of a canonical VM directory.
+/// Adds `payload`, provided it really lies inside this VM's staging root.
+///
+/// `payload` is the generation directory staging produced, not the staging
+/// root itself: the root also holds the `ready` markers and lock files that
+/// make a swap atomic, while the guest reads `sources.json` at the root of the
+/// share it mounts. Naming the root would offer a guest a directory it finds
+/// no payload in.
+///
+/// `None` is a VM nothing was staged for, which is a set of shares without a
+/// payload rather than no shares at all.
 pub(crate) fn build_with_payload(
     adapters: &[HostGpuAdapter],
     roots: &ExportRoots,
     vm_directory: &Path,
+    payload: Option<&Path>,
     canonicalize: Canonicalize<'_>,
 ) -> Option<GpuExports> {
     let mut exports = build_with(adapters, roots, canonicalize)
         .map(|exports| exports.exports)
         .unwrap_or_default();
-    let candidate = gpu_payload_staging_directory(vm_directory);
-    if let (Ok(vm), Ok(payload)) = (canonicalize(vm_directory), canonicalize(&candidate))
-        && same_path(&vm.join("gpu-payload"), &payload)
+    if let Some(candidate) = payload
+        && let (Ok(vm), Ok(payload)) = (canonicalize(vm_directory), canonicalize(candidate))
+        // Inside the VM's own staging root and deeper than it. Outside is a
+        // reparse point aiming somewhere this VM has no business reading, and
+        // the root itself holds the `ready` markers and locks of a swap rather
+        // than a payload -- a guest mounting it would find no `sources.json`.
+        // The check is against canonical paths, so a junction cannot pass it
+        // and export elsewhere.
+        && let staging = gpu_payload_staging_directory(&vm)
+        && payload != staging
+        && is_within(&staging, &payload)
     {
         exports.insert(
             0,
@@ -497,7 +519,7 @@ mod tests {
     #[test]
     fn payload_wsl_and_driver_package_have_distinct_roles_and_order() {
         let vm = Path::new(r"D:\VMLord\dev-linux");
-        let payload = r"D:\VMLord\dev-linux\gpu-payload";
+        let payload = r"D:\VMLord\dev-linux\gpu-payload\generations\e7664769";
         let package = format!(r"{REPOSITORY}\nvltsi.inf_amd64_1");
         let canonicalize = canonicalizer(&[
             (SYSTEM32, SYSTEM32),
@@ -512,8 +534,14 @@ mod tests {
         ]);
         let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
         let roles: Vec<_> =
-            build_with_payload(&[adapter(Some(&package))], &roots, vm, &canonicalize)
-                .unwrap()
+            build_with_payload(
+                &[adapter(Some(&package))],
+                &roots,
+                vm,
+                Some(Path::new(payload)),
+                &canonicalize,
+            )
+            .unwrap()
                 .manifest()
                 .shares
                 .into_iter()
@@ -530,6 +558,61 @@ mod tests {
     }
 
     #[test]
+    fn the_staged_generation_is_what_the_payload_share_offers() {
+        // The guest reads `sources.json` at the root of the share. Staging
+        // writes it inside `generations/<digest>`, beside the `ready` markers
+        // and lock files that make the swap atomic, so the share has to name
+        // the generation rather than the staging root the guest would find
+        // nothing in.
+        let vm = Path::new(r"D:\VMLord\dev-linux");
+        let generation = r"D:\VMLord\dev-linux\gpu-payload\generations\e7664769";
+        let canonicalize = canonicalizer(&[
+            (SYSTEM32, SYSTEM32),
+            (REPOSITORY, REPOSITORY),
+            (r"D:\VMLord\dev-linux", r"D:\VMLord\dev-linux"),
+            (generation, generation),
+        ]);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+
+        let exports =
+            build_with_payload(&[], &roots, vm, Some(Path::new(generation)), &canonicalize)
+                .expect("a staged generation is something to export");
+
+        let payload = exports
+            .iter()
+            .find(|export| matches!(export.share().role, GpuShareRole::GpuPayload))
+            .expect("the payload share must be offered");
+        assert_eq!(payload.host_path(), Path::new(generation));
+    }
+
+    #[test]
+    fn a_vm_with_nothing_staged_is_offered_no_payload_share() {
+        let vm = Path::new(r"D:\VMLord\dev-linux");
+        let package = format!(r"{REPOSITORY}\nvltsi.inf_amd64_1");
+        let canonicalize = canonicalizer(&[
+            (SYSTEM32, SYSTEM32),
+            (REPOSITORY, REPOSITORY),
+            (
+                r"C:\Windows\System32\lxss\lib",
+                r"C:\Windows\System32\lxss\lib",
+            ),
+            (&package, &package),
+            (r"D:\VMLord\dev-linux", r"D:\VMLord\dev-linux"),
+        ]);
+        let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
+
+        let exports = build_with_payload(&[adapter(Some(&package))], &roots, vm, None, &canonicalize)
+            .expect("the host still has a driver package to offer");
+
+        assert!(
+            !exports
+                .iter()
+                .any(|export| matches!(export.share().role, GpuShareRole::GpuPayload)),
+            "a payload that was never staged is not a share"
+        );
+    }
+
+    #[test]
     fn a_payload_directory_reparsed_outside_its_vm_is_dropped() {
         let vm = Path::new(r"D:\VMLord\dev-linux");
         let canonicalize = canonicalizer(&[
@@ -539,7 +622,16 @@ mod tests {
             (r"D:\VMLord\dev-linux\gpu-payload", r"D:\attacker\payload"),
         ]);
         let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
-        assert!(build_with_payload(&[], &roots, vm, &canonicalize).is_none());
+        assert!(
+            build_with_payload(
+                &[],
+                &roots,
+                vm,
+                Some(&vm.join("gpu-payload")),
+                &canonicalize
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -556,7 +648,16 @@ mod tests {
         ]);
         let roots = ExportRoots::resolve(Path::new(SYSTEM32), &canonicalize);
 
-        assert!(build_with_payload(&[], &roots, vm, &canonicalize).is_none());
+        assert!(
+            build_with_payload(
+                &[],
+                &roots,
+                vm,
+                Some(&vm.join("gpu-payload")),
+                &canonicalize
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -882,7 +983,11 @@ mod tests {
         // a test that is permanently red on half the machines it runs on.
         let capabilities = crate::discover_host_gpu();
         let Some(exports) =
-            super::GpuExports::build(&capabilities.adapters, Path::new(r"C:\VMLord\ignored"))
+            super::GpuExports::build(
+                &capabilities.adapters,
+                Path::new(r"C:\VMLord\ignored"),
+                None,
+            )
         else {
             println!("nothing to export on this host");
             return;

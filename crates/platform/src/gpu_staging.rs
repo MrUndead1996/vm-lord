@@ -97,7 +97,7 @@ mod tests {
     }
 
     #[test]
-    fn the_staging_root_is_the_child_the_payload_share_exports() {
+    fn a_staged_generation_is_what_the_payload_share_exports() {
         let temporary = TemporaryDirectory::new("root");
         let vm = temporary.path().join("dev-linux");
         fs::create_dir(&vm).unwrap();
@@ -108,8 +108,6 @@ mod tests {
         assert!(root.join("generations").is_dir());
         assert!(root.join("ready").is_dir());
 
-        // The same directory has to be the one the Plan9 export accepts:
-        // staging that filled anything else would be invisible to the guest.
         let canonicalize = |path: &Path| {
             fs::canonicalize(path)
                 .map_err(|error| RepositoryError::new(format!("{}: {error}", path.display())))
@@ -117,9 +115,21 @@ mod tests {
         // No system roots: this test is about the per-VM child alone, and a
         // system directory that does not resolve leaves `ExportRoots` empty.
         let roots = ExportRoots::resolve(&temporary.path().join("no-system32"), &canonicalize);
-        let exports = build_with_payload(&[], &roots, &vm, &canonicalize).unwrap();
 
+        // A generation is what the guest mounts: `sources.json` lives at the
+        // root of the share, and staging writes it inside the generation.
+        let generation = root.join("generations").join("e7664769");
+        fs::create_dir_all(&generation).unwrap();
+        let exports =
+            build_with_payload(&[], &roots, &vm, Some(&generation), &canonicalize).unwrap();
         assert_eq!(exports.manifest().shares[0], GpuShare::payload());
+
+        // The staging root itself is not: a guest mounting it would find
+        // `generations` and `ready` and no payload.
+        assert!(
+            build_with_payload(&[], &roots, &vm, Some(&root), &canonicalize).is_none(),
+            "the staging root holds the machinery of a swap, not a payload"
+        );
     }
 
     #[test]

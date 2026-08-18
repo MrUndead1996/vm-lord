@@ -23,6 +23,8 @@ use vmlord_core::{
     HostGpuAdapter, NativeGpuDetail,
 };
 
+use vmlord_gpu_payload::StagedGpuPayload;
+
 use crate::{
     HcsClient,
     gpu_enumerate::partition_adapters,
@@ -61,7 +63,7 @@ pub(crate) fn prepare(
         return None;
     }
 
-    let payload_staged = stage(mapping, vm_directory, executable_directory, cache_root, cancel);
+    let staged = stage(mapping, vm_directory, executable_directory, cache_root, cancel);
     let adapters = partition_adapters().unwrap_or_else(|error| {
         log::warn!(
             "the GPU adapters of this host could not be enumerated for VM \"{}\": {error}",
@@ -72,13 +74,23 @@ pub(crate) fn prepare(
     // The grants are asked for before anything is offered, and every one of
     // them is expected to be refused: these paths live under `System32`. See
     // `GpuExports::granted_to` for why that is not a problem.
-    let exports = GpuExports::build(&adapters, vm_directory).map(|exports| {
+    let exports = GpuExports::build(
+        &adapters,
+        vm_directory,
+        staged.as_ref().map(StagedGpuPayload::generation_directory),
+    )
+    .map(|exports| {
         exports.granted_to(&mapping.hcs_compute_system_id, &|id, path| {
             HcsClient::new().grant_vm_access(id, path)
         })
     });
 
-    let assignment = coverage(&adapters, exports.as_ref(), payload_staged, mapping.gpu_mode);
+    let assignment = coverage(
+        &adapters,
+        exports.as_ref(),
+        staged.is_some(),
+        mapping.gpu_mode,
+    );
     let manifest = exports
         .as_ref()
         .map(GpuExports::manifest)
@@ -171,25 +183,25 @@ pub(crate) fn coverage(
     }
 }
 
-/// Stages the payload, and answers whether the VM has one.
+/// Stages the payload, and answers with the generation it staged.
 ///
-/// A failure is logged and nothing more. The catalog compiled into this build
-/// may have no entry for this guest at all -- today it has none for anyone --
-/// and a VM whose guest cannot render is still a VM that runs.
+/// `None` is a VM with no payload: a guest VMLord cannot identify, or a
+/// catalog with no entry for the one it can. A failure is logged and nothing
+/// more -- a VM whose guest cannot render is still a VM that runs.
 fn stage(
     mapping: &VmComputeSystemMapping,
     vm_directory: &Path,
     executable_directory: &Path,
     cache_root: &Path,
     cancel: &AtomicBool,
-) -> bool {
+) -> Option<StagedGpuPayload> {
     let Some(target) = &mapping.guest_target else {
         log::info!(
             "VM \"{}\" was not built from a cloud image, so VMLord has no GPU payload to \
              stage for it",
             mapping.vm_name
         );
-        return false;
+        return None;
     };
 
     match stage_for_vm(StageGpuPayloadRequest {
@@ -205,18 +217,19 @@ fn stage(
     }) {
         Ok(staged) => {
             log::info!(
-                "VM \"{}\" is staged with GPU payload {}",
+                "VM \"{}\" is staged with GPU payload {} at {}",
                 mapping.vm_name,
-                staged.payload_id()
+                staged.payload_id(),
+                staged.generation_directory().display()
             );
-            true
+            Some(staged)
         }
         Err(error) => {
             log::warn!(
                 "no GPU payload was staged for VM \"{}\": {error}",
                 mapping.vm_name
             );
-            false
+            None
         }
     }
 }

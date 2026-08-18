@@ -1188,9 +1188,16 @@ recipe below, and task 98 owns lifecycle and UI orchestration.
 `platform::gpu_staging` is what fills that child: given the executable's
 directory, the shared cache root, a VM directory and the guest triple recorded
 with the VM, it selects the entry, prepares the generation and stages it into
-`layout::gpu_payload_staging_directory` -- the same path `gpu_exports`
-canonicalizes. `gpu_prepare` calls it as the first step of every start of a VM
-that asks for a GPU.
+`layout::gpu_payload_staging_directory`. `gpu_prepare` calls it as the first
+step of every start of a VM that asks for a GPU.
+
+What is exported is the **generation** staging produced, not the staging root:
+the root also holds the `ready` markers and lock files that make a swap atomic,
+while the guest reads `sources.json` at the root of the share it mounts.
+Offering the root gives a guest a directory it finds no payload in, which is
+what the first real host reported as nine skipped recipe stages. The export is
+accepted only if it canonicalizes to something strictly inside this VM's
+staging root.
 
 The catalog is selected by distribution, release and architecture, and never by
 kernel: the host chooses a payload before the guest that will run it has
