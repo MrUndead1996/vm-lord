@@ -1166,33 +1166,55 @@ mode takes a full VM restart.
 
 `vmlord-gpu-payload` is portable: it validates an exact guest target tuple,
 verifies content-addressed ZIP archives, and exposes only an opaque
-`ReadyGpuPayload` after every cache hit has been rehashed. Its embedded
-schema-v1 production catalog is still empty: what the guest does with a payload
-is written below, but an entry needs an archive that has been packed with
-`cargo xtask gpu-payload pack` and published somewhere with its digest, which
-is neither code nor a decision any of these tasks makes. Nothing therefore
-selects a payload in a built release yet. Release tooling creates sorted ZIP
-content and deterministic provenance without making the archive digest
+`ReadyGpuPayload` after every cache hit has been rehashed. It has no network in
+it and no catalog compiled into it. Release tooling creates sorted ZIP content
+and deterministic provenance without making the archive digest
 self-referential.
 
-A payload normally reaches a host as a file rather than as a download.
+A payload reaches a host as a pair of files beside `vmlord.exe`, both named by
+the payload's own ID:
+
+```
+gpu-payload/ubuntu-26.04-amd64-7.0.0-28-v1.json
+gpu-payload/ubuntu-26.04-amd64-7.0.0-28-v1.zip
+```
+
 `cargo dist --gpu-payload <directory>` takes what `pack` wrote -- `payload.zip`
 beside `catalog-entry.json` -- re-reads the entry through
-`PayloadCatalog::from_entry_json`, checks the archive against the size and
-digest it claims, and copies it to `gpu-payload/<payload_id>.zip` beside the
-executable. The entry itself does not travel: the catalog the application
-trusts is the one compiled into it, and a second catalog on disk would be one
-an attacker can edit. `local_archive_path` states that layout once, for the
-build tool placing the file and the application reading it alike.
+`CatalogEntry::from_json`, hashes the archive against the `archive_sha256` that
+entry claims, and copies both files into place. `release.rs` states the layout
+once, as `local_archive_path` and `local_entry_path`, for the build tool
+placing the files and the application reading them alike.
 
-`PrepareRequest::local_archive` is what the application passes. A file that is
-there is prepared from with no network access at all; a file that is not there
-falls back to `archive_url`; a file that is there and does not match its entry
-is an error rather than a reason to go online. Verification does not soften for
-a local archive -- the same digest, the same expansion limits, the same
-`payload.json` and `sources.json` cross-check against the entry's provenance.
-`archive_url` therefore keeps one meaning, where these bytes are published, and
-serves as both the fallback and the way to replace a payload between releases.
+`PayloadCatalog::from_release_directory` assembles the catalog at runtime from
+that directory, which is derived from `current_exe` and from nothing else --
+never from a user directory and never from configuration. Each `*.json` is one
+entry document with a `schema_version` of its own, currently `2`, because an
+entry is now a release artifact rather than a fragment waiting to be pasted
+into a larger document. A file must be named for the `payload_id` it contains
+and must have its archive beside it.
+
+**A missing catalog is an empty catalog.** No `gpu-payload` directory, an empty
+one, or one that cannot be listed: the catalog has no entries, selection
+answers `NoPayloadForGuest`, and the VM starts without GPU support. A build
+without a payload is a build without GPU, and GPU assignment is best effort. A
+file that *is* there and is wrong -- unreadable JSON, a failed validation, a
+name that is not its `payload_id`, a missing archive -- fails the catalog,
+because that is a broken release and a silent absence is the worst way to learn
+of one. An archive no entry claims is ignored.
+
+`PrepareRequest::archive` is required: there is no second source, and a file
+that is not there is an error. Verification is the archive's `archive_sha256`,
+the expansion limits, and the `payload.json` and `sources.json` cross-check
+against the entry's provenance. The archive's length is measured rather than
+claimed -- a digest pins a length as surely as it pins content, so the entry
+does not state one, and the measured length is what caps the sum of the
+members' compressed sizes.
+
+The trust model changed deliberately with this layout. An entry is no longer
+trusted for being compiled into the executable; it is trusted because whoever
+can write into the installation directory can equally replace `vmlord.exe`
+itself. The boundary does not move -- it becomes visible.
 
 Ready content is materialized below a VM's exact `gpu-payload` child as
 `generations/<digest>` followed by `ready/<digest>.json`. The third logical

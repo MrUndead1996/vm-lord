@@ -22,12 +22,13 @@ wants:
 cargo dist --gpu-payload target/gpu-payload
 ```
 
-`dist` re-reads `catalog-entry.json`, checks `payload.zip` against the size and
-digest it claims, and copies the archive to `gpu-payload/<payload_id>.zip`
-beside `vmlord.exe`, which is where the application looks for it. The entry
-itself does not travel: the catalog the application trusts is the one compiled
-into it. Without the argument `dist` builds a release with no payload and says
-so.
+`dist` re-reads `catalog-entry.json` through the crate's own validation, hashes
+`payload.zip` against the digest that entry claims, and copies **both** files
+beside `vmlord.exe` — `gpu-payload/<payload_id>.json` and
+`gpu-payload/<payload_id>.zip`. That pair is the catalog: the application has
+none compiled into it and assembles one from that directory at startup. Without
+the argument `dist` builds a release with no payload and says so, and such a
+release simply starts VMs without GPU support.
 
 `prepare.sh` fetches the pinned upstream commit (cached under
 `<output>/upstream`, so a second run costs nothing), lays the tree out, and

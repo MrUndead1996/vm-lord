@@ -10,6 +10,20 @@
 
 **Spec:** `docs/superpowers/specs/2026-08-18-gpu-payload-runtime-catalog-design.md`
 
+## Execution notes
+
+* Tasks 5 and 6 were committed together. `PayloadCatalog::embedded` reads a
+  multi-entry catalog document, so deleting `from_json` leaves it without a
+  reader; splitting the two would have left the tree uncompilable between
+  commits, which the last constraint below forbids.
+* `builder::tests::archive_members_are_lexically_sorted_with_fixed_metadata`
+  and `builder::tests::prepared_paths_cannot_collide_on_windows` fail on this
+  machine **before** any of this work, and still do. They build fixtures under
+  the Windows temp directory, where NTFS is case-insensitive and permissions
+  come back `0664` rather than `0644`. They compile only with the `builder`
+  feature, which is why `cargo test-windows` alone is green and
+  `cargo test-windows -p xtask` is not. Not this task's to fix.
+
 ## Global Constraints
 
 * Every commit subject is prefixed `TASK-109: ` (AGENTS.md).
@@ -37,7 +51,7 @@ Deletes `download.rs`, the `ureq` dependency, and the fallback branch in `prepar
 - Consumes: nothing from earlier tasks.
 - Produces: `PrepareRequest { entry: &CatalogEntry, cache_root: &Path, archive: &Path, progress: &dyn Fn(PayloadProgress), cancel: &AtomicBool }`; `PayloadProgress::{Verifying { hashed: u64, total: u64 }, Extracting { files: u64, total: u64 }, Staging { files: u64, total: u64 }, Ready}` re-exported from `crate::progress`.
 
-- [ ] **Step 1: Rewrite the cache tests that drove the download branch**
+- [x] **Step 1: Rewrite the cache tests that drove the download branch**
 
 In `crates/gpu-payload/src/cache.rs`, the tests that passed `local_archive: None` or asserted on `PayloadProgress::Connecting` are testing a branch that is about to not exist. Replace them with the same assertions expressed over the required archive. Rename `Fixture::archive_path` usage stays as is.
 
@@ -89,12 +103,12 @@ Add the case the removed fallback used to hide:
 
 Delete `a_missing_local_archive_falls_back_to_the_published_url` outright — the behaviour it names is being removed. In the remaining tests (`a_local_archive_is_prepared_without_reaching_the_network`, `a_local_archive_that_does_not_match_the_entry_fails_instead_of_downloading`, `a_truncated_local_archive_fails_on_its_length`, and every other `PrepareRequest` literal in the module) replace `local_archive: Some(&path)` with `archive: &path` and `local_archive: None` with `archive: &fixture.archive_path`, and drop any `PayloadProgress::Connecting` assertion and the `connected` flag that fed it.
 
-- [ ] **Step 2: Run the tests to watch them fail**
+- [x] **Step 2: Run the tests to watch them fail**
 
 Run: `cargo test-windows -p vmlord-gpu-payload`
 Expected: compile errors — `PrepareRequest` has no field `archive`, `local_archive` is missing from the literals.
 
-- [ ] **Step 3: Move `PayloadProgress` into `progress.rs`**
+- [x] **Step 3: Move `PayloadProgress` into `progress.rs`**
 
 Create `crates/gpu-payload/src/progress.rs`:
 
@@ -114,7 +128,7 @@ pub enum PayloadProgress {
 }
 ```
 
-- [ ] **Step 4: Delete the download module and its dependency**
+- [x] **Step 4: Delete the download module and its dependency**
 
 ```bash
 git rm crates/gpu-payload/src/download.rs
@@ -124,7 +138,7 @@ In `crates/gpu-payload/src/lib.rs`, replace `mod download;` with `mod progress;`
 
 In `crates/gpu-payload/Cargo.toml`, delete the `ureq` line. Leave `url` — Task 2 removes it with `archive_url`.
 
-- [ ] **Step 5: Make the archive required in `prepare`**
+- [x] **Step 5: Make the archive required in `prepare`**
 
 In `crates/gpu-payload/src/cache.rs`, drop `download::LockedArchive` from the `use crate::{...}` list, and replace the `local_archive` field with:
 
@@ -150,11 +164,11 @@ Replace the `match request.local_archive.filter(...)` block (cache.rs:94-113) wi
     );
 ```
 
-- [ ] **Step 6: Fix the one out-of-crate caller**
+- [x] **Step 6: Fix the one out-of-crate caller**
 
 In `crates/platform/src/gpu_staging.rs`, `local_archive: Some(&archive)` becomes `archive: &archive`.
 
-- [ ] **Step 7: Run the tests**
+- [x] **Step 7: Run the tests**
 
 Run: `cargo test-windows -p vmlord-gpu-payload -p vmlord-platform`
 Expected: PASS.
@@ -162,7 +176,7 @@ Expected: PASS.
 Run: `cargo check-windows`
 Expected: no errors.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add -A
@@ -183,18 +197,18 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: Task 1's `PrepareRequest`.
 - Produces: `CatalogEntry` with no `archive_url` accessor; `validate_url` gone.
 
-- [ ] **Step 1: Delete the test that pins the removed rule, and the field from every literal**
+- [x] **Step 1: Delete the test that pins the removed rule, and the field from every literal**
 
 In `crates/gpu-payload/src/builder.rs` delete `recipe_archive_url_must_be_immutable_https` (builder.rs:1077). In `crates/gpu-payload/src/catalog.rs` delete any test asserting on URL validation.
 
 Remove the `"archive_url": ...` line from every JSON literal: `catalog.rs` (the `catalog()` and `entry_json` helpers), `cache.rs:900`, `staging.rs:1031`, `archive.rs:664`, `manifest.rs:367`, and from `crates/gpu-payload/tests/fixtures/recipe.json`, `crates/gpu-payload/catalog/catalog.json` and `payloads/ubuntu-26.04-amd64/payload.spec.json`.
 
-- [ ] **Step 2: Run the tests to watch them fail**
+- [x] **Step 2: Run the tests to watch them fail**
 
 Run: `cargo test-windows -p vmlord-gpu-payload`
 Expected: FAIL — `InvalidCatalog("missing field \`archive_url\`")` from the entry documents.
 
-- [ ] **Step 3: Remove the field**
+- [x] **Step 3: Remove the field**
 
 In `crates/gpu-payload/src/catalog.rs` delete `archive_url` from `CatalogEntryDocument`, `CatalogEntry`, the `From` impl, the `archive_url()` accessor, the `validate_url(&self.archive_url)?` call in `validate`, the `validate_url` function itself, and `use url::Url;`.
 
@@ -202,12 +216,12 @@ In `crates/gpu-payload/src/builder.rs` delete the `archive_url` field from `Pack
 
 In `crates/gpu-payload/Cargo.toml` delete the `url` dependency.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test-windows -p vmlord-gpu-payload`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -230,7 +244,7 @@ The declared size backed two mechanisms. Both now take the length of the file on
 - Consumes: Task 2's `CatalogEntry`.
 - Produces: `pub(crate) fn extract(entry: &CatalogEntry, archive: &Path, archive_length: u64, destination: &Path, progress: &dyn Fn(PayloadProgress), cancel: &AtomicBool) -> Result<(PayloadManifest, SourceManifest), PayloadError>`; `CatalogEntry` with no `archive_size()`.
 
-- [ ] **Step 1: Move the compressed-size limit onto `extract`'s argument in the tests**
+- [x] **Step 1: Move the compressed-size limit onto `extract`'s argument in the tests**
 
 The guard at `archive.rs:199-204` refuses an archive whose central directory claims more compressed bytes than the archive holds. It keeps its test lever by taking the length as an argument rather than reading it from the entry: the caller is the one holding the file, and one caller measuring beats an entry claiming.
 
@@ -265,7 +279,7 @@ In `crates/gpu-payload/src/archive.rs` change the test helpers so `entry(...)` n
 
 Every other call site of `entry(...)` in that module drops its third argument. `compressed_and_expanded_limits_are_enforced` keeps both halves unchanged — it already passes `1` and `archive.len() as u64` as that position.
 
-- [ ] **Step 2: Add the cache test that pins what replaces the declared size**
+- [x] **Step 2: Add the cache test that pins what replaces the declared size**
 
 In `crates/gpu-payload/src/cache.rs`:
 
@@ -297,12 +311,12 @@ Rename `a_truncated_local_archive_fails_on_its_length` to `a_truncated_archive_f
 
 Then remove `"archive_size": ...` from every JSON literal named in Task 2 Step 1, plus `crates/gpu-payload/catalog/catalog.json`.
 
-- [ ] **Step 3: Run the tests to watch them fail**
+- [x] **Step 3: Run the tests to watch them fail**
 
 Run: `cargo test-windows -p vmlord-gpu-payload`
 Expected: FAIL — `extract` takes five arguments, `archive_size` is a missing field.
 
-- [ ] **Step 4: Remove the field and measure instead**
+- [x] **Step 4: Remove the field and measure instead**
 
 In `crates/gpu-payload/src/catalog.rs` delete `archive_size` from `CatalogEntryDocument`, `CatalogEntry`, the `From` impl, the `archive_size()` accessor, and both conditions that mention it in `validate` (`self.archive_size == 0` and `self.expanded_size_limit < self.archive_size`).
 
@@ -349,12 +363,12 @@ In `crates/xtask/src/gpu_payload.rs` delete the size comparison from `stage_rele
 
 `PayloadError::ArchiveSizeMismatch` stays. Update its doc-adjacent use: it now only reports a source file that changed length while being copied.
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `cargo test-windows -p vmlord-gpu-payload -p xtask`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add -A
@@ -377,18 +391,18 @@ They existed to be cross-checked against each other. With the entry silent, a se
 - Consumes: Task 3's `CatalogEntry`.
 - Produces: `CatalogEntry` with no `vmlord_revision()` or `builder_version()`; `sources.json` at `schema_version: 1` with fields `target`, `mesa_policy`, `sources`, `overlays` only.
 
-- [ ] **Step 1: Delete the tests that pin the cross-check**
+- [x] **Step 1: Delete the tests that pin the cross-check**
 
 Delete `catalog_provenance_requires_vmlord_revision_and_builder_version` (catalog.rs:484). In `crates/gpu-payload/src/manifest.rs` remove the `"vmlord_revision"` and `"builder"` cases from the mismatch-driving test at manifest.rs:520-522 and the two assertions at manifest.rs:564-566. In `crates/gpu-payload/src/builder.rs` remove the `"vmlord_revision"`/`"builder"` cases at builder.rs:881-884.
 
 Remove both fields from every JSON literal in `catalog.rs`, `cache.rs`, `staging.rs`, `archive.rs`, `manifest.rs` (both the entry literals and the `sources.json` literals), and from `crates/gpu-payload/tests/fixtures/recipe.json`, `crates/gpu-payload/tests/fixtures/prepared/sources.json`, `crates/gpu-payload/catalog/catalog.json` and `payloads/ubuntu-26.04-amd64/payload.spec.json`.
 
-- [ ] **Step 2: Run the tests to watch them fail**
+- [x] **Step 2: Run the tests to watch them fail**
 
 Run: `cargo test-windows -p vmlord-gpu-payload`
 Expected: FAIL — missing fields in the entry and in `sources.json` (`deny_unknown_fields` makes the reverse fail too).
 
-- [ ] **Step 3: Remove the fields**
+- [x] **Step 3: Remove the fields**
 
 In `crates/gpu-payload/src/catalog.rs`: both fields from `CatalogEntryDocument`, `CatalogEntry`, the `From` impl, both accessors, and the four `validate` conditions that check the revision's 40 hex digits and the builder version's emptiness.
 
@@ -402,12 +416,12 @@ In `payloads/ubuntu-26.04-amd64/prepare.sh`: the `revision="$(git -C "$repositor
 
 In `payloads/ubuntu-26.04-amd64/README.md`: delete the "Commit before building. `vmlord_revision` is this repository's `HEAD` …" paragraph.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test-windows -p vmlord-gpu-payload`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -430,7 +444,7 @@ The entry becomes a release artifact with its own version, and the crate reads i
 - Consumes: Task 4's `CatalogEntry`.
 - Produces: `impl CatalogEntry { pub fn from_json(bytes: &[u8]) -> Result<Self, PayloadError> }` reading a single entry document at `schema_version: 2`; `fn PayloadCatalog::from_entries(entries: Vec<CatalogEntry>) -> Result<PayloadCatalog, PayloadError>` (private to the crate); `PayloadCatalog::from_json` and `from_entry_json` no longer exist; `#[cfg(test)] pub(crate) fn test_entry(value: serde_json::Value) -> CatalogEntry` in `catalog.rs`.
 
-- [ ] **Step 1: Write the failing tests for the new reader**
+- [x] **Step 1: Write the failing tests for the new reader**
 
 In `crates/gpu-payload/src/catalog.rs`'s `mod tests`, replace the document-shaped helpers with entry-shaped ones and add:
 
@@ -488,7 +502,7 @@ Add the shared test constructor so the other modules stop spelling the document 
 
 placed in `catalog.rs` outside `mod tests` behind `#[cfg(test)]`, and re-exported from `lib.rs` as `#[cfg(test)] pub(crate) use catalog::test_entry;`.
 
-- [ ] **Step 2: Point every other test module at it**
+- [x] **Step 2: Point every other test module at it**
 
 In `cache.rs`, `staging.rs`, `archive.rs` and `manifest.rs`, replace each
 
@@ -501,12 +515,12 @@ In `cache.rs`, `staging.rs`, `archive.rs` and `manifest.rs`, replace each
 
 with `let entry = crate::test_entry(entry_value);`, where `entry_value` is the former `catalog["entries"][0]` object literal — that is, delete the `{"schema_version": 1, "entries": [ ... ]}` wrapper and keep the object inside it.
 
-- [ ] **Step 3: Run the tests to watch them fail**
+- [x] **Step 3: Run the tests to watch them fail**
 
 Run: `cargo test-windows -p vmlord-gpu-payload`
 Expected: FAIL — `CatalogEntry::from_json` and `test_entry` do not exist.
 
-- [ ] **Step 4: Implement the reader**
+- [x] **Step 4: Implement the reader**
 
 In `crates/gpu-payload/src/catalog.rs`:
 
@@ -540,12 +554,12 @@ In `crates/gpu-payload/src/builder.rs`, `catalog_entry` emits `"schema_version":
 
 In `crates/xtask/src/gpu_payload.rs`, `PayloadCatalog::from_entry_json(&entry_bytes)` becomes `CatalogEntry::from_json(&entry_bytes)`; adjust the `use` list.
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `cargo test-windows -p vmlord-gpu-payload -p xtask`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add -A
@@ -567,7 +581,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: Task 5's `CatalogEntry::from_json` and `PayloadCatalog::from_entries`.
 - Produces: `PayloadCatalog::from_release_directory(directory: &Path) -> Result<PayloadCatalog, PayloadError>`, where `directory` is the executable's; `release::local_entry_path(directory: &Path, payload_id: &str) -> PathBuf`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In `crates/gpu-payload/src/release.rs`'s `mod tests`:
 
@@ -692,12 +706,12 @@ In `crates/gpu-payload/src/catalog.rs`'s `mod tests`, add a temporary-directory 
 
 Note `entry_json`'s `payload_id` is `"{distribution}-{release}-{architecture}-{kernel}"`, which is why the file names above read as they do.
 
-- [ ] **Step 2: Run the tests to watch them fail**
+- [x] **Step 2: Run the tests to watch them fail**
 
 Run: `cargo test-windows -p vmlord-gpu-payload`
 Expected: FAIL — `from_release_directory` and `local_entry_path` do not exist.
 
-- [ ] **Step 3: Implement the layout rule**
+- [x] **Step 3: Implement the layout rule**
 
 In `crates/gpu-payload/src/release.rs`:
 
@@ -719,7 +733,7 @@ pub(crate) fn local_payload_directory(directory: &Path) -> PathBuf {
 }
 ```
 
-- [ ] **Step 4: Implement the reader**
+- [x] **Step 4: Implement the reader**
 
 In `crates/gpu-payload/src/catalog.rs`:
 
@@ -775,13 +789,13 @@ impl PayloadCatalog {
 
 `use std::{ffi::OsStr, fs, path::Path};` joins the module's imports. `PayloadCatalog::embedded` is deleted.
 
-- [ ] **Step 5: Delete the compiled-in catalog**
+- [x] **Step 5: Delete the compiled-in catalog**
 
 ```bash
 git rm crates/gpu-payload/catalog/catalog.json
 ```
 
-- [ ] **Step 6: Point the staging service at the release directory**
+- [x] **Step 6: Point the staging service at the release directory**
 
 In `crates/platform/src/gpu_staging.rs`, `let catalog = PayloadCatalog::embedded()?;` becomes:
 
@@ -791,7 +805,7 @@ In `crates/platform/src/gpu_staging.rs`, `let catalog = PayloadCatalog::embedded
 
 The existing test `a_guest_the_catalog_has_nothing_for_stages_nothing` keeps its meaning and gains a sharper one — its `executable_directory` is a temporary directory with no `gpu-payload` child, so it now exercises the empty-catalog rule end to end. Update its comment to say so.
 
-- [ ] **Step 7: Run the tests**
+- [x] **Step 7: Run the tests**
 
 Run: `cargo test-windows -p vmlord-gpu-payload -p vmlord-platform`
 Expected: PASS.
@@ -799,7 +813,7 @@ Expected: PASS.
 Run: `cargo check-windows`
 Expected: no errors.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add -A
@@ -820,7 +834,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: Task 6's `local_entry_path` and `local_archive_path`.
 - Produces: `stage_release_payload(source: &Path, destination: &Path) -> Result<String, String>` writing two files.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In `crates/xtask/src/gpu_payload.rs`'s `mod tests`, extend the test that copies a valid pair (currently asserting on `gpu-payload/<id>.zip` around gpu_payload.rs:299):
 
@@ -848,12 +862,12 @@ In `crates/xtask/src/gpu_payload.rs`'s `mod tests`, extend the test that copies 
         );
 ```
 
-- [ ] **Step 2: Run the test to watch it fail**
+- [x] **Step 2: Run the test to watch it fail**
 
 Run: `cargo test-windows -p xtask`
 Expected: FAIL — `<id>.json` is not there.
 
-- [ ] **Step 3: Copy both files**
+- [x] **Step 3: Copy both files**
 
 In `stage_release_payload`, after the digest check, write the entry as well:
 
@@ -880,12 +894,12 @@ In `crates/xtask/src/main.rs`, the line printed after staging becomes:
         println!("dist: gpu-payload/{payload_id}.zip and gpu-payload/{payload_id}.json");
 ```
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test-windows -p xtask`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
@@ -905,7 +919,7 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 - Consumes: every task above.
 - Produces: nothing code depends on.
 
-- [ ] **Step 1: Rewrite the payload section of ARCHITECTURE.md**
+- [x] **Step 1: Rewrite the payload section of ARCHITECTURE.md**
 
 Find the passage at ARCHITECTURE.md:1190 describing the local archive with `archive_url` as fallback. Replace the whole local-archive/URL discussion with the runtime catalog, keeping the document's voice:
 
@@ -916,7 +930,7 @@ Find the passage at ARCHITECTURE.md:1190 describing the local archive with `arch
 * the trust model: the entry is no longer trusted for being compiled in; whoever can write into the installation directory can equally replace the executable, so the boundary is unchanged and now visible. Reading a payload from a user directory or from configuration stays refused — the directory comes from `current_exe` through `release.rs` and nowhere else;
 * the archive is checked by `archive_sha256` alone; its length is measured, not claimed.
 
-- [ ] **Step 2: Rewrite the payload README**
+- [x] **Step 2: Rewrite the payload README**
 
 In `payloads/ubuntu-26.04-amd64/README.md`:
 
@@ -924,7 +938,7 @@ In `payloads/ubuntu-26.04-amd64/README.md`:
 * delete the "Before this can be published" section entirely: there is no URL and nothing to publish, and the catalog is no longer pasted into the crate;
 * in "What the spec holds", the builder still reads provenance twice and refuses a disagreeing pair — that is about `sources`, `overlays` and `target`, which stay.
 
-- [ ] **Step 3: Verify the whole workspace**
+- [x] **Step 3: Verify the whole workspace**
 
 Run: `cargo check-windows`
 Expected: no errors.
@@ -940,7 +954,7 @@ grep -rn "archive_url\|vmlord_revision\|builder_version\|embedded()\|from_entry_
 
 Expected: no hits outside the design document, which records history deliberately.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add -A
