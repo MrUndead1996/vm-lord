@@ -84,6 +84,13 @@ pub(crate) struct AgentSession {
     pub(crate) version: ProtocolVersion,
     /// The capabilities both peers have, which is the only set either may use.
     pub(crate) capabilities: Vec<Capability>,
+    /// The agent build that is speaking, for logs only.
+    ///
+    /// Kept because an agent is installed once, at a VM's first boot, and then
+    /// outlives any number of host rebuilds. Which build is answering is
+    /// otherwise invisible, and guessing at it costs a real-host round trip
+    /// every time.
+    pub(crate) build: String,
 }
 
 /// Runs the hello exchange and the challenge, in that order.
@@ -110,8 +117,9 @@ pub(crate) fn open<S: Read + Write>(
     authenticate(stream, secret, vm_name, &mut buffer)?;
 
     log::info!(
-        "the agent of VM \"{vm_name}\" opened a session on protocol {}.{} with {} \
-         agreed capability(ies)",
+        "the agent of VM \"{vm_name}\" is build \"{}\" and opened a session on protocol \
+         {}.{} with {} agreed capability(ies)",
+        session.build,
         session.version.major,
         session.version.minor,
         session.capabilities.len()
@@ -488,8 +496,7 @@ fn greet<S: Read + Write>(
     let capabilities = handshake::agreed_capabilities(HOST_CAPABILITIES, &hello.capabilities);
 
     log::debug!(
-        "the agent of VM \"{vm_name}\" is build \"{}\" and speaks protocol {}.{}",
-        hello.agent_version,
+        "the agent of VM \"{vm_name}\" speaks protocol {}.{}",
         remote.major,
         remote.minor
     );
@@ -505,6 +512,7 @@ fn greet<S: Read + Write>(
     Ok(AgentSession {
         version,
         capabilities,
+        build: hello.agent_version,
     })
 }
 
@@ -902,13 +910,17 @@ mod tests {
         }
     }
 
+    /// A stamp of the shape a real agent sends: version plus the revision it
+    /// was built from, which is the part that tells two builds apart.
+    const AGENT_BUILD: &str = "0.1.0+e02e08e129b8";
+
     fn hello(version: ProtocolVersion, capabilities: &[Capability]) -> Envelope {
         Envelope::request(
             7,
             request::Kind::Hello(HelloRequest {
                 version: Some(version),
                 capabilities: capabilities.iter().copied().map(i32::from).collect(),
-                agent_version: "0.1.0".to_owned(),
+                agent_version: AGENT_BUILD.to_owned(),
             }),
         )
     }
@@ -937,6 +949,11 @@ mod tests {
 
         assert_eq!(session.version, ProtocolVersion::current());
         assert!(session.capabilities.is_empty());
+        assert_eq!(
+            session.build, AGENT_BUILD,
+            "the build the guest named is what the session log reports, and it \
+             is the only way to tell which agent a VM is running"
+        );
         let Some(envelope::Body::Response(ref response)) = guest.answer_to(7).body else {
             panic!("the hello should have been answered");
         };
@@ -1515,6 +1532,7 @@ mod tests {
         let session = AgentSession {
             version: ProtocolVersion::current(),
             capabilities: Vec::new(),
+            build: String::new(),
         };
 
         serve(&mut stream, &session, None, VM, &|_| {}).expect("an idle boundary is not a failed session");
