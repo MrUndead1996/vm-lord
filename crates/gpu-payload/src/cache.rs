@@ -20,6 +20,16 @@ static NEXT_OPERATION: AtomicU64 = AtomicU64::new(0);
 pub struct PrepareRequest<'a> {
     pub entry: &'a CatalogEntry,
     pub cache_root: &'a Path,
+    /// The archive this build ships beside its executable, when it has one.
+    ///
+    /// A path naming a regular file is prepared from without any network
+    /// access at all. A path naming nothing falls back to `archive_url`: a
+    /// build that shipped without its payload is not broken, only online. A
+    /// file that is present and does not match the entry is an error --
+    /// falling back would put a host on the network exactly when someone
+    /// arranged for it not to be, and would hide a substituted release
+    /// artifact behind a successful start.
+    pub local_archive: Option<&'a Path>,
     pub progress: &'a dyn Fn(PayloadProgress),
     pub cancel: &'a AtomicBool,
 }
@@ -81,18 +91,29 @@ pub fn prepare(request: PrepareRequest<'_>) -> Result<ReadyGpuPayload, PayloadEr
         }
     }
 
-    let mut locked = LockedArchive::acquire(&root, request.entry)?;
-    locked.download(request.progress, request.cancel)?;
-    locked.verify(request.progress, request.cancel)?;
-    let archive_path = locked.path().to_owned();
-    drop(locked);
-    let ready = prepare_verified_archive(
-        request.entry,
-        &archive_path,
-        &root,
-        request.progress,
-        request.cancel,
-    );
+    let ready = match request.local_archive.filter(|path| path.is_file()) {
+        Some(archive) => prepare_verified_archive(
+            request.entry,
+            archive,
+            &root,
+            request.progress,
+            request.cancel,
+        ),
+        None => {
+            let mut locked = LockedArchive::acquire(&root, request.entry)?;
+            locked.download(request.progress, request.cancel)?;
+            locked.verify(request.progress, request.cancel)?;
+            let archive_path = locked.path().to_owned();
+            drop(locked);
+            prepare_verified_archive(
+                request.entry,
+                &archive_path,
+                &root,
+                request.progress,
+                request.cancel,
+            )
+        }
+    };
     drop(quarantines);
     ready
 }
@@ -983,6 +1004,7 @@ mod tests {
         let ready = prepare(PrepareRequest {
             entry: &fixture.entry,
             cache_root: &fixture.cache_root(),
+            local_archive: None,
             progress: &progress,
             cancel: &AtomicBool::new(false),
         })
@@ -1084,6 +1106,7 @@ mod tests {
         let result = prepare(PrepareRequest {
             entry: &fixture.entry,
             cache_root: &fixture.cache_root(),
+            local_archive: None,
             progress: &progress,
             cancel: &AtomicBool::new(false),
         });
@@ -1155,5 +1178,106 @@ mod tests {
         drop(OperationPath::new(quarantine.clone()));
 
         assert!(fs::symlink_metadata(quarantine).is_err());
+    }
+
+    #[test]
+    fn a_local_archive_is_prepared_without_reaching_the_network() {
+        let fixture = Fixture::new("local-source");
+        let connected = AtomicBool::new(false);
+        let progress = |event| {
+            if matches!(
+                event,
+                PayloadProgress::Connecting | PayloadProgress::Downloading { .. }
+            ) {
+                connected.store(true, Ordering::Relaxed);
+            }
+        };
+
+        let ready = prepare(PrepareRequest {
+            entry: &fixture.entry,
+            cache_root: &fixture.cache_root(),
+            local_archive: Some(&fixture.archive_path),
+            progress: &progress,
+            cancel: &AtomicBool::new(false),
+        })
+        .unwrap();
+
+        assert_eq!(ready.generation(), fixture.entry.archive_sha256());
+        assert!(!connected.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_local_archive_that_does_not_match_the_entry_fails_instead_of_downloading() {
+        let fixture = Fixture::new("local-corrupt");
+        let corrupt = fixture.temporary.path().join("corrupt.zip");
+        let mut bytes = fixture.archive.clone();
+        bytes[0] ^= 0xFF;
+        fs::write(&corrupt, &bytes).unwrap();
+        let connected = AtomicBool::new(false);
+        let progress = |event| {
+            if matches!(
+                event,
+                PayloadProgress::Connecting | PayloadProgress::Downloading { .. }
+            ) {
+                connected.store(true, Ordering::Relaxed);
+            }
+        };
+
+        let result = prepare(PrepareRequest {
+            entry: &fixture.entry,
+            cache_root: &fixture.cache_root(),
+            local_archive: Some(&corrupt),
+            progress: &progress,
+            cancel: &AtomicBool::new(false),
+        });
+
+        assert!(matches!(result, Err(PayloadError::DigestMismatch { .. })));
+        assert!(!connected.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_truncated_local_archive_fails_on_its_length() {
+        let fixture = Fixture::new("local-short");
+        let short = fixture.temporary.path().join("short.zip");
+        fs::write(&short, &fixture.archive[..fixture.archive.len() - 1]).unwrap();
+
+        let result = prepare(PrepareRequest {
+            entry: &fixture.entry,
+            cache_root: &fixture.cache_root(),
+            local_archive: Some(&short),
+            progress: &|_| {},
+            cancel: &AtomicBool::new(false),
+        });
+
+        assert!(matches!(
+            result,
+            Err(PayloadError::ArchiveSizeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn a_missing_local_archive_falls_back_to_the_published_url() {
+        let fixture = Fixture::new("local-absent");
+        let absent = fixture.temporary.path().join("absent.zip");
+        let connected = AtomicBool::new(false);
+        let progress = |event| {
+            if event == PayloadProgress::Connecting {
+                connected.store(true, Ordering::Relaxed);
+            }
+        };
+
+        // The fixture's `archive_url` is `https://offline.invalid/payload.zip`,
+        // so the fallback is taken and then fails: that it was taken at all is
+        // the fact under test.
+        let result = prepare(PrepareRequest {
+            entry: &fixture.entry,
+            cache_root: &fixture.cache_root(),
+            local_archive: Some(&absent),
+            progress: &progress,
+            cancel: &AtomicBool::new(false),
+        });
+
+        assert!(matches!(result, Err(PayloadError::Http(_))));
+        assert!(connected.load(Ordering::Relaxed));
     }
 }
