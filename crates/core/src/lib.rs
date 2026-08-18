@@ -8,7 +8,7 @@ pub mod provisioning;
 pub mod settings;
 pub mod ssh;
 
-pub use distro::{DistroProfile, SshDaemon, ubuntu};
+pub use distro::{DistroProfile, SshDaemon, SshUnits, ubuntu};
 pub use gpu::{
     GpuAssignment, GpuAvailability, GpuFailure, GpuMode, GpuShare, GpuShareManifest, GpuShareRole,
     GpuStage, GpuState, GpuStatusCode, GuestGpuDetail, GuestGpuReport, HostGpuAdapter,
