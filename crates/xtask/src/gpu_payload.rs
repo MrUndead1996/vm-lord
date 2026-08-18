@@ -5,7 +5,7 @@ use std::{
 use vmlord_gpu_payload::{
     CatalogEntry, Sha256Digest,
     builder::{PackRequest, pack},
-    local_archive_path,
+    local_archive_path, local_entry_path,
 };
 
 pub(crate) struct PackCommand {
@@ -78,9 +78,11 @@ pub(crate) fn parse_dist<I: IntoIterator<Item = String>>(
 /// not exactly what `pack` wrote.
 ///
 /// `source` is the directory the recipe's `pack` step wrote `payload.zip` and
-/// `catalog-entry.json` into. Only the archive travels: the catalog is
-/// embedded in the application and trusted for being embedded, and a second
-/// catalog sitting beside the executable would be one an attacker can edit.
+/// `catalog-entry.json` into. Both travel, named by the payload's ID: the
+/// application has no catalog of its own any more, and reads the one a release
+/// carries. An entry beside the executable is no longer trusted for being
+/// compiled in -- but whoever can write there can equally replace the
+/// executable, so the trust boundary is unchanged and merely visible.
 ///
 /// Deeper checks -- `payload.json`, `sources.json`, expansion limits -- belong
 /// to `prepare` on the machine that will use the payload. Repeating them here
@@ -117,6 +119,9 @@ pub(crate) fn stage_release_payload(source: &Path, destination: &Path) -> Result
         .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
     fs::write(&target, &archive)
         .map_err(|error| format!("cannot write {}: {error}", target.display()))?;
+    let entry_target = local_entry_path(destination, entry.payload_id());
+    fs::write(&entry_target, &entry_bytes)
+        .map_err(|error| format!("cannot write {}: {error}", entry_target.display()))?;
     Ok(entry.payload_id().to_owned())
 }
 
@@ -128,6 +133,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
+    use vmlord_gpu_payload::PayloadCatalog;
     use vmlord_gpu_payload::builder::{PackRequest, pack};
 
     use super::{parse, run};
@@ -293,6 +299,24 @@ mod tests {
             )
             .unwrap(),
             fs::read(source.join("payload.zip")).unwrap()
+        );
+        assert_eq!(
+            fs::read(
+                destination
+                    .join("gpu-payload")
+                    .join(format!("{payload_id}.json"))
+            )
+            .unwrap(),
+            fs::read(source.join("catalog-entry.json")).unwrap()
+        );
+        // The catalog the application will assemble has to accept what dist
+        // wrote, or the release ships a pair nothing can read.
+        assert_eq!(
+            PayloadCatalog::from_release_directory(&destination)
+                .expect("a staged pair must read back as a catalog")
+                .entries()
+                .len(),
+            1
         );
     }
 
