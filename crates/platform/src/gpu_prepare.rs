@@ -84,6 +84,31 @@ pub(crate) fn prepare(
         .map(GpuExports::manifest)
         .unwrap_or_default();
 
+    // What the host managed to hand over, said once and out loud. Everything
+    // below this point is silent on success, and three quite different
+    // outcomes -- everything attached, some of it attached, nothing to attach
+    // -- would otherwise look identical in a log.
+    match &assignment {
+        GpuAssignment::Complete(detail) => log::info!(
+            "VM \"{}\" is offered {} share(s) for {} GPU adapter(s)",
+            mapping.vm_name,
+            manifest.shares.len(),
+            detail.adapters
+        ),
+        GpuAssignment::Partial { detail, reason } => log::warn!(
+            "VM \"{}\" gets less GPU than it asked for, across {} adapter(s): {}",
+            mapping.vm_name,
+            detail.adapters,
+            reason.message
+        ),
+        GpuAssignment::Failed(reason) => log::warn!(
+            "VM \"{}\" gets no GPU: {}",
+            mapping.vm_name,
+            reason.message
+        ),
+        GpuAssignment::Unknown => {}
+    }
+
     Some(PreparedGpu {
         exports,
         manifest,
@@ -178,7 +203,14 @@ fn stage(
         progress: &|_progress| {},
         cancel,
     }) {
-        Ok(_staged) => true,
+        Ok(staged) => {
+            log::info!(
+                "VM \"{}\" is staged with GPU payload {}",
+                mapping.vm_name,
+                staged.payload_id()
+            );
+            true
+        }
         Err(error) => {
             log::warn!(
                 "no GPU payload was staged for VM \"{}\": {error}",

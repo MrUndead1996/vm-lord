@@ -343,18 +343,29 @@ impl VmStartPipeline {
         // recorded. Attaching adapters whose drivers the guest cannot reach
         // would not make that less true.
         if matches!(prepared.assignment, GpuAssignment::Failed(_)) {
+            log::info!(
+                "VM \"{}\" is not asked to attach any GPU adapter, because none could be \
+                 handed to it",
+                mapping.vm_name
+            );
             return;
         }
 
-        if let Err(failure) = (self.gpu_assigner)(&mapping.hcs_compute_system_id, mapping.gpu_mode)
-        {
-            log::warn!(
-                "VM \"{}\" is running without the GPU it asked for: {}",
+        match (self.gpu_assigner)(&mapping.hcs_compute_system_id, mapping.gpu_mode) {
+            Ok(()) => log::info!(
+                "VM \"{}\" has its GPU attached in mode {:?}",
                 mapping.vm_name,
-                failure.message
-            );
-            self.gpu_runs
-                .record_assignment(mapping.vm_id, GpuAssignment::Failed(failure));
+                mapping.gpu_mode
+            ),
+            Err(failure) => {
+                log::warn!(
+                    "VM \"{}\" is running without the GPU it asked for: {}",
+                    mapping.vm_name,
+                    failure.message
+                );
+                self.gpu_runs
+                    .record_assignment(mapping.vm_id, GpuAssignment::Failed(failure));
+            }
         }
     }
 

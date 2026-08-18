@@ -360,7 +360,11 @@ fn report_recipe(
                 stage.step(),
                 stage.message
             ),
-            GpuRecipeStageState::Skipped => log::debug!(
+            // Info, unlike a stage that finished: a step that did not run is
+            // how a recipe reports "there was nothing for me to do here", and
+            // a guest that ends up with no device after a recipe that failed
+            // nowhere is explained by exactly these lines.
+            GpuRecipeStageState::Skipped => log::info!(
                 "the agent of VM \"{vm_name}\" skipped GPU recipe stage {:?}: {}",
                 stage.step(),
                 stage.message
