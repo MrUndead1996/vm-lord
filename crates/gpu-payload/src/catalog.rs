@@ -499,8 +499,27 @@ mod tests {
         }
     }
     #[test]
-    fn an_empty_embedded_catalog_is_valid_until_a_tested_recipe_is_published() {
-        assert!(PayloadCatalog::embedded().unwrap().entries().is_empty());
+    fn the_embedded_catalog_is_valid_and_offers_the_guests_it_names() {
+        // Validation is the point: every entry goes through the same checks a
+        // packed one does, and a catalog compiled into the application is the
+        // only one it trusts, so a malformed entry has to fail the build
+        // rather than a host.
+        let catalog = PayloadCatalog::embedded().expect("the shipped catalog must parse");
+
+        for entry in catalog.entries() {
+            let target = entry.target();
+            assert!(
+                catalog
+                    .select_for_guest(&GuestSelector {
+                        distribution: &target.distribution,
+                        release: &target.release,
+                        architecture: &target.architecture,
+                    })
+                    .is_ok(),
+                "an entry that cannot be selected for its own guest is unreachable: {}",
+                entry.payload_id()
+            );
+        }
     }
 
     #[test]

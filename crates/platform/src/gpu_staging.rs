@@ -132,9 +132,11 @@ mod tests {
             executable_directory: temporary.path(),
             cache_root: &temporary.path().join("cache"),
             vm_directory: &vm,
+            // A guest the shipped catalog cannot have an entry for, so that
+            // this test says what it means whatever the catalog ships.
             guest: GuestSelector {
                 distribution: "ubuntu",
-                release: "26.04",
+                release: "1.04",
                 architecture: "amd64",
             },
             progress: &|_| {},
