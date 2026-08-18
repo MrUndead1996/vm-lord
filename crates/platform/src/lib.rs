@@ -43,6 +43,7 @@ mod password_hash;
 mod reconnect;
 mod repository;
 mod shutdown;
+mod shutdown_workers;
 mod ssh;
 mod ssh_terminal;
 mod start;

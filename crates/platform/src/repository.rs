@@ -35,6 +35,7 @@ use crate::{
     hcs_config::{self, VmTopology},
     layout, list_known_vms,
     reconnect::{ReconnectOutcome, reconnect_known_vms},
+    shutdown_workers::ShutdownWorkers,
     ssh_terminal::SshLauncher,
     vhd, watch,
     watch::VmEventSink,
@@ -79,7 +80,11 @@ pub struct HcsVmRepository {
     /// Opens interactive SSH sessions into running guests. Nothing is kept
     /// beside it: a session belongs to whoever asked for it, not to VMLord.
     ssh_launcher: SshLauncher,
-    shutdown: VmShutdownPipeline,
+    /// Shared with the worker threads that deliver shutdown requests, which is
+    /// why it is behind an `Arc`.
+    shutdown: Arc<VmShutdownPipeline>,
+    /// The shutdown requests being delivered right now.
+    shutdowns: ShutdownWorkers,
     force_stop: VmForceStopPipeline,
     delete: VmDeletionPipeline,
     // `list_vms` takes `&self` but still has findings worth surfacing, and a
@@ -121,7 +126,8 @@ impl HcsVmRepository {
             com1_sessions: Com1Sessions::default(),
             agent_sessions: AgentSessions::default(),
             ssh_launcher: SshLauncher::production(),
-            shutdown: VmShutdownPipeline::production(),
+            shutdown: Arc::new(VmShutdownPipeline::production()),
+            shutdowns: ShutdownWorkers::default(),
             force_stop: VmForceStopPipeline::production(),
             delete: VmDeletionPipeline::production(),
             diagnostics: Arc::new(Mutex::new(Vec::new())),
@@ -255,6 +261,98 @@ impl HcsVmRepository {
             mapping.vm_name
         );
         Ok(())
+    }
+
+    /// Puts the guest's own account of a shutdown on screen.
+    ///
+    /// A graceful shutdown is the one operation whose progress VMLord cannot
+    /// report: HCS answers when the request has been delivered, and everything
+    /// after that -- services stopping, filesystems unmounting, a unit that
+    /// hangs for its ninety seconds -- is written to COM1 and nowhere else. So
+    /// the console is opened before the request goes out, unless a window is
+    /// already showing it.
+    ///
+    /// Nothing here can fail a stop: a guest still gets asked to power off when
+    /// its log cannot be shown, and the reason is reported instead.
+    fn show_shutdown_console(&mut self, mapping: &VmComputeSystemMapping) {
+        // A console whose window has been closed leaves a session behind that
+        // is over; reaping it here is what makes reopening possible at all.
+        for diagnostic in console_failure_diagnostics(&mut self.com1_sessions, &self.storage_root) {
+            self.push_diagnostic(diagnostic.level, diagnostic.message);
+        }
+        if self.com1_sessions.contains(mapping.vm_id) {
+            return;
+        }
+
+        // Appended to rather than truncated: this is the boot that is ending,
+        // and its log is what the messages about to be written belong to.
+        let opened =
+            layout::vm_directory(&self.storage_root, &mapping.vm_name).and_then(|vm_directory| {
+                self.com1_launcher
+                    .launch(mapping, &vm_directory, Com1LogMode::Append)
+            });
+        match opened {
+            Ok(session) => {
+                self.com1_sessions.insert(session);
+                log::info!(
+                    "the COM1 console of VM \"{}\" was opened to show its shutdown",
+                    mapping.vm_name
+                );
+            }
+            Err(error) => {
+                log::warn!(
+                    "VM \"{}\" is being shut down without its console: {error}",
+                    mapping.vm_name
+                );
+                self.push_diagnostic(
+                    DiagnosticLevel::Warning,
+                    format!(
+                        "VM \"{}\" is being shut down, but its COM1 console could not be \
+                         opened to show it: {error}",
+                        mapping.vm_name
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Collects the shutdown requests that have been answered since the last
+    /// refresh.
+    ///
+    /// A delivered request means the guest is on its way down, so what belongs
+    /// to its run is given up here. A failed one means the opposite -- the guest
+    /// never heard the request and keeps running -- so its agent connection and
+    /// its event watch stay exactly where they are, and only the reason is
+    /// reported.
+    fn finish_shutdowns(&mut self) {
+        for finished in self.shutdowns.take_finished() {
+            match finished.result {
+                Ok(()) => {
+                    log::info!(
+                        "the guest of VM \"{}\" was asked to shut down",
+                        finished.vm_name
+                    );
+                    // The agent goes down with the guest that runs it, and the
+                    // partition its listener is bound to stops existing as HCS
+                    // tears the compute system down.
+                    self.agent_sessions.cancel(finished.vm_id);
+                    // The console is left alone: the guest is still writing the
+                    // messages it prints on its way down, and the pipe closing
+                    // is what ends the capture. The guest powers off on its own
+                    // schedule and HCS destroys the compute system as it goes,
+                    // so the handle is released now rather than kept until it
+                    // refers to nothing.
+                    self.connections.remove(finished.vm_id);
+                }
+                Err(error) => {
+                    log::error!("failed to stop VM \"{}\": {error}", finished.vm_name);
+                    self.push_diagnostic(
+                        DiagnosticLevel::Error,
+                        format!("Failed to stop VM \"{}\": {error}", finished.vm_name),
+                    );
+                }
+            }
+        }
     }
 
     /// Opens a session into a VM HCS reports as being in `state`.
@@ -936,23 +1034,34 @@ impl VmRepository for HcsVmRepository {
         Ok(())
     }
 
+    /// Asks the guest of `name` to shut down, without waiting for the answer.
+    ///
+    /// Returning `Ok` means the request is on its way, not that HCS has
+    /// delivered it: the delivery waits on the Host Compute Service, and this
+    /// is called from the thread that draws the window. What comes back is
+    /// collected on the next refresh -- see
+    /// [`HcsVmRepository::finish_shutdowns`].
+    ///
+    /// Everything that can be refused cheaply and certainly is refused here,
+    /// before the thread, so an obvious mistake is the return value of the call
+    /// that made it rather than a diagnostic a moment later.
     fn stop_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
         self.require_initialized()?;
         self.builds.refuse_if_building(name)?;
 
         let mapping = self.mapping(name)?;
-        self.shutdown.shutdown(&self.store, name)?;
-        // The agent goes down with the guest that runs it, and the partition
-        // its listener is bound to stops existing as HCS tears the compute
-        // system down.
-        self.agent_sessions.cancel(mapping.vm_id);
-        // The console is left alone: the guest is still writing the messages it
-        // prints on its way down, and the pipe closing is what ends the capture.
-        // The guest powers off on its own schedule and HCS destroys the
-        // compute system as it goes, so the handle is released now rather than
-        // kept until it refers to nothing.
-        self.connections.remove(mapping.vm_id);
-        Ok(())
+        // Before the request: what the guest prints on its way down is the only
+        // account there is of a shutdown that stalls, and the user watching it
+        // is why the wait no longer happens on the UI thread.
+        self.show_shutdown_console(&mapping);
+
+        let store = self.store.clone();
+        let shutdown = Arc::clone(&self.shutdown);
+        let vm_name = mapping.vm_name.clone();
+        self.shutdowns
+            .start(mapping.vm_id, &mapping.vm_name, move || {
+                shutdown.shutdown(&store, &vm_name)
+            })
     }
 
     fn force_stop_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
@@ -1086,6 +1195,9 @@ impl VmRepository for HcsVmRepository {
         // the place what it started can be taken over.
         let started = self.builds.take_started();
         self.adopt_started(started);
+        // The same call, for the same reason: a shutdown request that has been
+        // answered has handles to give up, and they are reachable only here.
+        self.finish_shutdowns();
         let drained = watch::drain_events(&self.events, |vm_id, generation| {
             self.connections.is_superseded(vm_id, generation)
         });
@@ -1131,7 +1243,8 @@ impl VmRepository for HcsVmRepository {
     }
 }
 
-/// Stops every build before the process leaves.
+/// Stops every build, and waits for every shutdown request, before the process
+/// leaves.
 ///
 /// Without this, shutting VMLord down either kills a thread in the middle of
 /// writing a VHDX -- leaving the directory it was told to remove -- or waits
@@ -1145,6 +1258,9 @@ impl Drop for HcsVmRepository {
         // the process that bound it.
         self.agent_sessions.cancel_all();
         self.builds.cancel_all_and_join();
+        // A request still being delivered holds a handle to a compute system
+        // this repository is about to drop.
+        self.shutdowns.join_all();
     }
 }
 
@@ -1681,6 +1797,125 @@ mod tests {
 
         assert_eq!(recorded.lock().unwrap().len(), 2);
         assert!(repository.com1_sessions.contains(mapping.vm_id));
+    }
+
+    #[test]
+    fn a_stop_opens_the_console_so_the_guest_is_watched_as_it_powers_off() {
+        // Everything a shutdown does after HCS has delivered the request is
+        // written to COM1 and nowhere else, so a stop with no window shows the
+        // user nothing at all.
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut repository = repository_with_console(recorded.clone());
+        let mapping = mapping(NetworkMode::None);
+
+        repository.show_shutdown_console(&mapping);
+
+        let commands = recorded.lock().unwrap().clone();
+        assert_eq!(commands.len(), 1);
+        assert!(
+            commands[0].contains("--mode append"),
+            "the boot that is ending keeps its log: {}",
+            commands[0]
+        );
+        assert!(commands[0].contains("--vm-name dev"), "{}", commands[0]);
+        assert!(repository.com1_sessions.contains(mapping.vm_id));
+    }
+
+    #[test]
+    fn a_stop_leaves_a_console_that_is_already_open_alone() {
+        // Two readers on one pipe split the guest's output between two windows,
+        // which is exactly what a shutdown must not do to its own log.
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut repository = repository_with_console(recorded.clone());
+        let mapping = mapping(NetworkMode::None);
+        repository
+            .open_console_in_state(&mapping, Some(HcsSystemState::Running))
+            .expect("the console opens");
+
+        repository.show_shutdown_console(&mapping);
+
+        assert_eq!(
+            recorded.lock().unwrap().len(),
+            1,
+            "the window already showing the guest is the one to watch it in"
+        );
+        assert!(repository.com1_sessions.contains(mapping.vm_id));
+    }
+
+    #[test]
+    fn a_console_that_cannot_be_opened_does_not_keep_a_guest_running() {
+        // The user asked for the VM to stop. A window is how they watch it, not
+        // what they asked for.
+        let mut repository = repository();
+        repository.com1_launcher = Com1Launcher::for_test(
+            std::path::PathBuf::from(r"C:\VMLord\vmlord-com1.exe"),
+            |_command: &TerminalCommand| Err(std::io::Error::other("no terminal here")),
+        );
+        let mapping = mapping(NetworkMode::None);
+
+        repository.show_shutdown_console(&mapping);
+
+        assert!(!repository.com1_sessions.contains(mapping.vm_id));
+        let diagnostics = repository.diagnostics.lock().unwrap().clone();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, DiagnosticLevel::Warning);
+        assert!(
+            diagnostics[0].message.contains("could not be opened"),
+            "{}",
+            diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn a_delivered_shutdown_request_gives_up_what_the_run_leaves_behind() {
+        let mut repository = repository();
+        let mapping = mapping(NetworkMode::None);
+        repository
+            .shutdowns
+            .start(mapping.vm_id, &mapping.vm_name, || Ok(()))
+            .expect("the request should be dispatched");
+
+        repository.shutdowns.wait_until_answered();
+        repository.finish_shutdowns();
+
+        assert!(
+            repository.diagnostics.lock().unwrap().is_empty(),
+            "a request that went through is not news"
+        );
+        // The same VM can be asked again once its request is over: a guest that
+        // ignored the first one is stopped by a second.
+        repository
+            .shutdowns
+            .start(mapping.vm_id, &mapping.vm_name, || Ok(()))
+            .expect("the VM is no longer being shut down");
+        repository.shutdowns.join_all();
+    }
+
+    #[test]
+    fn a_shutdown_request_that_failed_is_reported_rather_than_lost() {
+        // The wait happens on a thread of its own, so the failure cannot come
+        // back as the return value of the click that caused it.
+        let mut repository = repository();
+        let mapping = mapping(NetworkMode::None);
+        repository
+            .shutdowns
+            .start(mapping.vm_id, &mapping.vm_name, || {
+                Err(RepositoryError::new("injected shutdown failure"))
+            })
+            .expect("the request should be dispatched");
+
+        repository.shutdowns.wait_until_answered();
+        repository.finish_shutdowns();
+
+        let diagnostics = repository.diagnostics.lock().unwrap().clone();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, DiagnosticLevel::Error);
+        assert!(
+            diagnostics[0].message.contains("injected shutdown failure")
+                && diagnostics[0].message.contains("dev"),
+            "{}",
+            diagnostics[0].message
+        );
     }
 
     /// A VM with SSH access, an address and a key: everything a session needs,

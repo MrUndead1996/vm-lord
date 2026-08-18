@@ -460,6 +460,38 @@ so a document is always passed. A successful shutdown means HCS delivered the
 request, not that the guest powered off, so forced stop remains a separate
 action.
 
+That request is delivered on a thread of its own. The call waits for HCS to
+answer -- moments when the guest is listening, and up to the pipeline's
+sixty-second bound when the Host Compute Service is wedged -- and `stop_vm` used
+to spend that wait on its caller's thread, which is the one drawing the window:
+a slow stop froze the whole UI until the answer came back.
+`platform::shutdown_workers::ShutdownWorkers` now carries each request,
+modelled on the build registry for the same reasons: a flag the worker sets
+however it leaves, the answer parked for the main thread, and a join for every
+thread before the process goes. `stop_vm` still refuses what it can refuse
+cheaply -- an unknown VM, one still being built, one already being shut down --
+so an obvious mistake is the return value of the click that made it rather than
+a diagnostic a moment later.
+
+What comes back is collected in `take_diagnostics`, the `&mut self` call the
+refresh already makes. A delivered request means the guest is on its way down,
+so its agent connection and its HCS event watch are given up there; a failed one
+means the opposite -- the guest never heard the request and keeps running -- so
+both stay where they are and only the reason becomes an `Error` diagnostic. A
+second Stop on a VM whose request is still in flight is refused rather than
+queued behind the first: clicking again means "it is taking long", not "ask once
+more". Once the request is over the VM can be asked again, which is what stops a
+guest that ignored the first one.
+
+A stop also opens the VM's COM1 console, unless a window is already showing it.
+Everything a shutdown does after HCS has delivered the request -- services
+stopping, filesystems unmounting, a unit hanging for its ninety seconds -- is
+written to the serial console and nowhere else, so it is the only account there
+is of a stop that stalls. The log is appended to, because this is the boot that
+is ending. A console that cannot be opened is a `Warning` diagnostic and nothing
+more: the user asked for the VM to stop, and a window is how they watch it, not
+what they asked for.
+
 Two things have to be right for that request to reach a guest at all, and until
 #70 neither was, which made every stop an emergency one.
 
@@ -1809,8 +1841,10 @@ reaped first, so a window a person closed is not mistaken for one that is still
 reading; a reader that stopped for the wrong reason still becomes its `Error`
 diagnostic on the way through.
 
-A graceful stop leaves the session alone: the guest is still printing what it
-does on the way down, and the pipe closing is what ends the capture. A force
+A graceful stop leaves the session alone -- and opens one when there is none:
+the guest is still printing what it does on the way down, that output is the
+only account there is of a stop that stalls, and the pipe closing is what ends
+the capture. A force
 stop, a delete, an HCS exit event, and VMLord's own shutdown all cancel it,
 because in each of those cases nothing will ever close the pipe from the other
 end. `take_diagnostics` reaps sessions that are over: one that finished with its
