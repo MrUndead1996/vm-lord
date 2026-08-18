@@ -4,12 +4,6 @@
 //! guest this VM was built from, prepare that generation in the shared cache, and
 //! stage it into the VM's own `gpu-payload` child -- the exact directory
 //! `gpu_exports` canonicalizes and offers as `vmlord.gpu.payload`.
-//!
-//! Nothing in the running application calls this yet, for the reason
-//! `gpu_exports` states: a start cannot know a VM's GPU mode until the task
-//! that applies HCS assignment records one, and that task is this module's
-//! caller. The allow below goes away with it.
-#![allow(dead_code)]
 
 use std::{path::Path, path::PathBuf, sync::atomic::AtomicBool};
 

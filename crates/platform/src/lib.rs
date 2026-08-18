@@ -29,6 +29,7 @@ mod gpu_discovery;
 mod gpu_enumerate;
 mod gpu_exports;
 mod gpu_facts;
+mod gpu_prepare;
 mod gpu_staging;
 mod guest_ready;
 mod hcn;

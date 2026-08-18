@@ -9,11 +9,6 @@
 //! resolve to that exact direct child, not merely another descendant of the
 //! VM directory. What is exported afterwards is the canonical path, not the
 //! one discovery reported.
-//!
-//! Nothing in the running application calls this yet: a start cannot know a
-//! VM's GPU mode until the task that applies HCS assignment records one, and
-//! that task is this module's caller. The allow below goes away with it.
-#![allow(dead_code)]
 
 use std::path::{Component, Path, PathBuf};
 
@@ -53,6 +48,10 @@ impl GpuExport {
 
     pub(crate) fn host_path(&self) -> &Path {
         &self.host_path
+    }
+
+    pub(crate) fn share(&self) -> &GpuShare {
+        &self.share
     }
 }
 
