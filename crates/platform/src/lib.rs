@@ -51,6 +51,7 @@ mod ssh;
 mod ssh_launches;
 mod ssh_terminal;
 mod start;
+mod start_registry;
 mod subnet;
 mod vhd;
 mod vm_key;

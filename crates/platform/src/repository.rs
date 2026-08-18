@@ -39,6 +39,7 @@ use crate::{
     shutdown_workers::ShutdownWorkers,
     ssh_launches::SshLaunches,
     ssh_terminal::SshLauncher,
+    start_registry::StartRegistry,
     vhd, watch,
     watch::VmEventSink,
 };
@@ -67,7 +68,11 @@ pub struct HcsVmRepository {
     readiness_timeouts: ReadinessTimeouts,
     /// The VMs being created right now.
     builds: Arc<BuildRegistry>,
-    start: VmStartPipeline,
+    /// Starts VMs. Shared rather than owned because a start now runs on a
+    /// thread of its own.
+    start: Arc<VmStartPipeline>,
+    /// The VMs being started right now.
+    starts: Arc<StartRegistry>,
     /// Opens the COM1 console of a VM that is starting or already running.
     com1_launcher: Com1Launcher,
     /// The consoles VMLord currently owns, one per running VM.
@@ -127,7 +132,8 @@ impl HcsVmRepository {
             )),
             readiness_timeouts: ReadinessTimeouts::default(),
             builds: Arc::new(BuildRegistry::default()),
-            start: VmStartPipeline::production(com1_launcher.clone()),
+            start: Arc::new(VmStartPipeline::production(com1_launcher.clone())),
+            starts: Arc::new(StartRegistry::default()),
             com1_launcher,
             com1_sessions: Com1Sessions::default(),
             agent_sessions: AgentSessions::default(),
@@ -605,6 +611,7 @@ impl HcsVmRepository {
             &mapping,
             state,
             self.agent_sessions.is_online(mapping.vm_id),
+            self.starts.contains(&mapping.vm_name),
         );
         let ip_address = self.guest_address(&mapping, state);
 
@@ -827,8 +834,13 @@ fn vm_state(
     mapping: &VmComputeSystemMapping,
     state: Option<HcsSystemState>,
     agent_online: Option<bool>,
+    starting: bool,
 ) -> VmState {
     match state {
+        // A start in flight outranks anything HCS says short of running: the
+        // compute system is still being prepared, and reporting the VM as
+        // stopped would offer a start it is already in the middle of.
+        _ if starting && !matches!(state, Some(HcsSystemState::Running)) => VmState::Starting,
         Some(HcsSystemState::Running) => VmState::Running {
             agent_status: match agent_online {
                 Some(true) => AgentStatus::Online,
@@ -1081,6 +1093,7 @@ impl VmRepository for HcsVmRepository {
     fn update_vm(&mut self, request: VmUpdateRequest) -> Result<(), RepositoryError> {
         self.require_initialized()?;
         self.builds.refuse_if_building(&request.name)?;
+        self.starts.refuse_if_starting(&request.name)?;
 
         let mapping = self.mapping(&request.name)?;
         refuse_gpu_mode_change(
@@ -1125,18 +1138,50 @@ impl VmRepository for HcsVmRepository {
         Ok(())
     }
 
+    /// Starts VM `name`, on a thread of its own.
+    ///
+    /// Returning `Ok` means the start is under way, not that the VM is
+    /// running: a start with a GPU stages a payload first, which unpacks an
+    /// archive and hashes the staged tree, and neither can happen on the
+    /// thread that draws the window. What the thread produces is taken over on
+    /// the next refresh -- see [`HcsVmRepository::take_diagnostics`] -- and
+    /// what it could not do arrives there as a diagnostic.
+    ///
+    /// Everything that can be refused cheaply and certainly is refused here,
+    /// before the thread, so an obvious mistake is the return value of the call
+    /// that made it rather than a diagnostic a moment later.
     fn start_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
         self.require_initialized()?;
         self.builds.refuse_if_building(name)?;
+        self.starts.refuse_if_starting(name)?;
 
-        let vm_directory = layout::vm_directory(&self.storage_root, name)?;
-        let session = self.start.start(&self.store, name, &vm_directory)?;
+        // Read here rather than on the thread: a VM VMLord does not know, or
+        // one whose directory cannot be named, is the return value of the call
+        // that asked for it instead of a diagnostic a moment later.
         let mapping = self.mapping(name)?;
-        // Before the local session drops: dropping it is what tells a reader
-        // that the start it was opened for is over.
-        self.com1_sessions.insert(session);
-        self.hold_started_system(&mapping);
-        Ok(())
+        let vm_directory = layout::vm_directory(&self.storage_root, name)?;
+        let store = self.store.clone();
+        let start = Arc::clone(&self.start);
+        let diagnostics = Arc::clone(&self.diagnostics);
+
+        self.starts.start(name, move || {
+            match start.start(&store, &mapping.vm_name, &vm_directory) {
+                Ok(session) => Some(StartedVm { mapping, session }),
+                Err(error) => {
+                    let message =
+                        format!("VM \"{}\" could not be started: {error}", mapping.vm_name);
+                    log::error!("{message}");
+                    diagnostics
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(Diagnostic {
+                            level: DiagnosticLevel::Error,
+                            message,
+                        });
+                    None
+                }
+            }
+        })
     }
 
     /// Asks the guest of `name` to shut down, without waiting for the answer.
@@ -1192,6 +1237,10 @@ impl VmRepository for HcsVmRepository {
     fn delete_vm(&mut self, request: VmDeleteRequest) -> Result<(), RepositoryError> {
         self.require_initialized()?;
         self.builds.refuse_if_building(&request.name)?;
+        // A VM in the middle of starting is not a VM to remove: its thread is
+        // about to hand over a console and a compute system for a VM that
+        // would no longer exist.
+        self.starts.refuse_if_starting(&request.name)?;
 
         let mapping = self.mapping(&request.name)?;
         self.refuse_if_live(&mapping)?;
@@ -1302,6 +1351,11 @@ impl VmRepository for HcsVmRepository {
         // the place what it started can be taken over.
         let started = self.builds.take_started();
         self.adopt_started(started);
+        // The same call for the same reason: a start that has ended has a
+        // console session and a compute system to hand over, and both are
+        // reachable only here.
+        let started = self.starts.take_started();
+        self.adopt_started(started);
         // The same call, for the same reason: a shutdown request that has been
         // answered has handles to give up, and they are reachable only here.
         self.finish_shutdowns();
@@ -1366,6 +1420,10 @@ impl Drop for HcsVmRepository {
         // the process that bound it.
         self.agent_sessions.cancel_all();
         self.gpu_facts.forget_all();
+        // Joined rather than abandoned: HCS has either been asked to run each
+        // system or has not, and a thread left behind would outlive the
+        // process that owns what it is about to produce.
+        self.starts.join_all();
         self.builds.cancel_all_and_join();
         // A request still being delivered holds a handle to a compute system
         // this repository is about to drop.
@@ -1504,6 +1562,8 @@ mod tests {
         record_network_mode,
         refuse_gpu_mode_change,
     };
+    use std::sync::atomic::AtomicBool;
+
     use vmlord_core::{GuestGpuDetail, GuestGpuReport};
 
     use crate::{
@@ -2292,6 +2352,155 @@ mod tests {
         record_network_mode(&store, &mapping, NetworkMode::Nat).unwrap();
 
         assert_eq!(store.find_by_vm_name("dev").unwrap().unwrap(), mapping);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A repository with one stopped VM and a start held on a flag.
+    ///
+    /// The start is a substitute rather than the real pipeline: what these
+    /// tests are about is what the rest of VMLord does while a start is in
+    /// flight, and a real one would need a compute system.
+    ///
+    /// The flag is released by [`Held::release`] before anything is asserted,
+    /// because dropping the repository joins the start thread -- a failed
+    /// assertion with the flag still set would hang the suite instead of
+    /// failing it.
+    struct Held {
+        root: std::path::PathBuf,
+        repository: HcsVmRepository,
+        release: Arc<AtomicBool>,
+    }
+
+    impl Held {
+        fn new(label: &str) -> Self {
+            let (root, store) = temp_store(label);
+            store
+                .insert(mapping(NetworkMode::None))
+                .expect("the mapping should be stored");
+            let mut repository = repository();
+            repository.store = store;
+            repository.initialized = true;
+            let release = Arc::new(AtomicBool::new(false));
+            let held = Arc::clone(&release);
+            repository
+                .starts
+                .start("dev", move || {
+                    while !held.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::thread::yield_now();
+                    }
+                    None
+                })
+                .expect("the start should be accepted");
+            Self {
+                root,
+                repository,
+                release,
+            }
+        }
+
+        fn release(&self) {
+            self.release.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.repository.starts.join_all();
+        }
+    }
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            self.release
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    #[test]
+    fn a_vm_whose_start_is_in_flight_is_listed_as_starting() {
+        let held = Held::new("start-listed");
+
+        let summary = held.repository.summary(KnownVm {
+            mapping: mapping(NetworkMode::None),
+            state: None,
+            runtime_id: None,
+        });
+        held.release();
+
+        assert_eq!(
+            summary.state,
+            VmState::Starting,
+            "a VM being prepared is not a stopped VM offering another start"
+        );
+    }
+
+    #[test]
+    fn a_vm_that_is_already_running_is_not_relisted_as_starting() {
+        let held = Held::new("start-running");
+
+        let summary = held.repository.summary(KnownVm {
+            mapping: mapping(NetworkMode::None),
+            state: Some(HcsSystemState::Running),
+            runtime_id: None,
+        });
+        held.release();
+
+        assert!(
+            matches!(summary.state, VmState::Running { .. }),
+            "HCS reports it running, which is the later fact: {:?}",
+            summary.state
+        );
+    }
+
+    #[test]
+    fn a_vm_being_started_may_not_be_deleted() {
+        let mut held = Held::new("start-delete");
+
+        let outcome = held.repository.delete_vm(VmDeleteRequest {
+            name: "dev".into(),
+            delete_disks: true,
+        });
+        held.release();
+
+        let error = outcome.expect_err("a VM in the middle of starting is not one to remove");
+        assert!(error.to_string().contains("starting"), "{error}");
+    }
+
+    #[test]
+    fn a_vm_being_started_may_not_be_edited() {
+        let mut held = Held::new("start-update");
+
+        let outcome = held.repository.update_vm(update_request());
+        held.release();
+
+        let error = outcome.expect_err("the configuration a start is reading must not move");
+        assert!(error.to_string().contains("starting"), "{error}");
+    }
+
+    #[test]
+    fn a_vm_being_started_may_not_be_started_again() {
+        let mut held = Held::new("start-twice");
+
+        let outcome = held.repository.start_vm("dev");
+        held.release();
+
+        let error =
+            outcome.expect_err("two threads must not prepare the same configuration at once");
+        assert!(error.to_string().contains("starting"), "{error}");
+    }
+
+    #[test]
+    fn a_start_of_a_vm_vmlord_does_not_know_is_refused_before_any_thread() {
+        let (root, store) = temp_store("start-unknown");
+        let mut repository = repository();
+        repository.store = store;
+        repository.initialized = true;
+
+        let error = repository
+            .start_vm("nothing-of-this-name")
+            .expect_err("an unknown VM is the return value of the call that asked for it");
+
+        assert!(error.to_string().contains("nothing-of-this-name"), "{error}");
+        assert!(
+            !repository.starts.contains("nothing-of-this-name"),
+            "a refusal starts no thread"
+        );
         let _ = fs::remove_dir_all(root);
     }
 
