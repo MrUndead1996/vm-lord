@@ -58,7 +58,6 @@ struct PackRecipe {
     schema_version: u32,
     payload_id: String,
     target: GuestTarget,
-    archive_url: String,
     required_renderers: Vec<RendererCapability>,
     mesa_policy: MesaPolicy,
     vmlord_revision: String,
@@ -383,7 +382,6 @@ fn catalog_entry(
     serde_json::json!({
         "payload_id": recipe.payload_id,
         "target": recipe.target,
-        "archive_url": recipe.archive_url,
         "archive_size": archive_size,
         "expanded_size_limit": expanded_size,
         "file_count_limit": file_count,
@@ -1071,29 +1069,6 @@ mod tests {
 
         assert_eq!(built.expanded_size(), actual_expanded);
         assert!(emitted_entry(&catalog_entry).expanded_size_limit() >= actual_expanded);
-    }
-
-    #[test]
-    fn recipe_archive_url_must_be_immutable_https() {
-        for (index, url) in [
-            "http://downloads.example.test/payload.zip",
-            "https://user:secret@downloads.example.test/payload.zip",
-            "https://downloads.example.test/payload.zip?latest=1",
-            "https://downloads.example.test/payload.zip#latest",
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let fixture = PreparedFixture::new(&format!("immutable-url-{index}"));
-            fixture.rewrite_recipe(|recipe| recipe["archive_url"] = url.into());
-            assert!(matches!(
-                pack(fixture.request(
-                    &fixture.root.join("payload.zip"),
-                    &fixture.root.join("entry.json")
-                )),
-                Err(PayloadError::InvalidCatalog(_))
-            ));
-        }
     }
 
     #[test]

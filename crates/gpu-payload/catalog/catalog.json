@@ -3,7 +3,6 @@
     {
       "archive_sha256": "e7664769a64ca6a6648c1af8d1a969340e039e3463a9b1409da32d2c56cbaec3",
       "archive_size": 95052,
-      "archive_url": "https://payloads.vmlord.invalid/ubuntu-26.04-amd64-7.0.0-28-v1.zip",
       "builder_version": "vmlord-gpu-payload 0.1.0",
       "expanded_size_limit": 481306,
       "file_count_limit": 20,

@@ -1,7 +1,6 @@
 use crate::{PayloadError, Sha256Digest};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use url::Url;
 const CATALOG_SCHEMA_VERSION: u32 = 1;
 const PAYLOAD_ABI_VERSION: u32 = 1;
 
@@ -69,7 +68,6 @@ struct CatalogDocument {
 struct CatalogEntryDocument {
     payload_id: String,
     target: GuestTarget,
-    archive_url: String,
     archive_size: u64,
     expanded_size_limit: u64,
     file_count_limit: u64,
@@ -94,7 +92,6 @@ struct CatalogEntryDocument {
 pub struct CatalogEntry {
     payload_id: String,
     target: GuestTarget,
-    archive_url: String,
     archive_size: u64,
     expanded_size_limit: u64,
     file_count_limit: u64,
@@ -112,7 +109,6 @@ impl From<CatalogEntryDocument> for CatalogEntry {
         Self {
             payload_id: value.payload_id,
             target: value.target,
-            archive_url: value.archive_url,
             archive_size: value.archive_size,
             expanded_size_limit: value.expanded_size_limit,
             file_count_limit: value.file_count_limit,
@@ -150,7 +146,6 @@ impl CatalogEntry {
                 "missing or invalid required catalog field".into(),
             ));
         }
-        validate_url(&self.archive_url)?;
         if self.sources.is_empty()
             || self.sources.iter().any(|source| {
                 source.url.is_empty()
@@ -180,9 +175,6 @@ impl CatalogEntry {
     }
     pub fn target(&self) -> &GuestTarget {
         &self.target
-    }
-    pub fn archive_url(&self) -> &str {
-        &self.archive_url
     }
     pub fn archive_size(&self) -> u64 {
         self.archive_size
@@ -320,21 +312,6 @@ fn kernel_order(release: &str) -> Vec<u64> {
         .filter_map(|part| part.parse().ok())
         .collect()
 }
-fn validate_url(value: &str) -> Result<Url, PayloadError> {
-    let url = Url::parse(value)
-        .map_err(|error| PayloadError::InvalidCatalog(format!("invalid archive URL: {error}")))?;
-    if url.scheme() != "https"
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(PayloadError::InvalidCatalog(
-            "archive URL must be immutable HTTPS without credentials, query, or fragment".into(),
-        ));
-    }
-    Ok(url)
-}
 
 #[cfg(test)]
 mod tests {
@@ -344,7 +321,7 @@ mod tests {
     const C: &str = "14794180686c2fb6307fbe359c359bec765249f3";
     fn catalog() -> String {
         format!(
-            r#"{{"schema_version":1,"entries":[{{"payload_id":"ubuntu-26.04-amd64-7.0.0-14-v1","target":{{"distribution":"ubuntu","release":"26.04","architecture":"amd64","kernel_release":"7.0.0-14-generic","payload_abi":1}},"archive_url":"https://downloads.example.test/payload.zip","archive_size":1,"expanded_size_limit":2,"file_count_limit":3,"archive_sha256":"{Z}","payload_manifest_sha256":"{Z}","required_renderers":["d3d12-gallium","dzn-vulkan"],"mesa_policy":"bundled","vmlord_revision":"{C}","builder_version":"vmlord-gpu-payload 1","sources":[{{"url":"https://github.com/microsoft/WSL2-Linux-Kernel","commit":"{C}","version":"1"}}],"licenses":[{{"spdx":"GPL-2.0","path":"licenses/GPL-2.0.txt"}}]}}]}}"#
+            r#"{{"schema_version":1,"entries":[{{"payload_id":"ubuntu-26.04-amd64-7.0.0-14-v1","target":{{"distribution":"ubuntu","release":"26.04","architecture":"amd64","kernel_release":"7.0.0-14-generic","payload_abi":1}},"archive_size":1,"expanded_size_limit":2,"file_count_limit":3,"archive_sha256":"{Z}","payload_manifest_sha256":"{Z}","required_renderers":["d3d12-gallium","dzn-vulkan"],"mesa_policy":"bundled","vmlord_revision":"{C}","builder_version":"vmlord-gpu-payload 1","sources":[{{"url":"https://github.com/microsoft/WSL2-Linux-Kernel","commit":"{C}","version":"1"}}],"licenses":[{{"spdx":"GPL-2.0","path":"licenses/GPL-2.0.txt"}}]}}]}}"#
         )
     }
     #[test]
@@ -363,7 +340,7 @@ mod tests {
     }
     fn entry_json(distribution: &str, release: &str, architecture: &str, kernel: &str) -> String {
         format!(
-            r#"{{"payload_id":"{distribution}-{release}-{architecture}-{kernel}","target":{{"distribution":"{distribution}","release":"{release}","architecture":"{architecture}","kernel_release":"{kernel}","payload_abi":1}},"archive_url":"https://downloads.example.test/payload.zip","archive_size":1,"expanded_size_limit":2,"file_count_limit":3,"archive_sha256":"{Z}","payload_manifest_sha256":"{Z}","required_renderers":["d3d12-gallium"],"mesa_policy":"bundled","vmlord_revision":"{C}","builder_version":"vmlord-gpu-payload 1","sources":[{{"url":"https://github.com/microsoft/WSL2-Linux-Kernel","commit":"{C}","version":"1"}}],"licenses":[{{"spdx":"GPL-2.0","path":"licenses/GPL-2.0.txt"}}]}}"#
+            r#"{{"payload_id":"{distribution}-{release}-{architecture}-{kernel}","target":{{"distribution":"{distribution}","release":"{release}","architecture":"{architecture}","kernel_release":"{kernel}","payload_abi":1}},"archive_size":1,"expanded_size_limit":2,"file_count_limit":3,"archive_sha256":"{Z}","payload_manifest_sha256":"{Z}","required_renderers":["d3d12-gallium"],"mesa_policy":"bundled","vmlord_revision":"{C}","builder_version":"vmlord-gpu-payload 1","sources":[{{"url":"https://github.com/microsoft/WSL2-Linux-Kernel","commit":"{C}","version":"1"}}],"licenses":[{{"spdx":"GPL-2.0","path":"licenses/GPL-2.0.txt"}}]}}"#
         )
     }
     fn catalog_with(entries: &[String]) -> PayloadCatalog {
@@ -438,24 +415,6 @@ mod tests {
             kernel_order("7.0.0-14-lowlatency"),
             "a flavour is not a newer kernel"
         );
-    }
-    #[test]
-    fn production_urls_cannot_carry_mutable_or_secret_structure() {
-        for url in [
-            "http://downloads.example.test/payload.zip",
-            "https://user:secret@downloads.example.test/payload.zip",
-            "https://downloads.example.test/payload.zip?latest=1",
-            "https://downloads.example.test/payload.zip#latest",
-        ] {
-            assert!(matches!(
-                PayloadCatalog::from_json(
-                    catalog()
-                        .replace("https://downloads.example.test/payload.zip", url)
-                        .as_bytes()
-                ),
-                Err(PayloadError::InvalidCatalog(_))
-            ));
-        }
     }
     #[test]
     fn target_dimensions_must_all_be_non_empty() {
@@ -538,7 +497,7 @@ mod tests {
     #[test]
     fn a_packed_entry_that_fails_catalog_validation_is_refused() {
         let mut document: serde_json::Value = serde_json::from_str(&catalog()).unwrap();
-        document["entries"][0]["archive_url"] = "http://downloads.example.test/payload.zip".into();
+        document["entries"][0]["target"]["payload_abi"] = 2.into();
         let entry = serde_json::to_vec(&document["entries"][0]).unwrap();
 
         assert!(matches!(

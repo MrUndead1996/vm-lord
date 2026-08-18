@@ -62,7 +62,6 @@ def main() -> None:
         {
             "schema_version": SCHEMA_VERSION,
             "payload_id": spec["payload_id"],
-            "archive_url": spec["archive_url"],
             "required_renderers": spec["required_renderers"],
             **provenance,
             "licenses": [{"spdx": l["spdx"], "path": l["path"]} for l in spec["licenses"]],

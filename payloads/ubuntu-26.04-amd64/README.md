@@ -82,14 +82,6 @@ under this policy would be a false statement in the provenance.
 Switching to `bundled` means building Mesa for the guest, shipping it under
 `content/mesa`, and adding `dzn-vulkan` back.
 
-## Before this can be published
-
-`archive_url` points at `payloads.vmlord.invalid`. The catalog requires an
-immutable HTTPS URL, and there is nowhere to publish yet, so the placeholder is
-deliberate and the embedded `catalog.json` stays empty. Publishing means
-hosting the archive, putting its real URL in the spec, rebuilding, and pasting
-`catalog-entry.json` into `crates/gpu-payload/catalog/catalog.json`.
-
 ## Proven on
 
 `7.0.0-28-generic`, by hand: `dkms add`, `build` and `install`, `modprobe`, and

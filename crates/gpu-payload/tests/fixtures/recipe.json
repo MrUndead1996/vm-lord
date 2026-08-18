@@ -8,7 +8,6 @@
     "kernel_release": "test",
     "payload_abi": 1
   },
-  "archive_url": "https://downloads.example.test/vmlord/ubuntu-26.04-amd64-test-v1.zip",
   "required_renderers": [
     "d3d12-gallium",
     "dzn-vulkan"

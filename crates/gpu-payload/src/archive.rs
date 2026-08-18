@@ -661,7 +661,6 @@ mod tests {
                     "kernel_release": "test",
                     "payload_abi": 1
                 },
-                "archive_url": "https://offline.invalid/payload.zip",
                 "archive_size": archive_size_limit,
                 "expanded_size_limit": expanded_size_limit,
                 "file_count_limit": file_count_limit,

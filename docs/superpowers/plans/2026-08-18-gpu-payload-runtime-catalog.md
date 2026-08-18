@@ -14,7 +14,7 @@
 
 * Every commit subject is prefixed `TASK-109: ` (AGENTS.md).
 * Work happens on branch `task-109-gpu-payload-runtime-catalog`. Do not open a merge request without explicit approval.
-* Test command for the crate: `cargo test-windows -p vmlord-gpu-payload`. For the others: `-p vmlord-xtask`, `-p vmlord-platform`. Compile check: `cargo check-windows`.
+* Test command for the crate: `cargo test-windows -p vmlord-gpu-payload`. For the others: `-p xtask`, `-p vmlord-platform`. Compile check: `cargo check-windows`.
 * Never spell `gpu-payload` as a literal outside `release.rs` — `LOCAL_ARCHIVE_DIRECTORY` and the two path functions own that name.
 * Catalog entry schema version after this work is `2`; `sources.json` and `payload.json` stay at `1`.
 * Do not add dependencies. This plan only removes them (`ureq`, `url`).
@@ -351,7 +351,7 @@ In `crates/xtask/src/gpu_payload.rs` delete the size comparison from `stage_rele
 
 - [ ] **Step 5: Run the tests**
 
-Run: `cargo test-windows -p vmlord-gpu-payload -p vmlord-xtask`
+Run: `cargo test-windows -p vmlord-gpu-payload -p xtask`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -542,7 +542,7 @@ In `crates/xtask/src/gpu_payload.rs`, `PayloadCatalog::from_entry_json(&entry_by
 
 - [ ] **Step 5: Run the tests**
 
-Run: `cargo test-windows -p vmlord-gpu-payload -p vmlord-xtask`
+Run: `cargo test-windows -p vmlord-gpu-payload -p xtask`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -850,7 +850,7 @@ In `crates/xtask/src/gpu_payload.rs`'s `mod tests`, extend the test that copies 
 
 - [ ] **Step 2: Run the test to watch it fail**
 
-Run: `cargo test-windows -p vmlord-xtask`
+Run: `cargo test-windows -p xtask`
 Expected: FAIL — `<id>.json` is not there.
 
 - [ ] **Step 3: Copy both files**
@@ -882,7 +882,7 @@ In `crates/xtask/src/main.rs`, the line printed after staging becomes:
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cargo test-windows -p vmlord-xtask`
+Run: `cargo test-windows -p xtask`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
