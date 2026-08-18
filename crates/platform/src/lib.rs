@@ -46,6 +46,7 @@ mod repository;
 mod shutdown;
 mod shutdown_workers;
 mod ssh;
+mod ssh_launches;
 mod ssh_terminal;
 mod start;
 mod subnet;

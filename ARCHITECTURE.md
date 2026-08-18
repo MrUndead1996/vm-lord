@@ -1439,16 +1439,35 @@ COM1 console, which owns exactly one reader per VM because two readers on one
 pipe would split the guest's output between two windows.
 
 `HcsVmRepository::open_ssh` is the way in. It asks HCS for the VM's state rather
-than trusting the list the user clicked in, refuses anything but `Running` --
+than trusting the list the user clicked in and refuses anything but `Running` --
 the network endpoint the guest answers on exists only while its compute system
-does -- and hands the preflight failure to the application layer with its own
-cause intact.
+does.
+
+That refusal is all it answers, because the rest of the launch does not happen
+on the caller's thread. Reaching a guest costs an HNS read, a port probe with a
+three-second deadline and the start of a terminal host, and the caller is the
+UI: a VM that had stopped answering froze the window for the whole probe.
+`ssh_launches::SshLaunches` gives every launch a thread of its own, modelled on
+`shutdown_workers::ShutdownWorkers` -- which exists for the same symptom -- minus
+the part that carries an answer back, because a launch has none to carry. It is
+not keyed by VM either: two shells into one guest is an ordinary thing to want,
+and a second click while the first is still probing is a second session rather
+than a duplicate to refuse. The threads are joined as later launches start and
+again when the repository is dropped.
+
+So `open_ssh` answers "a session is being opened", not "a session opened", and
+the preflight failure that used to be its return value is now a diagnostic. The
+person sees no difference: the UI ignored that return value and read the
+diagnostics buffer, which is where both outcomes have always gone.
 
 ### Offering a session
 
 `WorkspaceApp::open_ssh` is the only thing the desktop shell calls, and it
 collects the backend's diagnostics on both outcomes -- which is what makes it
-different from the other actions beside it.
+different from the other actions beside it. Its own line says "Opening an SSH
+session for VM …", in that tense deliberately: what it heard back is that the
+request was accepted, and what became of it arrives moments later from the
+thread that found out.
 
 A refusal reaches the log unchanged: "Failed to open SSH session for VM …"
 followed by which Windows feature is missing, which port did not answer, which
