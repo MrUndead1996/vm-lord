@@ -124,12 +124,24 @@ pub fn classify(name: &str) -> Option<Renderer> {
 ///
 /// It walks several platforms and prints the same renderer for most of them,
 /// and a check's message is read by a person.
+///
+/// The label is matched rather than one exact spelling of it: Mesa 26 writes
+/// `OpenGL core profile renderer:` where older releases wrote `OpenGL renderer
+/// string:`, and a guest whose renderer is only spelled the newer way reported
+/// none at all. Both end in `renderer`, and what precedes it -- the profile --
+/// is not something this has to know the list of.
 pub fn eglinfo_renderers(output: &str) -> Vec<String> {
     let mut renderers: Vec<String> = Vec::new();
     for line in output.lines() {
-        let Some((_, name)) = line.split_once("renderer string:") else {
+        let Some((label, name)) = line.split_once(':') else {
             continue;
         };
+        // `EGL vendor string:` also ends in `string`, which is why the word
+        // before it is what decides rather than the word itself.
+        let label = label.trim();
+        if !label.ends_with("renderer") && !label.ends_with("renderer string") {
+            continue;
+        }
         let name = name.trim().to_owned();
         if !name.is_empty() && !renderers.contains(&name) {
             renderers.push(name);
@@ -304,6 +316,29 @@ OpenGL ES profile renderer string: llvmpipe (LLVM 17.0.6, 256 bits)
             ]
         );
         assert!(eglinfo_renderers("eglinfo: command not found").is_empty());
+    }
+
+    #[test]
+    fn the_renderer_is_read_when_eglinfo_omits_the_word_string() {
+        // Mesa 26's eglinfo labels the line "OpenGL core profile renderer:",
+        // where older ones wrote "OpenGL renderer string:". A guest whose
+        // renderer is only spelled the newer way reported no renderer at all
+        // and was held at DeviceOnly with an RTX 5070 Ti answering for it.
+        let output = "\
+EGL vendor string: Mesa Project
+OpenGL core profile vendor: Microsoft Corporation
+OpenGL core profile renderer: D3D12 (NVIDIA GeForce RTX 5070 Ti)
+OpenGL core profile version: 4.6 (Core Profile) Mesa 26.0.3-1ubuntu1
+OpenGL compatibility profile renderer: D3D12 (NVIDIA GeForce RTX 5070 Ti)
+OpenGL ES profile renderer: D3D12 (NVIDIA GeForce RTX 5070 Ti)
+";
+
+        assert_eq!(
+            eglinfo_renderers(output),
+            vec!["D3D12 (NVIDIA GeForce RTX 5070 Ti)".to_owned()],
+            "the vendor and version lines are not renderers, and one renderer \
+             printed under three profiles is one renderer"
+        );
     }
 
     #[test]
