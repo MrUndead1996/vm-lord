@@ -14,9 +14,9 @@ use std::{
 
 use uuid::Uuid;
 use vmlord_core::{
-    AgentStatus, Diagnostic, DiagnosticLevel, GpuMode, GuestReadinessTimeouts, HostGpuCapabilities,
-    NetworkMode, RepositoryError, SshAvailability, VmCreateRequest, VmDeleteRequest, VmGpuFacts,
-    VmRepository, VmState, VmSummary, VmUpdateRequest,
+    AgentStatus, Diagnostic, DiagnosticLevel, GpuAssignment, GpuMode, GuestReadinessTimeouts,
+    HostGpuCapabilities, NetworkMode, RepositoryError, SshAvailability, VmCreateRequest,
+    VmDeleteRequest, VmRepository, VmState, VmSummary, VmUpdateRequest,
 };
 
 use crate::{
@@ -28,6 +28,7 @@ use crate::{
     cleanup,
     com1_terminal::{Com1Launcher, Com1Sessions},
     cycle::{CycleOutcome, VmBuildCycle},
+    gpu_facts::GpuFacts,
     guest_ready::ReadinessTimeouts,
     hcn::HcnNetwork,
     hcn_endpoint::{EndpointAddress, HcnEndpoint},
@@ -78,6 +79,8 @@ pub struct HcsVmRepository {
     /// up when that run ends, and this is the only place that sees every way a
     /// run can end.
     agent_sessions: AgentSessions,
+    /// What has been observed about each running VM's GPU, in memory only.
+    gpu_facts: GpuFacts,
     /// Opens interactive SSH sessions into running guests. Nothing is kept
     /// beside it: a session belongs to whoever asked for it, not to VMLord.
     ssh_launcher: Arc<SshLauncher>,
@@ -128,6 +131,7 @@ impl HcsVmRepository {
             com1_launcher,
             com1_sessions: Com1Sessions::default(),
             agent_sessions: AgentSessions::default(),
+            gpu_facts: GpuFacts::default(),
             ssh_launcher: Arc::new(SshLauncher::production()),
             ssh_launches: SshLaunches::default(),
             shutdown: Arc::new(VmShutdownPipeline::production()),
@@ -353,6 +357,7 @@ impl HcsVmRepository {
                     // partition its listener is bound to stops existing as HCS
                     // tears the compute system down.
                     self.agent_sessions.cancel(finished.vm_id);
+                    self.gpu_facts.forget(finished.vm_id);
                     // The console is left alone: the guest is still writing the
                     // messages it prints on its way down, and the pipe closing
                     // is what ends the capture. The guest powers off on its own
@@ -549,6 +554,16 @@ impl HcsVmRepository {
             }
         };
 
+        // A VM this process is only now discovering was started by somebody
+        // else, so nothing here saw what was attached to it. Reporting "not
+        // yet" would be a different sentence, and a false one.
+        if mapping.gpu_mode != GpuMode::None
+            && self.gpu_facts.snapshot(mapping.vm_id).assignment.is_none()
+        {
+            self.gpu_facts
+                .record_assignment(mapping.vm_id, GpuAssignment::Unknown);
+        }
+
         match AgentConnection::start(
             mapping,
             runtime_id,
@@ -576,6 +591,7 @@ impl HcsVmRepository {
         // Read before `mapping.vm_name` is moved into the summary below.
         let network_mode = mapping.network_mode;
         let gpu_mode = mapping.gpu_mode;
+        let vm_id = mapping.vm_id;
         let ssh = SshAvailability::from(mapping.ssh.clone());
         let topology = self.topology(&mapping).unwrap_or(VmTopology {
             ram_mb: 0,
@@ -598,7 +614,7 @@ impl HcsVmRepository {
             disk_gb,
             cpu_cores: topology.cpu_cores,
             gpu_mode,
-            gpu: VmGpuFacts::default(),
+            gpu: self.gpu_facts.snapshot(vm_id),
             network_mode,
             ip_address,
             ssh,
@@ -1161,6 +1177,7 @@ impl VmRepository for HcsVmRepository {
         // was torn down under its guest.
         self.com1_sessions.cancel(mapping.vm_id);
         self.agent_sessions.cancel(mapping.vm_id);
+        self.gpu_facts.forget(mapping.vm_id);
         self.connections.remove(mapping.vm_id);
         Ok(())
     }
@@ -1182,6 +1199,7 @@ impl VmRepository for HcsVmRepository {
         // be removed.
         self.com1_sessions.cancel(mapping.vm_id);
         self.agent_sessions.cancel(mapping.vm_id);
+        self.gpu_facts.forget(mapping.vm_id);
         let vm_directory = layout::vm_directory(&self.storage_root, &request.name)?;
         self.delete.delete(
             &self.store,
@@ -1294,6 +1312,7 @@ impl VmRepository for HcsVmRepository {
             // a pipe that will never deliver again.
             self.com1_sessions.cancel(vm_id);
             self.agent_sessions.cancel(vm_id);
+            self.gpu_facts.forget(vm_id);
             self.connections.remove(vm_id);
         }
         if drained.service_disconnected && !self.service_disconnect_reported {
@@ -1344,6 +1363,7 @@ impl Drop for HcsVmRepository {
         // Each listener's thread is joined as it goes, so no socket outlives
         // the process that bound it.
         self.agent_sessions.cancel_all();
+        self.gpu_facts.forget_all();
         self.builds.cancel_all_and_join();
         // A request still being delivered holds a handle to a compute system
         // this repository is about to drop.
@@ -1478,9 +1498,12 @@ mod tests {
 
     use super::{
         HcsSystemState, HcsVmRepository, OS_TYPE, console_failure_diagnostics, guest_ip,
-        launch_running_consoles, merge_with_builds, record_gpu_mode, record_network_mode,
+        GpuAssignment, launch_running_consoles, merge_with_builds, record_gpu_mode,
+        record_network_mode,
         refuse_gpu_mode_change,
     };
+    use vmlord_core::{GuestGpuDetail, GuestGpuReport};
+
     use crate::{
         Com1Launcher, Com1LogMode, KnownVm, MetadataStore, VmComputeSystemMapping,
         agent::AgentConnection,
@@ -2319,6 +2342,64 @@ mod tests {
     fn a_running_vm_may_still_be_edited_as_long_as_its_gpu_mode_stands() {
         refuse_gpu_mode_change("dev", GpuMode::Mirror, GpuMode::Mirror, Some("running"))
             .expect("only the GPU mode is frozen while a VM runs, not the whole form");
+    }
+
+    #[test]
+    fn a_summary_carries_what_was_observed_about_the_vms_gpu() {
+        let repository = repository();
+        let mapping = VmComputeSystemMapping {
+            gpu_mode: GpuMode::Default,
+            ..mapping(NetworkMode::None)
+        };
+        repository.gpu_facts.record_guest(
+            mapping.vm_id,
+            GuestGpuReport::Ready(GuestGpuDetail {
+                driver: Some("dxgkrnl".into()),
+                render_node: Some("/dev/dri/renderD128".into()),
+            }),
+        );
+
+        let summary = repository.summary(KnownVm {
+            mapping,
+            state: None,
+            runtime_id: None,
+        });
+
+        assert!(
+            matches!(summary.gpu.guest, Some(GuestGpuReport::Ready(_))),
+            "the facts a session recorded have to reach the list that reads them"
+        );
+    }
+
+    #[test]
+    fn a_summary_of_a_vm_nothing_was_observed_about_carries_nothing() {
+        let repository = repository();
+
+        let summary = repository.summary(KnownVm {
+            mapping: mapping(NetworkMode::None),
+            state: None,
+            runtime_id: None,
+        });
+
+        assert_eq!(summary.gpu, vmlord_core::VmGpuFacts::default());
+    }
+
+    #[test]
+    fn a_run_that_is_over_leaves_no_gpu_facts_behind() {
+        let repository = repository();
+        let mapping = mapping(NetworkMode::None);
+        repository
+            .gpu_facts
+            .record_assignment(mapping.vm_id, GpuAssignment::Unknown);
+
+        repository.gpu_facts.forget(mapping.vm_id);
+
+        let summary = repository.summary(KnownVm {
+            mapping,
+            state: None,
+            runtime_id: None,
+        });
+        assert_eq!(summary.gpu.assignment, None);
     }
 
     #[test]
