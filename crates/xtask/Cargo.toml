@@ -16,3 +16,8 @@ workspace = true
 
 [dependencies]
 vmlord-gpu-payload = { path = "../gpu-payload", features = ["builder"] }
+
+# Tests only: reading back the catalog entry `pack` wrote. The build tool
+# itself reads it through `PayloadCatalog::from_entry_json`.
+[dev-dependencies]
+serde_json = "1.0"

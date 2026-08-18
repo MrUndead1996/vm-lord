@@ -28,6 +28,7 @@ mod gpu_assignment;
 mod gpu_discovery;
 mod gpu_enumerate;
 mod gpu_exports;
+mod gpu_staging;
 mod guest_ready;
 mod hcn;
 mod hcn_endpoint;
@@ -62,6 +63,7 @@ pub use event::{EventWaitResult, WindowsEvent};
 pub use force_stop::VmForceStopPipeline;
 pub use gpu_assignment::GpuAssignmentService;
 pub use gpu_discovery::discover_host_gpu;
+pub use gpu_staging::{StageGpuPayloadRequest, stage_for_vm};
 pub use hcn::{HcnNetwork, VMLORD_NETWORK_ID};
 pub use hcn_endpoint::{EndpointAddress, HcnEndpoint};
 pub use hcs::{

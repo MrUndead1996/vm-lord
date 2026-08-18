@@ -225,16 +225,12 @@ pub fn pack(request: PackRequest<'_>) -> Result<BuiltArtifact, PayloadError> {
     );
     let entry_bytes = serde_json::to_vec_pretty(&entry)
         .map_err(|error| PayloadError::InvalidCatalog(error.to_string()))?;
-    let catalog_bytes = serde_json::to_vec(&serde_json::json!({
-        "schema_version": 1,
-        "entries": [entry]
-    }))
-    .map_err(|error| PayloadError::InvalidCatalog(error.to_string()))?;
-    let catalog = PayloadCatalog::from_json(&catalog_bytes)?;
-    let validated_entry = &catalog.entries()[0];
-    PayloadManifest::parse_and_validate(&manifest_bytes, validated_entry)?;
+    // Validated from the exact bytes that are about to be written, so what
+    // the file says and what was checked cannot differ.
+    let validated_entry = PayloadCatalog::from_entry_json(&entry_bytes)?;
+    PayloadManifest::parse_and_validate(&manifest_bytes, &validated_entry)?;
     let sources_bytes = read_prepared_file(&files, "sources.json")?;
-    SourceManifest::parse_and_validate(&sources_bytes, validated_entry)?;
+    SourceManifest::parse_and_validate(&sources_bytes, &validated_entry)?;
 
     fs::write(request.catalog_entry_path, entry_bytes).map_err(|error| {
         PayloadError::io(

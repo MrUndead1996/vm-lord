@@ -234,6 +234,27 @@ impl PayloadCatalog {
         }
         Ok(Self { entries })
     }
+    /// Reads one entry as `cargo xtask gpu-payload pack` writes it.
+    ///
+    /// `pack` emits a bare entry object rather than a catalog document, and
+    /// what makes an entry trustworthy is [`Self::from_json`]'s validation --
+    /// so the entry is wrapped in the document it belongs to and read through
+    /// exactly that. Both the builder and the release build use this, so the
+    /// file has one reading rather than two that can drift apart.
+    pub fn from_entry_json(bytes: &[u8]) -> Result<CatalogEntry, PayloadError> {
+        let entry: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|error| PayloadError::InvalidCatalog(error.to_string()))?;
+        let document = serde_json::to_vec(&serde_json::json!({
+            "schema_version": CATALOG_SCHEMA_VERSION,
+            "entries": [entry],
+        }))
+        .map_err(|error| PayloadError::InvalidCatalog(error.to_string()))?;
+        Self::from_json(&document)?
+            .entries
+            .into_iter()
+            .next()
+            .ok_or_else(|| PayloadError::InvalidCatalog("empty catalog entry".into()))
+    }
     pub fn embedded() -> Result<Self, PayloadError> {
         Self::from_json(include_bytes!("../catalog/catalog.json"))
     }
@@ -349,5 +370,38 @@ mod tests {
     #[test]
     fn an_empty_embedded_catalog_is_valid_until_a_tested_recipe_is_published() {
         assert!(PayloadCatalog::embedded().unwrap().entries().is_empty());
+    }
+
+    #[test]
+    fn a_packed_entry_is_read_through_the_same_validation_as_the_catalog() {
+        let document: serde_json::Value = serde_json::from_str(&catalog()).unwrap();
+        let entry = serde_json::to_vec(&document["entries"][0]).unwrap();
+
+        assert_eq!(
+            PayloadCatalog::from_entry_json(&entry)
+                .unwrap()
+                .payload_id(),
+            "ubuntu-26.04-amd64-7.0.0-14-v1"
+        );
+    }
+
+    #[test]
+    fn a_packed_entry_that_fails_catalog_validation_is_refused() {
+        let mut document: serde_json::Value = serde_json::from_str(&catalog()).unwrap();
+        document["entries"][0]["archive_url"] = "http://downloads.example.test/payload.zip".into();
+        let entry = serde_json::to_vec(&document["entries"][0]).unwrap();
+
+        assert!(matches!(
+            PayloadCatalog::from_entry_json(&entry),
+            Err(PayloadError::InvalidCatalog(_))
+        ));
+    }
+
+    #[test]
+    fn a_whole_catalog_document_is_not_an_entry() {
+        assert!(matches!(
+            PayloadCatalog::from_entry_json(catalog().as_bytes()),
+            Err(PayloadError::InvalidCatalog(_))
+        ));
     }
 }

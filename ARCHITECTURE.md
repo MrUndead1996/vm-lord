@@ -1058,14 +1058,34 @@ mode takes a full VM restart.
 ### GPU: guest payload
 
 `vmlord-gpu-payload` is portable: it validates an exact guest target tuple,
-downloads and verifies content-addressed ZIP archives, and exposes only an
-opaque `ReadyGpuPayload` after every cache hit has been rehashed. Its embedded
+verifies content-addressed ZIP archives, and exposes only an opaque
+`ReadyGpuPayload` after every cache hit has been rehashed. Its embedded
 schema-v1 production catalog is still empty: what the guest does with a payload
 is written below, but an entry needs an archive that has been packed with
 `cargo xtask gpu-payload pack` and published somewhere with its digest, which
-is neither code nor a decision any of these tasks makes. Release tooling
-creates sorted ZIP content and deterministic provenance without making the
-archive digest self-referential.
+is neither code nor a decision any of these tasks makes. Nothing therefore
+selects a payload in a built release yet. Release tooling creates sorted ZIP
+content and deterministic provenance without making the archive digest
+self-referential.
+
+A payload normally reaches a host as a file rather than as a download.
+`cargo dist --gpu-payload <directory>` takes what `pack` wrote -- `payload.zip`
+beside `catalog-entry.json` -- re-reads the entry through
+`PayloadCatalog::from_entry_json`, checks the archive against the size and
+digest it claims, and copies it to `gpu-payload/<payload_id>.zip` beside the
+executable. The entry itself does not travel: the catalog the application
+trusts is the one compiled into it, and a second catalog on disk would be one
+an attacker can edit. `local_archive_path` states that layout once, for the
+build tool placing the file and the application reading it alike.
+
+`PrepareRequest::local_archive` is what the application passes. A file that is
+there is prepared from with no network access at all; a file that is not there
+falls back to `archive_url`; a file that is there and does not match its entry
+is an error rather than a reason to go online. Verification does not soften for
+a local archive -- the same digest, the same expansion limits, the same
+`payload.json` and `sources.json` cross-check against the entry's provenance.
+`archive_url` therefore keeps one meaning, where these bytes are published, and
+serves as both the fallback and the way to replace a payload between releases.
 
 Ready content is materialized below a VM's exact `gpu-payload` child as
 `generations/<digest>` followed by `ready/<digest>.json`. The third logical
@@ -1073,6 +1093,13 @@ share, `GpuPayload` / `vmlord.gpu.payload`, exports only that canonical child;
 it never broadens either System32 root or exposes the cache. The guest mounts
 that share at `/opt/vmlord/gpu-payload`; what the guest makes of it is the
 recipe below, and task 98 owns lifecycle and UI orchestration.
+
+`platform::gpu_staging` is what fills that child: given the executable's
+directory, the shared cache root, a VM directory and the guest tuple an agent
+reported, it selects the entry, prepares the generation and stages it into
+`layout::gpu_payload_staging_directory` -- the same path `gpu_exports` will
+canonicalize. It is called by nothing yet, for the reason `gpu_exports` is: a
+start does not know a VM's GPU mode until assignment records one.
 
 ### GPU: the guest's Ubuntu recipe
 

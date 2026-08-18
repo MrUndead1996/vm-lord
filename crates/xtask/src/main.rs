@@ -33,7 +33,7 @@ const ARTIFACTS: [(&str, &str); 4] = [
 fn main() -> ExitCode {
     let task = env::args().nth(1);
     let result = match task.as_deref() {
-        Some("dist") => dist(),
+        Some("dist") => gpu_payload::parse_dist(env::args().skip(2)).and_then(dist),
         Some("gpu-payload") => gpu_payload::run(env::args().skip(2)),
         Some(other) => Err(format!("unknown task `{other}`")),
         None => Err("missing task".to_owned()),
@@ -49,7 +49,7 @@ fn main() -> ExitCode {
 }
 
 /// Builds the release artifacts and gathers them under Cargo's target directory.
-fn dist() -> Result<(), String> {
+fn dist(gpu_payloads: Vec<PathBuf>) -> Result<(), String> {
     if !cfg!(windows) {
         return Err(format!(
             "`cargo dist` runs on Windows only: the release application is built for {APP_TARGET}, \
@@ -97,6 +97,14 @@ fn dist() -> Result<(), String> {
             )
         })?;
         println!("dist: {file}");
+    }
+
+    if gpu_payloads.is_empty() {
+        println!("dist: no GPU payload included; pass --gpu-payload <directory>");
+    }
+    for source in &gpu_payloads {
+        let payload_id = gpu_payload::stage_release_payload(source, &destination)?;
+        println!("dist: gpu-payload/{payload_id}.zip");
     }
 
     println!("dist: written to {}", destination.display());

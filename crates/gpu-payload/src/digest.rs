@@ -14,7 +14,7 @@ pub struct Sha256Digest {
 impl Sha256Digest {
     pub fn as_hex(&self) -> &str { &self.hex }
 
-    pub(crate) fn hash_reader(mut reader: impl Read) -> Result<Self, PayloadError> {
+    pub fn hash_reader(mut reader: impl Read) -> Result<Self, PayloadError> {
         let mut hash = Sha256::new();
         let mut buffer = [0; 64 * 1024];
         loop {

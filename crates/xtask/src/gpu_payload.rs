@@ -1,5 +1,12 @@
-use std::path::PathBuf;
-use vmlord_gpu_payload::builder::{PackRequest, pack};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
+use vmlord_gpu_payload::{
+    PayloadCatalog, Sha256Digest,
+    builder::{PackRequest, pack},
+    local_archive_path,
+};
 
 pub(crate) struct PackCommand {
     pub recipe: PathBuf,
@@ -48,6 +55,77 @@ pub(crate) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
     })
     .map(|_| ())
     .map_err(|e| e.to_string())
+}
+
+/// Reads `cargo dist`'s arguments: zero or more payload directories.
+pub(crate) fn parse_dist<I: IntoIterator<Item = String>>(
+    arguments: I,
+) -> Result<Vec<PathBuf>, String> {
+    let mut values = arguments.into_iter();
+    let mut directories = Vec::new();
+    while let Some(flag) = values.next() {
+        if flag != "--gpu-payload" {
+            return Err(format!("unknown argument `{flag}`"));
+        }
+        directories.push(PathBuf::from(
+            values.next().ok_or("missing value for --gpu-payload")?,
+        ));
+    }
+    Ok(directories)
+}
+
+/// Copies one packed payload into a distribution, refusing anything that is
+/// not exactly what `pack` wrote.
+///
+/// `source` is the directory the recipe's `pack` step wrote `payload.zip` and
+/// `catalog-entry.json` into. Only the archive travels: the catalog is
+/// embedded in the application and trusted for being embedded, and a second
+/// catalog sitting beside the executable would be one an attacker can edit.
+///
+/// Deeper checks -- `payload.json`, `sources.json`, expansion limits -- belong
+/// to `prepare` on the machine that will use the payload. Repeating them here
+/// would be a second opinion that can drift from the first.
+pub(crate) fn stage_release_payload(source: &Path, destination: &Path) -> Result<String, String> {
+    let entry_path = source.join("catalog-entry.json");
+    let archive_path = source.join("payload.zip");
+    let entry_bytes = fs::read(&entry_path)
+        .map_err(|error| format!("cannot read {}: {error}", entry_path.display()))?;
+    let entry = PayloadCatalog::from_entry_json(&entry_bytes).map_err(|error| {
+        format!(
+            "{} is not a packed catalog entry: {error}",
+            entry_path.display()
+        )
+    })?;
+
+    let archive = fs::read(&archive_path)
+        .map_err(|error| format!("cannot read {}: {error}", archive_path.display()))?;
+    let size = archive.len() as u64;
+    if size != entry.archive_size() {
+        return Err(format!(
+            "{} is {size} bytes; its entry says {}",
+            archive_path.display(),
+            entry.archive_size()
+        ));
+    }
+    let digest = Sha256Digest::hash_reader(archive.as_slice())
+        .map_err(|error| format!("cannot hash {}: {error}", archive_path.display()))?;
+    if digest != *entry.archive_sha256() {
+        return Err(format!(
+            "{} hashes to {digest}; its entry says {}",
+            archive_path.display(),
+            entry.archive_sha256()
+        ));
+    }
+
+    let target = local_archive_path(destination, entry.payload_id());
+    let directory = target
+        .parent()
+        .expect("a payload archive path always has a parent");
+    fs::create_dir_all(directory)
+        .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
+    fs::write(&target, &archive)
+        .map_err(|error| format!("cannot write {}: {error}", target.display()))?;
+    Ok(entry.payload_id().to_owned())
 }
 
 #[cfg(test)]
@@ -183,5 +261,132 @@ mod tests {
             fs::read(cli_entry).unwrap(),
             fs::read(direct_entry).unwrap()
         );
+    }
+
+    /// Packs the crate's fixture into `directory`, as the recipe's `pack` step
+    /// does, and answers with the payload ID the entry carries.
+    fn packed_pair(directory: &Path) -> String {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../gpu-payload/tests/fixtures");
+        pack(PackRequest {
+            prepared_directory: &fixture.join("prepared"),
+            recipe_path: &fixture.join("recipe.json"),
+            archive_path: &directory.join("payload.zip"),
+            catalog_entry_path: &directory.join("catalog-entry.json"),
+        })
+        .unwrap();
+        let entry: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.join("catalog-entry.json")).unwrap())
+                .unwrap();
+        entry["payload_id"].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn a_packed_pair_is_copied_under_its_payload_id() {
+        let temporary = TemporaryDirectory::new("stage-ok");
+        let source = temporary.path().join("built");
+        let destination = temporary.path().join("dist");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        let payload_id = packed_pair(&source);
+
+        assert_eq!(
+            super::stage_release_payload(&source, &destination).unwrap(),
+            payload_id
+        );
+        assert_eq!(
+            fs::read(
+                destination
+                    .join("gpu-payload")
+                    .join(format!("{payload_id}.zip"))
+            )
+            .unwrap(),
+            fs::read(source.join("payload.zip")).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_pair_that_is_not_what_pack_produced_fails_the_build() {
+        let temporary = TemporaryDirectory::new("stage-bad");
+        let destination = temporary.path().join("dist");
+        fs::create_dir_all(&destination).unwrap();
+
+        // Each case is a separate source directory: a build tool that accepted
+        // any of these would put bytes nobody verified into a release.
+        for (label, damage) in [
+            (
+                "truncated",
+                Box::new(|source: &Path| {
+                    let archive = fs::read(source.join("payload.zip")).unwrap();
+                    fs::write(source.join("payload.zip"), &archive[..archive.len() - 1]).unwrap();
+                }) as Box<dyn Fn(&Path)>,
+            ),
+            (
+                "flipped",
+                Box::new(|source: &Path| {
+                    let mut archive = fs::read(source.join("payload.zip")).unwrap();
+                    archive[0] ^= 0xFF;
+                    fs::write(source.join("payload.zip"), archive).unwrap();
+                }),
+            ),
+            (
+                "entry-invalid",
+                Box::new(|source: &Path| {
+                    fs::write(source.join("catalog-entry.json"), b"{}").unwrap();
+                }),
+            ),
+            (
+                "archive-missing",
+                Box::new(|source: &Path| {
+                    fs::remove_file(source.join("payload.zip")).unwrap();
+                }),
+            ),
+            (
+                "entry-missing",
+                Box::new(|source: &Path| {
+                    fs::remove_file(source.join("catalog-entry.json")).unwrap();
+                }),
+            ),
+        ] {
+            let source = temporary.path().join(label);
+            fs::create_dir_all(&source).unwrap();
+            packed_pair(&source);
+            damage(&source);
+
+            assert!(
+                super::stage_release_payload(&source, &destination).is_err(),
+                "accepted a {label} pair"
+            );
+        }
+    }
+
+    #[test]
+    fn dist_takes_any_number_of_payload_directories() {
+        assert_eq!(
+            super::parse_dist(Vec::new()).unwrap(),
+            Vec::<PathBuf>::new()
+        );
+        assert_eq!(
+            super::parse_dist(
+                ["--gpu-payload", "one", "--gpu-payload", "two"]
+                    .into_iter()
+                    .map(str::to_owned)
+            )
+            .unwrap(),
+            vec![PathBuf::from("one"), PathBuf::from("two")]
+        );
+    }
+
+    #[test]
+    fn dist_rejects_an_unknown_or_incomplete_argument() {
+        for arguments in [
+            vec!["--gpu-payload"],
+            vec!["--unknown", "value"],
+            vec!["built"],
+        ] {
+            assert!(
+                super::parse_dist(arguments.iter().map(|value| (*value).to_owned())).is_err(),
+                "accepted {arguments:?}"
+            );
+        }
     }
 }
