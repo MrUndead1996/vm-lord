@@ -488,13 +488,17 @@ impl WorkspaceApp {
         }
     }
 
-    /// Opens an interactive SSH session into a running guest.
+    /// Asks for an interactive SSH session into a running guest.
     ///
     /// Both outcomes are collected from the backend, which is what makes this
     /// different from the other actions here. A session that opened says
     /// nothing to VMLord afterwards -- it is a process in a window of its own --
     /// so the command it was opened with is the only account of it there will
     /// be, and it belongs in the log beside the failures.
+    ///
+    /// What comes back here is only whether the request was accepted: reaching
+    /// the guest takes seconds the UI's thread cannot spend, so the backend
+    /// does it on its own and reports what happened into the same diagnostics.
     pub fn open_ssh(&mut self, name: &str) -> Result<(), RepositoryError> {
         self.require_ready_backend("SSH connection")?;
 
@@ -502,7 +506,7 @@ impl WorkspaceApp {
             Ok(()) => {
                 self.diagnostics.push(Diagnostic {
                     level: DiagnosticLevel::Info,
-                    message: format!("SSH session for VM \"{name}\" started"),
+                    message: format!("Opening an SSH session for VM \"{name}\""),
                 });
                 self.collect_diagnostics();
                 Ok(())
@@ -1016,7 +1020,7 @@ mod tests {
         assert!(
             app.diagnostics()
                 .iter()
-                .any(|diagnostic| diagnostic.message == "SSH session for VM \"dev\" started")
+                .any(|diagnostic| diagnostic.message == "Opening an SSH session for VM \"dev\"")
         );
     }
 

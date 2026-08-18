@@ -36,6 +36,7 @@ use crate::{
     layout, list_known_vms,
     reconnect::{ReconnectOutcome, reconnect_known_vms},
     shutdown_workers::ShutdownWorkers,
+    ssh_launches::SshLaunches,
     ssh_terminal::SshLauncher,
     vhd, watch,
     watch::VmEventSink,
@@ -79,7 +80,9 @@ pub struct HcsVmRepository {
     agent_sessions: AgentSessions,
     /// Opens interactive SSH sessions into running guests. Nothing is kept
     /// beside it: a session belongs to whoever asked for it, not to VMLord.
-    ssh_launcher: SshLauncher,
+    ssh_launcher: Arc<SshLauncher>,
+    /// The sessions being opened right now, each on a thread of its own.
+    ssh_launches: SshLaunches,
     /// Shared with the worker threads that deliver shutdown requests, which is
     /// why it is behind an `Arc`.
     shutdown: Arc<VmShutdownPipeline>,
@@ -125,7 +128,8 @@ impl HcsVmRepository {
             com1_launcher,
             com1_sessions: Com1Sessions::default(),
             agent_sessions: AgentSessions::default(),
-            ssh_launcher: SshLauncher::production(),
+            ssh_launcher: Arc::new(SshLauncher::production()),
+            ssh_launches: SshLaunches::default(),
             shutdown: Arc::new(VmShutdownPipeline::production()),
             shutdowns: ShutdownWorkers::default(),
             force_stop: VmForceStopPipeline::production(),
@@ -359,6 +363,22 @@ impl HcsVmRepository {
     ///
     /// Split from [`VmRepository::open_ssh`] at the one call that needs HCS, so
     /// that what it decides can be tested without a compute system.
+    /// Starts an interactive session into `mapping`'s guest, on a thread of
+    /// its own.
+    ///
+    /// What is answered here is only whether the session is worth attempting:
+    /// a VM that is not running has no guest to log into, and saying so is
+    /// instant. Everything the attempt itself costs -- the address from HNS,
+    /// the port probe and its three-second timeout, the terminal host starting
+    /// -- happens on the worker, because this is called on the UI's thread and
+    /// a guest that stopped answering used to freeze the window for the whole
+    /// probe.
+    ///
+    /// So `Ok` means "a session is being opened", not "a session opened". The
+    /// difference is not hidden: both outcomes reach the diagnostics the UI
+    /// already reads, and they are the only account of a session there ever
+    /// was -- once the terminal is up, everything else OpenSSH has to say goes
+    /// into that window rather than back here.
     fn open_ssh_in_state(
         &self,
         mapping: &VmComputeSystemMapping,
@@ -371,32 +391,36 @@ impl HcsVmRepository {
         )?;
 
         let vm_directory = layout::vm_directory(&self.storage_root, &mapping.vm_name)?;
-        let invocation = self
-            .ssh_launcher
-            .launch(mapping, &vm_directory)
-            .map_err(|failure| {
-                let error = RepositoryError::new(format!(
-                    "cannot open an SSH session to VM \"{}\": {failure}",
-                    mapping.vm_name
-                ));
-                log::error!("{error}");
-                error
-            })?;
+        let launcher = Arc::clone(&self.ssh_launcher);
+        let diagnostics = Arc::clone(&self.diagnostics);
+        let mapping = mapping.clone();
 
-        // The command, not just the fact of it. Everything the session goes on
-        // to say lands in its own window, so this line is the only account
-        // VMLord can give of what it asked for -- which key, which known-hosts
-        // file, which port -- and it is the first thing worth reading when a
-        // guest refuses a login.
-        self.push_diagnostic(
-            DiagnosticLevel::Info,
-            format!(
-                "SSH session for VM \"{}\": {}",
-                mapping.vm_name,
-                invocation.command_line()
-            ),
-        );
-        Ok(())
+        self.ssh_launches.start(&mapping.vm_name.clone(), move || {
+            match launcher.launch(&mapping, &vm_directory) {
+                // The command, not just the fact of it. Everything the session
+                // goes on to say lands in its own window, so this line is the
+                // only account VMLord can give of what it asked for -- which
+                // key, which known-hosts file, which port -- and it is the
+                // first thing worth reading when a guest refuses a login.
+                Ok(invocation) => push_shared_diagnostic(
+                    &diagnostics,
+                    DiagnosticLevel::Info,
+                    format!(
+                        "SSH session for VM \"{}\": {}",
+                        mapping.vm_name,
+                        invocation.command_line()
+                    ),
+                ),
+                Err(failure) => {
+                    let message = format!(
+                        "cannot open an SSH session to VM \"{}\": {failure}",
+                        mapping.vm_name
+                    );
+                    log::error!("{message}");
+                    push_shared_diagnostic(&diagnostics, DiagnosticLevel::Error, message);
+                }
+            }
+        })
     }
 
     fn push_diagnostic(&self, level: DiagnosticLevel, message: String) {
@@ -1261,6 +1285,9 @@ impl Drop for HcsVmRepository {
         // A request still being delivered holds a handle to a compute system
         // this repository is about to drop.
         self.shutdowns.join_all();
+        // A launch still probing holds nothing of the repository's, but its
+        // thread must not outlive the process that started it.
+        self.ssh_launches.join_all();
     }
 }
 
@@ -1934,7 +1961,7 @@ mod tests {
     /// A repository whose SSH sessions are recorded instead of opened.
     fn repository_with_ssh(recorded: Arc<Mutex<Vec<String>>>) -> HcsVmRepository {
         let mut repository = repository();
-        repository.ssh_launcher = SshLauncher::for_test(
+        repository.ssh_launcher = Arc::new(SshLauncher::for_test(
             |_| Ok(Some("172.22.42.7".parse().unwrap())),
             |_, _, _| Ok(()),
             |_| true,
@@ -1945,7 +1972,7 @@ mod tests {
                     .push(command.program.display().to_string());
                 Ok(())
             },
-        );
+        ));
         repository
     }
 
@@ -1971,8 +1998,47 @@ mod tests {
         repository
             .open_ssh_in_state(&ssh_mapping(), Some(HcsSystemState::Running))
             .expect("a running guest can be logged into");
+        repository.ssh_launches.wait_until_opened();
 
         assert_eq!(recorded.lock().unwrap().clone(), ["wt.exe"]);
+    }
+
+    /// The call the UI makes has to come back before the guest has been
+    /// reached: probing a VM that stopped answering costs seconds, and they
+    /// used to be seconds the window did not repaint in.
+    #[test]
+    fn opening_a_session_returns_before_the_guest_is_reached() {
+        let reached = Arc::new(Mutex::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut repository = repository();
+        repository.ssh_launcher = Arc::new(SshLauncher::for_test(
+            |_| Ok(Some("172.22.42.7".parse().unwrap())),
+            {
+                let reached = Arc::clone(&reached);
+                let held = Arc::clone(&release);
+                move |_, _, _| {
+                    while !held.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::thread::yield_now();
+                    }
+                    *reached.lock().unwrap() = true;
+                    Ok(())
+                }
+            },
+            |_| true,
+            |_: &TerminalCommand| Ok(()),
+        ));
+
+        repository
+            .open_ssh_in_state(&ssh_mapping(), Some(HcsSystemState::Running))
+            .expect("a running guest can be logged into");
+
+        assert!(
+            !*reached.lock().unwrap(),
+            "the caller waited for the probe it was supposed to hand off"
+        );
+        release.store(true, std::sync::atomic::Ordering::Relaxed);
+        repository.ssh_launches.wait_until_opened();
+        assert!(*reached.lock().unwrap());
     }
 
     /// A session that opened tells VMLord nothing afterwards, so the command it
@@ -1986,6 +2052,7 @@ mod tests {
         repository
             .open_ssh_in_state(&ssh_mapping(), Some(HcsSystemState::Running))
             .expect("a running guest can be logged into");
+        repository.ssh_launches.wait_until_opened();
 
         let diagnostics = repository.take_diagnostics();
         let logged = diagnostics
@@ -2014,30 +2081,44 @@ mod tests {
                 .open_ssh_in_state(&mapping, Some(HcsSystemState::Running))
                 .expect("a second shell is not a second reader on one pipe");
         }
+        repository.ssh_launches.wait_until_opened();
 
         assert_eq!(recorded.lock().unwrap().len(), 2);
     }
 
     /// The preflight checks exist to be reported: what the person sees has to
     /// name the thing that stopped the session, not that one did not open.
+    ///
+    /// It reaches them as a diagnostic rather than as this call's answer,
+    /// because the check runs after the call has already returned -- which is
+    /// what keeps the window painting. The UI reads the same buffer either way.
     #[test]
-    fn a_preflight_failure_reaches_the_repository_with_its_own_reason() {
+    fn a_preflight_failure_reaches_the_diagnostics_with_its_own_reason() {
         let mut repository = repository();
-        repository.ssh_launcher = SshLauncher::for_test(
+        repository.ssh_launcher = Arc::new(SshLauncher::for_test(
             |_| Ok(Some("172.22.42.7".parse().unwrap())),
             |_, _, _| Err("connection refused".to_owned()),
             |_| panic!("a guest that does not answer is not asked for its key"),
             |_| panic!("nor given a terminal"),
-        );
+        ));
 
-        let error = repository
+        repository
             .open_ssh_in_state(&ssh_mapping(), Some(HcsSystemState::Running))
-            .expect_err("a guest that does not answer cannot be logged into")
-            .to_string();
+            .expect("the attempt is made in the background, so it is accepted");
+        repository.ssh_launches.wait_until_opened();
 
-        assert!(error.contains("dev"), "{error}");
-        assert!(error.contains("port 22"), "{error}");
-        assert!(error.contains("connection refused"), "{error}");
+        let diagnostics = repository.take_diagnostics();
+        let reported = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.level == DiagnosticLevel::Error)
+            .expect("a refused session has to be reported");
+
+        assert!(reported.message.contains("dev"), "{reported:?}");
+        assert!(reported.message.contains("port 22"), "{reported:?}");
+        assert!(
+            reported.message.contains("connection refused"),
+            "{reported:?}"
+        );
     }
 
     #[test]
