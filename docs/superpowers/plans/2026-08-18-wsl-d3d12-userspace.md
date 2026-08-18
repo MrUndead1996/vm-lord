@@ -89,7 +89,7 @@ Ubuntu guest kernel is a fact, not an opinion.
 
 **This is a spike. Its output is an answer, and nothing it produces is kept.**
 
-- [ ] **Step 1: Reproduce the two mounts by hand in a running guest**
+- [x] **Step 1: Reproduce the two mounts by hand in a running guest**
 
 On a VM built by the current branch, with `/usr/lib/wsl/lib` already mounted:
 
@@ -102,7 +102,7 @@ sudo mount -t 9p -o trans=virtio,version=9p2000.L,ro,aname=vmlord.gpu.wsl-lib \
 sudo mount --bind -o ro /usr/share /tmp/spike/b
 ```
 
-- [ ] **Step 2: Try the overlay**
+- [x] **Step 2: Try the overlay**
 
 ```sh
 sudo mount -t overlay overlay -o lowerdir=/tmp/spike/b:/tmp/spike/a /tmp/spike/merged
@@ -111,7 +111,7 @@ ls /tmp/spike/merged | head
 
 Expected if it works: the union of both directories, and no `upperdir` required.
 
-- [ ] **Step 3: Record the answer and clean up**
+- [x] **Step 3: Record the answer and clean up**
 
 ```sh
 sudo umount /tmp/spike/merged /tmp/spike/a /tmp/spike/b
@@ -146,7 +146,7 @@ Write the answer into this plan under Task 4 before starting it:
   - `pub const WSL_D3D12_SHARE: &str = "vmlord.gpu.wsl-d3d12";`
   - `GpuShare::wsl_d3d12() -> GpuShare`
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In `crates/core/src/gpu.rs` `mod tests`:
 
@@ -166,12 +166,12 @@ In `crates/core/src/gpu.rs` `mod tests`:
     }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cargo test-windows -p vmlord-core gpu::tests::the_d3d12_share`
 Expected: FAIL — `no function or associated item named wsl_d3d12`.
 
-- [ ] **Step 3: Add the role on the wire**
+- [x] **Step 3: Add the role on the wire**
 
 In `agent.proto`, inside `GpuShareRole`:
 
@@ -186,7 +186,7 @@ Bump `CURRENT_VERSION` in `handshake.rs` to `minor: 6`. Leave `major` alone: an
 agent that predates this value decodes it as `UNSPECIFIED` and refuses that one
 share, which is a session that still mounts everything else.
 
-- [ ] **Step 4: Add the role in the domain**
+- [x] **Step 4: Add the role in the domain**
 
 In `crates/core/src/gpu.rs`, add to `GpuShareRole`:
 
@@ -220,18 +220,18 @@ and beside `wsl_lib`:
     }
 ```
 
-- [ ] **Step 5: Map the role on both sides of the wire**
+- [x] **Step 5: Map the role on both sides of the wire**
 
 In `crates/platform/src/agent_session.rs`, `wire_share` gains
 `CoreShareRole::WslD3d12 => (GpuShareRole::WslD3d12, String::new()),`. The match
 is total, so a missing arm fails to compile, which is where it should fail.
 
-- [ ] **Step 6: Run the tests**
+- [x] **Step 6: Run the tests**
 
 Run: `cargo test-windows -p vmlord-core -p vmlord-agent-protocol -p vmlord-platform`
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [x] **Step 7: Commit**
 
 ```bash
 git add crates/agent-protocol crates/core/src/gpu.rs crates/platform/src/agent_session.rs
@@ -254,7 +254,7 @@ git commit -m "TASK-107: Give the Microsoft D3D12 userspace a share role"
   - `ExportRoots::resolve(system32: &Path, program_files: Option<&Path>, canonicalize: Canonicalize<'_>)`
   - `fn program_files_directory() -> Option<PathBuf>`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
     const PROGRAM_FILES: &str = r"C:\Program Files";
@@ -335,12 +335,12 @@ git commit -m "TASK-107: Give the Microsoft D3D12 userspace a share role"
     }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `cargo test-windows -p vmlord-platform gpu_exports`
 Expected: FAIL — `resolve` takes two arguments.
 
-- [ ] **Step 3: Add the root**
+- [x] **Step 3: Add the root**
 
 In `ExportRoots`:
 
@@ -387,7 +387,7 @@ puts the Microsoft libraries first for the same reason the payload leads today:
     }
 ```
 
-- [ ] **Step 4: Read Program Files natively**
+- [x] **Step 4: Read Program Files natively**
 
 Add `"Win32_UI_Shell"` to the `windows` features in `crates/platform/Cargo.toml`,
 and beside `system_directory`:
@@ -421,12 +421,12 @@ and pass it in `GpuExports::build`:
         let roots = ExportRoots::resolve(&system32, program_files_directory().as_deref(), &canonicalize);
 ```
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `cargo test-windows -p vmlord-platform gpu_exports` then `cargo check-windows`
 Expected: PASS, no warnings.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/platform/Cargo.toml crates/platform/src/gpu_exports.rs
@@ -449,7 +449,7 @@ this host exists and is the wrong half.
 - Consumes: `program_files_directory` (Task 2).
 - Produces: `GpuAvailability::linux_payload` that answers for both directories.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
     #[test]
@@ -477,12 +477,12 @@ this host exists and is the wrong half.
     }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `cargo test-windows -p vmlord-platform gpu_discovery`
 Expected: FAIL — `assemble` takes a `bool`.
 
-- [ ] **Step 3: Answer for both directories**
+- [x] **Step 3: Answer for both directories**
 
 Replace the `payload_present: bool` parameter of `assemble` with:
 
@@ -505,12 +505,12 @@ today and `program_files_directory()?.join("WSL").join("lib")` for the other.
 `assemble` reports `Available` only when both are set, and names the missing
 half in the failure message.
 
-- [ ] **Step 4: Run the tests**
+- [x] **Step 4: Run the tests**
 
 Run: `cargo test-windows -p vmlord-platform gpu_discovery`
 Expected: PASS.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/platform/src/gpu_discovery.rs
@@ -547,7 +547,7 @@ observes on the real host. The symlink alternative is dropped.
   - `WSL_LIB` keeps its value `/usr/lib/wsl/lib` and stops being a mount target
   - `fn merge_wsl_lib(sources: &[PathBuf]) -> Result<(), String>`
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 ```rust
     #[test]
@@ -580,19 +580,19 @@ observes on the real host. The symlink alternative is dropped.
     }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `cargo test -p vmlord-agent gpu_targets`
 Expected: FAIL — `WSL_HOST_LIB` is not defined.
 
-- [ ] **Step 3: Move the mount targets and add the new one**
+- [x] **Step 3: Move the mount targets and add the new one**
 
 In `gpu_targets.rs`, `WSL_LIB` keeps its path but is no longer a target;
 `WslLib` maps to `WSL_HOST_LIB` and `WslD3d12` to `WSL_D3D12`. The allowlist
 comment gains the reason: `/usr/lib/wsl/lib` is composed from these two and must
 not be something a manifest can mount over.
 
-- [ ] **Step 4: Build the merged view**
+- [x] **Step 4: Build the merged view**
 
 In `gpu_mounts.rs`, after the mounts and before `refresh_libraries`, compose
 `/usr/lib/wsl/lib` from whichever of the two mounts are present.
@@ -623,12 +623,12 @@ set" rule `refresh_libraries` already follows, and for the same reason.
 Either way `refresh_libraries` is then given `/usr/lib/wsl/lib` rather than the
 two mounts, so the linker learns one directory.
 
-- [ ] **Step 5: Run the tests**
+- [x] **Step 5: Run the tests**
 
 Run: `cargo test -p vmlord-agent` then `cargo agent`
 Expected: PASS, and the agent still cross-compiles for musl with no C toolchain.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/agent/src
@@ -661,14 +661,14 @@ Phase 1 of `superpowers:systematic-debugging` — the host directories are
 inspectable directly from WSL under `/mnt/c`, which is how the split was found
 in the first place.
 
-- [ ] **Step 3: Record what is true**
+- [x] **Step 3: Record what is true**
 
 In `ARCHITECTURE.md`, in the export section: two host sources, one guest
 directory, and why the merge exists rather than a second `ld.so.conf` line. In
 the TASK-88 spec, a superseding note that the WSL userspace is not one directory
 on hosts that install WSL from the Store.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add ARCHITECTURE.md docs/superpowers/specs
