@@ -998,6 +998,8 @@ fn shuts_down_a_running_guest() {
             endpoint_id: None,
             network_mode: NetworkMode::None,
             ssh: None,
+            gpu_mode: vmlord_core::GpuMode::None,
+            guest_target: None,
         })
         .expect("mapping should be persisted");
 
@@ -1897,6 +1899,8 @@ fn mapping_owning(vm_name: &str, endpoint_id: Uuid) -> VmComputeSystemMapping {
         endpoint_id: Some(endpoint_id),
         network_mode: NetworkMode::Nat,
         ssh: None,
+        gpu_mode: vmlord_core::GpuMode::None,
+        guest_target: None,
     }
 }
 

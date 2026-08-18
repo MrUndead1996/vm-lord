@@ -23,8 +23,12 @@ impl HcsVmConfigBuilder {
     /// for a cloud image. `tools_path`, when supplied for a cloud VM with an
     /// installed agent, becomes the third attachment.
     ///
-    /// GPU configuration is not yet implemented; any mode other than `None` is
-    /// rejected. Networking accepts `None` and `NetworkMode::Nat`; a NAT VM
+    /// A GPU mode reaches the compute system in two later steps rather than
+    /// here: the Plan9 shares a guest mounts are written by `gpu_prepare`
+    /// before each start, and the adapters themselves are attached by
+    /// `GpuAssignmentService` once the system is running. What is refused here
+    /// is only a mode this build cannot apply at all. Networking accepts
+    /// `None` and `NetworkMode::Nat`; a NAT VM
     /// gets no adapter here, because `VmStartPipeline` writes the
     /// `NetworkAdapters` section once its endpoint exists.
     pub(crate) fn build(
@@ -36,10 +40,9 @@ impl HcsVmConfigBuilder {
     ) -> Result<String, RepositoryError> {
         request.validate()?;
 
-        if request.gpu_mode != GpuMode::None {
+        if let GpuMode::Unknown(value) = request.gpu_mode {
             return Err(RepositoryError::new(format!(
-                "HCS configuration does not support GPU mode: {:?}",
-                request.gpu_mode
+                "GPU mode {value} is not supported by this build"
             )));
         }
         ensure_supported_network_mode(request.network_mode)?;
@@ -949,21 +952,38 @@ mod tests {
     }
 
     #[test]
-    fn rejects_each_unsupported_gpu_mode() {
+    fn accepts_the_gpu_modes_this_build_can_apply() {
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
         let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
-        for mode in [GpuMode::Default, GpuMode::Mirror, GpuMode::Unknown(42)] {
+        for mode in [GpuMode::None, GpuMode::Default, GpuMode::Mirror] {
             let request = VmCreateRequest {
                 gpu_mode: mode,
                 ..request()
             };
             assert!(
                 HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path, None, VM_ID)
-                    .unwrap_err()
-                    .to_string()
-                    .contains("GPU mode")
+                    .is_ok(),
+                "the adapters are attached after the start, so the configuration has \
+                 nothing to refuse about {mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn rejects_a_gpu_mode_this_build_cannot_apply() {
+        let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
+        let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
+        let request = VmCreateRequest {
+            gpu_mode: GpuMode::Unknown(42),
+            ..request()
+        };
+
+        assert!(
+            HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path, None, VM_ID)
+                .unwrap_err()
+                .to_string()
+                .contains("42")
+        );
     }
 
     #[test]

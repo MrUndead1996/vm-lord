@@ -212,6 +212,8 @@ mod tests {
             endpoint_id,
             network_mode,
             ssh: None,
+            gpu_mode: vmlord_core::GpuMode::None,
+            guest_target: None,
         };
         let store = MetadataStore::new(root.0.join("vm-mapping.json"));
         store

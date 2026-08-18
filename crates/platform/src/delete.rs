@@ -338,6 +338,8 @@ mod tests {
                 NetworkMode::None
             },
             ssh: None,
+            gpu_mode: vmlord_core::GpuMode::None,
+            guest_target: None,
         };
         let store = MetadataStore::new(root.0.join("vm-mapping.json"));
         store

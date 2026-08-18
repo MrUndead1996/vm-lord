@@ -168,6 +168,8 @@ mod tests {
             endpoint_id,
             network_mode: NetworkMode::Nat,
             ssh: None,
+            gpu_mode: vmlord_core::GpuMode::None,
+            guest_target: None,
         }
     }
 

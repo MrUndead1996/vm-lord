@@ -407,6 +407,8 @@ mod tests {
                 port: SshPort::DEFAULT,
                 authentication,
             }),
+            gpu_mode: GpuMode::None,
+            guest_target: None,
         }
     }
 

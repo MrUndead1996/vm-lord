@@ -1644,6 +1644,8 @@ mod tests {
             endpoint_id: None,
             network_mode,
             ssh: None,
+            gpu_mode: GpuMode::None,
+            guest_target: None,
         }
     }
 
@@ -1658,6 +1660,8 @@ mod tests {
                 endpoint_id: None,
                 network_mode: NetworkMode::None,
                 ssh: None,
+                gpu_mode: GpuMode::None,
+                guest_target: None,
             },
             state,
             runtime_id: None,

@@ -14,7 +14,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use vmlord_core::{NetworkMode, RepositoryError, SshConfig};
+use vmlord_core::{GpuMode, NetworkMode, RepositoryError, SshConfig, VmSource};
+use vmlord_gpu_payload::GuestSelector;
 
 /// Serializes the read-modify-write of the mapping document.
 ///
@@ -75,6 +76,64 @@ pub struct VmComputeSystemMapping {
     /// disk is a password leaked.
     #[serde(default)]
     pub ssh: Option<SshConfig>,
+    /// What the VM asks of the host's GPU.
+    ///
+    /// Recorded because a start has to know what to attach, and the stored HCS
+    /// configuration cannot answer it: that document describes the shares a VM
+    /// was last started with, not the mode it was created with.
+    ///
+    /// A mapping written before this field existed reads as [`GpuMode::None`],
+    /// which is what every VM created so far asked for.
+    #[serde(default)]
+    pub gpu_mode: GpuMode,
+    /// The guest a GPU payload would have to suit, as far as VMLord knows it.
+    ///
+    /// `None` is a VM built from installation media: VMLord promises nothing
+    /// about the system inside it, so there is nothing to select a payload
+    /// from. Deliberately not a guess.
+    #[serde(default)]
+    pub guest_target: Option<GuestTargetKey>,
+}
+
+/// The three facts that pick a GPU payload out of the catalog.
+///
+/// Not a [`vmlord_gpu_payload::GuestTarget`]: that type carries the kernel a
+/// payload was proven on, which is a property of a booted guest and not of a
+/// VM that has never run.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestTargetKey {
+    pub distribution: String,
+    pub release: String,
+    pub architecture: String,
+}
+
+impl GuestTargetKey {
+    pub(crate) fn selector(&self) -> GuestSelector<'_> {
+        GuestSelector {
+            distribution: &self.distribution,
+            release: &self.release,
+            architecture: &self.architecture,
+        }
+    }
+}
+
+/// Every VM VMLord builds is amd64. The field exists because the catalog has
+/// one, and a literal in three places would be three places to correct.
+const GUEST_ARCHITECTURE: &str = "amd64";
+
+/// What a source says about the guest it will produce.
+pub(crate) fn guest_target_key(source: &VmSource) -> Option<GuestTargetKey> {
+    match source {
+        VmSource::LocalMedia { .. } => None,
+        VmSource::CloudImage { image, .. } => Some(GuestTargetKey {
+            // The catalog spells a distribution the way the guest's
+            // `/etc/os-release` does, which is lowercase; the profile spells
+            // the name the way a person reads it.
+            distribution: image.profile.name.to_ascii_lowercase(),
+            release: image.release.clone(),
+            architecture: GUEST_ARCHITECTURE.to_owned(),
+        }),
+    }
 }
 
 impl VmComputeSystemMapping {
@@ -276,9 +335,12 @@ mod tests {
     };
 
     use uuid::Uuid;
-    use vmlord_core::{NetworkMode, SshAuthentication, SshConfig, SshPort};
+    use vmlord_core::{
+        CloudImage, GpuMode, NetworkMode, Provisioning, SshAccess, SshAuthentication, SshConfig,
+        SshPort, VmSource, distro,
+    };
 
-    use super::{MetadataStore, VmComputeSystemMapping};
+    use super::{GuestTargetKey, MetadataStore, VmComputeSystemMapping, guest_target_key};
 
     fn temporary_mapping_file() -> std::path::PathBuf {
         let unique_id = SystemTime::now()
@@ -298,6 +360,8 @@ mod tests {
             disk_gb: 20,
             endpoint_id: None,
             network_mode: NetworkMode::None,
+            gpu_mode: GpuMode::None,
+            guest_target: None,
             ssh: None,
         }
     }
@@ -631,4 +695,70 @@ mod tests {
         assert!(store.list().is_err());
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
+    #[test]
+    fn a_mapping_written_before_gpu_existed_reads_back_without_one() {
+        let document = r#"{"vm_id":"00000000-0000-0000-0000-000000000001",
+            "vm_name":"dev","hcs_compute_system_id":"vmlord-dev"}"#;
+
+        let mapping: VmComputeSystemMapping =
+            serde_json::from_str(document).expect("an older mapping must still read");
+
+        assert_eq!(mapping.gpu_mode, GpuMode::None);
+        assert_eq!(mapping.guest_target, None);
+    }
+
+    #[test]
+    fn a_recorded_gpu_mode_survives_a_round_trip() {
+        let mapping = VmComputeSystemMapping {
+            gpu_mode: GpuMode::Mirror,
+            guest_target: Some(GuestTargetKey {
+                distribution: "ubuntu".into(),
+                release: "26.04".into(),
+                architecture: "amd64".into(),
+            }),
+            ..mapping(Uuid::from_u128(1), "dev", "vmlord-dev")
+        };
+
+        let encoded = serde_json::to_string(&mapping).expect("a mapping must serialize");
+        let decoded: VmComputeSystemMapping =
+            serde_json::from_str(&encoded).expect("a mapping must deserialize");
+
+        assert_eq!(decoded.gpu_mode, GpuMode::Mirror);
+        assert_eq!(decoded.guest_target.expect("recorded").release, "26.04");
+    }
+
+    #[test]
+    fn a_cloud_image_names_the_guest_it_provisions() {
+        let key = guest_target_key(&VmSource::CloudImage {
+            image: CloudImage {
+                profile: distro::ubuntu(),
+                release: "26.04".into(),
+            },
+            provisioning: Provisioning {
+                username: "ubuntu".into(),
+                password: None,
+                ssh: SshAccess::Disabled,
+                locale: "en_US.UTF-8".into(),
+                keyboard: "us".into(),
+                timezone: "UTC".into(),
+            },
+        })
+        .expect("a cloud image knows what it boots");
+
+        assert_eq!(key.distribution, "ubuntu", "the catalog spells it lowercase");
+        assert_eq!(key.release, "26.04");
+        assert_eq!(key.architecture, "amd64");
+    }
+
+    #[test]
+    fn installation_media_names_no_guest() {
+        assert_eq!(
+            guest_target_key(&VmSource::LocalMedia {
+                path: "C:\\images\\ubuntu.iso".into()
+            }),
+            None,
+            "VMLord does not know what system is inside installation media"
+        );
+    }
+
 }

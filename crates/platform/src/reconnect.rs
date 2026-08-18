@@ -351,6 +351,8 @@ mod tests {
             endpoint_id: None,
             network_mode: NetworkMode::None,
             ssh: None,
+            gpu_mode: vmlord_core::GpuMode::None,
+            guest_target: None,
         }
     }
 
