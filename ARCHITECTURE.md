@@ -1061,8 +1061,11 @@ name, instance id, interface path, driver package directory and kernel service,
 and an adapter whose package could not be located is still reported: it is a
 real device that simply has nothing to hand a guest.
 
-`vmlord_platform::gpu_discovery` turns that, a `System32\lxss\lib` check and an
-HCS service query into the two verdicts. Nothing is cached -- the enumeration
+`vmlord_platform::gpu_discovery` turns that, a check of both halves of the
+Linux userspace and an HCS service query into the two verdicts. Both halves,
+because a host with only `System32\lxss\lib` looks installed and cannot
+render, and the failure names the half that is missing rather than saying
+"install WSL" to someone who has. Nothing is cached -- the enumeration
 is cheap, and a driver update or a WSL install changes the answer with nothing
 to invalidate a cache on. A dead Host Compute Service outranks the adapter
 question, since reporting "no adapters" when the service is not answering would
@@ -1099,10 +1102,22 @@ substituted in the tests of a start, which have no compute system to open.
 A GPU partition is useless to a Linux guest without the host's driver package
 and the WSL Linux userspace beside it, and the way in is a Plan9 share.
 `vmlord_platform::gpu_exports` decides what may be shared, and the answer is
-two system directories plus one exact per-VM staging directory:
-`System32\DriverStore\FileRepository`, for
-the driver packages behind the host's adapters, and `System32\lxss\lib`, for
-the Linux userspace WSL stages.
+three system directories plus one exact per-VM staging directory:
+`System32\DriverStore\FileRepository`, for the driver packages behind the
+host's adapters, and the two directories the Linux userspace is split across.
+
+That userspace is one directory only on a host whose WSL is the inbox one.
+Where WSL comes from the Store or the standalone installer, `System32\lxss\lib`
+holds what the GPU driver puts there -- the vendor's libraries, and on the
+first real host nothing else -- while the Microsoft half the renderer actually
+links against, `libd3d12.so`, `libd3d12core.so` and `libdxcore.so`, is
+installed beside the package as `Program Files\WSL\lib`. A guest given only
+the first half has vendor libraries with nothing to drive them, which is
+exactly what the first real host produced. So there are two roots and two
+roles, and the second is checked against `Program Files` for the same reason
+the others are checked against `System32`. `Program Files` is asked of the
+shell rather than read from `%ProgramFiles%`: the environment variable is
+inherited and this decides what a VM is shown.
 
 Every candidate is canonicalized before it is judged -- opened as a directory
 handle, without `FILE_FLAG_OPEN_REPARSE_POINT`, and resolved with
@@ -1130,7 +1145,8 @@ this used to do, and it removed the guest's entire GPU userspace on every real
 host.
 
 What the guest is told is a `GpuShareManifest`: for each share, a name and a
-role -- `WslLib`, or `DriverPackage` with the package's folder name. Never a
+role -- `WslLib`, `WslD3d12`, or `DriverPackage` with the package's folder
+name. Never a
 host path. Where a share is mounted is the guest's decision, taken from its own
 allowlist, so the host cannot dictate a path into a guest filesystem and the
 host's topology does not travel. Share names are `vmlord.gpu.wsl-lib` and
@@ -2468,11 +2484,25 @@ compute system was started and is immutable for the lifetime of a boot, so
 delivers the same one.
 
 The guest decides where a share goes, from a table with one entry per role:
-`WslLib` at `/usr/lib/wsl/lib`, `DriverPackage` at
-`/usr/lib/wsl/drivers/<package>` and `GpuPayload` at `/opt/vmlord/gpu-payload`.
-The first two are WSL's own paths, which is where the Mesa D3D12 driver and a
-vendor's DriverStore libraries expect to find each other; the payload is
-VMLord's own and lives under `/opt`. The package name is the only part a host
+`WslLib` at `/usr/lib/wsl/host-lib`, `WslD3d12` at `/usr/lib/wsl/d3d12`,
+`DriverPackage` at `/usr/lib/wsl/drivers/<package>` and `GpuPayload` at
+`/opt/vmlord/gpu-payload`. The drivers are at WSL's own path, which is where a
+vendor's DriverStore libraries are expected; the payload is VMLord's own and
+lives under `/opt`.
+
+`/usr/lib/wsl/lib` -- the path Mesa's D3D12 driver, the probe and anyone
+running `eglinfo` by hand expect to find whole -- is not in that table and
+cannot be claimed by a manifest. It is composed after the mounts, as a
+read-only overlay whose lower layers are the two halves above, Microsoft's
+first so that a name present in both resolves to the library a renderer links
+against. An overlay rather than a directory of symlinks because every share is
+mounted `MS_RDONLY` and nothing can be created inside one; a merged directory
+rather than a second `ld.so.conf` line because a half-populated
+`/usr/lib/wsl/lib` is what neither the probe nor a person finds complete. It is
+remounted rather than repaired on each attach, so a half the manifest dropped
+leaves it, and the linker is told about the merged directory rather than about
+two fragments of one. It is also unmounted by name on shutdown, since the mount
+table this agent reads holds 9p mounts and this one is an overlay. The package name is the only part a host
 contributes to a path, and the guest validates it again -- non-empty, bounded,
 neither `.` nor `..`, `[A-Za-z0-9._-]` throughout -- because a path assembled
 from a peer's string is exactly where "the other side already checked it" stops
@@ -2492,10 +2522,10 @@ took its own reference.
 The attach is a reconcile against `/proc/self/mountinfo` rather than a mount. A
 target already carrying the share the manifest names is left alone if it reads
 back; one carrying a different share, or a mount that no longer reads back, is
-lazily unmounted and mounted again at most once; a 9p mount under one of the
-three roots that the manifest no longer names is unmounted. The health check is
-a directory read rather than a `stat`, because a 9p mount whose transport died
-still answers a `stat` from the dentry cache. Reading the mount table rather
+lazily unmounted and mounted again at most once; a 9p mount at one of the
+allowlisted targets that the manifest no longer names is unmounted. The health
+check is a directory read rather than a `stat`, because a 9p mount whose
+transport died still answers a `stat` from the dentry cache. Reading the mount table rather
 than a list the process kept is also what lets an agent that was upgraded and
 restarted clean up its predecessor's mounts.
 
@@ -2508,7 +2538,8 @@ writing `/etc/ld.so.cache` by hand would be a second implementation of a format
 the distribution owns.
 
 `SIGTERM` ends the loop rather than the process. The agent then unmounts every
-9p mount under its three roots, removes its `ld.so.conf.d` file and runs
+9p mount under its allowlisted targets, unmounts the merged
+`/usr/lib/wsl/lib` by name, removes its `ld.so.conf.d` file and runs
 `ldconfig` once more, all best effort: a guest that is going down is not helped
 by an agent that refuses to exit because a mount was busy. The handler itself
 sets a flag and shuts down the connection the agent is on, because a signal

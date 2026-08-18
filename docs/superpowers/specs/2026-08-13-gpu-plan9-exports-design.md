@@ -117,6 +117,21 @@ Two roots, both derived from `GetSystemDirectoryW`:
 the WSL userspace. Nothing else is exportable, even if discovery some day
 reports a path outside the DriverStore.
 
+> **Superseded by TASK-107.** This design assumed the WSL Linux userspace is
+> one directory, which is true only of the inbox WSL. Where WSL comes from the
+> Store or the standalone installer, `System32\lxss\lib` holds the GPU
+> vendor's libraries and the Microsoft ones a renderer links against --
+> `libd3d12.so`, `libd3d12core.so`, `libdxcore.so` -- are installed beside the
+> package under `Program Files\WSL\lib`. The first real host had eighteen
+> NVIDIA files in the first directory and no `libd3d12.so` anywhere the guest
+> could reach, and its probe stopped at `DEVICE_ONLY`. There is now a third
+> root and a second userspace role, `WslD3d12`, and the new root is validated
+> against `Program Files` by exactly the procedure below. `Program Files` is
+> asked of the shell rather than read from `%ProgramFiles%`. In the guest the
+> two halves mount beside each other and `/usr/lib/wsl/lib` becomes the
+> read-only overlay of them, because that is the path everything downstream
+> expects to find whole.
+
 Every candidate goes through the same procedure:
 
 1. `CreateFileW` with `FILE_FLAG_BACKUP_SEMANTICS`, asking only for attribute
