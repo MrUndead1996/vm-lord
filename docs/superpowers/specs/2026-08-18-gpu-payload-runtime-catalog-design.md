@@ -87,8 +87,10 @@ and both move from *claimed* to *measured*:
 * `copy_and_flush` (cache.rs:154) bounded its copy by it — it now takes the length
   `require_regular_file` already returns for the source file;
 * `archive::extract` (archive.rs:203) capped the sum of the members' compressed sizes by
-  it, guarding against a doctored central directory — it now caps by the archive's actual
-  length.
+  it, guarding against a doctored central directory — it now takes that length as an
+  argument, measured by the caller that already holds the file open. One caller measuring
+  beats an entry claiming, and the guard keeps a test lever it would lose if `extract`
+  stat'ed the file itself.
 
 This is strictly tighter than what it replaces. The bytes are hashed against
 `archive_sha256` regardless, and a digest pins length as surely as it pins content, so
