@@ -63,7 +63,7 @@
     {
       "spdx": "MIT",
       "path": "licenses/MIT-Mesa.txt",
-      "upstream": "docs/license.rst"
+      "upstream": "licenses/MIT"
     },
     {
       "spdx": "MIT",

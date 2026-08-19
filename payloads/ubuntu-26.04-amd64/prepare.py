@@ -19,7 +19,14 @@ import json
 import shutil
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+# Separate on purpose: SPEC_SCHEMA_VERSION versions payload.spec.json, the file this
+# repository maintains and edits by hand; DOCUMENT_SCHEMA_VERSION versions the wire
+# format the Rust packer reads from recipe.json and prepared/sources.json, and is
+# additionally pinned by literals on that side (builder.rs, manifest.rs) that never
+# read the spec at all. They agree on 2 today by coincidence, not by rule, so a change
+# to one shape must not force an edit to the other.
+SPEC_SCHEMA_VERSION = 2
+DOCUMENT_SCHEMA_VERSION = 2
 
 
 def main() -> None:
@@ -33,8 +40,13 @@ def main() -> None:
     arguments = parser.parse_args()
 
     spec = json.loads(arguments.spec.read_text())
-    if spec["schema_version"] != SCHEMA_VERSION:
+    if spec["schema_version"] != SPEC_SCHEMA_VERSION:
         raise SystemExit(f"unknown payload spec schema version: {spec['schema_version']}")
+    if arguments.mesa is not None and spec["mesa_policy"] != "bundled":
+        raise SystemExit(
+            f"this payload's policy is {spec['mesa_policy']!r}, not bundled: "
+            "--mesa must not be given"
+        )
 
     prepared = arguments.output / "prepared"
     if prepared.exists():
@@ -52,11 +64,11 @@ def main() -> None:
         "overlays": [overlay_record(overlay, prepared) for overlay in spec["overlays"]],
     }
 
-    write_json(prepared / "sources.json", {"schema_version": SCHEMA_VERSION, **provenance})
+    write_json(prepared / "sources.json", {"schema_version": DOCUMENT_SCHEMA_VERSION, **provenance})
     write_json(
         arguments.output / "recipe.json",
         {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": DOCUMENT_SCHEMA_VERSION,
             "payload_id": spec["payload_id"],
             "required_renderers": spec["required_renderers"],
             **provenance,
