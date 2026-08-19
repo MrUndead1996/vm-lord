@@ -1130,15 +1130,15 @@ staged="$source/install/opt/vmlord/wsl-mesa"
 }
 
 # Headers, pkg-config files and static archives are for building against this Mesa,
-# which nothing in a guest ever does.
-rm -rf "$staged/include" "$staged/lib/x86_64-linux-gnu/pkgconfig"
+# which nothing in a guest ever does, and bin/ holds spirv2dxil -- twelve megabytes of
+# developer tool no guest runs.
+rm -rf "$staged/bin" "$staged/include" "$staged/lib/x86_64-linux-gnu/pkgconfig"
 find "$staged" -name '*.a' -delete
 find "$staged" -name '*.la' -delete
 
-# Every member arrives as a plain file: the payload builder rejects a symlink outright,
-# and Mesa installs its DRI modules as names pointing at one gallium module. The cost is
-# a second copy of that module per driver, and it is the price of a payload with no
-# links in it.
+# Every member arrives as a plain file: the payload builder rejects a symlink outright.
+# Measured on mesa-26.2.0 that costs about 2 MB across nine links -- the DRI names point
+# at a 121 KB loader shim, and the 22 MB gallium library is a real file nothing links to.
 mkdir -p "$destination"
 cp -rL "$staged/." "$destination/"
 
@@ -1238,7 +1238,7 @@ RUN git init /src/directx-headers \
     && git -C /src/directx-headers remote add origin ${DIRECTX_HEADERS_URL} \
     && git -C /src/directx-headers fetch --depth 1 origin ${DIRECTX_HEADERS_COMMIT} \
     && git -C /src/directx-headers checkout -q --detach ${DIRECTX_HEADERS_COMMIT} \
-    && mv /src/directx-headers /src/mesa/subprojects/DirectX-Headers
+    && mv /src/directx-headers /src/mesa/subprojects/DirectX-Headers-1.0
 
 FROM sources AS mesa
 COPY mesa/build.sh /usr/local/bin/build-mesa

@@ -171,19 +171,22 @@ softpipe — unlike llvmpipe — needs no LLVM. `-Dllvm=disabled` then removes t
 where a guest under `bundled` would get `libLLVM`, since no apt step under this policy
 installs one. Vulkan is dozen alone: lavapipe *is* LLVM.
 
-`meson install --strip` into a DESTDIR, then `include/`, `lib/*/pkgconfig`, `*.a` and
-`*.la` are dropped, and every symlink is replaced by the file it points at. That last one
-is not tidiness: `collect_files` (builder.rs:462) rejects a symlink in the prepared tree
-outright, and modern Mesa installs its DRI modules as names pointing at one
-`libgallium_dri.so`, its libraries as soname chains. Dereferencing costs a second copy of
-the gallium module — one per gallium driver — and that is the price of a payload whose
-every member is a plain file. What travels is `lib/x86_64-linux-gnu/` — `libEGL_mesa.so.0*`,
+`meson install --strip` into a DESTDIR, then `bin/`, `include/`, `lib/*/pkgconfig`, `*.a`
+and `*.la` are dropped, and every symlink is replaced by the file it points at. That last
+one is not tidiness: `collect_files` (builder.rs:462) rejects a symlink in the prepared
+tree outright, and Mesa installs its DRI modules as names pointing at one shared module
+and its libraries as soname chains. Measured on `mesa-26.2.0`, that costs about 2 MB
+across nine links — the DRI names point at a 121 KB loader shim, not at the 22 MB gallium
+library, which is a real file nothing links to. `bin/` goes because `spirv2dxil` is a 12 MB
+developer tool no guest runs. An installed tree of 88 MB becomes roughly 50 MB. What travels is `lib/x86_64-linux-gnu/` — `libEGL_mesa.so.0*`,
 `libGLX_mesa.so.0*`, `libgbm.so.1*`, `libgallium*.so`, `dri/d3d12_dri.so`,
 `dri/swrast_dri.so`, `libvulkan_dzn.so` — and `share/vulkan/icd.d/dzn_icd.x86_64.json`,
 whose name `vulkan_stage` already expects.
 
-SPIRV-Tools is linked statically, so that the guest needs nothing installed for the ICD to
-load. The closure gate is what makes that a fact rather than an intention.
+Nothing external is needed beyond DirectX-Headers: a configure run under
+`--wrap-mode=nodownload` accepts this option set with that subproject in place and asks
+for nothing else, so `inputs` holds one entry and the licence list gains MIT alone. The
+closure gate is what keeps that a fact rather than an intention.
 
 ## Identity, limits and licenses
 
@@ -201,11 +204,9 @@ from 481306 and 20 to tens of megabytes and thousands of files, and they will gr
 correctly. Staging hard-links from a shared content-addressed cache, so the growth costs
 disk once for all VMs rather than once per VM.
 
-Licenses arrive with the material: MIT for Mesa, MIT for DirectX-Headers — different
-texts, both travelling — and Apache-2.0 for SPIRV-Tools, whose code is inside
-`libvulkan_dzn.so` once it is linked statically. All three must be declared, or
-`license_expression_is_declared` (manifest.rs:263) rejects the `built` records, which is
-the correct outcome.
+Licenses arrive with the material: MIT for Mesa and MIT for DirectX-Headers, different
+texts, both travelling. Both must be declared, or `license_expression_is_declared`
+(manifest.rs:263) rejects the `built` record, which is the correct outcome.
 
 ## Tests
 
