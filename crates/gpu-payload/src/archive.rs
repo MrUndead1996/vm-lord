@@ -533,7 +533,7 @@ mod tests {
     fn source_manifest() -> Vec<u8> {
         let source = b"source material";
         serde_json::to_vec(&serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "target": {
                 "distribution": "ubuntu",
                 "release": "26.04",
@@ -543,6 +543,7 @@ mod tests {
             },
             "mesa_policy": "bundled",
             "sources": [{
+                "kind": "checkout",
                 "url": SOURCE_URL,
                 "commit": SOURCE_COMMIT,
                 "version": "1",
@@ -726,7 +727,7 @@ mod tests {
     fn extraction_rejects_an_overlay_with_a_digest_not_declared_by_payload() {
         let content = b"content";
         let sources = serde_json::to_vec(&serde_json::json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "target": {
                 "distribution": "ubuntu",
                 "release": "26.04",
@@ -736,6 +737,7 @@ mod tests {
             },
             "mesa_policy": "bundled",
             "sources": [{
+                "kind": "checkout",
                 "url": SOURCE_URL,
                 "commit": SOURCE_COMMIT,
                 "version": "1",

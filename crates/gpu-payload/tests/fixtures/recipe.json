@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "payload_id": "ubuntu-26.04-amd64-test-v1",
   "target": {
     "distribution": "ubuntu",
@@ -15,6 +15,7 @@
   "mesa_policy": "bundled",
   "sources": [
     {
+      "kind": "checkout",
       "url": "https://github.com/microsoft/WSL2-Linux-Kernel",
       "commit": "14794180686c2fb6307fbe359c359bec765249f3",
       "version": "linux-msft-wsl-6.6.87.2",
@@ -33,6 +34,24 @@
         }
       ],
       "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "kind": "built",
+      "url": "https://gitlab.freedesktop.org/mesa/mesa",
+      "commit": "14794180686c2fb6307fbe359c359bec765249f3",
+      "version": "26.1.2",
+      "output": "content/mesa",
+      "licenses": [
+        "GPL-2.0"
+      ],
+      "inputs": [
+        {
+          "url": "https://github.com/microsoft/DirectX-Headers",
+          "commit": "14794180686c2fb6307fbe359c359bec765249f3",
+          "version": "v1.615.0"
+        }
+      ],
+      "sha256": "7d3b1dbd9687da80a7d7edb4d14d3a1675ea768191ce7a5f69e37a5f1cf827b7"
     }
   ],
   "overlays": [

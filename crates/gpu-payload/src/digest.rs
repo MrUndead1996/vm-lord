@@ -25,9 +25,41 @@ impl Sha256Digest {
         Self::from_bytes(hash.finalize().into())
     }
 
+    /// An incremental digest, for content that is not one reader.
+    pub fn hasher() -> Sha256Hasher {
+        Sha256Hasher(Sha256::new())
+    }
+
     pub(crate) fn from_bytes(bytes: [u8; 32]) -> Result<Self, PayloadError> {
         let hex = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
         Ok(Self { bytes, hex })
+    }
+}
+
+/// A digest under construction, fed in pieces rather than read from one place.
+///
+/// `io::Write` so that `io::copy` can pour a file into it without a buffer of its own.
+pub struct Sha256Hasher(Sha256);
+
+impl Sha256Hasher {
+    pub fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    /// A digest is 32 bytes of hash output, so this cannot fail in practice.
+    pub fn finish(self) -> Sha256Digest {
+        Sha256Digest::from_bytes(self.0.finalize().into()).expect("a hash is 32 bytes")
+    }
+}
+
+impl std::io::Write for Sha256Hasher {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0.update(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
