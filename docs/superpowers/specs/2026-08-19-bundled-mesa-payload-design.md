@@ -89,9 +89,11 @@ one upstream file is not possible and not meaningful; the list says under which 
 material it was compiled from stands. Each identifier must be declared in the recipe's
 `licenses`, exactly as overlay licenses already must.
 
-The three commits are chosen when the recipe is written, not here: Mesa is pinned to a
-release tag at or above the 26.x the guest's own Ubuntu ships, and DirectX-Headers and
-SPIRV-Tools to whatever that tag builds against.
+The commits are chosen when the recipe is written, not here: Mesa is pinned to a release
+tag at or above the 26.x the guest's own Ubuntu ships, and each `inputs` entry to whatever
+that tag actually builds against. The list above is illustrative — which upstreams
+`microsoft-experimental` pulls in is a fact the first container build reports, and the
+recipe records what was consumed rather than what we expected.
 
 `inputs` are the other upstreams that ended up inside those binaries. They carry no
 digest of their own — their bytes are not separable from the output's — but their commits
@@ -170,7 +172,12 @@ where a guest under `bundled` would get `libLLVM`, since no apt step under this 
 installs one. Vulkan is dozen alone: lavapipe *is* LLVM.
 
 `meson install --strip` into a DESTDIR, then `include/`, `lib/*/pkgconfig`, `*.a` and
-`*.la` are dropped. What travels is `lib/x86_64-linux-gnu/` — `libEGL_mesa.so.0*`,
+`*.la` are dropped, and every symlink is replaced by the file it points at. That last one
+is not tidiness: `collect_files` (builder.rs:462) rejects a symlink in the prepared tree
+outright, and modern Mesa installs its DRI modules as names pointing at one
+`libgallium_dri.so`, its libraries as soname chains. Dereferencing costs a second copy of
+the gallium module — one per gallium driver — and that is the price of a payload whose
+every member is a plain file. What travels is `lib/x86_64-linux-gnu/` — `libEGL_mesa.so.0*`,
 `libGLX_mesa.so.0*`, `libgbm.so.1*`, `libgallium*.so`, `dri/d3d12_dri.so`,
 `dri/swrast_dri.so`, `libvulkan_dzn.so` — and `share/vulkan/icd.d/dzn_icd.x86_64.json`,
 whose name `vulkan_stage` already expects.
