@@ -167,9 +167,12 @@ already exports, is written for exactly this arrangement.
 
 `softpipe` is the same argument for the same reason. A guest whose adapter goes away on a
 later start falls back to a software rasteriser instead of losing GL entirely, and
-softpipe — unlike llvmpipe — needs no LLVM. `-Dllvm=disabled` then removes the question of
-where a guest under `bundled` would get `libLLVM`, since no apt step under this policy
-installs one. Vulkan is dozen alone: lavapipe *is* LLVM.
+softpipe — unlike llvmpipe — needs no LLVM. `-Dllvm=disabled` then keeps `libLLVM` out of
+what the payload *carries*, which is what matters: our `libgallium` is version-named and
+answers to nobody else's. It does not keep LLVM out of the guest — `tools_check` installs
+`mesa-utils` for `eglinfo`, and that pulls `libgl1-mesa-dri`, `mesa-libgallium` and
+`libllvm21` with it. The payload simply no longer depends on which of those arrived.
+Vulkan is dozen alone: lavapipe *is* LLVM.
 
 `meson install --strip` into a DESTDIR, then `bin/`, `include/`, `lib/*/pkgconfig`, `*.a`
 and `*.la` are dropped, and every symlink is replaced by the file it points at. That last
