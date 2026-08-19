@@ -2,9 +2,15 @@
 # Prepares the input `cargo xtask gpu-payload pack` needs for this target.
 #
 # Everything happens in the image beside this file: the pinned checkouts, the Mesa
-# build, the closure check, and the layout. The host needs docker and nothing else --
-# not jq, not python3, not a git new enough for partial clones -- and the toolchain that
-# produced a payload is a pinned image rather than whatever the machine happened to have.
+# build, the closure check, and the layout. What the host does not need is any part of
+# the payload's own toolchain -- not jq, not python3, not a git new enough for partial
+# clones -- and the toolchain that produced a payload is therefore a pinned image rather
+# than whatever the machine happened to have.
+#
+# What the host does need, beyond docker: a bash 4 or newer, for the associative arrays
+# below; sed, which reads the ARG names out of the Dockerfile; and a docker daemon that
+# shares this filesystem, because the spec is read through a -v bind mount. All three
+# fail loudly and immediately, so this paragraph is a courtesy and not a contract.
 #
 # Commits come from payload.spec.json, read inside the image and passed back in as build
 # arguments so that each checkout is a layer keyed by its own pin. Nothing here is

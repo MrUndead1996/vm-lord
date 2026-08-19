@@ -15,13 +15,21 @@ cargo run -p xtask -- gpu-payload pack \
     --catalog-entry target/gpu-payload/catalog-entry.json
 ```
 
-The host needs docker and nothing else. Not `jq`, not `python3`, not a `git`
-new enough for partial clones: `prepare.sh` is a wrapper over one `docker build`
-of the `Dockerfile` beside it, and everything that used to run on the host —
-the pinned checkouts, the Mesa build, the closure check and the layout — now
-runs in that image. The toolchain that produced a payload is therefore a base
-image pinned by digest rather than whatever the machine happened to have, and
-the same command produces the same tree on a machine that has never built one.
+The host needs none of the payload's toolchain: not `jq`, not `python3`, not a
+`git` new enough for partial clones. `prepare.sh` is a wrapper over one `docker
+build` of the `Dockerfile` beside it, and everything that used to run on the
+host — the pinned checkouts, the Mesa build, the closure check and the layout —
+now runs in that image. The toolchain that produced a payload is therefore a
+frontend and a base image both pinned by digest rather than whatever the
+machine happened to have, and the same command produces the same tree on a
+machine that has never built one.
+
+Beyond docker the host does need three small things, all of which fail loudly
+the moment they are missing: a `bash` 4 or newer, because `prepare.sh` keys its
+build-argument table with an associative array; `sed`, which reads the `ARG`
+names back out of the Dockerfile for the cross-check below; and a docker daemon
+that shares this filesystem, because `payload.spec.json` is read through a `-v`
+bind mount.
 
 The commits still come from `payload.spec.json`. `prepare.sh` reads them with
 the image's own `jq` and passes them back in as build arguments, so each

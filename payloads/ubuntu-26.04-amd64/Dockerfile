@@ -1,4 +1,8 @@
-# syntax=docker/dockerfile:1.7
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+#
+# The frontend is pinned by digest for the same reason the base image below is: it is
+# part of the toolchain that produces a payload, and `1.7` is a tag that upstream may
+# move. The tag is kept beside the digest so a reader can see which release this is.
 #
 # The whole prepare step for this payload. `prepare.sh` runs this and nothing else, so
 # the host needs docker and no toolchain of its own -- and so the toolchain that built a
