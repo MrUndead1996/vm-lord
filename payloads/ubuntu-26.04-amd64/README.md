@@ -193,26 +193,33 @@ looked at: a name it prints is not necessarily wrong, it is unreviewed, and the
 fix is to decide whether a guest really has it and then either add it in both
 places or build without it.
 
-Two things are dropped after `meson install --strip`. `bin/`, `include/`,
+Three things are dropped after `meson install --strip`. `bin/`, `include/`,
 `pkgconfig/`, `*.a` and `*.la` go because they are for building against this
-Mesa, which nothing in a guest does. `lib/x86_64-linux-gnu/libspirv_to_dxil.so`
-goes for a reason particular to it: dozen links the SPIR-V to DXIL translator
-into `libvulkan_dzn.so`, no shipped object lists the shared form as `NEEDED`
-and nothing names it for a `dlopen` — the only occurrence of the string in the
-tree is the file's own `SONAME` — and it was 12 MB of what would otherwise have
-travelled.
+Mesa, which nothing in a guest does. So do the unversioned `libEGL_mesa.so`,
+`libGLX_mesa.so` and `libgbm.so`, for the same reason read one level down:
+those are the linker names, upstream ships them as symlinks, and `cp -rL` would
+otherwise turn each into a full second copy of the library it points at —
+905,408 bytes of one. They go by rule rather than by name — an unversioned
+`.so` that has a versioned sibling is a development alias — which is what
+leaves `libvulkan_dzn.so`, `dri/*.so` and `gbm/dri_gbm.so` alone: those are
+runtime modules that carry no version suffix and so have no sibling. And
+`lib/x86_64-linux-gnu/libspirv_to_dxil.so` goes for a reason particular to it:
+dozen links the SPIR-V to DXIL translator into `libvulkan_dzn.so`, no shipped
+object lists the shared form as `NEEDED` and nothing names it for a `dlopen` —
+the only occurrence of the string in the tree is the file's own `SONAME` — and
+it was 12 MB of what would otherwise have travelled.
 
 The payload holds no symbolic links, because `collect_files` in the builder
 rejects one outright rather than resolving it, so `build.sh` copies the staged
 tree with `cp -rL` and every link arrives as the file it pointed at. Measured
-on `mesa-26.2.0` the whole payload is 39,195,094 bytes across 43 files, with
-`expanded_size_limit` at 39,201,252 — the tree plus the 6,158-byte manifest the
-builder generates — and `file_count_limit` at 43; the archive is 9,342,125
+on `mesa-26.2.0` the whole payload is 38,289,686 bytes across 40 files, with
+`expanded_size_limit` at 38,295,400 — the tree plus the 5,714-byte manifest the
+builder generates — and `file_count_limit` at 40; the archive is 9,017,460
 bytes. The previous, `distro` payload's limits were 481,306 and 20. The cost of
 the rule is smaller than it looks: `d3d12_dri.so`, `swrast_dri.so` and
 `kms_swrast_dri.so` are each a full copy of the 121,136-byte `libdril_dri.so`
-loader shim, and the `.so`/`.so.0`/`.so.0.0.0` chains for the two glvnd vendor
-libraries and for libgbm cost their sizes again twice over. The 22 MB
+loader shim, and the `.so.0`/`.so.0.0.0` pairs for the two glvnd vendor
+libraries and for libgbm cost their sizes a second time. The 22 MB
 `libgallium-26.2.0.so` is a real file that nothing links to, so it travels
 once — an earlier draft of the design feared a copy of it per gallium driver,
 and that was wrong.

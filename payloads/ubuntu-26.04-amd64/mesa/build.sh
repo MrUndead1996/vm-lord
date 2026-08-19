@@ -41,6 +41,24 @@ rm -rf "$staged/bin" "$staged/include" "$staged/lib/x86_64-linux-gnu/pkgconfig"
 find "$staged" -name '*.a' -delete
 find "$staged" -name '*.la' -delete
 
+# The unversioned `libfoo.so` names are the same thing the headers and the pkg-config
+# files are: they exist so something can be linked against this Mesa. Nothing in a guest
+# loads a library by one -- a program loads `libEGL_mesa.so.0` by its soname, or a driver
+# module by a path its loader computes -- and upstream ships them as symlinks, so `cp -rL`
+# below would turn each into a full second copy of the library it points at.
+#
+# Dropped by rule and not by name: an unversioned `.so` with a versioned sibling is a
+# linker name, because the versioned sibling is what anything real refers to. That is
+# what leaves `libvulkan_dzn.so`, `dri/*.so` and `gbm/dri_gbm.so` alone. They are runtime
+# modules that carry no version suffix at all, so they have no sibling to be the
+# development alias of.
+while IFS= read -r -d '' library; do
+	versions=("$library".*)
+	if [ -e "${versions[0]}" ]; then
+		rm -f "$library"
+	fi
+done < <(find "$staged" -name '*.so' -print0)
+
 # The shared form of the SPIR-V to DXIL translator, whose 12 MB is a fifth of what is
 # left. It goes for a reason particular to it rather than as the bin/ rule spreading: it
 # is a correctly built library that this payload's drivers never load. dozen has the
