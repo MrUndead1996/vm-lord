@@ -34,6 +34,15 @@ against the `ARG` names in the Dockerfile in both directions before the build
 starts: a pin the script has no arguments for, and an argument the spec pins
 nothing for, each fail with the file and the name to fix.
 
+Two more spec shapes are refused there, because neither is one the
+bidirectional check can see — in both, every name is declared and every name is
+supplied. A row with an empty `commit` would reach docker as `--build-arg
+NAME=` and fetch nothing, failing much later and deep inside the image. And two
+rows naming one URL would both resolve to the one pair of arguments that URL
+has, so the second would silently win: the build would check out one commit
+while `sources.json` and the catalog entry, generated from the spec, attested
+to two.
+
 `prepare.sh` clears `<output>/prepared` and `<output>/recipe.json` before it
 builds, and exactly those two paths. BuildKit's `type=local` exporter merges
 into the destination rather than replacing it, so a file left over from an

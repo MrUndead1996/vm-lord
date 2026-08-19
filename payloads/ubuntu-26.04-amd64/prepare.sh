@@ -107,8 +107,31 @@ pins="$(
 
 arguments=()
 declare -A SUPPLIED=()
+declare -A COMMIT_FOR=()
 while IFS=$'\t' read -r url commit; do
 	[[ -n "$url" ]] || continue
+	# An empty commit reaches docker as `--build-arg NAME=`, which is not a missing
+	# argument the bidirectional check above would catch: the name is declared and it is
+	# supplied. `git fetch origin ""` is what happens next, and the failure surfaces
+	# inside the image, far from the spec row that caused it.
+	[[ -n "$commit" ]] || {
+		echo "payload.spec.json pins $url with an empty commit." >&2
+		echo "Every source and every input needs a commit to check out." >&2
+		exit 1
+	}
+	# ARGUMENT_FOR is keyed by URL, so one URL gets one pair of build arguments. Two rows
+	# naming it would both resolve to that pair and the second --build-arg would win
+	# silently -- and if their commits differ, the build then checks out one of them while
+	# payload.spec.json, sources.json and the catalog entry all attest to two. Nothing
+	# downstream can notice: the provenance documents are generated from the spec, and the
+	# spec is the half that is wrong.
+	[[ -z "${COMMIT_FOR["$url"]-}" ]] || {
+		echo "payload.spec.json pins $url twice, at ${COMMIT_FOR["$url"]} and at $commit." >&2
+		echo "One URL carries one pair of build arguments, so only one of the two could" >&2
+		echo "be built while the recorded provenance would claim both." >&2
+		exit 1
+	}
+	COMMIT_FOR["$url"]="$commit"
 	prefix="${ARGUMENT_FOR["$url"]-}"
 	[[ -n "$prefix" ]] || {
 		echo "payload.spec.json pins $url, which prepare.sh has no build arguments for." >&2
