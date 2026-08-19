@@ -1249,6 +1249,28 @@ mod tests {
         );
     }
 
+    /// `kind` is the only thing separating the two variants, so a record that declares
+    /// one kind and carries the other's fields must be refused rather than quietly read
+    /// as the variant it happens to fit.
+    #[test]
+    fn a_source_record_whose_kind_disagrees_with_its_shape_is_refused() {
+        let fixture = PreparedFixture::new("kind-mismatch");
+        fixture.rewrite_recipe(|recipe| {
+            recipe["sources"][0]["kind"] = serde_json::json!("built");
+        });
+
+        let error = pack(fixture.request(
+            &fixture.root.join("payload.zip"),
+            &fixture.root.join("entry.json"),
+        ))
+        .unwrap_err();
+
+        let PayloadError::InvalidCatalog(message) = error else {
+            panic!("a record must be refused, not read as the kind it does not declare");
+        };
+        assert!(message.contains("untagged enum RecipeSource"), "{message}");
+    }
+
     #[test]
     fn a_recipe_at_version_one_is_no_longer_understood() {
         let fixture = PreparedFixture::new("old-recipe");

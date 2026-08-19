@@ -675,6 +675,25 @@ mod tests {
         }
     }
 
+    /// `kind` is the only thing separating the two variants, so a record that declares
+    /// one kind and carries the other's fields must be refused rather than quietly read
+    /// as the variant it happens to fit.
+    #[test]
+    fn a_source_record_whose_kind_disagrees_with_its_shape_is_refused() {
+        let entry = built_entry();
+        let mut document = built_sources();
+        document["sources"][0]["kind"] = json!("checkout");
+
+        let error =
+            SourceManifest::parse_and_validate(&serde_json::to_vec(&document).unwrap(), &entry)
+                .unwrap_err();
+
+        let PayloadError::InvalidManifest(message) = error else {
+            panic!("a record must be refused, not read as the kind it does not declare");
+        };
+        assert!(message.contains("untagged enum SourceRecord"), "{message}");
+    }
+
     #[test]
     fn a_sources_document_at_version_one_is_no_longer_understood() {
         let entry = entry();
