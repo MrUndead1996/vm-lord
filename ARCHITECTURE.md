@@ -1175,8 +1175,8 @@ A payload reaches a host as a pair of files beside `vmlord.exe`, both named by
 the payload's own ID:
 
 ```
-gpu-payload/ubuntu-26.04-amd64-7.0.0-28-v1.json
-gpu-payload/ubuntu-26.04-amd64-7.0.0-28-v1.zip
+gpu-payload/ubuntu-26.04-amd64-7.0.0-28-v2.json
+gpu-payload/ubuntu-26.04-amd64-7.0.0-28-v2.zip
 ```
 
 `cargo dist --gpu-payload <directory>` takes what `pack` wrote -- `payload.zip`
