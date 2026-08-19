@@ -68,7 +68,7 @@ done < <(find "$staged" -name '*.so' -print0)
 rm -f "$staged/lib/x86_64-linux-gnu/libspirv_to_dxil.so"
 
 # Every member arrives as a plain file: the payload builder rejects a symlink outright.
-# Measured on mesa-26.2.0 that costs about 2 MB across nine links -- the DRI names point
+# Measured on mesa-26.2.0 that costs about 1.3 MB across six links -- the DRI names point
 # at a 121 KB loader shim, and the 22 MB gallium library is a real file nothing links to.
 mkdir -p "$destination"
 cp -rL "$staged/." "$destination/"

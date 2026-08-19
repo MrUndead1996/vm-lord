@@ -7,7 +7,7 @@ ever disagree, `pack` refuses a tree it just built with a message that names
 neither the rule nor the file.
 
 The tie between them is the literal below. `EXPECTED_ADVERSARIAL_DIGEST` also
-appears in `builder.rs`'s `the_python_and_rust_tree_digests_agree_on_one_vector`
+appears in `builder.rs`'s `the_built_output_digest_matches_the_python_golden_vector`
 test, over a tree with the same three members and the same bytes, so changing
 either implementation's rule turns exactly one of the two red.
 
