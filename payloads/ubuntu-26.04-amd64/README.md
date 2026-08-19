@@ -96,6 +96,17 @@ computed by the same rule as the upstream one but over the files under
 than records: those files are in its hands when it packs them, so drift between
 what was compiled and what was written down is impossible rather than unlikely.
 
+That last one is a rule written twice — `tree_digest` in `prepare.py` and
+`built_output_digest` in `crates/gpu-payload/src/builder.rs` — and the two
+disagreeing would show up only as `pack` refusing a tree it had just built,
+naming neither the rule nor the file. A golden vector ties them: one small tree
+whose members (`lib-extra`, `lib.conf`, `lib/dri.so`) sort one way as joined
+strings and the other way as path components, and one expected digest asserted
+from both sides. The Rust half is a unit test in `builder.rs`; the Python half
+is `prepare_test.py`, which the Dockerfile runs in the same stage that runs
+`prepare.py`, so every payload build executes it and no host needs a test
+framework — or a `python3` — to get the check.
+
 Overlay digests are measured from the files that were just copied. Editing an
 overlay changes them on the next run; nothing needs transcribing.
 

@@ -87,9 +87,14 @@ COPY --from=mesa /out/mesa /mesa
 # The closure stage produces nothing this stage needs, but copying one file out of it is
 # what makes BuildKit run it: a gate nobody depends on is a gate that gets skipped.
 COPY --from=closure /check/mesa/share/vulkan/icd.d/dzn_icd.x86_64.json /closure-passed.json
-COPY payload.spec.json prepare.py ./
+COPY payload.spec.json prepare.py prepare_test.py ./
 COPY overlays ./overlays
 COPY licenses ./licenses
+# The layout script's digest rule has a twin in crates/gpu-payload/src/builder.rs, and a
+# disagreement between them surfaces only as `pack` refusing a tree it just built. The
+# golden vector that ties them together is checked here, in the one place that is
+# guaranteed to run on every payload build and needs nothing the image does not have.
+RUN --network=none python3 prepare_test.py
 RUN --network=none python3 prepare.py \
         --spec payload.spec.json \
         --overlays overlays \

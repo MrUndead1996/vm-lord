@@ -1205,6 +1205,74 @@ mod tests {
         assert!(matches!(error, PayloadError::InvalidManifest(_)));
     }
 
+    /// The digest of the adversarial tree below, and the tie between this rule and the
+    /// one `payloads/ubuntu-26.04-amd64/prepare.py` writes into every recipe.
+    ///
+    /// The same literal appears in `prepare_test.py` beside that script, over a tree with
+    /// the same three members and the same bytes. The two implementations are one rule in
+    /// two languages -- each file under the built output, sorted by its payload-relative
+    /// POSIX path *string*, contributed as path, NUL, contents -- and a disagreement
+    /// between them surfaces only as `pack` refusing a tree it just built, naming neither
+    /// the rule nor the file. Changing either side turns exactly one of the two red.
+    const EXPECTED_ADVERSARIAL_DIGEST: &str =
+        "033ae129cd90239804e4a42ba7b80063e4fdcf85d5b2a634eb9dc32acdc3a034";
+
+    /// Members whose two plausible orders genuinely differ: as joined strings `-` < `.`
+    /// < `/`, so `lib-extra` and `lib.conf` both precede anything under `lib/`; sorted as
+    /// path components instead, `lib` precedes both and `lib/dri.so` comes first.
+    const ADVERSARIAL_TREE: [(&str, &[u8]); 3] = [
+        ("content/mesa/lib/dri.so", b"dri\n"),
+        ("content/mesa/lib-extra", b"extra\n"),
+        ("content/mesa/lib.conf", b"conf\n"),
+    ];
+
+    #[test]
+    fn the_built_output_digest_matches_the_python_golden_vector() {
+        let fixture = PreparedFixture::new("golden-digest");
+        let root = fixture.root.join("adversarial");
+        for (relative, contents) in ADVERSARIAL_TREE {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+
+        let files = super::collect_files(&root).unwrap();
+        let digest = super::built_output_digest(&files, "content/mesa").unwrap();
+
+        assert_eq!(
+            digest.as_hex(),
+            EXPECTED_ADVERSARIAL_DIGEST,
+            "built_output_digest no longer computes the rule prepare.py writes into the \
+             recipe; see prepare_test.py, which asserts this same literal"
+        );
+    }
+
+    #[test]
+    fn the_golden_vector_would_catch_a_component_wise_sort() {
+        let fixture = PreparedFixture::new("golden-divergence");
+        let root = fixture.root.join("adversarial");
+        for (relative, contents) in ADVERSARIAL_TREE {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+
+        let mut wrong: Vec<_> = super::collect_files(&root).unwrap();
+        wrong.sort_by(|left, right| {
+            let left: Vec<_> = left.archive_path.split('/').collect();
+            let right: Vec<_> = right.archive_path.split('/').collect();
+            left.cmp(&right)
+        });
+        let digest = super::built_output_digest(&wrong, "content/mesa").unwrap();
+
+        assert_ne!(
+            digest.as_hex(),
+            EXPECTED_ADVERSARIAL_DIGEST,
+            "the adversarial tree no longer distinguishes the two orders, so the golden \
+             vector proves nothing"
+        );
+    }
+
     #[test]
     fn a_built_record_whose_output_holds_nothing_is_refused() {
         let fixture = PreparedFixture::new("built-empty");
