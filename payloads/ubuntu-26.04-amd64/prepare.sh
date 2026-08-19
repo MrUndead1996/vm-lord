@@ -17,17 +17,24 @@ SPEC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SPEC="$SPEC_DIR/payload.spec.json"
 DOCKERFILE="$SPEC_DIR/Dockerfile"
 
-# Which build argument carries which upstream's commit. The mapping is written out here
+# Which pair of build arguments carries which upstream. The mapping is written out here
 # instead of being computed from the repository URL because a computed name has no way to
 # be wrong loudly: a URL that ends in `.git` or a slash, or whose last segment simply is
 # not what the Dockerfile chose to call it, would yield a name no `ARG` declares, and
 # docker would then build with that `ARG` unset -- a checkout of nothing, discovered much
-# later if at all. Written out, the pairing is one line per upstream and the two checks
-# below can hold it to the Dockerfile.
+# later if at all. Written out, the pairing is one line per upstream and the checks below
+# can hold it to the Dockerfile.
+#
+# Both halves of the pair are passed, the URL as well as the commit, because the URL the
+# Dockerfile would otherwise default to is not the URL the payload's provenance claims:
+# `recipe.json` and `sources.json` record what the spec says. A default edited to name a
+# fork would build from the fork while the provenance still named the original, and
+# nothing would notice. Sending the spec's own URL leaves the default with nothing to
+# decide.
 declare -A ARGUMENT_FOR=(
-	["https://github.com/microsoft/WSL2-Linux-Kernel"]="KERNEL_COMMIT"
-	["https://gitlab.freedesktop.org/mesa/mesa"]="MESA_COMMIT"
-	["https://github.com/microsoft/DirectX-Headers"]="DIRECTX_HEADERS_COMMIT"
+	["https://github.com/microsoft/WSL2-Linux-Kernel"]="KERNEL"
+	["https://gitlab.freedesktop.org/mesa/mesa"]="MESA"
+	["https://github.com/microsoft/DirectX-Headers"]="DIRECTX_HEADERS"
 )
 
 usage() {
@@ -70,17 +77,17 @@ done
 mkdir -p "$output"
 output="$(cd "$output" && pwd)"
 
-# The commit arguments the Dockerfile actually declares. Reading them out of the file is
-# what lets the two checks below be checks and not comments: the table above is a claim
-# about the Dockerfile, and this is the Dockerfile itself.
+# The upstream arguments the Dockerfile actually declares. Reading them out of the file
+# itself is what lets the checks below be checks and not comments: the table above is a
+# claim about the Dockerfile, and this is the Dockerfile.
 declare -A DECLARED=()
 while read -r name; do
 	[[ -n "$name" ]] || continue
 	DECLARED["$name"]=1
-done < <(sed -n 's/^ARG[[:space:]]\{1,\}\([A-Z0-9_]*_COMMIT\)[[:space:]]*$/\1/p' "$DOCKERFILE")
+done < <(sed -nE 's/^ARG[[:space:]]+([A-Z0-9_]+_(URL|COMMIT))([[:space:]]*|=.*)$/\1/p' "$DOCKERFILE")
 
 [[ ${#DECLARED[@]} -gt 0 ]] || {
-	echo "no ARG <NAME>_COMMIT found in $DOCKERFILE" >&2
+	echo "no ARG <NAME>_URL or <NAME>_COMMIT found in $DOCKERFILE" >&2
 	exit 1
 }
 
@@ -102,28 +109,44 @@ arguments=()
 declare -A SUPPLIED=()
 while IFS=$'\t' read -r url commit; do
 	[[ -n "$url" ]] || continue
-	name="${ARGUMENT_FOR["$url"]-}"
-	[[ -n "$name" ]] || {
-		echo "payload.spec.json pins $url, which prepare.sh has no build argument for." >&2
-		echo "Add it to ARGUMENT_FOR in this script, and an ARG to $DOCKERFILE." >&2
+	prefix="${ARGUMENT_FOR["$url"]-}"
+	[[ -n "$prefix" ]] || {
+		echo "payload.spec.json pins $url, which prepare.sh has no build arguments for." >&2
+		echo "Add it to ARGUMENT_FOR in this script, and ARGs to $DOCKERFILE." >&2
 		exit 1
 	}
-	[[ -n "${DECLARED["$name"]-}" ]] || {
-		echo "prepare.sh passes $name for $url, which $DOCKERFILE does not declare." >&2
-		exit 1
-	}
-	arguments+=(--build-arg "${name}=${commit}")
-	SUPPLIED["$name"]=1
+	for pair in "URL=$url" "COMMIT=$commit"; do
+		name="${prefix}_${pair%%=*}"
+		[[ -n "${DECLARED["$name"]-}" ]] || {
+			echo "prepare.sh passes $name for $url, which $DOCKERFILE does not declare." >&2
+			exit 1
+		}
+		arguments+=(--build-arg "${name}=${pair#*=}")
+		SUPPLIED["$name"]=1
+	done
 done <<<"$pins"
 
 # The other direction, and the one that would otherwise fail silently: an ARG the spec
-# says nothing about is an ARG docker expands to the empty string.
+# says nothing about is an ARG the Dockerfile answers out of its own default, or with the
+# empty string when it has none.
 for name in "${!DECLARED[@]}"; do
 	[[ -n "${SUPPLIED["$name"]-}" ]] || {
 		echo "$DOCKERFILE declares $name, which payload.spec.json pins nothing for." >&2
 		exit 1
 	}
 done
+
+# BuildKit's local exporter merges into the destination rather than replacing it, so
+# anything already sitting in these two paths survives a run and is packed as if the
+# build had produced it -- a leftover from an older pin, or half a tree from an export
+# that was interrupted. Inside the image /output is always fresh; on the host it has to
+# be made so. Only the two paths this build writes are cleared, and not the directory
+# around them, because the documented workflow packs `payload.zip` and
+# `catalog-entry.json` into that same directory: refusing a non-empty --output, or
+# emptying it, would turn the README's own second run into a failure or a surprise.
+# This happens last, after the arguments are settled, so a rejected invocation leaves the
+# previous run's output intact.
+rm -rf "$output/prepared" "$output/recipe.json"
 
 DOCKER_BUILDKIT=1 docker build \
 	"${arguments[@]}" \
