@@ -19,7 +19,7 @@ import json
 import shutil
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def main() -> None:
@@ -28,6 +28,7 @@ def main() -> None:
     parser.add_argument("--overlays", type=Path, required=True)
     parser.add_argument("--licenses", type=Path, required=True)
     parser.add_argument("--checkout", type=Path, required=True)
+    parser.add_argument("--mesa", type=Path, default=None)
     parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
 
@@ -47,7 +48,7 @@ def main() -> None:
     provenance = {
         "target": spec["target"],
         "mesa_policy": spec["mesa_policy"],
-        "sources": [source_record(spec, arguments.checkout)],
+        "sources": source_records(spec, arguments.checkout, prepared, arguments.mesa),
         "overlays": [overlay_record(overlay, prepared) for overlay in spec["overlays"]],
     }
 
@@ -71,15 +72,18 @@ def main() -> None:
 
 def copy_upstream(spec: dict, checkout: Path, prepared: Path) -> None:
     """Copies the selected upstream paths into the payload's layout."""
-    for selection in spec["source"]["paths"]:
-        destination = prepared / selection["destination"]
-        if selection["kind"] == "file":
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(checkout / selection["path"], destination)
+    for source in spec["sources"]:
+        if source["kind"] != "checkout":
             continue
-        destination.mkdir(parents=True, exist_ok=True)
-        for item in selected_files(selection, checkout):
-            shutil.copyfile(item, destination / item.name)
+        for selection in source["paths"]:
+            destination = prepared / selection["destination"]
+            if selection["kind"] == "file":
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(checkout / selection["path"], destination)
+                continue
+            destination.mkdir(parents=True, exist_ok=True)
+            for item in selected_files(selection, checkout):
+                shutil.copyfile(item, destination / item.name)
 
 
 def selected_files(selection: dict, checkout: Path) -> list[Path]:
@@ -105,11 +109,22 @@ def copy_files(root: Path, prepared: Path, pairs: list[tuple[str, str]]) -> None
         shutil.copyfile(root / name, destination)
 
 
-def source_record(spec: dict, checkout: Path) -> dict:
+def source_records(spec: dict, checkout: Path, prepared: Path, mesa: Path | None) -> list[dict]:
+    """The provenance record for every source, in the order the spec lists them."""
+    records = []
+    for source in spec["sources"]:
+        if source["kind"] == "checkout":
+            records.append(checkout_record(source, checkout))
+        else:
+            records.append(built_record(source, prepared, mesa))
+    return records
+
+
+def checkout_record(source: dict, checkout: Path) -> dict:
     """The upstream record, with its paths sorted as the manifest requires."""
-    source = spec["source"]
     selections = sorted(source["paths"], key=lambda selection: selection["path"])
     return {
+        "kind": "checkout",
         "url": source["url"],
         "commit": source["commit"],
         "version": source["version"],
@@ -119,6 +134,55 @@ def source_record(spec: dict, checkout: Path) -> dict:
         ],
         "sha256": upstream_digest(selections, checkout),
     }
+
+
+def built_record(source: dict, prepared: Path, mesa: Path | None) -> dict:
+    """The record for a tree that was compiled rather than copied.
+
+    The digest covers what shipped, by the same rule the upstream digest uses, so the
+    builder can check it against the files it is about to pack instead of taking it on
+    trust.
+    """
+    if mesa is None:
+        raise SystemExit("this payload's policy is bundled: --mesa <tree> is required")
+    output = prepared / source["output"]
+    if output.exists():
+        shutil.rmtree(output)
+    shutil.copytree(mesa, output, symlinks=False)
+    return {
+        "kind": "built",
+        "url": source["url"],
+        "commit": source["commit"],
+        "version": source["version"],
+        "output": source["output"],
+        "licenses": source["licenses"],
+        "inputs": source["inputs"],
+        "sha256": tree_digest(prepared, output),
+    }
+
+
+def tree_digest(root: Path, tree: Path) -> str:
+    """Digests a shipped subtree: each file, sorted by payload path, path, NUL, bytes.
+
+    Sorted by the joined POSIX string and not by `Path`, which orders component by
+    component. The two disagree whenever a sibling name holds a byte below `/` -- a
+    `mesa.conf` beside a `mesa/` directory is enough -- and the builder sorts the joined
+    string. A disagreement here surfaces as the builder refusing a tree it just built,
+    with a message that explains nothing.
+    """
+    digest = hashlib.sha256()
+    members = sorted(
+        (path.relative_to(root).as_posix(), path)
+        for path in tree.rglob("*")
+        if path.is_file()
+    )
+    if not members:
+        raise SystemExit(f"the built tree at {tree} holds nothing")
+    for relative, path in members:
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
 
 
 def upstream_digest(selections: list[dict], checkout: Path) -> str:
