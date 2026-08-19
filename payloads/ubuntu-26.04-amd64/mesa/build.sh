@@ -41,6 +41,14 @@ rm -rf "$staged/bin" "$staged/include" "$staged/lib/x86_64-linux-gnu/pkgconfig"
 find "$staged" -name '*.a' -delete
 find "$staged" -name '*.la' -delete
 
+# The shared form of the SPIR-V to DXIL translator, whose 12 MB is a fifth of what is
+# left. It goes for a reason particular to it rather than as the bin/ rule spreading: it
+# is a correctly built library that this payload's drivers never load. dozen has the
+# translator linked into libvulkan_dzn.so, no shipped object lists this soname as NEEDED,
+# and no shipped file names it for a dlopen -- the only occurrence of the string in the
+# tree is the file's own SONAME.
+rm -f "$staged/lib/x86_64-linux-gnu/libspirv_to_dxil.so"
+
 # Every member arrives as a plain file: the payload builder rejects a symlink outright.
 # Measured on mesa-26.2.0 that costs about 2 MB across nine links -- the DRI names point
 # at a 121 KB loader shim, and the 22 MB gallium library is a real file nothing links to.

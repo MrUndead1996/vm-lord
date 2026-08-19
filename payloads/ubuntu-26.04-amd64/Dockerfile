@@ -67,11 +67,16 @@ FROM ${BASE} AS closure
 # the distribution's Mesa and with it libLLVM, which would hide an LLVM dependency of
 # ours instead of exposing it. Runtime packages only: a -dev package here would defeat
 # the whole stage.
+#
+# binutils is here for `readelf`, which reads the sonames out of the tree. It is a tool
+# and not a library: it cannot satisfy anything the payload links against, so it cannot
+# make a dependency of ours resolve that would not have resolved without it.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libdrm2 libexpat1 libx11-6 libx11-xcb1 libxext6 libxxf86vm1 \
         libxcb1 libxcb-dri3-0 libxcb-glx0 libxcb-present0 libxcb-randr0 \
         libxcb-shm0 libxcb-sync1 libxcb-xfixes0 libxshmfence1 \
         libwayland-client0 zlib1g libzstd1 \
+        binutils \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=mesa /out/mesa /check/mesa
 COPY mesa/closure.sh /usr/local/bin/closure
