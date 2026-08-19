@@ -960,13 +960,24 @@ def built_record(source: dict, prepared: Path, mesa: Path | None) -> dict:
 
 
 def tree_digest(root: Path, tree: Path) -> str:
-    """Digests a shipped subtree: each file, sorted by payload path, path, NUL, bytes."""
+    """Digests a shipped subtree: each file, sorted by payload path, path, NUL, bytes.
+
+    Sorted by the joined POSIX string and not by `Path`, which orders component by
+    component. The two disagree whenever a sibling name holds a byte below `/` -- a
+    `mesa.conf` beside a `mesa/` directory is enough -- and the builder sorts the joined
+    string. A disagreement here surfaces as the builder refusing a tree it just built,
+    with a message that explains nothing.
+    """
     digest = hashlib.sha256()
-    files = sorted(path for path in tree.rglob("*") if path.is_file())
-    if not files:
+    members = sorted(
+        (path.relative_to(root).as_posix(), path)
+        for path in tree.rglob("*")
+        if path.is_file()
+    )
+    if not members:
         raise SystemExit(f"the built tree at {tree} holds nothing")
-    for path in files:
-        digest.update(path.relative_to(root).as_posix().encode())
+    for relative, path in members:
+        digest.update(relative.encode())
         digest.update(b"\0")
         digest.update(path.read_bytes())
     return digest.hexdigest()
