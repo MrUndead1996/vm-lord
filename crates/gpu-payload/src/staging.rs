@@ -964,7 +964,7 @@ mod tests {
             let temporary = TemporaryDirectory::new(label);
             let content = b"original content".to_vec();
             let sources = serde_json::to_vec(&serde_json::json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "target": {
                     "distribution": "ubuntu",
                     "release": "26.04",
@@ -974,6 +974,7 @@ mod tests {
                 },
                 "mesa_policy": "bundled",
                 "sources": [{
+                    "kind": "checkout",
                     "url": SOURCE_URL,
                     "commit": SOURCE_COMMIT,
                     "version": "1",

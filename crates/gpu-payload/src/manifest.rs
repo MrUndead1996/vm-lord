@@ -136,9 +136,35 @@ struct SourceManifestDocument {
     overlays: Vec<OverlayRecord>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// One upstream a payload owes something to.
+///
+/// Untagged rather than `#[serde(tag = "kind")]` on purpose: serde does not honour
+/// `deny_unknown_fields` on an internally tagged enum, and refusing a field nobody
+/// meant to write is worth a less specific error message when both variants fail.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+enum SourceRecord {
+    Checkout(CheckoutRecord),
+    Built(BuiltRecord),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CheckoutKind {
+    Checkout,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BuiltKind {
+    Built,
+}
+
+/// Upstream files that travelled into the payload byte for byte.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct SourceRecord {
+struct CheckoutRecord {
+    kind: CheckoutKind,
     url: String,
     commit: String,
     version: String,
@@ -147,7 +173,38 @@ struct SourceRecord {
     sha256: Sha256Digest,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// A tree that was compiled, whose members correspond to no upstream file.
+///
+/// `output` is a path in the payload rather than upstream, `licenses` are bare SPDX
+/// identifiers because attributing one shared object to one upstream file is not
+/// meaningful, and `sha256` covers what shipped -- which makes it the one digest here
+/// that can be checked rather than believed.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BuiltRecord {
+    kind: BuiltKind,
+    url: String,
+    commit: String,
+    version: String,
+    output: String,
+    licenses: Vec<String>,
+    inputs: Vec<SourceInputRecord>,
+    sha256: Sha256Digest,
+}
+
+/// An upstream that ended up inside a built tree's binaries.
+///
+/// No digest of its own: its bytes are not separable from the output's. The commit is
+/// what makes it auditable, and it reaches the catalog as an ordinary source row.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SourceInputRecord {
+    url: String,
+    commit: String,
+    version: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct SourceLicenseRecord {
     path: String,
@@ -171,47 +228,30 @@ impl SourceManifest {
     pub fn parse_and_validate(bytes: &[u8], entry: &CatalogEntry) -> Result<Self, PayloadError> {
         let doc: SourceManifestDocument = serde_json::from_slice(bytes)
             .map_err(|error| PayloadError::InvalidManifest(error.to_string()))?;
-        if doc.schema_version != 1
+        if doc.schema_version != 2
             || doc.target != *entry.target()
             || doc.mesa_policy != *entry.mesa_policy()
-            || doc.sources.len() != entry.sources().len()
         {
             return Err(PayloadError::InvalidManifest(
                 "sources.json does not exactly match catalog provenance".into(),
             ));
         }
 
-        for (source, expected) in doc.sources.iter().zip(entry.sources()) {
-            if source.url != expected.url
-                || source.commit != expected.commit
-                || source.version != expected.version
-                || source.paths.is_empty()
-                || source.licenses.len() != source.paths.len()
-            {
-                return Err(PayloadError::InvalidManifest(
-                    "sources.json does not exactly match catalog provenance".into(),
-                ));
-            }
-            let mut previous = "";
-            for path in &source.paths {
-                validate_path(path)?;
-                if !previous.is_empty() && previous >= path.as_str() {
-                    return Err(PayloadError::InvalidManifest(
-                        "selected source paths must be unique and sorted".into(),
-                    ));
-                }
-                previous = path;
-            }
-            for (path, license) in source.paths.iter().zip(&source.licenses) {
-                validate_path(&license.path)?;
-                if license.path != *path
-                    || !license_expression_is_declared(&license.spdx, entry)
-                    || (license.path == D3DKMTHK_PATH && license.spdx != D3DKMTHK_LICENSE)
-                {
-                    return Err(PayloadError::InvalidManifest(
-                        "selected source paths must carry their declared licenses".into(),
-                    ));
-                }
+        let rows = catalog_rows(&doc.sources);
+        if rows.len() != entry.sources().len()
+            || rows.iter().zip(entry.sources()).any(|(row, expected)| {
+                row.0 != expected.url || row.1 != expected.commit || row.2 != expected.version
+            })
+        {
+            return Err(PayloadError::InvalidManifest(
+                "sources.json does not exactly match catalog provenance".into(),
+            ));
+        }
+
+        for source in &doc.sources {
+            match source {
+                SourceRecord::Checkout(checkout) => validate_checkout(checkout, entry)?,
+                SourceRecord::Built(built) => validate_built(built, entry)?,
             }
         }
 
@@ -260,6 +300,86 @@ impl SourceManifest {
         }
         Ok(())
     }
+}
+
+/// The `url`/`commit`/`version` rows one source contributes to a catalog entry.
+///
+/// A built record contributes itself and every input, in that order: what is inside the
+/// binaries is part of what the payload carries, and the catalog is where a person looks
+/// for that.
+fn catalog_rows(sources: &[SourceRecord]) -> Vec<(&str, &str, &str)> {
+    let mut rows = Vec::new();
+    for source in sources {
+        match source {
+            SourceRecord::Checkout(checkout) => {
+                rows.push((
+                    checkout.url.as_str(),
+                    checkout.commit.as_str(),
+                    checkout.version.as_str(),
+                ));
+            }
+            SourceRecord::Built(built) => {
+                rows.push((
+                    built.url.as_str(),
+                    built.commit.as_str(),
+                    built.version.as_str(),
+                ));
+                for input in &built.inputs {
+                    rows.push((
+                        input.url.as_str(),
+                        input.commit.as_str(),
+                        input.version.as_str(),
+                    ));
+                }
+            }
+        }
+    }
+    rows
+}
+
+fn validate_checkout(checkout: &CheckoutRecord, entry: &CatalogEntry) -> Result<(), PayloadError> {
+    if checkout.paths.is_empty() || checkout.licenses.len() != checkout.paths.len() {
+        return Err(PayloadError::InvalidManifest(
+            "sources.json does not exactly match catalog provenance".into(),
+        ));
+    }
+    let mut previous = "";
+    for path in &checkout.paths {
+        validate_path(path)?;
+        if !previous.is_empty() && previous >= path.as_str() {
+            return Err(PayloadError::InvalidManifest(
+                "selected source paths must be unique and sorted".into(),
+            ));
+        }
+        previous = path;
+    }
+    for (path, license) in checkout.paths.iter().zip(&checkout.licenses) {
+        validate_path(&license.path)?;
+        if license.path != *path
+            || !license_expression_is_declared(&license.spdx, entry)
+            || (license.path == D3DKMTHK_PATH && license.spdx != D3DKMTHK_LICENSE)
+        {
+            return Err(PayloadError::InvalidManifest(
+                "selected source paths must carry their declared licenses".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_built(built: &BuiltRecord, entry: &CatalogEntry) -> Result<(), PayloadError> {
+    validate_path(&built.output)?;
+    if built.licenses.is_empty()
+        || !built
+            .licenses
+            .iter()
+            .all(|spdx| license_expression_is_declared(spdx, entry))
+    {
+        return Err(PayloadError::InvalidManifest(
+            "a built source must declare licences the catalog knows".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn license_expression_is_declared(expression: &str, entry: &CatalogEntry) -> bool {
@@ -402,7 +522,7 @@ mod tests {
 
     fn sources() -> Value {
         json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "target": {
                 "distribution": "ubuntu",
                 "release": "26.04",
@@ -412,6 +532,7 @@ mod tests {
             },
             "mesa_policy": "bundled",
             "sources": [{
+                "kind": "checkout",
                 "url": "https://github.com/x/y",
                 "commit": COMMIT,
                 "version": "1",
@@ -430,6 +551,141 @@ mod tests {
             }],
             "overlays": []
         })
+    }
+
+    fn built_sources() -> Value {
+        json!({
+            "schema_version": 2,
+            "target": {
+                "distribution": "ubuntu",
+                "release": "26.04",
+                "architecture": "amd64",
+                "kernel_release": "k",
+                "payload_abi": 1
+            },
+            "mesa_policy": "bundled",
+            "sources": [{
+                "kind": "built",
+                "url": "https://gitlab.freedesktop.org/mesa/mesa",
+                "commit": COMMIT,
+                "version": "26.1.2",
+                "output": "content/mesa",
+                "licenses": ["GPL-2.0"],
+                "inputs": [{
+                    "url": "https://github.com/microsoft/DirectX-Headers",
+                    "commit": COMMIT,
+                    "version": "v1.615.0"
+                }],
+                "sha256": ZERO
+            }],
+            "overlays": []
+        })
+    }
+
+    /// A built record's inputs are sources in their own right: they are in the
+    /// binaries, and the catalog is where a person looks for what is in a payload.
+    fn built_entry() -> CatalogEntry {
+        CatalogEntry::from_json(
+            &serde_json::to_vec(&json!({
+                "schema_version": 2,
+                "payload_id": "p",
+                "target": {
+                    "distribution": "ubuntu",
+                    "release": "26.04",
+                    "architecture": "amd64",
+                    "kernel_release": "k",
+                    "payload_abi": 1
+                },
+                "expanded_size_limit": 2,
+                "file_count_limit": 4,
+                "archive_sha256": ZERO,
+                "payload_manifest_sha256": ZERO,
+                "required_renderers": ["d3d12-gallium", "dzn-vulkan"],
+                "mesa_policy": "bundled",
+                "sources": [
+                    {
+                        "url": "https://gitlab.freedesktop.org/mesa/mesa",
+                        "commit": COMMIT,
+                        "version": "26.1.2"
+                    },
+                    {
+                        "url": "https://github.com/microsoft/DirectX-Headers",
+                        "commit": COMMIT,
+                        "version": "v1.615.0"
+                    }
+                ],
+                "licenses": [{"spdx": "GPL-2.0", "path": "licenses/GPL-2.0.txt"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_built_source_contributes_itself_and_its_inputs_to_the_catalog() {
+        let entry = built_entry();
+        let document = serde_json::to_vec(&built_sources()).unwrap();
+
+        SourceManifest::parse_and_validate(&document, &entry)
+            .expect("a built record and its inputs are the catalog's two source rows");
+    }
+
+    #[test]
+    fn a_built_source_that_hides_an_input_from_the_catalog_is_refused() {
+        let entry = built_entry();
+        let mut document = built_sources();
+        document["sources"][0]["inputs"] = json!([]);
+
+        let error =
+            SourceManifest::parse_and_validate(&serde_json::to_vec(&document).unwrap(), &entry)
+                .unwrap_err();
+
+        assert!(matches!(error, PayloadError::InvalidManifest(_)));
+    }
+
+    #[test]
+    fn a_built_source_must_declare_licences_the_catalog_knows() {
+        let entry = built_entry();
+        let mut document = built_sources();
+        document["sources"][0]["licenses"] = json!(["MIT"]);
+
+        let error =
+            SourceManifest::parse_and_validate(&serde_json::to_vec(&document).unwrap(), &entry)
+                .unwrap_err();
+
+        assert!(matches!(error, PayloadError::InvalidManifest(_)));
+    }
+
+    #[test]
+    fn a_built_source_needs_an_output_a_licence_and_a_digest() {
+        let entry = built_entry();
+        for (field, value) in [
+            ("output", json!("")),
+            ("licenses", json!([])),
+            ("output", json!("../escape")),
+        ] {
+            let mut document = built_sources();
+            document["sources"][0][field] = value;
+
+            let error =
+                SourceManifest::parse_and_validate(&serde_json::to_vec(&document).unwrap(), &entry)
+                    .unwrap_err();
+
+            assert!(matches!(error, PayloadError::InvalidManifest(_)));
+        }
+    }
+
+    #[test]
+    fn a_sources_document_at_version_one_is_no_longer_understood() {
+        let entry = entry();
+        let mut document = sources();
+        document["schema_version"] = json!(1);
+
+        let error =
+            SourceManifest::parse_and_validate(&serde_json::to_vec(&document).unwrap(), &entry)
+                .unwrap_err();
+
+        assert!(matches!(error, PayloadError::InvalidManifest(_)));
     }
 
     #[test]
