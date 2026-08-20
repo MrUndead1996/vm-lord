@@ -123,3 +123,19 @@ udev marks vkms as a device mutter must not use. This is the filtering
 `asb_drm`'s own source comments predicted, seen for real: a virtual KMS
 device is refused by name, not by shape. A driver of the same shape under a
 different name is not on that list.
+
+## Who tags vkms, exactly
+
+    /usr/lib/udev/rules.d/61-mutter.rules:116:
+    ENV{ID_PATH}=="platform-vkms", TAG+="mutter-device-ignore"
+
+Mutter's own udev rule, and it matches on `ID_PATH` -- which udev builds
+from the platform device's name. Not the driver, not the topology, not the
+absence of a render node: the string `vkms`. A DRM device on the platform
+bus under any other name gets `ID_PATH=platform-<name>`, matches no rule in
+that file, and is a device mutter is willing to drive.
+
+That is the whole argument for a module of our own over vkms. vkms already
+proves the shape works in-kernel -- arbitrary resolution, a cursor plane, a
+writeback connector, no hardware behind any of it. It is disqualified by
+its name alone.
