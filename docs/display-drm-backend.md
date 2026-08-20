@@ -2,8 +2,13 @@
 
 The decision behind task #111, and the measurements it rests on. Every
 number here comes from a real VMLord VM: Ubuntu 24.04.4, kernel
-6.8.0-137-generic, GPU off, Secure Boot off. The raw logs and the captured
-frame are in `spikes/task-111-drm/results/`.
+6.8.0-137-generic, GPU off, Secure Boot off.
+
+The probe that produced them -- a staged shell script and a C capture tool --
+was research, and is not carried in the tree. It lives in history at
+`8d006d9`, under `spikes/task-111-drm/`, along with the full logs of every
+run; `git show 8d006d9:spikes/task-111-drm/probe.sh` brings it back. What
+that probe found, and the two frames it captured, are here.
 
 ## The decision
 
@@ -70,7 +75,7 @@ DRM client:
 This is proven, not projected: a non-master root process read the live GDM
 greeter out of mutter's framebuffer while mutter was running, at 0.27 ms
 per 1024x768 XRGB8888 frame -- copy only, one core. The capture is
-`spikes/task-111-drm/results/greeter-24.04-simpledrm.png`.
+[`greeter-1024x768-simpledrm.png`](display-drm-backend/greeter-1024x768-simpledrm.png).
 
 Consequences for the module's design:
 
@@ -114,10 +119,54 @@ Ubuntu 24.04 amd64 is proven, and is the first target. 22.04 (5.15) and
 plane helper signatures move between those kernels, so each release needs
 its own build, which is what DKMS is for.
 
+## What the module has to guard by kernel version
+
+The four the PoC needed, and the exact reason for each. `asb_drm` was
+written against 26.04's kernel; three of these are compile errors on 6.8 and
+5.15, and the fourth only appears at runtime.
+
+```c
+/* platform_driver::remove returned int until 6.11, and between 6.1 and 6.10
+ * the void-returning callback lived in ::remove_new. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+	.remove = asb_remove,
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
+	.remove_new = asb_remove,
+#else
+	.remove = asb_remove_int,   /* thin int-returning wrapper */
+#endif
+
+/* hrtimer_setup() replaced hrtimer_init + function assignment in 6.15. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+	hrtimer_setup(&asb->vblank_timer, asb_vblank_timer_fn,
+	              CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+#else
+	hrtimer_init(&asb->vblank_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	asb->vblank_timer.function = asb_vblank_timer_fn;
+#endif
+
+/* Renamed from DRM_PLANE_HELPER_NO_SCALING in 6.1. */
+#ifndef DRM_PLANE_NO_SCALING
+#define DRM_PLANE_NO_SCALING DRM_PLANE_HELPER_NO_SCALING
+#endif
+
+/* drm_version() copies drm_driver::date unconditionally until 6.14 removed
+ * the field. Left NULL it WARNs in drm_copy_field() and hands userspace a
+ * NULL string, which segfaults drm_info -- and nothing catches it at build
+ * time. */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 14, 0)
+	.date = "20260820",
+#endif
+```
+
+This is the DKMS bill in concrete form: four kernel APIs moved across the
+three releases VMLord means to support, and the module has to straddle all
+of them.
+
 ## The proof of one virtual output
 
 Done, on the target guest. `asb_drm` built through DKMS on 24.04's 6.8 (with
-`spikes/task-111-drm/asb_drm-kernel-compat.patch`, four version guards),
+four version guards, below),
 displaced `hyperv_drm`, and came up as `/dev/dri/card1` on
 `/sys/devices/platform/asb_drm.0` with a render node beside it. udev tagged
 it `master-of-seat:seat:uaccess` and nothing else -- no
@@ -127,7 +176,8 @@ it `master-of-seat:seat:uaccess` and nothing else -- no
 
 A non-master root process then read the greeter off it: primary plane
 1920x1080 XRGB8888 at 0.73 ms a frame, cursor plane 256x256 ARGB8888 in a
-buffer of its own. `spikes/task-111-drm/results/poc-greeter-1080p-asb_drm.png`
+buffer of its own.
+[`greeter-1920x1080-asb_drm.png`](display-drm-backend/greeter-1920x1080-asb_drm.png)
 is that frame, and the pointer is missing from it -- it lives on the cursor
 plane now, which is exactly the composition this document says the capture
 backend owes us.
