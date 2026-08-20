@@ -64,3 +64,62 @@ sees exactly what is on screen.
 - What `hyperv_drm` and `vkms` do once `linux-modules-extra` is installed --
   stage `extra` asks exactly that.
 - Whether anything in this stack can be driven above 1024x768.
+
+# What the `extra` stage answered
+
+`linux-modules-extra-6.8.0-137-generic` -- 113 MB, one `apt-get install`, no
+reboot -- and both candidates appear. Neither needed a rebuild, both loaded
+live.
+
+## hyperv_drm
+
+    hv_vmbus: registering driver hyperv_drm
+    hyperv_drm 5620e0c7-...: [drm] Synthvid Version major 3, minor 5
+    [drm] Initialized hyperv_drm 1.0.0 for 5620e0c7-... on minor 1
+
+It takes the display over from simpledrm outright: `card0` disappears,
+`card1` is the only node left. It sits on vmbus, and udev tags it
+`master-of-seat:seat:uaccess` -- seat0 is fine.
+
+Then it stops:
+
+| | |
+| --- | --- |
+| modes offered | 1024x768, 800x600, 800x600, 848x480, 640x480 |
+| framebuffer size | Width [0, 1024], Height [0, 768] |
+| 1920x1080 | `failed to find mode "1920x1080" for connector 31` |
+| 2560x1440 | `failed to find mode "2560x1440" for connector 31` |
+| planes | one, Primary. No cursor plane, no overlay |
+| writeback connector | none |
+| render node | none -- primary only |
+
+The ceiling is not the driver being coy: 1024x768 is what the host declared
+in `VideoMonitor`, and Synthvid hands the guest exactly that. Whether
+raising `VIDEO_WIDTH`/`VIDEO_HEIGHT` in `crates/platform/src/hcs_config.rs`
+raises this is the one question this guest cannot answer -- it needs a VM
+built with a different HCS config.
+
+(`failed to set mode: Permission denied` at 1024x768 is GDM holding DRM
+master, not a driver limit.)
+
+## vkms
+
+    [drm] Initialized vkms 1.0.0 for vkms on minor 2
+
+Everything hyperv_drm lacks, vkms has:
+
+| | |
+| --- | --- |
+| framebuffer size | Width [10, 8192], Height [10, 8192] |
+| cursor | a real Cursor plane; DRM_CAP_CURSOR 512x512 |
+| writeback connector | yes -- `WRITEBACK_FB_ID`, `WRITEBACK_OUT_FENCE_PTR`, `WRITEBACK_PIXEL_FORMATS` |
+| bus | `/sys/devices/platform/vkms` |
+
+And one tag kills it as a display for GNOME:
+
+    TAGS=:...:mutter-device-ignore:master-of-seat:seat:uaccess:
+
+udev marks vkms as a device mutter must not use. This is the filtering
+`asb_drm`'s own source comments predicted, seen for real: a virtual KMS
+device is refused by name, not by shape. A driver of the same shape under a
+different name is not on that list.
