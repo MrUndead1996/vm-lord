@@ -1,0 +1,37 @@
+[package]
+name = "vmlord-display-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+[dependencies]
+# Runtime only: the generated types are plain structs with `encode`/`decode`.
+# The frame channel deliberately does not use them for pixel payloads.
+prost = "0.14"
+
+# The record checksum. Castagnoli rather than IEEE because it is the
+# polynomial with hardware support on both ends of this socket.
+crc32c = "0.6"
+
+# What `keys` is made of. All pure Rust: the guest side of this protocol ships
+# in a static musl binary built without a C toolchain.
+base64 = "0.23"
+getrandom = "0.3"
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+# Comparing a tag with `==` leaks where two tags first differ, which is enough
+# to forge one a byte at a time.
+subtle = "2.6"
+zeroize = "1.9"
+
+[build-dependencies]
+prost = "0.14"
+prost-build = "0.14"
+# Compiles the `.proto` in-process, so no `protoc` has to be installed on
+# either the Windows or the Linux side.
+protox = "0.9"
+
+[lints]
+workspace = true

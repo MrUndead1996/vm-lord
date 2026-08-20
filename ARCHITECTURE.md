@@ -2734,6 +2734,117 @@ partition HCS would not name, one whose secret is missing -- is reported as
 unknown rather than offline: an agent that was never offered a socket has not
 failed to connect.
 
+## The display protocol
+
+The display stack that replaces AppSandbox's IDD has its own contract, and
+`vmlord-display-protocol` is it: the schema, the framing, the authentication
+and a transport-free session machine, written before either end of it exists
+so that the guest services, the codec and the Windows viewer are all built
+against the same wire. Like the agent's contract it is portable by
+construction -- no Windows APIs, no Linux syscalls, no sockets -- and it knows
+nothing about what a frame's bytes mean.
+
+A session is three HvSocket services rather than one: `VMLD` for control,
+`VMLF` for frames, `VMLI` for input, named the way `VMLA` is. **The guest
+listens and the host connects**, which is the opposite of the agent socket and
+is deliberate. The agent's connection is a standing report that lives as long
+as the VM; a display session begins when a user presses Connect and ends when
+they close the window, so making the socket's lifetime the session's lifetime
+leaves no "is the stream currently on?" state in the protocol -- no viewer, no
+connection, no capture. What the reversed direction would otherwise cost, the
+knowledge of when the guest is ready, comes over the agent channel instead: the
+guest reports its display readiness there and the UI keeps Connect disabled
+until it does, which leaves the viewer only a short bounded retry for the race
+of connecting while a guest service restarts.
+
+Every record on every channel begins with the same 24-byte little-endian
+header: header length, channel, type, payload length, sequence, base, CRC32C
+and generation. The payload is Protobuf on control and input and for the frame
+channel's own handshake, and raw codec bytes for keyframes, tile deltas and
+cursors. That last part is why the frame channel is not Protobuf all the way
+down: a 1440p keyframe is megabytes, and carrying it in a `bytes` field would
+copy it through an encoder on the way out and another on the way in, every
+frame, in the one place where this format meets real bandwidth. The frame
+channel is also the least changeable part of the contract -- a frame is a
+sequence, a base and some bytes -- while the changeable channels are the cold
+ones. The first header byte is the header's own length rather than a magic
+number: the version is settled in the handshake, and what a reader actually
+needs is room for a later minor to append a field it can skip.
+
+Control records are capped at 64 KiB and input records at 4 KiB, both fixed.
+The frame cap is not a constant but `width * height * 4` plus 64 KiB of slack
+for the geometry the session agreed on, recomputed when that geometry changes
+and held under an absolute 64 MiB. A record larger than an uncompressed frame
+of the agreed size is not a frame by definition, so "oversized" says something
+about this session instead of naming a number. As in the agent protocol, a
+record over its cap is unrecoverable -- the stream is parked on a body of
+unknown length -- so the connection closes rather than skipping past.
+
+Four records open a session, and the authentication is mutual because the
+reversed direction demands it: any process inside the guest can squat the
+service port before the real service binds it, so the host must be able to
+tell the two apart, exactly as the guest must be able to tell VMLord from
+anything else that reached the socket. The host sends `ClientHello` with a
+session id and a nonce, the guest answers `ServerHello` with its own nonce and
+what it supports, then proves itself with `ServerAuth`, and only then does the
+host prove itself with `ClientAuth`. The guest goes first because the host must
+not act on an unauthenticated peer, and a tag harvested by a fake host is worth
+nothing: it is a MAC over a transcript whose nonces will differ next time.
+
+The transcript is a SHA-256 over the two hello payloads *as they arrived on the
+wire*. Protobuf does not promise that a message encodes to the same bytes
+twice, so a transcript over a re-encoded message is one two correct
+implementations can disagree about -- and that is also why the tags are their
+own records rather than fields inside the hellos, which would force a side to
+re-encode a message with the field cleared in order to hash it.
+
+The key under those tags is derived from the per-VM secret the agent protocol
+already mints, through HKDF with the nonces as salt and the session id in the
+info. Nothing new is minted and nothing new is delivered. The unprivileged
+capture process never holds the secret: the privileged broker, which is root
+anyway because it needs DRM and uinput, derives the session key and hands only
+that on, so compromising the capture process costs one session rather than the
+VM's identity. Frame and input channels then get a key of their own from that
+session key and the transcript hash, and prove it in a three-record exchange of
+their own; because the channel key depends on the transcript, a socket cannot
+be carried in from another session or offered by a process that took no part in
+the control handshake.
+
+Losing control ends the session -- the guest stops capturing, the host closes
+the other two sockets, and the viewer starts again with a new session id.
+Losing frame or input alone does not: that channel reconnects within the same
+session at the next `generation`, and records still in flight from the previous
+connection are rejected by the header before they reach a decoder or an input
+device. A reconnected frame channel owes `StreamConfig` and a keyframe before
+any delta, since a delta has nothing to apply to, and a reconnected input
+channel owes a release-all -- which the guest also performs on its own the
+moment the channel drops, because a key stuck down is worse than a lost
+session.
+
+The stream is neither encrypted nor authenticated per record after the
+handshake, and that is a decision rather than an omission. This is a
+point-to-point stream inside the hypervisor: injecting into an established
+HvSocket stream requires a privilege under which everything else is already
+lost, and confidentiality here comes from the partition boundary. A MAC on
+every frame would cost a standing percentage of CPU in the hot path against a
+threat this transport does not have. The agent protocol makes the same trade.
+The CRC32C in each header is a corruption check, not a signature.
+
+Nothing acknowledges a frame either. The guest regulates its own stream through
+the encoder's bounded queue -- a newer frame displaces an older one that has
+not been sent, so what is queued is always current state -- and a viewer that
+falls behind receives one fresh frame rather than a backlog. The only back
+edges are `RequestKeyframe`, which is recovery for a decoder that lost
+synchronisation, and `Ping`/`Pong`, which is how a slow viewer is told from a
+dead one.
+
+`MODE_AUTO`, `MODE_DESKTOP` and `MODE_MOTION` all exist in the contract, and
+the MVP guest announces `MODE_DESKTOP` alone. `MODE_AUTO` names a host-side
+policy that resolves to `MODE_DESKTOP` until a motion codec exists; a request
+for `MODE_MOTION` is answered with `ERROR_CODE_UNSUPPORTED_MODE`. None of this
+is wired into a running VM yet: Connect still opens the AppSandbox IDD window,
+and it will until the native display path is proven end to end.
+
 ---
 
 # Planned Modules
