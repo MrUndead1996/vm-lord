@@ -11,6 +11,7 @@
 //! tools read, checked in beside the `.proto` so that a change to the wire
 //! format shows up in a diff.
 
+pub mod handshake;
 pub mod record;
 
 /// The generated types for `vmlord.display.v1`.
