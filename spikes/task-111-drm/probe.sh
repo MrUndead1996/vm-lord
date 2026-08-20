@@ -48,11 +48,16 @@ need_packages() {
 
 
 # The driver bound to the first real card, from the kernel's own uevent.
+# modetest -M wants the DRM driver's own name -- the string drm_info prints
+# as "Driver:", the one drmGetVersion returns. The bus driver in sysfs is a
+# different name for the same device (simple-framebuffer carries simpledrm,
+# and no "simple-framebuffer" module exists for modetest to open), so ask the
+# card, not the bus.
 driver_of_card1() {
-	for card in /sys/class/drm/card*; do
-		case "$card" in *-*) continue;; esac
-		[ -e "$card/device/uevent" ] || continue
-		sed -n 's/^DRIVER=//p' "$card/device/uevent" | head -n 1
+	for node in /dev/dri/card*; do
+		[ -e "$node" ] || continue
+		drm_info "$node" 2>/dev/null |
+			sed -n 's/.*Driver: \([A-Za-z0-9_-]*\).*/\1/p' | head -n 1
 		return
 	done
 }
@@ -197,6 +202,53 @@ stage_stock() {
 }
 
 # ---------------------------------------------------------------------------
+# Stage: extra
+#
+# The 24.04 cloud image has neither hyperv_drm nor vkms on disk, even though
+# its kernel config builds both as modules: linux-image-virtual pulls only
+# linux-modules, and every DRM driver beyond the builtin simpledrm lives in
+# linux-modules-extra. So "use the stock driver" is not free -- it is a
+# package, and this stage prices it and then asks what the two candidates
+# actually look like once they are there.
+# ---------------------------------------------------------------------------
+stage_extra() {
+	say "which DRM drivers this image ships at all"
+	run "ls /lib/modules/\$(uname -r)/kernel/drivers/gpu/drm/ 2>&1 | head -n 30"
+	run "apt-get install -s -y linux-modules-extra-\$(uname -r) 2>&1 | tail -n 8"
+
+	say "installing the module package the stock drivers live in"
+	run "DEBIAN_FRONTEND=noninteractive apt-get install -y linux-modules-extra-\$(uname -r)"
+
+	for mod in hyperv_drm vkms; do
+		say "$mod as a candidate backend"
+		run "modinfo $mod | head -n 8 || echo '$mod still absent'"
+		run "modprobe $mod 2>&1"
+		run "lsmod | grep $mod || echo '$mod did not load'"
+		run "dmesg | tail -n 15"
+		run "ls -l /dev/dri/"
+		for node in /dev/dri/card*; do
+			[ -e "$node" ] || continue
+			describe_card "$node"
+		done
+	done
+
+	say "mode setting on whatever now owns the display"
+	drv=$(driver_of_card1)
+	note "driver under test: ${drv:-none}"
+	run "modetest -M ${drv:-none} -c 2>&1 | head -n 60"
+	conn=$(modetest -M "${drv:-none}" -c 2>/dev/null |
+	       awk '$1 ~ /^[0-9]+$/ && $3 == "connected" {print $1; exit}')
+	note "connected connector: ${conn:-none found}"
+	for mode in 1024x768 1920x1080 2560x1440; do
+		run "timeout -k 2 6 modetest -M ${drv:-none} -s ${conn:-0}:$mode </dev/null >$OUT/extra-modeset-$mode.log 2>&1"
+		run "tail -n 20 $OUT/extra-modeset-$mode.log"
+	done
+
+	note ""
+	note "stage 'extra' done -- log at $LOG"
+}
+
+# ---------------------------------------------------------------------------
 # Stage: desktop
 # ---------------------------------------------------------------------------
 stage_desktop() {
@@ -318,6 +370,7 @@ stage_collect() {
 
 case "$STAGE" in
 	stock)   stage_stock;;
+	extra)   stage_extra;;
 	desktop) stage_desktop;;
 	greeter) stage_greeter;;
 	pattern) stage_pattern;;
@@ -327,6 +380,8 @@ case "$STAGE" in
 usage: sudo sh probe.sh <stage>
 
   stock     what a VMLord cloud VM's display stack is before any desktop
+  extra     install linux-modules-extra and see what hyperv_drm and vkms
+            do once they exist (the stock image ships neither)
   desktop   install GNOME + GDM and reboot (destructive to this VM)
   greeter   at the GDM greeter, not logged in: what the compositor bound to
             and whether its framebuffer can be read from outside it
