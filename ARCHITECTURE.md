@@ -962,6 +962,12 @@ because `AttachVirtualDisk` fails with `ERROR_PRIVILEGE_NOT_HELD` without one.
 
 ### GPU: desired mode and runtime status
 
+The sections below say why GPU-PV is built the way it is. What a host, a guest
+and a payload must *be* is `docs/gpu-pv-compatibility.md`, and what to do about
+a status that is not what it should be is `docs/gpu-pv-troubleshooting.md`;
+both are written for whoever is using VMLord rather than changing it, and the
+stable `GpuStatusCode` values are what they are indexed by.
+
 What a VM asks of the host's GPU and what GPU-PV is actually doing for it are
 two types, not one field. `GpuMode` is desired state: chosen in the create or
 edit form, stored with the VM, and unchanged by whatever a start makes of it --
@@ -1427,6 +1433,32 @@ mounted userspace), `TOOLS`, `OPENGL`, `VULKAN` and `VENDOR`. Only a failed
 veto over a guest that turns out to draw anyway. The host logs the verdict and
 every check and keeps nothing -- the next session probes again, and deriving a
 `VmGpuFacts` from a verdict is the application layer's work.
+
+### GPU: what only a host can answer
+
+Everything the start pipeline decides on its own is tested beside it with the
+GPU steps substituted -- that a failed attachment never fails a start, that a
+GPU is attached exactly once and never retried, that a host with nothing to
+hand over is not asked to attach anything, that a start that failed still
+leaves what it found out. None of it needs a GPU.
+
+What no fake can answer is whether a guest ends up rendering, and that is
+`#[ignore]`d in `crates/platform/tests/gpu_e2e.rs`, kept apart from
+`hyperv.rs` because it asks a different question. Its subjects are the three
+modes told apart by adapter coverage, a restart described by its own run rather
+than the one before it, a VM reclaimed by a second process reporting
+`GpuAssignment::Unknown`, a mode change applying at the next start rather than
+merely being stored, a host with no adapter and a host with no payload each
+leaving a running VM with the right half of the reason recorded, and a deleted
+VM leaving no staged payload behind. Driver drift is two-phase and manual: the
+exports name the DriverStore folder of the driver installed at the time of the
+start, so only an actual driver update between the phases can produce it.
+
+These tests need what the code needs: an elevated host, a partition adapter,
+and the payload pair beside the *test binary*, since the catalog is read from
+`current_exe` and under `cargo test` that is `deps\`. A host missing any of
+those is what two of the tests are about, and each of them says so rather than
+passing quietly.
 
 ### VM update contract
 
