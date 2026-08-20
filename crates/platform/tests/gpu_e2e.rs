@@ -17,12 +17,14 @@
 //! * A GPU partition adapter, which is what `Default` and `Mirror` attach.
 //!   `a_host_without_a_partition_adapter_still_starts_the_vm` is the one test
 //!   that wants the opposite and says so.
-//! * **The GPU payload beside the test binary.** The payload catalog is read
-//!   from the directory of the running executable, which under `cargo test` is
-//!   `target\<triple>\debug\deps\`, not `target\<triple>\debug\`. Copy the
-//!   packed archive and its catalog entry there, or every guest report below
-//!   is a guest with no userspace to render with. `cargo gpu-payload pack`
-//!   produces both.
+//! * **The guest agent and the GPU payload beside the test binary.** Both are
+//!   found from `current_exe`, which under `cargo test` is the test binary in
+//!   `target\debug\deps\` and not `target\debug\`. So that directory needs
+//!   `vmlord-agent`, the musl binary `cargo agent` builds, and a
+//!   `gpu-payload\` child holding the archive and catalog entry
+//!   `cargo gpu-payload pack` produces. Without the agent nothing reports at
+//!   all; without the payload every report is a guest with no userspace to
+//!   render with.
 //! * Network access for the cloud image, and roughly twenty minutes per test.
 //!
 //! Run them one at a time:
