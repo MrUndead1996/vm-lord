@@ -98,9 +98,9 @@ The frame cap is not a constant. It is `width * height * 4 + 64 KiB` for the
 geometry the session has agreed on, recomputed whenever the geometry changes,
 under an absolute ceiling of 64 MiB. Until the first `StreamConfig` arrives,
 the geometry named in the handshake is what the cap is derived from. A record
-larger than an uncompressed
-frame of the agreed size is not a frame by definition, so "oversized" stops
-being a magic number and becomes a statement about the session.
+larger than an uncompressed frame of the agreed size is not a frame by
+definition, so "oversized" stops being a magic number and becomes a statement
+about the session.
 
 A record that exceeds its cap is unrecoverable, as it is in the agent
 protocol: the stream is parked on a body of unknown length and cannot be
