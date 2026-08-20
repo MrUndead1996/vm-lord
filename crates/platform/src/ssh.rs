@@ -316,6 +316,8 @@ mod tests {
             network_mode: NetworkMode::Nat,
             ssh,
             gpu_mode: vmlord_core::GpuMode::None,
+            desktop_profile: vmlord_core::DesktopProfile::Headless,
+            display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
             guest_target: None,
         }
     }

@@ -8,11 +8,11 @@ use std::{
 use eframe::egui;
 use vmlord_app::{BackendStatus, VmAction, WorkspaceApp};
 use vmlord_core::{
-    AgentStatus, AppSettings, BuildProgress, BuildStep, CloudImage, DiagnosticLevel, DownloadPhase,
-    GpuMode, GpuState, GuestDefaults, GuestReadinessTimeouts, HostGpuCapabilities, Language,
-    LogLevel, NetworkMode, Password,
-    Provisioning, SshAccess, SshPort, VmCreateRequest, VmDeleteRequest, VmGpuStatus, VmSource,
-    VmState, VmSummary, VmUpdateRequest, ubuntu,
+    AgentStatus, AppSettings, BuildProgress, BuildStep, CloudImage, DesktopProfile,
+    DiagnosticLevel, DisplayState, DownloadPhase, GpuMode, GpuState, GuestDefaults,
+    GuestReadinessTimeouts, HostGpuCapabilities, Language, LogLevel, NetworkMode, Password,
+    Provisioning, SshAccess, SshPort, VmCreateRequest, VmDeleteRequest, VmDisplayStatus,
+    VmGpuStatus, VmSource, VmState, VmSummary, VmUpdateRequest, ubuntu,
 };
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -125,6 +125,13 @@ struct CreateVmForm {
     locale: String,
     keyboard: String,
     timezone: String,
+    /// The desktop cloud-init is asked to install.
+    ///
+    /// Kept on the form even while installation media is chosen, so that
+    /// switching back to a cloud image does not forget what was picked; the
+    /// request built from the form reads it only for a cloud image, where a
+    /// seed exists to install it.
+    desktop: DesktopProfile,
     disk_gb: u32,
     ram_mb: u32,
     cpu_cores: u32,
@@ -245,6 +252,9 @@ impl CreateVmForm {
             locale: guest_defaults.locale.clone(),
             keyboard: guest_defaults.keyboard.clone(),
             timezone: guest_defaults.timezone.clone(),
+            // A new VM comes with a desktop unless someone says otherwise:
+            // the profile's own default, not a choice of this dialog's.
+            desktop: DesktopProfile::default(),
             disk_gb: 64,
             ram_mb: 4096,
             cpu_cores: 4,
@@ -348,9 +358,17 @@ impl eframe::App for VmlordUi {
                 .selected_vm_name
                 .as_deref()
                 .and_then(|name| self.application.gpu_status(name));
-            if let Some(action) =
-                render_selected_vm(ui, self.application.vms(), &self.selected_vm_name, gpu_status)
-            {
+            let display_status = self
+                .selected_vm_name
+                .as_deref()
+                .and_then(|name| self.application.display_status(name));
+            if let Some(action) = render_selected_vm(
+                ui,
+                self.application.vms(),
+                &self.selected_vm_name,
+                gpu_status,
+                display_status,
+            ) {
                 selected_action = Some(action);
             }
             ui.add_space(12.0);
@@ -692,11 +710,41 @@ fn render_create_vm_dialog(
                                 });
                             ui.end_row();
 
-                            for warning in gpu_capability_warnings(host_gpu, form.gpu_mode)
-                            {
+                            for warning in gpu_capability_warnings(host_gpu, form.gpu_mode) {
                                 ui.label("");
                                 ui.colored_label(WARNING_COLOR, warning);
                                 ui.end_row();
+                            }
+
+                            // Only a cloud image can be given a desktop: a
+                            // hand-installed system gets no seed of VMLord's,
+                            // so there would be nothing to install it with.
+                            if form.source_kind == SourceKind::CloudImage {
+                                ui.label("Desktop");
+                                egui::ComboBox::from_id_salt("create-vm-desktop")
+                                    .selected_text(desktop_profile_label(form.desktop))
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut form.desktop,
+                                            DesktopProfile::Gnome,
+                                            desktop_profile_label(DesktopProfile::Gnome),
+                                        );
+                                        ui.selectable_value(
+                                            &mut form.desktop,
+                                            DesktopProfile::Headless,
+                                            desktop_profile_label(DesktopProfile::Headless),
+                                        );
+                                    });
+                                ui.end_row();
+
+                                // Advice from the domain, not a rule of the
+                                // dialog: a desktop on a small VM is built and
+                                // warned about, never refused.
+                                for advisory in create_vm_advisories(form) {
+                                    ui.label("");
+                                    ui.colored_label(WARNING_COLOR, advisory);
+                                    ui.end_row();
+                                }
                             }
 
                             ui.label("Network");
@@ -1189,6 +1237,7 @@ fn create_vm_source(form: &CreateVmForm) -> Result<VmSource, String> {
                 locale: form.locale.trim().into(),
                 keyboard: form.keyboard.trim().into(),
                 timezone: form.timezone.trim().into(),
+                desktop: form.desktop,
             },
         },
     })
@@ -1328,6 +1377,46 @@ fn gpu_state_label(state: GpuState) -> &'static str {
         GpuState::GuestReady => "Ready",
         GpuState::Degraded => "Degraded",
         GpuState::Failed => "Failed",
+    }
+}
+
+/// What the domain has to say about the VM this form describes, if anything.
+///
+/// The advice itself belongs to `VmCreateRequest`; this only asks for it. A
+/// form that is not yet a request has nothing to advise about -- the fields it
+/// is missing are what the error under the buttons is for.
+fn create_vm_advisories(form: &CreateVmForm) -> Vec<String> {
+    create_vm_request(form, &[])
+        .map(|request| request.advisories())
+        .unwrap_or_default()
+}
+
+fn desktop_profile_label(profile: DesktopProfile) -> &'static str {
+    match profile {
+        DesktopProfile::Headless => "None (headless)",
+        DesktopProfile::Gnome => "GNOME",
+    }
+}
+
+/// What to show beside a VM's desktop, in one line.
+fn display_status_detail(profile: DesktopProfile, status: Option<&VmDisplayStatus>) -> String {
+    let Some(status) = status else {
+        return desktop_profile_label(profile).to_owned();
+    };
+    let mut detail = format!("{}: {}", display_state_label(status.state), status.message);
+    if status.can_retry {
+        detail.push_str(" The desktop can be installed again.");
+    }
+    detail
+}
+
+fn display_state_label(state: DisplayState) -> &'static str {
+    match state {
+        DisplayState::Disabled => "Disabled",
+        DisplayState::Provisioning => "Installing",
+        DisplayState::WaitingForGuest => "Waiting for guest",
+        DisplayState::Ready => "Ready",
+        DisplayState::Degraded => "Degraded",
     }
 }
 
@@ -1533,6 +1622,7 @@ fn render_selected_vm(
     vms: &[VmSummary],
     selected_vm_name: &Option<String>,
     gpu_status: Option<&VmGpuStatus>,
+    display_status: Option<&VmDisplayStatus>,
 ) -> Option<VmAction> {
     let Some(name) = selected_vm_name else {
         return None;
@@ -1657,6 +1747,16 @@ fn render_selected_vm(
             detail_row(ui, "Disk", format!("{} GiB", vm.disk_gb));
             detail_row(ui, "GPU", gpu_mode_label(vm.gpu_mode).into());
             detail_row(ui, "GPU status", gpu_status_detail(gpu_status));
+            detail_row(
+                ui,
+                "Desktop",
+                desktop_profile_label(vm.desktop_profile).into(),
+            );
+            detail_row(
+                ui,
+                "Desktop status",
+                display_status_detail(vm.desktop_profile, display_status),
+            );
             detail_row(ui, "SSH", ssh_detail(vm));
         });
 
@@ -2201,6 +2301,57 @@ mod tests {
         assert_eq!(provisioning.locale, "ru_RU.UTF-8");
         assert_eq!(provisioning.keyboard, "ru");
         assert_eq!(provisioning.timezone, "Europe/Moscow");
+        assert_eq!(provisioning.desktop, DesktopProfile::Gnome);
+    }
+
+    /// The form starts on a desktop, and a headless VM is the choice someone
+    /// makes -- with the same form still able to describe one.
+    #[test]
+    fn the_chosen_desktop_reaches_the_request() {
+        assert_eq!(cloud_form().desktop, DesktopProfile::Gnome);
+
+        let form = CreateVmForm {
+            desktop: DesktopProfile::Headless,
+            ..cloud_form()
+        };
+        let request = create_vm_request(&form, &[]).unwrap();
+
+        assert_eq!(provisioning_of(&request).desktop, DesktopProfile::Headless);
+        assert_eq!(request.desktop_profile(), DesktopProfile::Headless);
+    }
+
+    /// Installation media has no seed to install a desktop from, so whatever
+    /// the form remembers of one stays out of the request.
+    #[test]
+    fn installation_media_carries_no_desktop_whatever_the_form_holds() {
+        let form = CreateVmForm {
+            source_kind: SourceKind::LocalMedia,
+            image_path: "C:\\images\\ubuntu.iso".into(),
+            desktop: DesktopProfile::Gnome,
+            ..cloud_form()
+        };
+
+        let request = create_vm_request(&form, &[]).unwrap();
+
+        assert!(matches!(request.source, VmSource::LocalMedia { .. }));
+        assert_eq!(request.desktop_profile(), DesktopProfile::Headless);
+        assert!(request.advisories().is_empty());
+    }
+
+    /// A small desktop VM is warned about and still built: the advice comes
+    /// from the domain, and the dialog only paints it.
+    #[test]
+    fn a_small_desktop_vm_is_advised_against_rather_than_refused() {
+        let form = CreateVmForm {
+            ram_mb: 1024,
+            cpu_cores: 1,
+            password: "hunter2".into(),
+            ..cloud_form()
+        };
+
+        assert!(create_vm_request(&form, &[]).is_ok());
+        assert_eq!(create_vm_advisories(&form).len(), 1);
+        assert!(create_vm_advisories(&cloud_form()).len() <= 1);
     }
 
     /// An empty password field is a choice, not a missing value: the guest gets
@@ -2413,6 +2564,9 @@ mod tests {
             cpu_cores: 2,
             gpu_mode: GpuMode::None,
             gpu: VmGpuFacts::default(),
+            desktop_profile: DesktopProfile::Headless,
+            display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
+            display: vmlord_core::VmDisplayFacts::default(),
             network_mode: NetworkMode::Nat,
             ip_address: None,
             ssh: SshAvailability::Disabled,
@@ -2831,5 +2985,4 @@ mod tests {
 
         assert!(detail.contains("gpu-assignment-partial"), "{detail}");
     }
-
 }

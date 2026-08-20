@@ -79,6 +79,7 @@ fn seed() -> Seed {
         admin_group: "sudo",
         ssh_daemon: &ubuntu().ssh,
         agent_secret: None,
+        desktop_packages: &[],
     })
 }
 

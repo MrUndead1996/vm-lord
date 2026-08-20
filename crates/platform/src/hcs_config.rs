@@ -767,6 +767,7 @@ mod tests {
                     locale: "en_US.UTF-8".into(),
                     keyboard: "us".into(),
                     timezone: "Europe/Moscow".into(),
+                    desktop: vmlord_core::DesktopProfile::Headless,
                 },
             },
             ..request()

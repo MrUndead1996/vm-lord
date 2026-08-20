@@ -606,6 +606,8 @@ impl HcsVmRepository {
         // Read before `mapping.vm_name` is moved into the summary below.
         let network_mode = mapping.network_mode;
         let gpu_mode = mapping.gpu_mode;
+        let desktop_profile = mapping.desktop_profile;
+        let display_provisioning = mapping.display_provisioning.clone();
         let vm_id = mapping.vm_id;
         let ssh = SshAvailability::from(mapping.ssh.clone());
         let topology = self.topology(&mapping).unwrap_or(VmTopology {
@@ -631,6 +633,12 @@ impl HcsVmRepository {
             cpu_cores: topology.cpu_cores,
             gpu_mode,
             gpu: self.gpu_runs.snapshot(vm_id),
+            desktop_profile,
+            display_provisioning,
+            // Nothing observes a guest's display yet: the services that would
+            // report it are the guest half of this epic (#115), and inventing
+            // a report here would be a fact nobody saw.
+            display: vmlord_core::VmDisplayFacts::default(),
             network_mode,
             ip_address,
             ssh,
@@ -1564,9 +1572,8 @@ mod tests {
     };
 
     use super::{
-        HcsSystemState, HcsVmRepository, OS_TYPE, console_failure_diagnostics, guest_ip,
-        GpuAssignment, launch_running_consoles, merge_with_builds, record_gpu_mode,
-        record_network_mode,
+        GpuAssignment, HcsSystemState, HcsVmRepository, OS_TYPE, console_failure_diagnostics,
+        guest_ip, launch_running_consoles, merge_with_builds, record_gpu_mode, record_network_mode,
         refuse_gpu_mode_change,
     };
     use std::sync::atomic::AtomicBool;
@@ -1628,6 +1635,9 @@ mod tests {
             cpu_cores: 2,
             gpu_mode: GpuMode::None,
             gpu: VmGpuFacts::default(),
+            desktop_profile: vmlord_core::DesktopProfile::Headless,
+            display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
+            display: vmlord_core::VmDisplayFacts::default(),
             network_mode: NetworkMode::Nat,
             ip_address: None,
             ssh: SshAvailability::Disabled,
@@ -1801,6 +1811,8 @@ mod tests {
             network_mode,
             ssh: None,
             gpu_mode: GpuMode::None,
+            desktop_profile: vmlord_core::DesktopProfile::Headless,
+            display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
             guest_target: None,
         }
     }
@@ -1817,6 +1829,8 @@ mod tests {
                 network_mode: NetworkMode::None,
                 ssh: None,
                 gpu_mode: GpuMode::None,
+                desktop_profile: vmlord_core::DesktopProfile::Headless,
+                display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
                 guest_target: None,
             },
             state,
@@ -2413,8 +2427,7 @@ mod tests {
 
     impl Drop for Held {
         fn drop(&mut self) {
-            self.release
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+            self.release.store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = fs::remove_dir_all(&self.root);
         }
     }

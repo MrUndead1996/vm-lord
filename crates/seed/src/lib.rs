@@ -43,6 +43,14 @@ pub struct SeedRequest<'a> {
     /// arrives here hashed: this crate prints documents and has no business
     /// holding the thing itself.
     pub agent_secret: Option<&'a str>,
+    /// The packages that install the guest's desktop, from the distribution's
+    /// own archives.
+    ///
+    /// Empty is a headless VM, which is not the same as a VM whose desktop
+    /// failed to install: nothing was asked for, so nothing is missing. Names
+    /// rather than a profile, because this crate prints documents and has no
+    /// business knowing what GNOME is.
+    pub desktop_packages: &'a [String],
 }
 
 /// The two documents that go into the seed volume.
@@ -192,6 +200,7 @@ mod tests {
             admin_group: "sudo",
             ssh_daemon: &UBUNTU_SSH,
             agent_secret: None,
+            desktop_packages: &[],
         });
 
         assert!(seed.user_data.starts_with("#cloud-config\n"));
@@ -218,6 +227,7 @@ mod tests {
             admin_group: "sudo",
             ssh_daemon: &UBUNTU_SSH,
             agent_secret: None,
+            desktop_packages: &[],
         });
 
         let bytes = super::image(&seed);

@@ -245,6 +245,14 @@ impl VmCreationPipeline {
                 VmSource::CloudImage { provisioning, .. } => provisioning.ssh_config(),
             },
             gpu_mode: request.gpu_mode,
+            // The desktop the seed below is asked to install, and the fact
+            // that nothing has installed it yet. A build that never reaches
+            // the guest leaves `Pending` behind, which is what later offers a
+            // retry instead of reporting a desktop that is not there.
+            desktop_profile: request.desktop_profile(),
+            display_provisioning: vmlord_core::DisplayProvisioning::requested(
+                request.desktop_profile(),
+            ),
             // The same three facts for the same reason: a payload is chosen
             // before the guest that will use it has booted, and only the
             // creation knows what system was installed.
@@ -494,6 +502,13 @@ fn write_provisioning(
         admin_group: &image.profile.admin_group,
         ssh_daemon: &image.profile.ssh,
         agent_secret: agent_secret.as_ref().map(|secret| secret.as_str()),
+        // What this distribution says installing the chosen desktop takes,
+        // and nothing when it was not asked for one -- or when the profile
+        // describes no desktop at all.
+        desktop_packages: image
+            .profile
+            .desktop_for(provisioning.desktop)
+            .map_or(&[][..], |desktop| desktop.packages.as_slice()),
     });
 
     write_restricted(seed_path, &vmlord_seed::image(&seed), "the cloud-init seed")?;
@@ -1288,6 +1303,7 @@ mod tests {
                     locale: "en_US.UTF-8".into(),
                     keyboard: "us".into(),
                     timezone: "Europe/Moscow".into(),
+                    desktop: vmlord_core::DesktopProfile::Headless,
                 },
             },
             ram_mb: 512,
@@ -1616,6 +1632,7 @@ mod tests {
                     locale: "en_US.UTF-8".into(),
                     keyboard: "us".into(),
                     timezone: "Europe/Moscow".into(),
+                    desktop: vmlord_core::DesktopProfile::Headless,
                 },
             },
             ..cloud_request("cloud-key-only-vm")
@@ -1646,6 +1663,7 @@ mod tests {
                     locale: "en_US.UTF-8".into(),
                     keyboard: "us".into(),
                     timezone: "Europe/Moscow".into(),
+                    desktop: vmlord_core::DesktopProfile::Headless,
                 },
             },
             ..cloud_request("cloud-no-ssh-vm")
@@ -1717,6 +1735,7 @@ mod tests {
                     locale: "en_US.UTF-8".into(),
                     keyboard: "us".into(),
                     timezone: "Europe/Moscow".into(),
+                    desktop: vmlord_core::DesktopProfile::Headless,
                 },
             },
             ..cloud_request("cloud-no-deploy-key-vm")

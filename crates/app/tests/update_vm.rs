@@ -57,6 +57,9 @@ impl VmRepository for FakeRepository {
             cpu_cores: 4,
             gpu_mode: GpuMode::Default,
             gpu: VmGpuFacts::default(),
+            desktop_profile: vmlord_core::DesktopProfile::Gnome,
+            display_provisioning: vmlord_core::DisplayProvisioning::Ready,
+            display: vmlord_core::VmDisplayFacts::default(),
             network_mode: NetworkMode::Nat,
             ip_address: None,
             ssh: SshAvailability::Enabled(SshConfig {

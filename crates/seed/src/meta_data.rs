@@ -40,6 +40,7 @@ mod tests {
             admin_group: "sudo",
             ssh_daemon: &UBUNTU_SSH,
             agent_secret: None,
+            desktop_packages: &[],
         }
     }
 

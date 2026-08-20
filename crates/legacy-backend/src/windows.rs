@@ -434,6 +434,12 @@ impl AppSandboxBackend {
                 // The AppSandbox FFI reports the mode a VM was configured
                 // with and nothing about what came of it.
                 gpu: VmGpuFacts::default(),
+                // AppSandbox VMs predate VMLord's display stack: their display
+                // is the IDD this epic replaces, and nothing here installs a
+                // desktop of VMLord's making into one.
+                desktop_profile: vmlord_core::DesktopProfile::Headless,
+                display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
+                display: vmlord_core::VmDisplayFacts::default(),
                 network_mode: network_mode((self.api.vm_network_mode)(vm)),
                 // The temporary AppSandbox FFI does not expose a guest IP address yet.
                 ip_address: None,

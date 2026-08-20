@@ -11,6 +11,8 @@
 //! are to be read from a JSON file, and a parsed file yields no `&'static str`
 //! short of leaking it.
 
+use crate::display::DesktopProfile;
+
 /// The placeholder both templates carry.
 const RELEASE_PLACEHOLDER: &str = "{release}";
 
@@ -32,6 +34,31 @@ pub struct DistroProfile {
     pub admin_group: String,
     /// How this distribution runs and configures its SSH daemon.
     pub ssh: SshDaemon,
+    /// What installing a GNOME desktop on this distribution takes, when it is
+    /// something VMLord knows how to install at all.
+    ///
+    /// `None` is a profile read from a file that says nothing about a
+    /// desktop -- a VM built from it can only be headless, which is a fact
+    /// about the profile rather than a failure to be reported later.
+    pub desktop: Option<DesktopSetup>,
+}
+
+/// What installing a desktop into a guest of this distribution takes.
+///
+/// Data rather than knowledge inside whatever writes the cloud-init seed, for
+/// the same reason [`SshDaemon`] is: the difference between distributions here
+/// is a list of package names and the name of a unit.
+///
+/// Every package is one the distribution publishes in its own archives. VMLord
+/// adds no repository, downloads no binary of its own and signs nothing: the
+/// desktop a guest ends up with is the one its vendor ships, updated by the
+/// guest's own updates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DesktopSetup {
+    /// The packages that bring in GNOME, GDM and their Wayland session.
+    pub packages: Vec<String>,
+    /// The display manager unit that has to run for a login screen to appear.
+    pub display_manager: String,
 }
 
 /// How a distribution starts its SSH daemon, and where a setting of VMLord's
@@ -128,10 +155,29 @@ pub fn ubuntu() -> DistroProfile {
             // cloud-init's own `50-cloud-init.conf`.
             config_drop_in: "/etc/ssh/sshd_config.d/10-vmlord.conf".into(),
         },
+        desktop: Some(DesktopSetup {
+            // The minimal desktop task rather than `ubuntu-desktop`: it pulls
+            // GNOME Shell, GDM and the Wayland session and leaves out the
+            // office suite, the games and the printer stack a VM opened for a
+            // desktop does not need.
+            packages: vec!["ubuntu-desktop-minimal".into()],
+            display_manager: "gdm3.service".into(),
+        }),
     }
 }
 
 impl DistroProfile {
+    /// What installing `profile` on this distribution takes, or `None` when
+    /// there is nothing to install -- either because no desktop was asked for
+    /// or because this distribution has no description of one.
+    #[must_use]
+    pub fn desktop_for(&self, profile: DesktopProfile) -> Option<&DesktopSetup> {
+        profile
+            .wants_desktop()
+            .then_some(self.desktop.as_ref())
+            .flatten()
+    }
+
     /// The URL of the image itself.
     #[must_use]
     pub fn image_url(&self, release: &str) -> String {
@@ -165,7 +211,7 @@ impl DistroProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::{DistroProfile, SshUnits, ubuntu};
+    use super::{DesktopProfile, DistroProfile, SshUnits, ubuntu};
 
     #[test]
     fn a_profile_builds_the_image_url_and_the_checksums_url_in_one_directory() {
@@ -182,6 +228,26 @@ mod tests {
             ubuntu().file_name("22.04"),
             "ubuntu-22.04-server-cloudimg-amd64.img"
         );
+    }
+
+    #[test]
+    fn a_desktop_is_offered_only_to_a_profile_that_asks_for_one() {
+        let ubuntu = ubuntu();
+        let desktop = ubuntu
+            .desktop_for(DesktopProfile::Gnome)
+            .expect("Ubuntu installs GNOME");
+        assert_eq!(desktop.packages, ["ubuntu-desktop-minimal"]);
+        assert_eq!(desktop.display_manager, "gdm3.service");
+        assert_eq!(ubuntu.desktop_for(DesktopProfile::Headless), None);
+    }
+
+    #[test]
+    fn a_profile_that_describes_no_desktop_offers_none() {
+        let profile = DistroProfile {
+            desktop: None,
+            ..ubuntu()
+        };
+        assert_eq!(profile.desktop_for(DesktopProfile::Gnome), None);
     }
 
     #[test]
