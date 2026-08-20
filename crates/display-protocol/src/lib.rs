@@ -11,6 +11,8 @@
 //! tools read, checked in beside the `.proto` so that a change to the wire
 //! format shows up in a diff.
 
+pub mod record;
+
 /// The generated types for `vmlord.display.v1`.
 ///
 /// The whole schema is one version module. A `v2` would be a second module
