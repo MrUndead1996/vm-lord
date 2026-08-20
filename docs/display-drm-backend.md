@@ -114,11 +114,30 @@ Ubuntu 24.04 amd64 is proven, and is the first target. 22.04 (5.15) and
 plane helper signatures move between those kernels, so each release needs
 its own build, which is what DKMS is for.
 
-## What is not yet proven
+## The proof of one virtual output
 
-The module itself. Everything above establishes that the stock options are
-out and what shape the replacement has; the next step is to build
-`asb_drm` unchanged in a VMLord guest via DKMS and show GDM binding it at
-a resolution hyperv_drm cannot offer, with the pointer on its own plane and
-a capture that composites both. That is the PoC of one virtual output, and
-`probe.sh poc` is where it goes.
+Done, on the target guest. `asb_drm` built through DKMS on 24.04's 6.8 (with
+`spikes/task-111-drm/asb_drm-kernel-compat.patch`, four version guards),
+displaced `hyperv_drm`, and came up as `/dev/dri/card1` on
+`/sys/devices/platform/asb_drm.0` with a render node beside it. udev tagged
+it `master-of-seat:seat:uaccess` and nothing else -- no
+`mutter-device-ignore` -- and mutter 46.2 bound it before login:
+
+    Added device '/dev/dri/card1' (asb_drm) using atomic mode setting
+
+A non-master root process then read the greeter off it: primary plane
+1920x1080 XRGB8888 at 0.73 ms a frame, cursor plane 256x256 ARGB8888 in a
+buffer of its own. `spikes/task-111-drm/results/poc-greeter-1080p-asb_drm.png`
+is that frame, and the pointer is missing from it -- it lives on the cursor
+plane now, which is exactly the composition this document says the capture
+backend owes us.
+
+So the shape holds end to end on the first proven target. What remains is
+not research:
+
+- the module's own name and packaging under VMLord, rather than AppSandbox's;
+- the mode list above 1920x1080 -- this run pinned the module to that size
+  through its modprobe.d file, so the ceiling is still unmeasured;
+- 22.04 and 26.04 builds (the patch compiles clean against 5.15, which is
+  evidence, not proof, for 22.04);
+- the capture backend itself, which is task #9's next step, not this one.
