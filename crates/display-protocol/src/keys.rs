@@ -97,6 +97,14 @@ impl Secret {
         Ok(Self(Zeroizing::new(bytes)))
     }
 
+    /// A second handle on the same secret, for a type that has to own one.
+    ///
+    /// Not `Clone`: copying a secret is a thing to do deliberately and rarely,
+    /// and a derive would make it look ordinary.
+    pub(crate) fn duplicate(&self) -> Self {
+        Self(Zeroizing::new(*self.0))
+    }
+
     /// The secret as base64, which is how it is written to a file.
     #[must_use]
     pub fn to_base64(&self) -> Zeroizing<String> {

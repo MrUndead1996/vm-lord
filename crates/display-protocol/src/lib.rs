@@ -14,6 +14,7 @@
 pub mod handshake;
 pub mod keys;
 pub mod record;
+pub mod session;
 
 /// The generated types for `vmlord.display.v1`.
 ///
