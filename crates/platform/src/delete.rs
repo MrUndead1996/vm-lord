@@ -186,6 +186,20 @@ fn remove_files(vm_directory: &Path, delete_disks: bool) -> Result<(), Repositor
     {
         failures.push(error.to_string());
     }
+    // The firmware and runtime state of a machine that no longer exists. They
+    // go with the configuration that named them and not with the disks: what
+    // they hold is boot entries into a compute system nothing can start again.
+    for (path, description) in [
+        (layout::guest_state_path(vm_directory), "the guest state"),
+        (
+            layout::runtime_state_path(vm_directory),
+            "the runtime state",
+        ),
+    ] {
+        if let Err(error) = remove_file_if_present(&path, description) {
+            failures.push(error.to_string());
+        }
+    }
 
     if failures.is_empty() {
         Ok(())
@@ -325,6 +339,10 @@ mod tests {
         .expect("readiness transcript should be written");
         fs::write(crate::layout::agent_secret_path(&vm_directory), b"c2VjcmV0")
             .expect("agent secret should be written");
+        fs::write(crate::layout::guest_state_path(&vm_directory), b"vmgs")
+            .expect("guest state should be written");
+        fs::write(crate::layout::runtime_state_path(&vm_directory), b"vmrs")
+            .expect("runtime state should be written");
 
         let mapping = VmComputeSystemMapping {
             vm_id: Uuid::new_v4(),
@@ -513,6 +531,29 @@ mod tests {
                 .find_by_vm_name("dev")
                 .expect("the store should be readable")
                 .is_none()
+        );
+    }
+
+    /// The `.vmgs` holds the boot entries the firmware of this compute system
+    /// wrote. Kept beside disks that outlive the VM, it would describe a
+    /// machine that is gone.
+    #[test]
+    fn keeping_the_disks_still_takes_the_state_files_with_the_vm() {
+        let fixture = fixture("keep-disks-state");
+
+        pipeline(&fixture, false)
+            .delete(&fixture.store, "dev", &fixture.vm_directory, false)
+            .expect("deletion should succeed");
+
+        assert!(!crate::layout::guest_state_path(&fixture.vm_directory).exists());
+        assert!(!crate::layout::runtime_state_path(&fixture.vm_directory).exists());
+        assert!(
+            fixture
+                .vm_directory
+                .join("disks")
+                .join("system.vhdx")
+                .exists(),
+            "the disks must survive when the user asked to keep them"
         );
     }
 

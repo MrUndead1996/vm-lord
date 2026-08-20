@@ -81,6 +81,26 @@ pub(crate) fn system_disk_path(vm_directory: &Path) -> PathBuf {
     vm_directory.join("disks").join("system.vhdx")
 }
 
+/// Returns the path of the VM's guest state store, its virtual firmware's
+/// own `.vmgs` file.
+///
+/// Beside `config.json` rather than under `disks/`: it holds the UEFI
+/// variables and boot entries the firmware wrote, which describe the machine
+/// rather than being one of its disks, and a deletion told to keep the disks
+/// is meant to leave nothing else of the VM behind.
+pub(crate) fn guest_state_path(vm_directory: &Path) -> PathBuf {
+    vm_directory.join("vm.vmgs")
+}
+
+/// Returns the path of the VM's runtime state store, the `.vmrs` file its
+/// worker process keeps the state of the running machine in.
+///
+/// Beside the `.vmgs` it accompanies: the two are created together, named in
+/// the same `GuestState` section and are worth nothing apart.
+pub(crate) fn runtime_state_path(vm_directory: &Path) -> PathBuf {
+    vm_directory.join("vm.vmrs")
+}
+
 /// Returns the path of the NoCloud seed the guest's cloud-init reads.
 ///
 /// Beside `config.json` rather than under `disks/`: this is a configuration
@@ -185,6 +205,22 @@ mod tests {
         assert_eq!(
             super::agent_secret_path(&directory),
             PathBuf::from("/vms").join("dev-linux").join("agent.secret")
+        );
+    }
+
+    /// Named by HCS in the VM's `GuestState` section, so they sit where a
+    /// deletion that keeps the disks still takes them away.
+    #[test]
+    fn the_state_files_live_beside_the_configuration_not_among_the_disks() {
+        let directory = vm_directory(Path::new("/vms"), "dev-linux").unwrap();
+
+        assert_eq!(
+            super::guest_state_path(&directory),
+            PathBuf::from("/vms").join("dev-linux").join("vm.vmgs")
+        );
+        assert_eq!(
+            super::runtime_state_path(&directory),
+            PathBuf::from("/vms").join("dev-linux").join("vm.vmrs")
         );
     }
 
