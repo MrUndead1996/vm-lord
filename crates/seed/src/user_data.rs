@@ -44,11 +44,35 @@ pub(crate) fn render(request: &SeedRequest<'_>) -> String {
     ));
     document.push_str(&format!("locale: {}\n", scalar::yaml(request.locale)));
     document.push_str(&format!("timezone: {}\n", scalar::yaml(request.timezone)));
+    document.push_str(&packages(request));
     document.push_str(&write_files(request));
     document.push_str("growpart:\n  mode: auto\n  devices: ['/']\nresize_rootfs: true\n");
     document.push_str(&runcmd(request));
 
     document
+}
+
+/// The desktop the first boot installs, as cloud-init's own `packages` block,
+/// or nothing when no desktop was asked for.
+///
+/// cloud-init's key rather than an `apt-get` line in `runcmd`: it runs before
+/// the commands, it refreshes the package lists itself, and it comes from the
+/// distribution's configured archives -- so a guest ends up with the desktop
+/// its vendor publishes and VMLord adds no repository of its own.
+///
+/// A failure here does not stop the boot. cloud-init reports it and carries
+/// on, which is exactly what a host with no working network must leave behind:
+/// a VM that runs, that SSH answers on, and whose desktop is missing and can
+/// be installed again.
+fn packages(request: &SeedRequest<'_>) -> String {
+    if request.desktop_packages.is_empty() {
+        return String::new();
+    }
+    let mut block = String::from("package_update: true\npackages:\n");
+    for package in request.desktop_packages {
+        block.push_str(&format!("  - {}\n", scalar::yaml(package)));
+    }
+    block
 }
 
 /// Every file the first boot writes, as one `write_files` block.
@@ -337,6 +361,7 @@ mod tests {
             // written files stay about the files they are named after. The
             // two tests about the secret set it themselves.
             agent_secret: None,
+            desktop_packages: &[],
         }
     }
 
@@ -380,6 +405,28 @@ mod tests {
     #[test]
     fn the_first_line_is_the_marker_cloud_init_looks_for() {
         assert!(render(&request()).starts_with("#cloud-config\n"));
+    }
+
+    #[test]
+    fn a_headless_vm_asks_for_no_packages_at_all() {
+        let document = parsed(&render(&request()));
+        assert!(document.get("packages").is_none());
+        assert!(document.get("package_update").is_none());
+    }
+
+    #[test]
+    fn a_desktop_vm_installs_its_packages_from_the_distribution_s_archives() {
+        let packages = ["ubuntu-desktop-minimal".to_owned()];
+        let document = parsed(&render(&SeedRequest {
+            desktop_packages: &packages,
+            ..request()
+        }));
+
+        assert_eq!(
+            document["packages"],
+            Value::from(vec!["ubuntu-desktop-minimal"])
+        );
+        assert_eq!(document["package_update"], Value::from(true));
     }
 
     #[test]

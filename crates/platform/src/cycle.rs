@@ -382,6 +382,7 @@ mod tests {
                     locale: "en_US.UTF-8".into(),
                     keyboard: "us".into(),
                     timezone: "Europe/Moscow".into(),
+                    desktop: vmlord_core::DesktopProfile::Headless,
                 },
             },
             ram_mb: 2048,
@@ -413,6 +414,8 @@ mod tests {
                 authentication,
             }),
             gpu_mode: GpuMode::None,
+            desktop_profile: vmlord_core::DesktopProfile::Headless,
+            display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
             guest_target: None,
         }
     }

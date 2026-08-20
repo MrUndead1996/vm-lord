@@ -14,7 +14,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use vmlord_core::{GpuMode, NetworkMode, RepositoryError, SshConfig, VmSource};
+use vmlord_core::{
+    DesktopProfile, DisplayProvisioning, GpuMode, NetworkMode, RepositoryError, SshConfig, VmSource,
+};
 use vmlord_gpu_payload::GuestSelector;
 
 /// Serializes the read-modify-write of the mapping document.
@@ -86,6 +88,30 @@ pub struct VmComputeSystemMapping {
     /// which is what every VM created so far asked for.
     #[serde(default)]
     pub gpu_mode: GpuMode,
+    /// The desktop this VM was created with.
+    ///
+    /// Recorded because a start and a Connect both have to know whether there
+    /// is a desktop at all, and nothing else on the host can be asked: the
+    /// seed that installed it was consumed on the first boot.
+    ///
+    /// A mapping written before this field existed reads as
+    /// [`DesktopProfile::Headless`] -- which is what those VMs are, since
+    /// nothing installed a desktop into them. That is deliberately not the
+    /// type's own default: a create form starts from a desktop, and a VM
+    /// built before desktops existed did not.
+    #[serde(default = "no_desktop")]
+    pub desktop_profile: DesktopProfile,
+    /// How far installing that desktop got, as it was last recorded.
+    ///
+    /// Stored rather than derived because the installation happens once,
+    /// during the build, and every later run of VMLord has to be able to read
+    /// its outcome -- including to offer a retry for it.
+    ///
+    /// A mapping written before this field existed reads as
+    /// [`DisplayProvisioning::NotRequested`], which matches the profile such a
+    /// mapping reads back with.
+    #[serde(default)]
+    pub display_provisioning: DisplayProvisioning,
     /// The guest a GPU payload would have to suit, as far as VMLord knows it.
     ///
     /// `None` is a VM built from installation media: VMLord promises nothing
@@ -93,6 +119,11 @@ pub struct VmComputeSystemMapping {
     /// from. Deliberately not a guess.
     #[serde(default)]
     pub guest_target: Option<GuestTargetKey>,
+}
+
+/// What a mapping written before desktops existed asks for.
+fn no_desktop() -> DesktopProfile {
+    DesktopProfile::Headless
 }
 
 /// The three facts that pick a GPU payload out of the catalog.
@@ -336,8 +367,9 @@ mod tests {
 
     use uuid::Uuid;
     use vmlord_core::{
-        CloudImage, GpuMode, NetworkMode, Provisioning, SshAccess, SshAuthentication, SshConfig,
-        SshPort, VmSource, distro,
+        CloudImage, DesktopProfile, DisplayFailure, DisplayProvisioning, DisplayStage,
+        DisplayStatusCode, GpuMode, NetworkMode, Provisioning, SshAccess, SshAuthentication,
+        SshConfig, SshPort, VmSource, distro,
     };
 
     use super::{GuestTargetKey, MetadataStore, VmComputeSystemMapping, guest_target_key};
@@ -361,6 +393,8 @@ mod tests {
             endpoint_id: None,
             network_mode: NetworkMode::None,
             gpu_mode: GpuMode::None,
+            desktop_profile: vmlord_core::DesktopProfile::Headless,
+            display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
             guest_target: None,
             ssh: None,
         }
@@ -705,12 +739,45 @@ mod tests {
 
         assert_eq!(mapping.gpu_mode, GpuMode::None);
         assert_eq!(mapping.guest_target, None);
+        // A VM built before desktops existed has none, whatever a create form
+        // starts from today.
+        assert_eq!(mapping.desktop_profile, DesktopProfile::Headless);
+        assert_eq!(
+            mapping.display_provisioning,
+            DisplayProvisioning::NotRequested
+        );
+    }
+
+    /// The desired desktop and what installing it came to are two fields, and
+    /// both have to survive a restart: one is what the VM asked for and the
+    /// other is what a retry is offered from.
+    #[test]
+    fn a_desktop_and_a_failed_installation_both_survive_a_round_trip() {
+        let mapping = VmComputeSystemMapping {
+            desktop_profile: DesktopProfile::Gnome,
+            display_provisioning: DisplayProvisioning::Degraded(DisplayFailure::new(
+                DisplayStage::Provisioning,
+                DisplayStatusCode::PackageDownloadFailed,
+                "archive.ubuntu.com did not answer",
+            )),
+            ..mapping(Uuid::from_u128(1), "dev", "vmlord-dev")
+        };
+
+        let encoded = serde_json::to_string(&mapping).expect("a mapping must serialize");
+        let decoded: VmComputeSystemMapping =
+            serde_json::from_str(&encoded).expect("a mapping must deserialize");
+
+        assert_eq!(decoded.desktop_profile, DesktopProfile::Gnome);
+        assert_eq!(decoded.display_provisioning, mapping.display_provisioning);
+        assert!(decoded.display_provisioning.can_retry());
     }
 
     #[test]
     fn a_recorded_gpu_mode_survives_a_round_trip() {
         let mapping = VmComputeSystemMapping {
             gpu_mode: GpuMode::Mirror,
+            desktop_profile: vmlord_core::DesktopProfile::Headless,
+            display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
             guest_target: Some(GuestTargetKey {
                 distribution: "ubuntu".into(),
                 release: "26.04".into(),
@@ -741,6 +808,7 @@ mod tests {
                 locale: "en_US.UTF-8".into(),
                 keyboard: "us".into(),
                 timezone: "UTC".into(),
+                desktop: vmlord_core::DesktopProfile::Headless,
             },
         })
         .expect("a cloud image knows what it boots");

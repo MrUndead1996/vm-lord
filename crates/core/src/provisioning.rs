@@ -12,6 +12,7 @@ use std::fmt;
 
 use crate::{
     RepositoryError,
+    display::DesktopProfile,
     distro::DistroProfile,
     ssh::{SshAuthentication, SshConfig, SshPort},
 };
@@ -59,6 +60,15 @@ pub struct Provisioning {
     pub locale: String,
     pub keyboard: String,
     pub timezone: String,
+    /// The desktop cloud-init is asked to install, if any.
+    ///
+    /// Here rather than beside the source, for the reason provisioning itself
+    /// is here: a desktop is something a seed installs, and installation media
+    /// gets no seed -- so "a local ISO with GNOME" is a state that cannot be
+    /// spelled rather than one to be rejected later. Changing it after the VM
+    /// exists means installing a desktop into a booted guest, which is its own
+    /// task (#127).
+    pub desktop: DesktopProfile,
 }
 
 /// Whether the guest runs an SSH server, on what port, and whether VMLord puts
@@ -328,7 +338,7 @@ fn rejected(message: impl Into<String>) -> RepositoryError {
 
 #[cfg(test)]
 mod tests {
-    use super::{CloudImage, Password, Provisioning, SshAccess, VmSource};
+    use super::{CloudImage, DesktopProfile, Password, Provisioning, SshAccess, VmSource};
     use crate::{distro::ubuntu, ssh::SshPort};
 
     fn provisioning() -> Provisioning {
@@ -342,6 +352,7 @@ mod tests {
             locale: "en_US.UTF-8".into(),
             keyboard: "us".into(),
             timezone: "Europe/Moscow".into(),
+            desktop: DesktopProfile::Gnome,
         }
     }
 

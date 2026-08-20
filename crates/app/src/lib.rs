@@ -1,15 +1,17 @@
 //! Application workflows shared by desktop, CLI, and future automation clients.
 
+pub mod display;
 pub mod gpu;
 
 use std::{collections::HashMap, fmt, path::PathBuf, time::SystemTime};
 
 use vmlord_core::{
     AppSettings, Diagnostic, DiagnosticLevel, GuestDefaults, HostGpuCapabilities, RepositoryError,
-    SettingsError, SettingsStore, VmCreateRequest, VmDeleteRequest, VmGpuStatus, VmRepository,
-    VmState, VmSummary, VmUpdateRequest,
+    SettingsError, SettingsStore, VmCreateRequest, VmDeleteRequest, VmDisplayStatus, VmGpuStatus,
+    VmRepository, VmState, VmSummary, VmUpdateRequest,
 };
 
+pub use display::derive_status as derive_display_status;
 pub use gpu::derive_status as derive_gpu_status;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -101,6 +103,10 @@ pub struct WorkspaceApp {
     /// keeps the time its facts were taken instead of ageing forward under a
     /// UI that redraws sixty times a second.
     gpu_status: HashMap<String, VmGpuStatus>,
+    /// What the display stack is doing for each listed VM, keyed by VM name.
+    ///
+    /// Derived once per refresh for the same reason `gpu_status` is.
+    display_status: HashMap<String, VmDisplayStatus>,
     /// What this host can do for GPU-PV, read once when the backend comes up.
     ///
     /// `None` is a backend that could not answer, which is not the same as a
@@ -131,6 +137,7 @@ impl WorkspaceApp {
             status: BackendStatus::Starting,
             vms: Vec::new(),
             gpu_status: HashMap::new(),
+            display_status: HashMap::new(),
             host_gpu: None,
             diagnostics: Vec::new(),
         }
@@ -291,6 +298,21 @@ impl WorkspaceApp {
                         (
                             vm.name.clone(),
                             gpu::derive_status(vm.gpu_mode, vm.state, &vm.gpu, now),
+                        )
+                    })
+                    .collect();
+                self.display_status = vms
+                    .iter()
+                    .map(|vm| {
+                        (
+                            vm.name.clone(),
+                            display::derive_status(
+                                vm.desktop_profile,
+                                &vm.display_provisioning,
+                                vm.state,
+                                &vm.display,
+                                now,
+                            ),
                         )
                     })
                     .collect();
@@ -601,6 +623,15 @@ impl WorkspaceApp {
         self.gpu_status.get(vm_name)
     }
 
+    /// What the display stack is doing for one VM.
+    ///
+    /// `None` for a name the last listing did not contain, for the same reason
+    /// [`Self::gpu_status`] answers `None` for one.
+    #[must_use]
+    pub fn display_status(&self, vm_name: &str) -> Option<&VmDisplayStatus> {
+        self.display_status.get(vm_name)
+    }
+
     #[must_use]
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
@@ -733,6 +764,9 @@ mod tests {
         /// What the VM asks of the GPU, and what the backend saw of it.
         gpu_mode: vmlord_core::GpuMode,
         gpu: vmlord_core::VmGpuFacts,
+        /// The desktop the VM was created with, and how far installing it got.
+        desktop_profile: vmlord_core::DesktopProfile,
+        display_provisioning: vmlord_core::DisplayProvisioning,
         /// Whether this backend can answer for the host at all, and how often
         /// it has been asked.
         reports_host_gpu: bool,
@@ -783,6 +817,9 @@ mod tests {
                 cpu_cores: 4,
                 gpu_mode: self.gpu_mode,
                 gpu: self.gpu.clone(),
+                desktop_profile: self.desktop_profile,
+                display_provisioning: self.display_provisioning.clone(),
+                display: vmlord_core::VmDisplayFacts::default(),
                 network_mode: vmlord_core::NetworkMode::Nat,
                 ip_address: None,
                 ssh: vmlord_core::SshAvailability::Enabled(vmlord_core::SshConfig {
@@ -899,6 +936,39 @@ mod tests {
             }),
             "the user has to be told the cancellation did not happen"
         );
+    }
+
+    /// The stored profile and the stored provisioning are enough for a status:
+    /// a desktop whose packages never arrived reads as degraded and offers a
+    /// retry, on a VM that is otherwise fine.
+    #[test]
+    fn the_application_layer_reads_a_display_status_out_of_what_the_backend_stored() {
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            vm_is_running: true,
+            desktop_profile: vmlord_core::DesktopProfile::Gnome,
+            display_provisioning: vmlord_core::DisplayProvisioning::Degraded(
+                vmlord_core::DisplayFailure::new(
+                    vmlord_core::DisplayStage::Provisioning,
+                    vmlord_core::DisplayStatusCode::PackageDownloadFailed,
+                    "archive.ubuntu.com did not answer",
+                ),
+            ),
+            ..FakeRepository::default()
+        }));
+        app.start();
+
+        let status = app
+            .display_status("dev")
+            .expect("the listed VM has a status");
+
+        assert_eq!(status.state, vmlord_core::DisplayState::Degraded);
+        assert!(status.can_retry);
+        assert_eq!(
+            app.vms()[0].desktop_profile,
+            vmlord_core::DesktopProfile::Gnome,
+            "the desired profile is reported as it was stored, whatever installing it did"
+        );
+        assert_eq!(app.display_status("absent"), None);
     }
 
     /// The backend reports facts and the application layer says what they
@@ -1356,5 +1426,4 @@ mod tests {
         );
         assert!(application.host_gpu_capabilities().is_none());
     }
-
 }

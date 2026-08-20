@@ -106,6 +106,7 @@ fn gpu_request(name: &str, gpu_mode: GpuMode) -> VmCreateRequest {
                 locale: "en_US.UTF-8".into(),
                 keyboard: "us".into(),
                 timezone: "Europe/Moscow".into(),
+                desktop: vmlord_core::DesktopProfile::Headless,
             },
         },
         ram_mb: 4096,

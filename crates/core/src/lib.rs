@@ -1,5 +1,6 @@
 //! UI-independent domain types and repository boundary for VMLord.
 
+pub mod display;
 pub mod distro;
 pub mod gpu;
 pub mod logging;
@@ -8,11 +9,17 @@ pub mod provisioning;
 pub mod settings;
 pub mod ssh;
 
-pub use distro::{DistroProfile, SshDaemon, SshUnits, ubuntu};
+pub use display::{
+    DesktopProfile, DisplayFailure, DisplayProvisioning, DisplayStage, DisplayState,
+    DisplayStatusCode, GuestDisplayDetail, GuestDisplayReport, MIN_DESKTOP_CPU_CORES,
+    MIN_DESKTOP_RAM_MB, VmDisplayFacts, VmDisplayStatus, desktop_resource_advice,
+};
+pub use distro::{DesktopSetup, DistroProfile, SshDaemon, SshUnits, ubuntu};
 pub use gpu::{
-    GpuAssignment, GpuAvailability, GpuFailure, GpuMode, GpuShare, GpuShareManifest, GpuShareRole,
-    GpuStage, GpuState, GpuStatusCode, GuestGpuDetail, GuestGpuReport, HostGpuAdapter,
-    HostGpuCapabilities, NativeGpuDetail, VmGpuFacts, VmGpuStatus, GPU_PAYLOAD_SHARE, WSL_LIB_SHARE,
+    GPU_PAYLOAD_SHARE, GpuAssignment, GpuAvailability, GpuFailure, GpuMode, GpuShare,
+    GpuShareManifest, GpuShareRole, GpuStage, GpuState, GpuStatusCode, GuestGpuDetail,
+    GuestGpuReport, HostGpuAdapter, HostGpuCapabilities, NativeGpuDetail, VmGpuFacts, VmGpuStatus,
+    WSL_LIB_SHARE,
 };
 pub use logging::{LoggingError, initialize as initialize_logging};
 pub use progress::{
@@ -65,6 +72,48 @@ impl VmCreateRequest {
         }
         Ok(())
     }
+
+    /// What is worth telling someone about this request without refusing it.
+    ///
+    /// Separate from [`Self::validate`] because the two answers are different
+    /// in kind: validation says whether the VM can be built at all, and this
+    /// says what its owner may not have meant. A desktop on one core is
+    /// buildable and slow, and only a person can decide whether that matters.
+    #[must_use]
+    pub fn advisories(&self) -> Vec<String> {
+        let mut advisories: Vec<String> =
+            desktop_resource_advice(self.desktop_profile(), self.cpu_cores, self.ram_mb)
+                .into_iter()
+                .collect();
+        // A GDM screen asks for a password and has nothing else to offer: the
+        // key VMLord deploys logs in over SSH and not at a login screen. This
+        // is worth saying and not worth refusing -- a password can be set from
+        // the SSH session afterwards.
+        if self.desktop_profile().wants_desktop()
+            && matches!(
+                &self.source,
+                VmSource::CloudImage { provisioning, .. } if provisioning.password.is_none()
+            )
+        {
+            advisories.push(
+                "A desktop VM without a password has nothing to log in with at its login                  screen; set one here, or set one later over SSH."
+                    .into(),
+            );
+        }
+        advisories
+    }
+
+    /// The desktop this request asks for.
+    ///
+    /// Installation media has none and cannot have one: VMLord writes no seed
+    /// for it, so nothing of VMLord's would ever install a desktop inside it.
+    #[must_use]
+    pub fn desktop_profile(&self) -> DesktopProfile {
+        match &self.source {
+            VmSource::LocalMedia { .. } => DesktopProfile::Headless,
+            VmSource::CloudImage { provisioning, .. } => provisioning.desktop,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -102,6 +151,21 @@ pub struct VmSummary {
     /// Facts, not a verdict: `vmlord_app` turns these into the
     /// `VmGpuStatus` a person reads, so the backend never has to name a state.
     pub gpu: VmGpuFacts,
+    /// The desktop this VM was created with: desired state, stored with the
+    /// VM, and unchanged by whatever installing it made of it.
+    pub desktop_profile: DesktopProfile,
+    /// How far installing that desktop got, as it was last recorded.
+    ///
+    /// Stored beside the profile rather than derived, because the
+    /// installation happens once during the build and its outcome has to
+    /// survive every later run of VMLord.
+    pub display_provisioning: DisplayProvisioning,
+    /// What a backend has observed about the display right now, if anything.
+    ///
+    /// Facts, not a verdict, exactly as with `gpu`: `vmlord_app` turns these,
+    /// the profile and the provisioning into the `VmDisplayStatus` a person
+    /// reads.
+    pub display: VmDisplayFacts,
     pub network_mode: NetworkMode,
     pub ip_address: Option<std::net::IpAddr>,
     /// Whether this VM can be reached over SSH, and with what.
@@ -257,8 +321,8 @@ pub trait VmRepository {
 #[cfg(test)]
 mod tests {
     use super::{
-        Diagnostic, GpuMode, NetworkMode, RepositoryError, VmCreateRequest, VmDeleteRequest,
-        VmRepository, VmSource, VmSummary, VmUpdateRequest,
+        DesktopProfile, Diagnostic, GpuMode, NetworkMode, RepositoryError, VmCreateRequest,
+        VmDeleteRequest, VmRepository, VmSource, VmSummary, VmUpdateRequest,
     };
 
     fn valid_request() -> VmCreateRequest {
@@ -272,6 +336,80 @@ mod tests {
             cpu_cores: 2,
             gpu_mode: GpuMode::None,
             network_mode: NetworkMode::None,
+        }
+    }
+
+    /// Installation media cannot be given a desktop, so nothing about its
+    /// size is worth warning about.
+    #[test]
+    fn installation_media_asks_for_no_desktop() {
+        let request = VmCreateRequest {
+            ram_mb: 512,
+            cpu_cores: 1,
+            ..valid_request()
+        };
+        assert_eq!(request.desktop_profile(), DesktopProfile::Headless);
+        assert!(request.advisories().is_empty());
+    }
+
+    /// A login screen takes a password and nothing else, so a key-only
+    /// desktop VM is worth a word -- and is still built.
+    #[test]
+    fn a_desktop_without_a_password_is_advised_against_and_still_valid() {
+        let mut source = cloud_request(DesktopProfile::Gnome);
+        if let VmSource::CloudImage { provisioning, .. } = &mut source {
+            provisioning.password = None;
+            provisioning.ssh = crate::SshAccess::Enabled {
+                deploy_key: true,
+                port: crate::SshPort::DEFAULT,
+            };
+        }
+        let request = VmCreateRequest {
+            source,
+            ram_mb: 8192,
+            cpu_cores: 4,
+            ..valid_request()
+        };
+        assert!(request.validate().is_ok());
+        assert_eq!(request.advisories().len(), 1);
+    }
+
+    #[test]
+    fn a_desktop_smaller_than_gnome_wants_is_advised_against_and_still_valid() {
+        let request = VmCreateRequest {
+            ram_mb: 1024,
+            cpu_cores: 1,
+            source: cloud_request(DesktopProfile::Gnome),
+            ..valid_request()
+        };
+        assert!(request.validate().is_ok());
+        assert_eq!(request.desktop_profile(), DesktopProfile::Gnome);
+        assert_eq!(request.advisories().len(), 1);
+
+        let headless = VmCreateRequest {
+            ram_mb: 1024,
+            cpu_cores: 1,
+            source: cloud_request(DesktopProfile::Headless),
+            ..valid_request()
+        };
+        assert!(headless.advisories().is_empty());
+    }
+
+    fn cloud_request(desktop: DesktopProfile) -> VmSource {
+        VmSource::CloudImage {
+            image: crate::CloudImage {
+                profile: crate::ubuntu(),
+                release: "24.04".into(),
+            },
+            provisioning: crate::Provisioning {
+                username: "user".into(),
+                password: Some(crate::Password::new("secret")),
+                ssh: crate::SshAccess::Disabled,
+                locale: "en_US.UTF-8".into(),
+                keyboard: "us".into(),
+                timezone: "UTC".into(),
+                desktop,
+            },
         }
     }
 
@@ -326,6 +464,7 @@ mod tests {
                     locale: "en_US.UTF-8".into(),
                     keyboard: "us".into(),
                     timezone: "Europe/Moscow".into(),
+                    desktop: DesktopProfile::Headless,
                 },
             },
             ..valid_request()

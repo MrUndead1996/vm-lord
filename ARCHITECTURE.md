@@ -2845,6 +2845,76 @@ for `MODE_MOTION` is answered with `ERROR_CODE_UNSUPPORTED_MODE`. None of this
 is wired into a running VM yet: Connect still opens the AppSandbox IDD window,
 and it will until the native display path is proven end to end.
 
+### Desktop profile and display provisioning
+
+What a VM asks of its desktop, what installing that desktop came to, and what
+the guest is doing with it right now are three things, and `core::display`
+makes them three types rather than one field.
+
+`DesktopProfile` is desired state -- `Headless` or `Gnome`, GNOME by default in
+a create form. It lives inside `Provisioning`, beside the user name and the
+locale, for the reason provisioning itself lives inside `VmSource::CloudImage`:
+a desktop is something a cloud-init seed installs, installation media gets no
+seed, and "a local ISO with GNOME" is therefore a state that cannot be spelled
+rather than one to be rejected at run time. It is a creation-time decision;
+installing a desktop into a guest that was built without one is #127.
+
+`DisplayProvisioning` is how far installing it got -- `NotRequested`,
+`Pending`, `Ready` or `Degraded` with a reason. It is *stored*, in the VM's
+metadata mapping beside the GPU mode, and that is the point of it: the
+installation happens once during the build, and every later run of VMLord has
+to be able to read its outcome. A VM whose desktop packages could not be
+downloaded is a working VM with a missing desktop -- it boots, SSH answers --
+and this field is the only thing that knows, so it is also the only thing a
+retry can be offered from. `Degraded` rather than `Failed` for the same reason:
+the VM is not broken, the desktop is. A mapping written before these fields
+existed reads back as `Headless` and `NotRequested`, which is what those VMs
+are; that is deliberately not `DesktopProfile`'s own default, since a create
+form starts from a desktop and a VM built before desktops existed did not.
+
+Retry is a property of the cause, not of the button: `DisplayStatusCode`
+answers `is_retryable`, and a download that failed, an install that was
+interrupted and a service that is not running are worth another attempt while a
+release that publishes no desktop packages is not. `DisplayProvisioning::retried`
+moves a retryable failure back to `Pending` rather than to nothing, because
+until the new attempt reports, what is known is still that the last one did not
+finish.
+
+Everything else is runtime state, and none of it is stored: `VmDisplayFacts` is
+what the guest last reported, and `vmlord_app::display::derive_status` turns
+the stored profile, the stored provisioning, the VM's state and those facts
+into a `VmDisplayStatus` -- `DisplayState` for the glance (`Disabled`,
+`Provisioning`, `WaitingForGuest`, `Ready`, `Degraded`), `DisplayStage` for
+where the reading came from, `DisplayStatusCode` for exactly why, and a message
+for the detail. The shape is the GPU's on purpose: a backend reports facts and
+never names a state, the UI paints a state and never works one out. Nothing
+fills the guest half of the facts yet -- the services that would report it are
+#115 -- so a native VM reads as waiting for its guest once its desktop is
+installed.
+
+The desktop itself comes from the distribution's own archives. `DistroProfile`
+carries a `DesktopSetup` -- the packages and the display manager unit -- and
+the seed prints them as cloud-init's `packages` block with `package_update`,
+so Ubuntu installs `ubuntu-desktop-minimal` (GNOME Shell, GDM and the Wayland
+session, without the office suite) from the archives the guest is already
+configured with. VMLord adds no repository, downloads no desktop binary of its
+own and signs nothing. A failure there does not stop the boot: cloud-init
+reports it and carries on, which is exactly the outcome the stored `Degraded`
+is for.
+
+Small VMs are advised against and never refused. `VmCreateRequest::advisories`
+is where that lives -- below 2 vCPU or 4 GiB a desktop is slow, and a desktop
+with no password has nothing to log in with at a GDM screen, since the key
+VMLord deploys logs in over SSH and not at a login screen. Both are sentences
+the create form paints beside the fields; neither is a rule that stops a build,
+because a machine that is small on purpose is a machine somebody meant.
+
+No credential is added to any of this. The plaintext password exists while a VM
+is being created, is hashed into the seed there, and the create form that held
+it is dropped the moment the build is accepted; a display session authenticates
+with a key derived from the per-VM agent secret, so nothing in the display
+model has a field a password could be stored in.
+
 ---
 
 # Planned Modules

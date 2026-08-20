@@ -84,6 +84,7 @@ fn background_cloud_request(name: &str) -> VmCreateRequest {
                 locale: "en_US.UTF-8".into(),
                 keyboard: "us".into(),
                 timezone: "Europe/Moscow".into(),
+                desktop: vmlord_core::DesktopProfile::Headless,
             },
         },
         ram_mb: 2048,
@@ -999,6 +1000,8 @@ fn shuts_down_a_running_guest() {
             network_mode: NetworkMode::None,
             ssh: None,
             gpu_mode: vmlord_core::GpuMode::None,
+            desktop_profile: vmlord_core::DesktopProfile::Headless,
+            display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
             guest_target: None,
         })
         .expect("mapping should be persisted");
@@ -1900,6 +1903,8 @@ fn mapping_owning(vm_name: &str, endpoint_id: Uuid) -> VmComputeSystemMapping {
         network_mode: NetworkMode::Nat,
         ssh: None,
         gpu_mode: vmlord_core::GpuMode::None,
+        desktop_profile: vmlord_core::DesktopProfile::Headless,
+        display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
         guest_target: None,
     }
 }
@@ -1956,6 +1961,7 @@ fn a_vm_is_created_from_a_real_cloud_image() {
                 locale: "en_US.UTF-8".into(),
                 keyboard: "us".into(),
                 timezone: "Europe/Moscow".into(),
+                desktop: vmlord_core::DesktopProfile::Headless,
             },
         },
         ram_mb: 2048,

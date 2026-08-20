@@ -279,6 +279,8 @@ mod tests {
             gpu_mode,
             // No guest target: a VM VMLord cannot pick a payload for is the
             // case every host runs today, because the shipped catalog is empty.
+            desktop_profile: vmlord_core::DesktopProfile::Headless,
+            display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
             guest_target: None,
         }
     }

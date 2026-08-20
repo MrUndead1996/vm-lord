@@ -20,9 +20,8 @@ use std::{
 };
 
 use vmlord_core::{
-    BuildMonitor, BuildStep, GpuMode, RepositoryError, SshAvailability, VmCreateRequest, VmGpuFacts,
-    VmSource,
-    VmState, VmSummary,
+    BuildMonitor, BuildStep, GpuMode, RepositoryError, SshAvailability, VmCreateRequest,
+    VmGpuFacts, VmSource, VmState, VmSummary,
 };
 
 use crate::{com1_terminal::Com1Session, metadata::VmComputeSystemMapping};
@@ -165,6 +164,14 @@ impl BuildRegistry {
                 gpu_mode: GpuMode::None,
                 // Nothing has been attached to a VM that is still being built.
                 gpu: VmGpuFacts::default(),
+                // What the build is installing, and the fact that it has not
+                // finished installing it: a desktop that is still being put
+                // into a guest is not one to report as missing.
+                desktop_profile: build.request.desktop_profile(),
+                display_provisioning: vmlord_core::DisplayProvisioning::requested(
+                    build.request.desktop_profile(),
+                ),
+                display: vmlord_core::VmDisplayFacts::default(),
                 network_mode: build.request.network_mode,
                 // A VM that does not exist answers nowhere.
                 ip_address: None,
@@ -334,6 +341,8 @@ mod tests {
             network_mode: NetworkMode::None,
             ssh: None,
             gpu_mode: GpuMode::None,
+            desktop_profile: vmlord_core::DesktopProfile::Headless,
+            display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
             guest_target: None,
         }
     }
@@ -402,6 +411,7 @@ mod tests {
                     locale: "en_US.UTF-8".into(),
                     keyboard: "us".into(),
                     timezone: "Europe/Moscow".into(),
+                    desktop: vmlord_core::DesktopProfile::Headless,
                 },
             },
             ram_mb: 2048,
