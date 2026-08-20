@@ -150,8 +150,16 @@ stage_stock() {
 	conn=$(modetest -M "${drv:-none}" -c 2>/dev/null |
 	       awk '$1 ~ /^[0-9]+$/ && $3 == "connected" {print $1; exit}')
 	note "connected connector: ${conn:-none found}"
+	# Two traps live in this one command. "modetest -s" holds the mode until
+	# its stdin closes, and "-v" replaces that wait with an endless vsynced
+	# page-flip loop -- on a driver whose flips never complete it sits in the
+	# ioctl, ignores a plain SIGTERM, and never closes the pipe a "| tail"
+	# would be waiting on. So: no -v, stdin already at EOF, output to a file
+	# that is read after the process is gone, and a SIGKILL behind the
+	# timeout for the case where the ioctl does wedge.
 	for mode in 1024x768 1920x1080 2560x1440; do
-		run "timeout 6 modetest -M ${drv:-none} -s ${conn:-0}:$mode -v 2>&1 | tail -n 20"
+		run "timeout -k 2 6 modetest -M ${drv:-none} -s ${conn:-0}:$mode </dev/null >$OUT/modeset-$mode.log 2>&1"
+		run "tail -n 20 $OUT/modeset-$mode.log"
 	done
 
 	say "framebuffer budget the synthetic video device was given"
@@ -272,7 +280,11 @@ stage_pattern() {
 	note "driver ${drv:-none}, connector ${conn:-none found}"
 
 	say "painting a test pattern and reading it back"
-	modetest -M "${drv:-none}" -s "${conn:-0}" -v >"$OUT/pattern-modetest.log" 2>&1 &
+	# Here the pattern has to stay on screen while the capture runs, so
+	# modetest must not exit -- but "-v" would wedge it in a page-flip loop
+	# that no signal can interrupt. Feeding it a pipe that stays open instead
+	# parks it in a plain read: the mode is held, and a signal still lands.
+	sleep 120 | modetest -M "${drv:-none}" -s "${conn:-0}" >"$OUT/pattern-modetest.log" 2>&1 &
 	pattern_pid=$!
 	sleep 3
 
@@ -285,6 +297,9 @@ stage_pattern() {
 	done
 
 	kill "$pattern_pid" 2>/dev/null
+	sleep 1
+	kill -KILL "$pattern_pid" 2>/dev/null
+	pkill -f 'modetest -M' 2>/dev/null
 	run "tail -n 20 $OUT/pattern-modetest.log"
 	run "systemctl start gdm"
 	note ""
