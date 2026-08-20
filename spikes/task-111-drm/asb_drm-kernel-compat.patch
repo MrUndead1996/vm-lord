@@ -1,15 +1,31 @@
-Build asb_drm on kernels older than the one it was written for.
+Build and run asb_drm on kernels older than the one it was written for.
 
-The sources target 6.15+ (Ubuntu 26.04's kernel): they call hrtimer_setup(),
-and give platform_driver::remove the void return it only got in 6.11. On
-24.04's 6.8 and 22.04's 5.15 both are compile errors, so DKMS fails before
-anything reaches the display.
+The sources target 6.15+ (Ubuntu 26.04's kernel). On 24.04's 6.8 and
+22.04's 5.15 three of its calls do not compile -- hrtimer_setup(), the void
+return on platform_driver::remove, and DRM_PLANE_NO_SCALING -- and a fourth
+problem only shows at runtime: drm_driver::date, which 6.14 removed and
+every kernel before it copies unconditionally. Left NULL it makes the
+kernel WARN in drm_copy_field() and segfaults drm_info.
 
-Verified: builds clean against 5.15.0-190-generic with these three hunks.
+Verified: builds clean against 5.15.0-190-generic, and the module drives
+GDM at 1920x1080 on 6.8.0-137-generic.
 
 --- a/asb_drm_drv.c	2026-07-28 11:25:33.145682500 +0400
-+++ b/asb_drm_drv.c	2026-08-20 20:13:01.906547085 +0400
-@@ -207,12 +207,28 @@
++++ b/asb_drm_drv.c	2026-08-20 20:28:48.094570317 +0400
+@@ -78,6 +78,12 @@
+ 
+ 	.name               = "asb_drm",
+ 	.desc               = "AppSandbox virtual display",
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 14, 0)
++	/* drm_version() copies this field unconditionally until 6.14 removed
++	 * it: leaving it NULL makes drm_copy_field() WARN in the kernel and
++	 * hands userspace a NULL string, which segfaults drm_info. */
++	.date               = "20260820",
++#endif
+ 	.major              = 1,
+ 	.minor              = 0,
+ 
+@@ -207,12 +213,28 @@
  	drm_atomic_helper_shutdown(drm);
  }
  

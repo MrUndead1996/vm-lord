@@ -194,3 +194,57 @@ This is the DKMS bill the decision predicted, arriving early: a module of
 our own must build on every release VMLord supports, and the kernel API
 under it moves. It is also why the PoC builds asb_drm rather than assuming
 it.
+
+# The PoC works: GDM draws on a module of ours, with a cursor plane
+
+Second run of `poc`, with the compat patch. asb_drm built through DKMS,
+installed, and after the reboot it owns the display:
+
+    asb_drm: loading out-of-tree module taints kernel
+    asb_drm asb_drm.0: writeback init failed (-38), continuing without
+    [drm] Initialized asb_drm 1.0.0 for asb_drm.0 on minor 1
+    asb_drm asb_drm.0: AppSandbox virtual display ready: 1920x1080@60Hz
+
+`hyperv_drm` is blacklisted and gone; `/dev/dri` holds `card1` and, unlike
+any stock candidate here, a render node `renderD128`. The device sits at
+`/sys/devices/platform/asb_drm.0`, and its udev tags are
+`master-of-seat:seat:uaccess` -- **no `mutter-device-ignore`**, which is the
+whole point:
+
+    ID_PATH=platform-asb_drm.0
+    seat0: [MASTER] drm:card1  ->  card1-Virtual-1
+    gnome-shell[1357]: Added device '/dev/dri/card1' (asb_drm)
+                       using atomic mode setting
+
+GDM bound it before anyone logged in. The capture, from a non-master root
+process while mutter held master:
+
+    planes: 2
+      plane 31 (primary): fb 40: 1920x1080 XR24 pitch 7680
+      plane 33 (cursor):  fb 42: 256x256  AR24 pitch 1024
+    copy of 8294400 bytes x60: 0.73 ms per frame (1371 fps ceiling)
+    frame content: a picture (37553 of 2073600 pixels differ)
+
+`poc-greeter-1080p-asb_drm.png` is that frame. Compare it with
+`greeter-24.04-simpledrm.png`: the pointer is missing from this one,
+because it is on the cursor plane, in its own 256x256 ARGB buffer, which
+the capture read separately. That is the composition the capture backend
+has to do, and it is now a measured fact rather than a plan.
+
+Costs, measured: 0.73 ms to copy a 1080p frame -- 2.7x the 1024x768 figure,
+in line with the pixel count.
+
+## What the run also found
+
+`drm_info` **segfaults** on asb_drm, and the kernel WARNs in
+`drm_copy_field()`, because `drm_driver::date` is NULL. Every kernel before
+6.14 copies that field unconditionally. The patch now sets it; the fourth
+hunk is the one no compile could have caught.
+
+The probe leaned on `drm_info` to name the driver, so that crash also took
+out the mode-setting section (`driver under test: none`). It now falls back
+to the driver name in sysfs.
+
+Still unmeasured, for want of that section: the mode list asb_drm offers
+above 1920x1080. The module was loaded with `width=1920 height=1080` from
+its own modprobe.d file, so this run proves the plumbing, not the ceiling.

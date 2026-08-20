@@ -56,8 +56,19 @@ need_packages() {
 driver_of_card1() {
 	for node in /dev/dri/card*; do
 		[ -e "$node" ] || continue
-		drm_info "$node" 2>/dev/null |
-			sed -n 's/.*Driver: \([A-Za-z0-9_-]*\).*/\1/p' | head -n 1
+		name=$(drm_info "$node" 2>/dev/null |
+			sed -n 's/.*Driver: \([A-Za-z0-9_-]*\).*/\1/p' | head -n 1)
+		# drm_info can die on a driver that hands it a NULL string, and a
+		# driver that crashes the tool is exactly the one worth testing.
+		# The bus driver's name in sysfs is the same string for every DRM
+		# driver whose module and platform device share a name, which is
+		# every driver of ours.
+		if [ -z "$name" ]; then
+			name=$(sed -n 's/^DRIVER=//p' \
+				"/sys/class/drm/$(basename "$node")/device/uevent" \
+				2>/dev/null | head -n 1)
+		fi
+		echo "$name"
 		return
 	done
 }
