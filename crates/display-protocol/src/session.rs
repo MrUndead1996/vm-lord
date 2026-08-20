@@ -15,12 +15,13 @@ use prost::Message;
 use crate::{
     handshake::{self, UnofferedCapability, VersionMismatch},
     keys::{
-        self, NONCE_LEN, Role, SESSION_ID_LEN, Secret, SessionKey, Tag, Transcript, WrongLength,
+        self, ChannelKey, NONCE_LEN, Role, SESSION_ID_LEN, Secret, SessionKey, Tag, Transcript,
+        WrongLength,
     },
     record::{Channel, Header, Record},
     v1::{
-        Capability, ClientAuth, ClientHello, ControlRecord, ErrorCode, Mode, ProtocolVersion,
-        ServerAuth, ServerHello,
+        Capability, ChannelAck, ChannelAuth, ChannelHello, ClientAuth, ClientHello, ControlRecord,
+        ErrorCode, FrameRecord, Mode, ProtocolVersion, ServerAuth, ServerHello,
     },
 };
 
@@ -78,6 +79,8 @@ pub enum Event {
     Continue,
     /// Both peers have proved themselves; the control channel is open.
     ControlEstablished,
+    /// A frame or input socket proved it belongs to this session.
+    ChannelBound(Channel),
 }
 
 /// What handling a record produced.
@@ -126,6 +129,18 @@ pub struct Session {
     pending: Option<Negotiated>,
     pending_auth: Option<Record>,
     control_sequence: u32,
+    /// Per channel, in `Channel` order: frame then input.
+    channels: [ChannelState; 2],
+}
+
+/// What one bound-or-binding frame or input socket holds.
+#[derive(Default)]
+struct ChannelState {
+    generation: u32,
+    host_nonce: Option<[u8; NONCE_LEN]>,
+    guest_nonce: Option<[u8; NONCE_LEN]>,
+    key: Option<ChannelKey>,
+    sequence: u32,
 }
 
 impl Session {
@@ -190,6 +205,7 @@ impl Session {
             pending: None,
             pending_auth: None,
             control_sequence: 0,
+            channels: [ChannelState::default(), ChannelState::default()],
         };
 
         let record = session.control_record(ControlRecord::ClientHello, payload);
@@ -217,6 +233,7 @@ impl Session {
             pending: None,
             pending_auth: None,
             control_sequence: 0,
+            channels: [ChannelState::default(), ChannelState::default()],
         }
     }
 
@@ -270,6 +287,21 @@ impl Session {
                 if message_type == ControlRecord::ClientAuth as u16 =>
             {
                 self.on_client_auth(payload)
+            }
+            (State::Established, Channel::Frame | Channel::Input, message_type)
+                if message_type == FrameRecord::ChannelHello as u16 =>
+            {
+                self.on_channel_hello(header.channel, payload)
+            }
+            (State::Established, Channel::Frame | Channel::Input, message_type)
+                if message_type == FrameRecord::ChannelAck as u16 =>
+            {
+                self.on_channel_ack(header.channel, payload)
+            }
+            (State::Established, Channel::Frame | Channel::Input, message_type)
+                if message_type == FrameRecord::ChannelAuth as u16 =>
+            {
+                self.on_channel_auth(header.channel, payload)
             }
             (_, channel, message_type) => Err(SessionError::Unexpected {
                 channel,
@@ -423,6 +455,263 @@ impl Session {
         })
     }
 
+    /// Opens a frame or input socket for this session, as the host.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::NotEstablished`] before the control handshake has
+    /// finished -- there is no transcript to key a channel off yet -- and
+    /// [`SessionError::Unexpected`] for the control channel, which is the one
+    /// that establishes sessions rather than binding to them.
+    pub fn open_channel(&mut self, channel: Channel) -> Result<Record, SessionError> {
+        self.channel_hello(channel)
+    }
+
+    /// Opens a replacement socket for a channel that dropped.
+    ///
+    /// The generation goes up, so records still in flight from the previous
+    /// connection are rejected by [`Session::accept`] rather than reaching a
+    /// decoder or an input device.
+    ///
+    /// What the reconnected channel owes is not something this crate can
+    /// enforce, and is named here because this is where it begins: a frame
+    /// channel must send `StreamConfig` and a keyframe before any delta, since
+    /// a delta has nothing to apply to, and an input channel must send
+    /// `ReleaseAll`, since the guest has just released everything it held.
+    ///
+    /// # Errors
+    ///
+    /// As [`Session::open_channel`].
+    pub fn reconnect_channel(&mut self, channel: Channel) -> Result<Record, SessionError> {
+        let index = self.channel_index(channel)?;
+        self.channels[index].generation += 1;
+        self.channels[index].sequence = 0;
+        self.channels[index].key = None;
+        self.channel_hello(channel)
+    }
+
+    /// Which generation of `channel` this session is on.
+    #[must_use]
+    pub fn generation(&self, channel: Channel) -> u32 {
+        match self.channel_index(channel) {
+            Ok(index) => self.channels[index].generation,
+            Err(_) => 0,
+        }
+    }
+
+    /// The key a bound channel proves itself with, for the process that owns
+    /// that socket.
+    #[must_use]
+    pub fn channel_key(&self, channel: Channel) -> Option<&ChannelKey> {
+        self.channels[self.channel_index(channel).ok()?].key.as_ref()
+    }
+
+    /// Checks a record against the generation its channel is on.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::StaleGeneration`] for a record from a connection that
+    /// has been replaced. The control channel is exempt: losing it ends the
+    /// session rather than reconnecting a channel within one.
+    pub fn accept(&self, header: &Header) -> Result<(), SessionError> {
+        let Ok(index) = self.channel_index(header.channel) else {
+            return Ok(());
+        };
+
+        let expected = self.channels[index].generation;
+        if header.generation != expected {
+            return Err(SessionError::StaleGeneration {
+                channel: header.channel,
+                expected,
+                found: header.generation,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Builds the `ChannelHello` both openers send.
+    ///
+    /// The three binding records are numbered 1, 2 and 3 on the frame and the
+    /// input channel alike, so `FrameRecord` names them for both. The schema
+    /// keeps `InputRecord` in step with it, and the compatibility rules keep
+    /// either from being renumbered.
+    fn channel_hello(&mut self, channel: Channel) -> Result<Record, SessionError> {
+        let index = self.channel_index(channel)?;
+        if self.negotiated.is_none() || self.role != Role::Host {
+            return Err(SessionError::NotEstablished);
+        }
+
+        let nonce: [u8; NONCE_LEN] = keys::random_bytes();
+        self.channels[index].host_nonce = Some(nonce);
+
+        let hello = ChannelHello {
+            session_id: self.session_id.to_vec(),
+            channel: u32::from(channel.as_wire()),
+            generation: self.channels[index].generation,
+            nonce: nonce.to_vec(),
+        };
+
+        Ok(self.channel_record(channel, FrameRecord::ChannelHello as u16, hello.encode_to_vec()))
+    }
+
+    /// The guest's half: recognise the session, and answer with a proof.
+    fn on_channel_hello(
+        &mut self,
+        channel: Channel,
+        payload: &[u8],
+    ) -> Result<Outcome, SessionError> {
+        let index = self.channel_index(channel)?;
+        let hello = ChannelHello::decode(payload).map_err(SessionError::Decode)?;
+
+        if session_id_from_wire(&hello.session_id)? != self.session_id {
+            return Err(SessionError::UnknownSession);
+        }
+        if hello.channel != u32::from(channel.as_wire()) {
+            return Err(SessionError::Unexpected {
+                channel,
+                message_type: FrameRecord::ChannelHello as u16,
+            });
+        }
+
+        let host_nonce = nonce_from_wire(&hello.nonce)?;
+        let guest_nonce: [u8; NONCE_LEN] = keys::random_bytes();
+        let key = self.derive_channel_key(channel);
+        let tag = keys::channel_tag(&key, Role::Guest, channel, &host_nonce, &guest_nonce);
+
+        self.channels[index].generation = hello.generation;
+        self.channels[index].host_nonce = Some(host_nonce);
+        self.channels[index].guest_nonce = Some(guest_nonce);
+        self.channels[index].key = Some(key);
+
+        let ack = ChannelAck {
+            nonce: guest_nonce.to_vec(),
+            tag: tag.as_bytes().to_vec(),
+        };
+
+        Ok(Outcome {
+            reply: Some(self.channel_record(
+                channel,
+                FrameRecord::ChannelAck as u16,
+                ack.encode_to_vec(),
+            )),
+            event: Event::Continue,
+        })
+    }
+
+    /// The host's half: check the guest's proof, then send its own.
+    fn on_channel_ack(&mut self, channel: Channel, payload: &[u8]) -> Result<Outcome, SessionError> {
+        let index = self.channel_index(channel)?;
+        let ack = ChannelAck::decode(payload).map_err(SessionError::Decode)?;
+
+        let host_nonce = self.channels[index]
+            .host_nonce
+            .ok_or(SessionError::NotEstablished)?;
+        let guest_nonce = nonce_from_wire(&ack.nonce)?;
+        let offered = Tag::from_wire(&ack.tag).map_err(SessionError::Field)?;
+
+        let key = self.derive_channel_key(channel);
+        let expected = keys::channel_tag(&key, Role::Guest, channel, &host_nonce, &guest_nonce);
+        if !keys::verify(&expected, &offered) {
+            return Err(SessionError::BadTag);
+        }
+
+        let mine = keys::channel_tag(&key, Role::Host, channel, &host_nonce, &guest_nonce);
+        self.channels[index].key = Some(key);
+
+        let auth = ChannelAuth {
+            tag: mine.as_bytes().to_vec(),
+        };
+
+        Ok(Outcome {
+            reply: Some(self.channel_record(
+                channel,
+                FrameRecord::ChannelAuth as u16,
+                auth.encode_to_vec(),
+            )),
+            event: Event::ChannelBound(channel),
+        })
+    }
+
+    /// The guest's half: check the host's proof, and open the channel.
+    fn on_channel_auth(
+        &mut self,
+        channel: Channel,
+        payload: &[u8],
+    ) -> Result<Outcome, SessionError> {
+        let index = self.channel_index(channel)?;
+        let auth = ChannelAuth::decode(payload).map_err(SessionError::Decode)?;
+        let offered = Tag::from_wire(&auth.tag).map_err(SessionError::Field)?;
+
+        let host_nonce = self.channels[index]
+            .host_nonce
+            .ok_or(SessionError::NotEstablished)?;
+        let guest_nonce = self.channel_guest_nonce(channel)?;
+        let key = self.derive_channel_key(channel);
+
+        let expected = keys::channel_tag(&key, Role::Host, channel, &host_nonce, &guest_nonce);
+        if !keys::verify(&expected, &offered) {
+            self.channels[index].key = None;
+            return Err(SessionError::BadTag);
+        }
+
+        Ok(Outcome {
+            reply: None,
+            event: Event::ChannelBound(channel),
+        })
+    }
+
+    /// Derives this session's key for `channel`.
+    fn derive_channel_key(&self, channel: Channel) -> ChannelKey {
+        keys::channel_key(
+            self.session_key
+                .as_ref()
+                .expect("an established session derived one"),
+            &self
+                .transcript_hash
+                .expect("an established session finished its transcript"),
+            channel,
+        )
+    }
+
+    /// The nonce the guest put in its own `ChannelAck`.
+    fn channel_guest_nonce(&self, channel: Channel) -> Result<[u8; NONCE_LEN], SessionError> {
+        let index = self.channel_index(channel)?;
+        self.channels[index]
+            .guest_nonce
+            .ok_or(SessionError::NotEstablished)
+    }
+
+    /// Where `channel` lives in `channels`.
+    fn channel_index(&self, channel: Channel) -> Result<usize, SessionError> {
+        match channel {
+            Channel::Frame => Ok(0),
+            Channel::Input => Ok(1),
+            Channel::Control => Err(SessionError::Unexpected {
+                channel,
+                message_type: 0,
+            }),
+        }
+    }
+
+    /// Wraps a payload as this side's next record on a bound channel.
+    fn channel_record(&mut self, channel: Channel, message_type: u16, payload: Vec<u8>) -> Record {
+        let index = self
+            .channel_index(channel)
+            .expect("a channel record is never on control");
+        let sequence = self.channels[index].sequence;
+        self.channels[index].sequence += 1;
+
+        Record::new(
+            channel,
+            message_type,
+            sequence,
+            0,
+            self.channels[index].generation,
+            payload,
+        )
+    }
+
     /// Finishes the transcript and derives the key both proofs are made under.
     fn derive_session_key(&mut self) {
         let hash = self.transcript.finish();
@@ -533,6 +822,20 @@ pub enum SessionError {
     UnsupportedMode(Mode),
     /// The guest announced no tile size at all.
     NoCommonTileSize,
+    /// A channel was offered for a session this end does not have.
+    UnknownSession,
+    /// A record arrived from a connection that has been replaced.
+    StaleGeneration {
+        /// Which channel it came in on.
+        channel: Channel,
+        /// The generation that channel is on.
+        expected: u32,
+        /// What the record's header carried.
+        found: u32,
+    },
+    /// A channel was offered before the control handshake finished, or by the
+    /// end that does not open channels.
+    NotEstablished,
 }
 
 impl SessionError {
@@ -547,6 +850,9 @@ impl SessionError {
             Self::BadTag => ErrorCode::Unauthenticated,
             Self::UnsupportedMode(_) => ErrorCode::UnsupportedMode,
             Self::NoCommonTileSize => ErrorCode::ResolutionRejected,
+            Self::UnknownSession => ErrorCode::UnknownSession,
+            Self::StaleGeneration { .. } => ErrorCode::ChannelBindingFailed,
+            Self::NotEstablished => ErrorCode::Unauthenticated,
         }
     }
 }
@@ -572,6 +878,20 @@ impl fmt::Display for SessionError {
             Self::NoCommonTileSize => {
                 formatter.write_str("the guest announced no tile size this session can use")
             }
+            Self::UnknownSession => {
+                formatter.write_str("a display channel named a session this end does not have")
+            }
+            Self::StaleGeneration {
+                channel,
+                expected,
+                found,
+            } => write!(
+                formatter,
+                "a {channel} record from generation {found} arrived while the channel is on {expected}"
+            ),
+            Self::NotEstablished => {
+                formatter.write_str("a display channel was offered before its session was open")
+            }
         }
     }
 }
@@ -591,7 +911,10 @@ impl Error for SessionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{keys::TAG_LEN, v1::Ping};
+    use crate::{
+        keys::TAG_LEN,
+        v1::{ChannelAck, FrameRecord, Ping},
+    };
 
     fn offer() -> Offer {
         Offer {
@@ -828,5 +1151,188 @@ mod tests {
             guest.handle(&nonsense.header, &nonsense.payload),
             Err(SessionError::Decode(_))
         ));
+    }
+
+    /// Drives a frame or input channel's three-record exchange to completion.
+    fn bind(host: &mut Session, guest: &mut Session, channel: Channel) {
+        let hello = host.open_channel(channel).expect("an established session");
+
+        let ack = guest
+            .handle(&hello.header, &hello.payload)
+            .expect("a well-formed channel hello")
+            .reply
+            .expect("a channel ack");
+
+        let outcome = host
+            .handle(&ack.header, &ack.payload)
+            .expect("a valid guest proof");
+        let auth = outcome.reply.expect("the host's channel proof");
+        assert_eq!(outcome.event, Event::ChannelBound(channel));
+
+        let outcome = guest
+            .handle(&auth.header, &auth.payload)
+            .expect("a valid host proof");
+        assert_eq!(outcome.event, Event::ChannelBound(channel));
+        assert!(outcome.reply.is_none());
+    }
+
+    #[test]
+    fn a_channel_binds_to_the_session_the_control_handshake_established() {
+        let (mut host, mut guest) = handshake(&Secret::generate(), offer(), support());
+
+        bind(&mut host, &mut guest, Channel::Frame);
+        bind(&mut host, &mut guest, Channel::Input);
+
+        assert!(host.channel_key(Channel::Frame).is_some());
+        assert!(guest.channel_key(Channel::Input).is_some());
+    }
+
+    #[test]
+    fn a_channel_offered_before_the_control_handshake_is_refused() {
+        let (mut host, _) = Session::host(&Secret::generate(), offer());
+
+        assert!(matches!(
+            host.open_channel(Channel::Frame),
+            Err(SessionError::NotEstablished)
+        ));
+    }
+
+    #[test]
+    fn a_channel_hello_naming_another_session_is_refused() {
+        let secret = Secret::generate();
+        let (mut host, mut guest) = handshake(&secret, offer(), support());
+
+        let hello = host
+            .open_channel(Channel::Frame)
+            .expect("an established session");
+        let mut message = ChannelHello::decode(hello.payload.as_slice()).expect("what was built");
+        message.session_id = vec![0xAA; SESSION_ID_LEN];
+        let forged = Record::new(
+            Channel::Frame,
+            FrameRecord::ChannelHello as u16,
+            0,
+            0,
+            0,
+            message.encode_to_vec(),
+        );
+
+        let error = guest
+            .handle(&forged.header, &forged.payload)
+            .expect_err("a hello for a session this guest never opened");
+
+        assert!(matches!(error, SessionError::UnknownSession));
+        assert_eq!(error.code(), ErrorCode::UnknownSession);
+    }
+
+    #[test]
+    fn a_channel_hello_from_another_session_does_not_bind() {
+        let secret = Secret::generate();
+        let (mut host, _) = handshake(&secret, offer(), support());
+        let (_, mut other_guest) = handshake(&secret, offer(), support());
+
+        let hello = host
+            .open_channel(Channel::Frame)
+            .expect("an established session");
+
+        // Another session with another transcript, holding the same VM
+        // secret: it refuses by session id before a tag is even reached.
+        assert!(matches!(
+            other_guest.handle(&hello.header, &hello.payload),
+            Err(SessionError::UnknownSession)
+        ));
+    }
+
+    #[test]
+    fn a_forged_channel_ack_does_not_bind_the_channel() {
+        let (mut host, _) = handshake(&Secret::generate(), offer(), support());
+        let _ = host
+            .open_channel(Channel::Frame)
+            .expect("an established session");
+
+        let forged = Record::new(
+            Channel::Frame,
+            FrameRecord::ChannelAck as u16,
+            0,
+            0,
+            0,
+            ChannelAck {
+                nonce: vec![7u8; NONCE_LEN],
+                tag: vec![0u8; TAG_LEN],
+            }
+            .encode_to_vec(),
+        );
+
+        assert!(matches!(
+            host.handle(&forged.header, &forged.payload),
+            Err(SessionError::BadTag)
+        ));
+        assert!(host.channel_key(Channel::Frame).is_none());
+    }
+
+    #[test]
+    fn a_reconnected_channel_runs_at_the_next_generation() {
+        let (mut host, mut guest) = handshake(&Secret::generate(), offer(), support());
+        bind(&mut host, &mut guest, Channel::Frame);
+
+        assert_eq!(host.generation(Channel::Frame), 0);
+
+        let hello = host
+            .reconnect_channel(Channel::Frame)
+            .expect("an established session");
+
+        assert_eq!(host.generation(Channel::Frame), 1);
+        assert_eq!(hello.header.generation, 1);
+    }
+
+    #[test]
+    fn a_record_from_a_generation_that_has_been_replaced_is_rejected() {
+        let (mut host, mut guest) = handshake(&Secret::generate(), offer(), support());
+        bind(&mut host, &mut guest, Channel::Frame);
+
+        let stale = Record::new(
+            Channel::Frame,
+            FrameRecord::TileDelta as u16,
+            9,
+            8,
+            0,
+            vec![1, 2, 3],
+        );
+        assert!(host.accept(&stale.header).is_ok());
+
+        let _ = host
+            .reconnect_channel(Channel::Frame)
+            .expect("an established session");
+
+        let error = host
+            .accept(&stale.header)
+            .expect_err("a record from the previous connection");
+        assert!(matches!(
+            error,
+            SessionError::StaleGeneration {
+                channel: Channel::Frame,
+                expected: 1,
+                found: 0
+            }
+        ));
+    }
+
+    #[test]
+    fn the_control_channel_has_no_generations() {
+        let (mut host, mut guest) = handshake(&Secret::generate(), offer(), support());
+        bind(&mut host, &mut guest, Channel::Frame);
+        let _ = host
+            .reconnect_channel(Channel::Frame)
+            .expect("an established session");
+
+        let ping = Record::new(
+            Channel::Control,
+            ControlRecord::Ping as u16,
+            4,
+            0,
+            0,
+            Ping { token: 1 }.encode_to_vec(),
+        );
+
+        assert!(host.accept(&ping.header).is_ok());
     }
 }
