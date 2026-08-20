@@ -6,8 +6,8 @@ number here comes from a real VMLord VM: Ubuntu 24.04.4, kernel
 
 The probe that produced them -- a staged shell script and a C capture tool --
 was research, and is not carried in the tree. It lives in history at
-`8d006d9`, under `spikes/task-111-drm/`, along with the full logs of every
-run; `git show 8d006d9:spikes/task-111-drm/probe.sh` brings it back. What
+`ead0c20`, under `spikes/task-111-drm/`, along with the full logs of every
+run; `git show ead0c20:spikes/task-111-drm/probe.sh` brings it back. What
 that probe found, and the two frames it captured, are here.
 
 ## The decision
