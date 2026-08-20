@@ -7,10 +7,11 @@ use windows::{
         },
         System::HostComputeSystem::{
             HCS_OPERATION, HCS_SYSTEM, HcsCloseComputeSystem, HcsCloseOperation,
-            HcsCreateComputeSystem, HcsCreateOperation, HcsEnumerateComputeSystems,
-            HcsGetServiceProperties, HcsGrantVmAccess, HcsModifyComputeSystem,
-            HcsOpenComputeSystem, HcsShutDownComputeSystem, HcsStartComputeSystem,
-            HcsTerminateComputeSystem, HcsWaitForOperationResult,
+            HcsCreateComputeSystem, HcsCreateEmptyGuestStateFile, HcsCreateEmptyRuntimeStateFile,
+            HcsCreateOperation, HcsEnumerateComputeSystems, HcsGetServiceProperties,
+            HcsGrantVmAccess, HcsModifyComputeSystem, HcsOpenComputeSystem,
+            HcsShutDownComputeSystem, HcsStartComputeSystem, HcsTerminateComputeSystem,
+            HcsWaitForOperationResult,
         },
     },
     core::{HSTRING, PCWSTR, PWSTR},
@@ -921,6 +922,30 @@ impl HcsClient {
         })
     }
 
+    /// Creates the pair of empty state files a VM's firmware needs, replacing
+    /// whatever was there before.
+    ///
+    /// `guest_state_path` (`.vmgs`) is where the virtual firmware keeps its
+    /// own store -- the UEFI variables, the boot entries it wrote there and,
+    /// on a machine that had one, the vTPM. `runtime_state_path` (`.vmrs`) is
+    /// where the worker process keeps the state of the running machine. A VM
+    /// described without either boots once, because HCS has somewhere to put
+    /// the state of a machine that is starting from nothing; what it has no
+    /// answer for is a guest that resets, which is bug #110.
+    ///
+    /// Both are created rather than reused: a stale `.vmgs` describes a
+    /// machine that no longer exists -- a different Secure Boot state, a vTPM
+    /// this one does not have -- and HCS refuses to create a compute system
+    /// around one.
+    pub fn create_state_files(
+        &self,
+        guest_state_path: &Path,
+        runtime_state_path: &Path,
+    ) -> Result<(), RepositoryError> {
+        create_state_file(guest_state_path, StateFile::Guest)?;
+        create_state_file(runtime_state_path, StateFile::Runtime)
+    }
+
     /// Lists every HCS compute system currently visible to this process,
     /// with the state HCS reports for it.
     ///
@@ -970,6 +995,54 @@ impl Default for HcsClient {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Which of the two state files a path names, for the API call and the error.
+#[derive(Clone, Copy)]
+enum StateFile {
+    Guest,
+    Runtime,
+}
+
+impl StateFile {
+    fn description(self) -> &'static str {
+        match self {
+            Self::Guest => "create guest state file",
+            Self::Runtime => "create runtime state file",
+        }
+    }
+}
+
+/// Creates one empty state file at `path`, removing any previous one first.
+///
+/// The removal is separate from the creation because the HCS call refuses a
+/// path that already exists, and the file it refuses is one only this VM ever
+/// had a use for.
+fn create_state_file(path: &Path, kind: StateFile) -> Result<(), RepositoryError> {
+    if let Err(error) = std::fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        let error = RepositoryError::new(format!(
+            "failed to remove the stale state file {}: {error}",
+            path.display()
+        ));
+        log::error!("{error}");
+        return Err(error);
+    }
+    log::debug!("creating the state file {}", path.display());
+    // `HSTRING` has no `From<&OsStr>`; the lossy conversion matches
+    // `grant_vm_access` above.
+    let wide_path = HSTRING::from(path.as_os_str().to_string_lossy().as_ref());
+    // SAFETY: `wide_path` remains valid for the duration of the call.
+    let result = match kind {
+        StateFile::Guest => unsafe { HcsCreateEmptyGuestStateFile(&wide_path) },
+        StateFile::Runtime => unsafe { HcsCreateEmptyRuntimeStateFile(&wide_path) },
+    };
+    result.map_err(|error| {
+        let error = windows_error(kind.description(), None, error);
+        log::error!("{error}");
+        error
+    })
 }
 
 #[cfg(test)]

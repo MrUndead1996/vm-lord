@@ -12,6 +12,18 @@ use windows::core::GUID;
 
 use crate::gpu_exports::GpuExports;
 
+/// The pair of files a compute system keeps its state in, as
+/// [`crate::layout`] names them.
+///
+/// One argument rather than two loose paths: the two are only ever passed
+/// together, and a call site that swapped them would describe a firmware store
+/// where the runtime state belongs and be refused by HCS rather than by the
+/// compiler.
+pub(crate) struct StateFilePaths<'a> {
+    pub(crate) guest_state: &'a Path,
+    pub(crate) runtime_state: &'a Path,
+}
+
 /// Builds HCS compute-system configuration documents from a validated
 /// [`VmCreateRequest`].
 pub(crate) struct HcsVmConfigBuilder;
@@ -21,7 +33,9 @@ impl HcsVmConfigBuilder {
     /// `system_disk_path` as the VM's boot disk and, as the second
     /// attachment, the installer ISO for a local-media source or `seed_path`
     /// for a cloud image. `tools_path`, when supplied for a cloud VM with an
-    /// installed agent, becomes the third attachment.
+    /// installed agent, becomes the third attachment. `state` names the two
+    /// files the compute system keeps its own state in; both must exist before
+    /// the system is created.
     ///
     /// A GPU mode reaches the compute system in two later steps rather than
     /// here: the Plan9 shares a guest mounts are written by `gpu_prepare`
@@ -36,6 +50,7 @@ impl HcsVmConfigBuilder {
         system_disk_path: &Path,
         seed_path: &Path,
         tools_path: Option<&Path>,
+        state: &StateFilePaths,
         vm_id: Uuid,
     ) -> Result<String, RepositoryError> {
         request.validate()?;
@@ -118,10 +133,18 @@ impl HcsVmConfigBuilder {
                     },
                     keyboard: EmptyObject {},
                     mouse: EmptyObject {},
+                    video_monitor: VideoMonitor {
+                        horizontal_resolution: VIDEO_WIDTH,
+                        vertical_resolution: VIDEO_HEIGHT,
+                    },
                 },
                 services: Services {
                     shutdown: EmptyObject {},
                     timesync: EmptyObject {},
+                },
+                guest_state: GuestState {
+                    guest_state_file_path: state.guest_state.to_path_buf(),
+                    runtime_state_file_path: state.runtime_state.to_path_buf(),
                 },
             },
         };
@@ -487,6 +510,26 @@ struct VirtualMachine {
     devices: Devices,
     #[serde(rename = "Services")]
     services: Services,
+    #[serde(rename = "GuestState")]
+    guest_state: GuestState,
+}
+
+/// Where the VM's state lives between one instant and the next.
+///
+/// `GuestStateFilePath` is the virtual firmware's own store -- the UEFI
+/// variables and the boot entries written into them -- and
+/// `RuntimeStateFilePath` is where the worker process keeps the state of the
+/// running machine. A compute system described without this section starts
+/// anyway, because HCS can hold the state of a machine booting from nothing in
+/// memory; what it cannot do is put that machine back together when its guest
+/// resets. The worker exits 255 and HCS reports `UnexpectedExit`, which is what
+/// made `reboot` inside a guest look like a power-off -- bug #110.
+#[derive(Serialize)]
+struct GuestState {
+    #[serde(rename = "GuestStateFilePath")]
+    guest_state_file_path: PathBuf,
+    #[serde(rename = "RuntimeStateFilePath")]
+    runtime_state_file_path: PathBuf,
 }
 
 /// The integration components the VM's guest is offered over VMBus.
@@ -559,7 +602,43 @@ struct Devices {
     keyboard: EmptyObject,
     #[serde(rename = "Mouse")]
     mouse: EmptyObject,
+    #[serde(rename = "VideoMonitor")]
+    video_monitor: VideoMonitor,
 }
+
+/// The synthetic display of a VM nobody looks at.
+///
+/// Named even though VMLord shows no framebuffer and offers no RDP: `Keyboard`
+/// and `Mouse` bring `vmuidevices.dll` into the worker process, and the video
+/// device is the one the other two are attached to. A VM described without it
+/// starts, because nothing composes a display while the machine is only
+/// booting; a guest that resets is what makes the worker build its UI devices
+/// a second time, and it dereferences what is not there:
+///
+/// ```text
+/// vmwp.exe … vmuidevices.dll … c0000005 … 000000000004bd7e
+/// ```
+///
+/// -- five times in Windows Error Reporting, once per attempted `reboot`, which
+/// is the whole of bug #110. The crash reaches VMLord as
+/// `{"ExitType":"UnexpectedExit", ... "ExitCode":255}`: the worker was gone, so
+/// the compute system was too, and a reboot looked like a power-off. The
+/// legacy AppSandbox backend named this section for every VM it built, with a
+/// comment saying vmwp crashes without it.
+///
+/// The resolution is the same 1024x768 that backend passed. It is what the
+/// guest's virtual adapter reports and nothing here draws into, so any
+/// supported mode would do; this one is known to be accepted.
+#[derive(Serialize)]
+struct VideoMonitor {
+    #[serde(rename = "HorizontalResolution")]
+    horizontal_resolution: u32,
+    #[serde(rename = "VerticalResolution")]
+    vertical_resolution: u32,
+}
+
+const VIDEO_WIDTH: u32 = 1024;
+const VIDEO_HEIGHT: u32 = 768;
 
 #[derive(Serialize)]
 struct Scsi {
@@ -638,9 +717,9 @@ mod tests {
     };
 
     use super::{
-        HcsVmConfigBuilder, VmTopology, adapter_key, apply_network_adapter, apply_plan9_shares,
-        apply_topology, com1_pipe_path, ensure_supported_network_mode, media_path, read_topology,
-        remove_network_adapter, remove_plan9_shares,
+        HcsVmConfigBuilder, StateFilePaths, VmTopology, adapter_key, apply_network_adapter,
+        apply_plan9_shares, apply_topology, com1_pipe_path, ensure_supported_network_mode,
+        media_path, read_topology, remove_network_adapter, remove_plan9_shares,
     };
     use crate::gpu_exports::GpuExports;
 
@@ -659,6 +738,15 @@ mod tests {
             cpu_cores: 1,
             gpu_mode: GpuMode::None,
             network_mode: NetworkMode::None,
+        }
+    }
+
+    /// The state files a built document points at, in the same VM directory
+    /// as the disk and the seed the tests use.
+    fn state_paths() -> StateFilePaths<'static> {
+        StateFilePaths {
+            guest_state: Path::new("C:\\vms\\test-vm\\vm.vmgs"),
+            runtime_state: Path::new("C:\\vms\\test-vm\\vm.vmrs"),
         }
     }
 
@@ -699,6 +787,7 @@ mod tests {
                 &system_disk_path,
                 &seed_path,
                 Some(&tools_path),
+                &state_paths(),
                 VM_ID,
             )
             .unwrap(),
@@ -722,6 +811,7 @@ mod tests {
             &PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx"),
             &PathBuf::from("C:\\vms\\test-vm\\seed.iso"),
             None,
+            &state_paths(),
             VM_ID,
         )
         .unwrap();
@@ -754,6 +844,7 @@ mod tests {
             Path::new(r"C:\vms\test-vm\disks\system.vhdx"),
             Path::new(r"C:\vms\test-vm\seed.iso"),
             None,
+            &state_paths(),
             VM_ID,
         )
         .unwrap();
@@ -784,6 +875,7 @@ mod tests {
                 Path::new(r"C:\vms\test-vm\disks\system.vhdx"),
                 Path::new(r"C:\vms\test-vm\seed.iso"),
                 None,
+                &state_paths(),
                 VM_ID,
             )
             .unwrap(),
@@ -807,8 +899,15 @@ mod tests {
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
         let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
         let json: Value = serde_json::from_str(
-            &HcsVmConfigBuilder::build(&request(), &system_disk_path, &seed_path, None, VM_ID)
-                .unwrap(),
+            &HcsVmConfigBuilder::build(
+                &request(),
+                &system_disk_path,
+                &seed_path,
+                None,
+                &state_paths(),
+                VM_ID,
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -841,11 +940,79 @@ mod tests {
                             }
                         }}},
                         "Keyboard": {},
-                        "Mouse": {}
+                        "Mouse": {},
+                        "VideoMonitor": {
+                            "HorizontalResolution": 1024,
+                            "VerticalResolution": 768
+                        }
                     },
-                    "Services": { "Shutdown": {}, "Timesync": {} }
+                    "Services": { "Shutdown": {}, "Timesync": {} },
+                    "GuestState": {
+                        "GuestStateFilePath": "C:\\vms\\test-vm\\vm.vmgs",
+                        "RuntimeStateFilePath": "C:\\vms\\test-vm\\vm.vmrs"
+                    }
                 }
             }),
+        );
+    }
+
+    /// The worker builds its UI devices again when a guest resets, and without
+    /// this section it crashes in `vmuidevices.dll` instead -- taking the
+    /// compute system with it and turning a `reboot` into a power-off. Bug
+    /// #110.
+    #[test]
+    fn a_vm_with_a_keyboard_and_a_mouse_is_given_the_display_they_hang_off() {
+        let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
+        let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
+
+        let json: Value = serde_json::from_str(
+            &HcsVmConfigBuilder::build(
+                &request(),
+                &system_disk_path,
+                &seed_path,
+                None,
+                &state_paths(),
+                VM_ID,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            json.pointer("/VirtualMachine/Devices/VideoMonitor"),
+            Some(&json!({ "HorizontalResolution": 1024, "VerticalResolution": 768 })),
+            "a VM offered input devices must be offered the display they belong to"
+        );
+    }
+
+    /// A guest that resets is put back together by its worker process from the
+    /// state files this section names. A document without them describes a
+    /// machine that can boot but not reboot: the worker exits 255 and HCS
+    /// reports `UnexpectedExit`, which is bug #110.
+    #[test]
+    fn a_vm_is_given_the_state_files_its_firmware_needs_to_survive_a_reset() {
+        let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
+        let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
+
+        let json: Value = serde_json::from_str(
+            &HcsVmConfigBuilder::build(
+                &request(),
+                &system_disk_path,
+                &seed_path,
+                None,
+                &state_paths(),
+                VM_ID,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            json.pointer("/VirtualMachine/GuestState"),
+            Some(&json!({
+                "GuestStateFilePath": "C:\\vms\\test-vm\\vm.vmgs",
+                "RuntimeStateFilePath": "C:\\vms\\test-vm\\vm.vmrs"
+            }))
         );
     }
 
@@ -862,6 +1029,7 @@ mod tests {
                 Path::new(r"C:\vms\test-vm\disks\system.vhdx"),
                 Path::new(r"C:\vms\test-vm\seed.iso"),
                 None,
+                &state_paths(),
                 VM_ID,
             )
             .unwrap(),
@@ -888,6 +1056,7 @@ mod tests {
                 Path::new(r"C:\vms\test-vm\disks\system.vhdx"),
                 Path::new(r"C:\vms\test-vm\seed.iso"),
                 None,
+                &state_paths(),
                 VM_ID,
             )
             .unwrap(),
@@ -912,8 +1081,15 @@ mod tests {
         let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
 
         let json: Value = serde_json::from_str(
-            &HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path, None, VM_ID)
-                .unwrap(),
+            &HcsVmConfigBuilder::build(
+                &request,
+                &system_disk_path,
+                &seed_path,
+                None,
+                &state_paths(),
+                VM_ID,
+            )
+            .unwrap(),
         )
         .unwrap();
 
@@ -937,9 +1113,15 @@ mod tests {
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
         let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
 
-        let document =
-            HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path, None, VM_ID)
-                .unwrap();
+        let document = HcsVmConfigBuilder::build(
+            &request,
+            &system_disk_path,
+            &seed_path,
+            None,
+            &state_paths(),
+            VM_ID,
+        )
+        .unwrap();
 
         assert!(!document.contains("secret"));
         assert!(!document.contains("password"));
@@ -961,8 +1143,15 @@ mod tests {
                 ..request()
             };
             assert!(
-                HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path, None, VM_ID)
-                    .is_ok(),
+                HcsVmConfigBuilder::build(
+                    &request,
+                    &system_disk_path,
+                    &seed_path,
+                    None,
+                    &state_paths(),
+                    VM_ID
+                )
+                .is_ok(),
                 "the adapters are attached after the start, so the configuration has \
                  nothing to refuse about {mode:?}"
             );
@@ -979,10 +1168,17 @@ mod tests {
         };
 
         assert!(
-            HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path, None, VM_ID)
-                .unwrap_err()
-                .to_string()
-                .contains("42")
+            HcsVmConfigBuilder::build(
+                &request,
+                &system_disk_path,
+                &seed_path,
+                None,
+                &state_paths(),
+                VM_ID
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("42")
         );
     }
 
@@ -997,9 +1193,15 @@ mod tests {
             ..request()
         };
 
-        let document =
-            HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path, None, VM_ID)
-                .unwrap();
+        let document = HcsVmConfigBuilder::build(
+            &request,
+            &system_disk_path,
+            &seed_path,
+            None,
+            &state_paths(),
+            VM_ID,
+        )
+        .unwrap();
 
         let json: Value = serde_json::from_str(&document).unwrap();
         assert!(
@@ -1022,10 +1224,16 @@ mod tests {
                 ..request()
             };
 
-            let message =
-                HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path, None, VM_ID)
-                    .unwrap_err()
-                    .to_string();
+            let message = HcsVmConfigBuilder::build(
+                &request,
+                &system_disk_path,
+                &seed_path,
+                None,
+                &state_paths(),
+                VM_ID,
+            )
+            .unwrap_err()
+            .to_string();
 
             assert!(message.contains("network mode"), "got: {message}");
             assert!(message.contains("#10"), "got: {message}");
@@ -1036,9 +1244,15 @@ mod tests {
     fn removes_the_network_adapter_section_and_nothing_else() {
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
         let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
-        let created =
-            HcsVmConfigBuilder::build(&request(), &system_disk_path, &seed_path, None, VM_ID)
-                .unwrap();
+        let created = HcsVmConfigBuilder::build(
+            &request(),
+            &system_disk_path,
+            &seed_path,
+            None,
+            &state_paths(),
+            VM_ID,
+        )
+        .unwrap();
         let attached = apply_network_adapter(
             &created,
             Uuid::from_u128(0x3f2b_0c11_5c78_4c1b_9e2f_3a8b_7d4c_6e50),
@@ -1064,9 +1278,15 @@ mod tests {
         // whether to rewrite `config.json` by comparing the two strings.
         let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
         let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
-        let created =
-            HcsVmConfigBuilder::build(&request(), &system_disk_path, &seed_path, None, VM_ID)
-                .unwrap();
+        let created = HcsVmConfigBuilder::build(
+            &request(),
+            &system_disk_path,
+            &seed_path,
+            None,
+            &state_paths(),
+            VM_ID,
+        )
+        .unwrap();
 
         let removed = remove_network_adapter(&created).unwrap();
 
@@ -1105,8 +1325,15 @@ mod tests {
         };
 
         assert!(
-            HcsVmConfigBuilder::build(&request, &system_disk_path, &seed_path, None, VM_ID)
-                .is_err()
+            HcsVmConfigBuilder::build(
+                &request,
+                &system_disk_path,
+                &seed_path,
+                None,
+                &state_paths(),
+                VM_ID
+            )
+            .is_err()
         );
     }
 
@@ -1122,6 +1349,7 @@ mod tests {
             &PathBuf::from("C:\\vms\\a\\disks\\system.vhdx"),
             &PathBuf::from("C:\\vms\\test-vm\\seed.iso"),
             None,
+            &state_paths(),
             VM_ID,
         )
         .unwrap();
@@ -1139,9 +1367,15 @@ mod tests {
     fn applying_a_topology_changes_only_memory_and_processors() {
         let system_disk_path = PathBuf::from("C:\\vms\\a\\disks\\system.vhdx");
         let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
-        let document =
-            HcsVmConfigBuilder::build(&request(), &system_disk_path, &seed_path, None, VM_ID)
-                .unwrap();
+        let document = HcsVmConfigBuilder::build(
+            &request(),
+            &system_disk_path,
+            &seed_path,
+            None,
+            &state_paths(),
+            VM_ID,
+        )
+        .unwrap();
 
         let updated = apply_topology(
             &document,
@@ -1210,6 +1444,7 @@ mod tests {
             &PathBuf::from("C:\\vms\\a\\disks\\system.vhdx"),
             &PathBuf::from("C:\\vms\\test-vm\\seed.iso"),
             None,
+            &state_paths(),
             VM_ID,
         )
         .unwrap();
@@ -1231,9 +1466,15 @@ mod tests {
     fn attaching_an_adapter_changes_nothing_else() {
         let system_disk_path = PathBuf::from("C:\\vms\\a\\disks\\system.vhdx");
         let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
-        let document =
-            HcsVmConfigBuilder::build(&request(), &system_disk_path, &seed_path, None, VM_ID)
-                .unwrap();
+        let document = HcsVmConfigBuilder::build(
+            &request(),
+            &system_disk_path,
+            &seed_path,
+            None,
+            &state_paths(),
+            VM_ID,
+        )
+        .unwrap();
 
         let before: Value = serde_json::from_str(&document).unwrap();
         let mut after: Value = serde_json::from_str(&with_adapter(&document)).unwrap();
@@ -1256,6 +1497,7 @@ mod tests {
             &PathBuf::from("C:\\vms\\a\\disks\\system.vhdx"),
             &PathBuf::from("C:\\vms\\test-vm\\seed.iso"),
             None,
+            &state_paths(),
             VM_ID,
         )
         .unwrap();
@@ -1275,6 +1517,7 @@ mod tests {
             &PathBuf::from("C:\\vms\\a\\disks\\system.vhdx"),
             &PathBuf::from("C:\\vms\\test-vm\\seed.iso"),
             None,
+            &state_paths(),
             VM_ID,
         )
         .unwrap();
@@ -1311,6 +1554,7 @@ mod tests {
             &PathBuf::from(r"C:\vms\test-vm\disks\system.vhdx"),
             &PathBuf::from(r"C:\vms\test-vm\seed.iso"),
             None,
+            &state_paths(),
             VM_ID,
         )
         .expect("the configuration must build")

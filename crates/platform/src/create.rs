@@ -31,6 +31,7 @@ const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
 type VhdCreator = Box<dyn Fn(&Path, u64) -> Result<(), RepositoryError> + Send + Sync>;
 type AccessGranter = Box<dyn Fn(&str, &Path) -> Result<(), RepositoryError> + Send + Sync>;
 type SystemCreator = Box<dyn Fn(&str, &str) -> Result<(), RepositoryError> + Send + Sync>;
+type StateFileCreator = Box<dyn Fn(&Path, &Path) -> Result<(), RepositoryError> + Send + Sync>;
 type AgentReader = Box<dyn Fn() -> Option<Vec<u8>> + Send + Sync>;
 
 const AGENT_FILE_NAME: &str = "vmlord-agent";
@@ -110,6 +111,7 @@ pub struct VmCreationPipeline {
     vhd_creator: VhdCreator,
     cloud_disk: CloudDiskImporter,
     access_granter: AccessGranter,
+    state_file_creator: StateFileCreator,
     system_creator: SystemCreator,
     system_teardown: SystemTeardown,
     agent_reader: AgentReader,
@@ -127,6 +129,7 @@ impl VmCreationPipeline {
             vhd_creator: Box::new(create_dynamic_vhdx),
             cloud_disk,
             access_granter: Box::new(grant_vm_access),
+            state_file_creator: Box::new(create_state_files),
             system_creator: Box::new(create_hcs_system),
             system_teardown: Box::new(cleanup::teardown_compute_system),
             agent_reader: Box::new(read_agent_beside_executable),
@@ -141,6 +144,7 @@ impl VmCreationPipeline {
         + Sync
         + 'static,
         access_granter: impl Fn(&str, &Path) -> Result<(), RepositoryError> + Send + Sync + 'static,
+        state_file_creator: impl Fn(&Path, &Path) -> Result<(), RepositoryError> + Send + Sync + 'static,
         system_creator: impl Fn(&str, &str) -> Result<(), RepositoryError> + Send + Sync + 'static,
         system_teardown: impl Fn(&str) -> Result<(), RepositoryError> + Send + Sync + 'static,
     ) -> Self {
@@ -148,6 +152,7 @@ impl VmCreationPipeline {
             vhd_creator: Box::new(vhd_creator),
             cloud_disk: Box::new(cloud_disk),
             access_granter: Box::new(access_granter),
+            state_file_creator: Box::new(state_file_creator),
             system_creator: Box::new(system_creator),
             system_teardown: Box::new(system_teardown),
             agent_reader: Box::new(|| Some(b"test agent".to_vec())),
@@ -187,6 +192,8 @@ impl VmCreationPipeline {
             VmSource::LocalMedia { .. } => None,
         };
         let tools_path = agent.as_ref().map(|_| layout::tools_path(vm_directory));
+        let guest_state_path = layout::guest_state_path(vm_directory);
+        let runtime_state_path = layout::runtime_state_path(vm_directory);
         // Rejects an unsupported request (name, GPU/network mode, ...) before
         // any filesystem or HCS side effect.
         let configuration = HcsVmConfigBuilder::build(
@@ -194,6 +201,10 @@ impl VmCreationPipeline {
             &system_disk_path,
             &seed_path,
             tools_path.as_deref(),
+            &hcs_config::StateFilePaths {
+                guest_state: &guest_state_path,
+                runtime_state: &runtime_state_path,
+            },
             vm_id,
         )?;
         let media_path = hcs_config::media_path(request, &seed_path).to_path_buf();
@@ -299,6 +310,12 @@ impl VmCreationPipeline {
                 |error| RepositoryError::new(format!("failed to write HCS configuration: {error}")),
             )?;
 
+            // The firmware and runtime state stores the configuration names.
+            // HCS makes them, rather than this pipeline writing empty files:
+            // both have a format only Hyper-V knows, and a compute system is
+            // refused outright if what it is pointed at is not one.
+            (self.state_file_creator)(&guest_state_path, &runtime_state_path)?;
+
             // Hyper-V opens VM-owned files under the VM's own security
             // principal, not the creating user's token: without this, start
             // fails with access denied even though both files exist and are
@@ -308,6 +325,10 @@ impl VmCreationPipeline {
             if let Some(tools_path) = &tools_path {
                 (self.access_granter)(&hcs_compute_system_id, tools_path)?;
             }
+            // The worker writes to both of these, so the grant is what lets it
+            // start at all -- and, on a reset, put the machine back together.
+            (self.access_granter)(&hcs_compute_system_id, &guest_state_path)?;
+            (self.access_granter)(&hcs_compute_system_id, &runtime_state_path)?;
 
             monitor.check_cancelled()?;
             monitor.report(BuildStep::Registering);
@@ -355,6 +376,10 @@ impl VmCreationPipeline {
 
 fn grant_vm_access(id: &str, path: &Path) -> Result<(), RepositoryError> {
     HcsClient::new().grant_vm_access(id, path)
+}
+
+fn create_state_files(guest_state: &Path, runtime_state: &Path) -> Result<(), RepositoryError> {
+    HcsClient::new().create_state_files(guest_state, runtime_state)
 }
 
 fn create_hcs_system(id: &str, configuration: &str) -> Result<(), RepositoryError> {
@@ -572,6 +597,7 @@ mod tests {
         vhd: Arc<Mutex<Vec<(PathBuf, u64)>>>,
         cloud: Arc<Mutex<Vec<(String, u64, PathBuf)>>>,
         grant: Arc<Mutex<Vec<(String, PathBuf)>>>,
+        state: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>,
         create: Arc<Mutex<Vec<(String, String)>>>,
         teardown: Arc<Mutex<Vec<String>>>,
     }
@@ -662,6 +688,22 @@ mod tests {
             },
             {
                 let calls = calls.clone();
+                move |guest_state: &std::path::Path, runtime_state: &std::path::Path| {
+                    calls
+                        .state
+                        .lock()
+                        .unwrap()
+                        .push((guest_state.to_path_buf(), runtime_state.to_path_buf()));
+                    // Empty stand-ins: the production creator is an HCS call,
+                    // and what the tests check is that the paths reached it
+                    // before the compute system was created.
+                    fs::write(guest_state, b"vmgs").unwrap();
+                    fs::write(runtime_state, b"vmrs").unwrap();
+                    Ok(())
+                }
+            },
+            {
+                let calls = calls.clone();
                 move |id, config| {
                     calls
                         .create
@@ -736,6 +778,13 @@ mod tests {
             },
             {
                 let record = Arc::clone(&record);
+                move |_: &std::path::Path, _: &std::path::Path| {
+                    record();
+                    Ok(())
+                }
+            },
+            {
+                let record = Arc::clone(&record);
                 move |_: &str, _: &str| {
                     record();
                     Ok(())
@@ -762,7 +811,8 @@ mod tests {
                 }
             },
             |_: &CloudImage, _, _: &std::path::Path, _: &BuildMonitor| Ok(()),
-            |_, _| Ok(()),
+            |_: &str, _: &std::path::Path| Ok(()),
+            |_: &std::path::Path, _: &std::path::Path| Ok(()),
             |_: &str, _: &str| panic!("the HCS client panicked"),
             {
                 let calls = calls.clone();
@@ -815,10 +865,13 @@ mod tests {
                 BuildStep::WritingDisk,
                 BuildStep::Provisioning,
                 BuildStep::Provisioning,
+                BuildStep::Provisioning,
+                BuildStep::Provisioning,
+                BuildStep::Provisioning,
                 BuildStep::Registering,
             ],
-            "the disk, then the files written for the VM and their grants, \
-             then the compute system"
+            "the disk, then the files written for the VM -- its state files \
+             included -- and their grants, then the compute system"
         );
         assert_eq!(monitor.snapshot().step, BuildStep::Registering);
     }
@@ -865,7 +918,8 @@ mod tests {
                 }
             },
             |_: &CloudImage, _, _: &std::path::Path, _: &BuildMonitor| Ok(()),
-            |_, _| Ok(()),
+            |_: &str, _: &std::path::Path| Ok(()),
+            |_: &std::path::Path, _: &std::path::Path| Ok(()),
             {
                 let calls = calls.clone();
                 move |id: &str, config: &str| {
@@ -980,8 +1034,68 @@ mod tests {
                     mapping.hcs_compute_system_id.clone(),
                     fixture.image_path.clone()
                 ),
+                (
+                    mapping.hcs_compute_system_id.clone(),
+                    fixture.vm_directory.join("vm.vmgs")
+                ),
+                (
+                    mapping.hcs_compute_system_id.clone(),
+                    fixture.vm_directory.join("vm.vmrs")
+                ),
             ],
-            "the VM must be granted access to its disk and installer image before HCS create"
+            "the VM must be granted access to its disk, its installer image and \
+             its state files before HCS create"
+        );
+    }
+
+    /// The two state files are HCS's to make, and they have to exist -- and be
+    /// the VM's to write -- before the compute system that names them does.
+    /// A VM created without them boots and refuses to reboot: bug #110.
+    #[test]
+    fn a_created_vm_gets_the_state_files_its_configuration_names() {
+        let fixture = fixture("state-files");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+
+        let mapping = pipeline
+            .create(
+                &fixture.store,
+                &fixture.request,
+                &fixture.vm_directory,
+                &monitor(),
+            )
+            .expect("creation should succeed");
+
+        assert_eq!(
+            calls.state.lock().unwrap().as_slice(),
+            &[(
+                fixture.vm_directory.join("vm.vmgs"),
+                fixture.vm_directory.join("vm.vmrs")
+            )]
+        );
+
+        let create_calls = calls.create.lock().unwrap();
+        let configuration: serde_json::Value = serde_json::from_str(&create_calls[0].1).unwrap();
+        assert_eq!(
+            configuration.pointer("/VirtualMachine/GuestState"),
+            Some(&serde_json::json!({
+                "GuestStateFilePath": fixture.vm_directory.join("vm.vmgs"),
+                "RuntimeStateFilePath": fixture.vm_directory.join("vm.vmrs")
+            })),
+            "the compute system must be told where its own state lives"
+        );
+        drop(create_calls);
+
+        let grants = calls.grant.lock().unwrap();
+        assert!(
+            grants.contains(&(
+                mapping.hcs_compute_system_id.clone(),
+                fixture.vm_directory.join("vm.vmgs")
+            )) && grants.contains(&(
+                mapping.hcs_compute_system_id.clone(),
+                fixture.vm_directory.join("vm.vmrs")
+            )),
+            "the worker writes to both files, so both need the VM's own grant: {grants:?}"
         );
     }
 
@@ -1310,6 +1424,14 @@ mod tests {
                     mapping.hcs_compute_system_id.clone(),
                     fixture.vm_directory.join("tools.iso")
                 ),
+                (
+                    mapping.hcs_compute_system_id.clone(),
+                    fixture.vm_directory.join("vm.vmgs")
+                ),
+                (
+                    mapping.hcs_compute_system_id.clone(),
+                    fixture.vm_directory.join("vm.vmrs")
+                ),
             ]
         );
 
@@ -1387,7 +1509,11 @@ mod tests {
             vec!["0", "1"],
             "a cloud VM without an agent keeps only its disk and seed"
         );
-        assert_eq!(calls.grant.lock().unwrap().len(), 2);
+        assert_eq!(
+            calls.grant.lock().unwrap().len(),
+            4,
+            "the disk and the seed, plus the two state files"
+        );
     }
 
     #[test]

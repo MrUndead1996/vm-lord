@@ -531,6 +531,51 @@ The legacy AppSandbox backend never found this. It resolved
 over its own in-guest agent instead, returning `ERROR_NOT_SUPPORTED` itself
 whenever that agent was unreachable. VMLord needs no agent for this.
 
+A guest that resets rather than powers off is the same subject seen from the
+other side, and it is bug #110: `reboot` inside a guest used to leave the VM
+stopped. Nothing in VMLord asked for that. HCS reported
+`{"ExitType":"UnexpectedExit", ... "WorkerExit":{"ExitCode":255,"Detail":"ProcessUnexpectedExit"}}`,
+which is the worker process dying rather than the orderly
+`GracefulExit`/`PowerOff` a `poweroff` produces -- the two are distinguishable
+in the log, and both were seen on the same VM. What HCS does not say is why the
+worker died. Windows Error Reporting does, once per attempted reboot:
+
+```text
+vmwp.exe … vmuidevices.dll … c0000005 … 000000000004bd7e
+```
+
+`vmuidevices.dll` is where a worker keeps a VM's input and display devices, and
+the document named `Keyboard` and `Mouse` without naming `VideoMonitor` -- the
+device the other two hang off. Nothing composes a display while a machine is
+only booting, so a cold start never touched it; a reset is what makes the worker
+build its UI devices a second time, and it dereferenced what was not there.
+`HcsVmConfigBuilder` therefore names a 1024x768 `VideoMonitor` for every VM,
+although VMLord draws no framebuffer and offers no RDP: the section exists to
+make the device real, not to be looked at. The legacy AppSandbox backend named
+it for every VM it built, with a comment saying vmwp crashes without it.
+
+The VM's own state has a home for the same reason a machine has to survive
+being put back together: `VirtualMachine.GuestState` names
+`GuestStateFilePath`, the `.vmgs` a machine's virtual firmware keeps its store
+in -- the UEFI variables and the boot entries written into them -- and
+`RuntimeStateFilePath`, the `.vmrs` its worker keeps the state of the running
+machine in. Creation makes both through `HcsCreateEmptyGuestStateFile` and
+`HcsCreateEmptyRuntimeStateFile` -- their format is Hyper-V's, and a compute
+system pointed at anything else is refused -- grants the VM access to them for
+the same reason it grants access to its disk, and names them in the document.
+They live beside `config.json` rather than under `disks/`: they describe the
+machine rather than being one of its disks. Without the section a VM still
+boots, on state HCS holds for a machine starting from nothing, and what it
+writes into its firmware store is forgotten by the next boot. That is not what
+made a reboot fail -- a VM given the files still crashed in `vmuidevices.dll`
+-- but a machine that reboots is one whose firmware state has to outlive a
+boot, so both belong to the same fix.
+
+A VM whose stored `config.json` predates #110 keeps being built without either
+section and has to be re-created to become rebootable, exactly as one predating
+#70 has to be re-created to become stoppable. Existing VMs are not migrated:
+VMLord has no users yet.
+
 `platform::VmForceStopPipeline` is that remaining option: it stops a known VM
 through `HcsTerminateComputeSystem`, which needs nothing from the guest, so its
 completion means the VM really has stopped.
@@ -552,7 +597,8 @@ place and therefore reserves its name; the image the VM was installed from is
 never touched.
 
 Keeping the disks keeps the disks and nothing else that only served the VM. The
-`config.json` describes a compute system that is gone, and the VM's SSH identity
+`config.json` describes a compute system that is gone, the `.vmgs` and `.vmrs`
+hold the firmware and runtime state of that same gone machine, and the VM's SSH identity
 -- the `keys/` pair and the `known_hosts` VMLord learned for it -- belongs to a
 guest nobody reaches through VMLord any more, so both go in either mode. A
 private key with no owner is worth removing on its own, and host keys kept past
