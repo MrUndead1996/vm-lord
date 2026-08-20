@@ -169,3 +169,28 @@ Two more details worth keeping:
   master) while the same command on vkms succeeds -- because mutter ignores
   vkms, its master is free. A DRM device GNOME refuses is a device a plain
   userspace process can own completely.
+
+# The PoC's first run: the module does not build on 24.04
+
+DKMS failed before anything reached the display, so the guest rebooted
+unchanged -- `hyperv_drm` still on `card1`, no `asb_drm` anywhere.
+
+The cause is not Hyper-V and not the DRM design: the AppSandbox sources
+were written against the 26.04 kernel and use API that 24.04's 6.8 does not
+have. Reproduced locally against 5.15 headers, three errors, in order:
+
+    asb_drm_drv.c:215: initialization of 'int (*)(struct platform_device *)'
+                       from incompatible pointer type 'void (*)(...)'
+    asb_drm_mode.c:135: implicit declaration of function 'hrtimer_setup'
+    asb_drm_plane.c:83:  'DRM_PLANE_NO_SCALING' undeclared
+
+`platform_driver::remove` got its void return in 6.11, `hrtimer_setup()`
+arrived in 6.15, and `DRM_PLANE_NO_SCALING` was renamed from
+`DRM_PLANE_HELPER_NO_SCALING` in 6.1. `asb_drm-kernel-compat.patch` guards
+all three by version; with it the module builds clean against
+5.15.0-190-generic, which is a stricter test than 6.8.
+
+This is the DKMS bill the decision predicted, arriving early: a module of
+our own must build on every release VMLord supports, and the kernel API
+under it moves. It is also why the PoC builds asb_drm rather than assuming
+it.

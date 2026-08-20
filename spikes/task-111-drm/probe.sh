@@ -385,9 +385,27 @@ stage_poc() {
 	drv=$(driver_of_card1)
 	note "driver before: ${drv:-none}"
 
+	# The sources target 6.15+; on 24.04's 6.8 and 22.04's 5.15 they do not
+	# compile at all. Applying the patch is idempotent -- a second run finds
+	# every hunk already in place and says so.
+	say "making the sources build on this kernel"
+	run "patch -d $DIR/asb_drm -p1 -N -r - <$DIR/asb_drm-kernel-compat.patch 2>&1 || true"
+
 	say "building and installing asb_drm through DKMS"
 	run "sh $DIR/asb_drm/deploy.sh 2>&1 | tail -n 40"
 	run "dkms status"
+
+	# deploy.sh pipes its own output, so a failed build reaches this script
+	# as a zero exit. Ask DKMS instead, and stop here rather than reboot
+	# into a guest where nothing changed -- the first run of this stage did
+	# exactly that and cost a reboot to learn nothing.
+	if ! dkms status | grep -q "asb_drm/1.0.0.*installed"; then
+		note ""
+		note "DKMS did not install the module -- not rebooting."
+		note "The compiler's own words are in:"
+		run "tail -n 40 /var/lib/dkms/asb_drm/1.0.0/build/make.log 2>&1"
+		exit 1
+	fi
 	run "cat /etc/modprobe.d/asb_drm.conf"
 
 	say "rebooting so the blacklist and the autoload take effect"

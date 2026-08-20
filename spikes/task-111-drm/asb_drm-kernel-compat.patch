@@ -1,0 +1,79 @@
+Build asb_drm on kernels older than the one it was written for.
+
+The sources target 6.15+ (Ubuntu 26.04's kernel): they call hrtimer_setup(),
+and give platform_driver::remove the void return it only got in 6.11. On
+24.04's 6.8 and 22.04's 5.15 both are compile errors, so DKMS fails before
+anything reaches the display.
+
+Verified: builds clean against 5.15.0-190-generic with these three hunks.
+
+--- a/asb_drm_drv.c	2026-07-28 11:25:33.145682500 +0400
++++ b/asb_drm_drv.c	2026-08-20 20:13:01.906547085 +0400
+@@ -207,12 +207,28 @@
+ 	drm_atomic_helper_shutdown(drm);
+ }
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
++/* platform_driver::remove returned int until 6.11, and between 6.1 and 6.10
++ * the void-returning callback lived in ::remove_new. */
++static int asb_remove_int(struct platform_device *pdev)
++{
++	asb_remove(pdev);
++	return 0;
++}
++#endif
++
+ static struct platform_driver asb_platform_driver = {
+ 	.driver = {
+ 		.name = "asb_drm",
+ 	},
+ 	.probe  = asb_probe,
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+ 	.remove = asb_remove,
++#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
++	.remove_new = asb_remove,
++#else
++	.remove = asb_remove_int,
++#endif
+ };
+ 
+ /* --------------------------------------------------------------------------
+--- a/asb_drm_mode.c	2026-07-28 09:14:16.795252200 +0400
++++ b/asb_drm_mode.c	2026-08-20 20:13:23.766548774 +0400
+@@ -12,6 +12,8 @@
+  * and disarms when the last reference drops.
+  */
+ 
++#include <linux/version.h>
++
+ #include <drm/drm_atomic.h>
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_crtc.h>
+@@ -132,8 +134,13 @@
+ 	 * Kernel 6.15+ replaced hrtimer_init+function-assignment with the
+ 	 * single hrtimer_setup() entry point that takes the callback as
+ 	 * an argument. */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+ 	hrtimer_setup(&asb->vblank_timer, asb_vblank_timer_fn,
+ 	              CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++#else
++	hrtimer_init(&asb->vblank_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++	asb->vblank_timer.function = asb_vblank_timer_fn;
++#endif
+ 	asb->vblank_period = ns_to_ktime(NSEC_PER_SEC / asb->refresh);
+ 
+ 	ret = drm_crtc_init_with_planes(drm, &asb->crtc,
+--- a/asb_drm_plane.c	2026-07-28 09:14:16.796252100 +0400
++++ b/asb_drm_plane.c	2026-08-20 20:13:45.022550507 +0400
+@@ -28,6 +28,11 @@
+ 
+ #include "asb_drm.h"
+ 
++/* Renamed from DRM_PLANE_HELPER_NO_SCALING in 6.1. */
++#ifndef DRM_PLANE_NO_SCALING
++#define DRM_PLANE_NO_SCALING DRM_PLANE_HELPER_NO_SCALING
++#endif
++
+ /* --------------------------------------------------------------------------
+  * Format tables. Listed in preference order; first format the compositor
+  * accepts is what it'll use.
