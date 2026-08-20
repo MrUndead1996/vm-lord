@@ -46,6 +46,30 @@ need_packages() {
 	run "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $*"
 }
 
+
+# The driver bound to the first real card, from the kernel's own uevent.
+driver_of_card1() {
+	for card in /sys/class/drm/card*; do
+		case "$card" in *-*) continue;; esac
+		[ -e "$card/device/uevent" ] || continue
+		sed -n 's/^DRIVER=//p' "$card/device/uevent" | head -n 1
+		return
+	done
+}
+
+# Everything about one card that decides whether a session can use it.
+describe_card() {
+	node=$1
+	name=$(basename "$node")
+	note ""
+	note "--- $name"
+	run "drm_info $node 2>&1 | head -n 24"
+	run "readlink -f /sys/class/drm/$name/device 2>/dev/null || echo '(no device link -- faux bus?)'"
+	run "cat /sys/class/drm/$name/device/uevent 2>/dev/null || echo '(no uevent)'"
+	run "udevadm info --query=property --name=$node | grep -E 'TAGS|ID_SEAT|ID_PATH|DEVPATH' || true"
+	run "drm_info $node 2>&1 | grep -iE 'writeback|\"type\"|Formats|Framebuffer size|Width|Height' | head -n 30"
+}
+
 # ---------------------------------------------------------------------------
 # Facts every stage wants: what the kernel is, what it will let us load, and
 # what DRM devices exist right now.
@@ -119,12 +143,15 @@ stage_stock() {
 	# the one moment we can ask the driver to actually set a mode. The
 	# answer bounds what a desktop can ask for later.
 	say "mode setting on the stock driver -- what resolutions are accepted"
-	run "modetest -c 2>&1 | head -n 60"
+	drv=$(driver_of_card1)
+	note "driver under test: ${drv:-none}"
+	run "modetest -M ${drv:-none} -c 2>&1 | head -n 60"
 	# The first connected connector: what a compositor would pick too.
-	conn=$(modetest -c 2>/dev/null | awk '$1 ~ /^[0-9]+$/ && $3 == "connected" {print $1; exit}')
+	conn=$(modetest -M "${drv:-none}" -c 2>/dev/null |
+	       awk '$1 ~ /^[0-9]+$/ && $3 == "connected" {print $1; exit}')
 	note "connected connector: ${conn:-none found}"
 	for mode in 1024x768 1920x1080 2560x1440; do
-		run "timeout 6 modetest -s ${conn:-0}:$mode -v 2>&1 | tail -n 20"
+		run "timeout 6 modetest -M ${drv:-none} -s ${conn:-0}:$mode -v 2>&1 | tail -n 20"
 	done
 
 	say "framebuffer budget the synthetic video device was given"
@@ -138,18 +165,20 @@ stage_stock() {
 	run "modprobe vkms 2>&1"
 	run "lsmod | grep vkms || echo 'vkms did not load'"
 	run "ls -l /dev/dri/"
-	for card in /sys/class/drm/card*; do
-		case "$card" in *-*) continue;; esac
-		[ -e "$card/device/driver" ] || continue
-		drv=$(basename "$(readlink -f "$card/device/driver")")
-		[ "$drv" = vkms ] || continue
-		note ""
-		note "--- vkms landed on $(basename "$card")"
-		run "readlink -f $card/device"
-		run "udevadm info --query=property --name=/dev/dri/$(basename "$card") | grep -E 'TAGS|ID_SEAT|ID_PATH' || true"
-		run "drm_info /dev/dri/$(basename "$card") 2>&1 | grep -iE 'writeback|driver:|plane|cursor' | head -n 40"
+	for node in /dev/dri/card*; do
+		[ -e "$node" ] || continue
+		describe_card "$node"
 	done
 	run "modprobe -r vkms 2>&1 || true"
+
+	# Which Mesa a compositor will load, and whether VMLord's GPU payload
+	# has put its own in front of the distribution's. A guest whose GBM
+	# comes from the WSL Mesa is not the guest Ubuntu ships.
+	say "userspace graphics stack in this guest"
+	run "ls -l /opt/vmlord/wsl-mesa/lib/x86_64-linux-gnu 2>/dev/null | head -n 20 || echo 'no VMLord Mesa staged'"
+	run "cat /etc/ld.so.conf.d/*vmlord* /etc/ld.so.conf.d/*mesa* 2>/dev/null || echo 'no ld.so.conf entry'"
+	run "ldconfig -p | grep -iE 'libgbm|libEGL_mesa|libGLX_mesa' || true"
+	run "ls -l /dev/dxg 2>/dev/null || echo 'no /dev/dxg -- no GPU-PV in this VM'"
 
 	say "what a DKMS module would cost this guest"
 	run "apt-get install -s -y dkms linux-headers-\$(uname -r) 2>&1 | tail -n 12"
@@ -221,6 +250,47 @@ stage_greeter() {
 	note "would have seen it. Keep it: it is the proof, not the log."
 }
 
+
+# ---------------------------------------------------------------------------
+# Stage: pattern
+#
+# The control experiment. A blank capture has two possible causes and the
+# logs cannot tell them apart: either nothing can be read out of this driver,
+# or nothing was ever drawn into it. So take the compositor out of the
+# picture and let modetest draw a test pattern of its own, then read that.
+# Bars in the PPM mean the capture path is sound and the blank frame was the
+# compositor's doing.
+# ---------------------------------------------------------------------------
+stage_pattern() {
+	drv=$(driver_of_card1)
+	say "stopping the display manager so modetest can take DRM master"
+	run "systemctl stop gdm"
+	run "sleep 2"
+
+	conn=$(modetest -M "${drv:-none}" -c 2>/dev/null |
+	       awk '$1 ~ /^[0-9]+$/ && $3 == "connected" {print $1; exit}')
+	note "driver ${drv:-none}, connector ${conn:-none found}"
+
+	say "painting a test pattern and reading it back"
+	modetest -M "${drv:-none}" -s "${conn:-0}" -v >"$OUT/pattern-modetest.log" 2>&1 &
+	pattern_pid=$!
+	sleep 3
+
+	if [ ! -x "$DIR/plane_capture" ]; then
+		run "cc -O2 -Wall -o $DIR/plane_capture $DIR/plane_capture.c \$(pkg-config --cflags --libs libdrm)"
+	fi
+	for node in /dev/dri/card*; do
+		[ -e "$node" ] || continue
+		run "$DIR/plane_capture $node 60 $OUT/pattern-\$(basename $node).ppm"
+	done
+
+	kill "$pattern_pid" 2>/dev/null
+	run "tail -n 20 $OUT/pattern-modetest.log"
+	run "systemctl start gdm"
+	note ""
+	note "stage 'pattern' done -- log at $LOG"
+}
+
 # ---------------------------------------------------------------------------
 # Stage: collect
 # ---------------------------------------------------------------------------
@@ -235,6 +305,7 @@ case "$STAGE" in
 	stock)   stage_stock;;
 	desktop) stage_desktop;;
 	greeter) stage_greeter;;
+	pattern) stage_pattern;;
 	collect) stage_collect;;
 	*)
 		cat <<'EOF'
@@ -244,6 +315,8 @@ usage: sudo sh probe.sh <stage>
   desktop   install GNOME + GDM and reboot (destructive to this VM)
   greeter   at the GDM greeter, not logged in: what the compositor bound to
             and whether its framebuffer can be read from outside it
+  pattern   with GDM stopped, modetest paints a test pattern and the probe
+            reads it back -- separates a broken capture from a blank desktop
   collect   tar up /var/log/vmlord-drm-spike for the report
 EOF
 		exit 2;;

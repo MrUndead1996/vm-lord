@@ -29,6 +29,11 @@ Create it in VMLord, elevated, as a throwaway — `desktop` installs GNOME onto
 it and it is not worth keeping afterwards.
 
 * Ubuntu **24.04** cloud image (the first proven target of epic #9).
+* **GPU off.** VMLord's GPU payload stages its own Mesa under
+  `/opt/vmlord/wsl-mesa` and puts it ahead of the distribution's, so a GPU VM
+  answers a question about the WSL userspace, not about the display stack
+  Ubuntu ships. The GPU combination is worth its own run afterwards -- the
+  first one already showed it is not neutral -- but not as the baseline.
 * **4096 MB RAM or more.** GNOME on llvmpipe on less than that swaps and
   every timing in the report becomes a measurement of the swap.
 * **24 GB disk or more** — `ubuntu-desktop-minimal` is a few GB on top of a
@@ -61,8 +66,15 @@ sudo sh probe.sh desktop    # ~10 min, installs GNOME, then reboots itself
 # … the VM reboots. Reconnect over SSH. DO NOT log in at the graphical
 #   console: the greeter is the subject of the next stage.
 sudo sh probe.sh greeter    # ~1 min
+sudo sh probe.sh pattern    # ~1 min, stops GDM briefly and restarts it
 sudo sh probe.sh collect    # prints the path of a tarball
 ```
+
+`pattern` is the control: it stops GDM, lets `modetest` paint a test pattern
+of its own, and reads that back through the same code path. A blank capture
+has two causes that no log distinguishes -- nothing can be read out of this
+driver, or nothing was ever drawn into it -- and this stage is what tells them
+apart. Bars in `pattern-*.ppm` mean the capture path is sound.
 
 `desktop` reboots the machine out from under the SSH session — that is
 expected, not a failure. `greeter` wants the machine sitting at GDM with

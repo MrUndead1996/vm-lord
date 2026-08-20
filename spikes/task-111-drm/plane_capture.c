@@ -152,6 +152,46 @@ static void write_ppm(const char *path, const uint8_t *pixels, uint32_t width,
 	printf("      wrote %s\n", path);
 }
 
+// One capture tick: bracket the read in dma-buf sync, copy the frame out and
+// return a checksum of it. The checksum is the reason the copy survives -O2.
+static uint64_t read_frame(int dmabuf, const void *map, uint8_t *sink, size_t size)
+{
+	struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+	uint64_t sum = 0;
+
+	ioctl(dmabuf, DMA_BUF_IOCTL_SYNC, &sync);
+	memcpy(sink, map, size);
+	sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+	ioctl(dmabuf, DMA_BUF_IOCTL_SYNC, &sync);
+
+	for (size_t i = 0; i < size; i += 8)
+		sum += sink[i] * (uint64_t)(i + 1);
+	return sum;
+}
+
+// Say whether there is a picture here at all. A capture that succeeds against
+// a framebuffer nobody rendered into looks identical, in every log line, to a
+// capture of a working desktop -- until someone looks at the pixels.
+static void describe_frame(const uint8_t *pixels, uint32_t width, uint32_t height,
+			   uint32_t pitch)
+{
+	uint32_t first = *(const uint32_t *)pixels;
+	size_t differing = 0;
+
+	for (uint32_t y = 0; y < height; y++) {
+		const uint32_t *row = (const uint32_t *)(pixels + (size_t)y * pitch);
+
+		for (uint32_t x = 0; x < width; x++)
+			if (row[x] != first)
+				differing++;
+	}
+
+	printf("frame content: %s (first pixel 0x%08x, %zu of %u pixels differ from it)\n",
+	       differing == 0 ? "ONE FLAT COLOUR -- nothing rendered into it"
+			      : "a picture",
+	       first, differing, width * height);
+}
+
 int main(int argc, char **argv)
 {
 	const char *card = argc > 1 ? argv[1] : "/dev/dri/card0";
@@ -220,7 +260,9 @@ int main(int argc, char **argv)
 	}
 
 	// Timed re-reads of the primary framebuffer: the cost of a capture
-	// tick, with no encoding and no transport in it.
+	// tick, with no encoding and no transport in it. The checksum is not
+	// decoration -- it is what keeps the compiler from deleting the copy
+	// it can otherwise prove nobody reads.
 	if (primary_fb && frames > 0) {
 		size_t size = 0;
 		drmModeFB2Ptr fb = NULL;
@@ -229,26 +271,42 @@ int main(int argc, char **argv)
 
 		if (map) {
 			uint8_t *sink = malloc(size);
-			double start, total;
 
 			if (sink) {
-				start = now_ms();
-				for (int i = 0; i < frames; i++) {
-					struct dma_buf_sync sync = {
-						.flags = DMA_BUF_SYNC_START |
-							 DMA_BUF_SYNC_READ,
-					};
+				uint64_t sum = 0;
+				double start = now_ms(), total;
 
-					ioctl(dmabuf, DMA_BUF_IOCTL_SYNC, &sync);
-					memcpy(sink, map, size);
-					sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
-					ioctl(dmabuf, DMA_BUF_IOCTL_SYNC, &sync);
+				for (int i = 0; i < frames; i++) {
+					sum += read_frame(dmabuf, map, sink, size);
 				}
 				total = now_ms() - start;
 				printf("\ncopy of %zu bytes x%d: %.1f ms total, "
 				       "%.2f ms per frame (%.0f fps ceiling, copy only)\n",
 				       size, frames, total, total / frames,
 				       1000.0 / (total / frames));
+				printf("checksum across the run: 0x%llx\n",
+				       (unsigned long long)sum);
+
+				// A framebuffer that reads as one flat colour is a
+				// framebuffer nothing rendered into: the capture
+				// path worked and there was nothing behind it.
+				describe_frame(sink, fb->width, fb->height, fb->pitches[0]);
+
+				// And one that never changes is a compositor that
+				// is not drawing, however alive its process list
+				// looks. One second is long enough for a greeter
+				// with a clock on it.
+				{
+					uint64_t before = read_frame(dmabuf, map, sink, size);
+					uint64_t after;
+
+					sleep(1);
+					after = read_frame(dmabuf, map, sink, size);
+					printf("content over one second: %s\n",
+					       before == after
+						       ? "unchanged (nothing is drawing)"
+						       : "changed (the compositor is drawing)");
+				}
 				free(sink);
 			}
 			munmap(map, size);
