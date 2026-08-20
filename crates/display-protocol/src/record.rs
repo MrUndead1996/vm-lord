@@ -209,6 +209,232 @@ impl Error for RecordError {
     }
 }
 
+/// The most a control record may carry.
+///
+/// Fixed, because nothing on this channel is a payload: hellos, tags, mode
+/// changes and errors.
+pub const CONTROL_MAX_PAYLOAD: u32 = 64 * 1024;
+
+/// The most an input record may carry.
+pub const INPUT_MAX_PAYLOAD: u32 = 4 * 1024;
+
+/// The most a frame record may carry whatever the geometry says.
+///
+/// A backstop against a geometry that is itself absurd, since the cap below is
+/// computed from numbers a peer sent.
+pub const FRAME_PAYLOAD_CEILING: u32 = 64 * 1024 * 1024;
+
+/// What a frame record may carry beyond its uncompressed pixels.
+///
+/// A keyframe should never exceed its raw size, but a codec header, a cursor
+/// and a tile map are not pixels, and refusing a frame for its metadata would
+/// be a limit that fires on correct behaviour.
+pub const FRAME_PAYLOAD_SLACK: u32 = 64 * 1024;
+
+/// What a session's records may weigh, given what it agreed to display.
+///
+/// The frame cap is derived rather than fixed: a record larger than an
+/// uncompressed frame of the agreed geometry is not a frame by definition, so
+/// "oversized" says something about this session instead of naming a number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    frame: u32,
+}
+
+impl Limits {
+    /// The limits for a session displaying `width` by `height`.
+    #[must_use]
+    pub fn new(width: u32, height: u32) -> Self {
+        let mut limits = Self { frame: 0 };
+        limits.set_geometry(width, height);
+        limits
+    }
+
+    /// Moves the frame cap to a new geometry, as a `StreamConfig` does.
+    pub fn set_geometry(&mut self, width: u32, height: u32) {
+        self.frame = width
+            .saturating_mul(height)
+            .saturating_mul(4)
+            .saturating_add(FRAME_PAYLOAD_SLACK)
+            .min(FRAME_PAYLOAD_CEILING);
+    }
+
+    /// The largest payload `channel` may carry in this session.
+    #[must_use]
+    pub fn for_channel(&self, channel: Channel) -> u32 {
+        match channel {
+            Channel::Control => CONTROL_MAX_PAYLOAD,
+            Channel::Frame => self.frame,
+            Channel::Input => INPUT_MAX_PAYLOAD,
+        }
+    }
+}
+
+/// A header and the payload it describes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Record {
+    /// What precedes the payload on the wire.
+    pub header: Header,
+    /// A Protobuf message, or codec bytes on the frame channel's four pixel
+    /// types.
+    pub payload: Vec<u8>,
+}
+
+impl Record {
+    /// Builds a record, filling in the length and the checksum.
+    ///
+    /// Those two are the header's own arithmetic rather than a caller's, which
+    /// is what keeps a record from ever announcing a length it does not carry.
+    #[must_use]
+    pub fn new(
+        channel: Channel,
+        message_type: u16,
+        sequence: u32,
+        base: u32,
+        generation: u32,
+        payload: Vec<u8>,
+    ) -> Self {
+        let header = Header {
+            channel,
+            message_type,
+            length: u32::try_from(payload.len()).unwrap_or(u32::MAX),
+            sequence,
+            base,
+            checksum: crc32c::crc32c(&payload),
+            generation,
+        };
+
+        Self { header, payload }
+    }
+}
+
+/// Writes one record and flushes it.
+///
+/// Flushing belongs here rather than to the caller: a buffered transport that
+/// holds a keystroke or a keyframe request back is a session that appears to
+/// have frozen.
+///
+/// # Errors
+///
+/// [`RecordError::TooLarge`] if the payload exceeds its channel's cap, in
+/// which case nothing is written -- a payload that cannot be framed must not
+/// become a truncated one -- or [`RecordError::Io`] if the transport fails.
+pub fn write<W: io::Write>(
+    writer: &mut W,
+    record: &Record,
+    limits: &Limits,
+) -> Result<(), RecordError> {
+    let cap = limits.for_channel(record.header.channel);
+    if record.header.length > cap {
+        return Err(RecordError::TooLarge {
+            channel: record.header.channel,
+            length: record.header.length,
+            cap,
+        });
+    }
+
+    writer
+        .write_all(&record.header.encode())
+        .map_err(RecordError::Io)?;
+    writer.write_all(&record.payload).map_err(RecordError::Io)?;
+    writer.flush().map_err(RecordError::Io)
+}
+
+/// Reads one record, leaving its payload in `payload`.
+///
+/// The cap is enforced from the header, before `payload` is grown, and the
+/// checksum after the bytes are in: the first bounds what a hostile peer can
+/// make this side allocate, the second catches a transport that corrupted what
+/// it carried.
+///
+/// # Errors
+///
+/// [`RecordError::Closed`] if the peer hung up at a record boundary, which is
+/// how a session ends and is not by itself a fault; [`RecordError::Idle`] if
+/// the transport timed out before a record began, so the caller may safely
+/// send one of its own. [`RecordError::MalformedHeader`],
+/// [`RecordError::UnknownChannel`], [`RecordError::TooLarge`],
+/// [`RecordError::ChecksumMismatch`] and [`RecordError::Io`] all leave the
+/// stream unusable and must be answered by closing it.
+pub fn read<R: io::Read>(
+    reader: &mut R,
+    limits: &Limits,
+    payload: &mut Vec<u8>,
+) -> Result<Header, RecordError> {
+    let mut bytes = [0u8; HEADER_LEN];
+    read_header_bytes(reader, &mut bytes)?;
+
+    let (header, extra) = Header::decode(&bytes)?;
+
+    let cap = limits.for_channel(header.channel);
+    if header.length > cap {
+        return Err(RecordError::TooLarge {
+            channel: header.channel,
+            length: header.length,
+            cap,
+        });
+    }
+
+    if extra > 0 {
+        // At most 231 bytes, since `header_len` is one byte wide, so the
+        // buffer is a stack array rather than an allocation a peer sizes.
+        let mut skipped = [0u8; 256];
+        reader
+            .read_exact(&mut skipped[..extra])
+            .map_err(RecordError::Io)?;
+    }
+
+    payload.clear();
+    payload.resize(header.length as usize, 0);
+    reader.read_exact(payload).map_err(RecordError::Io)?;
+
+    let found = crc32c::crc32c(payload);
+    if found != header.checksum {
+        return Err(RecordError::ChecksumMismatch {
+            expected: header.checksum,
+            found,
+        });
+    }
+
+    Ok(header)
+}
+
+/// Fills `bytes`, telling a connection that ended between records from one
+/// that ended inside a header.
+///
+/// `Read::read_exact` reports both as `UnexpectedEof`, and they mean opposite
+/// things: the first is a peer that finished, the second is a cut stream.
+fn read_header_bytes<R: io::Read>(
+    reader: &mut R,
+    bytes: &mut [u8; HEADER_LEN],
+) -> Result<(), RecordError> {
+    let mut filled = 0;
+    while filled < bytes.len() {
+        match reader.read(&mut bytes[filled..]) {
+            Ok(0) if filled == 0 => return Err(RecordError::Closed),
+            Ok(0) => {
+                return Err(RecordError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the connection ended part-way through a record header",
+                )));
+            }
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error)
+                if filled == 0
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                    ) =>
+            {
+                return Err(RecordError::Idle);
+            }
+            Err(error) => return Err(RecordError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +506,132 @@ mod tests {
             Header::decode(&bytes),
             Err(RecordError::UnknownChannel { value: 9 })
         ));
+    }
+
+    #[test]
+    fn the_frame_cap_is_a_raw_frame_of_the_agreed_geometry_plus_slack() {
+        let limits = Limits::new(2560, 1440);
+
+        assert_eq!(limits.for_channel(Channel::Frame), 2560 * 1440 * 4 + 65536);
+        assert_eq!(limits.for_channel(Channel::Control), 65536);
+        assert_eq!(limits.for_channel(Channel::Input), 4096);
+    }
+
+    #[test]
+    fn a_geometry_that_would_overflow_the_cap_is_held_at_the_ceiling() {
+        let limits = Limits::new(u32::MAX, u32::MAX);
+
+        assert_eq!(limits.for_channel(Channel::Frame), FRAME_PAYLOAD_CEILING);
+    }
+
+    #[test]
+    fn a_resolution_change_moves_the_frame_cap() {
+        let mut limits = Limits::new(1920, 1080);
+        limits.set_geometry(1280, 720);
+
+        assert_eq!(limits.for_channel(Channel::Frame), 1280 * 720 * 4 + 65536);
+    }
+
+    #[test]
+    fn a_record_survives_a_round_trip_through_a_stream() {
+        let limits = Limits::new(64, 64);
+        let record = Record::new(Channel::Control, 8, 3, 0, 0, b"payload".to_vec());
+
+        let mut wire = Vec::new();
+        write(&mut wire, &record, &limits).expect("a record within the control cap");
+
+        let mut payload = Vec::new();
+        let header = read(&mut wire.as_slice(), &limits, &mut payload).expect("what was written");
+
+        assert_eq!(header, record.header);
+        assert_eq!(payload, b"payload");
+    }
+
+    #[test]
+    fn a_payload_over_its_channel_cap_is_never_written() {
+        let limits = Limits::new(64, 64);
+        let record = Record::new(Channel::Input, 5, 0, 0, 0, vec![0u8; 4097]);
+
+        let mut wire = Vec::new();
+        let error = write(&mut wire, &record, &limits).expect_err("a payload over the input cap");
+
+        assert!(matches!(
+            error,
+            RecordError::TooLarge {
+                channel: Channel::Input,
+                length: 4097,
+                cap: 4096
+            }
+        ));
+        assert!(wire.is_empty(), "nothing may reach the wire");
+    }
+
+    #[test]
+    fn a_length_over_the_cap_is_refused_before_anything_is_allocated() {
+        let limits = Limits::new(64, 64);
+        let mut header = Record::new(Channel::Frame, 5, 0, 0, 0, Vec::new()).header;
+        header.length = limits.for_channel(Channel::Frame) + 1;
+
+        let mut payload = Vec::new();
+        let error = read(&mut header.encode().as_slice(), &limits, &mut payload)
+            .expect_err("a length over the frame cap");
+
+        assert!(matches!(error, RecordError::TooLarge { .. }));
+    }
+
+    #[test]
+    fn a_payload_that_does_not_match_its_checksum_is_refused() {
+        let limits = Limits::new(64, 64);
+        let record = Record::new(Channel::Control, 8, 0, 0, 0, b"payload".to_vec());
+
+        let mut wire = Vec::new();
+        write(&mut wire, &record, &limits).expect("a record within the control cap");
+        let last = wire.len() - 1;
+        wire[last] ^= 0xFF;
+
+        let mut payload = Vec::new();
+        let error =
+            read(&mut wire.as_slice(), &limits, &mut payload).expect_err("a corrupt payload");
+
+        assert!(matches!(error, RecordError::ChecksumMismatch { .. }));
+    }
+
+    #[test]
+    fn a_peer_that_hangs_up_between_records_is_not_a_fault() {
+        let limits = Limits::new(64, 64);
+        let mut payload = Vec::new();
+
+        let error = read(&mut [].as_slice(), &limits, &mut payload).expect_err("an empty stream");
+
+        assert!(matches!(error, RecordError::Closed));
+    }
+
+    #[test]
+    fn a_stream_cut_inside_a_header_is_a_fault() {
+        let limits = Limits::new(64, 64);
+        let mut payload = Vec::new();
+
+        let error = read(&mut [24u8, 1, 0].as_slice(), &limits, &mut payload)
+            .expect_err("a truncated header");
+
+        assert!(matches!(error, RecordError::Io(_)));
+    }
+
+    #[test]
+    fn the_extra_bytes_of_a_newer_minors_header_are_skipped() {
+        let limits = Limits::new(64, 64);
+        let record = Record::new(Channel::Control, 8, 0, 0, 0, b"payload".to_vec());
+
+        let mut wire = record.header.encode().to_vec();
+        wire[0] = 28;
+        wire.extend_from_slice(&[0xAA; 4]);
+        wire.extend_from_slice(&record.payload);
+
+        let mut payload = Vec::new();
+        let header =
+            read(&mut wire.as_slice(), &limits, &mut payload).expect("a newer minor's record");
+
+        assert_eq!(header.message_type, 8);
+        assert_eq!(payload, b"payload");
     }
 }
