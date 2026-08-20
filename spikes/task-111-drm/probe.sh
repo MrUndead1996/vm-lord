@@ -359,6 +359,79 @@ stage_pattern() {
 }
 
 # ---------------------------------------------------------------------------
+# Stage: poc  /  poc-check
+#
+# The proof of one virtual output. asb_drm is the reference implementation of
+# the shape the decision picked, so build it unchanged rather than write a
+# VMLord module first: if GDM binds it at a resolution hyperv_drm cannot
+# offer, and the pointer lands on its own plane, the shape is proven and the
+# only work left is the rename and the packaging.
+#
+# Copy the AppSandbox sources next to this script first:
+#
+#     scp -r appsandbox/tools/linux/asb_drm  <vm>:/home/<user>/
+#
+# 'poc' installs and reboots; 'poc-check' is what you run when it comes back,
+# at the greeter, not logged in.
+# ---------------------------------------------------------------------------
+stage_poc() {
+	if [ ! -f "$DIR/asb_drm/deploy.sh" ]; then
+		note "no $DIR/asb_drm/deploy.sh -- copy the AppSandbox sources here first"
+		exit 2
+	fi
+
+	say "what the display looks like before the module"
+	run "ls -l /dev/dri/"
+	drv=$(driver_of_card1)
+	note "driver before: ${drv:-none}"
+
+	say "building and installing asb_drm through DKMS"
+	run "sh $DIR/asb_drm/deploy.sh 2>&1 | tail -n 40"
+	run "dkms status"
+	run "cat /etc/modprobe.d/asb_drm.conf"
+
+	say "rebooting so the blacklist and the autoload take effect"
+	note "when it comes back, do NOT log in -- run: sudo sh probe.sh poc-check"
+	run "sleep 3; systemctl reboot"
+}
+
+stage_poc_check() {
+	say "did the module take the display"
+	run "lsmod | grep -E 'asb_drm|hyperv_drm' || echo 'neither loaded'"
+	run "dmesg | grep -iE 'asb|drm' | tail -n 20"
+	run "ls -l /dev/dri/"
+	for node in /dev/dri/card*; do
+		[ -e "$node" ] || continue
+		describe_card "$node"
+	done
+
+	say "the modes it offers -- the point is the ones hyperv_drm cannot"
+	drv=$(driver_of_card1)
+	note "driver under test: ${drv:-none}"
+	run "modetest -M ${drv:-none} -c 2>&1 | head -n 40"
+
+	say "did GDM bind it before login"
+	run "systemctl is-active gdm graphical.target"
+	run "loginctl seat-status seat0 2>&1 | head -n 30"
+	run "journalctl -b --no-pager | grep -iE 'mutter|Added device|cursor plane|primary GPU' | tail -n 30"
+
+	say "reading the greeter off the module's planes"
+	if [ ! -x "$DIR/plane_capture" ]; then
+		run "cc -O2 -Wall -o $DIR/plane_capture $DIR/plane_capture.c \$(pkg-config --cflags --libs libdrm)"
+	fi
+	for node in /dev/dri/card*; do
+		[ -e "$node" ] || continue
+		run "$DIR/plane_capture $node 60 $OUT/poc-\$(basename $node).ppm"
+	done
+	run "ls -l $OUT/*.ppm"
+
+	note ""
+	note "stage 'poc-check' done -- log at $LOG"
+	note "Two things decide it: a mode list that goes past 1920x1080, and a"
+	note "plane line saying (cursor) with an fb of its own."
+}
+
+# ---------------------------------------------------------------------------
 # Stage: collect
 # ---------------------------------------------------------------------------
 stage_collect() {
@@ -374,6 +447,8 @@ case "$STAGE" in
 	desktop) stage_desktop;;
 	greeter) stage_greeter;;
 	pattern) stage_pattern;;
+	poc)       stage_poc;;
+	poc-check) stage_poc_check;;
 	collect) stage_collect;;
 	*)
 		cat <<'EOF'
@@ -387,6 +462,10 @@ usage: sudo sh probe.sh <stage>
             and whether its framebuffer can be read from outside it
   pattern   with GDM stopped, modetest paints a test pattern and the probe
             reads it back -- separates a broken capture from a blank desktop
+  poc       build asb_drm through DKMS and reboot onto it (needs the
+            AppSandbox sources copied to ./asb_drm)
+  poc-check at the greeter afterwards: what the module gives and what a
+            capture reads off it
   collect   tar up /var/log/vmlord-drm-spike for the report
 EOF
 		exit 2;;
