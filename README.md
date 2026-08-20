@@ -145,6 +145,16 @@ from a local ISO, which boots to the distribution's own installer, or from an
 Ubuntu cloud image, which needs no one at the keyboard: there the image is
 downloaded and imported into a VHDX, and the guest is provisioned
 by cloud-init from a NoCloud seed VMLord writes itself, with COM1 available as a
-diagnostic console. Display, snapshots, and GPU work remain migration work.
-AppSandbox macOS code, WebView UI, provisioning tools, and display resources are
-not included.
+diagnostic console.
+
+GPU-PV runs on the native backend: a VM asks for `None`, `Default` or `Mirror`,
+the host attaches what it can and exports the driver package and Linux
+userspace beside it, and the guest agent brings the device up and reports what
+it renders on. It is applied best effort and never decides whether a VM starts.
+See **[docs/gpu-pv-compatibility.md](docs/gpu-pv-compatibility.md)** for what a
+host, a guest and a payload must be, and
+**[docs/gpu-pv-troubleshooting.md](docs/gpu-pv-troubleshooting.md)** for
+reading a GPU status that is not what it should be.
+
+Display and snapshots remain migration work. AppSandbox macOS code, WebView UI,
+provisioning tools, and display resources are not included.
