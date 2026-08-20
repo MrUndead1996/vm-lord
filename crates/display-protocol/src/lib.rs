@@ -12,6 +12,7 @@
 //! format shows up in a diff.
 
 pub mod handshake;
+pub mod keys;
 pub mod record;
 
 /// The generated types for `vmlord.display.v1`.
