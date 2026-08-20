@@ -139,3 +139,33 @@ That is the whole argument for a module of our own over vkms. vkms already
 proves the shape works in-kernel -- arbitrary resolution, a cursor plane, a
 writeback connector, no hardware behind any of it. It is disqualified by
 its name alone.
+
+# The 1024x768 ceiling was ours
+
+`VideoMonitor` in the VM's `config.json` hand-edited to 1920x1080, VM
+restarted, nothing else changed. hyperv_drm now offers 23 modes:
+
+    #0 1920x1080 60.00 ... type: preferred, driver
+    #1 1680x1050 ... #18 1024x768 ... #22 640x480
+    Framebuffer size: Width [0, 1920], Height [0, 1080]
+
+So Synthvid hands the guest exactly what the host declared, and the guest's
+ceiling is a number VMLord chooses at create time -- `VIDEO_WIDTH`/
+`VIDEO_HEIGHT` in `crates/platform/src/hcs_config.rs`, today a constant.
+2560x1440 is still refused (`failed to find mode`), because the host was
+told 1920x1080; the limit follows the declaration, it is not fixed at
+1024x768 as the first two runs suggested.
+
+What does not change with resolution: hyperv_drm still exposes one plane
+(Primary, XRGB8888, LINEAR), no cursor plane, no writeback, no render node,
+and the mode set is fixed for the life of the VM -- a guest cannot ask for
+more than the host declared at start.
+
+Two more details worth keeping:
+
+- At boot simpledrm comes up first (minor 0) and hyperv_drm takes the
+  display from it (minor 1); afterwards only `card1` exists.
+- `modetest -s` on hyperv_drm returns `Permission denied` (mutter holds DRM
+  master) while the same command on vkms succeeds -- because mutter ignores
+  vkms, its master is free. A DRM device GNOME refuses is a device a plain
+  userspace process can own completely.
