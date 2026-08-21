@@ -4602,6 +4602,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vmlord-display-payload"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "serde",
+ "serde_json",
+ "vmlord-payload",
+]
+
+[[package]]
 name = "vmlord-display-protocol"
 version = "0.1.0"
 dependencies = [
