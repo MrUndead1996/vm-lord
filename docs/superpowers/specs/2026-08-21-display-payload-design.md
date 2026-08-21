@@ -155,6 +155,11 @@ The three supported releases are three entries and three archives sharing one
 
 ### Selection
 
+One entry per payload ID, and one per (target, version): several versions for
+one guest is the ordinary state of a catalog that can be updated, so what is
+refused is the *same* version twice, which would make selection depend on the
+order a directory listed two identical candidates.
+
 1. Filter by distribution, release and architecture -- the hard gate, decided
    before the guest boots and therefore without a kernel.
 2. Of what remains, keep entries whose `protocol` range covers
@@ -224,6 +229,16 @@ pointer into the primary plane, which is a working desktop, not a broken one.
   never the staging root, which also holds ready markers and locks.
 * The share is its own: `vmlord.display.payload`, mounted by the guest at
   `/opt/vmlord/display-payload`.
+* **What is exported is `<vm>/display-payload/active`, not a generation.** A
+  compute system's `Devices/Plan9` section is written before the system is
+  built and is immutable for the lifetime of a boot, so a share can name one
+  path -- while a generation is named after its digest and is a different path
+  per version. Versions are therefore *published into* the active directory:
+  declared files first, each through a rename; `payload.json` last, so a guest
+  that reads a manifest finds every file it names already there; and only then
+  is what the new manifest does not declare removed. This is what makes an
+  update possible on a VM that is already running, and it is the one place this
+  design departs from what the plan first assumed.
 * The agent schema gains `AttachDisplayPayloadRequest`/`Response` and grows by a
   minor revision. It is **not** a new role inside `AttachGpuShares`: that would
   make a GPU attach failure a display failure, which is the lifecycle merge this
