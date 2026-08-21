@@ -56,6 +56,17 @@ pub(crate) fn prepare_staging_root(vm_directory: &Path) -> Result<PathBuf, Paylo
     Ok(root)
 }
 
+/// A staged display payload, and the version it carries.
+///
+/// The version travels beside the staged directory because it is what the
+/// status compares against what the guest reported, and the staging root knows
+/// only a payload ID -- which contains the version and is not one.
+#[derive(Debug)]
+pub struct StagedDisplayPayload {
+    pub staged: StagedPayload,
+    pub version: String,
+}
+
 /// Stages the display payload for `guest` into the VM's `display-payload` child.
 ///
 /// A failure here is a failure of the display and not of the VM: the caller
@@ -69,9 +80,10 @@ pub(crate) fn prepare_staging_root(vm_directory: &Path) -> Result<PathBuf, Paylo
 /// expansion or staging reported otherwise.
 pub fn stage_for_vm(
     request: StageDisplayPayloadRequest<'_>,
-) -> Result<StagedPayload, PayloadError> {
+) -> Result<StagedDisplayPayload, PayloadError> {
     let catalog = DisplayPayloadCatalog::from_release_directory(request.executable_directory)?;
     let entry = catalog.select_for_guest(&request.guest, speaks())?;
+    let version = entry.version().to_string();
     let archive = release::archive_path(
         request.executable_directory,
         LOCAL_ARCHIVE_DIRECTORY,
@@ -85,7 +97,8 @@ pub fn stage_for_vm(
         cancel: request.cancel,
     })?;
     let root = prepare_staging_root(request.vm_directory)?;
-    stage_payload(&ready, &root, request.progress, request.cancel)
+    let staged = stage_payload(&ready, &root, request.progress, request.cancel)?;
+    Ok(StagedDisplayPayload { staged, version })
 }
 
 #[cfg(test)]

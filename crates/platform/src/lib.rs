@@ -22,6 +22,7 @@ mod delete;
 mod dhcp;
 mod display_exports;
 mod display_prepare;
+mod display_runs;
 mod display_staging;
 mod enumerate;
 mod error;

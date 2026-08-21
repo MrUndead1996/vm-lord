@@ -27,11 +27,12 @@ use std::{
 
 use uuid::Uuid;
 use vmlord_agent_protocol::{auth::Secret, backoff::Backoff};
-use vmlord_core::{GpuShareManifest, RepositoryError};
+use vmlord_core::{DisplayShare, GpuShareManifest, RepositoryError};
 use zeroize::Zeroizing;
 
 use crate::{
-    agent_session::{self, GuestGpuSink, SessionError},
+    agent_session::{self, GuestDisplaySink, GuestGpuSink, SessionError},
+    display_runs::DisplayRuns,
     gpu_runs::GpuRuns,
     hvsocket::{ACCEPT_POLL, AgentListener},
     metadata::VmComputeSystemMapping,
@@ -122,7 +123,9 @@ impl AgentConnection {
         runtime_id: Uuid,
         secret_path: &Path,
         shares: Option<GpuShareManifest>,
+        display_share: Option<DisplayShare>,
         facts: GpuRuns,
+        display_facts: DisplayRuns,
     ) -> Result<Self, RepositoryError> {
         let vm_name = mapping.vm_name.clone();
         let vm_id = mapping.vm_id;
@@ -142,10 +145,20 @@ impl AgentConnection {
                         &listener,
                         &secret,
                         shares.as_ref(),
+                        display_share.as_ref(),
                         &vm_name,
                         &online,
                         &running,
                         &|report| facts.record_guest(vm_id, report),
+                        &|report| {
+                            display_facts.record_guest_payload(
+                                vm_id,
+                                report.installed,
+                                report.previous,
+                                report.loaded,
+                                report.failure,
+                            );
+                        },
                     )
                 }
             })
@@ -218,14 +231,20 @@ impl Drop for AgentConnection {
 /// connects and drops as fast as this thread can accept is a broken agent or
 /// something else on the machine that found the service, and serving it at that
 /// rate would cost a busy thread per VM.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one thread serves both stacks, and each needs what to offer and where to report"
+)]
 fn serve(
     listener: &AgentListener,
     secret: &Secret,
     shares: Option<&GpuShareManifest>,
+    display_share: Option<&DisplayShare>,
     vm_name: &str,
     online: &AtomicBool,
     running: &Arc<AtomicBool>,
     sink: GuestGpuSink<'_>,
+    display_sink: GuestDisplaySink<'_>,
 ) {
     let mut backoff = Backoff::new();
 
@@ -243,7 +262,17 @@ fn serve(
         let authenticated = match agent_session::open(&mut stream, secret, vm_name) {
             Ok(session) => {
                 online.store(true, Ordering::Relaxed);
-                let outcome = agent_session::serve(&mut stream, &session, shares, vm_name, sink);
+                let outcome = agent_session::serve(
+                    &mut stream,
+                    &session,
+                    agent_session::SessionWork {
+                        gpu_shares: shares,
+                        display_share,
+                        gpu: sink,
+                        display: display_sink,
+                    },
+                    vm_name,
+                );
                 online.store(false, Ordering::Relaxed);
                 if let Err(error) = outcome {
                     report(vm_name, &error);

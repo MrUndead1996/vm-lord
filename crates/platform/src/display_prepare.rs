@@ -31,6 +31,12 @@ pub(crate) struct PreparedDisplay {
     pub(crate) export: Option<DisplayExport>,
     /// Why there is no share, when there is none.
     pub(crate) failure: Option<DisplayFailure>,
+    /// The version this release could offer this guest, when it has one.
+    ///
+    /// Recorded even when the export failed: what a release carries is what a
+    /// person is told about, and a payload that was selected and could not be
+    /// staged is a different sentence from a release that carries none.
+    pub(crate) available_version: Option<String>,
 }
 
 /// Stages the payload and builds the export, for a VM that asked for a desktop.
@@ -65,6 +71,7 @@ pub(crate) fn prepare(
                 DisplayStatusCode::PayloadMissing,
                 "this VM records no guest a display payload could be chosen for",
             )),
+            available_version: None,
         });
     };
     let guest = target.display_selector();
@@ -86,20 +93,21 @@ pub(crate) fn prepare(
             return Some(PreparedDisplay {
                 export: None,
                 failure: Some(failure),
+                available_version: None,
             });
         }
     };
 
     let export = display_exports::build(
         vm_directory,
-        Some(staged.generation_directory()),
+        Some(staged.staged.generation_directory()),
         canonicalize,
     );
     if export.is_none() {
         log::warn!(
             "VM \"{}\" staged a display payload at {} that cannot be exported",
             mapping.vm_name,
-            staged.generation_directory().display()
+            staged.staged.generation_directory().display()
         );
     }
     let failure = export.is_none().then(|| {
@@ -109,7 +117,11 @@ pub(crate) fn prepare(
             "the staged display payload could not be offered to the VM",
         )
     });
-    Some(PreparedDisplay { export, failure })
+    Some(PreparedDisplay {
+        export,
+        failure,
+        available_version: Some(staged.version),
+    })
 }
 
 /// What a staging failure means for the display.
