@@ -146,6 +146,19 @@ impl GuestTargetKey {
             architecture: &self.architecture,
         }
     }
+
+    /// The same three facts, as the display catalog's own selector.
+    ///
+    /// Two methods and not one generic one: the two catalogs own their selector
+    /// types, and a shared one would be the first thing tying their lifecycles
+    /// together.
+    pub(crate) fn display_selector(&self) -> vmlord_display_payload::GuestSelector<'_> {
+        vmlord_display_payload::GuestSelector {
+            distribution: &self.distribution,
+            release: &self.release,
+            architecture: &self.architecture,
+        }
+    }
 }
 
 /// Every VM VMLord builds is amd64. The field exists because the catalog has

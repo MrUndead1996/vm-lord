@@ -208,6 +208,13 @@ pub enum DisplayStage {
     Provisioning,
     /// The guest is bringing its display services up.
     Guest,
+    /// The display payload is being verified, built or updated.
+    ///
+    /// Its own stage rather than part of `Provisioning`: installing a desktop
+    /// and installing the module that desktop draws on fail differently, are
+    /// fixed differently, and a person told only "provisioning" would go
+    /// looking in the wrong half.
+    Payload,
 }
 
 impl DisplayStage {
@@ -218,6 +225,7 @@ impl DisplayStage {
             Self::Idle => "idle",
             Self::Provisioning => "provisioning",
             Self::Guest => "guest",
+            Self::Payload => "payload",
         }
     }
 }
@@ -269,6 +277,30 @@ pub enum DisplayStatusCode {
     /// The guest's display services are installed and not running.
     #[serde(rename = "display-guest-services-failed")]
     GuestServicesFailed,
+    /// This build carries no display payload for this guest.
+    #[serde(rename = "display-payload-missing")]
+    PayloadMissing,
+    /// A display payload is there and is not what it claims to be.
+    #[serde(rename = "display-payload-invalid")]
+    PayloadInvalid,
+    /// The guest could not install what building the module needs.
+    #[serde(rename = "display-payload-dependencies-failed")]
+    PayloadDependenciesFailed,
+    /// The module would not build for the guest's running kernel.
+    #[serde(rename = "display-payload-build-failed")]
+    PayloadBuildFailed,
+    /// The module built and would not load.
+    #[serde(rename = "display-payload-module-not-loaded")]
+    PayloadModuleNotLoaded,
+    /// The module loaded and no display device appeared.
+    #[serde(rename = "display-payload-no-device")]
+    PayloadNoDevice,
+    /// An update did not verify, and the previous version is running again.
+    #[serde(rename = "display-payload-update-rolled-back")]
+    PayloadUpdateRolledBack,
+    /// An update did not verify and the previous version did not come back.
+    #[serde(rename = "display-payload-update-failed")]
+    PayloadUpdateFailed,
 }
 
 impl DisplayStatusCode {
@@ -286,6 +318,14 @@ impl DisplayStatusCode {
             Self::GuestPending => "display-guest-pending",
             Self::GuestReady => "display-guest-ready",
             Self::GuestServicesFailed => "display-guest-services-failed",
+            Self::PayloadMissing => "display-payload-missing",
+            Self::PayloadInvalid => "display-payload-invalid",
+            Self::PayloadDependenciesFailed => "display-payload-dependencies-failed",
+            Self::PayloadBuildFailed => "display-payload-build-failed",
+            Self::PayloadModuleNotLoaded => "display-payload-module-not-loaded",
+            Self::PayloadNoDevice => "display-payload-no-device",
+            Self::PayloadUpdateRolledBack => "display-payload-update-rolled-back",
+            Self::PayloadUpdateFailed => "display-payload-update-failed",
         }
     }
 
@@ -293,7 +333,10 @@ impl DisplayStatusCode {
     ///
     /// A download that failed and an install that was interrupted are worth
     /// another attempt; a release that has no desktop packages is not, and a
-    /// retry offered for it would only fail the same way.
+    /// retry offered for it would only fail the same way. The same line runs
+    /// through the payload's causes: a build that failed may build on the next
+    /// start, and a release that carries no payload for this guest will carry
+    /// none on the next start either.
     #[must_use]
     pub const fn is_retryable(self) -> bool {
         matches!(
@@ -302,6 +345,12 @@ impl DisplayStatusCode {
                 | Self::PackageInstallFailed
                 | Self::ProvisioningTimeout
                 | Self::GuestServicesFailed
+                | Self::PayloadDependenciesFailed
+                | Self::PayloadBuildFailed
+                | Self::PayloadModuleNotLoaded
+                | Self::PayloadNoDevice
+                | Self::PayloadUpdateRolledBack
+                | Self::PayloadUpdateFailed
         )
     }
 }
@@ -310,6 +359,22 @@ impl std::fmt::Display for DisplayStatusCode {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
     }
+}
+
+/// The name the display payload share is offered and mounted under.
+pub const DISPLAY_PAYLOAD_SHARE: &str = "vmlord.display.payload";
+
+/// The one share a VM's display is offered.
+///
+/// Its own type and not a GPU share with another role: a GPU manifest that
+/// failed to attach must not be able to take the display with it, and a role
+/// added to the GPU enum would be exactly that coupling. It carries a name and
+/// nothing else, because there is one display share and the guest knows what to
+/// do with it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DisplayShare {
+    /// The share's name, which is also `aname=` when the guest mounts it.
+    pub name: String,
 }
 
 /// What a backend observed about a VM's display, without deciding what it
@@ -325,8 +390,50 @@ impl std::fmt::Display for DisplayStatusCode {
 pub struct VmDisplayFacts {
     /// What the guest agent last reported about its display services.
     pub guest: Option<GuestDisplayReport>,
+    /// What is installed of the display payload, and what could be.
+    pub payload: DisplayPayloadFacts,
+    /// What the payload half last failed at, when it has failed.
+    ///
+    /// Separate from the guest report's own `Failed`, because that one is
+    /// about services that are installed and not running, and this one is
+    /// about a module that is not installed at all.
+    pub failure: Option<DisplayFailure>,
     /// When that report was observed. `None` while there is none.
     pub observed_at: Option<SystemTime>,
+}
+
+/// Which versions of the display payload are in play for one VM.
+///
+/// Facts, not stored: an update needs a running VM to ask, so a stopped one has
+/// no question to answer, and a version read before a stop says nothing about
+/// what is installed after one. Versions are strings here because the host does
+/// not order them -- the catalog does, and it does so with a type of its own.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DisplayPayloadFacts {
+    /// The version DKMS has installed, when the guest has said.
+    pub installed: Option<String>,
+    /// The version DKMS still holds beside it, which is what a failed update
+    /// would roll back to.
+    pub previous: Option<String>,
+    /// The version of the module that is actually loaded.
+    pub loaded: Option<String>,
+    /// The best version this release could offer this guest.
+    pub available: Option<String>,
+}
+
+impl DisplayPayloadFacts {
+    /// Whether a newer version could be installed than the one running.
+    ///
+    /// An offer and never an action: a start installs what is missing and
+    /// nothing else, and moving to a newer version is something a person asks
+    /// for.
+    #[must_use]
+    pub fn update_available(&self) -> bool {
+        match (&self.installed, &self.available) {
+            (Some(installed), Some(available)) => installed != available,
+            _ => false,
+        }
+    }
 }
 
 /// What the guest agent last said about the display services inside it.
@@ -385,6 +492,10 @@ pub struct VmDisplayStatus {
     pub state: DisplayState,
     pub stage: DisplayStage,
     pub code: DisplayStatusCode,
+    /// The payload version the guest is running, when it has said.
+    pub running_version: Option<String>,
+    /// A newer version this release offers, when there is one.
+    pub available_version: Option<String>,
     /// What to show a person, with whatever detail there is.
     pub message: String,
     /// What the guest reported, when it has reported anything.
@@ -407,6 +518,61 @@ impl VmDisplayStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_release_with_no_payload_for_this_guest_is_not_worth_retrying() {
+        assert!(!DisplayStatusCode::PayloadMissing.is_retryable());
+        assert!(!DisplayStatusCode::PayloadInvalid.is_retryable());
+    }
+
+    #[test]
+    fn a_build_that_failed_is_worth_another_attempt() {
+        for code in [
+            DisplayStatusCode::PayloadDependenciesFailed,
+            DisplayStatusCode::PayloadBuildFailed,
+            DisplayStatusCode::PayloadModuleNotLoaded,
+            DisplayStatusCode::PayloadNoDevice,
+        ] {
+            assert!(code.is_retryable(), "{code} should be retryable");
+        }
+    }
+
+    #[test]
+    fn every_payload_code_serializes_as_the_string_it_logs() {
+        let code = DisplayStatusCode::PayloadUpdateRolledBack;
+
+        assert_eq!(code.as_str(), "display-payload-update-rolled-back");
+        assert_eq!(
+            serde_json::to_string(&code).unwrap(),
+            "\"display-payload-update-rolled-back\""
+        );
+    }
+
+    #[test]
+    fn the_payload_has_a_stage_of_its_own_because_it_is_not_a_provisioning() {
+        assert_eq!(DisplayStage::Payload.as_str(), "payload");
+        assert_ne!(DisplayStage::Payload, DisplayStage::Provisioning);
+    }
+
+    #[test]
+    fn an_update_is_available_only_when_two_versions_differ() {
+        let running = |installed: &str, available: &str| DisplayPayloadFacts {
+            installed: Some(installed.to_owned()),
+            available: Some(available.to_owned()),
+            ..DisplayPayloadFacts::default()
+        };
+
+        assert!(running("0.1.0", "0.2.0").update_available());
+        assert!(!running("0.2.0", "0.2.0").update_available());
+        assert!(
+            !DisplayPayloadFacts {
+                available: Some("0.2.0".to_owned()),
+                ..DisplayPayloadFacts::default()
+            }
+            .update_available(),
+            "a guest that has said nothing is not a guest with an update waiting"
+        );
+    }
 
     #[test]
     fn a_new_vm_asks_for_a_desktop() {

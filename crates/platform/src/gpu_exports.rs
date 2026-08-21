@@ -10,7 +10,7 @@
 //! VM directory. What is exported afterwards is the canonical path, not the
 //! one discovery reported.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use vmlord_core::{GpuShare, GpuShareManifest, HostGpuAdapter, RepositoryError};
 use windows::{
@@ -29,7 +29,7 @@ use windows::{
 };
 
 use crate::error::windows_error;
-use crate::layout::gpu_payload_staging_directory;
+use crate::{layout::gpu_payload_staging_directory, paths::is_within};
 
 /// Resolves a path to its canonical form, failing if it is not a directory.
 pub(crate) type Canonicalize<'a> = &'a dyn Fn(&Path) -> Result<PathBuf, RepositoryError>;
@@ -496,32 +496,6 @@ pub(crate) fn build_with_payload(
         );
     }
     (!exports.is_empty()).then_some(GpuExports { exports })
-}
-
-/// Whether `path` is `root` or lies under it, compared component by component.
-///
-/// Not a string prefix: `...\FileRepositoryEvil` starts with
-/// `...\FileRepository` and is a different directory.
-fn is_within(root: &Path, path: &Path) -> bool {
-    let mut root_components = root.components();
-    let mut path_components = path.components();
-
-    loop {
-        match (root_components.next(), path_components.next()) {
-            (None, _) => return true,
-            (Some(_), None) => return false,
-            (Some(expected), Some(actual)) if component_eq(expected, actual) => {}
-            (Some(_), Some(_)) => return false,
-        }
-    }
-}
-
-/// Windows paths are case-insensitive, and the two spellings of one directory
-/// are the same directory.
-fn component_eq(left: Component<'_>, right: Component<'_>) -> bool {
-    left.as_os_str()
-        .to_string_lossy()
-        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {

@@ -14,13 +14,17 @@ use crate::{
     Com1LogMode, HcsClient, HcsSystem, cleanup,
     com1_terminal::{Com1Launcher, Com1Session},
     dhcp::{self, DhcpRegistrar},
+    display_exports::DisplayExport,
+    display_prepare::{self, PreparedDisplay},
     gpu_assignment,
+    gpu_exports::GpuExports,
     gpu_prepare::{self, PreparedGpu},
     gpu_runs::GpuRuns,
     hcn::HcnNetwork,
     hcn_endpoint::{EndpointAddress, HcnEndpoint},
     hcs::{HCS_ACCESS_ALL, HcsStartFailure, HcsSystemState},
-    hcs_config, layout,
+    hcs_config::{self, Plan9Export},
+    layout,
     metadata::{MetadataStore, VmComputeSystemMapping},
 };
 
@@ -64,6 +68,9 @@ type EndpointProvider = Box<
         + Sync,
 >;
 
+/// Prepares a VM's display payload before its compute system is built.
+type DisplayPreparer =
+    Box<dyn Fn(&VmComputeSystemMapping, &Path) -> Option<PreparedDisplay> + Send + Sync>;
 /// Prepares a VM's GPU before its compute system is built.
 type GpuPreparer = Box<dyn Fn(&VmComputeSystemMapping, &Path) -> Option<PreparedGpu> + Send + Sync>;
 /// Attaches the adapters a mode asks for to a compute system that is running.
@@ -78,6 +85,7 @@ pub struct VmStartPipeline {
     endpoint_provider: EndpointProvider,
     dhcp_registrar: DhcpRegistrar,
     gpu_preparer: GpuPreparer,
+    display_preparer: DisplayPreparer,
     gpu_assigner: GpuAssigner,
     /// Where what a start observes about a VM's GPU is recorded, and where the
     /// manifest its agent will be offered is left.
@@ -101,6 +109,9 @@ impl VmStartPipeline {
             // A pipeline nobody has given a place to record GPU in starts VMs
             // without one. `for_vms_under` is what the application builds.
             gpu_preparer: Box::new(|_mapping, _vm_directory| None),
+            // Likewise: a pipeline with nowhere to stage a display payload
+            // starts VMs whose guests find none.
+            display_preparer: Box::new(|_mapping, _vm_directory| None),
             gpu_assigner: Box::new(gpu_assignment::assign_to_system),
             gpu_runs: GpuRuns::default(),
         }
@@ -135,6 +146,17 @@ impl VmStartPipeline {
                 &AtomicBool::new(false),
             )
         });
+        let display_executable = executable_directory_for_display();
+        let display_cache_root = layout::payload_cache_root(storage_root);
+        self.display_preparer = Box::new(move |mapping, vm_directory| {
+            display_prepare::prepare(
+                mapping,
+                vm_directory,
+                &display_executable,
+                &display_cache_root,
+                &canonicalize_for_export,
+            )
+        });
         self.gpu_runs = gpu_runs;
         self
     }
@@ -165,6 +187,9 @@ impl VmStartPipeline {
             system_starter: Box::new(system_starter),
             endpoint_provider: Box::new(endpoint_provider),
             dhcp_registrar: Box::new(dhcp_registrar),
+            // No display payload either: a test of the start itself is a test
+            // of the start itself.
+            display_preparer: Box::new(|_mapping, _vm_directory| None),
             // A VM with no GPU is what every test of the start itself is
             // about; the GPU steps have tests of their own below.
             gpu_preparer: Box::new(|_mapping, _vm_directory| None),
@@ -174,6 +199,23 @@ impl VmStartPipeline {
     }
 
     /// The same pipeline with its GPU steps substituted.
+    /// The same pipeline, preparing a display payload the caller supplies.
+    ///
+    /// Its own builder rather than an argument to `with_gpu`: a test of the
+    /// display half must be able to say nothing about the GPU, which is what
+    /// every VM in this crate's tests does.
+    #[cfg(test)]
+    fn with_display(
+        mut self,
+        display_preparer: impl Fn(&VmComputeSystemMapping, &Path) -> Option<PreparedDisplay>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        self.display_preparer = Box::new(display_preparer);
+        self
+    }
+
     #[cfg(test)]
     fn with_gpu(
         mut self,
@@ -241,6 +283,7 @@ impl VmStartPipeline {
         // lifetime of a boot. Prepared once even though the start below may be
         // retried -- staging, enumeration and assignment are never repeated.
         let prepared = self.prepare_gpu(&mapping, vm_directory);
+        let display = (self.display_preparer)(&mapping, vm_directory);
 
         let (configuration, endpoint) = self.attach_network(
             store,
@@ -250,7 +293,12 @@ impl VmStartPipeline {
             mapping.endpoint_id,
             EndpointPolicy::Reuse,
         )?;
-        let configuration = with_gpu_shares(&mapping, configuration, prepared.as_ref());
+        let configuration = with_plan9_shares(
+            &mapping,
+            configuration,
+            prepared.as_ref(),
+            display.as_ref().and_then(|display| display.export.as_ref()),
+        );
         self.grant_access_to_attachments(&mapping, &configuration)?;
 
         let failure = match self.open_console_and_start(&mapping, vm_directory, &configuration) {
@@ -291,7 +339,12 @@ impl VmStartPipeline {
             Some(endpoint),
             EndpointPolicy::Replace,
         )?;
-        let configuration = with_gpu_shares(&mapping, configuration, prepared.as_ref());
+        let configuration = with_plan9_shares(
+            &mapping,
+            configuration,
+            prepared.as_ref(),
+            display.as_ref().and_then(|display| display.export.as_ref()),
+        );
         self.grant_access_to_attachments(&mapping, &configuration)?;
         let session = self
             .open_console_and_start(&mapping, vm_directory, &configuration)
@@ -589,31 +642,70 @@ fn attachment_paths(document: &str) -> Result<Vec<PathBuf>, RepositoryError> {
         .collect())
 }
 
-/// Writes this run's GPU shares into the configuration the system is built
-/// from, or leaves it alone when there are none.
+/// Writes this run's shares into the configuration the system is built from,
+/// or leaves it alone when there are none.
+///
+/// The GPU's shares and the display's meet here and nowhere earlier: they are
+/// decided separately and mean different things when they are missing, but HCS
+/// has one Plan9 device and it takes one list.
 ///
 /// A configuration that will not take them is logged and used as it stands: a
 /// VM that starts without its shares is a VM whose guest finds no GPU
-/// userspace, which is worse than a GPU and better than no VM.
-fn with_gpu_shares(
+/// userspace and no display payload, which is worse than a VM with both and
+/// better than no VM.
+fn with_plan9_shares(
     mapping: &VmComputeSystemMapping,
     configuration: String,
     prepared: Option<&PreparedGpu>,
+    display_payload: Option<&DisplayExport>,
 ) -> String {
-    let Some(exports) = prepared.and_then(|prepared| prepared.exports.as_ref()) else {
+    let mut exports: Vec<Plan9Export<'_>> = prepared
+        .and_then(|prepared| prepared.exports.as_ref())
+        .into_iter()
+        .flat_map(GpuExports::iter)
+        .map(|export| Plan9Export {
+            name: export.name(),
+            host_path: export.host_path(),
+        })
+        .collect();
+    if let Some(display) = display_payload {
+        exports.push(Plan9Export {
+            name: display.name(),
+            host_path: display.host_path(),
+        });
+    }
+    if exports.is_empty() {
         return configuration;
-    };
+    }
 
-    match hcs_config::apply_plan9_shares(&configuration, exports) {
+    match hcs_config::apply_plan9_shares(&configuration, &exports) {
         Ok(updated) => updated,
         Err(error) => {
             log::warn!(
-                "VM \"{}\" starts without its GPU shares: {error}",
+                "VM \"{}\" starts without its Plan9 shares: {error}",
                 mapping.vm_name
             );
             configuration
         }
     }
+}
+
+/// The directory the running executable lives in, for the display payload.
+///
+/// Read once per pipeline for the same reason the GPU's is: the executable
+/// does not move while VMLord runs, and a start that could not name its own
+/// directory is a start with no payload rather than one that fails.
+fn executable_directory_for_display() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+        .unwrap_or_default()
+}
+
+/// Canonicalizes a path the way an export must have it.
+fn canonicalize_for_export(path: &Path) -> Result<PathBuf, RepositoryError> {
+    std::fs::canonicalize(path)
+        .map_err(|error| RepositoryError::new(format!("{}: {error}", path.display())))
 }
 
 fn grant_vm_access(id: &str, path: &Path) -> Result<(), RepositoryError> {

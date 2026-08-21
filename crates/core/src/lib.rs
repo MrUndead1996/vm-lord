@@ -10,9 +10,10 @@ pub mod settings;
 pub mod ssh;
 
 pub use display::{
-    DesktopProfile, DisplayFailure, DisplayProvisioning, DisplayStage, DisplayState,
-    DisplayStatusCode, GuestDisplayDetail, GuestDisplayReport, MIN_DESKTOP_CPU_CORES,
-    MIN_DESKTOP_RAM_MB, VmDisplayFacts, VmDisplayStatus, desktop_resource_advice,
+    DISPLAY_PAYLOAD_SHARE, DesktopProfile, DisplayFailure, DisplayPayloadFacts,
+    DisplayProvisioning, DisplayShare, DisplayStage, DisplayState, DisplayStatusCode,
+    GuestDisplayDetail, GuestDisplayReport, MIN_DESKTOP_CPU_CORES, MIN_DESKTOP_RAM_MB,
+    VmDisplayFacts, VmDisplayStatus, desktop_resource_advice,
 };
 pub use distro::{DesktopSetup, DistroProfile, SshDaemon, SshUnits, ubuntu};
 pub use gpu::{

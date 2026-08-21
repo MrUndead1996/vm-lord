@@ -50,6 +50,11 @@ pub(crate) fn configuration_path(vm_directory: &Path) -> PathBuf {
 /// One cache and not one per VM: a generation is content-addressed, so two VMs
 /// on the same payload share the files rather than each unpacking their own
 /// copy of them.
+pub(crate) fn payload_cache_root(storage_root: &Path) -> PathBuf {
+    storage_root.join("cache")
+}
+
+/// The GPU payload's own name for the shared cache root.
 pub(crate) fn gpu_payload_cache_root(storage_root: &Path) -> PathBuf {
     storage_root.join("cache")
 }
