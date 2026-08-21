@@ -15,7 +15,7 @@ use vmlord_display_payload::{
     DisplayCatalogEntry, DisplayPayloadCatalog, GuestSelector, ProtocolVersionParts,
     builder::{PackRequest, pack},
 };
-use vmlord_payload::{PayloadEntry, PayloadFiles, Sha256Digest};
+use vmlord_payload::Sha256Digest;
 
 const COMMIT: &str = "14794180686c2fb6307fbe359c359bec765249f3";
 const SPEAKS_1_0: ProtocolVersionParts = ProtocolVersionParts { major: 1, minor: 0 };

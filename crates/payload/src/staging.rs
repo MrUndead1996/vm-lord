@@ -20,6 +20,7 @@ const READY_MARKER_SIZE_LIMIT: u64 = 64 * 1024;
 static NEXT_OPERATION: AtomicU64 = AtomicU64::new(0);
 
 /// One payload generation, published into one VM's directory.
+#[derive(Debug)]
 pub struct StagedPayload {
     payload_id: String,
     generation: Sha256Digest,

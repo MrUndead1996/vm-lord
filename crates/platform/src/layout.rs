@@ -58,6 +58,15 @@ pub(crate) fn gpu_payload_staging_directory(vm_directory: &Path) -> PathBuf {
     vm_directory.join("gpu-payload")
 }
 
+/// The exact per-VM directory that may hold staged display payload generations.
+///
+/// Beside `gpu-payload` and never inside it: the two are exported as different
+/// shares to a guest that mounts them separately, and a cleanup that removes
+/// one must not reach the other.
+pub(crate) fn display_payload_staging_directory(vm_directory: &Path) -> PathBuf {
+    vm_directory.join("display-payload")
+}
+
 /// Returns the path of the VM's serial-console capture.
 ///
 /// Beside `config.json` rather than under `disks/`: it describes what the VM
