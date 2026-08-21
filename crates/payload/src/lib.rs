@@ -12,6 +12,7 @@
 
 pub mod archive;
 mod cache;
+pub mod catalog;
 mod digest;
 mod entry;
 mod error;

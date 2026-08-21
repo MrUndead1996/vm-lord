@@ -20,10 +20,6 @@ pub fn local_entry_path(directory: &Path, payload_id: &str) -> PathBuf {
     vmlord_payload::release::entry_path(directory, LOCAL_ARCHIVE_DIRECTORY, payload_id)
 }
 
-pub(crate) fn local_payload_directory(directory: &Path) -> PathBuf {
-    vmlord_payload::release::payload_directory(directory, LOCAL_ARCHIVE_DIRECTORY)
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};

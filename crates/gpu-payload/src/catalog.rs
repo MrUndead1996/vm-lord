@@ -1,6 +1,6 @@
 use crate::{LOCAL_ARCHIVE_DIRECTORY, PayloadError, Sha256Digest};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, ffi::OsStr, fs, path::Path};
+use std::{collections::HashSet, path::Path};
 const ENTRY_SCHEMA_VERSION: u32 = 2;
 const PAYLOAD_ABI_VERSION: u32 = 1;
 
@@ -218,40 +218,10 @@ impl PayloadCatalog {
     /// An archive nothing claims is ignored, because failing over a leftover
     /// file would be a rule worse than the problem.
     pub fn from_release_directory(directory: &Path) -> Result<Self, PayloadError> {
-        let payloads = crate::release::local_payload_directory(directory);
-        let Ok(listing) = fs::read_dir(&payloads) else {
-            return Self::from_entries(Vec::new());
-        };
-        let mut entries = Vec::new();
-        for item in listing {
-            let Ok(item) = item else {
-                continue;
-            };
-            let path = item.path();
-            if path.extension().and_then(OsStr::to_str) != Some("json") {
-                continue;
-            }
-            let bytes = fs::read(&path)
-                .map_err(|error| PayloadError::io("read GPU payload entry", path.clone(), error))?;
-            let entry = CatalogEntry::from_json(&bytes)?;
-            if path.file_stem().and_then(OsStr::to_str) != Some(entry.payload_id()) {
-                return Err(PayloadError::InvalidCatalog(format!(
-                    "{} does not name its payload ID {}",
-                    path.display(),
-                    entry.payload_id()
-                )));
-            }
-            let archive = crate::local_archive_path(directory, entry.payload_id());
-            if !archive.is_file() {
-                return Err(PayloadError::InvalidCatalog(format!(
-                    "payload {} has no archive at {}",
-                    entry.payload_id(),
-                    archive.display()
-                )));
-            }
-            entries.push(entry);
-        }
-        Self::from_entries(entries)
+        Self::from_entries(vmlord_payload::catalog::read_release_directory(
+            directory,
+            LOCAL_ARCHIVE_DIRECTORY,
+        )?)
     }
     /// The catalog a set of read entries forms.
     ///
