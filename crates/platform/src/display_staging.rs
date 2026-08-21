@@ -17,10 +17,10 @@ use vmlord_display_payload::{
 };
 use vmlord_payload::{
     PayloadError, PayloadProgress, PrepareRequest, StagedPayload, ensure_staging_root, prepare,
-    release, stage_payload,
+    publish_active, release, stage_payload,
 };
 
-use crate::layout::display_payload_staging_directory;
+use crate::layout::{display_payload_active_directory, display_payload_staging_directory};
 
 /// Everything staging a display payload for one VM needs.
 pub struct StageDisplayPayloadRequest<'a> {
@@ -65,6 +65,8 @@ pub(crate) fn prepare_staging_root(vm_directory: &Path) -> Result<PathBuf, Paylo
 pub struct StagedDisplayPayload {
     pub staged: StagedPayload,
     pub version: String,
+    /// The stable path the VM exports, which is what the guest mounts.
+    pub active: PathBuf,
 }
 
 /// Stages the display payload for `guest` into the VM's `display-payload` child.
@@ -98,7 +100,16 @@ pub fn stage_for_vm(
     })?;
     let root = prepare_staging_root(request.vm_directory)?;
     let staged = stage_payload(&ready, &root, request.progress, request.cancel)?;
-    Ok(StagedDisplayPayload { staged, version })
+    // The generation is what a swap is made atomic by; the active directory is
+    // what a boot can export. Both, because an update publishes into the second
+    // and the first is what proves it arrived intact.
+    let active = display_payload_active_directory(request.vm_directory);
+    publish_active(&ready, &active, request.cancel)?;
+    Ok(StagedDisplayPayload {
+        staged,
+        version,
+        active,
+    })
 }
 
 #[cfg(test)]

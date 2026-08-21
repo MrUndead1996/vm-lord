@@ -187,6 +187,70 @@ fn a_packed_display_payload_prepares_and_stages() {
 }
 
 #[test]
+fn publishing_a_newer_version_replaces_what_the_active_directory_held() {
+    let temporary = TemporaryDirectory::new("active");
+    let active = temporary
+        .path()
+        .join("vm")
+        .join("display-payload")
+        .join("active");
+
+    for version in ["0.1.0", "0.2.0"] {
+        let (entry, archive) = packed(&temporary, version);
+        let ready = vmlord_payload::prepare(vmlord_payload::PrepareRequest {
+            entry: &entry,
+            cache_root: &temporary.path().join("cache"),
+            archive: &archive,
+            progress: &|_| {},
+            cancel: &AtomicBool::new(false),
+        })
+        .expect("a packed payload prepares");
+
+        vmlord_payload::publish_active(&ready, &active, &AtomicBool::new(false))
+            .expect("a ready payload publishes");
+
+        let manifest = fs::read_to_string(active.join("payload.json")).unwrap();
+        assert!(
+            manifest.contains(&format!("\"version\":\"{version}\"")),
+            "the active directory carries the version that was just published"
+        );
+        let dkms = fs::read_to_string(active.join("content/drm/dkms.conf")).unwrap();
+        assert!(
+            dkms.contains(version),
+            "and its files, not the previous version's: {dkms}"
+        );
+    }
+}
+
+#[test]
+fn publishing_removes_what_the_new_version_does_not_declare() {
+    let temporary = TemporaryDirectory::new("prune");
+    let active = temporary.path().join("active");
+    fs::create_dir_all(active.join("content/drm")).unwrap();
+    // What a previous version left behind, and what an interrupted publish
+    // left behind.
+    fs::write(active.join("content/drm/gone.c"), b"old").unwrap();
+    fs::write(active.join("stray.vmlord-partial"), b"half").unwrap();
+
+    let (entry, archive) = packed(&temporary, "0.1.0");
+    let ready = vmlord_payload::prepare(vmlord_payload::PrepareRequest {
+        entry: &entry,
+        cache_root: &temporary.path().join("cache"),
+        archive: &archive,
+        progress: &|_| {},
+        cancel: &AtomicBool::new(false),
+    })
+    .unwrap();
+
+    vmlord_payload::publish_active(&ready, &active, &AtomicBool::new(false)).unwrap();
+
+    assert!(!active.join("content/drm/gone.c").exists());
+    assert!(!active.join("stray.vmlord-partial").exists());
+    assert!(active.join("content/drm/vmlord_drm.c").is_file());
+    assert!(active.join("payload.json").is_file());
+}
+
+#[test]
 fn a_release_directory_holding_two_versions_offers_the_newer_one() {
     let temporary = TemporaryDirectory::new("release");
     let release = temporary.path().join("release");

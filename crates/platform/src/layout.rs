@@ -72,6 +72,17 @@ pub(crate) fn display_payload_staging_directory(vm_directory: &Path) -> PathBuf 
     vm_directory.join("display-payload")
 }
 
+/// The one path a VM's display payload is ever exported from.
+///
+/// A compute system's Plan9 section is written before the system is built and
+/// is immutable for the lifetime of a boot, so a share can name one path and
+/// only one. A generation is named after its digest and is a different path per
+/// version, so what is exported is this -- and a newer version is published
+/// into it rather than exported beside it.
+pub(crate) fn display_payload_active_directory(vm_directory: &Path) -> PathBuf {
+    display_payload_staging_directory(vm_directory).join("active")
+}
+
 /// Returns the path of the VM's serial-console capture.
 ///
 /// Beside `config.json` rather than under `disks/`: it describes what the VM

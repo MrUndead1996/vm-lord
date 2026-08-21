@@ -33,7 +33,7 @@ pub use error::PayloadError;
 pub use marker::{ReadyMarker, cache_provenance};
 pub use prepared::{PreparedFile, validate_path};
 pub use progress::PayloadProgress;
-pub use staging::{StagedPayload, ensure_staging_root, stage_payload};
+pub use staging::{StagedPayload, ensure_staging_root, publish_active, stage_payload};
 
 #[cfg(test)]
 mod tests {

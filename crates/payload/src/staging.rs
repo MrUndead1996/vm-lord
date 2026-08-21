@@ -76,6 +76,122 @@ pub fn stage_payload<E: PayloadEntry>(
     )
 }
 
+/// Publishes a ready payload into a directory whose path never changes.
+///
+/// A compute system's Plan9 section is written before the system is built and
+/// is immutable for the lifetime of a boot, so a share can only ever name one
+/// path. A generation directory is named after its digest and is therefore a
+/// different path per version -- which is why what a VM exports is this one,
+/// and why a newer version is *published into* it rather than exported beside
+/// it.
+///
+/// The order is the whole safety of it. Every declared file is written first,
+/// each through a temporary name in its own directory and a rename, so a
+/// reader never sees half a file; `payload.json` is written last, so a guest
+/// that reads it sees a manifest whose files are all already there; and only
+/// then is anything the new manifest does not declare removed, because a
+/// leftover file nothing declares is ignored by a guest and a missing declared
+/// one is not.
+///
+/// # Errors
+///
+/// [`PayloadError::Io`] for a directory that cannot be written, and
+/// [`PayloadError::Cancelled`] when the caller asked to stop.
+pub fn publish_active<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
+    active: &Path,
+    cancel: &AtomicBool,
+) -> Result<(), PayloadError> {
+    let files = expected_files(payload, cancel)?;
+    fs::create_dir_all(active).map_err(|error| {
+        PayloadError::io("create the active payload directory", active.into(), error)
+    })?;
+
+    // Declared files first, `payload.json` last: `expected_files` puts the
+    // manifest at the front, which is the order a fresh generation wants and
+    // the reverse of what a live directory does.
+    let (manifest, declared) = files.split_first().expect("payload.json is always first");
+    for expected in declared {
+        check_cancelled(cancel)?;
+        publish_one(payload, &expected.relative, active)?;
+    }
+    check_cancelled(cancel)?;
+    publish_one(payload, &manifest.relative, active)?;
+
+    prune_undeclared(active, &files)
+}
+
+/// Copies one file into place through a temporary name in its own directory.
+fn publish_one<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
+    relative: &Path,
+    active: &Path,
+) -> Result<(), PayloadError> {
+    let source = payload.files_directory().join(relative);
+    require_regular_file(&source, "verify the payload file to publish")?;
+    let target = active.join(relative);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            PayloadError::io(
+                "create an active payload subdirectory",
+                parent.into(),
+                error,
+            )
+        })?;
+    }
+    let temporary = target.with_extension("vmlord-partial");
+    let _ = fs::remove_file(&temporary);
+    if fs::hard_link(&source, &temporary).is_err() {
+        fs::copy(&source, &temporary).map_err(|error| {
+            PayloadError::io("copy an active payload file", temporary.clone(), error)
+        })?;
+    }
+    fs::rename(&temporary, &target)
+        .map_err(|error| PayloadError::io("publish an active payload file", target, error))
+}
+
+/// Removes whatever the published manifest does not declare.
+///
+/// Last, and never before: a file the new manifest does not name is one the
+/// previous version left behind, and a guest reading the new manifest ignores
+/// it either way.
+fn prune_undeclared(active: &Path, files: &[ExpectedFile]) -> Result<(), PayloadError> {
+    let declared: HashSet<PathBuf> = files
+        .iter()
+        .map(|expected| active.join(&expected.relative))
+        .collect();
+    let mut directories = vec![active.to_path_buf()];
+    let mut visited = Vec::new();
+    while let Some(directory) = directories.pop() {
+        let listing = fs::read_dir(&directory).map_err(|error| {
+            PayloadError::io(
+                "read the active payload directory",
+                directory.clone(),
+                error,
+            )
+        })?;
+        for item in listing.flatten() {
+            let path = item.path();
+            if path.is_dir() {
+                directories.push(path);
+                continue;
+            }
+            if !declared.contains(&path) {
+                let _ = fs::remove_file(&path);
+            }
+        }
+        visited.push(directory);
+    }
+    // Directories the pruning emptied, deepest first. `remove_dir` refuses a
+    // directory that still holds something, which is the check this wants.
+    for directory in visited.into_iter().rev() {
+        if directory != active {
+            let _ = fs::remove_dir(&directory);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn stage_with<E: PayloadEntry>(
     payload: &ReadyPayload<E>,
     root: &Path,

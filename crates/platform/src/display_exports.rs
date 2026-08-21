@@ -40,11 +40,11 @@ type Canonicalize<'a> = &'a dyn Fn(&Path) -> Result<PathBuf, RepositoryError>;
 /// The display share for `payload`, provided it really lies inside this VM's
 /// staging root.
 ///
-/// `payload` is the generation directory staging produced, not the staging
-/// root itself: the root also holds the ready markers and lock files that make
-/// a swap atomic, while the guest reads `payload.json` at the root of the share
-/// it mounts. Naming the root would offer a guest a directory it finds no
-/// payload in.
+/// `payload` is the VM's `active` directory, not the staging root and not a
+/// generation: the root holds the markers and locks of a publication rather
+/// than a payload, and a generation is named after its digest, which makes it
+/// a different path per version -- and a share can name one path for the whole
+/// life of a boot.
 ///
 /// `None` is a VM nothing was staged for, which is a VM whose display is
 /// degraded rather than a VM that cannot start.
@@ -122,16 +122,16 @@ mod tests {
         let temporary = TemporaryDirectory::new("containment");
         let vm = temporary.path().join("dev-linux");
         let staging = vm.join("display-payload");
-        let generation = staging.join("generations").join("abc");
-        fs::create_dir_all(&generation).unwrap();
+        let active = staging.join("active");
+        fs::create_dir_all(&active).unwrap();
         let elsewhere = temporary.path().join("elsewhere");
         fs::create_dir(&elsewhere).unwrap();
         let gpu = vm.join("gpu-payload").join("generations").join("abc");
         fs::create_dir_all(&gpu).unwrap();
 
         assert_eq!(
-            build(&vm, Some(&generation), &canonicalize)
-                .expect("a generation of this VM is exportable")
+            build(&vm, Some(&active), &canonicalize)
+                .expect("this VM's active directory is exportable")
                 .name(),
             "vmlord.display.payload"
         );
@@ -154,11 +154,11 @@ mod tests {
     fn an_export_carries_the_canonical_path_hcs_is_given() {
         let temporary = TemporaryDirectory::new("canonical");
         let vm = temporary.path().join("dev-linux");
-        let generation = vm.join("display-payload").join("generations").join("abc");
-        fs::create_dir_all(&generation).unwrap();
+        let active = vm.join("display-payload").join("active");
+        fs::create_dir_all(&active).unwrap();
 
-        let export = build(&vm, Some(&generation), &canonicalize).unwrap();
+        let export = build(&vm, Some(&active), &canonicalize).unwrap();
 
-        assert_eq!(export.host_path(), canonicalize(&generation).unwrap());
+        assert_eq!(export.host_path(), canonicalize(&active).unwrap());
     }
 }

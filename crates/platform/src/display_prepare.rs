@@ -98,16 +98,12 @@ pub(crate) fn prepare(
         }
     };
 
-    let export = display_exports::build(
-        vm_directory,
-        Some(staged.staged.generation_directory()),
-        canonicalize,
-    );
+    let export = display_exports::build(vm_directory, Some(&staged.active), canonicalize);
     if export.is_none() {
         log::warn!(
             "VM \"{}\" staged a display payload at {} that cannot be exported",
             mapping.vm_name,
-            staged.staged.generation_directory().display()
+            staged.active.display()
         );
     }
     let failure = export.is_none().then(|| {

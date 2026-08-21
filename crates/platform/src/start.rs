@@ -1874,12 +1874,8 @@ mod tests {
     fn a_prepared_display_payload_reaches_the_configuration_beside_the_gpus_shares() {
         let fixture = fixture("display-share");
         let calls = fixture.calls.clone();
-        let generation = fixture
-            .vm_directory
-            .join("display-payload")
-            .join("generations")
-            .join("abc");
-        fs::create_dir_all(&generation).expect("a staged generation");
+        let active = fixture.vm_directory.join("display-payload").join("active");
+        fs::create_dir_all(&active).expect("a published payload");
         let vm_directory = fixture.vm_directory.clone();
         let pipeline = pipeline(&calls, Behavior::default())
             .with_gpu(
@@ -1891,7 +1887,7 @@ mod tests {
                 Some(PreparedDisplay {
                     export: crate::display_exports::build(
                         &vm_directory,
-                        Some(&generation),
+                        Some(&active),
                         &canonicalize_for_export,
                     ),
                     failure: None,
