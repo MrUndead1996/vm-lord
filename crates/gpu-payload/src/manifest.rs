@@ -2,29 +2,11 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CatalogEntry, GuestTarget, MesaPolicy, PayloadError, Sha256Digest};
+use crate::{CatalogEntry, GuestTarget, MesaPolicy, PayloadError, PreparedFile, Sha256Digest};
+use vmlord_payload::validate_path;
 
 const D3DKMTHK_PATH: &str = "include/uapi/misc/d3dkmthk.h";
 const D3DKMTHK_LICENSE: &str = "GPL-2.0 WITH Linux-syscall-note";
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct PreparedFile {
-    path: String,
-    size: u64,
-    sha256: Sha256Digest,
-}
-impl PreparedFile {
-    pub fn path(&self) -> &str {
-        &self.path
-    }
-    pub fn size(&self) -> u64 {
-        self.size
-    }
-    pub fn sha256(&self) -> &Sha256Digest {
-        &self.sha256
-    }
-}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -75,16 +57,16 @@ impl PayloadManifest {
         let mut paths = HashSet::new();
         let mut last = "";
         for file in &value.files {
-            validate_path(&file.path)?;
-            if file.size == 0
-                || !paths.insert(file.path.as_str())
-                || (!last.is_empty() && last >= file.path.as_str())
+            validate_path(file.path())?;
+            if file.size() == 0
+                || !paths.insert(file.path())
+                || (!last.is_empty() && last >= file.path())
             {
                 return Err(PayloadError::InvalidManifest(
                     "prepared file paths must be unique, sorted, and non-empty".into(),
                 ));
             }
-            last = &file.path;
+            last = file.path();
         }
 
         if !paths.contains("sources.json") {
@@ -107,23 +89,6 @@ impl PayloadManifest {
     pub fn files(&self) -> &[PreparedFile] {
         &self.files
     }
-}
-
-fn validate_path(path: &str) -> Result<(), PayloadError> {
-    if path.is_empty()
-        || path.contains('\\')
-        || path.contains('\0')
-        || path.starts_with('/')
-        || path
-            .split('/')
-            .any(|part| part.is_empty() || part == "." || part == "..")
-        || path == "payload.json"
-    {
-        return Err(PayloadError::InvalidManifest(format!(
-            "unsafe prepared-file path: {path}"
-        )));
-    }
-    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

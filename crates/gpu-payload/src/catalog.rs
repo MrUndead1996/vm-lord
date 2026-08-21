@@ -276,7 +276,7 @@ impl PayloadCatalog {
         self.entries
             .iter()
             .find(|entry| entry.target == *target)
-            .ok_or_else(|| PayloadError::UnsupportedTarget(target.clone()))
+            .ok_or_else(|| PayloadError::UnsupportedTarget(format!("{target:?}")))
     }
     /// The entry for a guest, ignoring the kernel that guest runs.
     ///

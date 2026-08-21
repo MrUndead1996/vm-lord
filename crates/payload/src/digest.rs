@@ -30,7 +30,12 @@ impl Sha256Digest {
         Sha256Hasher(Sha256::new())
     }
 
-    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Result<Self, PayloadError> {
+    /// A digest from the 32 bytes a hash produced.
+    ///
+    /// Public because hashing happens wherever bytes flow -- the archive
+    /// reader, the cache, staging -- and each of those is free to be in
+    /// another crate.
+    pub fn from_bytes(bytes: [u8; 32]) -> Result<Self, PayloadError> {
         let hex = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
         Ok(Self { bytes, hex })
     }
