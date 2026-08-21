@@ -1,56 +1,28 @@
 use std::{
-    collections::HashSet,
-    fs::{self, File, Metadata},
-    io::{self, Write},
-    path::{Component, Path, PathBuf},
+    fs::{self, File},
+    io,
+    path::Path,
 };
 
 use serde::{Deserialize, Serialize};
-use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+use vmlord_payload::builder::{
+    BuiltArtifact, PAYLOAD_MANIFEST_LIMIT, PackPaths, PreparedInput, collect_files, validate_paths,
+    write_archive,
+};
 
 use crate::{
     CatalogEntry, GuestTarget, MesaPolicy, PayloadError, PayloadManifest, RendererCapability,
     Sha256Digest, SourceManifest,
 };
 
-const PAYLOAD_MANIFEST_LIMIT: u64 = 1024 * 1024;
+pub use vmlord_payload::builder::BuiltArtifact as BuiltGpuArtifact;
 
+/// Where a GPU payload pack reads from and writes to.
 pub struct PackRequest<'a> {
     pub prepared_directory: &'a Path,
     pub recipe_path: &'a Path,
     pub archive_path: &'a Path,
     pub catalog_entry_path: &'a Path,
-}
-
-#[derive(Debug)]
-pub struct BuiltArtifact {
-    archive_size: u64,
-    expanded_size: u64,
-    file_count: u64,
-    archive_sha256: Sha256Digest,
-    payload_manifest_sha256: Sha256Digest,
-}
-
-impl BuiltArtifact {
-    pub fn archive_size(&self) -> u64 {
-        self.archive_size
-    }
-
-    pub fn expanded_size(&self) -> u64 {
-        self.expanded_size
-    }
-
-    pub fn file_count(&self) -> u64 {
-        self.file_count
-    }
-
-    pub fn archive_sha256(&self) -> &Sha256Digest {
-        &self.archive_sha256
-    }
-
-    pub fn payload_manifest_sha256(&self) -> &Sha256Digest {
-        &self.payload_manifest_sha256
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,13 +131,6 @@ struct PreparedSources {
     overlays: Vec<RecipeOverlay>,
 }
 
-struct PreparedInput {
-    archive_path: String,
-    host_path: PathBuf,
-    size: u64,
-    sha256: Sha256Digest,
-}
-
 #[derive(Serialize)]
 struct PayloadManifestDocument<'a> {
     schema_version: u32,
@@ -182,7 +147,12 @@ struct PreparedFileDocument<'a> {
 }
 
 pub fn pack(request: PackRequest<'_>) -> Result<BuiltArtifact, PayloadError> {
-    validate_request_paths(&request)?;
+    validate_paths(&PackPaths {
+        prepared_directory: request.prepared_directory,
+        recipe_path: request.recipe_path,
+        archive_path: request.archive_path,
+        catalog_entry_path: request.catalog_entry_path,
+    })?;
     let recipe_bytes = fs::read(request.recipe_path).map_err(|error| {
         PayloadError::io("read GPU payload recipe", request.recipe_path.into(), error)
     })?;
@@ -290,118 +260,6 @@ pub fn pack(request: PackRequest<'_>) -> Result<BuiltArtifact, PayloadError> {
         archive_sha256,
         payload_manifest_sha256,
     })
-}
-
-fn validate_request_paths(request: &PackRequest<'_>) -> Result<(), PayloadError> {
-    let prepared_directory = fs::canonicalize(request.prepared_directory).map_err(|error| {
-        PayloadError::io(
-            "resolve prepared directory",
-            request.prepared_directory.into(),
-            error,
-        )
-    })?;
-    let recipe = fs::canonicalize(request.recipe_path).map_err(|error| {
-        PayloadError::io(
-            "resolve GPU payload recipe",
-            request.recipe_path.into(),
-            error,
-        )
-    })?;
-    let archive = resolve_output_path(request.archive_path)?;
-    let catalog_entry = resolve_output_path(request.catalog_entry_path)?;
-    if paths_equal(&archive, &catalog_entry)
-        || paths_equal(&archive, &recipe)
-        || paths_equal(&catalog_entry, &recipe)
-        || archive.starts_with(&prepared_directory)
-        || catalog_entry.starts_with(&prepared_directory)
-    {
-        return Err(PayloadError::InvalidManifest(
-            "GPU payload inputs and outputs must use distinct paths".into(),
-        ));
-    }
-    Ok(())
-}
-
-fn resolve_output_path(path: &Path) -> Result<PathBuf, PayloadError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => Err(PayloadError::InvalidManifest(format!(
-            "GPU payload output already exists: {}",
-            path.display()
-        ))),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            let parent = path
-                .parent()
-                .filter(|parent| !parent.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            let parent = fs::canonicalize(parent).map_err(|error| {
-                PayloadError::io("resolve output directory", parent.into(), error)
-            })?;
-            let file_name = path.file_name().ok_or_else(|| {
-                PayloadError::InvalidManifest("output path must name a file".into())
-            })?;
-            Ok(parent.join(file_name))
-        }
-        Err(error) => Err(PayloadError::io("inspect output path", path.into(), error)),
-    }
-}
-
-#[cfg(windows)]
-fn paths_equal(left: &Path, right: &Path) -> bool {
-    left.to_string_lossy()
-        .eq_ignore_ascii_case(&right.to_string_lossy())
-}
-
-#[cfg(not(windows))]
-fn paths_equal(left: &Path, right: &Path) -> bool {
-    left == right
-}
-
-fn write_archive(
-    archive_path: &Path,
-    files: &[PreparedInput],
-    manifest_bytes: &[u8],
-) -> Result<(), PayloadError> {
-    let output = File::create(archive_path)
-        .map_err(|error| PayloadError::io("create payload archive", archive_path.into(), error))?;
-    let mut writer = ZipWriter::new(output);
-    let options = SimpleFileOptions::default()
-        .compression_method(CompressionMethod::Deflated)
-        .compression_level(Some(6))
-        .last_modified_time(zip::DateTime::default())
-        .unix_permissions(0o644);
-    let mut paths = files
-        .iter()
-        .map(|file| file.archive_path.as_str())
-        .chain(std::iter::once("payload.json"))
-        .collect::<Vec<_>>();
-    paths.sort_unstable();
-
-    for path in paths {
-        writer
-            .start_file(path, options)
-            .map_err(|error| PayloadError::Archive(error.to_string()))?;
-        if path == "payload.json" {
-            writer
-                .write_all(manifest_bytes)
-                .map_err(|error| PayloadError::Archive(error.to_string()))?;
-        } else {
-            let file = files
-                .iter()
-                .find(|file| file.archive_path == path)
-                .expect("archive paths came from prepared files");
-            let mut input = File::open(&file.host_path).map_err(|error| {
-                PayloadError::io("open prepared file", file.host_path.clone(), error)
-            })?;
-            io::copy(&mut input, &mut writer)
-                .map_err(|error| PayloadError::Archive(error.to_string()))?;
-        }
-    }
-
-    writer
-        .finish()
-        .map_err(|error| PayloadError::Archive(error.to_string()))?
-        .sync_all()
-        .map_err(|error| PayloadError::io("flush payload archive", archive_path.into(), error))
 }
 
 fn catalog_entry(
@@ -564,167 +422,6 @@ fn find_prepared_file<'a>(
         })
 }
 
-fn collect_files(root: &Path) -> Result<Vec<PreparedInput>, PayloadError> {
-    fn walk(
-        root: &Path,
-        current: &Path,
-        output: &mut Vec<PreparedInput>,
-    ) -> Result<(), PayloadError> {
-        for item in fs::read_dir(current)
-            .map_err(|error| PayloadError::io("read prepared directory", current.into(), error))?
-        {
-            let item = item.map_err(|error| {
-                PayloadError::io("read prepared directory entry", current.into(), error)
-            })?;
-            let path = item.path();
-            let metadata = fs::symlink_metadata(&path)
-                .map_err(|error| PayloadError::io("read prepared metadata", path.clone(), error))?;
-            if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
-                return Err(PayloadError::UnsafeArchive(path.display().to_string()));
-            }
-            if metadata.is_dir() {
-                walk(root, &path, output)?;
-            } else if metadata.is_file() {
-                let relative = path
-                    .strip_prefix(root)
-                    .expect("walk stays below root")
-                    .to_str()
-                    .ok_or_else(|| PayloadError::UnsafeArchive("non-UTF-8 prepared path".into()))?
-                    .replace('\\', "/");
-                validate_archive_path(&relative)?;
-                if relative == "payload.json" {
-                    return Err(PayloadError::InvalidManifest(
-                        "prepared directory must not contain payload.json".into(),
-                    ));
-                }
-                if metadata.len() == 0 {
-                    return Err(PayloadError::InvalidManifest(format!(
-                        "prepared file must not be empty: {relative}"
-                    )));
-                }
-                output.push(PreparedInput {
-                    archive_path: relative,
-                    host_path: path.clone(),
-                    size: metadata.len(),
-                    sha256: Sha256Digest::hash_reader(File::open(&path).map_err(|error| {
-                        PayloadError::io("read prepared file", path.clone(), error)
-                    })?)?,
-                });
-            } else {
-                return Err(PayloadError::UnsafeArchive(path.display().to_string()));
-            }
-        }
-        Ok(())
-    }
-
-    let root_metadata = fs::symlink_metadata(root)
-        .map_err(|error| PayloadError::io("read prepared directory", root.into(), error))?;
-    if !root_metadata.is_dir()
-        || root_metadata.file_type().is_symlink()
-        || is_reparse_point(&root_metadata)
-    {
-        return Err(PayloadError::UnsafeArchive(root.display().to_string()));
-    }
-    let mut files = Vec::new();
-    walk(root, root, &mut files)?;
-    files.sort_by(|left, right| left.archive_path.cmp(&right.archive_path));
-    let mut windows_paths = HashSet::from([windows_path_key("payload.json")]);
-    for file in &files {
-        if !windows_paths.insert(windows_path_key(&file.archive_path)) {
-            return Err(PayloadError::InvalidManifest(format!(
-                "prepared paths collide on Windows: {}",
-                file.archive_path
-            )));
-        }
-    }
-    Ok(files)
-}
-
-fn windows_path_key(path: &str) -> String {
-    path.to_lowercase()
-}
-
-fn validate_archive_path(path: &str) -> Result<(), PayloadError> {
-    let bytes = path.as_bytes();
-    let has_windows_prefix = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
-    let ordinary_components = !path.is_empty()
-        && !path.contains('\\')
-        && !path.contains('\0')
-        && !path.starts_with('/')
-        && !has_windows_prefix
-        && path.split('/').all(is_safe_component);
-    let ordinary_path = Path::new(path)
-        .components()
-        .all(|component| matches!(component, Component::Normal(_)));
-    if !ordinary_components || !ordinary_path {
-        return Err(PayloadError::UnsafeArchive(path.into()));
-    }
-    Ok(())
-}
-
-fn is_safe_component(component: &str) -> bool {
-    if component.is_empty()
-        || component == "."
-        || component == ".."
-        || component.ends_with('.')
-        || component.ends_with(' ')
-        || component.chars().any(|character| {
-            character < ' ' || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
-        })
-    {
-        return false;
-    }
-    let device_stem = component
-        .split_once('.')
-        .map_or(component, |(stem, _)| stem)
-        .to_ascii_uppercase();
-    !matches!(
-        device_stem.as_str(),
-        "CON"
-            | "PRN"
-            | "AUX"
-            | "NUL"
-            | "COM1"
-            | "COM2"
-            | "COM3"
-            | "COM4"
-            | "COM5"
-            | "COM6"
-            | "COM7"
-            | "COM8"
-            | "COM9"
-            | "COM¹"
-            | "COM²"
-            | "COM³"
-            | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-            | "LPT¹"
-            | "LPT²"
-            | "LPT³"
-            | "CONIN$"
-            | "CONOUT$"
-    )
-}
-
-#[cfg(windows)]
-fn is_reparse_point(metadata: &Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-
-    metadata.file_attributes() & 0x400 != 0
-}
-
-#[cfg(not(windows))]
-fn is_reparse_point(_: &Metadata) -> bool {
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -738,7 +435,9 @@ mod tests {
 
     use crate::{CatalogEntry, PayloadError, Sha256Digest};
 
-    use super::{PackRequest, pack, validate_archive_path};
+    use vmlord_payload::builder::validate_archive_path;
+
+    use super::{PackRequest, pack};
 
     static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 

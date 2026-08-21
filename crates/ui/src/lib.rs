@@ -1300,7 +1300,11 @@ fn gpu_status_detail(status: Option<&VmGpuStatus>) -> String {
     };
 
     let mut detail = format!("{}: {}", gpu_state_label(status.state), status.message);
-    if let Some(adapter) = status.native.as_ref().and_then(|native| native.adapter.as_ref()) {
+    if let Some(adapter) = status
+        .native
+        .as_ref()
+        .and_then(|native| native.adapter.as_ref())
+    {
         detail.push_str(&format!(" Adapter: {adapter}."));
     }
     if let Some(node) = status

@@ -10,8 +10,12 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 vmlord-payload = { path = "../payload" }
 
+[dev-dependencies]
+serde_json = "1.0"
+vmlord-payload = { path = "../payload" }
+
 [features]
-builder = []
+builder = ["vmlord-payload/builder"]
 
 [lints]
 workspace = true

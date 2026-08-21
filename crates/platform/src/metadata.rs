@@ -813,7 +813,10 @@ mod tests {
         })
         .expect("a cloud image knows what it boots");
 
-        assert_eq!(key.distribution, "ubuntu", "the catalog spells it lowercase");
+        assert_eq!(
+            key.distribution, "ubuntu",
+            "the catalog spells it lowercase"
+        );
         assert_eq!(key.release, "26.04");
         assert_eq!(key.architecture, "amd64");
     }
@@ -828,5 +831,4 @@ mod tests {
             "VMLord does not know what system is inside installation media"
         );
     }
-
 }

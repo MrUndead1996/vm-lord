@@ -11,6 +11,8 @@
 //! for that kind of payload, which meets this one at [`PayloadEntry`].
 
 pub mod archive;
+#[cfg(feature = "builder")]
+pub mod builder;
 mod cache;
 pub mod catalog;
 mod digest;

@@ -13,7 +13,7 @@ vmlord-payload = { path = "../payload" }
 zip = { version = "9.0.0-pre3", default-features = false, features = ["deflate-flate2-zlib-rs", "time"] }
 
 [features]
-builder = []
+builder = ["vmlord-payload/builder"]
 
 [lints]
 workspace = true

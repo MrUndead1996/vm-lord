@@ -16,7 +16,10 @@ fn main() {
     rerun_when_head_moves();
 
     let version = env::var("CARGO_PKG_VERSION").expect("Cargo must set the package version");
-    println!("cargo::rustc-env=VMLORD_AGENT_BUILD={version}+{}", revision());
+    println!(
+        "cargo::rustc-env=VMLORD_AGENT_BUILD={version}+{}",
+        revision()
+    );
 }
 
 /// The short commit this was built from, plus whether the tree was edited.

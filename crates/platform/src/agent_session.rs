@@ -357,11 +357,7 @@ fn report_mounts(report: &AttachGpuSharesResponse, vm_name: &str) {
 /// Nothing is kept and nothing is retried: the next session applies the recipe
 /// again, and deriving a GPU status from these facts is the application
 /// layer's work.
-fn report_recipe(
-    report: &ApplyGpuRecipeResponse,
-    vm_name: &str,
-    sink: GuestGpuSink<'_>,
-) -> bool {
+fn report_recipe(report: &ApplyGpuRecipeResponse, vm_name: &str, sink: GuestGpuSink<'_>) -> bool {
     for stage in &report.stages {
         match stage.state() {
             GpuRecipeStageState::Ok => log::debug!(
@@ -726,6 +722,7 @@ impl Error for SessionError {
 mod tests {
     use std::io::{self, Read, Write};
 
+    use std::sync::Mutex;
     use vmlord_agent_protocol::{
         auth::{Nonce, Secret, tag},
         frame::{self, LENGTH_PREFIX_LEN},
@@ -737,7 +734,6 @@ mod tests {
             envelope, request, response,
         },
     };
-    use std::sync::Mutex;
 
     use vmlord_core::{GpuShareManifest, GpuStatusCode, GuestGpuDetail, GuestGpuReport};
 
@@ -1137,7 +1133,8 @@ mod tests {
             }),
         ));
 
-        serve(&mut guest, &session, Some(&manifest), VM, &|_| {}).expect("a session the agent closed");
+        serve(&mut guest, &session, Some(&manifest), VM, &|_| {})
+            .expect("a session the agent closed");
 
         let offered = guest.answer_to(super::ATTACH_REQUEST_ID);
         let Some(envelope::Body::Request(ref request)) = offered.body else {
@@ -1206,7 +1203,8 @@ mod tests {
             }),
         ));
 
-        serve(&mut guest, &session, Some(&manifest), VM, &|_| {}).expect("a session the agent closed");
+        serve(&mut guest, &session, Some(&manifest), VM, &|_| {})
+            .expect("a session the agent closed");
 
         let asked = guest.answer_to(super::APPLY_REQUEST_ID);
         let Some(envelope::Body::Request(ref request)) = asked.body else {
@@ -1237,7 +1235,10 @@ mod tests {
     /// The whole conversation rather than the probe alone: the probe is asked
     /// for only after a recipe that finished, so a fixture that skipped the
     /// earlier answers would test a request the host never sends.
-    fn reports_of_a_guest(recipe: ApplyGpuRecipeResponse, probe: Option<ProbeGpuResponse>) -> Vec<GuestGpuReport> {
+    fn reports_of_a_guest(
+        recipe: ApplyGpuRecipeResponse,
+        probe: Option<ProbeGpuResponse>,
+    ) -> Vec<GuestGpuReport> {
         let secret = Secret::generate();
         let mut guest = Guest::opening_with(
             Secret::from_base64(&secret.to_base64()).expect("the secret"),
@@ -1279,7 +1280,9 @@ mod tests {
         })
         .expect("a session the agent closed");
 
-        reports.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner())
+        reports
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn a_recipe_that_finished() -> ApplyGpuRecipeResponse {
@@ -1432,7 +1435,8 @@ mod tests {
             }),
         ));
 
-        serve(&mut guest, &session, Some(&manifest), VM, &|_| {}).expect("a session the agent closed");
+        serve(&mut guest, &session, Some(&manifest), VM, &|_| {})
+            .expect("a session the agent closed");
 
         let asked = guest.answer_to(super::PROBE_REQUEST_ID);
         let Some(envelope::Body::Request(ref request)) = asked.body else {
@@ -1514,7 +1518,8 @@ mod tests {
             shares: vec![vmlord_core::GpuShare::wsl_lib()],
         };
 
-        serve(&mut guest, &session, Some(&manifest), VM, &|_| {}).expect("a session the agent closed");
+        serve(&mut guest, &session, Some(&manifest), VM, &|_| {})
+            .expect("a session the agent closed");
 
         assert!(
             !guest.received.iter().any(|envelope| matches!(
@@ -1535,6 +1540,7 @@ mod tests {
             build: String::new(),
         };
 
-        serve(&mut stream, &session, None, VM, &|_| {}).expect("an idle boundary is not a failed session");
+        serve(&mut stream, &session, None, VM, &|_| {})
+            .expect("an idle boundary is not a failed session");
     }
 }

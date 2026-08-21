@@ -51,7 +51,8 @@ fn an_apply_request_carries_nothing_and_still_arrives() {
     // arm rather than as bytes -- an empty message encodes to nothing.
     let request = Envelope::request(3, request::Kind::ApplyGpuRecipe(ApplyGpuRecipeRequest {}));
 
-    let decoded = Envelope::decode(request.encode_to_vec().as_slice()).expect("a decodable request");
+    let decoded =
+        Envelope::decode(request.encode_to_vec().as_slice()).expect("a decodable request");
     let Some(envelope::Body::Request(request)) = decoded.body else {
         panic!("an apply is a request");
     };

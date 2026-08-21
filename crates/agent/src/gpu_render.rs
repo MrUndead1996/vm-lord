@@ -80,7 +80,13 @@ pub fn probe(stopping: &AtomicBool) -> ProbeGpuResponse {
             GpuProbeStep::Device,
             "/dev/dxg is missing, is not a character device, or will not open",
         );
-        return report(checks, "/dev/dxg never opened", device, &found, String::new());
+        return report(
+            checks,
+            "/dev/dxg never opened",
+            device,
+            &found,
+            String::new(),
+        );
     }
     checks.ok(GpuProbeStep::Device, "/dev/dxg is a usable device");
 
@@ -98,13 +104,7 @@ pub fn probe(stopping: &AtomicBool) -> ProbeGpuResponse {
     libraries_check(&mut checks);
 
     if halted(stopping) {
-        return report(
-            checks,
-            "the guest is shutting down",
-            device,
-            &found,
-            driver,
-        );
+        return report(checks, "the guest is shutting down", device, &found, driver);
     }
 
     if tools_check(&mut checks) {

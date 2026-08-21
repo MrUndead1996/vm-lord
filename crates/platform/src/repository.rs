@@ -2420,14 +2420,16 @@ mod tests {
         }
 
         fn release(&self) {
-            self.release.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.release
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             self.repository.starts.join_all();
         }
     }
 
     impl Drop for Held {
         fn drop(&mut self) {
-            self.release.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.release
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = fs::remove_dir_all(&self.root);
         }
     }
@@ -2516,7 +2518,10 @@ mod tests {
             .start_vm("nothing-of-this-name")
             .expect_err("an unknown VM is the return value of the call that asked for it");
 
-        assert!(error.to_string().contains("nothing-of-this-name"), "{error}");
+        assert!(
+            error.to_string().contains("nothing-of-this-name"),
+            "{error}"
+        );
         assert!(
             !repository.starts.contains("nothing-of-this-name"),
             "a refusal starts no thread"

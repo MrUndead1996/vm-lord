@@ -169,7 +169,10 @@ mod tests {
         let capabilities = assemble(Vec::new(), Ok(()), BOTH);
 
         assert_eq!(
-            capabilities.assignment.failure().map(|failure| failure.code),
+            capabilities
+                .assignment
+                .failure()
+                .map(|failure| failure.code),
             Some(GpuStatusCode::HostNoAdapter)
         );
         assert!(capabilities.linux_payload.is_available());
@@ -197,7 +200,10 @@ mod tests {
         let capabilities = assemble(vec![adapter(None), adapter(None)], Ok(()), BOTH);
 
         assert_eq!(
-            capabilities.assignment.failure().map(|failure| failure.code),
+            capabilities
+                .assignment
+                .failure()
+                .map(|failure| failure.code),
             Some(GpuStatusCode::HostDriverStoreMissing)
         );
         assert_eq!(

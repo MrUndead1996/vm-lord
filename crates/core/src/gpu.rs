@@ -388,7 +388,10 @@ impl GpuShare {
     /// The per-VM immutable GPU payload generation share.
     #[must_use]
     pub fn payload() -> Self {
-        Self { name: GPU_PAYLOAD_SHARE.to_owned(), role: GpuShareRole::GpuPayload }
+        Self {
+            name: GPU_PAYLOAD_SHARE.to_owned(),
+            role: GpuShareRole::GpuPayload,
+        }
     }
     /// The share for the host's WSL Linux userspace.
     #[must_use]
@@ -516,7 +519,10 @@ mod tests {
         let share = GpuShare::driver_package("nvltsi.inf_amd64_5b0e0dc41b0dbf1e")
             .expect("an ordinary DriverStore folder name is admissible");
 
-        assert_eq!(share.name, "vmlord.gpu.drv.nvltsi.inf_amd64_5b0e0dc41b0dbf1e");
+        assert_eq!(
+            share.name,
+            "vmlord.gpu.drv.nvltsi.inf_amd64_5b0e0dc41b0dbf1e"
+        );
         assert_eq!(
             share.role,
             GpuShareRole::DriverPackage {

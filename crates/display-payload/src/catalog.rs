@@ -84,6 +84,11 @@ struct DisplayCatalogEntryDocument {
 /// ```
 #[derive(Clone, Debug, Serialize)]
 pub struct DisplayCatalogEntry {
+    /// Always [`ENTRY_SCHEMA_VERSION`]: kept as a field so that an entry
+    /// written back out is a document its own reader accepts. A validated
+    /// entry that cannot be re-serialized into a valid entry would make every
+    /// tool that copies one a tool that can corrupt it.
+    schema_version: u32,
     payload_id: String,
     version: PayloadVersion,
     target: DisplayTarget,
@@ -100,6 +105,7 @@ pub struct DisplayCatalogEntry {
 impl From<DisplayCatalogEntryDocument> for DisplayCatalogEntry {
     fn from(value: DisplayCatalogEntryDocument) -> Self {
         Self {
+            schema_version: ENTRY_SCHEMA_VERSION,
             payload_id: value.payload_id,
             version: value.version,
             target: value.target,
@@ -393,6 +399,17 @@ mod tests {
             release: "24.04",
             architecture: "amd64",
         }
+    }
+
+    #[test]
+    fn an_entry_written_back_out_is_an_entry_again() {
+        let entry = parse(&entry_document("24.04", "0.1.0"));
+
+        let round_tripped = DisplayCatalogEntry::from_json(&serde_json::to_vec(&entry).unwrap())
+            .expect("a serialized entry must be readable by the reader that made it");
+
+        assert_eq!(round_tripped.payload_id(), entry.payload_id());
+        assert_eq!(round_tripped.version(), entry.version());
     }
 
     #[test]

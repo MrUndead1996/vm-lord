@@ -57,23 +57,6 @@ pub(crate) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), Str
     .map_err(|e| e.to_string())
 }
 
-/// Reads `cargo dist`'s arguments: zero or more payload directories.
-pub(crate) fn parse_dist<I: IntoIterator<Item = String>>(
-    arguments: I,
-) -> Result<Vec<PathBuf>, String> {
-    let mut values = arguments.into_iter();
-    let mut directories = Vec::new();
-    while let Some(flag) = values.next() {
-        if flag != "--gpu-payload" {
-            return Err(format!("unknown argument `{flag}`"));
-        }
-        directories.push(PathBuf::from(
-            values.next().ok_or("missing value for --gpu-payload")?,
-        ));
-    }
-    Ok(directories)
-}
-
 /// Copies one packed payload into a distribution, refusing anything that is
 /// not exactly what `pack` wrote.
 ///
@@ -371,37 +354,6 @@ mod tests {
             assert!(
                 super::stage_release_payload(&source, &destination).is_err(),
                 "accepted a {label} pair"
-            );
-        }
-    }
-
-    #[test]
-    fn dist_takes_any_number_of_payload_directories() {
-        assert_eq!(
-            super::parse_dist(Vec::new()).unwrap(),
-            Vec::<PathBuf>::new()
-        );
-        assert_eq!(
-            super::parse_dist(
-                ["--gpu-payload", "one", "--gpu-payload", "two"]
-                    .into_iter()
-                    .map(str::to_owned)
-            )
-            .unwrap(),
-            vec![PathBuf::from("one"), PathBuf::from("two")]
-        );
-    }
-
-    #[test]
-    fn dist_rejects_an_unknown_or_incomplete_argument() {
-        for arguments in [
-            vec!["--gpu-payload"],
-            vec!["--unknown", "value"],
-            vec!["built"],
-        ] {
-            assert!(
-                super::parse_dist(arguments.iter().map(|value| (*value).to_owned())).is_err(),
-                "accepted {arguments:?}"
             );
         }
     }

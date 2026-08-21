@@ -10,6 +10,8 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, ExitCode},
 };
+mod display_payload;
+mod dist_arguments;
 mod gpu_payload;
 
 /// The release target for the application. MSVC is the toolchain Windows
@@ -33,8 +35,9 @@ const ARTIFACTS: [(&str, &str); 4] = [
 fn main() -> ExitCode {
     let task = env::args().nth(1);
     let result = match task.as_deref() {
-        Some("dist") => gpu_payload::parse_dist(env::args().skip(2)).and_then(dist),
+        Some("dist") => dist_arguments::parse(env::args().skip(2)).and_then(dist),
         Some("gpu-payload") => gpu_payload::run(env::args().skip(2)),
+        Some("display-payload") => display_payload::run(env::args().skip(2)),
         Some(other) => Err(format!("unknown task `{other}`")),
         None => Err("missing task".to_owned()),
     };
@@ -49,7 +52,7 @@ fn main() -> ExitCode {
 }
 
 /// Builds the release artifacts and gathers them under Cargo's target directory.
-fn dist(gpu_payloads: Vec<PathBuf>) -> Result<(), String> {
+fn dist(payloads: Vec<dist_arguments::DistPayload>) -> Result<(), String> {
     if !cfg!(windows) {
         return Err(format!(
             "`cargo dist` runs on Windows only: the release application is built for {APP_TARGET}, \
@@ -99,12 +102,24 @@ fn dist(gpu_payloads: Vec<PathBuf>) -> Result<(), String> {
         println!("dist: {file}");
     }
 
-    if gpu_payloads.is_empty() {
-        println!("dist: no GPU payload included; pass --gpu-payload <directory>");
+    if payloads.is_empty() {
+        println!(
+            "dist: no payload included; pass --gpu-payload <directory> or \
+             --display-payload <directory>"
+        );
     }
-    for source in &gpu_payloads {
-        let payload_id = gpu_payload::stage_release_payload(source, &destination)?;
-        println!("dist: gpu-payload/{payload_id}.zip and gpu-payload/{payload_id}.json");
+    for payload in &payloads {
+        let (kind, payload_id) = match payload {
+            dist_arguments::DistPayload::Gpu(source) => (
+                vmlord_gpu_payload::LOCAL_ARCHIVE_DIRECTORY,
+                gpu_payload::stage_release_payload(source, &destination)?,
+            ),
+            dist_arguments::DistPayload::Display(source) => (
+                vmlord_display_payload::LOCAL_ARCHIVE_DIRECTORY,
+                display_payload::stage_release_payload(source, &destination)?,
+            ),
+        };
+        println!("dist: {kind}/{payload_id}.zip and {kind}/{payload_id}.json");
     }
 
     println!("dist: written to {}", destination.display());

@@ -333,7 +333,11 @@ fn source_stage(report: &mut Report, package: &DkmsPackage) -> Result<(), String
 }
 
 /// Builds and installs the module for the running kernel.
-fn build_stage(report: &mut Report, package: &DkmsPackage, guest: &GuestFacts) -> Result<(), String> {
+fn build_stage(
+    report: &mut Report,
+    package: &DkmsPackage,
+    guest: &GuestFacts,
+) -> Result<(), String> {
     let status = command::run("dkms", &["status"], &[], SHORT_BUDGET);
     if dkms_reports_installed(&status.output, package, &guest.kernel_release) {
         report.skipped(
@@ -444,7 +448,10 @@ fn load_stage(report: &mut Report) -> Result<(), String> {
 /// cannot open it.
 fn device_stage(report: &mut Report) -> Result<(), String> {
     if device_is_usable() {
-        report.ok(GpuRecipeStep::Device, format!("{DEVICE} is a usable device"));
+        report.ok(
+            GpuRecipeStep::Device,
+            format!("{DEVICE} is a usable device"),
+        );
         return Ok(());
     }
 
@@ -668,7 +675,8 @@ fn environment_stage(
 
     let mut changed = false;
     for (path, form) in [(GENERATOR, Shell::Generator), (PROFILE, Shell::Profile)] {
-        match write_script_if_different(Path::new(path), &environment_document(form, &environment)) {
+        match write_script_if_different(Path::new(path), &environment_document(form, &environment))
+        {
             Ok(written) => changed |= written,
             Err(error) => {
                 let reason = format!("{path} could not be written: {error}");

@@ -462,7 +462,10 @@ GPU0:
         // agent could disagree with it.
         let command = shell_command("eglinfo -B");
 
-        assert!(command.contains("/etc/profile.d/vmlord-gpu.sh"), "{command}");
+        assert!(
+            command.contains("/etc/profile.d/vmlord-gpu.sh"),
+            "{command}"
+        );
         // A guest whose recipe never wrote the file still runs the program:
         // sourcing a missing file must not be what fails the check.
         assert!(command.contains("[ -r "), "{command}");

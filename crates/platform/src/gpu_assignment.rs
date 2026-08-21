@@ -139,8 +139,7 @@ mod tests {
             let value: serde_json::Value = serde_json::from_str(&document).unwrap();
 
             assert_eq!(
-                value["Settings"]["AllowVendorExtension"],
-                true,
+                value["Settings"]["AllowVendorExtension"], true,
                 "a vendor GPU needs its own extension to be attachable: {mode:?}"
             );
         }

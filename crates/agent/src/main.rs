@@ -28,8 +28,9 @@ compile_error!(
 
 use std::{
     error::Error,
-    fs, process,
+    fs,
     os::fd::RawFd,
+    process,
     sync::atomic::{AtomicBool, AtomicI32, Ordering},
     thread,
     time::Duration,

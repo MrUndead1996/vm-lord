@@ -10,6 +10,8 @@
 //! payload. Nothing about the display's lifecycle is: this crate knows how a
 //! display payload is described and which one a guest gets, and stops there.
 
+#[cfg(feature = "builder")]
+pub mod builder;
 mod catalog;
 mod manifest;
 mod protocol;

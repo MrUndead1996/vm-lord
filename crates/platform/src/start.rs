@@ -65,8 +65,7 @@ type EndpointProvider = Box<
 >;
 
 /// Prepares a VM's GPU before its compute system is built.
-type GpuPreparer =
-    Box<dyn Fn(&VmComputeSystemMapping, &Path) -> Option<PreparedGpu> + Send + Sync>;
+type GpuPreparer = Box<dyn Fn(&VmComputeSystemMapping, &Path) -> Option<PreparedGpu> + Send + Sync>;
 /// Attaches the adapters a mode asks for to a compute system that is running.
 type GpuAssigner = Box<dyn Fn(&str, GpuMode) -> Result<(), GpuFailure> + Send + Sync>;
 

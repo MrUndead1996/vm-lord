@@ -363,9 +363,14 @@ pub(crate) fn apply_plan9_shares(
         })
         .collect();
     let shares = serde_json::to_value(shares).map_err(|error| {
-        RepositoryError::new(format!("failed to serialize the VM's Plan9 shares: {error}"))
+        RepositoryError::new(format!(
+            "failed to serialize the VM's Plan9 shares: {error}"
+        ))
     })?;
-    devices.insert(PLAN9_KEY.to_owned(), serde_json::json!({ "Shares": shares }));
+    devices.insert(
+        PLAN9_KEY.to_owned(),
+        serde_json::json!({ "Shares": shares }),
+    );
 
     serde_json::to_string(&configuration).map_err(|error| {
         RepositoryError::new(format!(
