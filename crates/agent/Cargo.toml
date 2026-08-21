@@ -18,6 +18,9 @@ libc = { version = "0.2", default-features = false }
 # guest is what compares that with itself. Pure Rust with no C library behind
 # it, so `cargo agent` still cross-compiles to musl with no toolchain.
 serde_json = "1.0"
+# The guest verifies the payload it mounted before it copies anything out of
+# it: the host's check is on the other side of a filesystem the host can write.
+sha2 = "0.11"
 vmlord-agent-protocol = { path = "../agent-protocol" }
 
 [lints]

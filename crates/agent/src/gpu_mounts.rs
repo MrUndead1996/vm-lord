@@ -37,7 +37,7 @@ use crate::{
 const PLAN9_VSOCK_PORT: u32 = 50001;
 
 /// The kernel's mount table.
-const MOUNTINFO: &str = "/proc/self/mountinfo";
+pub(crate) const MOUNTINFO: &str = "/proc/self/mountinfo";
 
 /// Where the dynamic linker is told about the mounted directories.
 const LD_CONF: &str = "/etc/ld.so.conf.d/vmlord-gpu.conf";
@@ -306,7 +306,7 @@ fn attach_one(share: &str, path: &Path, already: Option<String>) -> GpuMount {
 
     let mut last = String::new();
     for _ in 0..MOUNT_ATTEMPTS {
-        match mount(share, path) {
+        match mount_plan9_share(share, path) {
             Ok(()) => {
                 if reads_back(path) {
                     return mounted(share, path, "mounted");
@@ -332,7 +332,7 @@ fn attach_one(share: &str, path: &Path, already: Option<String>) -> GpuMount {
 /// `MS_RDONLY` states read-only a second time, independently of the flag the
 /// host put on the share, and a host directory has no business handing a guest
 /// device nodes or setuid binaries.
-fn mount(share: &str, path: &Path) -> io::Result<()> {
+pub(crate) fn mount_plan9_share(share: &str, path: &Path) -> io::Result<()> {
     let transport = vsock::connect(vsock::VMADDR_CID_HOST, PLAN9_VSOCK_PORT)?;
     let descriptor = transport.as_raw_fd();
 

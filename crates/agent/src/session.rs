@@ -11,10 +11,11 @@ use vmlord_agent_protocol::{
     frame::{self, FrameError},
     handshake::{self, CURRENT_VERSION},
     v1::{
-        ApplyGpuRecipeResponse, AttachGpuSharesResponse, AuthenticateResponse, Capability,
+        ApplyDisplayRecipeResponse, ApplyGpuRecipeResponse, AttachDisplayPayloadResponse,
+        AttachGpuSharesResponse, AuthenticateResponse, Capability, DisplayMount, DisplayShare,
         Envelope, ErrorCode, GpuMount, GpuRecipeStage, GpuShare, HeartbeatRequest,
-        HeartbeatResponse, HelloRequest, ProbeGpuResponse, ProtocolVersion, envelope, request,
-        response,
+        HeartbeatResponse, HelloRequest, ProbeGpuResponse, ProtocolVersion,
+        UpdateDisplayPayloadResponse, envelope, request, response,
     },
 };
 
@@ -23,10 +24,32 @@ const FIRST_HEARTBEAT_REQUEST_ID: u32 = HELLO_REQUEST_ID + 1;
 
 /// What this build of the agent implements beyond the base protocol.
 ///
-/// `Capability::Gpu` is announced unconditionally, because it says what this
-/// build can do rather than what its VM has: an agent on a VM with no GPU is
-/// asked for no manifest, and one that was given shares can mount them.
-const AGENT_CAPABILITIES: &[Capability] = &[Capability::Gpu];
+/// Both are announced unconditionally, because they say what this build can do
+/// rather than what its VM has: an agent on a VM with no GPU is asked for no
+/// manifest, and one on a headless VM is asked for no display payload.
+const AGENT_CAPABILITIES: &[Capability] = &[Capability::Gpu, Capability::Display];
+
+/// What the host may ask this agent to carry out.
+///
+/// A struct rather than six parameters: they are parameters at all because the
+/// order of the messages around them has to be testable against a peer made of
+/// bytes -- neither mounting a Plan9 share, building a kernel module nor
+/// holding a GL context can happen under a `cargo test` -- and six of them in a
+/// row is a call nobody can read.
+pub struct Handlers<'a> {
+    /// Carries out a GPU share manifest.
+    pub attach_gpu: &'a mut dyn FnMut(&[GpuShare]) -> (Vec<GpuMount>, bool),
+    /// Runs the guest's GPU recipe.
+    pub apply_gpu_recipe: &'a mut dyn FnMut() -> Vec<GpuRecipeStage>,
+    /// Looks at whether any of it renders.
+    pub probe_gpu: &'a mut dyn FnMut() -> ProbeGpuResponse,
+    /// Mounts the one display payload share.
+    pub attach_display: &'a mut dyn FnMut(&DisplayShare) -> DisplayMount,
+    /// Runs the guest's display recipe.
+    pub apply_display_recipe: &'a mut dyn FnMut() -> ApplyDisplayRecipeResponse,
+    /// Moves the guest to the version the mounted payload carries.
+    pub update_display: &'a mut dyn FnMut(&str) -> UpdateDisplayPayloadResponse,
+}
 
 /// What a session agreed on when it opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,13 +62,8 @@ pub struct Session {
 
 /// Opens and serves the guest half of an agent session.
 ///
-/// `attach` is what a GPU share manifest is carried out with, `apply` is what
-/// the guest's GPU recipe is run by, and `probe` is what looks at whether any
-/// of it renders. They are parameters rather than calls into the modules that
-/// implement them because the order of the messages around them has to be
-/// testable against a peer made of bytes, and neither mounting a Hyper-V Plan9
-/// share, building a kernel module nor holding a GL context can happen under a
-/// `cargo test`.
+/// [`Handlers`] is what the host's requests are carried out with, and why they
+/// are passed in rather than called directly.
 ///
 /// The session that was agreed on is returned so the caller can tell a
 /// connection that reached an authenticated session from one that did not:
@@ -60,26 +78,18 @@ pub struct Session {
 /// [`SessionError`] if the connection failed, the host answered the hello with
 /// something this build never offered, or the host sent something that has no
 /// place where it arrived.
-pub fn run<S, A, R, P>(
+pub fn run<S: Read + Write>(
     stream: &mut S,
     secret: &Secret,
     version: &str,
     opened: &mut Option<Session>,
-    attach: A,
-    apply: R,
-    probe: P,
-) -> Result<(), SessionError>
-where
-    S: Read + Write,
-    A: FnMut(&[GpuShare]) -> (Vec<GpuMount>, bool),
-    R: FnMut() -> Vec<GpuRecipeStage>,
-    P: FnMut() -> ProbeGpuResponse,
-{
+    handlers: Handlers<'_>,
+) -> Result<(), SessionError> {
     let mut buffer = Vec::new();
     let session = greet(stream, version, &mut buffer)?;
     authenticate(stream, secret, &mut buffer)?;
     let session = opened.insert(session);
-    serve(stream, session, attach, apply, probe, &mut buffer)
+    serve(stream, session, handlers, &mut buffer)
 }
 
 fn greet<S: Read + Write>(
@@ -165,20 +175,12 @@ fn authenticate<S: Read + Write>(
     frame::write(stream, &answer, buffer).map_err(SessionError::Frame)
 }
 
-fn serve<S, A, R, P>(
+fn serve<S: Read + Write>(
     stream: &mut S,
     session: &Session,
-    mut attach: A,
-    mut apply: R,
-    mut probe: P,
+    handlers: Handlers<'_>,
     buffer: &mut Vec<u8>,
-) -> Result<(), SessionError>
-where
-    S: Read + Write,
-    A: FnMut(&[GpuShare]) -> (Vec<GpuMount>, bool),
-    R: FnMut() -> Vec<GpuRecipeStage>,
-    P: FnMut() -> ProbeGpuResponse,
-{
+) -> Result<(), SessionError> {
     let mut next_request_id = FIRST_HEARTBEAT_REQUEST_ID;
     let mut pending_heartbeat = None;
 
@@ -217,7 +219,7 @@ where
             Body::Request(request::Kind::AttachGpuShares(manifest))
                 if session.capabilities.contains(&Capability::Gpu) =>
             {
-                let (mounts, libraries_refreshed) = attach(&manifest.shares);
+                let (mounts, libraries_refreshed) = (handlers.attach_gpu)(&manifest.shares);
                 let report = Envelope::response(
                     request_id,
                     response::Kind::AttachGpuShares(AttachGpuSharesResponse {
@@ -234,7 +236,7 @@ where
             Body::Request(request::Kind::ApplyGpuRecipe(_))
                 if session.capabilities.contains(&Capability::Gpu) =>
             {
-                let stages = apply();
+                let stages = (handlers.apply_gpu_recipe)();
                 let report = Envelope::response(
                     request_id,
                     response::Kind::ApplyGpuRecipe(ApplyGpuRecipeResponse { stages }),
@@ -247,7 +249,45 @@ where
             Body::Request(request::Kind::ProbeGpu(_))
                 if session.capabilities.contains(&Capability::Gpu) =>
             {
-                let report = Envelope::response(request_id, response::Kind::ProbeGpu(probe()));
+                let report = Envelope::response(
+                    request_id,
+                    response::Kind::ProbeGpu((handlers.probe_gpu)()),
+                );
+                frame::write(stream, &report, buffer).map_err(SessionError::Frame)?;
+            }
+            // The display's three requests, gated on the display capability
+            // and never on the GPU's: an agent asked for one has nothing to do
+            // with the other.
+            Body::Request(request::Kind::AttachDisplayPayload(request))
+                if session.capabilities.contains(&Capability::Display) =>
+            {
+                let mount = (handlers.attach_display)(&request.share.unwrap_or_default());
+                let report = Envelope::response(
+                    request_id,
+                    response::Kind::AttachDisplayPayload(AttachDisplayPayloadResponse {
+                        mount: Some(mount),
+                    }),
+                );
+                frame::write(stream, &report, buffer).map_err(SessionError::Frame)?;
+            }
+            Body::Request(request::Kind::ApplyDisplayRecipe(_))
+                if session.capabilities.contains(&Capability::Display) =>
+            {
+                let report = Envelope::response(
+                    request_id,
+                    response::Kind::ApplyDisplayRecipe((handlers.apply_display_recipe)()),
+                );
+                frame::write(stream, &report, buffer).map_err(SessionError::Frame)?;
+            }
+            Body::Request(request::Kind::UpdateDisplayPayload(request))
+                if session.capabilities.contains(&Capability::Display) =>
+            {
+                let report = Envelope::response(
+                    request_id,
+                    response::Kind::UpdateDisplayPayload((handlers.update_display)(
+                        &request.target_version,
+                    )),
+                );
                 frame::write(stream, &report, buffer).map_err(SessionError::Frame)?;
             }
             Body::Request(_) | Body::UnknownRequest => {
@@ -333,6 +373,9 @@ fn kind_name(kind: &request::Kind) -> &'static str {
         request::Kind::AttachGpuShares(_) => "a GPU share manifest out of order",
         request::Kind::ApplyGpuRecipe(_) => "a GPU recipe request out of order",
         request::Kind::ProbeGpu(_) => "a GPU probe request out of order",
+        request::Kind::AttachDisplayPayload(_) => "a display payload share out of order",
+        request::Kind::ApplyDisplayRecipe(_) => "a display recipe request out of order",
+        request::Kind::UpdateDisplayPayload(_) => "a display payload update out of order",
     }
 }
 
@@ -396,15 +439,16 @@ mod tests {
         auth::{self, Nonce, Secret},
         frame,
         v1::{
-            ApplyGpuRecipeRequest, AttachGpuSharesRequest, AuthenticateRequest, Capability,
-            ErrorCode, GpuMount, GpuMountState, GpuProbeCheck, GpuProbeCheckState, GpuProbeStep,
-            GpuProbeVerdict, GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep, GpuShare,
-            GpuShareRole, HelloRequest, HelloResponse, ProbeGpuRequest, ProbeGpuResponse,
-            ProtocolVersion, envelope, request, response,
+            ApplyDisplayRecipeResponse, ApplyGpuRecipeRequest, AttachGpuSharesRequest,
+            AuthenticateRequest, Capability, DisplayMount, DisplayShare, ErrorCode, GpuMount,
+            GpuMountState, GpuProbeCheck, GpuProbeCheckState, GpuProbeStep, GpuProbeVerdict,
+            GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep, GpuShare, GpuShareRole,
+            HelloRequest, HelloResponse, ProbeGpuRequest, ProbeGpuResponse, ProtocolVersion,
+            UpdateDisplayPayloadResponse, envelope, request, response,
         },
     };
 
-    use super::run;
+    use super::{Handlers, run};
 
     /// An attach that mounts nothing, for the tests about message order.
     ///
@@ -420,6 +464,27 @@ mod tests {
     /// guest to build a kernel module.
     fn apply_nothing() -> Vec<GpuRecipeStage> {
         Vec::new()
+    }
+
+    /// The handlers a test about message order needs: every one of them
+    /// answers immediately, because none of what they stand for can happen
+    /// under a `cargo test`.
+    fn handlers<'a>(
+        attach_gpu: &'a mut dyn FnMut(&[GpuShare]) -> (Vec<GpuMount>, bool),
+        apply_gpu_recipe: &'a mut dyn FnMut() -> Vec<GpuRecipeStage>,
+        probe_gpu: &'a mut dyn FnMut() -> ProbeGpuResponse,
+        attach_display: &'a mut dyn FnMut(&DisplayShare) -> DisplayMount,
+        apply_display_recipe: &'a mut dyn FnMut() -> ApplyDisplayRecipeResponse,
+        update_display: &'a mut dyn FnMut(&str) -> UpdateDisplayPayloadResponse,
+    ) -> Handlers<'a> {
+        Handlers {
+            attach_gpu,
+            apply_gpu_recipe,
+            probe_gpu,
+            attach_display,
+            apply_display_recipe,
+            update_display,
+        }
     }
 
     /// A probe that looks at nothing, for the tests about message order.
@@ -538,9 +603,14 @@ mod tests {
             &secret,
             "test-agent",
             &mut opened,
-            refuse_to_mount,
-            apply_nothing,
-            probe_nothing,
+            handlers(
+                &mut refuse_to_mount,
+                &mut apply_nothing,
+                &mut probe_nothing,
+                &mut |_share| DisplayMount::default(),
+                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_version| UpdateDisplayPayloadResponse::default(),
+            ),
         )
         .expect("the host closes after the heartbeat");
 
@@ -552,7 +622,11 @@ mod tests {
                 1,
                 request::Kind::Hello(HelloRequest {
                     version: Some(ProtocolVersion::current()),
-                    capabilities: vec![i32::from(Capability::Gpu)],
+                    capabilities: super::AGENT_CAPABILITIES
+                        .iter()
+                        .copied()
+                        .map(i32::from)
+                        .collect(),
                     agent_version: "test-agent".to_owned(),
                 }),
             )
@@ -611,9 +685,14 @@ mod tests {
             &secret,
             "test-agent",
             &mut None,
-            refuse_to_mount,
-            apply_nothing,
-            probe_nothing,
+            handlers(
+                &mut refuse_to_mount,
+                &mut apply_nothing,
+                &mut probe_nothing,
+                &mut |_share| DisplayMount::default(),
+                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_version| UpdateDisplayPayloadResponse::default(),
+            ),
         )
         .expect_err("a timeout after a partial frame must end the session");
         assert!(matches!(
@@ -659,9 +738,14 @@ mod tests {
             &secret,
             "test-agent",
             &mut None,
-            refuse_to_mount,
-            apply_nothing,
-            probe_nothing,
+            handlers(
+                &mut refuse_to_mount,
+                &mut apply_nothing,
+                &mut probe_nothing,
+                &mut |_share| DisplayMount::default(),
+                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_version| UpdateDisplayPayloadResponse::default(),
+            ),
         )
         .expect("the host closes after the refusal");
 
@@ -711,9 +795,14 @@ mod tests {
             &secret,
             "test-agent",
             &mut opened,
-            refuse_to_mount,
-            apply_nothing,
-            probe_nothing,
+            handlers(
+                &mut refuse_to_mount,
+                &mut apply_nothing,
+                &mut probe_nothing,
+                &mut |_share| DisplayMount::default(),
+                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_version| UpdateDisplayPayloadResponse::default(),
+            ),
         )
         .expect("a compatible host hang-up");
         assert_eq!(opened.expect("a session that authenticated").version, older);
@@ -754,9 +843,14 @@ mod tests {
             &secret,
             "test-agent",
             &mut opened,
-            refuse_to_mount,
-            apply_nothing,
-            probe_nothing,
+            handlers(
+                &mut refuse_to_mount,
+                &mut apply_nothing,
+                &mut probe_nothing,
+                &mut |_share| DisplayMount::default(),
+                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_version| UpdateDisplayPayloadResponse::default(),
+            ),
         )
         .expect_err("a capability the agent did not announce must not be served");
 
@@ -802,25 +896,31 @@ mod tests {
         ]);
 
         let mut attached = Vec::new();
+        let mut attach = |shares: &[GpuShare]| {
+            attached.extend_from_slice(shares);
+            (
+                vec![GpuMount {
+                    share: "vmlord.gpu.wsl-lib".to_owned(),
+                    state: i32::from(GpuMountState::Mounted),
+                    path: "/usr/lib/wsl/lib".to_owned(),
+                    message: "mounted".to_owned(),
+                }],
+                true,
+            )
+        };
         run(
             &mut stream,
             &secret,
             "test-agent",
             &mut None,
-            |shares: &[GpuShare]| {
-                attached.extend_from_slice(shares);
-                (
-                    vec![GpuMount {
-                        share: "vmlord.gpu.wsl-lib".to_owned(),
-                        state: i32::from(GpuMountState::Mounted),
-                        path: "/usr/lib/wsl/lib".to_owned(),
-                        message: "mounted".to_owned(),
-                    }],
-                    true,
-                )
-            },
-            apply_nothing,
-            probe_nothing,
+            handlers(
+                &mut attach,
+                &mut apply_nothing,
+                &mut probe_nothing,
+                &mut |_share| DisplayMount::default(),
+                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_version| UpdateDisplayPayloadResponse::default(),
+            ),
         )
         .expect("the host closes after its manifest was answered");
 
@@ -867,21 +967,27 @@ mod tests {
         ]);
 
         let mut applied = 0;
+        let mut apply = || {
+            applied += 1;
+            vec![GpuRecipeStage {
+                step: i32::from(GpuRecipeStep::Device),
+                state: i32::from(GpuRecipeStageState::Ok),
+                message: "/dev/dxg is a usable device".to_owned(),
+            }]
+        };
         run(
             &mut stream,
             &secret,
             "test-agent",
             &mut None,
-            refuse_to_mount,
-            || {
-                applied += 1;
-                vec![GpuRecipeStage {
-                    step: i32::from(GpuRecipeStep::Device),
-                    state: i32::from(GpuRecipeStageState::Ok),
-                    message: "/dev/dxg is a usable device".to_owned(),
-                }]
-            },
-            probe_nothing,
+            handlers(
+                &mut refuse_to_mount,
+                &mut apply,
+                &mut probe_nothing,
+                &mut |_share| DisplayMount::default(),
+                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_version| UpdateDisplayPayloadResponse::default(),
+            ),
         )
         .expect("the host closes after its recipe was answered");
 
@@ -927,27 +1033,33 @@ mod tests {
         ]);
 
         let mut probed = 0;
+        let mut probe = || {
+            probed += 1;
+            ProbeGpuResponse {
+                verdict: i32::from(GpuProbeVerdict::Renders),
+                checks: vec![GpuProbeCheck {
+                    step: i32::from(GpuProbeStep::Opengl),
+                    state: i32::from(GpuProbeCheckState::Ok),
+                    message: "GL renders on D3D12 (NVIDIA GeForce RTX 4070)".to_owned(),
+                }],
+                renderer: "D3D12 (NVIDIA GeForce RTX 4070)".to_owned(),
+                driver: "dxgkrnl".to_owned(),
+                render_node: String::new(),
+            }
+        };
         run(
             &mut stream,
             &secret,
             "test-agent",
             &mut None,
-            refuse_to_mount,
-            apply_nothing,
-            || {
-                probed += 1;
-                ProbeGpuResponse {
-                    verdict: i32::from(GpuProbeVerdict::Renders),
-                    checks: vec![GpuProbeCheck {
-                        step: i32::from(GpuProbeStep::Opengl),
-                        state: i32::from(GpuProbeCheckState::Ok),
-                        message: "GL renders on D3D12 (NVIDIA GeForce RTX 4070)".to_owned(),
-                    }],
-                    renderer: "D3D12 (NVIDIA GeForce RTX 4070)".to_owned(),
-                    driver: "dxgkrnl".to_owned(),
-                    render_node: String::new(),
-                }
-            },
+            handlers(
+                &mut refuse_to_mount,
+                &mut apply_nothing,
+                &mut probe,
+                &mut |_share| DisplayMount::default(),
+                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_version| UpdateDisplayPayloadResponse::default(),
+            ),
         )
         .expect("the host closes after its probe was answered");
 
@@ -998,9 +1110,14 @@ mod tests {
             &secret,
             "test-agent",
             &mut None,
-            refuse_to_mount,
-            apply_nothing,
-            || panic!("a probe that was never agreed on must not be run"),
+            handlers(
+                &mut refuse_to_mount,
+                &mut apply_nothing,
+                &mut || panic!("a probe that was never agreed on must not be run"),
+                &mut |_share| DisplayMount::default(),
+                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_version| UpdateDisplayPayloadResponse::default(),
+            ),
         )
         .expect("the host closes after the refusal");
 
@@ -1049,9 +1166,14 @@ mod tests {
             &secret,
             "test-agent",
             &mut None,
-            refuse_to_mount,
-            || panic!("a recipe that was never agreed on must not be applied"),
-            probe_nothing,
+            handlers(
+                &mut refuse_to_mount,
+                &mut || panic!("a recipe that was never agreed on must not be applied"),
+                &mut probe_nothing,
+                &mut |_share| DisplayMount::default(),
+                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_version| UpdateDisplayPayloadResponse::default(),
+            ),
         )
         .expect("the host closes after the refusal");
 
@@ -1100,11 +1222,16 @@ mod tests {
             &secret,
             "test-agent",
             &mut None,
-            |_shares: &[GpuShare]| {
-                panic!("a manifest that was never agreed on must not be mounted")
-            },
-            apply_nothing,
-            probe_nothing,
+            handlers(
+                &mut |_shares: &[GpuShare]| {
+                    panic!("a manifest that was never agreed on must not be mounted")
+                },
+                &mut apply_nothing,
+                &mut probe_nothing,
+                &mut |_share| DisplayMount::default(),
+                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_version| UpdateDisplayPayloadResponse::default(),
+            ),
         )
         .expect("the host closes after the refusal");
 
@@ -1148,9 +1275,14 @@ mod tests {
             &secret,
             "test-agent",
             &mut opened,
-            refuse_to_mount,
-            apply_nothing,
-            probe_nothing,
+            handlers(
+                &mut refuse_to_mount,
+                &mut apply_nothing,
+                &mut probe_nothing,
+                &mut |_share| DisplayMount::default(),
+                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_version| UpdateDisplayPayloadResponse::default(),
+            ),
         )
         .expect_err("a revision this agent never claimed must not be served");
 
@@ -1180,9 +1312,14 @@ mod tests {
             &secret,
             "test-agent",
             &mut opened,
-            refuse_to_mount,
-            apply_nothing,
-            probe_nothing,
+            handlers(
+                &mut refuse_to_mount,
+                &mut apply_nothing,
+                &mut probe_nothing,
+                &mut |_share| DisplayMount::default(),
+                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_version| UpdateDisplayPayloadResponse::default(),
+            ),
         )
         .expect_err("a host that hangs up before its challenge ends the session");
 

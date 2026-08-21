@@ -36,9 +36,16 @@ use std::{
     time::Duration,
 };
 
-use vmlord_agent_protocol::{auth::Secret, backoff::Backoff};
+use vmlord_agent_protocol::{
+    auth::Secret,
+    backoff::Backoff,
+    v1::{ApplyDisplayRecipeResponse, UpdateDisplayPayloadResponse},
+};
 
 mod command;
+mod display_kernel;
+mod display_mounts;
+mod display_recipe;
 mod gpu_kernel;
 mod gpu_mountinfo;
 mod gpu_mounts;
@@ -46,6 +53,7 @@ mod gpu_probe;
 mod gpu_recipe;
 mod gpu_render;
 mod gpu_targets;
+mod guest_files;
 mod session;
 mod vsock;
 
@@ -211,9 +219,27 @@ fn connect_to_host(secret: &Secret) -> bool {
         secret,
         AGENT_VERSION,
         &mut opened,
-        gpu_mounts::attach,
-        || gpu_kernel::apply(&STOPPING),
-        || gpu_render::probe(&STOPPING),
+        session::Handlers {
+            attach_gpu: &mut gpu_mounts::attach,
+            apply_gpu_recipe: &mut || gpu_kernel::apply(&STOPPING),
+            probe_gpu: &mut || gpu_render::probe(&STOPPING),
+            attach_display: &mut display_mounts::attach,
+            apply_display_recipe: &mut || {
+                let (stages, versions) = display_kernel::apply(&STOPPING);
+                ApplyDisplayRecipeResponse {
+                    stages,
+                    versions: Some(versions),
+                }
+            },
+            update_display: &mut |target_version| {
+                let (stages, versions, outcome) = display_kernel::update(target_version, &STOPPING);
+                UpdateDisplayPayloadResponse {
+                    stages,
+                    versions: Some(versions),
+                    outcome: i32::from(outcome),
+                }
+            },
+        },
     ) {
         Ok(()) => eprintln!("vmlord-agent: the host closed the session"),
         Err(error) => eprintln!("vmlord-agent: {error}"),
