@@ -8,9 +8,11 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
+use vmlord_payload::archive;
+
 use crate::{
     CatalogEntry, PayloadError, PayloadManifest, PayloadProgress, Sha256Digest, SourceManifest,
-    archive, manifest::cache_provenance,
+    manifest::cache_provenance,
 };
 
 const PAYLOAD_MANIFEST_LIMIT: u64 = 1024 * 1024;
@@ -143,15 +145,14 @@ pub(crate) fn prepare_verified_archive(
         format!("payload {} archive", entry.payload_id()),
         cancel,
     )?;
-    let (_, sources) =
-        archive::extract(
-            entry,
-            &cached_archive,
-            archive_length,
-            &files_directory,
-            progress,
-            cancel,
-        )?;
+    let (_, sources) = archive::extract(
+        entry,
+        &cached_archive,
+        archive_length,
+        &files_directory,
+        progress,
+        cancel,
+    )?;
     write_and_flush(
         &temporary.path().join("provenance.json"),
         &cache_provenance(entry, &sources)?,
@@ -261,7 +262,7 @@ fn load_ready(
     let source_bytes =
         read_bounded_regular_file(&sources_path, source_size, "read cached sources manifest")?;
     let sources = SourceManifest::parse_and_validate(&source_bytes, entry)?;
-    sources.validate_prepared_files(&manifest)?;
+    sources.validate_overlays_against(&manifest)?;
     let provenance_path = root.join("provenance.json");
     let expected_provenance = cache_provenance(entry, &sources)?;
     let actual_provenance = read_bounded_regular_file(

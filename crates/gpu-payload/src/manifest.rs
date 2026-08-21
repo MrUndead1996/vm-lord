@@ -241,7 +241,7 @@ impl SourceManifest {
         Ok(Self { document: doc })
     }
 
-    pub(crate) fn validate_prepared_files(
+    pub(crate) fn validate_overlays_against(
         &self,
         manifest: &PayloadManifest,
     ) -> Result<(), PayloadError> {
@@ -264,6 +264,26 @@ impl SourceManifest {
             }
         }
         Ok(())
+    }
+}
+
+impl vmlord_payload::PayloadFiles for PayloadManifest {
+    fn files(&self) -> &[PreparedFile] {
+        self.files()
+    }
+}
+
+impl serde::Serialize for SourceManifest {
+    /// The document as it was read: the wrapper exists to prove the document
+    /// was validated, and nothing about that is worth writing out.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.document.serialize(serializer)
+    }
+}
+
+impl vmlord_payload::PayloadSources<PayloadManifest> for SourceManifest {
+    fn validate_prepared_files(&self, manifest: &PayloadManifest) -> Result<(), PayloadError> {
+        self.validate_overlays_against(manifest)
     }
 }
 
@@ -907,7 +927,7 @@ mod tests {
             .unwrap();
 
             assert!(matches!(
-                sources.validate_prepared_files(&payload),
+                sources.validate_overlays_against(&payload),
                 Err(PayloadError::InvalidManifest(_))
             ));
         }

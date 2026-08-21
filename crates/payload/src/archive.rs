@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use zip::ZipArchive;
 
 use crate::{
-    CatalogEntry, PayloadError, PayloadManifest, PayloadProgress, Sha256Digest, SourceManifest,
+    PayloadEntry, PayloadError, PayloadFiles, PayloadProgress, PayloadSources, Sha256Digest,
 };
 
 const PAYLOAD_MANIFEST_LIMIT: u64 = 1024 * 1024;
@@ -23,14 +23,20 @@ struct InspectedEntry {
     size: u64,
 }
 
-pub(crate) fn extract(
-    entry: &CatalogEntry,
+/// Expands one verified archive into `destination`, under this entry's limits.
+///
+/// Generic over the kind of payload because the rules it enforces are not:
+/// `payload.json` must be there and must hash to what the entry claims, every
+/// member must be declared by it, nothing may be declared twice or left
+/// undeclared, and no member may leave the destination.
+pub fn extract<E: PayloadEntry>(
+    entry: &E,
     archive: &Path,
     archive_length: u64,
     destination: &Path,
     progress: &dyn Fn(PayloadProgress),
     cancel: &AtomicBool,
-) -> Result<(PayloadManifest, SourceManifest), PayloadError> {
+) -> Result<(E::Manifest, E::Sources), PayloadError> {
     let archive_file = File::open(archive)
         .map_err(|error| PayloadError::io("open archive", archive.into(), error))?;
     let mut zip =
@@ -54,8 +60,8 @@ pub(crate) fn extract(
             actual,
         });
     }
-    let manifest = PayloadManifest::parse_and_validate(&payload_bytes, entry)?;
-    validate_manifest_limits(&manifest, entry)?;
+    let manifest = entry.parse_manifest(&payload_bytes)?;
+    validate_manifest_limits::<E>(&manifest, entry)?;
     let inspected = inspect_entries(&mut zip, entry, archive_length)?;
 
     let declared: HashMap<_, _> = manifest
@@ -118,12 +124,10 @@ pub(crate) fn extract(
     }
 
     let sources_path = destination.join("sources.json");
-    let sources = SourceManifest::parse_and_validate(
-        &fs::read(&sources_path).map_err(|error| {
+    let sources =
+        entry.parse_sources(&fs::read(&sources_path).map_err(|error| {
             PayloadError::io("read extracted sources.json", sources_path, error)
-        })?,
-        entry,
-    )?;
+        })?)?;
     sources.validate_prepared_files(&manifest)?;
     Ok((manifest, sources))
 }
@@ -173,9 +177,9 @@ fn read_central_names(archive: &Path, directory_start: u64) -> Result<Vec<Vec<u8
     Ok(names)
 }
 
-fn inspect_entries(
+fn inspect_entries<E: PayloadEntry>(
     zip: &mut ZipArchive<File>,
-    entry: &CatalogEntry,
+    entry: &E,
     archive_length: u64,
 ) -> Result<Vec<InspectedEntry>, PayloadError> {
     let mut seen = HashSet::new();
@@ -347,9 +351,9 @@ fn read_payload_manifest(
     Ok(bytes)
 }
 
-fn validate_manifest_limits(
-    manifest: &PayloadManifest,
-    entry: &CatalogEntry,
+fn validate_manifest_limits<E: PayloadEntry>(
+    manifest: &E::Manifest,
+    entry: &E,
 ) -> Result<(), PayloadError> {
     let mut count = 0_u64;
     let mut expanded = 0_u64;
@@ -476,7 +480,7 @@ mod tests {
 
     use zip::{CompressionMethod, System, ZipWriter, write::SimpleFileOptions};
 
-    use crate::{PayloadError, Sha256Digest};
+    use crate::{PayloadError, Sha256Digest, test_kind::TestEntry};
 
     use super::{extract, stream_member};
 
@@ -649,30 +653,13 @@ mod tests {
         payload: &[u8],
         expanded_size_limit: u64,
         file_count_limit: u64,
-    ) -> crate::CatalogEntry {
-        let entry_document = serde_json::json!({
-                "payload_id": "test",
-                "target": {
-                    "distribution": "ubuntu",
-                    "release": "26.04",
-                    "architecture": "amd64",
-                    "kernel_release": "test",
-                    "payload_abi": 1
-                },
-                "expanded_size_limit": expanded_size_limit,
-                "file_count_limit": file_count_limit,
-                "archive_sha256": digest(archive),
-                "payload_manifest_sha256": digest(payload),
-                "required_renderers": ["d3d12-gallium"],
-                "mesa_policy": "bundled",
-                "sources": [{
-                    "url": SOURCE_URL,
-                    "commit": SOURCE_COMMIT,
-                    "version": "1"
-                }],
-                "licenses": [{"spdx": "MIT", "path": "licenses/MIT.txt"}]
-        });
-        crate::test_entry(entry_document)
+    ) -> TestEntry {
+        TestEntry::new(
+            digest(archive).parse().unwrap(),
+            digest(payload).parse().unwrap(),
+            expanded_size_limit,
+            file_count_limit,
+        )
     }
 
     fn extract_fixture(
@@ -721,68 +708,6 @@ mod tests {
             },
         ]);
         (archive, payload, sources)
-    }
-
-    #[test]
-    fn extraction_rejects_an_overlay_with_a_digest_not_declared_by_payload() {
-        let content = b"content";
-        let sources = serde_json::to_vec(&serde_json::json!({
-            "schema_version": 2,
-            "target": {
-                "distribution": "ubuntu",
-                "release": "26.04",
-                "architecture": "amd64",
-                "kernel_release": "test",
-                "payload_abi": 1
-            },
-            "mesa_policy": "bundled",
-            "sources": [{
-                "kind": "checkout",
-                "url": SOURCE_URL,
-                "commit": SOURCE_COMMIT,
-                "version": "1",
-                "paths": ["content/file"],
-                "licenses": [{"path": "content/file", "spdx": "MIT"}],
-                "sha256": digest(b"source material")
-            }],
-            "overlays": [{
-                "path": "content/file",
-                "sha256": digest(b"different content"),
-                "license": "MIT",
-                "author": "VMLord contributors"
-            }]
-        }))
-        .unwrap();
-        let payload = payload_manifest(&[("content/file", content), ("sources.json", &sources)]);
-        let archive = archive_bytes(&[
-            Member {
-                name: "payload.json",
-                bytes: &payload,
-                kind: MemberKind::File,
-            },
-            Member {
-                name: "content/file",
-                bytes: content,
-                kind: MemberKind::File,
-            },
-            Member {
-                name: "sources.json",
-                bytes: &sources,
-                kind: MemberKind::File,
-            },
-        ]);
-
-        assert!(matches!(
-            extract_fixture(
-                &archive,
-                &payload,
-                archive.len() as u64,
-                archive.len() as u64,
-                3,
-                false,
-            ),
-            Err(PayloadError::InvalidManifest(message)) if message.contains("overlay digest")
-        ));
     }
 
     #[test]
@@ -1069,7 +994,12 @@ mod tests {
     #[test]
     fn wrong_payload_digest_declared_size_and_cancellation_are_rejected() {
         let (archive, payload, sources) = valid_archive(b"content");
-        let wrong_digest_entry = entry(&archive, b"different payload bytes", archive.len() as u64, 3);
+        let wrong_digest_entry = entry(
+            &archive,
+            b"different payload bytes",
+            archive.len() as u64,
+            3,
+        );
         let temporary = TemporaryDirectory::new("wrong-digest");
         let archive_path = temporary.path().join("archive.zip");
         let destination = temporary.path().join("files");

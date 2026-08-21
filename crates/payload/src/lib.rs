@@ -10,12 +10,17 @@
 //! provenance, what makes one applicable to a guest -- belongs to the crate
 //! for that kind of payload, which meets this one at [`PayloadEntry`].
 
+pub mod archive;
 mod digest;
+mod entry;
 mod error;
 mod prepared;
 mod progress;
+#[cfg(test)]
+mod test_kind;
 
 pub use digest::{Sha256Digest, Sha256Hasher};
+pub use entry::{PayloadEntry, PayloadFiles, PayloadSources};
 pub use error::PayloadError;
 pub use prepared::{PreparedFile, validate_path};
 pub use progress::PayloadProgress;

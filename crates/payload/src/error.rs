@@ -109,7 +109,11 @@ impl fmt::Display for PayloadError {
                 operation,
                 path,
                 source,
-            } => write!(formatter, "could not {operation} {}: {source}", path.display()),
+            } => write!(
+                formatter,
+                "could not {operation} {}: {source}",
+                path.display()
+            ),
             Self::ConflictingGeneration { path } => write!(
                 formatter,
                 "conflicting payload generation: {}",
