@@ -397,7 +397,8 @@ impl eframe::App for VmlordUi {
                 | VmAction::CancelCreate
                 | VmAction::Connect
                 | VmAction::Ssh
-                | VmAction::Console => {
+                | VmAction::Console
+                | VmAction::UpdateDisplay => {
                     if let Some(name) = self.selected_vm_name.clone() {
                         let result = match action {
                             VmAction::Start => self.application.start_vm(&name),
@@ -407,6 +408,9 @@ impl eframe::App for VmlordUi {
                             VmAction::Connect => self.application.connect_display(&name),
                             VmAction::Ssh => self.application.open_ssh(&name),
                             VmAction::Console => self.application.open_console(&name),
+                            VmAction::UpdateDisplay => {
+                                self.application.update_display_payload(&name)
+                            }
                             _ => unreachable!("only supported VM actions reach this branch"),
                         };
                         if result.is_ok() {
@@ -1924,6 +1928,33 @@ fn render_action_icon(ui: &mut egui::Ui, action: VmAction, enabled: bool) -> egu
                 stroke,
             );
         }
+        VmAction::UpdateDisplay => {
+            // A screen with an arrow into it: the display, and something new
+            // arriving in it.
+            let screen = egui::Rect::from_center_size(center, egui::vec2(14.0, 10.0));
+            painter.rect_stroke(screen, 2.0, stroke, egui::StrokeKind::Inside);
+            painter.line_segment(
+                [
+                    egui::pos2(center.x, center.y - 7.0),
+                    egui::pos2(center.x, center.y - 1.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x - 3.0, center.y - 4.0),
+                    egui::pos2(center.x, center.y - 1.0),
+                ],
+                stroke,
+            );
+            painter.line_segment(
+                [
+                    egui::pos2(center.x + 3.0, center.y - 4.0),
+                    egui::pos2(center.x, center.y - 1.0),
+                ],
+                stroke,
+            );
+        }
         VmAction::Console => {
             // The D-sub connector on the back of a machine: what COM1 looks
             // like to the person who needs it.
@@ -1984,7 +2015,7 @@ fn action_color(action: VmAction) -> egui::Color32 {
         VmAction::Stop => egui::Color32::from_rgb(235, 210, 64),
         VmAction::ForceStop => egui::Color32::from_rgb(225, 70, 70),
         VmAction::CancelCreate => egui::Color32::from_rgb(235, 170, 64),
-        VmAction::Connect | VmAction::Ssh | VmAction::Console => {
+        VmAction::Connect | VmAction::Ssh | VmAction::Console | VmAction::UpdateDisplay => {
             egui::Color32::from_rgb(85, 193, 233)
         }
         VmAction::Edit => egui::Color32::from_rgb(235, 134, 58),

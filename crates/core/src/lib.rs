@@ -286,6 +286,24 @@ pub trait VmRepository {
             "display connections are not supported by this backend",
         ))
     }
+    /// Moves a running VM's display payload to the newest version this build
+    /// carries for it.
+    ///
+    /// Asked for and never automatic: a start installs what is missing, and a
+    /// version change is something a person chooses at a moment they chose.
+    /// The VM has to be running, because what verifies an update is its own
+    /// guest.
+    ///
+    /// # Errors
+    ///
+    /// [`RepositoryError`] when there is nothing newer to move to, when the VM
+    /// is not running, or when the guest could not be asked. None of them
+    /// change what the guest is running.
+    fn update_display_payload(&mut self, _name: &str) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(
+            "display payload updates are not supported by this backend",
+        ))
+    }
     fn open_ssh(&mut self, _name: &str) -> Result<(), RepositoryError> {
         Err(RepositoryError::new(
             "SSH connections are not supported by this backend",

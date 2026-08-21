@@ -17,6 +17,7 @@ use std::{
     error::Error,
     fmt,
     io::{Read, Write},
+    sync::mpsc::{Receiver, Sender},
 };
 
 use vmlord_agent_protocol::{
@@ -27,16 +28,19 @@ use vmlord_agent_protocol::{
         ApplyDisplayRecipeRequest, ApplyDisplayRecipeResponse, ApplyGpuRecipeRequest,
         ApplyGpuRecipeResponse, AttachDisplayPayloadRequest, AttachDisplayPayloadResponse,
         AttachGpuSharesRequest, AttachGpuSharesResponse, AuthenticateRequest, Capability,
-        DisplayMountState, DisplayRecipeStageState, DisplayShare as WireDisplayShare, Envelope,
-        ErrorCode, GpuMountState, GpuProbeCheckState, GpuProbeVerdict, GpuRecipeStageState,
-        GpuShareRole, HeartbeatResponse, HelloResponse, ProbeGpuRequest, ProbeGpuResponse,
-        ProtocolVersion, envelope, request, response,
+        DisplayMountState, DisplayRecipeStageState, DisplayShare as WireDisplayShare,
+        DisplayUpdateOutcome, Envelope, ErrorCode, GpuMountState, GpuProbeCheckState,
+        GpuProbeVerdict, GpuRecipeStageState, GpuShareRole, HeartbeatResponse, HelloResponse,
+        ProbeGpuRequest, ProbeGpuResponse, ProtocolVersion, UpdateDisplayPayloadRequest,
+        UpdateDisplayPayloadResponse, envelope, request, response,
     },
 };
 use vmlord_core::{
     DisplayFailure, DisplayShare, DisplayStage, DisplayStatusCode, GpuFailure, GpuShareManifest,
     GpuShareRole as CoreShareRole, GpuStatusCode, GuestGpuDetail, GuestGpuReport,
 };
+
+use crate::agent::{DisplayUpdate, DisplayUpdateAnswer};
 
 /// What this build of the host implements beyond the base protocol.
 ///
@@ -78,6 +82,13 @@ const PROBE_REQUEST_ID: u32 = APPLY_REQUEST_ID + 1;
 const DISPLAY_ATTACH_REQUEST_ID: u32 = PROBE_REQUEST_ID + 1;
 const DISPLAY_APPLY_REQUEST_ID: u32 = DISPLAY_ATTACH_REQUEST_ID + 1;
 
+/// The id an update is asked under.
+///
+/// One id and not a counter, like the questions above it, because a session
+/// carries at most one update at a time: a second while the first is building
+/// would be a second question on a socket still waiting for an answer.
+const DISPLAY_UPDATE_REQUEST_ID: u32 = DISPLAY_APPLY_REQUEST_ID + 1;
+
 /// Where a session hands what the guest said about its GPU.
 ///
 /// A callback rather than a channel: `serve` is tested against a peer made of
@@ -115,6 +126,13 @@ pub(crate) struct SessionWork<'a> {
     pub(crate) display_share: Option<&'a DisplayShare>,
     pub(crate) gpu: GuestGpuSink<'a>,
     pub(crate) display: GuestDisplaySink<'a>,
+    /// Where a display payload update arrives from, when this session is one
+    /// somebody can ask things of.
+    ///
+    /// Read between frames rather than written to the socket from another
+    /// thread: a session is one conversation, and two writers would interleave
+    /// halfway through a frame.
+    pub(crate) updates: Option<&'a Receiver<DisplayUpdate>>,
 }
 
 /// What a session agreed on when it opened.
@@ -202,6 +220,10 @@ pub(crate) fn serve<S: Read + Write>(
     let mut pending_display_attach =
         attach_display(stream, session, work.display_share, vm_name, &mut buffer)?;
     let mut pending_display_recipe = None;
+    // At most one update at a time, and its answer channel with it: a second
+    // request while one is in flight would be a second question on a socket
+    // that is still waiting for the first answer.
+    let mut pending_update: Option<Sender<DisplayUpdateAnswer>> = None;
 
     loop {
         let envelope = match frame::read(stream, &mut buffer) {
@@ -214,7 +236,29 @@ pub(crate) fn serve<S: Read + Write>(
             // retrying cannot abandon a partial prefix or body. This is the
             // normal result of the bounded socket reads that let VM shutdown
             // interrupt a silent agent session.
-            Err(FrameError::Idle) => continue,
+            // The one place another thread's request can get onto this socket:
+            // between frames, where nothing is half-written.
+            Err(FrameError::Idle) => {
+                if pending_update.is_none()
+                    && let Some(update) = work.updates.and_then(|updates| updates.try_recv().ok())
+                {
+                    pending_update = start_update(stream, session, &update, vm_name, &mut buffer)?;
+                    if pending_update.is_none() {
+                        let _ = update.answer.send(DisplayUpdateAnswer {
+                            outcome: DisplayUpdateOutcome::Failed,
+                            report: GuestDisplayPayloadReport {
+                                failure: Some(DisplayFailure::new(
+                                    DisplayStage::Payload,
+                                    DisplayStatusCode::PayloadUpdateFailed,
+                                    "this guest's agent does not speak the display capability",
+                                )),
+                                ..GuestDisplayPayloadReport::default()
+                            },
+                        });
+                    }
+                }
+                continue;
+            }
             Err(error) => return Err(SessionError::Frame(error)),
         };
 
@@ -261,6 +305,17 @@ pub(crate) fn serve<S: Read + Write>(
             {
                 pending_display_recipe = None;
                 report_display_recipe(&report, vm_name, work.display);
+            }
+            Body::Response(response::Kind::UpdateDisplayPayload(report))
+                if request_id == DISPLAY_UPDATE_REQUEST_ID =>
+            {
+                let answer = report_display_update(&report, vm_name, work.display);
+                if let Some(waiting) = pending_update.take() {
+                    // A caller that gave up while the guest was building is
+                    // not an error here: the update happened either way, and
+                    // the facts it produced have already been recorded.
+                    let _ = waiting.send(answer);
+                }
             }
             // A response to a request this side did not send, or one it has
             // already had an answer to. Worth a line and nothing more: there is
@@ -441,6 +496,111 @@ fn apply_display_recipe<S: Read + Write>(
     log::debug!("VMLord asked the agent of VM \"{vm_name}\" to apply its display recipe");
 
     Ok(Some(DISPLAY_APPLY_REQUEST_ID))
+}
+
+/// Asks the guest to move to a version, and answers with where to send the
+/// answer.
+///
+/// `None` is an agent that never agreed the display capability, which is a
+/// guest nothing can be asked of.
+fn start_update<S: Read + Write>(
+    stream: &mut S,
+    session: &AgentSession,
+    update: &DisplayUpdate,
+    vm_name: &str,
+    buffer: &mut Vec<u8>,
+) -> Result<Option<Sender<DisplayUpdateAnswer>>, SessionError> {
+    if !session.capabilities.contains(&Capability::Display) {
+        return Ok(None);
+    }
+
+    let request = Envelope::request(
+        DISPLAY_UPDATE_REQUEST_ID,
+        request::Kind::UpdateDisplayPayload(UpdateDisplayPayloadRequest {
+            target_version: update.target_version.clone(),
+        }),
+    );
+    frame::write(stream, &request, buffer).map_err(SessionError::Frame)?;
+    log::info!(
+        "VMLord asked the agent of VM \"{vm_name}\" to move its display payload to {}",
+        update.target_version
+    );
+
+    Ok(Some(update.answer.clone()))
+}
+
+/// Says what an update came to, records the facts it produced, and hands the
+/// caller the outcome.
+///
+/// A rollback is reported as what it is: the display works, on the version that
+/// was working before, and the failure that goes with it says so rather than
+/// calling a working desktop broken.
+fn report_display_update(
+    report: &UpdateDisplayPayloadResponse,
+    vm_name: &str,
+    sink: GuestDisplaySink<'_>,
+) -> DisplayUpdateAnswer {
+    for stage in &report.stages {
+        match stage.state() {
+            DisplayRecipeStageState::Failed => log::warn!(
+                "the agent of VM \"{vm_name}\" did not finish update stage {:?}: {}",
+                stage.step(),
+                stage.message
+            ),
+            state => log::debug!(
+                "the agent of VM \"{vm_name}\" update stage {:?} ({state:?}): {}",
+                stage.step(),
+                stage.message
+            ),
+        }
+    }
+
+    let versions = report.versions.clone().unwrap_or_default();
+    let outcome = report.outcome();
+    let reason = report
+        .stages
+        .iter()
+        .find(|stage| stage.state() == DisplayRecipeStageState::Failed)
+        .map(|broken| broken.message.clone())
+        .unwrap_or_else(|| "the guest did not say which stage failed".to_owned());
+    let failure = match outcome {
+        DisplayUpdateOutcome::Updated => None,
+        DisplayUpdateOutcome::RolledBack => Some(DisplayFailure::new(
+            DisplayStage::Payload,
+            DisplayStatusCode::PayloadUpdateRolledBack,
+            reason,
+        )),
+        _ => Some(DisplayFailure::new(
+            DisplayStage::Payload,
+            DisplayStatusCode::PayloadUpdateFailed,
+            reason,
+        )),
+    };
+
+    let payload = GuestDisplayPayloadReport {
+        installed: some_version(&versions.installed),
+        previous: some_version(&versions.previous),
+        loaded: some_version(&versions.loaded),
+        failure,
+    };
+    sink(payload.clone());
+
+    match outcome {
+        DisplayUpdateOutcome::Updated => log::info!(
+            "the agent of VM \"{vm_name}\" is running display payload {}",
+            versions.loaded
+        ),
+        DisplayUpdateOutcome::RolledBack => log::warn!(
+            "the display payload update of VM \"{vm_name}\" did not verify; {} is running again",
+            versions.loaded
+        ),
+        _ => log::error!("the display payload update of VM \"{vm_name}\" left nothing running"),
+    }
+
+    DisplayUpdateAnswer {
+        outcome,
+        report: payload,
+    }
 }
 
 /// Says what the guest made of the display share, and whether the recipe is
@@ -1026,6 +1186,7 @@ mod tests {
             display_share: None,
             gpu,
             display: &|_| {},
+            updates: None,
         }
     }
 
@@ -1412,6 +1573,7 @@ mod tests {
             display_share: share,
             gpu: &|_| {},
             display,
+            updates: None,
         }
     }
 

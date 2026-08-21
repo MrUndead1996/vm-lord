@@ -29,6 +29,7 @@ use crate::{
     com1_terminal::{Com1Launcher, Com1Sessions},
     cycle::{CycleOutcome, VmBuildCycle},
     display_runs::DisplayRuns,
+    display_update,
     gpu_runs::GpuRuns,
     guest_ready::ReadinessTimeouts,
     hcn::HcnNetwork,
@@ -1347,6 +1348,65 @@ impl VmRepository for HcsVmRepository {
         let mapping = self.mapping(name)?;
         let state = self.reported_state(&mapping)?;
         self.open_ssh_in_state(&mapping, state)
+    }
+
+    /// Moves a running VM's display payload to the newest version this build
+    /// carries for it.
+    ///
+    /// Everything that can refuse does so before the guest is asked: a VM that
+    /// is not running, a release with nothing newer, a payload that will not
+    /// stage. What the guest then answers is recorded whichever way it went --
+    /// an update that rolled back is a working display on the previous version
+    /// and is worth saying so.
+    fn update_display_payload(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.require_initialized()?;
+        self.builds.refuse_if_building(name)?;
+
+        let mapping = self.mapping(name)?;
+        let Some(target) = mapping.guest_target.clone() else {
+            return Err(RepositoryError::new(format!(
+                "VM \"{name}\" records no guest, so no display payload can be chosen for it"
+            )));
+        };
+        let state = self.reported_state(&mapping)?;
+        let vm_directory = layout::vm_directory(&self.storage_root, &mapping.vm_name)?;
+        let executable_directory = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .unwrap_or_default();
+        let cache_root = display_update::cache_root(&self.storage_root);
+        let installed = self.display_runs.snapshot(mapping.vm_id).payload.installed;
+        let sessions = &self.agent_sessions;
+        let vm_id = mapping.vm_id;
+
+        let outcome = display_update::run(&display_update::UpdateRequest {
+            vm_name: &mapping.vm_name,
+            vm_directory: &vm_directory,
+            executable_directory: &executable_directory,
+            cache_root: &cache_root,
+            guest: target.display_selector(),
+            installed,
+            running: matches!(state, Some(HcsSystemState::Running)),
+            progress: &|_| {},
+            ask: &|version| {
+                sessions
+                    .update_display_payload(vm_id, version)
+                    .unwrap_or_else(|| {
+                        Err(RepositoryError::new(format!(
+                            "VMLord is not listening for the agent of VM \"{name}\""
+                        )))
+                    })
+            },
+        })?;
+
+        self.display_runs.record_guest_payload(
+            vm_id,
+            outcome.payload.installed,
+            outcome.payload.previous,
+            outcome.payload.loaded,
+            outcome.failure,
+        );
+        Ok(())
     }
 
     /// Reads the host afresh on every call: see [`crate::discover_host_gpu`].

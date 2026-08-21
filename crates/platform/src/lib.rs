@@ -24,6 +24,7 @@ mod display_exports;
 mod display_prepare;
 mod display_runs;
 mod display_staging;
+mod display_update;
 mod enumerate;
 mod error;
 mod event;
