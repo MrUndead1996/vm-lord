@@ -34,3 +34,11 @@ rustc-ice-*.txt
 
 # Left behind by running payloads/*/prepare_test.py on the host
 __pycache__/
+
+# Out-of-tree kernel module build products
+payloads/display/module/*.ko
+payloads/display/module/*.o
+payloads/display/module/*.mod*
+payloads/display/module/.*.cmd
+payloads/display/module/Module.symvers
+payloads/display/module/modules.order

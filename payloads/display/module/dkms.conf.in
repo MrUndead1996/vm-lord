@@ -1,0 +1,7 @@
+PACKAGE_NAME="vmlord-display"
+PACKAGE_VERSION="@VERSION@"
+BUILT_MODULE_NAME[0]="vmlord_drm"
+DEST_MODULE_LOCATION[0]="/updates"
+# What carries the module across Ubuntu's unattended kernel upgrades with
+# VMLord not involved at all.
+AUTOINSTALL="yes"
