@@ -32,6 +32,12 @@
 #include <drm/drm_connector.h>
 #include <drm/drm_crtc.h>
 #include <drm/drm_drv.h>
+/*
+ * Every DRM header this file needs is included by name, and none is relied on
+ * to arrive through another: 5.15 pulled drm_edid.h in transitively and 6.8
+ * does not, which is one implicit declaration and a build that fails.
+ */
+#include <drm/drm_edid.h>
 #include <drm/drm_encoder.h>
 #include <drm/drm_fourcc.h>
 #include <drm/drm_framebuffer.h>
@@ -39,6 +45,7 @@
 #include <drm/drm_gem.h>
 #include <drm/drm_gem_shmem_helper.h>
 #include <drm/drm_managed.h>
+#include <drm/drm_modes.h>
 #include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_plane.h>
 #include <drm/drm_probe_helper.h>
