@@ -10,20 +10,24 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use crate::{PayloadError, PayloadProgress, ReadyGpuPayload, ReadyMarker, Sha256Digest};
+use crate::{
+    PayloadEntry, PayloadError, PayloadFiles, PayloadProgress, ReadyMarker, ReadyPayload,
+    Sha256Digest,
+};
 
 const HASH_BUFFER_SIZE: usize = 64 * 1024;
 const READY_MARKER_SIZE_LIMIT: u64 = 64 * 1024;
 static NEXT_OPERATION: AtomicU64 = AtomicU64::new(0);
 
-pub struct StagedGpuPayload {
+/// One payload generation, published into one VM's directory.
+pub struct StagedPayload {
     payload_id: String,
     generation: Sha256Digest,
     generation_directory: PathBuf,
     ready_marker_path: PathBuf,
 }
 
-impl StagedGpuPayload {
+impl StagedPayload {
     pub fn payload_id(&self) -> &str {
         &self.payload_id
     }
@@ -56,12 +60,12 @@ pub fn ensure_staging_root(path: &Path) -> Result<(), PayloadError> {
     Ok(())
 }
 
-pub fn stage_payload(
-    payload: &ReadyGpuPayload,
+pub fn stage_payload<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
     root: &Path,
     progress: &dyn Fn(PayloadProgress),
     cancel: &AtomicBool,
-) -> Result<StagedGpuPayload, PayloadError> {
+) -> Result<StagedPayload, PayloadError> {
     stage_with(
         payload,
         root,
@@ -71,13 +75,13 @@ pub fn stage_payload(
     )
 }
 
-pub(crate) fn stage_with(
-    payload: &ReadyGpuPayload,
+pub(crate) fn stage_with<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
     root: &Path,
     hard_link: &dyn Fn(&Path, &Path) -> io::Result<()>,
     progress: &dyn Fn(PayloadProgress),
     cancel: &AtomicBool,
-) -> Result<StagedGpuPayload, PayloadError> {
+) -> Result<StagedPayload, PayloadError> {
     ensure_staging_root(root)?;
     check_cancelled(cancel)?;
     let digest = payload.generation().as_hex();
@@ -105,7 +109,7 @@ pub(crate) fn stage_with(
     ensure_ready_marker(payload, &marker, &ready_root, cancel, &mut quarantines)?;
 
     progress(PayloadProgress::Ready);
-    Ok(StagedGpuPayload {
+    Ok(StagedPayload {
         payload_id: payload.payload_id().into(),
         generation: payload.generation().clone(),
         generation_directory: generation,
@@ -113,8 +117,8 @@ pub(crate) fn stage_with(
     })
 }
 
-fn ensure_generation(
-    payload: &ReadyGpuPayload,
+fn ensure_generation<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
     expected: &[ExpectedFile],
     generation: &Path,
     generations_root: &Path,
@@ -222,8 +226,8 @@ fn ensure_generation(
     }
 }
 
-fn materialize_generation(
-    payload: &ReadyGpuPayload,
+fn materialize_generation<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
     files: &[ExpectedFile],
     temporary: &Path,
     hard_link: &dyn Fn(&Path, &Path) -> io::Result<()>,
@@ -260,8 +264,8 @@ struct ExpectedFile {
     digest: Sha256Digest,
 }
 
-fn expected_files(
-    payload: &ReadyGpuPayload,
+fn expected_files<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
     cancel: &AtomicBool,
 ) -> Result<Vec<ExpectedFile>, PayloadError> {
     let payload_path = payload.files_directory().join("payload.json");
@@ -418,8 +422,8 @@ fn hash_reader(
     Sha256Digest::from_bytes(hash.finalize().into())
 }
 
-fn verify_or_quarantine_marker(
-    payload: &ReadyGpuPayload,
+fn verify_or_quarantine_marker<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
     marker: &Path,
     ready_root: &Path,
     quarantines: &mut Vec<OperationPath>,
@@ -439,8 +443,8 @@ fn verify_or_quarantine_marker(
     }
 }
 
-fn deactivate_ready_marker(
-    payload: &ReadyGpuPayload,
+fn deactivate_ready_marker<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
     marker: &Path,
     ready_root: &Path,
     quarantines: &mut Vec<OperationPath>,
@@ -460,8 +464,8 @@ fn deactivate_ready_marker(
     }
 }
 
-fn ensure_ready_marker(
-    payload: &ReadyGpuPayload,
+fn ensure_ready_marker<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
     marker: &Path,
     ready_root: &Path,
     cancel: &AtomicBool,
@@ -470,8 +474,8 @@ fn ensure_ready_marker(
     ensure_ready_marker_with(payload, marker, ready_root, cancel, quarantines, &|| {})
 }
 
-fn ensure_ready_marker_with(
-    payload: &ReadyGpuPayload,
+fn ensure_ready_marker_with<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
     marker: &Path,
     ready_root: &Path,
     cancel: &AtomicBool,
@@ -536,8 +540,8 @@ struct ReadyMarkerDocument {
     payload_manifest_sha256: Sha256Digest,
 }
 
-fn inspect_ready_marker(
-    payload: &ReadyGpuPayload,
+fn inspect_ready_marker<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
     marker: &Path,
     cancel: &AtomicBool,
 ) -> Result<MarkerState, PayloadError> {
@@ -912,7 +916,7 @@ mod tests {
 
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-    use crate::{PayloadError, Sha256Digest};
+    use crate::{PayloadEntry, PayloadError, ReadyPayload, Sha256Digest, test_kind::TestEntry};
 
     use super::{ensure_ready_marker_with, stage_payload, stage_with};
 
@@ -951,7 +955,7 @@ mod tests {
 
     struct Fixture {
         _temporary: TemporaryDirectory,
-        ready: crate::ReadyGpuPayload,
+        ready: ReadyPayload<TestEntry>,
         payload: Vec<u8>,
         content: Vec<u8>,
         license: Vec<u8>,
@@ -1038,11 +1042,12 @@ mod tests {
                     }],
                     "licenses": [{"spdx": "MIT", "path": "licenses/MIT.txt"}]
             });
-            let entry = crate::test_entry(entry_document);
+            let entry = TestEntry::from_json(&serde_json::to_vec(&entry_document).unwrap())
+                .expect("the fixture entry must parse");
             let archive_path = temporary.path().join("fixture.zip");
             fs::write(&archive_path, archive).unwrap();
             let cache_root = temporary.path().join("cache");
-            let ready = crate::cache::prepare_verified_archive(
+            let ready = crate::prepare_verified_archive(
                 &entry,
                 &archive_path,
                 &cache_root,
@@ -1062,7 +1067,7 @@ mod tests {
             }
         }
 
-        fn stage_with_copy(&self) -> Result<super::StagedGpuPayload, PayloadError> {
+        fn stage_with_copy(&self) -> Result<super::StagedPayload, PayloadError> {
             stage_with(
                 &self.ready,
                 &self.staging_root,

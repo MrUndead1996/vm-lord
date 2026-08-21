@@ -11,19 +11,26 @@
 //! for that kind of payload, which meets this one at [`PayloadEntry`].
 
 pub mod archive;
+mod cache;
 mod digest;
 mod entry;
 mod error;
+mod marker;
 mod prepared;
 mod progress;
+pub mod release;
+mod staging;
 #[cfg(test)]
 mod test_kind;
 
+pub use cache::{PrepareRequest, ReadyPayload, prepare, prepare_verified_archive};
 pub use digest::{Sha256Digest, Sha256Hasher};
 pub use entry::{PayloadEntry, PayloadFiles, PayloadSources};
 pub use error::PayloadError;
+pub use marker::{ReadyMarker, cache_provenance};
 pub use prepared::{PreparedFile, validate_path};
 pub use progress::PayloadProgress;
+pub use staging::{StagedPayload, ensure_staging_root, stage_payload};
 
 #[cfg(test)]
 mod tests {

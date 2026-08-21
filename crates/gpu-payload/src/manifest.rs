@@ -383,72 +383,13 @@ fn license_expression_is_declared(expression: &str, entry: &CatalogEntry) -> boo
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ReadyMarker {
-    schema_version: u32,
-    payload_id: String,
-    generation: Sha256Digest,
-    payload_manifest_sha256: Sha256Digest,
-}
-impl ReadyMarker {
-    pub fn new(entry: &CatalogEntry) -> Self {
-        Self {
-            schema_version: 1,
-            payload_id: entry.payload_id().into(),
-            generation: entry.archive_sha256().clone(),
-            payload_manifest_sha256: entry.payload_manifest_sha256().clone(),
-        }
-    }
-    pub(crate) fn new_for(payload: &crate::ReadyGpuPayload) -> Self {
-        Self {
-            schema_version: 1,
-            payload_id: payload.payload_id().into(),
-            generation: payload.generation().clone(),
-            payload_manifest_sha256: payload.payload_manifest_sha256().clone(),
-        }
-    }
-    pub fn to_json_bytes(&self) -> Result<Vec<u8>, PayloadError> {
-        let mut bytes =
-            serde_json::to_vec(self).map_err(|e| PayloadError::InvalidManifest(e.to_string()))?;
-        bytes.push(b'\n');
-        Ok(bytes)
-    }
-}
-pub(crate) fn cache_provenance(
-    entry: &CatalogEntry,
-    sources: &SourceManifest,
-) -> Result<Vec<u8>, PayloadError> {
-    #[derive(Serialize)]
-    struct CacheProvenance<'a> {
-        schema_version: u32,
-        payload_id: &'a str,
-        archive_sha256: &'a Sha256Digest,
-        payload_manifest_sha256: &'a Sha256Digest,
-        catalog_entry: &'a CatalogEntry,
-        sources: &'a SourceManifestDocument,
-    }
-
-    let value = CacheProvenance {
-        schema_version: 1,
-        payload_id: entry.payload_id(),
-        archive_sha256: entry.archive_sha256(),
-        payload_manifest_sha256: entry.payload_manifest_sha256(),
-        catalog_entry: entry,
-        sources: &sources.document,
-    };
-    let mut bytes =
-        serde_json::to_vec(&value).map_err(|e| PayloadError::InvalidManifest(e.to_string()))?;
-    bytes.push(b'\n');
-    Ok(bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
 
     use crate::{CatalogEntry, PayloadError, PayloadManifest, SourceManifest};
 
-    use super::cache_provenance;
+    use vmlord_payload::cache_provenance;
 
     const ZERO: &str = "0000000000000000000000000000000000000000000000000000000000000000";
     const COMMIT: &str = "14794180686c2fb6307fbe359c359bec765249f3";

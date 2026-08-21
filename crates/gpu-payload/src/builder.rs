@@ -1170,7 +1170,7 @@ mod tests {
         assert_eq!(entry.file_count_limit(), built.file_count());
 
         let cancel = AtomicBool::new(false);
-        let ready = crate::cache::prepare_verified_archive(
+        let ready = vmlord_payload::prepare_verified_archive(
             &entry,
             &archive,
             &fixture.root.join("cache"),

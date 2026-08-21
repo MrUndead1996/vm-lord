@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{PayloadEntry, PayloadError, PayloadFiles, PayloadSources, PreparedFile, Sha256Digest};
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct TestEntry {
     payload_id: String,
     archive_sha256: Sha256Digest,

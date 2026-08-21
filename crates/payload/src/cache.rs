@@ -8,19 +8,17 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use vmlord_payload::archive;
-
 use crate::{
-    CatalogEntry, PayloadError, PayloadManifest, PayloadProgress, Sha256Digest, SourceManifest,
-    manifest::cache_provenance,
+    PayloadEntry, PayloadError, PayloadFiles, PayloadProgress, PayloadSources, Sha256Digest,
+    archive, marker::cache_provenance,
 };
 
 const PAYLOAD_MANIFEST_LIMIT: u64 = 1024 * 1024;
 const HASH_BUFFER_SIZE: usize = 64 * 1024;
 static NEXT_OPERATION: AtomicU64 = AtomicU64::new(0);
 
-pub struct PrepareRequest<'a> {
-    pub entry: &'a CatalogEntry,
+pub struct PrepareRequest<'a, E: PayloadEntry> {
+    pub entry: &'a E,
     pub cache_root: &'a Path,
     /// The archive this release ships for the entry.
     ///
@@ -33,16 +31,17 @@ pub struct PrepareRequest<'a> {
     pub cancel: &'a AtomicBool,
 }
 
-pub struct ReadyGpuPayload {
+/// A payload that has been verified and expanded, whatever it carries.
+pub struct ReadyPayload<E: PayloadEntry> {
     payload_id: String,
     generation: Sha256Digest,
     payload_manifest_sha256: Sha256Digest,
     files_directory: PathBuf,
-    manifest: PayloadManifest,
+    manifest: E::Manifest,
     provenance_path: PathBuf,
 }
 
-impl ReadyGpuPayload {
+impl<E: PayloadEntry> ReadyPayload<E> {
     pub fn payload_id(&self) -> &str {
         &self.payload_id
     }
@@ -55,7 +54,7 @@ impl ReadyGpuPayload {
         &self.files_directory
     }
 
-    pub fn manifest(&self) -> &PayloadManifest {
+    pub fn manifest(&self) -> &E::Manifest {
         &self.manifest
     }
 
@@ -63,13 +62,15 @@ impl ReadyGpuPayload {
         &self.provenance_path
     }
 
-    pub(crate) fn payload_manifest_sha256(&self) -> &Sha256Digest {
+    pub fn payload_manifest_sha256(&self) -> &Sha256Digest {
         &self.payload_manifest_sha256
     }
 }
 
-pub fn prepare(request: PrepareRequest<'_>) -> Result<ReadyGpuPayload, PayloadError> {
-    let root = request.cache_root.join("gpu-payload").join("v1");
+pub fn prepare<E: PayloadEntry>(
+    request: PrepareRequest<'_, E>,
+) -> Result<ReadyPayload<E>, PayloadError> {
+    let root = request.cache_root.join(E::NAMESPACE).join("v1");
     let _digest_lock = DigestLock::acquire(&root, request.entry)?;
     let final_directory = root.join(request.entry.archive_sha256().as_hex());
     let mut quarantines = Vec::new();
@@ -101,13 +102,13 @@ pub fn prepare(request: PrepareRequest<'_>) -> Result<ReadyGpuPayload, PayloadEr
     ready
 }
 
-pub(crate) fn prepare_verified_archive(
-    entry: &CatalogEntry,
+pub fn prepare_verified_archive<E: PayloadEntry>(
+    entry: &E,
     archive: &Path,
     root: &Path,
     progress: &dyn Fn(PayloadProgress),
     cancel: &AtomicBool,
-) -> Result<ReadyGpuPayload, PayloadError> {
+) -> Result<ReadyPayload<E>, PayloadError> {
     fs::create_dir_all(root)
         .map_err(|error| PayloadError::io("create GPU payload cache", root.into(), error))?;
     let final_directory = root.join(entry.archive_sha256().as_hex());
@@ -193,12 +194,12 @@ pub(crate) fn prepare_verified_archive(
     }
 }
 
-fn load_ready(
-    entry: &CatalogEntry,
+fn load_ready<E: PayloadEntry>(
+    entry: &E,
     root: &Path,
     progress: &dyn Fn(PayloadProgress),
     cancel: &AtomicBool,
-) -> Result<ReadyGpuPayload, PayloadError> {
+) -> Result<ReadyPayload<E>, PayloadError> {
     require_directory(root, "verify cached payload directory")?;
     if cancel.load(Ordering::Relaxed) {
         return Err(PayloadError::Cancelled);
@@ -233,7 +234,7 @@ fn load_ready(
             actual,
         });
     }
-    let manifest = PayloadManifest::parse_and_validate(&payload_bytes, entry)?;
+    let manifest = entry.parse_manifest(&payload_bytes)?;
     validate_manifest_limits(&manifest, entry)?;
     verify_cached_tree(&files_directory, &manifest)?;
 
@@ -261,8 +262,8 @@ fn load_ready(
         .size();
     let source_bytes =
         read_bounded_regular_file(&sources_path, source_size, "read cached sources manifest")?;
-    let sources = SourceManifest::parse_and_validate(&source_bytes, entry)?;
-    sources.validate_overlays_against(&manifest)?;
+    let sources = entry.parse_sources(&source_bytes)?;
+    sources.validate_prepared_files(&manifest)?;
     let provenance_path = root.join("provenance.json");
     let expected_provenance = cache_provenance(entry, &sources)?;
     let actual_provenance = read_bounded_regular_file(
@@ -276,7 +277,7 @@ fn load_ready(
         ));
     }
 
-    Ok(ReadyGpuPayload {
+    Ok(ReadyPayload {
         payload_id: entry.payload_id().into(),
         generation: entry.archive_sha256().clone(),
         payload_manifest_sha256: entry.payload_manifest_sha256().clone(),
@@ -286,9 +287,9 @@ fn load_ready(
     })
 }
 
-fn validate_manifest_limits(
-    manifest: &PayloadManifest,
-    entry: &CatalogEntry,
+fn validate_manifest_limits<E: PayloadEntry>(
+    manifest: &E::Manifest,
+    entry: &E,
 ) -> Result<(), PayloadError> {
     let count = u64::try_from(manifest.files().len()).unwrap_or(u64::MAX);
     if count > entry.file_count_limit() {
@@ -318,7 +319,7 @@ fn validate_manifest_limits(
     Ok(())
 }
 
-fn verify_cached_tree(root: &Path, manifest: &PayloadManifest) -> Result<(), PayloadError> {
+fn verify_cached_tree<M: PayloadFiles>(root: &Path, manifest: &M) -> Result<(), PayloadError> {
     let mut expected = manifest
         .files()
         .iter()
@@ -526,7 +527,10 @@ fn write_and_flush(path: &Path, bytes: &[u8], operation: &'static str) -> Result
         .map_err(|error| PayloadError::io("flush cache metadata", path.into(), error))
 }
 
-fn create_temporary_directory(root: &Path, entry: &CatalogEntry) -> Result<PathBuf, PayloadError> {
+fn create_temporary_directory<E: PayloadEntry>(
+    root: &Path,
+    entry: &E,
+) -> Result<PathBuf, PayloadError> {
     loop {
         let path = unique_operation_path(root, entry, "tmp");
         match fs::create_dir(&path) {
@@ -543,7 +547,7 @@ fn create_temporary_directory(root: &Path, entry: &CatalogEntry) -> Result<PathB
     }
 }
 
-fn quarantine(source: &Path, entry: &CatalogEntry) -> Result<Option<PathBuf>, PayloadError> {
+fn quarantine<E: PayloadEntry>(source: &Path, entry: &E) -> Result<Option<PathBuf>, PayloadError> {
     let root = source.parent().expect("cache entries have a parent");
     loop {
         let destination = unique_operation_path(root, entry, "corrupt");
@@ -562,7 +566,7 @@ fn quarantine(source: &Path, entry: &CatalogEntry) -> Result<Option<PathBuf>, Pa
     }
 }
 
-fn unique_operation_path(root: &Path, entry: &CatalogEntry, kind: &str) -> PathBuf {
+fn unique_operation_path<E: PayloadEntry>(root: &Path, entry: &E, kind: &str) -> PathBuf {
     let sequence = NEXT_OPERATION.fetch_add(1, Ordering::Relaxed);
     root.join(format!(
         "{}.{kind}-{}-{sequence}",
@@ -700,7 +704,7 @@ struct DigestLock {
 }
 
 impl DigestLock {
-    fn acquire(root: &Path, entry: &CatalogEntry) -> Result<Self, PayloadError> {
+    fn acquire<E: PayloadEntry>(root: &Path, entry: &E) -> Result<Self, PayloadError> {
         fs::create_dir_all(root)
             .map_err(|error| PayloadError::io("create GPU payload cache", root.into(), error))?;
         let path = root.join(format!("{}.lock", entry.archive_sha256()));
@@ -773,7 +777,7 @@ mod tests {
 
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-    use crate::{PayloadError, Sha256Digest};
+    use crate::{PayloadEntry, PayloadError, Sha256Digest, test_kind::TestEntry};
 
     use super::{
         OperationPath, PrepareRequest, prepare, prepare_verified_archive, rename_noreplace,
@@ -811,7 +815,7 @@ mod tests {
         temporary: TemporaryDirectory,
         archive: Vec<u8>,
         payload: Vec<u8>,
-        entry: crate::CatalogEntry,
+        entry: TestEntry,
         archive_path: PathBuf,
     }
 
@@ -894,7 +898,8 @@ mod tests {
                     }],
                 "licenses": [{"spdx": "MIT", "path": "licenses/MIT.txt"}]
             });
-            let entry = crate::test_entry(entry_document);
+            let entry = TestEntry::from_json(&serde_json::to_vec(&entry_document).unwrap())
+                .expect("the fixture entry must parse");
             let archive_path = temporary.path().join("fixture.zip");
             fs::write(&archive_path, &archive).unwrap();
             Self {
@@ -911,7 +916,8 @@ mod tests {
         }
 
         fn version_root(&self) -> PathBuf {
-            self.cache_root().join("gpu-payload/v1")
+            self.cache_root()
+                .join(format!("{}/v1", TestEntry::NAMESPACE))
         }
 
         fn final_directory(&self) -> PathBuf {
@@ -919,7 +925,7 @@ mod tests {
                 .join(self.entry.archive_sha256().as_hex())
         }
 
-        fn prepare_local(&self) -> Result<super::ReadyGpuPayload, PayloadError> {
+        fn prepare_local(&self) -> Result<super::ReadyPayload<TestEntry>, PayloadError> {
             prepare_verified_archive(
                 &self.entry,
                 &self.archive_path,
@@ -1099,7 +1105,7 @@ mod tests {
             workers.push(thread::spawn(move || {
                 barrier.wait();
                 prepare_verified_archive(
-                    &entry,
+                    entry.as_ref(),
                     &archive_path,
                     &version_root,
                     &|_| {},
