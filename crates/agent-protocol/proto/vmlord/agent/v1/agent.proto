@@ -49,6 +49,9 @@ message Request {
     AttachGpuSharesRequest attach_gpu_shares = 4;
     ApplyGpuRecipeRequest apply_gpu_recipe = 5;
     ProbeGpuRequest probe_gpu = 6;
+    AttachDisplayPayloadRequest attach_display_payload = 7;
+    ApplyDisplayRecipeRequest apply_display_recipe = 8;
+    UpdateDisplayPayloadRequest update_display_payload = 9;
   }
 }
 
@@ -66,6 +69,9 @@ message Response {
     AttachGpuSharesResponse attach_gpu_shares = 5;
     ApplyGpuRecipeResponse apply_gpu_recipe = 6;
     ProbeGpuResponse probe_gpu = 7;
+    AttachDisplayPayloadResponse attach_display_payload = 8;
+    ApplyDisplayRecipeResponse apply_display_recipe = 9;
+    UpdateDisplayPayloadResponse update_display_payload = 10;
   }
 }
 
@@ -89,6 +95,12 @@ enum Capability {
 
   // The peer can report on GPU-PV and act on a GPU share manifest.
   CAPABILITY_GPU = 1;
+
+  // The peer can mount a display payload, apply the display recipe and update
+  // what it has installed. Separate from the GPU capability because the two
+  // stacks are installed, applied and reported on separately: an agent that
+  // speaks one and not the other is an ordinary agent.
+  CAPABILITY_DISPLAY = 2;
 }
 
 // Opens a session: the first message the guest sends after connecting.
@@ -441,6 +453,121 @@ enum GpuProbeVerdict {
 }
 
 // A request that failed, described so the other side can act on it.
+// ---------------------------------------------------------------- display
+
+// What the guest is told about the one display share it is offered.
+//
+// Its own request and not a role inside AttachGpuShares: a GPU attach that
+// fails must not be able to take the display down with it, and the two are
+// mounted, applied and reported on separately from the host to the guest.
+message AttachDisplayPayloadRequest {
+  DisplayShare share = 1;
+}
+
+message DisplayShare {
+  // The share's name, which is also `aname=` when the guest mounts it. The
+  // guest refuses any name but the one it knows: mounting whatever it is
+  // handed would be a guest with no boundary at all.
+  string name = 1;
+}
+
+message AttachDisplayPayloadResponse {
+  DisplayMount mount = 1;
+}
+
+message DisplayMount {
+  string name = 1;
+  // Where the guest put it. The host names the share; where it lands is the
+  // guest's business, and this is how the host learns which it was.
+  string mount_point = 2;
+  DisplayMountState state = 3;
+  string message = 4;
+}
+
+enum DisplayMountState {
+  DISPLAY_MOUNT_STATE_UNSPECIFIED = 0;
+  DISPLAY_MOUNT_STATE_MOUNTED = 1;
+  DISPLAY_MOUNT_STATE_ALREADY_MOUNTED = 2;
+  DISPLAY_MOUNT_STATE_FAILED = 3;
+  DISPLAY_MOUNT_STATE_REFUSED = 4;
+}
+
+// Everything the guest needs in order to decide is in the guest or in the
+// payload it mounted one message earlier, so this request carries nothing.
+message ApplyDisplayRecipeRequest {}
+
+message ApplyDisplayRecipeResponse {
+  repeated DisplayRecipeStage stages = 1;
+  DisplayPayloadVersions versions = 2;
+}
+
+// Moves the guest to the version the mounted payload carries.
+//
+// Never sent as part of a start: installation reconciles by itself and a
+// version change is something a person asks for.
+message UpdateDisplayPayloadRequest {
+  // The version the mounted payload is expected to carry. The guest refuses
+  // rather than installs when the mount says something else: an update to a
+  // version nobody asked for is worse than an update that did not happen.
+  string target_version = 1;
+}
+
+message UpdateDisplayPayloadResponse {
+  repeated DisplayRecipeStage stages = 1;
+  DisplayPayloadVersions versions = 2;
+  DisplayUpdateOutcome outcome = 3;
+}
+
+enum DisplayUpdateOutcome {
+  DISPLAY_UPDATE_OUTCOME_UNSPECIFIED = 0;
+  // The target version is installed, loaded and verified.
+  DISPLAY_UPDATE_OUTCOME_UPDATED = 1;
+  // The target version did not verify and the previous one is running again.
+  // A working display, and not a degradation.
+  DISPLAY_UPDATE_OUTCOME_ROLLED_BACK = 2;
+  // Neither version is running.
+  DISPLAY_UPDATE_OUTCOME_FAILED = 3;
+}
+
+// Which versions of the display payload are in play inside the guest.
+//
+// An empty string is "not present": proto3 scalars have no absence, and a
+// sentinel that looks like a version would be read as one.
+message DisplayPayloadVersions {
+  string installed = 1;
+  string previous = 2;
+  string loaded = 3;
+}
+
+// One step of the display recipe, and what became of it.
+message DisplayRecipeStage {
+  DisplayRecipeStep step = 1;
+  DisplayRecipeStageState state = 2;
+  string message = 3;
+}
+
+enum DisplayRecipeStep {
+  DISPLAY_RECIPE_STEP_UNSPECIFIED = 0;
+  DISPLAY_RECIPE_STEP_DISTRIBUTION = 1;
+  DISPLAY_RECIPE_STEP_PAYLOAD = 2;
+  DISPLAY_RECIPE_STEP_BUILD_DEPENDENCIES = 3;
+  DISPLAY_RECIPE_STEP_MODULE_SOURCE = 4;
+  DISPLAY_RECIPE_STEP_MODULE_BUILD = 5;
+  DISPLAY_RECIPE_STEP_MODULE_LOAD = 6;
+  DISPLAY_RECIPE_STEP_DEVICE = 7;
+  DISPLAY_RECIPE_STEP_SERVICES = 8;
+  DISPLAY_RECIPE_STEP_SERVICES_START = 9;
+}
+
+enum DisplayRecipeStageState {
+  DISPLAY_RECIPE_STAGE_STATE_UNSPECIFIED = 0;
+  DISPLAY_RECIPE_STAGE_STATE_OK = 1;
+  DISPLAY_RECIPE_STAGE_STATE_SKIPPED = 2;
+  DISPLAY_RECIPE_STAGE_STATE_FAILED = 3;
+}
+
+// ---------------------------------------------------------------- errors
+
 message Error {
   ErrorCode code = 1;
 

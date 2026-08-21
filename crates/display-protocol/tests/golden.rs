@@ -22,7 +22,10 @@ use vmlord_display_protocol::{
     keys::{NONCE_LEN, SESSION_ID_LEN, Secret},
     record::{self, Channel, Limits, Record},
     session::{Offer, Session, Support},
-    v1::{Capability, FrameRecord, InputRecord, KeyEvent, Mode, PixelFormat, PointerMotion, StreamConfig},
+    v1::{
+        Capability, FrameRecord, InputRecord, KeyEvent, Mode, PixelFormat, PointerMotion,
+        StreamConfig,
+    },
 };
 
 /// A secret nobody holds, so that these bytes may live in a public tree.
@@ -41,7 +44,8 @@ fn hold(name: &str, produced: &[u8]) {
     let path = golden(name);
 
     if env::var_os("VMLORD_REFRESH_GOLDEN").is_some() {
-        fs::create_dir_all(path.parent().expect("a parent")).expect("failed to create tests/golden");
+        fs::create_dir_all(path.parent().expect("a parent"))
+            .expect("failed to create tests/golden");
         fs::write(&path, produced).expect("failed to refresh a golden vector");
         return;
     }

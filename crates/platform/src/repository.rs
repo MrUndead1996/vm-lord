@@ -28,6 +28,8 @@ use crate::{
     cleanup,
     com1_terminal::{Com1Launcher, Com1Sessions},
     cycle::{CycleOutcome, VmBuildCycle},
+    display_runs::DisplayRuns,
+    display_update,
     gpu_runs::GpuRuns,
     guest_ready::ReadinessTimeouts,
     hcn::HcnNetwork,
@@ -86,6 +88,8 @@ pub struct HcsVmRepository {
     agent_sessions: AgentSessions,
     /// What has been observed about each running VM's GPU, in memory only.
     gpu_runs: GpuRuns,
+    /// What this process knows about each running VM's display.
+    display_runs: DisplayRuns,
     /// Opens interactive SSH sessions into running guests. Nothing is kept
     /// beside it: a session belongs to whoever asked for it, not to VMLord.
     ssh_launcher: Arc<SshLauncher>,
@@ -123,8 +127,10 @@ impl HcsVmRepository {
         // Built before the pipelines, because both a build and a start record
         // what they did to a VM's GPU in it, and they have to be the same one.
         let gpu_runs = GpuRuns::default();
+        let display_runs = DisplayRuns::default();
         Self {
             client: HcsClient::new(),
+            display_runs: display_runs.clone(),
             store: MetadataStore::new(storage_root.join(MAPPING_FILE_NAME)),
             storage_root: storage_root.clone(),
             connections: VmConnections::with_events(events.clone()),
@@ -133,13 +139,17 @@ impl HcsVmRepository {
                 com1_launcher.clone(),
                 ReadinessTimeouts::default(),
                 gpu_runs.clone(),
+                display_runs.clone(),
                 &storage_root,
             )),
             readiness_timeouts: ReadinessTimeouts::default(),
             builds: Arc::new(BuildRegistry::default()),
             start: Arc::new(
-                VmStartPipeline::production(com1_launcher.clone())
-                    .for_vms_under(&storage_root, gpu_runs.clone()),
+                VmStartPipeline::production(com1_launcher.clone()).for_vms_under(
+                    &storage_root,
+                    gpu_runs.clone(),
+                    display_runs.clone(),
+                ),
             ),
             starts: Arc::new(StartRegistry::default()),
             com1_launcher,
@@ -372,6 +382,7 @@ impl HcsVmRepository {
                     // tears the compute system down.
                     self.agent_sessions.cancel(finished.vm_id);
                     self.gpu_runs.forget(finished.vm_id);
+                    self.display_runs.forget(finished.vm_id);
                     // The console is left alone: the guest is still writing the
                     // messages it prints on its way down, and the pipe closing
                     // is what ends the capture. The guest powers off on its own
@@ -586,7 +597,9 @@ impl HcsVmRepository {
             // VM reclaimed from a previous process was prepared by nobody
             // here, and has nothing to be told to mount.
             self.gpu_runs.shares(mapping.vm_id),
+            self.display_runs.share(mapping.vm_id),
             self.gpu_runs.clone(),
+            self.display_runs.clone(),
         ) {
             Ok(connection) => self.agent_sessions.insert(connection),
             Err(error) => log::warn!(
@@ -635,10 +648,7 @@ impl HcsVmRepository {
             gpu: self.gpu_runs.snapshot(vm_id),
             desktop_profile,
             display_provisioning,
-            // Nothing observes a guest's display yet: the services that would
-            // report it are the guest half of this epic (#115), and inventing
-            // a report here would be a fact nobody saw.
-            display: vmlord_core::VmDisplayFacts::default(),
+            display: self.display_runs.snapshot(vm_id),
             network_mode,
             ip_address,
             ssh,
@@ -1240,6 +1250,7 @@ impl VmRepository for HcsVmRepository {
         self.com1_sessions.cancel(mapping.vm_id);
         self.agent_sessions.cancel(mapping.vm_id);
         self.gpu_runs.forget(mapping.vm_id);
+        self.display_runs.forget(mapping.vm_id);
         self.connections.remove(mapping.vm_id);
         Ok(())
     }
@@ -1266,6 +1277,7 @@ impl VmRepository for HcsVmRepository {
         self.com1_sessions.cancel(mapping.vm_id);
         self.agent_sessions.cancel(mapping.vm_id);
         self.gpu_runs.forget(mapping.vm_id);
+        self.display_runs.forget(mapping.vm_id);
         let vm_directory = layout::vm_directory(&self.storage_root, &request.name)?;
         self.delete.delete(
             &self.store,
@@ -1336,6 +1348,65 @@ impl VmRepository for HcsVmRepository {
         let mapping = self.mapping(name)?;
         let state = self.reported_state(&mapping)?;
         self.open_ssh_in_state(&mapping, state)
+    }
+
+    /// Moves a running VM's display payload to the newest version this build
+    /// carries for it.
+    ///
+    /// Everything that can refuse does so before the guest is asked: a VM that
+    /// is not running, a release with nothing newer, a payload that will not
+    /// stage. What the guest then answers is recorded whichever way it went --
+    /// an update that rolled back is a working display on the previous version
+    /// and is worth saying so.
+    fn update_display_payload(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.require_initialized()?;
+        self.builds.refuse_if_building(name)?;
+
+        let mapping = self.mapping(name)?;
+        let Some(target) = mapping.guest_target.clone() else {
+            return Err(RepositoryError::new(format!(
+                "VM \"{name}\" records no guest, so no display payload can be chosen for it"
+            )));
+        };
+        let state = self.reported_state(&mapping)?;
+        let vm_directory = layout::vm_directory(&self.storage_root, &mapping.vm_name)?;
+        let executable_directory = std::env::current_exe()
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf))
+            .unwrap_or_default();
+        let cache_root = display_update::cache_root(&self.storage_root);
+        let installed = self.display_runs.snapshot(mapping.vm_id).payload.installed;
+        let sessions = &self.agent_sessions;
+        let vm_id = mapping.vm_id;
+
+        let outcome = display_update::run(&display_update::UpdateRequest {
+            vm_name: &mapping.vm_name,
+            vm_directory: &vm_directory,
+            executable_directory: &executable_directory,
+            cache_root: &cache_root,
+            guest: target.display_selector(),
+            installed,
+            running: matches!(state, Some(HcsSystemState::Running)),
+            progress: &|_| {},
+            ask: &|version| {
+                sessions
+                    .update_display_payload(vm_id, version)
+                    .unwrap_or_else(|| {
+                        Err(RepositoryError::new(format!(
+                            "VMLord is not listening for the agent of VM \"{name}\""
+                        )))
+                    })
+            },
+        })?;
+
+        self.display_runs.record_guest_payload(
+            vm_id,
+            outcome.payload.installed,
+            outcome.payload.previous,
+            outcome.payload.loaded,
+            outcome.failure,
+        );
+        Ok(())
     }
 
     /// Reads the host afresh on every call: see [`crate::discover_host_gpu`].
@@ -1435,6 +1506,7 @@ impl Drop for HcsVmRepository {
         // the process that bound it.
         self.agent_sessions.cancel_all();
         self.gpu_runs.forget_all();
+        self.display_runs.forget_all();
         // Joined rather than abandoned: HCS has either been asked to run each
         // system or has not, and a thread left behind would outlive the
         // process that owns what it is about to produce.
@@ -2420,14 +2492,16 @@ mod tests {
         }
 
         fn release(&self) {
-            self.release.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.release
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             self.repository.starts.join_all();
         }
     }
 
     impl Drop for Held {
         fn drop(&mut self) {
-            self.release.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.release
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             let _ = fs::remove_dir_all(&self.root);
         }
     }
@@ -2516,7 +2590,10 @@ mod tests {
             .start_vm("nothing-of-this-name")
             .expect_err("an unknown VM is the return value of the call that asked for it");
 
-        assert!(error.to_string().contains("nothing-of-this-name"), "{error}");
+        assert!(
+            error.to_string().contains("nothing-of-this-name"),
+            "{error}"
+        );
         assert!(
             !repository.starts.contains("nothing-of-this-name"),
             "a refusal starts no thread"

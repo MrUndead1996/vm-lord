@@ -20,6 +20,11 @@ mod create;
 mod cycle;
 mod delete;
 mod dhcp;
+mod display_exports;
+mod display_prepare;
+mod display_runs;
+mod display_staging;
+mod display_update;
 mod enumerate;
 mod error;
 mod event;
@@ -43,6 +48,7 @@ mod import;
 mod layout;
 mod metadata;
 mod password_hash;
+mod paths;
 mod reconnect;
 mod repository;
 mod shutdown;
@@ -61,6 +67,9 @@ pub use com1_reader::{Com1HelperOptions, Com1LogMode, parse_com1_helper_args, ru
 pub use com1_terminal::{Com1Launcher, Com1Session};
 pub use create::{CloudDiskImporter, VmCreationPipeline};
 pub use delete::VmDeletionPipeline;
+pub use display_staging::{
+    StageDisplayPayloadRequest, stage_for_vm as stage_display_payload_for_vm,
+};
 pub use enumerate::{KnownVm, list_known_vms, open_by_vm_id, open_by_vm_name};
 pub use error::hresult_to_repository_error;
 pub use event::{EventWaitResult, WindowsEvent};

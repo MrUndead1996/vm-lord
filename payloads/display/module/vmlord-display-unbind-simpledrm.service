@@ -1,0 +1,17 @@
+[Unit]
+Description=Release simple-framebuffer so the VMLord display can take the desktop
+Documentation=https://vmlord.invalid/display
+DefaultDependencies=no
+Before=display-manager.service
+ConditionPathExists=/sys/bus/platform/drivers/simple-framebuffer/simple-framebuffer.0
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# `simpledrm` is builtin (CONFIG_DRM_SIMPLEDRM=y), so blacklisting it is a
+# no-op: unbinding the device is the only thing that frees the console for a
+# driver that loads later.
+ExecStart=/bin/sh -c 'echo simple-framebuffer.0 > /sys/bus/platform/drivers/simple-framebuffer/unbind'
+
+[Install]
+WantedBy=multi-user.target

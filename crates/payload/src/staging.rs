@@ -10,20 +10,25 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
-use crate::{PayloadError, PayloadProgress, ReadyGpuPayload, ReadyMarker, Sha256Digest};
+use crate::{
+    PayloadEntry, PayloadError, PayloadFiles, PayloadProgress, ReadyMarker, ReadyPayload,
+    Sha256Digest,
+};
 
 const HASH_BUFFER_SIZE: usize = 64 * 1024;
 const READY_MARKER_SIZE_LIMIT: u64 = 64 * 1024;
 static NEXT_OPERATION: AtomicU64 = AtomicU64::new(0);
 
-pub struct StagedGpuPayload {
+/// One payload generation, published into one VM's directory.
+#[derive(Debug)]
+pub struct StagedPayload {
     payload_id: String,
     generation: Sha256Digest,
     generation_directory: PathBuf,
     ready_marker_path: PathBuf,
 }
 
-impl StagedGpuPayload {
+impl StagedPayload {
     pub fn payload_id(&self) -> &str {
         &self.payload_id
     }
@@ -56,12 +61,12 @@ pub fn ensure_staging_root(path: &Path) -> Result<(), PayloadError> {
     Ok(())
 }
 
-pub fn stage_payload(
-    payload: &ReadyGpuPayload,
+pub fn stage_payload<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
     root: &Path,
     progress: &dyn Fn(PayloadProgress),
     cancel: &AtomicBool,
-) -> Result<StagedGpuPayload, PayloadError> {
+) -> Result<StagedPayload, PayloadError> {
     stage_with(
         payload,
         root,
@@ -71,13 +76,129 @@ pub fn stage_payload(
     )
 }
 
-pub(crate) fn stage_with(
-    payload: &ReadyGpuPayload,
+/// Publishes a ready payload into a directory whose path never changes.
+///
+/// A compute system's Plan9 section is written before the system is built and
+/// is immutable for the lifetime of a boot, so a share can only ever name one
+/// path. A generation directory is named after its digest and is therefore a
+/// different path per version -- which is why what a VM exports is this one,
+/// and why a newer version is *published into* it rather than exported beside
+/// it.
+///
+/// The order is the whole safety of it. Every declared file is written first,
+/// each through a temporary name in its own directory and a rename, so a
+/// reader never sees half a file; `payload.json` is written last, so a guest
+/// that reads it sees a manifest whose files are all already there; and only
+/// then is anything the new manifest does not declare removed, because a
+/// leftover file nothing declares is ignored by a guest and a missing declared
+/// one is not.
+///
+/// # Errors
+///
+/// [`PayloadError::Io`] for a directory that cannot be written, and
+/// [`PayloadError::Cancelled`] when the caller asked to stop.
+pub fn publish_active<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
+    active: &Path,
+    cancel: &AtomicBool,
+) -> Result<(), PayloadError> {
+    let files = expected_files(payload, cancel)?;
+    fs::create_dir_all(active).map_err(|error| {
+        PayloadError::io("create the active payload directory", active.into(), error)
+    })?;
+
+    // Declared files first, `payload.json` last: `expected_files` puts the
+    // manifest at the front, which is the order a fresh generation wants and
+    // the reverse of what a live directory does.
+    let (manifest, declared) = files.split_first().expect("payload.json is always first");
+    for expected in declared {
+        check_cancelled(cancel)?;
+        publish_one(payload, &expected.relative, active)?;
+    }
+    check_cancelled(cancel)?;
+    publish_one(payload, &manifest.relative, active)?;
+
+    prune_undeclared(active, &files)
+}
+
+/// Copies one file into place through a temporary name in its own directory.
+fn publish_one<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
+    relative: &Path,
+    active: &Path,
+) -> Result<(), PayloadError> {
+    let source = payload.files_directory().join(relative);
+    require_regular_file(&source, "verify the payload file to publish")?;
+    let target = active.join(relative);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            PayloadError::io(
+                "create an active payload subdirectory",
+                parent.into(),
+                error,
+            )
+        })?;
+    }
+    let temporary = target.with_extension("vmlord-partial");
+    let _ = fs::remove_file(&temporary);
+    if fs::hard_link(&source, &temporary).is_err() {
+        fs::copy(&source, &temporary).map_err(|error| {
+            PayloadError::io("copy an active payload file", temporary.clone(), error)
+        })?;
+    }
+    fs::rename(&temporary, &target)
+        .map_err(|error| PayloadError::io("publish an active payload file", target, error))
+}
+
+/// Removes whatever the published manifest does not declare.
+///
+/// Last, and never before: a file the new manifest does not name is one the
+/// previous version left behind, and a guest reading the new manifest ignores
+/// it either way.
+fn prune_undeclared(active: &Path, files: &[ExpectedFile]) -> Result<(), PayloadError> {
+    let declared: HashSet<PathBuf> = files
+        .iter()
+        .map(|expected| active.join(&expected.relative))
+        .collect();
+    let mut directories = vec![active.to_path_buf()];
+    let mut visited = Vec::new();
+    while let Some(directory) = directories.pop() {
+        let listing = fs::read_dir(&directory).map_err(|error| {
+            PayloadError::io(
+                "read the active payload directory",
+                directory.clone(),
+                error,
+            )
+        })?;
+        for item in listing.flatten() {
+            let path = item.path();
+            if path.is_dir() {
+                directories.push(path);
+                continue;
+            }
+            if !declared.contains(&path) {
+                let _ = fs::remove_file(&path);
+            }
+        }
+        visited.push(directory);
+    }
+    // Directories the pruning emptied, deepest first. `remove_dir` refuses a
+    // directory that still holds something, which is the check this wants.
+    for directory in visited.into_iter().rev() {
+        if directory != active {
+            let _ = fs::remove_dir(&directory);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn stage_with<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
     root: &Path,
     hard_link: &dyn Fn(&Path, &Path) -> io::Result<()>,
     progress: &dyn Fn(PayloadProgress),
     cancel: &AtomicBool,
-) -> Result<StagedGpuPayload, PayloadError> {
+) -> Result<StagedPayload, PayloadError> {
     ensure_staging_root(root)?;
     check_cancelled(cancel)?;
     let digest = payload.generation().as_hex();
@@ -105,7 +226,7 @@ pub(crate) fn stage_with(
     ensure_ready_marker(payload, &marker, &ready_root, cancel, &mut quarantines)?;
 
     progress(PayloadProgress::Ready);
-    Ok(StagedGpuPayload {
+    Ok(StagedPayload {
         payload_id: payload.payload_id().into(),
         generation: payload.generation().clone(),
         generation_directory: generation,
@@ -113,8 +234,8 @@ pub(crate) fn stage_with(
     })
 }
 
-fn ensure_generation(
-    payload: &ReadyGpuPayload,
+fn ensure_generation<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
     expected: &[ExpectedFile],
     generation: &Path,
     generations_root: &Path,
@@ -222,8 +343,8 @@ fn ensure_generation(
     }
 }
 
-fn materialize_generation(
-    payload: &ReadyGpuPayload,
+fn materialize_generation<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
     files: &[ExpectedFile],
     temporary: &Path,
     hard_link: &dyn Fn(&Path, &Path) -> io::Result<()>,
@@ -260,8 +381,8 @@ struct ExpectedFile {
     digest: Sha256Digest,
 }
 
-fn expected_files(
-    payload: &ReadyGpuPayload,
+fn expected_files<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
     cancel: &AtomicBool,
 ) -> Result<Vec<ExpectedFile>, PayloadError> {
     let payload_path = payload.files_directory().join("payload.json");
@@ -418,8 +539,8 @@ fn hash_reader(
     Sha256Digest::from_bytes(hash.finalize().into())
 }
 
-fn verify_or_quarantine_marker(
-    payload: &ReadyGpuPayload,
+fn verify_or_quarantine_marker<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
     marker: &Path,
     ready_root: &Path,
     quarantines: &mut Vec<OperationPath>,
@@ -439,8 +560,8 @@ fn verify_or_quarantine_marker(
     }
 }
 
-fn deactivate_ready_marker(
-    payload: &ReadyGpuPayload,
+fn deactivate_ready_marker<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
     marker: &Path,
     ready_root: &Path,
     quarantines: &mut Vec<OperationPath>,
@@ -460,8 +581,8 @@ fn deactivate_ready_marker(
     }
 }
 
-fn ensure_ready_marker(
-    payload: &ReadyGpuPayload,
+fn ensure_ready_marker<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
     marker: &Path,
     ready_root: &Path,
     cancel: &AtomicBool,
@@ -470,8 +591,8 @@ fn ensure_ready_marker(
     ensure_ready_marker_with(payload, marker, ready_root, cancel, quarantines, &|| {})
 }
 
-fn ensure_ready_marker_with(
-    payload: &ReadyGpuPayload,
+fn ensure_ready_marker_with<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
     marker: &Path,
     ready_root: &Path,
     cancel: &AtomicBool,
@@ -536,8 +657,8 @@ struct ReadyMarkerDocument {
     payload_manifest_sha256: Sha256Digest,
 }
 
-fn inspect_ready_marker(
-    payload: &ReadyGpuPayload,
+fn inspect_ready_marker<E: PayloadEntry>(
+    payload: &ReadyPayload<E>,
     marker: &Path,
     cancel: &AtomicBool,
 ) -> Result<MarkerState, PayloadError> {
@@ -912,7 +1033,7 @@ mod tests {
 
     use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
-    use crate::{PayloadError, Sha256Digest};
+    use crate::{PayloadEntry, PayloadError, ReadyPayload, Sha256Digest, test_kind::TestEntry};
 
     use super::{ensure_ready_marker_with, stage_payload, stage_with};
 
@@ -951,7 +1072,7 @@ mod tests {
 
     struct Fixture {
         _temporary: TemporaryDirectory,
-        ready: crate::ReadyGpuPayload,
+        ready: ReadyPayload<TestEntry>,
         payload: Vec<u8>,
         content: Vec<u8>,
         license: Vec<u8>,
@@ -1038,11 +1159,12 @@ mod tests {
                     }],
                     "licenses": [{"spdx": "MIT", "path": "licenses/MIT.txt"}]
             });
-            let entry = crate::test_entry(entry_document);
+            let entry = TestEntry::from_json(&serde_json::to_vec(&entry_document).unwrap())
+                .expect("the fixture entry must parse");
             let archive_path = temporary.path().join("fixture.zip");
             fs::write(&archive_path, archive).unwrap();
             let cache_root = temporary.path().join("cache");
-            let ready = crate::cache::prepare_verified_archive(
+            let ready = crate::prepare_verified_archive(
                 &entry,
                 &archive_path,
                 &cache_root,
@@ -1062,7 +1184,7 @@ mod tests {
             }
         }
 
-        fn stage_with_copy(&self) -> Result<super::StagedGpuPayload, PayloadError> {
+        fn stage_with_copy(&self) -> Result<super::StagedPayload, PayloadError> {
             stage_with(
                 &self.ready,
                 &self.staging_root,

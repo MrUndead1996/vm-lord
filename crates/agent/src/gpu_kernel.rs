@@ -27,6 +27,7 @@ use crate::{
         parse_payload_target, recipe_for,
     },
     gpu_targets::{PAYLOAD, WSL_LIB},
+    guest_files::{copy_tree, failure, read, write_if_different},
 };
 
 /// The kernel module this recipe exists to deliver.
@@ -333,7 +334,11 @@ fn source_stage(report: &mut Report, package: &DkmsPackage) -> Result<(), String
 }
 
 /// Builds and installs the module for the running kernel.
-fn build_stage(report: &mut Report, package: &DkmsPackage, guest: &GuestFacts) -> Result<(), String> {
+fn build_stage(
+    report: &mut Report,
+    package: &DkmsPackage,
+    guest: &GuestFacts,
+) -> Result<(), String> {
     let status = command::run("dkms", &["status"], &[], SHORT_BUDGET);
     if dkms_reports_installed(&status.output, package, &guest.kernel_release) {
         report.skipped(
@@ -444,7 +449,10 @@ fn load_stage(report: &mut Report) -> Result<(), String> {
 /// cannot open it.
 fn device_stage(report: &mut Report) -> Result<(), String> {
     if device_is_usable() {
-        report.ok(GpuRecipeStep::Device, format!("{DEVICE} is a usable device"));
+        report.ok(
+            GpuRecipeStep::Device,
+            format!("{DEVICE} is a usable device"),
+        );
         return Ok(());
     }
 
@@ -668,7 +676,8 @@ fn environment_stage(
 
     let mut changed = false;
     for (path, form) in [(GENERATOR, Shell::Generator), (PROFILE, Shell::Profile)] {
-        match write_script_if_different(Path::new(path), &environment_document(form, &environment)) {
+        match write_script_if_different(Path::new(path), &environment_document(form, &environment))
+        {
             Ok(written) => changed |= written,
             Err(error) => {
                 let reason = format!("{path} could not be written: {error}");
@@ -710,45 +719,6 @@ pub fn device_is_usable() -> bool {
     metadata.file_type().is_char_device() && fs::File::open(DEVICE).is_ok()
 }
 
-/// Copies `source` onto `destination`, and says whether anything changed.
-///
-/// Files that are already byte-for-byte identical are left alone, so a
-/// reconnect does not rewrite the tree DKMS is registered against -- rewriting
-/// it is what would make DKMS rebuild on every session.
-pub fn copy_tree(source: &Path, destination: &Path) -> io::Result<bool> {
-    fs::create_dir_all(destination)?;
-    let mut changed = false;
-
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        let from = entry.path();
-        let to = destination.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            changed |= copy_tree(&from, &to)?;
-            continue;
-        }
-        let wanted = fs::read(&from)?;
-        if fs::read(&to).is_ok_and(|present| present == wanted) {
-            continue;
-        }
-        fs::write(&to, &wanted)?;
-        changed = true;
-    }
-
-    Ok(changed)
-}
-
-/// Writes `content` only when the file does not already hold it.
-fn write_if_different(path: &Path, content: &str) -> io::Result<()> {
-    if fs::read_to_string(path).is_ok_and(|present| present == content) {
-        return Ok(());
-    }
-    if let Some(directory) = path.parent() {
-        fs::create_dir_all(directory)?;
-    }
-    fs::write(path, content)
-}
-
 /// Points `link` at `target`, and says whether anything changed.
 fn symlink_if_different(target: &Path, link: &Path) -> io::Result<bool> {
     if fs::read_link(link).is_ok_and(|present| present == target) {
@@ -777,25 +747,6 @@ fn write_script_if_different(path: &Path, content: &str) -> io::Result<bool> {
     fs::write(path, content)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
     Ok(true)
-}
-
-/// A file that may not be there, as the empty string.
-///
-/// Every caller treats "missing" and "empty" the same way -- as a fact that is
-/// not there to be read -- and an `io::Error` here would be a second way of
-/// saying the same stage did not apply.
-pub fn read(path: &Path) -> String {
-    fs::read_to_string(path).unwrap_or_default()
-}
-
-/// One line about a program that did not succeed.
-pub fn failure(what: &str, outcome: &Outcome) -> String {
-    let ending = match outcome.ending {
-        command::Ending::Exited(code) => format!("exited with {code}"),
-        command::Ending::TimedOut => "outran its time budget".to_owned(),
-        command::Ending::NotStarted => "could not be started".to_owned(),
-    };
-    format!("{what} {ending}: {}", outcome.output)
 }
 
 #[cfg(test)]

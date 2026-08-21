@@ -1,6 +1,6 @@
-use crate::{PayloadError, Sha256Digest};
+use crate::{LOCAL_ARCHIVE_DIRECTORY, PayloadError, Sha256Digest};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, ffi::OsStr, fs, path::Path};
+use std::{collections::HashSet, path::Path};
 const ENTRY_SCHEMA_VERSION: u32 = 2;
 const PAYLOAD_ABI_VERSION: u32 = 1;
 
@@ -218,40 +218,10 @@ impl PayloadCatalog {
     /// An archive nothing claims is ignored, because failing over a leftover
     /// file would be a rule worse than the problem.
     pub fn from_release_directory(directory: &Path) -> Result<Self, PayloadError> {
-        let payloads = crate::release::local_payload_directory(directory);
-        let Ok(listing) = fs::read_dir(&payloads) else {
-            return Self::from_entries(Vec::new());
-        };
-        let mut entries = Vec::new();
-        for item in listing {
-            let Ok(item) = item else {
-                continue;
-            };
-            let path = item.path();
-            if path.extension().and_then(OsStr::to_str) != Some("json") {
-                continue;
-            }
-            let bytes = fs::read(&path)
-                .map_err(|error| PayloadError::io("read GPU payload entry", path.clone(), error))?;
-            let entry = CatalogEntry::from_json(&bytes)?;
-            if path.file_stem().and_then(OsStr::to_str) != Some(entry.payload_id()) {
-                return Err(PayloadError::InvalidCatalog(format!(
-                    "{} does not name its payload ID {}",
-                    path.display(),
-                    entry.payload_id()
-                )));
-            }
-            let archive = crate::local_archive_path(directory, entry.payload_id());
-            if !archive.is_file() {
-                return Err(PayloadError::InvalidCatalog(format!(
-                    "payload {} has no archive at {}",
-                    entry.payload_id(),
-                    archive.display()
-                )));
-            }
-            entries.push(entry);
-        }
-        Self::from_entries(entries)
+        Self::from_entries(vmlord_payload::catalog::read_release_directory(
+            directory,
+            LOCAL_ARCHIVE_DIRECTORY,
+        )?)
     }
     /// The catalog a set of read entries forms.
     ///
@@ -276,7 +246,7 @@ impl PayloadCatalog {
         self.entries
             .iter()
             .find(|entry| entry.target == *target)
-            .ok_or_else(|| PayloadError::UnsupportedTarget(target.clone()))
+            .ok_or_else(|| PayloadError::UnsupportedTarget(format!("{target:?}")))
     }
     /// The entry for a guest, ignoring the kernel that guest runs.
     ///
@@ -604,5 +574,44 @@ mod tests {
             PayloadCatalog::from_release_directory(temporary.path()),
             Err(PayloadError::InvalidCatalog(_))
         ));
+    }
+}
+
+impl vmlord_payload::PayloadEntry for CatalogEntry {
+    type Manifest = crate::PayloadManifest;
+    type Sources = crate::SourceManifest;
+    /// The GPU payload's own directory, in the cache and in a release.
+    const NAMESPACE: &'static str = LOCAL_ARCHIVE_DIRECTORY;
+
+    fn from_json(bytes: &[u8]) -> Result<Self, PayloadError> {
+        Self::from_json(bytes)
+    }
+
+    fn payload_id(&self) -> &str {
+        self.payload_id()
+    }
+
+    fn archive_sha256(&self) -> &Sha256Digest {
+        self.archive_sha256()
+    }
+
+    fn payload_manifest_sha256(&self) -> &Sha256Digest {
+        self.payload_manifest_sha256()
+    }
+
+    fn expanded_size_limit(&self) -> u64 {
+        self.expanded_size_limit()
+    }
+
+    fn file_count_limit(&self) -> u64 {
+        self.file_count_limit()
+    }
+
+    fn parse_manifest(&self, bytes: &[u8]) -> Result<Self::Manifest, PayloadError> {
+        crate::PayloadManifest::parse_and_validate(bytes, self)
+    }
+
+    fn parse_sources(&self, bytes: &[u8]) -> Result<Self::Sources, PayloadError> {
+        crate::SourceManifest::parse_and_validate(bytes, self)
     }
 }

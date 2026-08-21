@@ -17,7 +17,10 @@ vmlord-seed = { path = "../seed" }
 # The GPU payload boundary: catalog, verified cache and per-VM staging. The
 # crate is portable and knows nothing of Windows; this layer is what gives it a
 # VM directory to fill.
+vmlord-display-payload = { path = "../display-payload" }
+vmlord-display-protocol = { path = "../display-protocol" }
 vmlord-gpu-payload = { path = "../gpu-payload" }
+vmlord-payload = { path = "../payload" }
 arcbox-dhcp = "0.6"
 log.workspace = true
 serde = { version = "1.0", features = ["derive"] }

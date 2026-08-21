@@ -17,6 +17,7 @@ use std::{
     error::Error,
     fmt,
     io::{Read, Write},
+    sync::mpsc::{Receiver, Sender},
 };
 
 use vmlord_agent_protocol::{
@@ -24,25 +25,31 @@ use vmlord_agent_protocol::{
     frame::{self, FrameError},
     handshake::{self, CURRENT_VERSION, VersionMismatch},
     v1::{
-        ApplyGpuRecipeRequest, ApplyGpuRecipeResponse, AttachGpuSharesRequest,
-        AttachGpuSharesResponse, AuthenticateRequest, Capability, Envelope, ErrorCode,
-        GpuMountState, GpuProbeCheckState, GpuProbeVerdict, GpuRecipeStageState, GpuShareRole,
-        HeartbeatResponse, HelloResponse, ProbeGpuRequest, ProbeGpuResponse, ProtocolVersion,
-        envelope, request, response,
+        ApplyDisplayRecipeRequest, ApplyDisplayRecipeResponse, ApplyGpuRecipeRequest,
+        ApplyGpuRecipeResponse, AttachDisplayPayloadRequest, AttachDisplayPayloadResponse,
+        AttachGpuSharesRequest, AttachGpuSharesResponse, AuthenticateRequest, Capability,
+        DisplayMountState, DisplayRecipeStageState, DisplayShare as WireDisplayShare,
+        DisplayUpdateOutcome, Envelope, ErrorCode, GpuMountState, GpuProbeCheckState,
+        GpuProbeVerdict, GpuRecipeStageState, GpuShareRole, HeartbeatResponse, HelloResponse,
+        ProbeGpuRequest, ProbeGpuResponse, ProtocolVersion, UpdateDisplayPayloadRequest,
+        UpdateDisplayPayloadResponse, envelope, request, response,
     },
 };
 use vmlord_core::{
-    GpuFailure, GpuShareManifest, GpuShareRole as CoreShareRole, GpuStatusCode, GuestGpuDetail,
-    GuestGpuReport,
+    DisplayFailure, DisplayShare, DisplayStage, DisplayStatusCode, GpuFailure, GpuShareManifest,
+    GpuShareRole as CoreShareRole, GpuStatusCode, GuestGpuDetail, GuestGpuReport,
 };
+
+use crate::agent::{DisplayUpdate, DisplayUpdateAnswer};
 
 /// What this build of the host implements beyond the base protocol.
 ///
-/// `Capability::Gpu` is what lets a session carry a share manifest. It is
-/// announced whether or not the VM on this connection has any shares: the
-/// capability says what the two builds can do, and a VM with no GPU is simply
-/// a session no manifest is sent on.
-const HOST_CAPABILITIES: &[Capability] = &[Capability::Gpu];
+/// `Capability::Gpu` is what lets a session carry a share manifest, and
+/// `Capability::Display` what lets it carry a display payload. Both are
+/// announced whether or not the VM on this connection has either: a capability
+/// says what the two builds can do, and a VM with no GPU or no desktop is
+/// simply a session that is sent nothing about one.
+const HOST_CAPABILITIES: &[Capability] = &[Capability::Gpu, Capability::Display];
 
 /// The id the host numbers its challenge with.
 ///
@@ -68,6 +75,20 @@ const APPLY_REQUEST_ID: u32 = ATTACH_REQUEST_ID + 1;
 /// about a userspace the recipe has just installed.
 const PROBE_REQUEST_ID: u32 = APPLY_REQUEST_ID + 1;
 
+/// The display's two requests, numbered after the GPU's.
+///
+/// Fixed ids like the GPU's, and for the same reason: this side asks each
+/// question once per session, so an id is a question rather than a counter.
+const DISPLAY_ATTACH_REQUEST_ID: u32 = PROBE_REQUEST_ID + 1;
+const DISPLAY_APPLY_REQUEST_ID: u32 = DISPLAY_ATTACH_REQUEST_ID + 1;
+
+/// The id an update is asked under.
+///
+/// One id and not a counter, like the questions above it, because a session
+/// carries at most one update at a time: a second while the first is building
+/// would be a second question on a socket still waiting for an answer.
+const DISPLAY_UPDATE_REQUEST_ID: u32 = DISPLAY_APPLY_REQUEST_ID + 1;
+
 /// Where a session hands what the guest said about its GPU.
 ///
 /// A callback rather than a channel: `serve` is tested against a peer made of
@@ -76,6 +97,43 @@ const PROBE_REQUEST_ID: u32 = APPLY_REQUEST_ID + 1;
 /// but nothing here limits it, because a session that ends up saying two
 /// things has said two things.
 pub(crate) type GuestGpuSink<'a> = &'a dyn Fn(GuestGpuReport);
+
+/// What a guest said about the display payload it has.
+///
+/// Versions as the guest reported them, and the failure -- if any -- that its
+/// recipe stopped at. Empty strings on the wire become `None` here, which is
+/// what "the guest has no such version" is in the host's own model.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GuestDisplayPayloadReport {
+    pub(crate) installed: Option<String>,
+    pub(crate) previous: Option<String>,
+    pub(crate) loaded: Option<String>,
+    pub(crate) failure: Option<DisplayFailure>,
+}
+
+/// Where a display report goes, for the same reason the GPU's has a sink.
+pub(crate) type GuestDisplaySink<'a> = &'a dyn Fn(GuestDisplayPayloadReport);
+
+/// What one session is to do for a VM, and where its answers go.
+///
+/// A struct rather than four more parameters: the GPU half and the display
+/// half are decided separately and neither is a variation of the other, and a
+/// six-argument `serve` is a call nobody can read.
+pub(crate) struct SessionWork<'a> {
+    /// The GPU shares this VM's guest is to mount, if any.
+    pub(crate) gpu_shares: Option<&'a GpuShareManifest>,
+    /// The display payload share this VM's guest is to mount, if any.
+    pub(crate) display_share: Option<&'a DisplayShare>,
+    pub(crate) gpu: GuestGpuSink<'a>,
+    pub(crate) display: GuestDisplaySink<'a>,
+    /// Where a display payload update arrives from, when this session is one
+    /// somebody can ask things of.
+    ///
+    /// Read between frames rather than written to the socket from another
+    /// thread: a session is one conversation, and two writers would interleave
+    /// halfway through a frame.
+    pub(crate) updates: Option<&'a Receiver<DisplayUpdate>>,
+}
 
 /// What a session agreed on when it opened.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,9 +199,8 @@ pub(crate) fn open<S: Read + Write>(
 pub(crate) fn serve<S: Read + Write>(
     stream: &mut S,
     session: &AgentSession,
-    shares: Option<&GpuShareManifest>,
+    work: SessionWork<'_>,
     vm_name: &str,
-    sink: GuestGpuSink<'_>,
 ) -> Result<(), SessionError> {
     let mut buffer = Vec::new();
     log::debug!(
@@ -152,9 +209,21 @@ pub(crate) fn serve<S: Read + Write>(
         session.version.minor
     );
 
-    let mut pending_manifest = attach_shares(stream, session, shares, vm_name, &mut buffer)?;
+    let sink = work.gpu;
+    let mut pending_manifest =
+        attach_shares(stream, session, work.gpu_shares, vm_name, &mut buffer)?;
     let mut pending_recipe = None;
     let mut pending_probe = None;
+    // Sent up front and answered in turn: the guest serves one request at a
+    // time, so the GPU's attach and recipe still go first, and the display's
+    // long stage waits behind them without the host having to sequence it.
+    let mut pending_display_attach =
+        attach_display(stream, session, work.display_share, vm_name, &mut buffer)?;
+    let mut pending_display_recipe = None;
+    // At most one update at a time, and its answer channel with it: a second
+    // request while one is in flight would be a second question on a socket
+    // that is still waiting for the first answer.
+    let mut pending_update: Option<Sender<DisplayUpdateAnswer>> = None;
 
     loop {
         let envelope = match frame::read(stream, &mut buffer) {
@@ -167,7 +236,29 @@ pub(crate) fn serve<S: Read + Write>(
             // retrying cannot abandon a partial prefix or body. This is the
             // normal result of the bounded socket reads that let VM shutdown
             // interrupt a silent agent session.
-            Err(FrameError::Idle) => continue,
+            // The one place another thread's request can get onto this socket:
+            // between frames, where nothing is half-written.
+            Err(FrameError::Idle) => {
+                if pending_update.is_none()
+                    && let Some(update) = work.updates.and_then(|updates| updates.try_recv().ok())
+                {
+                    pending_update = start_update(stream, session, &update, vm_name, &mut buffer)?;
+                    if pending_update.is_none() {
+                        let _ = update.answer.send(DisplayUpdateAnswer {
+                            outcome: DisplayUpdateOutcome::Failed,
+                            report: GuestDisplayPayloadReport {
+                                failure: Some(DisplayFailure::new(
+                                    DisplayStage::Payload,
+                                    DisplayStatusCode::PayloadUpdateFailed,
+                                    "this guest's agent does not speak the display capability",
+                                )),
+                                ..GuestDisplayPayloadReport::default()
+                            },
+                        });
+                    }
+                }
+                continue;
+            }
             Err(error) => return Err(SessionError::Frame(error)),
         };
 
@@ -200,6 +291,31 @@ pub(crate) fn serve<S: Read + Write>(
             {
                 pending_probe = None;
                 report_probe(&report, vm_name, sink);
+            }
+            Body::Response(response::Kind::AttachDisplayPayload(report))
+                if pending_display_attach == Some(request_id) =>
+            {
+                pending_display_attach = None;
+                if report_display_mount(&report, vm_name, work.display) {
+                    pending_display_recipe = apply_display_recipe(stream, vm_name, &mut buffer)?;
+                }
+            }
+            Body::Response(response::Kind::ApplyDisplayRecipe(report))
+                if pending_display_recipe == Some(request_id) =>
+            {
+                pending_display_recipe = None;
+                report_display_recipe(&report, vm_name, work.display);
+            }
+            Body::Response(response::Kind::UpdateDisplayPayload(report))
+                if request_id == DISPLAY_UPDATE_REQUEST_ID =>
+            {
+                let answer = report_display_update(&report, vm_name, work.display);
+                if let Some(waiting) = pending_update.take() {
+                    // A caller that gave up while the guest was building is
+                    // not an error here: the update happened either way, and
+                    // the facts it produced have already been recorded.
+                    let _ = waiting.send(answer);
+                }
             }
             // A response to a request this side did not send, or one it has
             // already had an answer to. Worth a line and nothing more: there is
@@ -322,6 +438,299 @@ fn wire_share(share: &vmlord_core::GpuShare) -> vmlord_agent_protocol::v1::GpuSh
     }
 }
 
+/// Offers the guest its display payload share, and says which id asked.
+///
+/// `None` comes back when there is nothing to offer or nobody to offer it to:
+/// a headless VM, a VM this release carries no payload for, or an agent too
+/// old to have the display capability. All three are sessions that simply
+/// never wait for a mount report.
+fn attach_display<S: Read + Write>(
+    stream: &mut S,
+    session: &AgentSession,
+    share: Option<&DisplayShare>,
+    vm_name: &str,
+    buffer: &mut Vec<u8>,
+) -> Result<Option<u32>, SessionError> {
+    let Some(share) = share else {
+        return Ok(None);
+    };
+    if !session.capabilities.contains(&Capability::Display) {
+        log::warn!(
+            "the agent of VM \"{vm_name}\" does not speak the display capability, so its \
+             display payload is exported but not mounted"
+        );
+        return Ok(None);
+    }
+
+    let request = Envelope::request(
+        DISPLAY_ATTACH_REQUEST_ID,
+        request::Kind::AttachDisplayPayload(AttachDisplayPayloadRequest {
+            share: Some(WireDisplayShare {
+                name: share.name.clone(),
+            }),
+        }),
+    );
+    frame::write(stream, &request, buffer).map_err(SessionError::Frame)?;
+    log::debug!("VMLord offered the agent of VM \"{vm_name}\" its display payload share");
+
+    Ok(Some(DISPLAY_ATTACH_REQUEST_ID))
+}
+
+/// Asks the guest to apply its display recipe, and says which id asked.
+///
+/// After the mount of the same session, because the module is built out of the
+/// payload the guest has just mounted. Once per session, for the reason the
+/// GPU recipe is asked for once: the guest reconciles rather than rebuilds,
+/// and a retry loop around a kernel build is how a guest ends up compiling
+/// continuously.
+fn apply_display_recipe<S: Read + Write>(
+    stream: &mut S,
+    vm_name: &str,
+    buffer: &mut Vec<u8>,
+) -> Result<Option<u32>, SessionError> {
+    let request = Envelope::request(
+        DISPLAY_APPLY_REQUEST_ID,
+        request::Kind::ApplyDisplayRecipe(ApplyDisplayRecipeRequest {}),
+    );
+    frame::write(stream, &request, buffer).map_err(SessionError::Frame)?;
+    log::debug!("VMLord asked the agent of VM \"{vm_name}\" to apply its display recipe");
+
+    Ok(Some(DISPLAY_APPLY_REQUEST_ID))
+}
+
+/// Asks the guest to move to a version, and answers with where to send the
+/// answer.
+///
+/// `None` is an agent that never agreed the display capability, which is a
+/// guest nothing can be asked of.
+fn start_update<S: Read + Write>(
+    stream: &mut S,
+    session: &AgentSession,
+    update: &DisplayUpdate,
+    vm_name: &str,
+    buffer: &mut Vec<u8>,
+) -> Result<Option<Sender<DisplayUpdateAnswer>>, SessionError> {
+    if !session.capabilities.contains(&Capability::Display) {
+        return Ok(None);
+    }
+
+    let request = Envelope::request(
+        DISPLAY_UPDATE_REQUEST_ID,
+        request::Kind::UpdateDisplayPayload(UpdateDisplayPayloadRequest {
+            target_version: update.target_version.clone(),
+        }),
+    );
+    frame::write(stream, &request, buffer).map_err(SessionError::Frame)?;
+    log::info!(
+        "VMLord asked the agent of VM \"{vm_name}\" to move its display payload to {}",
+        update.target_version
+    );
+
+    Ok(Some(update.answer.clone()))
+}
+
+/// Says what an update came to, records the facts it produced, and hands the
+/// caller the outcome.
+///
+/// A rollback is reported as what it is: the display works, on the version that
+/// was working before, and the failure that goes with it says so rather than
+/// calling a working desktop broken.
+fn report_display_update(
+    report: &UpdateDisplayPayloadResponse,
+    vm_name: &str,
+    sink: GuestDisplaySink<'_>,
+) -> DisplayUpdateAnswer {
+    for stage in &report.stages {
+        match stage.state() {
+            DisplayRecipeStageState::Failed => log::warn!(
+                "the agent of VM \"{vm_name}\" did not finish update stage {:?}: {}",
+                stage.step(),
+                stage.message
+            ),
+            state => log::debug!(
+                "the agent of VM \"{vm_name}\" update stage {:?} ({state:?}): {}",
+                stage.step(),
+                stage.message
+            ),
+        }
+    }
+
+    let versions = report.versions.clone().unwrap_or_default();
+    let outcome = report.outcome();
+    let reason = report
+        .stages
+        .iter()
+        .find(|stage| stage.state() == DisplayRecipeStageState::Failed)
+        .map(|broken| broken.message.clone())
+        .unwrap_or_else(|| "the guest did not say which stage failed".to_owned());
+    let failure = match outcome {
+        DisplayUpdateOutcome::Updated => None,
+        DisplayUpdateOutcome::RolledBack => Some(DisplayFailure::new(
+            DisplayStage::Payload,
+            DisplayStatusCode::PayloadUpdateRolledBack,
+            reason,
+        )),
+        _ => Some(DisplayFailure::new(
+            DisplayStage::Payload,
+            DisplayStatusCode::PayloadUpdateFailed,
+            reason,
+        )),
+    };
+
+    let payload = GuestDisplayPayloadReport {
+        installed: some_version(&versions.installed),
+        previous: some_version(&versions.previous),
+        loaded: some_version(&versions.loaded),
+        failure,
+    };
+    sink(payload.clone());
+
+    match outcome {
+        DisplayUpdateOutcome::Updated => log::info!(
+            "the agent of VM \"{vm_name}\" is running display payload {}",
+            versions.loaded
+        ),
+        DisplayUpdateOutcome::RolledBack => log::warn!(
+            "the display payload update of VM \"{vm_name}\" did not verify; {} is running again",
+            versions.loaded
+        ),
+        _ => log::error!("the display payload update of VM \"{vm_name}\" left nothing running"),
+    }
+
+    DisplayUpdateAnswer {
+        outcome,
+        report: payload,
+    }
+}
+
+/// Says what the guest made of the display share, and whether the recipe is
+/// worth asking for.
+///
+/// A share that was refused or would not mount is a display that cannot be
+/// installed, and asking for the recipe anyway would only be a second way of
+/// saying so.
+fn report_display_mount(
+    report: &AttachDisplayPayloadResponse,
+    vm_name: &str,
+    sink: GuestDisplaySink<'_>,
+) -> bool {
+    let Some(mount) = report.mount.as_ref() else {
+        sink(GuestDisplayPayloadReport {
+            failure: Some(DisplayFailure::new(
+                DisplayStage::Payload,
+                DisplayStatusCode::PayloadInvalid,
+                "the guest answered the display share with no mount report",
+            )),
+            ..GuestDisplayPayloadReport::default()
+        });
+        return false;
+    };
+
+    match mount.state() {
+        DisplayMountState::Mounted | DisplayMountState::AlreadyMounted => {
+            log::info!(
+                "the agent of VM \"{vm_name}\" has its display payload at {}",
+                mount.mount_point
+            );
+            true
+        }
+        state => {
+            log::warn!(
+                "the agent of VM \"{vm_name}\" did not mount its display payload ({state:?}): {}",
+                mount.message
+            );
+            sink(GuestDisplayPayloadReport {
+                failure: Some(DisplayFailure::new(
+                    DisplayStage::Payload,
+                    DisplayStatusCode::PayloadInvalid,
+                    format!(
+                        "the guest did not mount its display payload: {}",
+                        mount.message
+                    ),
+                )),
+                ..GuestDisplayPayloadReport::default()
+            });
+            false
+        }
+    }
+}
+
+/// Says what the guest's display recipe did, at the volume each stage earns,
+/// and turns the whole of it into one report.
+fn report_display_recipe(
+    report: &ApplyDisplayRecipeResponse,
+    vm_name: &str,
+    sink: GuestDisplaySink<'_>,
+) {
+    for stage in &report.stages {
+        match stage.state() {
+            DisplayRecipeStageState::Ok => log::debug!(
+                "the agent of VM \"{vm_name}\" finished display recipe stage {:?}: {}",
+                stage.step(),
+                stage.message
+            ),
+            DisplayRecipeStageState::Skipped => log::info!(
+                "the agent of VM \"{vm_name}\" skipped display recipe stage {:?}: {}",
+                stage.step(),
+                stage.message
+            ),
+            state => log::warn!(
+                "the agent of VM \"{vm_name}\" did not finish display recipe stage {:?} \
+                 ({state:?}): {}",
+                stage.step(),
+                stage.message
+            ),
+        }
+    }
+
+    let versions = report.versions.clone().unwrap_or_default();
+    let failure = report
+        .stages
+        .iter()
+        .find(|stage| stage.state() == DisplayRecipeStageState::Failed)
+        .map(|broken| {
+            DisplayFailure::new(
+                DisplayStage::Payload,
+                code_for(broken.step()),
+                format!(
+                    "the guest's display recipe stopped at {:?}: {}",
+                    broken.step(),
+                    broken.message
+                ),
+            )
+        });
+
+    sink(GuestDisplayPayloadReport {
+        installed: some_version(&versions.installed),
+        previous: some_version(&versions.previous),
+        loaded: some_version(&versions.loaded),
+        failure,
+    });
+}
+
+/// Which cause a failed stage is.
+///
+/// One code per stage rather than one for all of them: "the headers would not
+/// install" and "the module built and no device appeared" are one word apart
+/// in a summary and are different problems.
+fn code_for(step: vmlord_agent_protocol::v1::DisplayRecipeStep) -> DisplayStatusCode {
+    use vmlord_agent_protocol::v1::DisplayRecipeStep as Step;
+
+    match step {
+        Step::BuildDependencies => DisplayStatusCode::PayloadDependenciesFailed,
+        Step::ModuleBuild | Step::ModuleSource => DisplayStatusCode::PayloadBuildFailed,
+        Step::ModuleLoad => DisplayStatusCode::PayloadModuleNotLoaded,
+        Step::Device => DisplayStatusCode::PayloadNoDevice,
+        Step::Services | Step::ServicesStart => DisplayStatusCode::GuestServicesFailed,
+        Step::Distribution | Step::Payload | Step::Unspecified => DisplayStatusCode::PayloadInvalid,
+    }
+}
+
+/// An empty string on the wire is "not present" here.
+fn some_version(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
 /// Says what the guest made of the manifest, at the volume each answer earns.
 ///
 /// A share the guest refused is the two builds disagreeing about what a share
@@ -357,11 +766,7 @@ fn report_mounts(report: &AttachGpuSharesResponse, vm_name: &str) {
 /// Nothing is kept and nothing is retried: the next session applies the recipe
 /// again, and deriving a GPU status from these facts is the application
 /// layer's work.
-fn report_recipe(
-    report: &ApplyGpuRecipeResponse,
-    vm_name: &str,
-    sink: GuestGpuSink<'_>,
-) -> bool {
+fn report_recipe(report: &ApplyGpuRecipeResponse, vm_name: &str, sink: GuestGpuSink<'_>) -> bool {
     for stage in &report.stages {
         match stage.state() {
             GpuRecipeStageState::Ok => log::debug!(
@@ -634,6 +1039,24 @@ fn answer(request_id: u32, kind: &request::Kind, vm_name: &str) -> Envelope {
             ErrorCode::UnsupportedRequest,
             "a GPU probe is the host's to ask for",
         ),
+        // The display's three requests are the host's to ask, for the reason
+        // the GPU's are: a guest that asked the host to mount, apply or update
+        // something would be a guest with the conversation the wrong way round.
+        request::Kind::AttachDisplayPayload(_) => Envelope::error(
+            request_id,
+            ErrorCode::UnsupportedRequest,
+            "a display payload share is the host's to offer",
+        ),
+        request::Kind::ApplyDisplayRecipe(_) => Envelope::error(
+            request_id,
+            ErrorCode::UnsupportedRequest,
+            "a display recipe is the host's to ask for",
+        ),
+        request::Kind::UpdateDisplayPayload(_) => Envelope::error(
+            request_id,
+            ErrorCode::UnsupportedRequest,
+            "a display payload update is the host's to ask for",
+        ),
     }
 }
 
@@ -726,24 +1149,46 @@ impl Error for SessionError {
 mod tests {
     use std::io::{self, Read, Write};
 
+    use std::sync::Mutex;
     use vmlord_agent_protocol::{
         auth::{Nonce, Secret, tag},
         frame::{self, LENGTH_PREFIX_LEN},
         v1::{
-            ApplyGpuRecipeResponse, AttachGpuSharesResponse, AuthenticateResponse, Capability,
-            Envelope, ErrorCode, GpuMount, GpuMountState, GpuProbeCheck, GpuProbeCheckState,
-            GpuProbeStep, GpuProbeVerdict, GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep,
-            GpuShareRole, HeartbeatRequest, HelloRequest, ProbeGpuResponse, ProtocolVersion,
-            envelope, request, response,
+            ApplyDisplayRecipeResponse, ApplyGpuRecipeResponse, AttachDisplayPayloadResponse,
+            AttachGpuSharesResponse, AuthenticateResponse, Capability, DisplayMountState,
+            DisplayRecipeStage, DisplayRecipeStageState, Envelope, ErrorCode, GpuMount,
+            GpuMountState, GpuProbeCheck, GpuProbeCheckState, GpuProbeStep, GpuProbeVerdict,
+            GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep, GpuShareRole, HeartbeatRequest,
+            HelloRequest, ProbeGpuResponse, ProtocolVersion, envelope, request, response,
         },
     };
-    use std::sync::Mutex;
 
-    use vmlord_core::{GpuShareManifest, GpuStatusCode, GuestGpuDetail, GuestGpuReport};
+    use vmlord_core::{
+        DisplayShare, DisplayStage, DisplayStatusCode, GpuShareManifest, GpuStatusCode,
+        GuestGpuDetail, GuestGpuReport,
+    };
 
-    use super::{AgentSession, SessionError, open, serve};
+    use super::{
+        AgentSession, GuestDisplaySink, GuestGpuSink, SessionError, SessionWork, open, serve,
+    };
 
     const VM: &str = "dev-linux";
+
+    /// What a test session is to do: the GPU half as the test asked for it,
+    /// and no display payload at all -- every test here is about the order of
+    /// the GPU messages, and the display tests build their own work.
+    fn work<'a>(
+        gpu_shares: Option<&'a GpuShareManifest>,
+        gpu: GuestGpuSink<'a>,
+    ) -> SessionWork<'a> {
+        SessionWork {
+            gpu_shares,
+            display_share: None,
+            gpu,
+            display: &|_| {},
+            updates: None,
+        }
+    }
 
     /// An agent made of bytes, which answers rather than replays.
     ///
@@ -851,6 +1296,17 @@ mod tests {
             let envelope = frame::decode(&rest[LENGTH_PREFIX_LEN..frame_len]).expect("an envelope");
             self.parsed += frame_len;
             Some(envelope)
+        }
+
+        /// Whether the host ever sent a request of this shape.
+        ///
+        /// The negative is what the display tests need: a session that must
+        /// not send something has no request to look up by id.
+        fn was_asked(&self, matches: impl Fn(&request::Kind) -> bool) -> bool {
+            self.received.iter().any(|envelope| {
+                matches!(&envelope.body, Some(envelope::Body::Request(request))
+                    if request.kind.as_ref().is_some_and(&matches))
+            })
         }
 
         /// The answer the host gave to the request numbered `request_id`.
@@ -1062,7 +1518,7 @@ mod tests {
             .after_answer(&[heartbeat(11)]);
         let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
 
-        serve(&mut guest, &session, None, VM, &|_| {}).expect("a session the agent closed");
+        serve(&mut guest, &session, work(None, &|_| {}), VM).expect("a session the agent closed");
 
         let Some(envelope::Body::Response(ref response)) = guest.answer_to(11).body else {
             panic!("the heartbeat should have been answered");
@@ -1077,7 +1533,7 @@ mod tests {
             .after_answer(&[hello(ProtocolVersion::current(), &[])]);
         let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
 
-        serve(&mut guest, &session, None, VM, &|_| {}).expect("a session the agent closed");
+        serve(&mut guest, &session, work(None, &|_| {}), VM).expect("a session the agent closed");
 
         // The hello and its refusal share a request id, so the last answer to
         // it is the one `serve` gave.
@@ -1102,7 +1558,268 @@ mod tests {
         let mut guest = Guest::new(Secret::from_base64(&secret.to_base64()).expect("the secret"));
         let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
 
-        serve(&mut guest, &session, None, VM, &|_| {}).expect("a clean close is not a failure");
+        serve(&mut guest, &session, work(None, &|_| {}), VM)
+            .expect("a clean close is not a failure");
+    }
+
+    /// The work a display test does: no GPU, one display share, and a sink
+    /// that keeps what came back.
+    fn display_work<'a>(
+        share: Option<&'a DisplayShare>,
+        display: GuestDisplaySink<'a>,
+    ) -> SessionWork<'a> {
+        SessionWork {
+            gpu_shares: None,
+            display_share: share,
+            gpu: &|_| {},
+            display,
+            updates: None,
+        }
+    }
+
+    fn display_share() -> DisplayShare {
+        DisplayShare {
+            name: vmlord_core::DISPLAY_PAYLOAD_SHARE.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_desktop_vm_is_offered_its_display_payload_and_asked_to_apply_it() {
+        let secret = Secret::generate();
+        let mut guest = Guest::opening_with(
+            Secret::from_base64(&secret.to_base64()).expect("the secret"),
+            hello(
+                ProtocolVersion::current(),
+                &[Capability::Gpu, Capability::Display],
+            ),
+        );
+        let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
+        guest.say(&Envelope::response(
+            super::DISPLAY_ATTACH_REQUEST_ID,
+            response::Kind::AttachDisplayPayload(AttachDisplayPayloadResponse {
+                mount: Some(vmlord_agent_protocol::v1::DisplayMount {
+                    name: vmlord_core::DISPLAY_PAYLOAD_SHARE.to_owned(),
+                    mount_point: "/opt/vmlord/display-payload".to_owned(),
+                    state: i32::from(DisplayMountState::Mounted),
+                    message: "mounted".to_owned(),
+                }),
+            }),
+        ));
+        guest.say(&Envelope::response(
+            super::DISPLAY_APPLY_REQUEST_ID,
+            response::Kind::ApplyDisplayRecipe(ApplyDisplayRecipeResponse {
+                stages: vec![DisplayRecipeStage {
+                    step: i32::from(vmlord_agent_protocol::v1::DisplayRecipeStep::Device),
+                    state: i32::from(DisplayRecipeStageState::Ok),
+                    message: "a vmlord_drm display device is present".to_owned(),
+                }],
+                versions: Some(vmlord_agent_protocol::v1::DisplayPayloadVersions {
+                    installed: "0.1.0".to_owned(),
+                    previous: String::new(),
+                    loaded: "0.1.0".to_owned(),
+                }),
+            }),
+        ));
+
+        let reports = Mutex::new(Vec::new());
+        let share = display_share();
+        serve(
+            &mut guest,
+            &session,
+            display_work(Some(&share), &|report| {
+                reports
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(report);
+            }),
+            VM,
+        )
+        .expect("a session the agent closed");
+
+        let offered = guest.answer_to(super::DISPLAY_ATTACH_REQUEST_ID);
+        let Some(envelope::Body::Request(ref request)) = offered.body else {
+            panic!("the share should have been sent as a request");
+        };
+        let Some(request::Kind::AttachDisplayPayload(ref attach)) = request.kind else {
+            panic!("the share should have been an attach request");
+        };
+        assert_eq!(
+            attach.share.as_ref().expect("a share").name,
+            "vmlord.display.payload"
+        );
+
+        let reports = reports
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].installed.as_deref(), Some("0.1.0"));
+        assert_eq!(reports[0].loaded.as_deref(), Some("0.1.0"));
+        assert_eq!(
+            reports[0].previous, None,
+            "an empty string on the wire is not a version"
+        );
+        assert_eq!(reports[0].failure, None);
+    }
+
+    #[test]
+    fn a_headless_vm_is_asked_nothing_about_a_display() {
+        let secret = Secret::generate();
+        let mut guest = Guest::opening_with(
+            Secret::from_base64(&secret.to_base64()).expect("the secret"),
+            hello(
+                ProtocolVersion::current(),
+                &[Capability::Gpu, Capability::Display],
+            ),
+        );
+        let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
+
+        serve(&mut guest, &session, display_work(None, &|_| {}), VM)
+            .expect("a session the agent closed");
+
+        assert!(
+            !guest.was_asked(|kind| matches!(kind, request::Kind::AttachDisplayPayload(_))),
+            "a VM with no display payload is a session that says nothing about one"
+        );
+    }
+
+    #[test]
+    fn an_agent_without_the_display_capability_is_sent_no_display_requests() {
+        let secret = Secret::generate();
+        let mut guest = Guest::opening_with(
+            Secret::from_base64(&secret.to_base64()).expect("the secret"),
+            hello(ProtocolVersion::current(), &[Capability::Gpu]),
+        );
+        let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
+        let share = display_share();
+
+        serve(
+            &mut guest,
+            &session,
+            display_work(Some(&share), &|_| {}),
+            VM,
+        )
+        .expect("a session the agent closed");
+
+        assert!(
+            !guest.was_asked(|kind| matches!(kind, request::Kind::AttachDisplayPayload(_))),
+            "an agent that never agreed to the capability must not be sent its messages"
+        );
+    }
+
+    #[test]
+    fn a_display_recipe_that_failed_is_reported_with_the_cause_of_the_stage() {
+        let secret = Secret::generate();
+        let mut guest = Guest::opening_with(
+            Secret::from_base64(&secret.to_base64()).expect("the secret"),
+            hello(
+                ProtocolVersion::current(),
+                &[Capability::Gpu, Capability::Display],
+            ),
+        );
+        let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
+        guest.say(&Envelope::response(
+            super::DISPLAY_ATTACH_REQUEST_ID,
+            response::Kind::AttachDisplayPayload(AttachDisplayPayloadResponse {
+                mount: Some(vmlord_agent_protocol::v1::DisplayMount {
+                    name: vmlord_core::DISPLAY_PAYLOAD_SHARE.to_owned(),
+                    mount_point: "/opt/vmlord/display-payload".to_owned(),
+                    state: i32::from(DisplayMountState::AlreadyMounted),
+                    message: "already mounted".to_owned(),
+                }),
+            }),
+        ));
+        guest.say(&Envelope::response(
+            super::DISPLAY_APPLY_REQUEST_ID,
+            response::Kind::ApplyDisplayRecipe(ApplyDisplayRecipeResponse {
+                stages: vec![DisplayRecipeStage {
+                    step: i32::from(vmlord_agent_protocol::v1::DisplayRecipeStep::ModuleBuild),
+                    state: i32::from(DisplayRecipeStageState::Failed),
+                    message: "dkms build failed for kernel 6.8.0-137-generic".to_owned(),
+                }],
+                versions: None,
+            }),
+        ));
+
+        let reports = Mutex::new(Vec::new());
+        let share = display_share();
+        serve(
+            &mut guest,
+            &session,
+            display_work(Some(&share), &|report| {
+                reports
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(report);
+            }),
+            VM,
+        )
+        .expect("a display that will not build ends nothing");
+
+        let reports = reports
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let failure = reports[0]
+            .failure
+            .as_ref()
+            .expect("a failed stage is a failure");
+        assert_eq!(failure.code, DisplayStatusCode::PayloadBuildFailed);
+        assert_eq!(failure.stage, DisplayStage::Payload);
+        assert!(failure.message.contains("6.8.0-137-generic"));
+    }
+
+    #[test]
+    fn a_share_the_guest_refused_is_not_followed_by_a_recipe() {
+        let secret = Secret::generate();
+        let mut guest = Guest::opening_with(
+            Secret::from_base64(&secret.to_base64()).expect("the secret"),
+            hello(
+                ProtocolVersion::current(),
+                &[Capability::Gpu, Capability::Display],
+            ),
+        );
+        let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
+        guest.say(&Envelope::response(
+            super::DISPLAY_ATTACH_REQUEST_ID,
+            response::Kind::AttachDisplayPayload(AttachDisplayPayloadResponse {
+                mount: Some(vmlord_agent_protocol::v1::DisplayMount {
+                    name: "vmlord.display.payload".to_owned(),
+                    mount_point: String::new(),
+                    state: i32::from(DisplayMountState::Failed),
+                    message: "9p mount failed".to_owned(),
+                }),
+            }),
+        ));
+
+        let reports = Mutex::new(Vec::new());
+        let share = display_share();
+        serve(
+            &mut guest,
+            &session,
+            display_work(Some(&share), &|report| {
+                reports
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(report);
+            }),
+            VM,
+        )
+        .expect("a session the agent closed");
+
+        assert!(
+            !guest.was_asked(|kind| matches!(kind, request::Kind::ApplyDisplayRecipe(_))),
+            "there is nothing to build out of a payload that was never mounted"
+        );
+        let reports = reports
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(
+            reports[0]
+                .failure
+                .as_ref()
+                .expect("a mount that failed is a failure")
+                .code,
+            DisplayStatusCode::PayloadInvalid
+        );
     }
 
     #[test]
@@ -1137,7 +1854,8 @@ mod tests {
             }),
         ));
 
-        serve(&mut guest, &session, Some(&manifest), VM, &|_| {}).expect("a session the agent closed");
+        serve(&mut guest, &session, work(Some(&manifest), &|_| {}), VM)
+            .expect("a session the agent closed");
 
         let offered = guest.answer_to(super::ATTACH_REQUEST_ID);
         let Some(envelope::Body::Request(ref request)) = offered.body else {
@@ -1206,7 +1924,8 @@ mod tests {
             }),
         ));
 
-        serve(&mut guest, &session, Some(&manifest), VM, &|_| {}).expect("a session the agent closed");
+        serve(&mut guest, &session, work(Some(&manifest), &|_| {}), VM)
+            .expect("a session the agent closed");
 
         let asked = guest.answer_to(super::APPLY_REQUEST_ID);
         let Some(envelope::Body::Request(ref request)) = asked.body else {
@@ -1237,7 +1956,10 @@ mod tests {
     /// The whole conversation rather than the probe alone: the probe is asked
     /// for only after a recipe that finished, so a fixture that skipped the
     /// earlier answers would test a request the host never sends.
-    fn reports_of_a_guest(recipe: ApplyGpuRecipeResponse, probe: Option<ProbeGpuResponse>) -> Vec<GuestGpuReport> {
+    fn reports_of_a_guest(
+        recipe: ApplyGpuRecipeResponse,
+        probe: Option<ProbeGpuResponse>,
+    ) -> Vec<GuestGpuReport> {
         let secret = Secret::generate();
         let mut guest = Guest::opening_with(
             Secret::from_base64(&secret.to_base64()).expect("the secret"),
@@ -1271,15 +1993,22 @@ mod tests {
         }
 
         let reports = Mutex::new(Vec::new());
-        serve(&mut guest, &session, Some(&manifest), VM, &|report| {
-            reports
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(report);
-        })
+        serve(
+            &mut guest,
+            &session,
+            work(Some(&manifest), &|report| {
+                reports
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(report);
+            }),
+            VM,
+        )
         .expect("a session the agent closed");
 
-        reports.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner())
+        reports
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn a_recipe_that_finished() -> ApplyGpuRecipeResponse {
@@ -1432,7 +2161,8 @@ mod tests {
             }),
         ));
 
-        serve(&mut guest, &session, Some(&manifest), VM, &|_| {}).expect("a session the agent closed");
+        serve(&mut guest, &session, work(Some(&manifest), &|_| {}), VM)
+            .expect("a session the agent closed");
 
         let asked = guest.answer_to(super::PROBE_REQUEST_ID);
         let Some(envelope::Body::Request(ref request)) = asked.body else {
@@ -1466,7 +2196,7 @@ mod tests {
         );
         let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
 
-        serve(&mut guest, &session, None, VM, &|_| {}).expect("a session the agent closed");
+        serve(&mut guest, &session, work(None, &|_| {}), VM).expect("a session the agent closed");
 
         assert!(
             !guest.received.iter().any(|envelope| matches!(
@@ -1488,7 +2218,7 @@ mod tests {
         );
         let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
 
-        serve(&mut guest, &session, None, VM, &|_| {}).expect("a session the agent closed");
+        serve(&mut guest, &session, work(None, &|_| {}), VM).expect("a session the agent closed");
 
         assert!(
             !guest.received.iter().any(|envelope| matches!(
@@ -1514,7 +2244,8 @@ mod tests {
             shares: vec![vmlord_core::GpuShare::wsl_lib()],
         };
 
-        serve(&mut guest, &session, Some(&manifest), VM, &|_| {}).expect("a session the agent closed");
+        serve(&mut guest, &session, work(Some(&manifest), &|_| {}), VM)
+            .expect("a session the agent closed");
 
         assert!(
             !guest.received.iter().any(|envelope| matches!(
@@ -1535,6 +2266,7 @@ mod tests {
             build: String::new(),
         };
 
-        serve(&mut stream, &session, None, VM, &|_| {}).expect("an idle boundary is not a failed session");
+        serve(&mut stream, &session, work(None, &|_| {}), VM)
+            .expect("an idle boundary is not a failed session");
     }
 }

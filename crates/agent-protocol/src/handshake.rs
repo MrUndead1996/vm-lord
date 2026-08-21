@@ -16,7 +16,7 @@ use crate::v1::{Capability, ProtocolVersion};
 /// `major` changes when an existing message changes meaning; `minor` changes
 /// when something is added. A guest agent is upgraded on its own schedule, so
 /// this is the number a session negotiates against, never the crate version.
-pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 6 };
+pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 7 };
 
 impl ProtocolVersion {
     /// The revision this build implements.
@@ -220,6 +220,33 @@ mod tests {
         let unspecified = i32::from(Capability::Unspecified);
 
         assert!(agreed_capabilities(&[Capability::Unspecified], &[unspecified]).is_empty());
+    }
+
+    #[test]
+    fn an_agent_without_the_display_messages_negotiates_down_to_what_it_has() {
+        let settled = negotiate_version(CURRENT_VERSION, ProtocolVersion { major: 1, minor: 6 })
+            .expect("one major, so the two negotiate");
+
+        assert_eq!(
+            settled.minor, 6,
+            "the older side never sees a message it has no field for"
+        );
+    }
+
+    #[test]
+    fn the_display_capability_is_not_the_gpu_one() {
+        assert_ne!(
+            i32::from(Capability::Display),
+            i32::from(Capability::Gpu),
+            "an agent that speaks one and not the other is an ordinary agent"
+        );
+        assert_eq!(
+            agreed_capabilities(
+                &[Capability::Gpu, Capability::Display],
+                &[i32::from(Capability::Display)]
+            ),
+            vec![Capability::Display]
+        );
     }
 
     #[test]

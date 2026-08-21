@@ -182,9 +182,7 @@ pub fn is_managed(path: &Path) -> bool {
 mod tests {
     use vmlord_agent_protocol::v1::{GpuShare, GpuShareRole};
 
-    use super::{
-        Planned, Refusal, WSL_D3D12, WSL_HOST_LIB, WSL_LIB, is_managed, plan,
-    };
+    use super::{Planned, Refusal, WSL_D3D12, WSL_HOST_LIB, WSL_LIB, is_managed, plan};
     use std::path::{Path, PathBuf};
 
     fn share(name: &str, role: GpuShareRole, package: &str) -> GpuShare {

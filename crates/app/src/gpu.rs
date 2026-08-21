@@ -27,8 +27,8 @@ pub fn derive_status(
     now: SystemTime,
 ) -> VmGpuStatus {
     let observed_at = facts.observed_at.unwrap_or(now);
-    let status = |state: GpuState, stage: GpuStage, code: GpuStatusCode, message: String| {
-        VmGpuStatus {
+    let status =
+        |state: GpuState, stage: GpuStage, code: GpuStatusCode, message: String| VmGpuStatus {
             state,
             stage,
             code,
@@ -36,8 +36,7 @@ pub fn derive_status(
             native: native_detail(facts),
             guest: guest_detail(facts),
             observed_at,
-        }
-    };
+        };
 
     match mode {
         GpuMode::None => {

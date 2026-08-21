@@ -1,0 +1,2 @@
+obj-m += vmlord_drm.o
+ccflags-y += -I$(src)

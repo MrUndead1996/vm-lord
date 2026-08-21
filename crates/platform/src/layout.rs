@@ -50,12 +50,37 @@ pub(crate) fn configuration_path(vm_directory: &Path) -> PathBuf {
 /// One cache and not one per VM: a generation is content-addressed, so two VMs
 /// on the same payload share the files rather than each unpacking their own
 /// copy of them.
+pub(crate) fn payload_cache_root(storage_root: &Path) -> PathBuf {
+    storage_root.join("cache")
+}
+
+/// The GPU payload's own name for the shared cache root.
 pub(crate) fn gpu_payload_cache_root(storage_root: &Path) -> PathBuf {
     storage_root.join("cache")
 }
 
 pub(crate) fn gpu_payload_staging_directory(vm_directory: &Path) -> PathBuf {
     vm_directory.join("gpu-payload")
+}
+
+/// The exact per-VM directory that may hold staged display payload generations.
+///
+/// Beside `gpu-payload` and never inside it: the two are exported as different
+/// shares to a guest that mounts them separately, and a cleanup that removes
+/// one must not reach the other.
+pub(crate) fn display_payload_staging_directory(vm_directory: &Path) -> PathBuf {
+    vm_directory.join("display-payload")
+}
+
+/// The one path a VM's display payload is ever exported from.
+///
+/// A compute system's Plan9 section is written before the system is built and
+/// is immutable for the lifetime of a boot, so a share can name one path and
+/// only one. A generation is named after its digest and is a different path per
+/// version, so what is exported is this -- and a newer version is published
+/// into it rather than exported beside it.
+pub(crate) fn display_payload_active_directory(vm_directory: &Path) -> PathBuf {
+    display_payload_staging_directory(vm_directory).join("active")
 }
 
 /// Returns the path of the VM's serial-console capture.

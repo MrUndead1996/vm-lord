@@ -1,8 +1,7 @@
-//! Where a release keeps the payload archives it ships.
+//! Where a release keeps the GPU payload archives it ships.
 //!
-//! One rule, written once: `cargo dist` copies to it and the running
-//! application reads from it, and a disagreement between the two would be a
-//! release whose payload is invisible with nothing to say so.
+//! The rule itself is `vmlord_payload::release`'s; what is here is the one
+//! name that is the GPU payload's own.
 
 use std::path::{Path, PathBuf};
 
@@ -10,31 +9,15 @@ use std::path::{Path, PathBuf};
 pub const LOCAL_ARCHIVE_DIRECTORY: &str = "gpu-payload";
 
 /// The archive for `payload_id` below `directory`.
-///
-/// `directory` is the one holding the executable. It is a parameter rather
-/// than read from `current_exe` here so that this can be tested, and so that
-/// the build tool -- which is placing files into a distribution rather than
-/// running from one -- can use the same rule.
+#[must_use]
 pub fn local_archive_path(directory: &Path, payload_id: &str) -> PathBuf {
-    directory
-        .join(LOCAL_ARCHIVE_DIRECTORY)
-        .join(format!("{payload_id}.zip"))
+    vmlord_payload::release::archive_path(directory, LOCAL_ARCHIVE_DIRECTORY, payload_id)
 }
 
 /// The entry document for `payload_id` below `directory`.
-///
-/// The pair is named by the payload's own ID: one directory listing then says
-/// which payloads a release carries, and an entry cannot describe an archive
-/// other than the one beside it.
+#[must_use]
 pub fn local_entry_path(directory: &Path, payload_id: &str) -> PathBuf {
-    directory
-        .join(LOCAL_ARCHIVE_DIRECTORY)
-        .join(format!("{payload_id}.json"))
-}
-
-/// The directory a release keeps its payload pairs in.
-pub(crate) fn local_payload_directory(directory: &Path) -> PathBuf {
-    directory.join(LOCAL_ARCHIVE_DIRECTORY)
+    vmlord_payload::release::entry_path(directory, LOCAL_ARCHIVE_DIRECTORY, payload_id)
 }
 
 #[cfg(test)]

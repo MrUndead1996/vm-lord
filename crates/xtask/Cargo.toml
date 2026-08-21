@@ -15,7 +15,9 @@ bench = false
 workspace = true
 
 [dependencies]
+vmlord-display-payload = { path = "../display-payload", features = ["builder"] }
 vmlord-gpu-payload = { path = "../gpu-payload", features = ["builder"] }
+vmlord-payload = { path = "../payload" }
 
 # Tests only: reading back the catalog entry `pack` wrote. The build tool
 # itself reads it through `PayloadCatalog::from_entry_json`.

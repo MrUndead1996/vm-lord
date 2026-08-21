@@ -20,18 +20,23 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     thread::{self, JoinHandle},
     time::Duration,
 };
 
 use uuid::Uuid;
+use vmlord_agent_protocol::v1::DisplayUpdateOutcome;
 use vmlord_agent_protocol::{auth::Secret, backoff::Backoff};
-use vmlord_core::{GpuShareManifest, RepositoryError};
+use vmlord_core::{DisplayShare, GpuShareManifest, RepositoryError};
 use zeroize::Zeroizing;
 
 use crate::{
-    agent_session::{self, GuestGpuSink, SessionError},
+    agent_session::{
+        self, GuestDisplayPayloadReport, GuestDisplaySink, GuestGpuSink, SessionError,
+    },
+    display_runs::DisplayRuns,
     gpu_runs::GpuRuns,
     hvsocket::{ACCEPT_POLL, AgentListener},
     metadata::VmComputeSystemMapping,
@@ -62,6 +67,19 @@ impl AgentSessions {
         self.0.clear();
     }
 
+    /// Asks the agent of `vm_id` to move its display payload to a version.
+    ///
+    /// The request goes to the thread that owns that VM's session, because a
+    /// session is one conversation on one socket and a second writer would be
+    /// two. `None` is a VM VMLord is not listening for at all.
+    pub(crate) fn update_display_payload(
+        &self,
+        vm_id: Uuid,
+        target_version: &str,
+    ) -> Option<Result<DisplayUpdateAnswer, RepositoryError>> {
+        Some(self.0.get(&vm_id)?.update_display_payload(target_version))
+    }
+
     /// Whether the agent of `vm_id` has a session open right now.
     ///
     /// `None` means VMLord is not listening for that VM at all, which is not
@@ -87,10 +105,76 @@ pub(crate) struct AgentConnection {
     /// mean a channel for a single bit.
     online: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
+    /// Where a display payload update is handed to the thread that owns the
+    /// session.
+    updates: Sender<DisplayUpdate>,
     worker: Option<JoinHandle<()>>,
 }
 
+/// One update, and where its answer goes.
+pub(crate) struct DisplayUpdate {
+    pub(crate) target_version: String,
+    pub(crate) answer: Sender<DisplayUpdateAnswer>,
+}
+
+/// What the guest made of an update it was asked for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DisplayUpdateAnswer {
+    pub(crate) outcome: DisplayUpdateOutcome,
+    pub(crate) report: GuestDisplayPayloadReport,
+}
+
+/// How long a caller waits for a guest to finish an update.
+///
+/// Long, because what it waits on is a DKMS build against the guest's running
+/// kernel, and the recipe's own budget for one is fifteen minutes. Shorter than
+/// forever, because a guest that stopped answering must not hold the thread
+/// that asked.
+const UPDATE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
 impl AgentConnection {
+    /// Asks this VM's guest to move its display payload to `target_version`.
+    ///
+    /// Blocks until the guest answers or the budget runs out, because what a
+    /// caller wants from an update is whether it worked. A VM whose session is
+    /// not open right now answers immediately: there is nobody to ask, and
+    /// queueing the request would move a version at a moment nobody chose.
+    fn update_display_payload(
+        &self,
+        target_version: &str,
+    ) -> Result<DisplayUpdateAnswer, RepositoryError> {
+        let (answer, answered) = mpsc::channel();
+        if !self.online.load(Ordering::Relaxed) {
+            return Err(RepositoryError::new(format!(
+                "the agent of VM \"{}\" has no open session, so its display payload cannot be \
+                 updated right now",
+                self.vm_name
+            )));
+        }
+        self.updates
+            .send(DisplayUpdate {
+                target_version: target_version.to_owned(),
+                answer,
+            })
+            .map_err(|_| {
+                RepositoryError::new(format!(
+                    "the agent thread of VM \"{}\" is gone",
+                    self.vm_name
+                ))
+            })?;
+
+        answered.recv_timeout(UPDATE_TIMEOUT).map_err(|error| {
+            let reason = match error {
+                RecvTimeoutError::Timeout => "did not finish inside the time allowed for it",
+                RecvTimeoutError::Disconnected => "ended before it answered",
+            };
+            RepositoryError::new(format!(
+                "the display payload update of VM \"{}\" {reason}",
+                self.vm_name
+            ))
+        })
+    }
+
     /// Binds the agent service of a running VM and starts serving it.
     ///
     /// `runtime_id` is the partition the VM is running as, which is what an
@@ -122,7 +206,9 @@ impl AgentConnection {
         runtime_id: Uuid,
         secret_path: &Path,
         shares: Option<GpuShareManifest>,
+        display_share: Option<DisplayShare>,
         facts: GpuRuns,
+        display_facts: DisplayRuns,
     ) -> Result<Self, RepositoryError> {
         let vm_name = mapping.vm_name.clone();
         let vm_id = mapping.vm_id;
@@ -131,6 +217,7 @@ impl AgentConnection {
 
         let online = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
+        let (updates, pending_updates) = mpsc::channel();
         let worker = thread::Builder::new()
             .name(format!("vmlord-agent-{}", mapping.vm_id.as_simple()))
             .spawn({
@@ -141,11 +228,22 @@ impl AgentConnection {
                     serve(
                         &listener,
                         &secret,
+                        &pending_updates,
                         shares.as_ref(),
+                        display_share.as_ref(),
                         &vm_name,
                         &online,
                         &running,
                         &|report| facts.record_guest(vm_id, report),
+                        &|report| {
+                            display_facts.record_guest_payload(
+                                vm_id,
+                                report.installed,
+                                report.previous,
+                                report.loaded,
+                                report.failure,
+                            );
+                        },
                     )
                 }
             })
@@ -162,6 +260,7 @@ impl AgentConnection {
             vm_name,
             online,
             running,
+            updates,
             worker: Some(worker),
         })
     }
@@ -175,6 +274,9 @@ impl AgentConnection {
             vm_name: format!("vm-{}", vm_id.as_simple()),
             online: Arc::new(AtomicBool::new(online)),
             running: Arc::new(AtomicBool::new(true)),
+            // Nothing serves this one, so an update sent into it is never read
+            // -- which is what a connection with no session is.
+            updates: mpsc::channel().0,
             worker: None,
         }
     }
@@ -218,14 +320,21 @@ impl Drop for AgentConnection {
 /// connects and drops as fast as this thread can accept is a broken agent or
 /// something else on the machine that found the service, and serving it at that
 /// rate would cost a busy thread per VM.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one thread serves both stacks, and each needs what to offer and where to report"
+)]
 fn serve(
     listener: &AgentListener,
     secret: &Secret,
+    updates: &Receiver<DisplayUpdate>,
     shares: Option<&GpuShareManifest>,
+    display_share: Option<&DisplayShare>,
     vm_name: &str,
     online: &AtomicBool,
     running: &Arc<AtomicBool>,
     sink: GuestGpuSink<'_>,
+    display_sink: GuestDisplaySink<'_>,
 ) {
     let mut backoff = Backoff::new();
 
@@ -243,7 +352,18 @@ fn serve(
         let authenticated = match agent_session::open(&mut stream, secret, vm_name) {
             Ok(session) => {
                 online.store(true, Ordering::Relaxed);
-                let outcome = agent_session::serve(&mut stream, &session, shares, vm_name, sink);
+                let outcome = agent_session::serve(
+                    &mut stream,
+                    &session,
+                    agent_session::SessionWork {
+                        gpu_shares: shares,
+                        display_share,
+                        gpu: sink,
+                        display: display_sink,
+                        updates: Some(updates),
+                    },
+                    vm_name,
+                );
                 online.store(false, Ordering::Relaxed);
                 if let Err(error) = outcome {
                     report(vm_name, &error);
@@ -329,6 +449,7 @@ mod tests {
         sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
+            mpsc,
         },
         time::{Duration, Instant},
     };
@@ -450,6 +571,7 @@ mod tests {
             vm_name: "dev-linux".to_owned(),
             online: Arc::new(AtomicBool::new(true)),
             running: Arc::clone(&running),
+            updates: mpsc::channel().0,
             worker: None,
         };
 

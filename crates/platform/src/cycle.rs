@@ -16,6 +16,7 @@ use crate::{
     com1_terminal::{Com1Launcher, Com1Session},
     create::{CloudDiskImporter, VmCreationPipeline},
     delete::VmDeletionPipeline,
+    display_runs::DisplayRuns,
     force_stop::VmForceStopPipeline,
     gpu_runs::GpuRuns,
     guest_ready::{GuestReadiness, GuestReady, ReadinessFailure, ReadinessTimeouts, com1_tail},
@@ -117,12 +118,14 @@ impl VmBuildCycle {
         com1: Com1Launcher,
         timeouts: ReadinessTimeouts,
         gpu_runs: GpuRuns,
+        display_runs: DisplayRuns,
         storage_root: &Path,
     ) -> Self {
         let creation = VmCreationPipeline::production(cloud_disk);
         // The same pipeline a later start uses, so that a VM created with a
         // GPU gets one on its first boot rather than only on its second.
-        let start = VmStartPipeline::production(com1).for_vms_under(storage_root, gpu_runs);
+        let start =
+            VmStartPipeline::production(com1).for_vms_under(storage_root, gpu_runs, display_runs);
         let force_stop = VmForceStopPipeline::production();
         let deletion = VmDeletionPipeline::production();
         Self {

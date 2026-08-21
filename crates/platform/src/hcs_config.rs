@@ -10,8 +10,6 @@ use uuid::Uuid;
 use vmlord_core::{GpuMode, NetworkMode, RepositoryError, VmCreateRequest, VmSource};
 use windows::core::GUID;
 
-use crate::gpu_exports::GpuExports;
-
 /// The pair of files a compute system keeps its state in, as
 /// [`crate::layout`] names them.
 ///
@@ -327,18 +325,24 @@ pub(crate) fn remove_network_adapter(document: &str) -> Result<String, Repositor
     })
 }
 
+/// One directory a VM is offered, whatever decided to offer it.
+pub(crate) struct Plan9Export<'a> {
+    pub name: &'a str,
+    pub host_path: &'a Path,
+}
+
 /// Returns `document` with `exports` written into its `Plan9` section.
 ///
 /// The whole section is replaced rather than merged: the export set is
 /// computed once per start and is what the VM boots with, so a leftover share
 /// from a previous start is stale by definition.
-/// Nothing calls this yet: a start cannot know a VM's GPU mode until the task
-/// that applies HCS assignment records one, and that task is the caller. The
-/// allow goes away with it.
-#[allow(dead_code)]
+///
+/// A flat list of names and paths, and not one kind of export's type: the GPU
+/// shares and the display share are decided separately, mean different things
+/// when they are missing, and meet only here -- as entries in one HCS device.
 pub(crate) fn apply_plan9_shares(
     document: &str,
-    exports: &GpuExports,
+    exports: &[Plan9Export<'_>],
 ) -> Result<String, RepositoryError> {
     let mut configuration = parse(document)?;
     let devices = write_target(&mut configuration, DEVICES_POINTER)?
@@ -355,17 +359,22 @@ pub(crate) fn apply_plan9_shares(
     let shares: Vec<Plan9Share<'_>> = exports
         .iter()
         .map(|export| Plan9Share {
-            name: export.name(),
-            access_name: export.name(),
-            path: export.host_path(),
+            name: export.name,
+            access_name: export.name,
+            path: export.host_path,
             port: PLAN9_PORT,
             flags: PLAN9_FLAG_READ_ONLY,
         })
         .collect();
     let shares = serde_json::to_value(shares).map_err(|error| {
-        RepositoryError::new(format!("failed to serialize the VM's Plan9 shares: {error}"))
+        RepositoryError::new(format!(
+            "failed to serialize the VM's Plan9 shares: {error}"
+        ))
     })?;
-    devices.insert(PLAN9_KEY.to_owned(), serde_json::json!({ "Shares": shares }));
+    devices.insert(
+        PLAN9_KEY.to_owned(),
+        serde_json::json!({ "Shares": shares }),
+    );
 
     serde_json::to_string(&configuration).map_err(|error| {
         RepositoryError::new(format!(
@@ -712,16 +721,16 @@ mod tests {
     use serde_json::{Value, json};
     use uuid::Uuid;
     use vmlord_core::{
-        CloudImage, GpuMode, GpuShare, NetworkMode, Password, Provisioning, SshAccess, SshPort,
+        CloudImage, GpuMode, NetworkMode, Password, Provisioning, SshAccess, SshPort,
         VmCreateRequest, VmSource, ubuntu,
     };
 
     use super::{
-        HcsVmConfigBuilder, StateFilePaths, VmTopology, adapter_key, apply_network_adapter,
-        apply_plan9_shares, apply_topology, com1_pipe_path, ensure_supported_network_mode,
-        media_path, read_topology, remove_network_adapter, remove_plan9_shares,
+        HcsVmConfigBuilder, Plan9Export, StateFilePaths, VmTopology, adapter_key,
+        apply_network_adapter, apply_plan9_shares, apply_topology, com1_pipe_path,
+        ensure_supported_network_mode, media_path, read_topology, remove_network_adapter,
+        remove_plan9_shares,
     };
-    use crate::gpu_exports::GpuExports;
 
     /// The identity a created compute system is given, fixed so that the pipe
     /// name derived from it can be written down.
@@ -1561,52 +1570,72 @@ mod tests {
         .expect("the configuration must build")
     }
 
-    fn exports() -> GpuExports {
-        GpuExports::for_test(vec![
+    fn export_paths() -> Vec<(String, PathBuf)> {
+        vec![
             (
-                GpuShare::wsl_lib(),
+                "vmlord.gpu.wsl-lib".to_owned(),
                 PathBuf::from(r"C:\Windows\System32\lxss\lib"),
             ),
             (
-                GpuShare::driver_package("nvltsi.inf_amd64_1").unwrap(),
+                "vmlord.gpu.drv.nvltsi.inf_amd64_1".to_owned(),
                 PathBuf::from(r"C:\Windows\System32\DriverStore\FileRepository\nvltsi.inf_amd64_1"),
             ),
-        ])
+            (
+                "vmlord.display.payload".to_owned(),
+                PathBuf::from(r"C:\vms\test-vm\display-payload\generations\abc"),
+            ),
+        ]
+    }
+
+    fn exports(paths: &[(String, PathBuf)]) -> Vec<Plan9Export<'_>> {
+        paths
+            .iter()
+            .map(|(name, path)| Plan9Export {
+                name,
+                host_path: path,
+            })
+            .collect()
     }
 
     #[test]
     fn plan9_shares_are_written_read_only_on_the_agent_port() {
-        let updated =
-            apply_plan9_shares(&document_with_devices(), &exports()).expect("shares must apply");
+        let updated = apply_plan9_shares(&document_with_devices(), &exports(&export_paths()))
+            .expect("shares must apply");
 
         let value: Value = serde_json::from_str(&updated).expect("valid JSON");
         let shares = value
             .pointer("/VirtualMachine/Devices/Plan9/Shares")
             .and_then(Value::as_array)
             .expect("the Plan9 section must hold an array of shares");
-        assert_eq!(shares.len(), 2);
+        assert_eq!(shares.len(), 3);
         assert_eq!(shares[0]["Name"], "vmlord.gpu.wsl-lib");
         assert_eq!(shares[0]["AccessName"], "vmlord.gpu.wsl-lib");
         assert_eq!(shares[0]["Path"], r"C:\Windows\System32\lxss\lib");
         assert_eq!(shares[0]["Port"], 50001);
         assert_eq!(shares[0]["Flags"], 1, "1 is read-only");
         assert_eq!(shares[1]["Name"], "vmlord.gpu.drv.nvltsi.inf_amd64_1");
+        assert_eq!(
+            shares[2]["Name"], "vmlord.display.payload",
+            "the display share travels in the same device and is not a GPU share"
+        );
     }
 
     #[test]
     fn applying_shares_twice_replaces_rather_than_appends() {
         let document = document_with_devices();
 
-        let once = apply_plan9_shares(&document, &exports()).expect("shares must apply");
-        let twice = apply_plan9_shares(&once, &exports()).expect("shares must apply again");
+        let once =
+            apply_plan9_shares(&document, &exports(&export_paths())).expect("shares must apply");
+        let twice =
+            apply_plan9_shares(&once, &exports(&export_paths())).expect("shares must apply again");
 
         assert_eq!(once, twice, "a start that changes nothing writes nothing");
     }
 
     #[test]
     fn removing_shares_takes_the_whole_section() {
-        let with_shares =
-            apply_plan9_shares(&document_with_devices(), &exports()).expect("shares must apply");
+        let with_shares = apply_plan9_shares(&document_with_devices(), &exports(&export_paths()))
+            .expect("shares must apply");
 
         let without = remove_plan9_shares(&with_shares).expect("shares must be removable");
 

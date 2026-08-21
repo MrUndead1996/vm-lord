@@ -10,7 +10,7 @@
 //! VM directory. What is exported afterwards is the canonical path, not the
 //! one discovery reported.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use vmlord_core::{GpuShare, GpuShareManifest, HostGpuAdapter, RepositoryError};
 use windows::{
@@ -29,7 +29,7 @@ use windows::{
 };
 
 use crate::error::windows_error;
-use crate::layout::gpu_payload_staging_directory;
+use crate::{layout::gpu_payload_staging_directory, paths::is_within};
 
 /// Resolves a path to its canonical form, failing if it is not a directory.
 pub(crate) type Canonicalize<'a> = &'a dyn Fn(&Path) -> Result<PathBuf, RepositoryError>;
@@ -348,11 +348,7 @@ impl ExportRoots {
     }
 }
 
-fn resolve_root(
-    root: &Path,
-    candidate: &Path,
-    canonicalize: Canonicalize<'_>,
-) -> Option<PathBuf> {
+fn resolve_root(root: &Path, candidate: &Path, canonicalize: Canonicalize<'_>) -> Option<PathBuf> {
     match canonicalize(candidate) {
         Ok(resolved) if is_within(root, &resolved) => Some(resolved),
         Ok(resolved) => {
@@ -502,32 +498,6 @@ pub(crate) fn build_with_payload(
     (!exports.is_empty()).then_some(GpuExports { exports })
 }
 
-/// Whether `path` is `root` or lies under it, compared component by component.
-///
-/// Not a string prefix: `...\FileRepositoryEvil` starts with
-/// `...\FileRepository` and is a different directory.
-fn is_within(root: &Path, path: &Path) -> bool {
-    let mut root_components = root.components();
-    let mut path_components = path.components();
-
-    loop {
-        match (root_components.next(), path_components.next()) {
-            (None, _) => return true,
-            (Some(_), None) => return false,
-            (Some(expected), Some(actual)) if component_eq(expected, actual) => {}
-            (Some(_), Some(_)) => return false,
-        }
-    }
-}
-
-/// Windows paths are case-insensitive, and the two spellings of one directory
-/// are the same directory.
-fn component_eq(left: Component<'_>, right: Component<'_>) -> bool {
-    left.as_os_str()
-        .to_string_lossy()
-        .eq_ignore_ascii_case(&right.as_os_str().to_string_lossy())
-}
-
 fn same_path(left: &Path, right: &Path) -> bool {
     left.to_string_lossy()
         .eq_ignore_ascii_case(&right.to_string_lossy())
@@ -670,20 +640,19 @@ mod tests {
             (payload, payload),
         ]);
         let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
-        let roles: Vec<_> =
-            build_with_payload(
-                &[adapter(Some(&package))],
-                &roots,
-                vm,
-                Some(Path::new(payload)),
-                &canonicalize,
-            )
-            .unwrap()
-                .manifest()
-                .shares
-                .into_iter()
-                .map(|share| share.role)
-                .collect();
+        let roles: Vec<_> = build_with_payload(
+            &[adapter(Some(&package))],
+            &roots,
+            vm,
+            Some(Path::new(payload)),
+            &canonicalize,
+        )
+        .unwrap()
+        .manifest()
+        .shares
+        .into_iter()
+        .map(|share| share.role)
+        .collect();
         assert!(matches!(
             roles.as_slice(),
             [
@@ -738,8 +707,9 @@ mod tests {
         ]);
         let roots = ExportRoots::resolve(Path::new(SYSTEM32), None, &canonicalize);
 
-        let exports = build_with_payload(&[adapter(Some(&package))], &roots, vm, None, &canonicalize)
-            .expect("the host still has a driver package to offer");
+        let exports =
+            build_with_payload(&[adapter(Some(&package))], &roots, vm, None, &canonicalize)
+                .expect("the host still has a driver package to offer");
 
         assert!(
             !exports
@@ -1014,14 +984,13 @@ mod tests {
             ),
         ]);
 
-        let survived = exports
-            .granted_to("hcs-id", &|id, path| {
-                granted
-                    .lock()
-                    .unwrap()
-                    .push((id.to_owned(), path.to_path_buf()));
-                Ok(())
-            });
+        let survived = exports.granted_to("hcs-id", &|id, path| {
+            granted
+                .lock()
+                .unwrap()
+                .push((id.to_owned(), path.to_path_buf()));
+            Ok(())
+        });
 
         assert_eq!(survived.iter().count(), 2);
         assert_eq!(
@@ -1058,14 +1027,13 @@ mod tests {
             ),
         ]);
 
-        let survived = exports
-            .granted_to("hcs-id", &|_, path| {
-                if path.ends_with("lib") {
-                    Err(RepositoryError::new("access denied"))
-                } else {
-                    Ok(())
-                }
-            });
+        let survived = exports.granted_to("hcs-id", &|_, path| {
+            if path.ends_with("lib") {
+                Err(RepositoryError::new("access denied"))
+            } else {
+                Ok(())
+            }
+        });
 
         assert_eq!(survived.iter().count(), 2);
     }
@@ -1119,13 +1087,11 @@ mod tests {
         // and no WSL there is nothing to export, and demanding either would be
         // a test that is permanently red on half the machines it runs on.
         let capabilities = crate::discover_host_gpu();
-        let Some(exports) =
-            super::GpuExports::build(
-                &capabilities.adapters,
-                Path::new(r"C:\VMLord\ignored"),
-                None,
-            )
-        else {
+        let Some(exports) = super::GpuExports::build(
+            &capabilities.adapters,
+            Path::new(r"C:\VMLord\ignored"),
+            None,
+        ) else {
             println!("nothing to export on this host");
             return;
         };

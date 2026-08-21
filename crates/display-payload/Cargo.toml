@@ -1,0 +1,21 @@
+[package]
+name = "vmlord-display-payload"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+log.workspace = true
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+vmlord-payload = { path = "../payload" }
+
+[dev-dependencies]
+serde_json = "1.0"
+vmlord-payload = { path = "../payload" }
+
+[features]
+builder = ["vmlord-payload/builder"]
+
+[lints]
+workspace = true

@@ -1229,7 +1229,13 @@ the payload's own ID:
 ```
 gpu-payload/ubuntu-26.04-amd64-7.0.0-28-v2.json
 gpu-payload/ubuntu-26.04-amd64-7.0.0-28-v2.zip
+display-payload/display-ubuntu-24.04-amd64-0.1.0.json
+display-payload/display-ubuntu-24.04-amd64-0.1.0.zip
 ```
+
+The display pair travels the same way and is staged by
+`cargo dist --display-payload`; the two kinds keep separate directories because
+each catalog reads its own.
 
 `cargo dist --gpu-payload <directory>` takes what `pack` wrote -- `payload.zip`
 beside `catalog-entry.json` -- re-reads the entry through
@@ -2914,6 +2920,135 @@ is being created, is hashed into the seed there, and the create form that held
 it is dropped the moment the build is accepted; a display session authenticates
 with a key derived from the per-VM agent secret, so nothing in the display
 model has a field a password could be stored in.
+
+### Display: the payload crates
+
+`vmlord-payload` is what every VMLord payload is made of and nothing else: a
+digest, a progress report, a prepared file, an error, ZIP expansion under
+limits, the content-addressed host cache, per-VM staging, the layout of a
+release directory and the four rules for reading one. It knows nothing about
+what a payload carries, and it meets a kind of payload at one trait.
+
+`PayloadEntry` is that trait, and it is deliberately small: identify a payload,
+say what it may cost, and parse the two documents at its root. Everything a
+kind decides for itself -- what a target is, which guest an entry applies to,
+which of several entries wins -- has no method here, because a method here
+would be the mechanism pretending to know. `PayloadSources` is the one hook the
+mechanism owes back: expansion ends by handing the parsed provenance the
+manifest, which is what the GPU payload's overlay cross-check needs and what
+the display payload answers `Ok` to.
+
+`vmlord-gpu-payload` and `vmlord-display-payload` are thin layers above it,
+each with its own entry document, its own manifest and its own selection. The
+GPU tests are what proved the extraction changed no behaviour; the shared half
+is tested against a payload kind that exists only in tests, because no real
+kind may be privileged by the mechanism that serves both.
+
+### Display: the guest payload
+
+A display payload carries the whole guest side of the display that a guest's
+own apt cannot provide: today the DKMS sources of `vmlord_drm`, and from task
+#115 the guest display services. One artifact, one version and one declared
+range of display protocol revisions, so that what the host talks to and what
+the guest runs cannot drift apart unnoticed.
+
+An entry states a semantic `version` of its own, a `target` of distribution,
+release and architecture, the kernel it was `proven_on`, the `protocol` range,
+both digests and the expansion limits. `proven_on` is a record and never a
+selector: DKMS builds against the headers of the kernel a guest is running, and
+Ubuntu upgrades kernels unattended, so requiring the kernel a payload was built
+against would mean an upgrade kills the display until somebody repacks.
+
+Selection filters by the triple -- the hard gate, decided before the guest has
+booted -- keeps the entries whose protocol range covers this build's revision,
+and takes the greatest version. An entry outside that range is *passed over*
+rather than failed: a payload may legitimately be built for a newer or an older
+VMLord. Nothing for this guest is `NoPayloadForGuest`, which is a degraded
+display and a VM that starts.
+
+Several versions for one guest is the ordinary state of this catalog -- it is
+what an update is made of -- so what a release may not do is carry the same
+version twice, which would make selection depend on the order a directory
+listed two identical candidates.
+
+Verification happens twice, on both sides of the share. The host checks the
+archive against the entry, the expansion limits, and `payload.json` against
+what the entry claims; the guest, before it copies anything, checks
+`payload.json` and hashes every file it declares. Both, because a 9p export is
+a filesystem the host can rewrite between its own check and the guest's.
+
+A VM exports one path, `<vm>/display-payload/active`, and versions are
+*published into* it. That follows from HCS: a compute system's `Devices/Plan9`
+section is written before the system is built and is immutable for the lifetime
+of a boot, while a generation directory is named after its digest and is
+therefore a different path per version. A publication writes every declared
+file first, each through a rename; then `payload.json`, so a guest that reads a
+manifest finds every file it names already there; and only then removes what
+the new manifest does not declare, because a leftover file nothing declares is
+ignored and a missing declared one is not.
+
+The share is `vmlord.display.payload`, mounted at `/opt/vmlord/display-payload`,
+and it is the display's own -- not a role inside the GPU manifest. So are the
+agent's three display messages. A GPU attach that fails must not be able to
+take the display with it, and the two stacks meet only where HCS makes them:
+as entries in one Plan9 device.
+
+### Display: the guest's recipe
+
+Stages, in order, reported as a list and never as a verdict:
+`DISTRIBUTION`, `PAYLOAD` (the mount, its manifest, and every declared file's
+digest -- before anything is copied), `BUILD_DEPENDENCIES` (`dkms`,
+`build-essential` and the running kernel's headers, from the guest's own apt),
+`MODULE_SOURCE` (copied to `/usr/src/vmlord-display-<version>`, because 9p is
+read-only and DKMS writes beside its sources), `MODULE_BUILD`, `MODULE_LOAD`
+(`modules-load.d`, the modprobe options, the unit that unbinds
+`simple-framebuffer`, and `modprobe`), `DEVICE` (a `/dev/dri/card*` whose
+driver is ours), and `SERVICES`/`SERVICES_START`, which are skipped with their
+reason until task #115 fills `content/services`.
+
+Idempotence is by fact and not by a flag: the payload's version installed, the
+module loaded and a device that answers short-circuits the three build stages,
+so every start after the first costs a few checks and needs no network. A
+kernel upgrade is handled in the same place -- DKMS's `AUTOINSTALL=yes` carries
+the module across it with VMLord not involved, and when it did not, the recipe
+finds no loaded module and builds again. A build that fails on the new kernel
+is a degraded display naming exactly that, and a VM that runs.
+
+`vmlord_drm` itself is one CRTC, one connector, a primary plane, GEM shmem,
+atomic modesetting and PRIME export, and nothing scans out: the framebuffer a
+compositor commits is the product, and capture reads it as an ordinary DRM
+client. Three properties are decisions task #111 measured -- a platform device
+under its own name (mutter's udev rules tag `platform-vkms` on `ID_PATH`), no
+`DRIVER_CURSOR_HOTSPOT` (mutter hides the cursor plane of drivers that declare
+it), and linear XRGB8888/ARGB8888 only (a capture client that mmaps a buffer
+cannot detile anything else). The cursor plane, the mode list and a real vblank
+are task #114's.
+
+### Display: updating and rolling back
+
+Installation is automatic and idempotent; a version change never is. A newer
+version in the release becomes an offer in the status, and moving to it is an
+action a person takes on a running VM.
+
+The host refuses everything it can before the guest is asked: a VM that is not
+running, a release with nothing newer, a payload that will not stage. Then the
+new version is published into the directory the VM already exports, and the
+request goes to the thread that owns that VM's agent session -- written onto
+the socket between frames, because a session is one conversation and a second
+writer would interleave halfway through one.
+
+The guest builds, reloads and then *verifies*: the module loaded, its version
+the one that was asked for, and a device that exists. A verification that fails
+rolls back one version, which costs a `modprobe` and a `dkms remove` because
+the previous `/usr/src` tree was never deleted and DKMS still holds its build.
+One step and no further: keeping two would be a version history, and there is
+nothing in an MVP to build one from.
+
+A successful rollback is **not** a degraded display. The desktop works, on the
+version that was working before, and `display-payload-update-rolled-back` says
+exactly that. `display-payload-update-failed` is the other case: neither
+version is running.
+
 
 ---
 

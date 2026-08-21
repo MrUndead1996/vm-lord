@@ -9,8 +9,8 @@
 use std::time::SystemTime;
 
 use vmlord_core::{
-    DesktopProfile, DisplayProvisioning, DisplayStage, DisplayState, DisplayStatusCode,
-    GuestDisplayReport, VmDisplayFacts, VmDisplayStatus, VmState,
+    DesktopProfile, DisplayFailure, DisplayProvisioning, DisplayStage, DisplayState,
+    DisplayStatusCode, GuestDisplayReport, VmDisplayFacts, VmDisplayStatus, VmState,
 };
 
 /// Reads what the display stack is doing for a VM from what it asked for, how
@@ -38,6 +38,16 @@ pub fn derive_status(
         stage,
         code,
         message,
+        running_version: facts
+            .payload
+            .loaded
+            .clone()
+            .or(facts.payload.installed.clone()),
+        available_version: facts
+            .payload
+            .update_available()
+            .then(|| facts.payload.available.clone())
+            .flatten(),
         guest: guest_detail(facts),
         can_retry,
         observed_at,
@@ -92,6 +102,29 @@ pub fn derive_status(
         );
     }
 
+    // The payload, between the desktop and the guest's services. A module that
+    // will not build and a desktop that never installed are both a degraded
+    // display and are not the same problem, so the one a person can act on is
+    // the one already returned above -- and this is the next one down.
+    if let Some(failure) = payload_failure(facts) {
+        // An update that rolled back is the one payload failure that is not a
+        // degradation: the display works, on the version that was working
+        // before, and saying otherwise would paint a working desktop as a
+        // broken one.
+        let rolled_back = failure.code == DisplayStatusCode::PayloadUpdateRolledBack;
+        return status(
+            if rolled_back {
+                DisplayState::Ready
+            } else {
+                DisplayState::Degraded
+            },
+            failure.stage,
+            failure.code,
+            failure.message.clone(),
+            failure.code.is_retryable(),
+        );
+    }
+
     match facts.guest.as_ref() {
         None | Some(GuestDisplayReport::ServicesPending) => status(
             DisplayState::WaitingForGuest,
@@ -120,6 +153,15 @@ pub fn derive_status(
     }
 }
 
+/// What the payload half last failed at, if anything.
+///
+/// A rolled-back update is reported even though the display works, because a
+/// person who asked for an update is owed the answer; every other cause here is
+/// a display that is not working.
+fn payload_failure(facts: &VmDisplayFacts) -> Option<&DisplayFailure> {
+    facts.failure.as_ref()
+}
+
 fn guest_detail(facts: &VmDisplayFacts) -> Option<vmlord_core::GuestDisplayDetail> {
     match facts.guest.as_ref()? {
         GuestDisplayReport::Ready(detail) => Some(detail.clone()),
@@ -132,7 +174,8 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use vmlord_core::{
-        AgentStatus, DisplayFailure, GuestDisplayDetail, GuestDisplayReport, VmDisplayFacts,
+        AgentStatus, DisplayFailure, DisplayPayloadFacts, GuestDisplayDetail, GuestDisplayReport,
+        VmDisplayFacts,
     };
 
     use super::{
@@ -157,6 +200,7 @@ mod tests {
                 output: Some("Virtual-1".into()),
             })),
             observed_at: Some(now() - Duration::from_secs(5)),
+            ..VmDisplayFacts::default()
         }
     }
 
@@ -247,6 +291,7 @@ mod tests {
             VmDisplayFacts {
                 guest: Some(GuestDisplayReport::ServicesPending),
                 observed_at: Some(now()),
+                ..VmDisplayFacts::default()
             },
         ] {
             let status = derive_status(
@@ -284,6 +329,130 @@ mod tests {
     }
 
     #[test]
+    fn a_payload_that_would_not_build_is_degraded_and_says_so() {
+        let facts = VmDisplayFacts {
+            payload: DisplayPayloadFacts {
+                available: Some("0.1.0".into()),
+                ..DisplayPayloadFacts::default()
+            },
+            failure: Some(DisplayFailure::new(
+                DisplayStage::Payload,
+                DisplayStatusCode::PayloadBuildFailed,
+                "dkms build failed for kernel 6.8.0-137-generic",
+            )),
+            observed_at: Some(now()),
+            ..VmDisplayFacts::default()
+        };
+
+        let status = derive_status(
+            DesktopProfile::Gnome,
+            &DisplayProvisioning::Ready,
+            running(),
+            &facts,
+            now(),
+        );
+
+        assert_eq!(status.state, DisplayState::Degraded);
+        assert_eq!(status.stage, DisplayStage::Payload);
+        assert_eq!(status.code, DisplayStatusCode::PayloadBuildFailed);
+        assert!(status.can_retry);
+    }
+
+    #[test]
+    fn a_newer_payload_in_the_release_is_offered_beside_a_working_display() {
+        let facts = VmDisplayFacts {
+            payload: DisplayPayloadFacts {
+                installed: Some("0.1.0".into()),
+                loaded: Some("0.1.0".into()),
+                available: Some("0.2.0".into()),
+                previous: None,
+            },
+            guest: Some(GuestDisplayReport::Ready(GuestDisplayDetail::default())),
+            observed_at: Some(now()),
+            ..VmDisplayFacts::default()
+        };
+
+        let status = derive_status(
+            DesktopProfile::Gnome,
+            &DisplayProvisioning::Ready,
+            running(),
+            &facts,
+            now(),
+        );
+
+        assert_eq!(
+            status.state,
+            DisplayState::Ready,
+            "an offer is not a degradation"
+        );
+        assert_eq!(status.running_version.as_deref(), Some("0.1.0"));
+        assert_eq!(status.available_version.as_deref(), Some("0.2.0"));
+    }
+
+    #[test]
+    fn a_desktop_that_never_installed_reads_as_the_desktop_and_not_the_payload() {
+        let facts = VmDisplayFacts {
+            failure: Some(DisplayFailure::new(
+                DisplayStage::Payload,
+                DisplayStatusCode::PayloadMissing,
+                "this build carries no display payload for ubuntu 24.04 amd64",
+            )),
+            observed_at: Some(now()),
+            ..VmDisplayFacts::default()
+        };
+
+        let status = derive_status(
+            DesktopProfile::Gnome,
+            &DisplayProvisioning::Degraded(DisplayFailure::new(
+                DisplayStage::Provisioning,
+                DisplayStatusCode::PackageDownloadFailed,
+                "could not reach archive.ubuntu.com",
+            )),
+            running(),
+            &facts,
+            now(),
+        );
+
+        assert_eq!(status.code, DisplayStatusCode::PackageDownloadFailed);
+    }
+
+    #[test]
+    fn a_rolled_back_update_is_a_working_display_that_says_what_happened() {
+        let facts = VmDisplayFacts {
+            payload: DisplayPayloadFacts {
+                installed: Some("0.1.0".into()),
+                loaded: Some("0.1.0".into()),
+                available: Some("0.2.0".into()),
+                previous: None,
+            },
+            guest: Some(GuestDisplayReport::Ready(GuestDisplayDetail::default())),
+            failure: Some(DisplayFailure::new(
+                DisplayStage::Payload,
+                DisplayStatusCode::PayloadUpdateRolledBack,
+                "0.2.0 did not verify; 0.1.0 is running",
+            )),
+            observed_at: Some(now()),
+        };
+
+        let status = derive_status(
+            DesktopProfile::Gnome,
+            &DisplayProvisioning::Ready,
+            running(),
+            &facts,
+            now(),
+        );
+
+        assert_eq!(
+            status.state,
+            DisplayState::Ready,
+            "the display works; the update did not"
+        );
+        assert_eq!(status.code, DisplayStatusCode::PayloadUpdateRolledBack);
+        assert!(status.message.contains("0.1.0"));
+        assert_eq!(status.running_version.as_deref(), Some("0.1.0"));
+    }
+
+    #[test]
     fn a_guest_whose_display_services_are_down_is_degraded_and_retryable() {
         let facts = VmDisplayFacts {
             guest: Some(GuestDisplayReport::Failed(DisplayFailure::new(
@@ -292,6 +461,7 @@ mod tests {
                 "vmlord-display.service is not running",
             ))),
             observed_at: Some(now()),
+            ..VmDisplayFacts::default()
         };
         let status = derive_status(
             DesktopProfile::Gnome,

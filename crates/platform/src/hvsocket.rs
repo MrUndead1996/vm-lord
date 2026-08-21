@@ -27,8 +27,8 @@ use std::{
     io::{self, Read, Write},
     mem,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -36,12 +36,12 @@ use std::{
 use uuid::Uuid;
 use vmlord_core::RepositoryError;
 use windows::{
-    core::GUID,
     Win32::Networking::WinSock::{
-        accept, bind, closesocket, listen, recv, select, send, setsockopt, socket, WSAGetLastError,
-        WSAStartup, AF_HYPERV, FD_SET, SEND_RECV_FLAGS, SOCKADDR, SOCKET, SOCKET_ERROR,
-        SOCK_STREAM, SOL_SOCKET, SOMAXCONN, SO_SNDTIMEO, TIMEVAL, WSADATA,
+        AF_HYPERV, FD_SET, SEND_RECV_FLAGS, SO_SNDTIMEO, SOCK_STREAM, SOCKADDR, SOCKET,
+        SOCKET_ERROR, SOL_SOCKET, SOMAXCONN, TIMEVAL, WSADATA, WSAGetLastError, WSAStartup, accept,
+        bind, closesocket, listen, recv, select, send, setsockopt, socket,
     },
+    core::GUID,
 };
 
 /// The vsock port the agent connects to.
@@ -421,7 +421,7 @@ fn timeval(duration: Duration) -> TIMEVAL {
 mod tests {
     use std::io;
 
-    use super::{agent_service_id, idle_read, vsock_service_id, AGENT_VSOCK_PORT};
+    use super::{AGENT_VSOCK_PORT, agent_service_id, idle_read, vsock_service_id};
 
     #[test]
     fn a_vsock_port_becomes_the_first_field_of_its_service_guid() {

@@ -146,6 +146,19 @@ impl GuestTargetKey {
             architecture: &self.architecture,
         }
     }
+
+    /// The same three facts, as the display catalog's own selector.
+    ///
+    /// Two methods and not one generic one: the two catalogs own their selector
+    /// types, and a shared one would be the first thing tying their lifecycles
+    /// together.
+    pub(crate) fn display_selector(&self) -> vmlord_display_payload::GuestSelector<'_> {
+        vmlord_display_payload::GuestSelector {
+            distribution: &self.distribution,
+            release: &self.release,
+            architecture: &self.architecture,
+        }
+    }
 }
 
 /// Every VM VMLord builds is amd64. The field exists because the catalog has
@@ -813,7 +826,10 @@ mod tests {
         })
         .expect("a cloud image knows what it boots");
 
-        assert_eq!(key.distribution, "ubuntu", "the catalog spells it lowercase");
+        assert_eq!(
+            key.distribution, "ubuntu",
+            "the catalog spells it lowercase"
+        );
         assert_eq!(key.release, "26.04");
         assert_eq!(key.architecture, "amd64");
     }
@@ -828,5 +844,4 @@ mod tests {
             "VMLord does not know what system is inside installation media"
         );
     }
-
 }

@@ -63,7 +63,13 @@ pub(crate) fn prepare(
         return None;
     }
 
-    let staged = stage(mapping, vm_directory, executable_directory, cache_root, cancel);
+    let staged = stage(
+        mapping,
+        vm_directory,
+        executable_directory,
+        cache_root,
+        cancel,
+    );
     let adapters = partition_adapters().unwrap_or_else(|error| {
         log::warn!(
             "the GPU adapters of this host could not be enumerated for VM \"{}\": {error}",
@@ -113,11 +119,9 @@ pub(crate) fn prepare(
             detail.adapters,
             reason.message
         ),
-        GpuAssignment::Failed(reason) => log::warn!(
-            "VM \"{}\" gets no GPU: {}",
-            mapping.vm_name,
-            reason.message
-        ),
+        GpuAssignment::Failed(reason) => {
+            log::warn!("VM \"{}\" gets no GPU: {}", mapping.vm_name, reason.message)
+        }
         GpuAssignment::Unknown => {}
     }
 
@@ -289,10 +293,8 @@ mod tests {
 
     impl TemporaryDirectory {
         fn new(label: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "vmlord-gpu-prepare-{label}-{}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("vmlord-gpu-prepare-{label}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&path);
             std::fs::create_dir_all(&path).expect("a temporary directory");
             Self(path)

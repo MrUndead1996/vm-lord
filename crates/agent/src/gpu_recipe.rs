@@ -742,7 +742,10 @@ mod tests {
             "{document}"
         );
         assert!(document.contains("export LD_LIBRARY_PATH"), "{document}");
-        assert!(document.contains("export GALLIUM_DRIVER=d3d12"), "{document}");
+        assert!(
+            document.contains("export GALLIUM_DRIVER=d3d12"),
+            "{document}"
+        );
         // Nothing was registered, so nothing is pinned.
         assert!(!document.contains("VK_DRIVER_FILES"), "{document}");
     }

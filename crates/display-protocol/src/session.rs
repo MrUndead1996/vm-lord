@@ -147,12 +147,7 @@ impl Session {
     /// Opens a session as the host, returning the `ClientHello` to send.
     #[must_use]
     pub fn host(secret: &Secret, offer: Offer) -> (Self, Record) {
-        Self::host_with_randomness(
-            secret,
-            offer,
-            keys::random_bytes(),
-            keys::random_bytes(),
-        )
+        Self::host_with_randomness(secret, offer, keys::random_bytes(), keys::random_bytes())
     }
 
     /// Waits for a session as the guest.
@@ -216,7 +211,11 @@ impl Session {
     /// only, for the reason [`Session::host_with_randomness`] gives.
     #[doc(hidden)]
     #[must_use]
-    pub fn guest_with_randomness(secret: &Secret, support: Support, nonce: [u8; NONCE_LEN]) -> Self {
+    pub fn guest_with_randomness(
+        secret: &Secret,
+        support: Support,
+        nonce: [u8; NONCE_LEN],
+    ) -> Self {
         Self {
             role: Role::Guest,
             state: State::AwaitingClientHello,
@@ -320,7 +319,8 @@ impl Session {
             hello.version.unwrap_or_default(),
         )
         .map_err(SessionError::Version)?;
-        let capabilities = handshake::agreed_capabilities(&support.capabilities, &hello.capabilities);
+        let capabilities =
+            handshake::agreed_capabilities(&support.capabilities, &hello.capabilities);
 
         let wanted = Mode::try_from(hello.mode).unwrap_or_default();
         let mode = resolve_mode(wanted, &support.modes)?;
@@ -344,10 +344,15 @@ impl Session {
 
         self.derive_session_key();
         let hash = self.transcript_hash.expect("the key derivation set it");
-        let key = self.session_key.as_ref().expect("the key derivation set it");
+        let key = self
+            .session_key
+            .as_ref()
+            .expect("the key derivation set it");
 
         let proof = ServerAuth {
-            tag: keys::control_tag(key, Role::Guest, &hash).as_bytes().to_vec(),
+            tag: keys::control_tag(key, Role::Guest, &hash)
+                .as_bytes()
+                .to_vec(),
         };
 
         self.pending = Some(Negotiated {
@@ -375,9 +380,11 @@ impl Session {
         let answer = ServerHello::decode(payload).map_err(SessionError::Decode)?;
         let offer = self.offer.clone().expect("a host holds its offer");
 
-        let version =
-            handshake::confirm_version(ProtocolVersion::current(), answer.version.unwrap_or_default())
-                .map_err(SessionError::Version)?;
+        let version = handshake::confirm_version(
+            ProtocolVersion::current(),
+            answer.version.unwrap_or_default(),
+        )
+        .map_err(SessionError::Version)?;
         let capabilities =
             handshake::confirm_capabilities(&offer.capabilities, &answer.capabilities)
                 .map_err(SessionError::Capability)?;
@@ -422,7 +429,9 @@ impl Session {
         }
 
         let answer = ClientAuth {
-            tag: keys::control_tag(key, Role::Host, &hash).as_bytes().to_vec(),
+            tag: keys::control_tag(key, Role::Host, &hash)
+                .as_bytes()
+                .to_vec(),
         };
         let record = self.control_record(ControlRecord::ClientAuth, answer.encode_to_vec());
 
@@ -503,7 +512,9 @@ impl Session {
     /// that socket.
     #[must_use]
     pub fn channel_key(&self, channel: Channel) -> Option<&ChannelKey> {
-        self.channels[self.channel_index(channel).ok()?].key.as_ref()
+        self.channels[self.channel_index(channel).ok()?]
+            .key
+            .as_ref()
     }
 
     /// Checks a record against the generation its channel is on.
@@ -552,7 +563,11 @@ impl Session {
             nonce: nonce.to_vec(),
         };
 
-        Ok(self.channel_record(channel, FrameRecord::ChannelHello as u16, hello.encode_to_vec()))
+        Ok(self.channel_record(
+            channel,
+            FrameRecord::ChannelHello as u16,
+            hello.encode_to_vec(),
+        ))
     }
 
     /// The guest's half: recognise the session, and answer with a proof.
@@ -600,7 +615,11 @@ impl Session {
     }
 
     /// The host's half: check the guest's proof, then send its own.
-    fn on_channel_ack(&mut self, channel: Channel, payload: &[u8]) -> Result<Outcome, SessionError> {
+    fn on_channel_ack(
+        &mut self,
+        channel: Channel,
+        payload: &[u8],
+    ) -> Result<Outcome, SessionError> {
         let index = self.channel_index(channel)?;
         let ack = ChannelAck::decode(payload).map_err(SessionError::Decode)?;
 
@@ -871,7 +890,9 @@ impl fmt::Display for SessionError {
                 formatter,
                 "record type {message_type} arrived on the {channel} channel with nothing to answer it"
             ),
-            Self::BadTag => formatter.write_str("a display peer could not prove it holds the VM secret"),
+            Self::BadTag => {
+                formatter.write_str("a display peer could not prove it holds the VM secret")
+            }
             Self::UnsupportedMode(mode) => {
                 write!(formatter, "the guest does not have display mode {mode:?}")
             }

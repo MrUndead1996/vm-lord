@@ -57,6 +57,8 @@ pub enum VmAction {
     Ssh,
     /// Reopen the serial console of a running VM.
     Console,
+    /// Move a running VM's display payload to a newer version.
+    UpdateDisplay,
     Edit,
     Delete,
 }
@@ -74,6 +76,7 @@ impl VmAction {
             // the session is decided when it is launched.
             Self::Ssh => "Open SSH",
             Self::Console => "Open COM port",
+            Self::UpdateDisplay => "Update display",
             Self::Edit => "Edit",
             Self::Delete => "Delete",
         }
@@ -542,6 +545,44 @@ impl WorkspaceApp {
         }
     }
 
+    /// Moves a running VM's display payload to the newest version this build
+    /// carries for it.
+    ///
+    /// Blocking, unlike the connections beside it: what a person wants from an
+    /// update is whether it worked, and the guest builds a kernel module to
+    /// find out. Both outcomes go into the diagnostics, because an update that
+    /// rolled back is a working display and still an answer somebody asked for.
+    ///
+    /// # Errors
+    ///
+    /// [`RepositoryError`] when there was nothing to update to, nobody to ask,
+    /// or the guest could not carry it out.
+    pub fn update_display_payload(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.require_ready_backend("display payload update")?;
+        self.log_vm_action(VmAction::UpdateDisplay);
+
+        match self.repository.update_display_payload(name) {
+            Ok(()) => {
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Info,
+                    message: format!("Display payload of VM \"{name}\" updated"),
+                });
+                self.refresh();
+                Ok(())
+            }
+            Err(error) => {
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Error,
+                    message: format!(
+                        "Failed to update the display payload of VM \"{name}\": {error}"
+                    ),
+                });
+                self.collect_diagnostics();
+                Err(error)
+            }
+        }
+    }
+
     /// Asks for an interactive SSH session into a running guest.
     ///
     /// Both outcomes are collected from the backend, which is what makes this
@@ -880,6 +921,18 @@ mod tests {
             Ok(())
         }
 
+        /// Updates the way the native backend does: only a running VM can be
+        /// asked, because what verifies an update is its own guest.
+        fn update_display_payload(&mut self, name: &str) -> Result<(), RepositoryError> {
+            self.actions.push(format!("update-display:{name}"));
+            if !self.vm_is_running {
+                return Err(RepositoryError::new(format!(
+                    "VM \"{name}\" is not running, so its display payload cannot be updated"
+                )));
+            }
+            Ok(())
+        }
+
         /// Opens a session the way the native backend does: the command it was
         /// opened with is left in the diagnostics, and a refusal names the
         /// preflight check that stopped it.
@@ -1111,6 +1164,43 @@ mod tests {
             app.diagnostics().iter().any(|diagnostic| {
                 diagnostic.message == "VM \"dev\" force stop request accepted"
             })
+        );
+    }
+
+    #[test]
+    fn updates_a_display_payload_through_the_repository() {
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            vm_is_running: true,
+            ..FakeRepository::default()
+        }));
+        app.start();
+
+        app.update_display_payload("dev")
+            .expect("a running VM can be asked");
+
+        assert!(
+            app.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("Display payload of VM \"dev\"")),
+            "an update that worked is worth one line"
+        );
+    }
+
+    #[test]
+    fn a_display_payload_update_of_a_stopped_vm_is_refused_and_says_why() {
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()));
+        app.start();
+
+        let error = app
+            .update_display_payload("dev")
+            .expect_err("there is nobody to ask");
+
+        assert!(error.to_string().contains("not running"));
+        assert!(
+            app.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.level == DiagnosticLevel::Error
+                    && diagnostic.message.contains("Failed to update")),
         );
     }
 
