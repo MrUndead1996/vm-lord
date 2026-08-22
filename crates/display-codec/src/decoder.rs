@@ -7,6 +7,7 @@
 
 use crate::{
     container::{self, Method},
+    cursor::{self, CursorPosition, OwnedCursorImage},
     error::CodecError,
     geometry::{Geometry, Rect},
     varint, zrle,
@@ -116,6 +117,28 @@ impl Decoder {
         }
 
         Ok(&self.damage)
+    }
+
+    /// Reads a cursor bitmap.
+    ///
+    /// An associated function rather than a method: the cursor stream keeps no
+    /// state on either side, which is what lets a viewer draw a cursor before
+    /// the first keyframe arrives.
+    ///
+    /// # Errors
+    ///
+    /// Any [`CodecError`] a cursor image can carry.
+    pub fn decode_cursor_image(payload: &[u8]) -> Result<OwnedCursorImage, CodecError> {
+        cursor::read_image(payload)
+    }
+
+    /// Reads a cursor position.
+    ///
+    /// # Errors
+    ///
+    /// Any [`CodecError`] a cursor position can carry.
+    pub fn decode_cursor_position(payload: &[u8]) -> Result<CursorPosition, CodecError> {
+        cursor::read_position(payload)
     }
 
     /// Reads one tile record into the frame, and says how long it was.

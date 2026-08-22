@@ -2,6 +2,7 @@
 
 use crate::{
     container::{self, Method},
+    cursor::{self, CursorImage, CursorPosition},
     error::CodecError,
     geometry::{Geometry, Rect},
     varint, zrle,
@@ -73,6 +74,13 @@ pub struct Encoder {
     reference: Vec<u32>,
     has_reference: bool,
     output: Vec<u8>,
+    /// The cursor's two records live in buffers of their own: they must be
+    /// able to overtake a frame that is still being written, and each is
+    /// latest-wins on its own.
+    cursor_image: Vec<u8>,
+    cursor_image_pending: bool,
+    cursor_position: Vec<u8>,
+    cursor_position_pending: bool,
     tile: Vec<u32>,
     previous_tile: Vec<u32>,
     selected: Vec<bool>,
@@ -102,6 +110,10 @@ impl Encoder {
             reference: vec![0; pixels],
             has_reference: false,
             output: Vec::new(),
+            cursor_image: Vec::new(),
+            cursor_image_pending: false,
+            cursor_position: Vec::new(),
+            cursor_position_pending: false,
             tile: Vec::new(),
             previous_tile: Vec::new(),
             selected: vec![false; config.geometry.tile_count() as usize],
@@ -160,30 +172,61 @@ impl Encoder {
         Ok(())
     }
 
+    /// Replaces the cursor bitmap the next payload will carry.
+    ///
+    /// # Errors
+    ///
+    /// [`CodecError::CursorTooLarge`] for a bitmap above the cursor limit or a
+    /// hotspot outside it, and [`CodecError::FrameSize`] when the pixels do
+    /// not match the dimensions.
+    pub fn submit_cursor_image(&mut self, image: CursorImage<'_>) -> Result<(), CodecError> {
+        cursor::write_image(&mut self.cursor_image, image)?;
+        self.cursor_image_pending = true;
+        Ok(())
+    }
+
+    /// Replaces the cursor position the next payload will carry.
+    pub fn submit_cursor_position(&mut self, position: CursorPosition) {
+        cursor::write_position(&mut self.cursor_position, position);
+        self.cursor_position_pending = true;
+    }
+
     /// The next payload to write, or `None` when there is nothing to send.
     ///
     /// Encoding happens here rather than in [`Encoder::submit`], which is what
     /// keeps the reference frame equal to the last payload handed out.
+    ///
+    /// The order is fixed: the frame first, then the cursor bitmap, then the
+    /// cursor position. A viewer that lost synchronisation must not wait for a
+    /// mouse move to be written first.
     pub fn next_payload(&mut self) -> Option<Payload<'_>> {
-        if !self.staged_pending {
-            return None;
+        if self.staged_pending {
+            self.staged_pending = false;
+            let hint = self.hint.replace(Vec::new());
+
+            if !self.has_reference {
+                self.encode_keyframe();
+                self.reference.copy_from_slice(&self.staged);
+                self.has_reference = true;
+                return Some(Payload::Keyframe(&self.output));
+            }
+
+            if self.encode_delta(hint.as_deref()) {
+                return Some(Payload::TileDelta(&self.output));
+            }
         }
 
-        self.staged_pending = false;
-        let hint = self.hint.replace(Vec::new());
-
-        if !self.has_reference {
-            self.encode_keyframe();
-            self.reference.copy_from_slice(&self.staged);
-            self.has_reference = true;
-            return Some(Payload::Keyframe(&self.output));
+        if self.cursor_image_pending {
+            self.cursor_image_pending = false;
+            return Some(Payload::CursorImage(&self.cursor_image));
         }
 
-        if self.encode_delta(hint.as_deref()) {
-            Some(Payload::TileDelta(&self.output))
-        } else {
-            None
+        if self.cursor_position_pending {
+            self.cursor_position_pending = false;
+            return Some(Payload::CursorPosition(&self.cursor_position));
         }
+
+        None
     }
 
     /// Writes every tile of the staged frame into `output`.

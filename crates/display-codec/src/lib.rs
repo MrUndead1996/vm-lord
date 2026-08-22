@@ -11,6 +11,7 @@
 //! something a payload may change.
 
 mod container;
+pub mod cursor;
 pub mod decoder;
 pub mod encoder;
 pub mod error;
@@ -19,6 +20,7 @@ pub mod scenes;
 mod varint;
 mod zrle;
 
+pub use cursor::{CursorImage, CursorPosition, MAX_CURSOR_DIMENSION, OwnedCursorImage};
 pub use decoder::Decoder;
 pub use encoder::{Encoder, EncoderConfig, Frame, Payload};
 pub use error::CodecError;
