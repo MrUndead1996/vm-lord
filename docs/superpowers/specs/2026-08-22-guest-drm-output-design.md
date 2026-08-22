@@ -80,8 +80,12 @@ primary and passed to `drm_crtc_init_with_planes` as the CRTC's cursor.
   `atomic_enable`. Deliberately not `framedur_ns` off the vblank structure:
   how that structure is reached moved between the kernels this module supports,
   and dividing by a refresh rate did not move anywhere.
-* `atomic_enable` calls `drm_crtc_vblank_on` and starts the timer;
-  `atomic_disable` calls `drm_crtc_vblank_off` and cancels it.
+* `atomic_enable` computes the period and calls `drm_crtc_vblank_on`;
+  `atomic_disable` calls `drm_crtc_vblank_off`. The timer itself is armed in
+  `.enable_vblank` and cancelled in `.disable_vblank`, which is where DRM
+  reaches it: `drm_crtc_vblank_on` runs the enable callback when a client is
+  already waiting, so arming the timer in `atomic_enable` as well would arm it
+  twice.
 * The timer function calls `drm_crtc_handle_vblank`, `hrtimer_forward_now` and
   returns `HRTIMER_RESTART`.
 * `atomic_flush` stops sending the event itself. It takes
@@ -167,12 +171,21 @@ written before this field existed reads as `None`, which is the fallback.
 
 ### The recipe
 
-`display_recipe` gains two pure functions, testable without a guest:
+The agent checks the mode it was sent against the same bounds, and falls back
+when it is outside them. The constants are written out a second time rather
+than shared: `vmlord-agent` depends on `libc`, `serde_json`, `sha2` and the
+protocol crate and on nothing else, because it cross-compiles to static musl,
+and a dependency on `vmlord-core` for two numbers would be the wrong trade. The
+duplication is commented at both ends.
+
+`display_recipe` gains three pure functions, testable without a guest:
 
 * one that renders the contents of `/etc/modprobe.d/vmlord-display.conf` from a
   mode;
-* one that reads `/sys/module/vmlord_drm/parameters/width` and `height` and says
-  whether what is loaded matches what is wanted.
+* one that reads `/sys/module/vmlord_drm/parameters/width` and `height`;
+* one that says whether what is loaded has to be reloaded to reach what is
+  wanted. A module that does not say what it was loaded with is never
+  reloaded: a reload on a guess is a desktop dropped for nothing.
 
 `display_kernel::load_stage` writes that file itself instead of copying
 `vmlord-display.conf` out of the payload. When the module is already loaded and
@@ -212,8 +225,17 @@ test rather than a new code.
   desktop dropped for nothing.
 * The session carries the mode when there is one and carries nothing when there
   is not; the agent's fallback is 1920x1080 in both the absent cases.
-* `load_stage` reloads on a mismatch, does not reload on a match, and reports
-  `Failed` when the reload fails.
+* Whether a reload is owed: a mismatch owes one, a match does not, and a module
+  that does not say what it was loaded with never does.
+
+`load_stage` itself gets no test, and that is the existing boundary rather than
+a new exemption: it runs `modprobe` and `systemctl` through `command::run`
+directly, and `display_kernel`'s tests today cover only the parts that are
+functions of text and files. What is testable is the decision, and the decision
+is the part that can be wrong. The stage's own reporting -- a failed reload as
+`MODULE_LOAD` in `Failed`, a degraded display, and a VM that keeps running --
+is straight-line code through the same `report.failed` path #113 already uses
+everywhere else, and it is proven for real in #128's matrix.
 
 **C.** There is no unit test for a kernel module. The test is that it compiles,
 per release, and the proof is per release:
