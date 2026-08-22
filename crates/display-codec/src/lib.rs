@@ -11,10 +11,14 @@
 //! something a payload may change.
 
 mod container;
+pub mod decoder;
+pub mod encoder;
 pub mod error;
 pub mod geometry;
 mod varint;
 mod zrle;
 
+pub use decoder::Decoder;
+pub use encoder::{Encoder, EncoderConfig, Frame, Payload};
 pub use error::CodecError;
 pub use geometry::{Geometry, MAX_DIMENSION, PixelFormat, Rect, TileSize};
