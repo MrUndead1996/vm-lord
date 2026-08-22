@@ -28,7 +28,9 @@ those exist beyond the contract they share.
 * **The broker never touches the frame or input sockets.** It hands out
   `ChannelKey`s and the unprivileged process binds its own channels, which is
   what `Session::channel_key`'s own documentation describes -- "for the process
-  that owns that socket".
+  that owns that socket". The one thing #118 left half-built is the way to get
+  a key before a socket binds, and this task adds it as
+  `Session::derive_channel_key`.
 * **Pixels cross the privilege boundary as read-only dma-bufs**, passed by
   `SCM_RIGHTS` and cached by `fb_id`. Root exports descriptors; it never
   copies a frame. The alternative -- root copying into shared memory -- puts
@@ -190,8 +192,12 @@ and builds its `Support` from facts rather than wishes:
 * `tile_sizes`: the three the codec can produce.
 * `width`, `height`: what the CRTC is at.
 
-It then takes `channel_key(Frame)`, `channel_key(Input)`, the `Negotiated` and
-the `session_id`, and sends `SessionOpened`.
+It then takes the two channel keys, the `Negotiated` and the `session_id`, and
+sends `SessionOpened`. `Session::channel_key` answers only once a socket has
+bound, and the broker needs a key before any socket exists, so the protocol
+crate gains `Session::derive_channel_key` -- the same `keys::channel_key`
+arithmetic over the session key and transcript hash it already performs, given
+a way out. It is that crate's promise to keep, so its test lives there.
 
 The unprivileged process listens on both its ports for its whole life, not from
 the moment a session opens: the host may connect to the frame port before
