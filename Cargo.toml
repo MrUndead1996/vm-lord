@@ -3,6 +3,7 @@ members = [
     "crates/agent",
     "crates/agent-protocol",
     "crates/core",
+    "crates/display-codec",
     "crates/display-payload",
     "crates/display-protocol",
     "crates/image",
@@ -30,6 +31,7 @@ members = [
 default-members = [
     "crates/agent-protocol",
     "crates/core",
+    "crates/display-codec",
     "crates/display-payload",
     "crates/display-protocol",
     "crates/image",

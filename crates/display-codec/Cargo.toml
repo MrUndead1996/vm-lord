@@ -1,0 +1,13 @@
+[package]
+name = "vmlord-display-codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# No dependencies, deliberately: this crate is linked into a Windows viewer and
+# into a static musl guest binary built without a C toolchain, and its output
+# must be byte-identical on both.
+[dependencies]
+
+[lints]
+workspace = true
