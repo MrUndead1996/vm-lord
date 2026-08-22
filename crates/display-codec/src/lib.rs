@@ -10,6 +10,7 @@
 //! `StreamConfig`, which is why [`Geometry`] is constructor input rather than
 //! something a payload may change.
 
+mod container;
 pub mod error;
 pub mod geometry;
 mod varint;
