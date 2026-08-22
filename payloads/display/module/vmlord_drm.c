@@ -2,11 +2,12 @@
 /*
  * VMLord virtual display.
  *
- * One CRTC, one connector, one primary plane, GEM shmem buffers and PRIME
- * export: the smallest DRM device a Wayland compositor will bind and a capture
- * client can read out of. Nothing here scans out anywhere -- the framebuffer a
- * compositor commits is the product, and VMLord's capture service reads it as
- * an ordinary DRM client through drmModeGetFB2 and a PRIME fd.
+ * One CRTC, one connector, a primary plane and a cursor plane, GEM shmem
+ * buffers and PRIME export: the smallest DRM device a Wayland compositor will
+ * bind and a capture client can read out of. Nothing here scans out anywhere
+ * -- the framebuffer a compositor commits is the product, and VMLord's capture
+ * service reads it as an ordinary DRM client through drmModeGetFB2 and a
+ * PRIME fd.
  *
  * Three things about this driver are decisions rather than style, and task
  * #111 measured all three:
@@ -70,10 +71,22 @@ struct vmlord_device {
 	struct drm_encoder encoder;
 	struct drm_connector connector;
 	struct drm_plane primary;
+	struct drm_plane cursor;
 };
 
 static const uint32_t vmlord_formats[] = {
 	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_ARGB8888,
+};
+
+/*
+ * A cursor has an alpha channel by definition, so it gets the one format that
+ * has one. The linear-only rule of task #111 applies to every plane a capture
+ * client mmaps, and a cursor is one of them: with a cursor plane present,
+ * mutter puts the pointer here and leaves it out of the primary plane, and
+ * compositing the two is the capture backend's job.
+ */
+static const uint32_t vmlord_cursor_formats[] = {
 	DRM_FORMAT_ARGB8888,
 };
 
@@ -90,6 +103,7 @@ static int vmlord_plane_atomic_check(struct drm_plane *plane,
 	struct drm_plane_state *new_state =
 		drm_atomic_get_new_plane_state(state, plane);
 	struct drm_crtc_state *crtc_state;
+	bool cursor;
 
 	if (!new_state->crtc)
 		return 0;
@@ -98,10 +112,19 @@ static int vmlord_plane_atomic_check(struct drm_plane *plane,
 	if (!crtc_state)
 		return -EINVAL;
 
+	/*
+	 * A cursor is positioned by definition -- it moves across the desktop
+	 * without the CRTC being reconfigured -- and it is moved while the
+	 * CRTC is off as readily as while it is on. A primary plane that could
+	 * be positioned would be a primary plane offset from the framebuffer
+	 * capture reads, which is why the primary gets neither.
+	 */
+	cursor = plane->type == DRM_PLANE_TYPE_CURSOR;
+
 	return drm_atomic_helper_check_plane_state(new_state, crtc_state,
 						   DRM_PLANE_NO_SCALING,
 						   DRM_PLANE_NO_SCALING,
-						   false, false);
+						   cursor, cursor);
 }
 
 /*
@@ -264,6 +287,13 @@ static int vmlord_mode_config_init(struct vmlord_device *vmlord)
 	drm->mode_config.max_width = 4096;
 	drm->mode_config.max_height = 4096;
 	drm->mode_config.preferred_depth = 24;
+	/*
+	 * The size task #111 measured mutter asking this output for. A
+	 * compositor that is told nothing assumes 64x64 and draws a cursor
+	 * that is a quarter of the size it meant.
+	 */
+	drm->mode_config.cursor_width = 256;
+	drm->mode_config.cursor_height = 256;
 	drm->mode_config.funcs = &vmlord_mode_config_funcs;
 
 	return 0;
@@ -283,8 +313,19 @@ static int vmlord_pipe_init(struct vmlord_device *vmlord)
 		return error;
 	drm_plane_helper_add(&vmlord->primary, &vmlord_plane_helper_funcs);
 
+	error = drm_universal_plane_init(drm, &vmlord->cursor, 1,
+					 &vmlord_plane_funcs,
+					 vmlord_cursor_formats,
+					 ARRAY_SIZE(vmlord_cursor_formats),
+					 vmlord_modifiers,
+					 DRM_PLANE_TYPE_CURSOR, "cursor");
+	if (error)
+		return error;
+	drm_plane_helper_add(&vmlord->cursor, &vmlord_plane_helper_funcs);
+
 	error = drm_crtc_init_with_planes(drm, &vmlord->crtc, &vmlord->primary,
-					  NULL, &vmlord_crtc_funcs, NULL);
+					  &vmlord->cursor, &vmlord_crtc_funcs,
+					  NULL);
 	if (error)
 		return error;
 	drm_crtc_helper_add(&vmlord->crtc, &vmlord_crtc_helper_funcs);
