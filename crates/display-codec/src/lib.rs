@@ -15,6 +15,7 @@ pub mod decoder;
 pub mod encoder;
 pub mod error;
 pub mod geometry;
+pub mod scenes;
 mod varint;
 mod zrle;
 
