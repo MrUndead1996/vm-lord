@@ -64,11 +64,18 @@ pub struct Encoder {
     /// socket must be served current state, not a backlog.
     staged: Vec<u32>,
     staged_pending: bool,
+    /// Where the staged frame may differ from the one before it, accumulated
+    /// across every submission since the last payload: a frame displaced
+    /// before it was encoded still carried changes, and its hint is the only
+    /// record of where they were. `None` means "somewhere".
+    hint: Option<Vec<Rect>>,
     /// What the far side is believed to hold: the last payload handed out.
     reference: Vec<u32>,
     has_reference: bool,
     output: Vec<u8>,
     tile: Vec<u32>,
+    previous_tile: Vec<u32>,
+    selected: Vec<bool>,
     scratch: Scratch,
 }
 
@@ -91,10 +98,13 @@ impl Encoder {
             geometry: config.geometry,
             staged: vec![0; pixels],
             staged_pending: false,
+            hint: Some(Vec::new()),
             reference: vec![0; pixels],
             has_reference: false,
             output: Vec::new(),
             tile: Vec::new(),
+            previous_tile: Vec::new(),
+            selected: vec![false; config.geometry.tile_count() as usize],
             scratch: Scratch::default(),
         }
     }
@@ -116,7 +126,6 @@ impl Encoder {
     /// [`CodecError::FrameSize`] if the buffer cannot hold a frame of this
     /// geometry at this stride.
     pub fn submit(&mut self, frame: Frame<'_>, damage: Option<&[Rect]>) -> Result<(), CodecError> {
-        let _ = damage;
         let width = self.geometry.width() as usize;
         let height = self.geometry.height() as usize;
         let row = width * 4;
@@ -141,6 +150,12 @@ impl Encoder {
             }
         }
 
+        match (damage, self.hint.as_mut()) {
+            (Some(rects), Some(hint)) => hint.extend_from_slice(rects),
+            (Some(_), None) => {}
+            (None, _) => self.hint = None,
+        }
+
         self.staged_pending = true;
         Ok(())
     }
@@ -155,11 +170,20 @@ impl Encoder {
         }
 
         self.staged_pending = false;
-        self.encode_keyframe();
-        self.reference.copy_from_slice(&self.staged);
-        self.has_reference = true;
+        let hint = self.hint.replace(Vec::new());
 
-        Some(Payload::Keyframe(&self.output))
+        if !self.has_reference {
+            self.encode_keyframe();
+            self.reference.copy_from_slice(&self.staged);
+            self.has_reference = true;
+            return Some(Payload::Keyframe(&self.output));
+        }
+
+        if self.encode_delta(hint.as_deref()) {
+            Some(Payload::TileDelta(&self.output))
+        } else {
+            None
+        }
     }
 
     /// Writes every tile of the staged frame into `output`.
@@ -173,6 +197,96 @@ impl Encoder {
             write_tile(&mut self.output, &self.tile, None, &mut self.scratch);
             index += 1;
         }
+    }
+
+    /// Writes the tiles that changed, and says whether there were any.
+    ///
+    /// A hint says where a frame *may* differ; the comparison still decides.
+    /// Tiles no hint covers are not compared, and so are not advanced in the
+    /// reference either -- what the reference holds is what the far side was
+    /// sent, never what was captured.
+    fn encode_delta(&mut self, hint: Option<&[Rect]>) -> bool {
+        select_tiles(&mut self.selected, self.geometry, hint);
+
+        self.output.clear();
+        container::write_header(&mut self.output, false, &self.geometry);
+        let mut written = false;
+
+        let mut index = 0;
+        while let Some(rect) = self.geometry.tile(index) {
+            if !self.selected[index as usize] {
+                index += 1;
+                continue;
+            }
+
+            gather(&self.staged, self.geometry, rect, &mut self.tile);
+            gather(
+                &self.reference,
+                self.geometry,
+                rect,
+                &mut self.previous_tile,
+            );
+
+            if self.tile != self.previous_tile {
+                varint::write(&mut self.output, index);
+                write_tile(
+                    &mut self.output,
+                    &self.tile,
+                    Some(&self.previous_tile),
+                    &mut self.scratch,
+                );
+                scatter(&mut self.reference, self.geometry, rect, &self.tile);
+                written = true;
+            }
+
+            index += 1;
+        }
+
+        written
+    }
+}
+
+/// Marks the tiles a hint reaches, or every tile when there is none.
+///
+/// A rectangle is clipped to the frame first: a capture backend that reports
+/// damage in a stale resolution should select fewer tiles, not none and not a
+/// panic.
+fn select_tiles(selected: &mut [bool], geometry: Geometry, hint: Option<&[Rect]>) {
+    let Some(hint) = hint else {
+        selected.fill(true);
+        return;
+    };
+
+    selected.fill(false);
+    let tile = geometry.tile_size().as_pixels();
+
+    for rect in hint {
+        if rect.width == 0
+            || rect.height == 0
+            || rect.x >= geometry.width()
+            || rect.y >= geometry.height()
+        {
+            continue;
+        }
+
+        let right = rect.x.saturating_add(rect.width).min(geometry.width()) - 1;
+        let bottom = rect.y.saturating_add(rect.height).min(geometry.height()) - 1;
+
+        for row in rect.y / tile..=bottom / tile {
+            for column in rect.x / tile..=right / tile {
+                selected[(row * geometry.columns() + column) as usize] = true;
+            }
+        }
+    }
+}
+
+/// Writes a tile's pixels back into a frame, row by row.
+fn scatter(frame: &mut [u32], geometry: Geometry, rect: Rect, tile: &[u32]) {
+    let width = geometry.width() as usize;
+    for (row, y) in (rect.y..rect.y + rect.height).enumerate() {
+        let start = y as usize * width + rect.x as usize;
+        frame[start..start + rect.width as usize]
+            .copy_from_slice(&tile[row * rect.width as usize..(row + 1) * rect.width as usize]);
     }
 }
 
