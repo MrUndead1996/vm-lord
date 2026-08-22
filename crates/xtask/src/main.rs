@@ -10,6 +10,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, ExitCode},
 };
+mod display_bench;
 mod display_payload;
 mod dist_arguments;
 mod gpu_payload;
@@ -38,6 +39,7 @@ fn main() -> ExitCode {
         Some("dist") => dist_arguments::parse(env::args().skip(2)).and_then(dist),
         Some("gpu-payload") => gpu_payload::run(env::args().skip(2)),
         Some("display-payload") => display_payload::run(env::args().skip(2)),
+        Some("display-bench") => display_bench::run(env::args().skip(2)),
         Some(other) => Err(format!("unknown task `{other}`")),
         None => Err("missing task".to_owned()),
     };

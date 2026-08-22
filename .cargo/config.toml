@@ -33,3 +33,7 @@ test-windows = ["test", "--target", "x86_64-pc-windows-gnu"]
 dist = ["run", "-p", "xtask", "--", "dist"]
 gpu-payload = ["run", "-p", "xtask", "--", "gpu-payload", "pack"]
 display-payload = ["run", "-p", "xtask", "--", "display-payload", "pack"]
+
+# The desktop codec's benchmark. Release, and in xtask's own process: a debug
+# build measures the wrong thing, and a nested `cargo run` would only hide that.
+display-bench = ["run", "--release", "-p", "xtask", "--", "display-bench"]
