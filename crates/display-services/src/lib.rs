@@ -5,6 +5,7 @@
 //! [`ipc`], and it is typed operations only: no device descriptor and no ioctl
 //! passthrough leaves the broker.
 
+pub mod cursor;
 pub mod ipc;
 pub mod unix;
 
