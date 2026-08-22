@@ -15,6 +15,7 @@ bench = false
 workspace = true
 
 [dependencies]
+vmlord-display-codec = { path = "../display-codec" }
 vmlord-display-payload = { path = "../display-payload", features = ["builder"] }
 vmlord-gpu-payload = { path = "../gpu-payload", features = ["builder"] }
 vmlord-payload = { path = "../payload" }
