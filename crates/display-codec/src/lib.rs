@@ -12,6 +12,8 @@
 
 pub mod error;
 pub mod geometry;
+mod varint;
+mod zrle;
 
 pub use error::CodecError;
 pub use geometry::{Geometry, MAX_DIMENSION, PixelFormat, Rect, TileSize};
