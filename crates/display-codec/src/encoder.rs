@@ -5,6 +5,7 @@ use crate::{
     cursor::{self, CursorImage, CursorPosition},
     error::CodecError,
     geometry::{Geometry, Rect},
+    queue::Staging,
     varint, zrle,
 };
 
@@ -61,26 +62,16 @@ pub enum Payload<'a> {
 /// The encoding half of the codec.
 pub struct Encoder {
     geometry: Geometry,
-    /// The most recently submitted frame, which is the only one kept: a slow
-    /// socket must be served current state, not a backlog.
-    staged: Vec<u32>,
-    staged_pending: bool,
-    /// Where the staged frame may differ from the one before it, accumulated
-    /// across every submission since the last payload: a frame displaced
-    /// before it was encoded still carried changes, and its hint is the only
-    /// record of where they were. `None` means "somewhere".
-    hint: Option<Vec<Rect>>,
+    keyframe_interval: u32,
+    /// What has been captured and not yet encoded. Every slot is latest-wins.
+    staging: Staging,
     /// What the far side is believed to hold: the last payload handed out.
     reference: Vec<u32>,
     has_reference: bool,
+    /// Frames encoded since the last keyframe, which is what the protective
+    /// interval counts.
+    since_keyframe: u32,
     output: Vec<u8>,
-    /// The cursor's two records live in buffers of their own: they must be
-    /// able to overtake a frame that is still being written, and each is
-    /// latest-wins on its own.
-    cursor_image: Vec<u8>,
-    cursor_image_pending: bool,
-    cursor_position: Vec<u8>,
-    cursor_position_pending: bool,
     tile: Vec<u32>,
     previous_tile: Vec<u32>,
     selected: Vec<bool>,
@@ -104,16 +95,12 @@ impl Encoder {
 
         Self {
             geometry: config.geometry,
-            staged: vec![0; pixels],
-            staged_pending: false,
-            hint: Some(Vec::new()),
+            keyframe_interval: config.keyframe_interval,
+            staging: Staging::new(pixels),
             reference: vec![0; pixels],
             has_reference: false,
+            since_keyframe: 0,
             output: Vec::new(),
-            cursor_image: Vec::new(),
-            cursor_image_pending: false,
-            cursor_position: Vec::new(),
-            cursor_position_pending: false,
             tile: Vec::new(),
             previous_tile: Vec::new(),
             selected: vec![false; config.geometry.tile_count() as usize],
@@ -154,21 +141,16 @@ impl Encoder {
             });
         }
 
+        let staged = self.staging.frame_mut();
         for y in 0..height {
             let source = &frame.pixels[y * frame.stride..y * frame.stride + row];
-            let target = &mut self.staged[y * width..(y + 1) * width];
+            let target = &mut staged[y * width..(y + 1) * width];
             for (pixel, bytes) in target.iter_mut().zip(source.chunks_exact(4)) {
                 *pixel = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             }
         }
 
-        match (damage, self.hint.as_mut()) {
-            (Some(rects), Some(hint)) => hint.extend_from_slice(rects),
-            (Some(_), None) => {}
-            (None, _) => self.hint = None,
-        }
-
-        self.staged_pending = true;
+        self.staging.stage_frame(damage);
         Ok(())
     }
 
@@ -180,15 +162,24 @@ impl Encoder {
     /// hotspot outside it, and [`CodecError::FrameSize`] when the pixels do
     /// not match the dimensions.
     pub fn submit_cursor_image(&mut self, image: CursorImage<'_>) -> Result<(), CodecError> {
-        cursor::write_image(&mut self.cursor_image, image)?;
-        self.cursor_image_pending = true;
+        cursor::write_image(self.staging.cursor_image_mut(), image)?;
+        self.staging.stage_cursor_image();
         Ok(())
     }
 
     /// Replaces the cursor position the next payload will carry.
     pub fn submit_cursor_position(&mut self, position: CursorPosition) {
-        cursor::write_position(&mut self.cursor_position, position);
-        self.cursor_position_pending = true;
+        cursor::write_position(self.staging.cursor_position_mut(), position);
+        self.staging.stage_cursor_position();
+    }
+
+    /// Records that the viewer asked for a keyframe, which the next payload
+    /// will be.
+    ///
+    /// Recovery for a decoder that lost synchronisation -- the protocol's only
+    /// back edge -- not flow control.
+    pub fn request_keyframe(&mut self) {
+        self.staging.request_keyframe();
     }
 
     /// The next payload to write, or `None` when there is nothing to send.
@@ -200,33 +191,44 @@ impl Encoder {
     /// cursor position. A viewer that lost synchronisation must not wait for a
     /// mouse move to be written first.
     pub fn next_payload(&mut self) -> Option<Payload<'_>> {
-        if self.staged_pending {
-            self.staged_pending = false;
-            let hint = self.hint.replace(Vec::new());
-
-            if !self.has_reference {
+        if let Some(hint) = self.staging.take_frame() {
+            if self.keyframe_due() {
                 self.encode_keyframe();
-                self.reference.copy_from_slice(&self.staged);
-                self.has_reference = true;
                 return Some(Payload::Keyframe(&self.output));
             }
 
             if self.encode_delta(hint.as_deref()) {
+                self.since_keyframe += 1;
                 return Some(Payload::TileDelta(&self.output));
             }
+        } else if self.staging.keyframe_requested() && self.has_reference {
+            // Nothing new was captured, so the keyframe is of the frame the
+            // far side should already have: a viewer that lost
+            // synchronisation must not wait for the guest to repaint.
+            self.encode_keyframe();
+            return Some(Payload::Keyframe(&self.output));
         }
 
-        if self.cursor_image_pending {
-            self.cursor_image_pending = false;
-            return Some(Payload::CursorImage(&self.cursor_image));
+        if self.staging.take_cursor_image() {
+            return Some(Payload::CursorImage(self.staging.cursor_image()));
         }
 
-        if self.cursor_position_pending {
-            self.cursor_position_pending = false;
-            return Some(Payload::CursorPosition(&self.cursor_position));
+        if self.staging.take_cursor_position() {
+            return Some(Payload::CursorPosition(self.staging.cursor_position()));
         }
 
         None
+    }
+
+    /// Whether the frame about to be encoded must be a whole one.
+    ///
+    /// Three reasons, and no others: there is nothing to build on, the viewer
+    /// asked, or the protective interval came round.
+    fn keyframe_due(&self) -> bool {
+        !self.has_reference
+            || self.staging.keyframe_requested()
+            || (self.keyframe_interval > 0
+                && self.since_keyframe.is_multiple_of(self.keyframe_interval))
     }
 
     /// Writes every tile of the staged frame into `output`.
@@ -236,10 +238,15 @@ impl Encoder {
 
         let mut index = 0;
         while let Some(rect) = self.geometry.tile(index) {
-            gather(&self.staged, self.geometry, rect, &mut self.tile);
+            gather(self.staging.frame(), self.geometry, rect, &mut self.tile);
             write_tile(&mut self.output, &self.tile, None, &mut self.scratch);
             index += 1;
         }
+
+        self.reference.copy_from_slice(self.staging.frame());
+        self.has_reference = true;
+        self.since_keyframe = 1;
+        self.staging.keyframe_sent();
     }
 
     /// Writes the tiles that changed, and says whether there were any.
@@ -262,7 +269,7 @@ impl Encoder {
                 continue;
             }
 
-            gather(&self.staged, self.geometry, rect, &mut self.tile);
+            gather(self.staging.frame(), self.geometry, rect, &mut self.tile);
             gather(
                 &self.reference,
                 self.geometry,
