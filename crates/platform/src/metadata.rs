@@ -15,7 +15,8 @@ use std::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use vmlord_core::{
-    DesktopProfile, DisplayProvisioning, GpuMode, NetworkMode, RepositoryError, SshConfig, VmSource,
+    DesktopProfile, DisplayMode, DisplayProvisioning, GpuMode, NetworkMode, RepositoryError,
+    SshConfig, VmSource,
 };
 use vmlord_gpu_payload::GuestSelector;
 
@@ -112,6 +113,15 @@ pub struct VmComputeSystemMapping {
     /// mapping reads back with.
     #[serde(default)]
     pub display_provisioning: DisplayProvisioning,
+    /// The mode this VM's output comes up at, when one has been saved.
+    ///
+    /// `None` is every VM today: nothing writes this field until task #120
+    /// saves the size somebody resized a viewer to. The guest answers `None`
+    /// with 1920x1080, which is what every VM has come up at so far, so an
+    /// absent field and a mapping written before this field existed read the
+    /// same and neither needs a migration.
+    #[serde(default, deserialize_with = "forgiving_display_mode")]
+    pub display_mode: Option<DisplayMode>,
     /// The guest a GPU payload would have to suit, as far as VMLord knows it.
     ///
     /// `None` is a VM built from installation media: VMLord promises nothing
@@ -124,6 +134,28 @@ pub struct VmComputeSystemMapping {
 /// What a mapping written before desktops existed asks for.
 fn no_desktop() -> DesktopProfile {
     DesktopProfile::Headless
+}
+
+/// Reads a stored display mode, and reads an unusable one as no mode at all.
+///
+/// A mode outside what the module drives cannot be honoured, and the fallback
+/// is a working desktop. A mapping that refuses to parse, on the other hand,
+/// is a VM VMLord loses entirely -- so one bad field is worth the fallback and
+/// is not worth the VM.
+fn forgiving_display_mode<'de, D>(deserializer: D) -> Result<Option<DisplayMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct Stored {
+        width: u32,
+        height: u32,
+    }
+
+    let Some(stored) = Option::<Stored>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    Ok(DisplayMode::new(stored.width, stored.height))
 }
 
 /// The three facts that pick a GPU payload out of the catalog.
@@ -380,12 +412,50 @@ mod tests {
 
     use uuid::Uuid;
     use vmlord_core::{
-        CloudImage, DesktopProfile, DisplayFailure, DisplayProvisioning, DisplayStage,
+        CloudImage, DesktopProfile, DisplayFailure, DisplayMode, DisplayProvisioning, DisplayStage,
         DisplayStatusCode, GpuMode, NetworkMode, Provisioning, SshAccess, SshAuthentication,
         SshConfig, SshPort, VmSource, distro,
     };
 
     use super::{GuestTargetKey, MetadataStore, VmComputeSystemMapping, guest_target_key};
+
+    #[test]
+    fn a_stored_display_mode_survives_a_round_trip() {
+        let mut written = mapping(Uuid::nil(), "vm", "hcs");
+        written.display_mode = DisplayMode::new(2560, 1440);
+
+        let json = serde_json::to_string(&written).unwrap();
+        let read: VmComputeSystemMapping = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(read.display_mode, DisplayMode::new(2560, 1440));
+    }
+
+    #[test]
+    fn a_mapping_with_no_display_mode_reads_as_no_mode() {
+        let json = serde_json::to_string(&mapping(Uuid::nil(), "vm", "hcs")).unwrap();
+        let stripped = json.replace(r#""display_mode":null,"#, "");
+        let read: VmComputeSystemMapping = serde_json::from_str(&stripped).unwrap();
+
+        assert_eq!(
+            read.display_mode, None,
+            "every VM today, and every VM written before this field existed"
+        );
+    }
+
+    #[test]
+    fn a_stored_mode_the_module_will_not_drive_reads_as_no_mode() {
+        let json = serde_json::to_string(&mapping(Uuid::nil(), "vm", "hcs"))
+            .unwrap()
+            .replace(
+                r#""display_mode":null"#,
+                r#""display_mode":{"width":7680,"height":4320}"#,
+            );
+
+        let read: VmComputeSystemMapping = serde_json::from_str(&json)
+            .expect("one unusable field must not cost VMLord the whole VM");
+
+        assert_eq!(read.display_mode, None);
+    }
 
     fn temporary_mapping_file() -> std::path::PathBuf {
         let unique_id = SystemTime::now()
@@ -408,6 +478,7 @@ mod tests {
             gpu_mode: GpuMode::None,
             desktop_profile: vmlord_core::DesktopProfile::Headless,
             display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
+            display_mode: None,
             guest_target: None,
             ssh: None,
         }

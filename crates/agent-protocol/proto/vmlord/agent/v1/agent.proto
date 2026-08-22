@@ -492,9 +492,24 @@ enum DisplayMountState {
   DISPLAY_MOUNT_STATE_REFUSED = 4;
 }
 
-// Everything the guest needs in order to decide is in the guest or in the
-// payload it mounted one message earlier, so this request carries nothing.
-message ApplyDisplayRecipeRequest {}
+// Everything else the guest needs in order to decide is in the guest or in the
+// payload it mounted one message earlier.
+message ApplyDisplayRecipeRequest {
+  // The mode this VM's output is to come up at, as the host has it stored.
+  //
+  // Absent is a VM nothing has been saved for, which is every VM until task
+  // #120 saves one, and the guest answers absence with its own fallback. A
+  // message rather than two uint32s precisely so that absence and a width of
+  // zero are different things: proto3 scalars have no absence, and a zero
+  // width read as a mode is an output nobody can see.
+  DisplayMode initial_mode = 1;
+}
+
+// One output mode, in pixels.
+message DisplayMode {
+  uint32 width = 1;
+  uint32 height = 2;
+}
 
 message ApplyDisplayRecipeResponse {
   repeated DisplayRecipeStage stages = 1;

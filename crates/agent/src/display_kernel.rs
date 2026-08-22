@@ -27,8 +27,9 @@ use crate::{
     command,
     display_recipe::{
         DKMS_PACKAGE, InstalledVersions, MODULE, PayloadFacts, Report, applies_to,
-        dkms_reports_installed, dkms_versions, has_recipe, module_is_loaded, needs_build,
-        parse_module_version, read_payload_facts,
+        dkms_reports_installed, dkms_versions, has_recipe, modprobe_options, module_is_loaded,
+        needs_build, needs_reload, parse_module_parameters, parse_module_version,
+        read_payload_facts, wanted_mode,
     },
     gpu_kernel::guest_facts,
     guest_files::{copy_tree, failure, read, write_if_different},
@@ -43,6 +44,8 @@ const MODPROBE_OPTIONS: &str = "/etc/modprobe.d/vmlord-display.conf";
 const UNBIND_UNIT: &str = "/etc/systemd/system/vmlord-display-unbind-simpledrm.service";
 const DRM_DEVICES: &str = "/sys/class/drm";
 const MODULE_VERSION: &str = "/sys/module/vmlord_drm/version";
+const MODULE_PARAM_WIDTH: &str = "/sys/module/vmlord_drm/parameters/width";
+const MODULE_PARAM_HEIGHT: &str = "/sys/module/vmlord_drm/parameters/height";
 
 /// The budgets the recipe's three kinds of program get, as the GPU recipe's do:
 /// apt talks to the network, a build compiles a kernel module, and everything
@@ -58,9 +61,12 @@ const KEPT_LOG_LINES: usize = 40;
 /// Idempotent by fact: a guest already running the mounted version passes
 /// through in a handful of checks and needs no network. Every failure is a
 /// stage that says so, and the VM keeps running regardless.
-pub fn apply(stopping: &AtomicBool) -> (Vec<DisplayRecipeStage>, DisplayPayloadVersions) {
+pub fn apply(
+    stopping: &AtomicBool,
+    mode: Option<(u32, u32)>,
+) -> (Vec<DisplayRecipeStage>, DisplayPayloadVersions) {
     let mut report = Report::new();
-    let reason = match run_stages(&mut report, stopping) {
+    let reason = match run_stages(&mut report, stopping, mode) {
         Ok(()) => "the recipe did not need this stage".to_owned(),
         Err(reason) => reason,
     };
@@ -112,7 +118,11 @@ struct UpdateFailure {
 /// The stages, in order, stopping at the first one that ends the recipe.
 ///
 /// `Err` carries what the stages that never ran are reported with.
-fn run_stages(report: &mut Report, stopping: &AtomicBool) -> Result<(), String> {
+fn run_stages(
+    report: &mut Report,
+    stopping: &AtomicBool,
+    mode: Option<(u32, u32)>,
+) -> Result<(), String> {
     let guest = guest_facts()?;
     if !has_recipe(&guest.distribution) {
         let reason = format!(
@@ -161,7 +171,7 @@ fn run_stages(report: &mut Report, stopping: &AtomicBool) -> Result<(), String> 
         }
     }
 
-    load_stage(report)?;
+    load_stage(report, mode)?;
     device_stage(report)?;
     services_stages(report);
     Ok(())
@@ -510,7 +520,8 @@ fn make_log(version: &str) -> Option<String> {
 /// The unit that unbinds `simple-framebuffer` is installed here too: simpledrm
 /// is builtin, so it cannot be blacklisted, and until it lets go of the console
 /// a compositor has two devices to choose between.
-fn load_stage(report: &mut Report) -> Result<(), String> {
+fn load_stage(report: &mut Report, mode: Option<(u32, u32)>) -> Result<(), String> {
+    let wanted = wanted_mode(mode);
     let payload_drm = Path::new(PAYLOAD_MOUNT).join("content").join("drm");
     let copy = |from: &str, to: &str| -> Result<(), String> {
         let source = payload_drm.join(from);
@@ -525,7 +536,13 @@ fn load_stage(report: &mut Report) -> Result<(), String> {
 
     let prepared = write_if_different(Path::new(MODULES_LOAD), &format!("{MODULE}\n"))
         .map_err(|error| format!("{MODULES_LOAD} could not be written: {error}"))
-        .and_then(|()| copy("vmlord-display.conf", MODPROBE_OPTIONS))
+        .and_then(|()| {
+            write_if_different(
+                Path::new(MODPROBE_OPTIONS),
+                &modprobe_options(wanted.0, wanted.1),
+            )
+            .map_err(|error| format!("{MODPROBE_OPTIONS} could not be written: {error}"))
+        })
         .and_then(|()| copy("vmlord-display-unbind-simpledrm.service", UNBIND_UNIT));
     if let Err(reason) = prepared {
         report.failed(DisplayRecipeStep::ModuleLoad, reason.clone());
@@ -539,7 +556,20 @@ fn load_stage(report: &mut Report) -> Result<(), String> {
     );
 
     if module_is_loaded(&read(Path::new("/proc/modules"))) {
-        report.skipped(DisplayRecipeStep::ModuleLoad, format!("{MODULE} is loaded"));
+        let loaded = parse_module_parameters(
+            &read(Path::new(MODULE_PARAM_WIDTH)),
+            &read(Path::new(MODULE_PARAM_HEIGHT)),
+        );
+        if needs_reload(loaded, wanted) {
+            // The stored mode changed under a module that is already up, and a
+            // module parameter is read once. A reload that fails is a failed
+            // stage and a degraded display -- and a VM that keeps running.
+            return reload_module(report);
+        }
+        report.skipped(
+            DisplayRecipeStep::ModuleLoad,
+            format!("{MODULE} is loaded at {}x{}", wanted.0, wanted.1),
+        );
         return Ok(());
     }
 
@@ -552,7 +582,10 @@ fn load_stage(report: &mut Report) -> Result<(), String> {
 
     report.ok(
         DisplayRecipeStep::ModuleLoad,
-        format!("loaded {MODULE} and asked for it on every boot"),
+        format!(
+            "loaded {MODULE} at {}x{} and asked for it on every boot",
+            wanted.0, wanted.1
+        ),
     );
     Ok(())
 }
@@ -738,7 +771,7 @@ mod tests {
         // This machine is not a VMLord guest: nothing is mounted at
         // /opt/vmlord/display-payload, which is the failure a guest whose share
         // never arrived would hit.
-        let (stages, versions) = apply(&AtomicBool::new(false));
+        let (stages, versions) = apply(&AtomicBool::new(false), None);
 
         assert_eq!(stages.len(), crate::display_recipe::STEPS.len());
         assert!(

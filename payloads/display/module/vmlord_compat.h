@@ -13,6 +13,7 @@
 #ifndef VMLORD_COMPAT_H
 #define VMLORD_COMPAT_H
 
+#include <linux/hrtimer.h>
 #include <linux/version.h>
 
 #include <drm/drm_plane_helper.h>
@@ -29,5 +30,23 @@
 static const struct drm_encoder_funcs vmlord_encoder_funcs = {
 	.destroy = drm_encoder_cleanup,
 };
+
+/*
+ * hrtimer_setup() replaced hrtimer_init plus a function assignment in 6.15.
+ * This is the fourth of the four moves task #111 measured, and the only one
+ * that is a statement rather than a struct field -- which is why it is wrapped
+ * here and the other two are #if'd at their definition sites.
+ */
+static inline void
+vmlord_hrtimer_setup(struct hrtimer *timer,
+		     enum hrtimer_restart (*function)(struct hrtimer *))
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+	hrtimer_setup(timer, function, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+#else
+	hrtimer_init(timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	timer->function = function;
+#endif
+}
 
 #endif /* VMLORD_COMPAT_H */

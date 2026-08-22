@@ -5,11 +5,19 @@ what a guest builds to get a `/dev/dri/card*` a compositor will bind.
 
 ## What it is
 
-One CRTC, one connector, one primary plane, GEM shmem buffers, atomic
-modesetting and PRIME export. Nothing scans out: the framebuffer a compositor
-commits *is* the product, and VMLord's capture service reads it as an ordinary
-DRM client -- `drmModeGetFB2`, `drmPrimeHandleToFD`, `mmap` -- without taking
-DRM master.
+One CRTC, one connector, a primary plane and a cursor plane, GEM shmem buffers,
+an hrtimer vblank, atomic modesetting and PRIME export. Nothing scans out: the
+framebuffer a compositor commits *is* the product, and VMLord's capture service
+reads it as an ordinary DRM client -- `drmModeGetFB2`, `drmPrimeHandleToFD`,
+`mmap` -- without taking DRM master.
+
+Modes run up to 2560x1440, from the standard list plus the module's own size
+marked preferred. That size comes from the `width` and `height` parameters,
+which `vmlord-agent` writes into `/etc/modprobe.d/vmlord-display.conf` from the
+mode the host has stored for one VM; a size outside the bounds is refused with
+a warning and falls back to 1920x1080. There is no vblank hardware to be in
+phase with, so the timer is the output's only clock -- and without one a
+compositor is never paced.
 
 Three properties are decisions rather than style, all three measured by task
 #111 (`docs/display-drm-backend.md`):
@@ -22,27 +30,29 @@ Three properties are decisions rather than style, all three measured by task
 * its formats are XRGB8888 and ARGB8888 with `DRM_FORMAT_MOD_LINEAR` only,
   because a capture client that mmaps a buffer cannot detile anything else.
 
-## What it is not, yet
+## What it is not
 
-Task #113 delivers delivery: versioning, verification, DKMS and rollback. The
-output itself is task #114, which adds the cursor plane, the mode list up to
-2560x1440, a real hrtimer vblank in place of the immediate flush here, and the
-behaviour of an output that fails. Until then a compositor draws its own
-pointer into the primary plane, which is a working desktop rather than a broken
-one.
+* **No synthesized EDID.** The connector reports a physical size at 96 DPI and
+  no monitor name, so GNOME Settings calls it an unknown display. A hand-built
+  128-byte block would fix the name and would cost a fifth version guard across
+  an API that moved in 6.7; it is a nicety, deferred.
+* **One CRTC and one connector**, so one monitor. Multi-monitor is task #130.
+* **No capture.** Task #115's service reads this device from outside, as an
+  ordinary DRM client, and composites the cursor plane onto the primary --
+  which is what having a cursor plane at all costs.
 
 ## Kernels
 
-Ubuntu 22.04 runs 5.15, 24.04 runs 6.8, 26.04 runs 7.x. Two API moves are
-guarded at their definition sites in `vmlord_drm.c` -- `platform_driver::remove`
+Ubuntu 22.04 runs 5.15, 24.04 runs 6.8, 26.04 runs 7.x. All four API moves task
+#111 measured are guarded. Two live at their definition sites in
+`vmlord_drm.c`, because both are struct initializers and an `#if` around a
+field reads better than a macro that hides one: `platform_driver::remove`
 (which returned `int` until 6.11 and lived in `::remove_new` from 6.1) and
 `drm_driver::date` (removed in 6.14, and a `WARN` plus a segfault in `drm_info`
-if left NULL before that) -- and one in `vmlord_compat.h`:
-`DRM_PLANE_HELPER_NO_SCALING` was renamed in 6.1.
-
-Task #111 also measured a fourth: `hrtimer_setup()` replaced `hrtimer_init`
-plus a function assignment in 6.15. There is no timer here yet, so the guard
-belongs with the vblank work of task #114 rather than as dead code now.
+if left NULL before that). Two live in `vmlord_compat.h`:
+`DRM_PLANE_HELPER_NO_SCALING` was renamed in 6.1, and `hrtimer_setup()`
+replaced `hrtimer_init` plus a function assignment in 6.15 -- the latter as
+`vmlord_hrtimer_setup`, because it is a statement rather than a field.
 
 ## Building
 
@@ -53,3 +63,9 @@ compiles for that release. Against a local kernel's headers:
 ```sh
 make -C /lib/modules/$(uname -r)/build M=$PWD modules
 ```
+
+The module reports its payload's version through `MODULE_VERSION`, which is
+what `/sys/module/vmlord_drm/version` answers and what the recipe compares an
+update against. `Kbuild` defaults `VMLORD_VERSION` to `0.0.0-dev` so the
+command above works on a checkout; the Dockerfile rewrites that default with
+the payload's real version when it lays a payload out.

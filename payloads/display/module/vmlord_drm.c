@@ -2,11 +2,12 @@
 /*
  * VMLord virtual display.
  *
- * One CRTC, one connector, one primary plane, GEM shmem buffers and PRIME
- * export: the smallest DRM device a Wayland compositor will bind and a capture
- * client can read out of. Nothing here scans out anywhere -- the framebuffer a
- * compositor commits is the product, and VMLord's capture service reads it as
- * an ordinary DRM client through drmModeGetFB2 and a PRIME fd.
+ * One CRTC, one connector, a primary plane and a cursor plane, GEM shmem
+ * buffers and PRIME export: the smallest DRM device a Wayland compositor will
+ * bind and a capture client can read out of. Nothing here scans out anywhere
+ * -- the framebuffer a compositor commits is the product, and VMLord's capture
+ * service reads it as an ordinary DRM client through drmModeGetFB2 and a
+ * PRIME fd.
  *
  * Three things about this driver are decisions rather than style, and task
  * #111 measured all three:
@@ -22,6 +23,8 @@
  *     else.
  */
 
+#include <linux/kernel.h>
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/platform_device.h>
@@ -56,6 +59,25 @@
 
 #define VMLORD_DRIVER_NAME "vmlord_drm"
 
+/*
+ * What /sys/module/vmlord_drm/version answers, and what the recipe's update
+ * verification compares against. Kbuild defines it from the payload's version;
+ * the fallback is what a module built by hand out of a checkout reports.
+ */
+#ifndef VMLORD_DRM_VERSION
+#define VMLORD_DRM_VERSION "0.0.0-dev"
+#endif
+
+/*
+ * What this output offers, and the same numbers vmlord_core::DisplayMode and
+ * vmlord-agent carry. A mode this module will not drive is a mode a compositor
+ * should not be offered and a host should not store.
+ */
+#define VMLORD_MIN_WIDTH  640
+#define VMLORD_MIN_HEIGHT 480
+#define VMLORD_MAX_WIDTH  2560
+#define VMLORD_MAX_HEIGHT 1440
+
 static unsigned int width = 1920;
 static unsigned int height = 1080;
 
@@ -70,10 +92,25 @@ struct vmlord_device {
 	struct drm_encoder encoder;
 	struct drm_connector connector;
 	struct drm_plane primary;
+	struct drm_plane cursor;
+	struct hrtimer vblank_timer;
+	/* How long one frame lasts at the enabled mode's refresh rate. */
+	ktime_t period;
 };
 
 static const uint32_t vmlord_formats[] = {
 	DRM_FORMAT_XRGB8888,
+	DRM_FORMAT_ARGB8888,
+};
+
+/*
+ * A cursor has an alpha channel by definition, so it gets the one format that
+ * has one. The linear-only rule of task #111 applies to every plane a capture
+ * client mmaps, and a cursor is one of them: with a cursor plane present,
+ * mutter puts the pointer here and leaves it out of the primary plane, and
+ * compositing the two is the capture backend's job.
+ */
+static const uint32_t vmlord_cursor_formats[] = {
 	DRM_FORMAT_ARGB8888,
 };
 
@@ -90,6 +127,7 @@ static int vmlord_plane_atomic_check(struct drm_plane *plane,
 	struct drm_plane_state *new_state =
 		drm_atomic_get_new_plane_state(state, plane);
 	struct drm_crtc_state *crtc_state;
+	bool cursor;
 
 	if (!new_state->crtc)
 		return 0;
@@ -98,10 +136,19 @@ static int vmlord_plane_atomic_check(struct drm_plane *plane,
 	if (!crtc_state)
 		return -EINVAL;
 
+	/*
+	 * A cursor is positioned by definition -- it moves across the desktop
+	 * without the CRTC being reconfigured -- and it is moved while the
+	 * CRTC is off as readily as while it is on. A primary plane that could
+	 * be positioned would be a primary plane offset from the framebuffer
+	 * capture reads, which is why the primary gets neither.
+	 */
+	cursor = plane->type == DRM_PLANE_TYPE_CURSOR;
+
 	return drm_atomic_helper_check_plane_state(new_state, crtc_state,
 						   DRM_PLANE_NO_SCALING,
 						   DRM_PLANE_NO_SCALING,
-						   false, false);
+						   cursor, cursor);
 }
 
 /*
@@ -129,24 +176,83 @@ static const struct drm_plane_funcs vmlord_plane_funcs = {
 
 /* ------------------------------------------------------------------- crtc */
 
+/*
+ * The output's only clock.
+ *
+ * Nothing scans out here, so there is no hardware vblank to report and no
+ * counter to read: this timer is what makes a commit take a frame's worth of
+ * time instead of none at all. Without it a compositor is never paced, and a
+ * frame stream with no clock behind it is one the capture service of task #115
+ * would have to invent a clock for.
+ */
+static enum hrtimer_restart vmlord_vblank_timer(struct hrtimer *timer)
+{
+	struct vmlord_device *vmlord =
+		container_of(timer, struct vmlord_device, vblank_timer);
+
+	drm_crtc_handle_vblank(&vmlord->crtc);
+	hrtimer_forward_now(timer, vmlord->period);
+
+	return HRTIMER_RESTART;
+}
+
+static int vmlord_crtc_enable_vblank(struct drm_crtc *crtc)
+{
+	struct vmlord_device *vmlord =
+		container_of(crtc, struct vmlord_device, crtc);
+
+	hrtimer_start(&vmlord->vblank_timer, vmlord->period, HRTIMER_MODE_REL);
+
+	return 0;
+}
+
+static void vmlord_crtc_disable_vblank(struct drm_crtc *crtc)
+{
+	struct vmlord_device *vmlord =
+		container_of(crtc, struct vmlord_device, crtc);
+
+	hrtimer_cancel(&vmlord->vblank_timer);
+}
+
 static void vmlord_crtc_atomic_enable(struct drm_crtc *crtc,
 				      struct drm_atomic_state *state)
 {
+	struct vmlord_device *vmlord =
+		container_of(crtc, struct vmlord_device, crtc);
+	int vrefresh = drm_mode_vrefresh(&crtc->state->adjusted_mode);
+
+	/*
+	 * The period from the refresh rate of the mode being enabled, and
+	 * deliberately not framedur_ns off the vblank structure: how that
+	 * structure is reached moved between the kernels this module supports,
+	 * and dividing by a refresh rate did not move anywhere. A mode that
+	 * reports no refresh rate at all would be a division by zero, so 60 is
+	 * the floor rather than an assumption.
+	 */
+	if (vrefresh <= 0)
+		vrefresh = 60;
+	vmlord->period = ns_to_ktime(NSEC_PER_SEC / vrefresh);
+
+	/*
+	 * Runs .enable_vblank when a client is already waiting, which is what
+	 * arms the timer. Arming it here as well would arm it twice.
+	 */
+	drm_crtc_vblank_on(crtc);
 }
 
 static void vmlord_crtc_atomic_disable(struct drm_crtc *crtc,
 				       struct drm_atomic_state *state)
 {
+	drm_crtc_vblank_off(crtc);
 }
 
 /*
- * Completes the commit immediately.
+ * Hands the commit's event to the vblank that will complete it.
  *
- * This driver reports no vblank counter and arms no timer -- there is no
- * refresh to be in phase with until task #114 gives the output one. A
- * compositor waiting on the event of a commit that will never be answered is a
- * compositor that stops drawing, so the event is sent here, in the flush, and
- * the commit is as complete as it is ever going to be.
+ * The fallback below is not tidiness. A compositor waiting on an event that
+ * never arrives stops drawing, so a vblank that could not be enabled must not
+ * be able to freeze a desktop: the event is sent outright instead, which is
+ * what this driver did for every commit before it had a clock.
  */
 static void vmlord_crtc_atomic_flush(struct drm_crtc *crtc,
 				     struct drm_atomic_state *state)
@@ -157,8 +263,12 @@ static void vmlord_crtc_atomic_flush(struct drm_crtc *crtc,
 		return;
 
 	crtc->state->event = NULL;
+
 	spin_lock_irq(&crtc->dev->event_lock);
-	drm_crtc_send_vblank_event(crtc, event);
+	if (drm_crtc_vblank_get(crtc) != 0)
+		drm_crtc_send_vblank_event(crtc, event);
+	else
+		drm_crtc_arm_vblank_event(crtc, event);
 	spin_unlock_irq(&crtc->dev->event_lock);
 }
 
@@ -171,6 +281,8 @@ static const struct drm_crtc_helper_funcs vmlord_crtc_helper_funcs = {
 static const struct drm_crtc_funcs vmlord_crtc_funcs = {
 	.set_config = drm_atomic_helper_set_config,
 	.page_flip = drm_atomic_helper_page_flip,
+	.enable_vblank = vmlord_crtc_enable_vblank,
+	.disable_vblank = vmlord_crtc_disable_vblank,
 	.destroy = drm_crtc_cleanup,
 	.reset = drm_atomic_helper_crtc_reset,
 	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
@@ -180,21 +292,43 @@ static const struct drm_crtc_funcs vmlord_crtc_funcs = {
 /* -------------------------------------------------------------- connector */
 
 /*
+ * A pixel count as millimetres at 96 DPI: px * 25.4 / 96, in integers, because
+ * a kernel module has no floating point. 96 is a choice and not a measurement
+ * -- there is no glass -- but it is the one that makes a compositor pick scale
+ * 1 for every size this output offers.
+ */
+static u32 vmlord_millimetres(u32 pixels)
+{
+	return DIV_ROUND_CLOSEST(pixels * 254u, 960u);
+}
+
+/*
  * The modes this output offers.
  *
- * The module's own size, marked preferred, plus the standard list below it, so
- * that a compositor started before anything has been configured comes up at
- * the size the host asked for. A synthesized EDID -- which is what would carry
- * a physical size and a richer mode list -- belongs with the resizing work of
- * task #114, and inventing one here would be a mode list nothing has been
- * measured against.
+ * The standard list up to what this module will drive, plus the module's own
+ * size marked preferred, so that a compositor started before anything has been
+ * configured comes up at the size the host asked for and can still be resized
+ * within the list.
+ *
+ * No EDID is synthesized. The two things one would buy are a physical size and
+ * a monitor name; the size is a field and is set here, and the name costs a
+ * hand-built 128-byte block plus a fifth version guard across an API that moved
+ * in 6.7 -- which is a deferred nicety, not an MVP.
  */
 static int vmlord_connector_get_modes(struct drm_connector *connector)
 {
 	struct drm_display_mode *mode;
 	int count;
 
-	count = drm_add_modes_noedid(connector, width, height);
+	/*
+	 * Set on every probe rather than once at connector init: fill_modes is
+	 * entitled to reset display_info, and get_modes runs inside every probe.
+	 */
+	connector->display_info.width_mm = vmlord_millimetres(width);
+	connector->display_info.height_mm = vmlord_millimetres(height);
+
+	count = drm_add_modes_noedid(connector, VMLORD_MAX_WIDTH,
+				     VMLORD_MAX_HEIGHT);
 	mode = drm_cvt_mode(connector->dev, width, height, 60, false, false,
 			    false);
 	if (mode) {
@@ -259,11 +393,18 @@ static int vmlord_mode_config_init(struct vmlord_device *vmlord)
 	if (error)
 		return error;
 
-	drm->mode_config.min_width = 640;
-	drm->mode_config.min_height = 480;
-	drm->mode_config.max_width = 4096;
-	drm->mode_config.max_height = 4096;
+	drm->mode_config.min_width = VMLORD_MIN_WIDTH;
+	drm->mode_config.min_height = VMLORD_MIN_HEIGHT;
+	drm->mode_config.max_width = VMLORD_MAX_WIDTH;
+	drm->mode_config.max_height = VMLORD_MAX_HEIGHT;
 	drm->mode_config.preferred_depth = 24;
+	/*
+	 * The size task #111 measured mutter asking this output for. A
+	 * compositor that is told nothing assumes 64x64 and draws a cursor
+	 * that is a quarter of the size it meant.
+	 */
+	drm->mode_config.cursor_width = 256;
+	drm->mode_config.cursor_height = 256;
 	drm->mode_config.funcs = &vmlord_mode_config_funcs;
 
 	return 0;
@@ -283,8 +424,19 @@ static int vmlord_pipe_init(struct vmlord_device *vmlord)
 		return error;
 	drm_plane_helper_add(&vmlord->primary, &vmlord_plane_helper_funcs);
 
+	error = drm_universal_plane_init(drm, &vmlord->cursor, 1,
+					 &vmlord_plane_funcs,
+					 vmlord_cursor_formats,
+					 ARRAY_SIZE(vmlord_cursor_formats),
+					 vmlord_modifiers,
+					 DRM_PLANE_TYPE_CURSOR, "cursor");
+	if (error)
+		return error;
+	drm_plane_helper_add(&vmlord->cursor, &vmlord_plane_helper_funcs);
+
 	error = drm_crtc_init_with_planes(drm, &vmlord->crtc, &vmlord->primary,
-					  NULL, &vmlord_crtc_funcs, NULL);
+					  &vmlord->cursor, &vmlord_crtc_funcs,
+					  NULL);
 	if (error)
 		return error;
 	drm_crtc_helper_add(&vmlord->crtc, &vmlord_crtc_helper_funcs);
@@ -320,11 +472,39 @@ static int vmlord_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, vmlord);
 
+	/*
+	 * The parameters are writable by whoever installs the modprobe.d file,
+	 * and a size outside the bounds would produce a preferred mode the
+	 * mode_config rejects -- a device that exists and shows nothing. The
+	 * fallback is a working desktop, and the warning is how somebody finds
+	 * out why it is not the size they asked for.
+	 */
+	if (width < VMLORD_MIN_WIDTH || width > VMLORD_MAX_WIDTH ||
+	    height < VMLORD_MIN_HEIGHT || height > VMLORD_MAX_HEIGHT) {
+		dev_warn(&pdev->dev,
+			 "%ux%u is outside %ux%u..%ux%u; using 1920x1080\n",
+			 width, height, VMLORD_MIN_WIDTH, VMLORD_MIN_HEIGHT,
+			 VMLORD_MAX_WIDTH, VMLORD_MAX_HEIGHT);
+		width = 1920;
+		height = 1080;
+	}
+
+	/*
+	 * A period before any mode is enabled, so that a vblank enabled early
+	 * has something to run at. atomic_enable replaces it with the real one.
+	 */
+	vmlord->period = ns_to_ktime(NSEC_PER_SEC / 60);
+	vmlord_hrtimer_setup(&vmlord->vblank_timer, vmlord_vblank_timer);
+
 	error = vmlord_mode_config_init(vmlord);
 	if (error)
 		return error;
 
 	error = vmlord_pipe_init(vmlord);
+	if (error)
+		return error;
+
+	error = drm_vblank_init(&vmlord->drm, 1);
 	if (error)
 		return error;
 
@@ -345,6 +525,12 @@ static void vmlord_remove(struct platform_device *pdev)
 
 	drm_dev_unplug(&vmlord->drm);
 	drm_atomic_helper_shutdown(&vmlord->drm);
+	/*
+	 * The shutdown above disables the CRTC, which cancels the timer through
+	 * .disable_vblank. This is the belt to that braces: a timer still armed
+	 * when the device is freed fires into memory that is gone.
+	 */
+	hrtimer_cancel(&vmlord->vblank_timer);
 }
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
@@ -406,3 +592,4 @@ module_exit(vmlord_drm_exit);
 MODULE_AUTHOR("VMLord contributors");
 MODULE_DESCRIPTION("VMLord virtual display");
 MODULE_LICENSE("GPL");
+MODULE_VERSION(VMLORD_DRM_VERSION);

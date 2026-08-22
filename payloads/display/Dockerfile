@@ -39,9 +39,11 @@ RUN set -eu; \
     proven_on="$(cat /src/proven_on)"; \
     mkdir -p /output/prepared/content/drm /output/prepared/content/services \
              /output/prepared/licenses; \
-    cp /src/module/Kbuild /src/module/vmlord_drm.c /src/module/vmlord_compat.h \
-       /src/module/vmlord-display.conf /src/module/vmlord-display-unbind-simpledrm.service \
+    cp /src/module/vmlord_drm.c /src/module/vmlord_compat.h \
+       /src/module/vmlord-display-unbind-simpledrm.service \
        /output/prepared/content/drm/; \
+    sed "s/^VMLORD_VERSION ?= .*/VMLORD_VERSION ?= ${VERSION}/" /src/module/Kbuild \
+       > /output/prepared/content/drm/Kbuild; \
     sed "s/@VERSION@/${VERSION}/" /src/module/dkms.conf.in \
        > /output/prepared/content/drm/dkms.conf; \
     cp /src/licenses/GPL-2.0.txt /output/prepared/licenses/; \

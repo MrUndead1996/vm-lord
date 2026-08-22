@@ -285,6 +285,7 @@ mod tests {
             // case every host runs today, because the shipped catalog is empty.
             desktop_profile: vmlord_core::DesktopProfile::Headless,
             display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
+            display_mode: None,
             guest_target: None,
         }
     }
