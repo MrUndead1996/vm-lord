@@ -69,6 +69,65 @@ impl std::fmt::Display for DesktopProfile {
     }
 }
 
+/// The smallest and largest output VMLord's DRM module offers.
+///
+/// The same numbers `vmlord_drm`'s `mode_config` carries and `vmlord-agent`
+/// checks against. A mode stored here that the module will not drive is a mode
+/// nothing can honour, so this is where a stored one is refused.
+pub const MIN_DISPLAY_WIDTH: u32 = 640;
+/// The shortest output VMLord's DRM module offers. See [`MIN_DISPLAY_WIDTH`].
+pub const MIN_DISPLAY_HEIGHT: u32 = 480;
+/// The widest output VMLord's DRM module offers. See [`MIN_DISPLAY_WIDTH`].
+pub const MAX_DISPLAY_WIDTH: u32 = 2560;
+/// The tallest output VMLord's DRM module offers. See [`MIN_DISPLAY_WIDTH`].
+pub const MAX_DISPLAY_HEIGHT: u32 = 1440;
+
+/// The mode a VM's display comes up at, in pixels.
+///
+/// Its fields are private and its constructor refuses anything the module will
+/// not drive, so a value of this type is a mode that can be honoured rather
+/// than a pair of numbers that might be one.
+///
+/// `Serialize` and not `Deserialize`: it is stored on a VM's mapping, and a
+/// stored mode that has become unusable must read as *no* mode rather than
+/// make the whole mapping unreadable. `metadata.rs` does that reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct DisplayMode {
+    width: u32,
+    height: u32,
+}
+
+impl DisplayMode {
+    /// The mode, or `None` when it is outside what the module offers.
+    #[must_use]
+    pub const fn new(width: u32, height: u32) -> Option<Self> {
+        if width < MIN_DISPLAY_WIDTH
+            || width > MAX_DISPLAY_WIDTH
+            || height < MIN_DISPLAY_HEIGHT
+            || height > MAX_DISPLAY_HEIGHT
+        {
+            return None;
+        }
+        Some(Self { width, height })
+    }
+
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+}
+
+impl std::fmt::Display for DisplayMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}x{}", self.width, self.height)
+    }
+}
+
 /// The fewest CPU cores a desktop guest is comfortable on.
 pub const MIN_DESKTOP_CPU_CORES: u32 = 2;
 
@@ -518,6 +577,35 @@ impl VmDisplayStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_display_mode_is_one_the_module_will_actually_drive() {
+        assert_eq!(
+            DisplayMode::new(1920, 1080).map(|mode| (mode.width(), mode.height())),
+            Some((1920, 1080))
+        );
+        assert_eq!(
+            DisplayMode::new(2560, 1440).map(|mode| (mode.width(), mode.height())),
+            Some((2560, 1440)),
+            "the largest mode this task promises is a mode"
+        );
+        assert_eq!(
+            DisplayMode::new(640, 480).map(|mode| (mode.width(), mode.height())),
+            Some((640, 480))
+        );
+
+        assert_eq!(DisplayMode::new(3840, 2160), None, "above the ceiling");
+        assert_eq!(DisplayMode::new(320, 240), None, "below the floor");
+        assert_eq!(DisplayMode::new(1920, 0), None, "a height of nothing");
+        assert_eq!(DisplayMode::new(0, 0), None);
+    }
+
+    #[test]
+    fn a_display_mode_is_stored_as_two_numbers() {
+        let json = serde_json::to_string(&DisplayMode::new(1600, 900).unwrap()).unwrap();
+
+        assert_eq!(json, r#"{"width":1600,"height":900}"#);
+    }
 
     #[test]
     fn a_release_with_no_payload_for_this_guest_is_not_worth_retrying() {
