@@ -18,6 +18,17 @@ agent-release = [
     "--release",
 ]
 
+# The guest display services: the privileged DRM broker and the unprivileged
+# capture process. The same musl target as the agent, and for the same reason.
+display-services = [
+    "build",
+    "-p",
+    "vmlord-display-services",
+    "--target",
+    "x86_64-unknown-linux-musl",
+    "--release",
+]
+
 # Compile-check the Windows application from WSL. The GNU target exists only
 # for this: it needs no MSVC, so a Linux box can tell whether the Windows code
 # still builds. Release binaries stay MSVC -- see `cargo dist`.

@@ -1,0 +1,84 @@
+// The private interface between the two guest display services.
+//
+// Not the display protocol: this never leaves the guest, both binaries ship in
+// one payload at one version, and there is nothing here to negotiate. It is a
+// schema rather than a hand-rolled encoding because the workspace already
+// compiles protobuf in-process, and because "typed operations only" is the rule
+// this interface exists to keep.
+
+syntax = "proto3";
+
+package vmlord.display.broker;
+
+message Envelope {
+  oneof message {
+    Attach attach = 1;
+    NextFrame next_frame = 2;
+    SessionOpened session_opened = 3;
+    SessionClosed session_closed = 4;
+    KeyframeRequested keyframe_requested = 5;
+    Snapshot snapshot = 6;
+    Report report = 7;
+  }
+}
+
+// The unprivileged process introducing itself.
+message Attach {}
+
+// It is ready for another frame. The reply arrives at the next vblank, and
+// other messages may arrive before it.
+message NextFrame {}
+
+// A control handshake completed. Everything the frame and input channels need,
+// and nothing the secret could be recovered from.
+message SessionOpened {
+  bytes session_id = 1;
+  bytes frame_key = 2;
+  bytes input_key = 3;
+  uint32 width = 4;
+  uint32 height = 5;
+  uint32 tile_size = 6;
+  bool cursor_stream = 7;
+}
+
+// Control was lost or the host sent EndSession. Stop capturing and release
+// everything.
+message SessionClosed {
+  string reason = 1;
+}
+
+// The viewer asked for a keyframe. Recovery, not flow control.
+message KeyframeRequested {}
+
+// What the planes hold at one vblank.
+message Snapshot {
+  uint64 sequence = 1;
+  repeated PlaneLayout planes = 2;
+  // The buffer ids whose descriptors are attached to this datagram, in the
+  // order they were attached. A buffer the peer already holds is not resent.
+  repeated uint64 new_buffers = 3;
+}
+
+message PlaneLayout {
+  PlaneKind kind = 1;
+  uint64 buffer = 2;
+  uint32 width = 3;
+  uint32 height = 4;
+  uint32 stride = 5;
+  // The DRM fourcc, checked against what this build will map.
+  uint32 format = 6;
+  // Signed: a cursor plane goes negative at the left and top edges.
+  sint32 x = 7;
+  sint32 y = 8;
+}
+
+enum PlaneKind {
+  PLANE_KIND_UNSPECIFIED = 0;
+  PLANE_KIND_PRIMARY = 1;
+  PLANE_KIND_CURSOR = 2;
+}
+
+// What the unprivileged process wants the host told.
+message Report {
+  string detail = 1;
+}
