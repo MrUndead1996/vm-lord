@@ -60,6 +60,15 @@
 #define VMLORD_DRIVER_NAME "vmlord_drm"
 
 /*
+ * What /sys/module/vmlord_drm/version answers, and what the recipe's update
+ * verification compares against. Kbuild defines it from the payload's version;
+ * the fallback is what a module built by hand out of a checkout reports.
+ */
+#ifndef VMLORD_DRM_VERSION
+#define VMLORD_DRM_VERSION "0.0.0-dev"
+#endif
+
+/*
  * What this output offers, and the same numbers vmlord_core::DisplayMode and
  * vmlord-agent carry. A mode this module will not drive is a mode a compositor
  * should not be offered and a host should not store.
@@ -583,3 +592,4 @@ module_exit(vmlord_drm_exit);
 MODULE_AUTHOR("VMLord contributors");
 MODULE_DESCRIPTION("VMLord virtual display");
 MODULE_LICENSE("GPL");
+MODULE_VERSION(VMLORD_DRM_VERSION);

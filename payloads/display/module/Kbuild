@@ -1,2 +1,11 @@
+# The payload version this module reports as its own.
+#
+# `payloads/display/Dockerfile` rewrites the default below when it lays a
+# payload out, so a packed module reports the version of the payload that
+# carries it. The `?=` is what keeps a plain
+# `make -C /lib/modules/$(uname -r)/build M=$PWD modules` working on a
+# checkout, which is how this module is compiled during development.
+VMLORD_VERSION ?= 0.0.0-dev
+
 obj-m += vmlord_drm.o
-ccflags-y += -I$(src)
+ccflags-y += -I$(src) -DVMLORD_DRM_VERSION=\"$(VMLORD_VERSION)\"
