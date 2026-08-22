@@ -29,7 +29,7 @@ use std::{
 use uuid::Uuid;
 use vmlord_agent_protocol::v1::DisplayUpdateOutcome;
 use vmlord_agent_protocol::{auth::Secret, backoff::Backoff};
-use vmlord_core::{DisplayShare, GpuShareManifest, RepositoryError};
+use vmlord_core::{DisplayMode, DisplayShare, GpuShareManifest, RepositoryError};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -212,6 +212,7 @@ impl AgentConnection {
     ) -> Result<Self, RepositoryError> {
         let vm_name = mapping.vm_name.clone();
         let vm_id = mapping.vm_id;
+        let display_mode = mapping.display_mode;
         let secret = read_secret(secret_path, &vm_name)?;
         let listener = AgentListener::bind(&vm_name, runtime_id)?;
 
@@ -231,6 +232,7 @@ impl AgentConnection {
                         &pending_updates,
                         shares.as_ref(),
                         display_share.as_ref(),
+                        display_mode,
                         &vm_name,
                         &online,
                         &running,
@@ -330,6 +332,7 @@ fn serve(
     updates: &Receiver<DisplayUpdate>,
     shares: Option<&GpuShareManifest>,
     display_share: Option<&DisplayShare>,
+    display_mode: Option<DisplayMode>,
     vm_name: &str,
     online: &AtomicBool,
     running: &Arc<AtomicBool>,
@@ -358,6 +361,7 @@ fn serve(
                     agent_session::SessionWork {
                         gpu_shares: shares,
                         display_share,
+                        display_mode,
                         gpu: sink,
                         display: display_sink,
                         updates: Some(updates),

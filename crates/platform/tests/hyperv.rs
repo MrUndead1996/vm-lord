@@ -1002,6 +1002,7 @@ fn shuts_down_a_running_guest() {
             gpu_mode: vmlord_core::GpuMode::None,
             desktop_profile: vmlord_core::DesktopProfile::Headless,
             display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
+            display_mode: None,
             guest_target: None,
         })
         .expect("mapping should be persisted");
@@ -1905,6 +1906,7 @@ fn mapping_owning(vm_name: &str, endpoint_id: Uuid) -> VmComputeSystemMapping {
         gpu_mode: vmlord_core::GpuMode::None,
         desktop_profile: vmlord_core::DesktopProfile::Headless,
         display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
+        display_mode: None,
         guest_target: None,
     }
 }

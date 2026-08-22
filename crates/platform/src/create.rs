@@ -253,6 +253,7 @@ impl VmCreationPipeline {
             display_provisioning: vmlord_core::DisplayProvisioning::requested(
                 request.desktop_profile(),
             ),
+            display_mode: None,
             // The same three facts for the same reason: a payload is chosen
             // before the guest that will use it has booted, and only the
             // creation knows what system was installed.

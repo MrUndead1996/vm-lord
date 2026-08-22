@@ -36,8 +36,8 @@ use vmlord_agent_protocol::{
     },
 };
 use vmlord_core::{
-    DisplayFailure, DisplayShare, DisplayStage, DisplayStatusCode, GpuFailure, GpuShareManifest,
-    GpuShareRole as CoreShareRole, GpuStatusCode, GuestGpuDetail, GuestGpuReport,
+    DisplayFailure, DisplayMode, DisplayShare, DisplayStage, DisplayStatusCode, GpuFailure,
+    GpuShareManifest, GpuShareRole as CoreShareRole, GpuStatusCode, GuestGpuDetail, GuestGpuReport,
 };
 
 use crate::agent::{DisplayUpdate, DisplayUpdateAnswer};
@@ -124,6 +124,12 @@ pub(crate) struct SessionWork<'a> {
     pub(crate) gpu_shares: Option<&'a GpuShareManifest>,
     /// The display payload share this VM's guest is to mount, if any.
     pub(crate) display_share: Option<&'a DisplayShare>,
+    /// The mode this VM's output is to come up at, if one is stored with it.
+    ///
+    /// It belongs to the run for the reason the share does: a module parameter
+    /// is read once, when the module loads, so every session of a run carries
+    /// the same mode and a changed one reaches the output through a reload.
+    pub(crate) display_mode: Option<DisplayMode>,
     pub(crate) gpu: GuestGpuSink<'a>,
     pub(crate) display: GuestDisplaySink<'a>,
     /// Where a display payload update arrives from, when this session is one
@@ -297,7 +303,8 @@ pub(crate) fn serve<S: Read + Write>(
             {
                 pending_display_attach = None;
                 if report_display_mount(&report, vm_name, work.display) {
-                    pending_display_recipe = apply_display_recipe(stream, vm_name, &mut buffer)?;
+                    pending_display_recipe =
+                        apply_display_recipe(stream, work.display_mode, vm_name, &mut buffer)?;
                 }
             }
             Body::Response(response::Kind::ApplyDisplayRecipe(report))
@@ -485,15 +492,27 @@ fn attach_display<S: Read + Write>(
 /// continuously.
 fn apply_display_recipe<S: Read + Write>(
     stream: &mut S,
+    mode: Option<DisplayMode>,
     vm_name: &str,
     buffer: &mut Vec<u8>,
 ) -> Result<Option<u32>, SessionError> {
     let request = Envelope::request(
         DISPLAY_APPLY_REQUEST_ID,
-        request::Kind::ApplyDisplayRecipe(ApplyDisplayRecipeRequest {}),
+        request::Kind::ApplyDisplayRecipe(ApplyDisplayRecipeRequest {
+            initial_mode: mode.map(|mode| vmlord_agent_protocol::v1::DisplayMode {
+                width: mode.width(),
+                height: mode.height(),
+            }),
+        }),
     );
     frame::write(stream, &request, buffer).map_err(SessionError::Frame)?;
-    log::debug!("VMLord asked the agent of VM \"{vm_name}\" to apply its display recipe");
+    log::debug!(
+        "VMLord asked the agent of VM \"{vm_name}\" to apply its display recipe{}",
+        match mode {
+            Some(mode) => format!(" at {mode}"),
+            None => String::new(),
+        }
+    );
 
     Ok(Some(DISPLAY_APPLY_REQUEST_ID))
 }
@@ -1184,6 +1203,7 @@ mod tests {
         SessionWork {
             gpu_shares,
             display_share: None,
+            display_mode: None,
             gpu,
             display: &|_| {},
             updates: None,
@@ -1562,15 +1582,17 @@ mod tests {
             .expect("a clean close is not a failure");
     }
 
-    /// The work a display test does: no GPU, one display share, and a sink
-    /// that keeps what came back.
+    /// The work a display test does: no GPU, one display share, a stored mode
+    /// or none, and a sink that keeps what came back.
     fn display_work<'a>(
         share: Option<&'a DisplayShare>,
+        mode: Option<vmlord_core::DisplayMode>,
         display: GuestDisplaySink<'a>,
     ) -> SessionWork<'a> {
         SessionWork {
             gpu_shares: None,
             display_share: share,
+            display_mode: mode,
             gpu: &|_| {},
             display,
             updates: None,
@@ -1626,7 +1648,7 @@ mod tests {
         serve(
             &mut guest,
             &session,
-            display_work(Some(&share), &|report| {
+            display_work(Some(&share), None, &|report| {
                 reports
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1662,6 +1684,93 @@ mod tests {
     }
 
     #[test]
+    fn a_vm_with_a_stored_mode_asks_the_guest_for_it() {
+        let secret = Secret::generate();
+        let mut guest = Guest::opening_with(
+            Secret::from_base64(&secret.to_base64()).expect("the secret"),
+            hello(
+                ProtocolVersion::current(),
+                &[Capability::Gpu, Capability::Display],
+            ),
+        );
+        let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
+        guest.say(&Envelope::response(
+            super::DISPLAY_ATTACH_REQUEST_ID,
+            response::Kind::AttachDisplayPayload(AttachDisplayPayloadResponse {
+                mount: Some(vmlord_agent_protocol::v1::DisplayMount {
+                    name: vmlord_core::DISPLAY_PAYLOAD_SHARE.to_owned(),
+                    mount_point: "/opt/vmlord/display-payload".to_owned(),
+                    state: i32::from(DisplayMountState::Mounted),
+                    message: "mounted".to_owned(),
+                }),
+            }),
+        ));
+
+        let share = display_share();
+        let mode = vmlord_core::DisplayMode::new(2560, 1440);
+        let _ = serve(
+            &mut guest,
+            &session,
+            display_work(Some(&share), mode, &|_| {}),
+            VM,
+        );
+
+        let asked = guest.answer_to(super::DISPLAY_APPLY_REQUEST_ID);
+        let Some(envelope::Body::Request(ref request)) = asked.body else {
+            panic!("the recipe should have been sent as a request");
+        };
+        let Some(request::Kind::ApplyDisplayRecipe(ref apply)) = request.kind else {
+            panic!("the recipe should have been an apply request");
+        };
+        let sent = apply.initial_mode.as_ref().expect("the stored mode");
+        assert_eq!((sent.width, sent.height), (2560, 1440));
+    }
+
+    #[test]
+    fn a_vm_with_no_stored_mode_asks_the_guest_for_nothing() {
+        let secret = Secret::generate();
+        let mut guest = Guest::opening_with(
+            Secret::from_base64(&secret.to_base64()).expect("the secret"),
+            hello(
+                ProtocolVersion::current(),
+                &[Capability::Gpu, Capability::Display],
+            ),
+        );
+        let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
+        guest.say(&Envelope::response(
+            super::DISPLAY_ATTACH_REQUEST_ID,
+            response::Kind::AttachDisplayPayload(AttachDisplayPayloadResponse {
+                mount: Some(vmlord_agent_protocol::v1::DisplayMount {
+                    name: vmlord_core::DISPLAY_PAYLOAD_SHARE.to_owned(),
+                    mount_point: "/opt/vmlord/display-payload".to_owned(),
+                    state: i32::from(DisplayMountState::Mounted),
+                    message: "mounted".to_owned(),
+                }),
+            }),
+        ));
+
+        let share = display_share();
+        let _ = serve(
+            &mut guest,
+            &session,
+            display_work(Some(&share), None, &|_| {}),
+            VM,
+        );
+
+        let asked = guest.answer_to(super::DISPLAY_APPLY_REQUEST_ID);
+        let Some(envelope::Body::Request(ref request)) = asked.body else {
+            panic!("the recipe should have been sent as a request");
+        };
+        let Some(request::Kind::ApplyDisplayRecipe(ref apply)) = request.kind else {
+            panic!("the recipe should have been an apply request");
+        };
+        assert_eq!(
+            apply.initial_mode, None,
+            "absence is what the guest answers with its own fallback"
+        );
+    }
+
+    #[test]
     fn a_headless_vm_is_asked_nothing_about_a_display() {
         let secret = Secret::generate();
         let mut guest = Guest::opening_with(
@@ -1673,7 +1782,7 @@ mod tests {
         );
         let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
 
-        serve(&mut guest, &session, display_work(None, &|_| {}), VM)
+        serve(&mut guest, &session, display_work(None, None, &|_| {}), VM)
             .expect("a session the agent closed");
 
         assert!(
@@ -1695,7 +1804,7 @@ mod tests {
         serve(
             &mut guest,
             &session,
-            display_work(Some(&share), &|_| {}),
+            display_work(Some(&share), None, &|_| {}),
             VM,
         )
         .expect("a session the agent closed");
@@ -1745,7 +1854,7 @@ mod tests {
         serve(
             &mut guest,
             &session,
-            display_work(Some(&share), &|report| {
+            display_work(Some(&share), None, &|report| {
                 reports
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1795,7 +1904,7 @@ mod tests {
         serve(
             &mut guest,
             &session,
-            display_work(Some(&share), &|report| {
+            display_work(Some(&share), None, &|report| {
                 reports
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
