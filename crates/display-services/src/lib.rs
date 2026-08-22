@@ -6,6 +6,7 @@
 //! passthrough leaves the broker.
 
 pub mod ipc;
+pub mod unix;
 
 /// The generated types for the broker's private schema.
 mod broker {
