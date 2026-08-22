@@ -40,7 +40,7 @@ RUN set -eu; \
     mkdir -p /output/prepared/content/drm /output/prepared/content/services \
              /output/prepared/licenses; \
     cp /src/module/vmlord_drm.c /src/module/vmlord_compat.h \
-       /src/module/vmlord-display.conf /src/module/vmlord-display-unbind-simpledrm.service \
+       /src/module/vmlord-display-unbind-simpledrm.service \
        /output/prepared/content/drm/; \
     sed "s/^VMLORD_VERSION ?= .*/VMLORD_VERSION ?= ${VERSION}/" /src/module/Kbuild \
        > /output/prepared/content/drm/Kbuild; \

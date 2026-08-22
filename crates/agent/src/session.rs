@@ -45,8 +45,8 @@ pub struct Handlers<'a> {
     pub probe_gpu: &'a mut dyn FnMut() -> ProbeGpuResponse,
     /// Mounts the one display payload share.
     pub attach_display: &'a mut dyn FnMut(&DisplayShare) -> DisplayMount,
-    /// Runs the guest's display recipe.
-    pub apply_display_recipe: &'a mut dyn FnMut() -> ApplyDisplayRecipeResponse,
+    /// Runs the guest's display recipe, at the mode the host asked for.
+    pub apply_display_recipe: &'a mut dyn FnMut(Option<(u32, u32)>) -> ApplyDisplayRecipeResponse,
     /// Moves the guest to the version the mounted payload carries.
     pub update_display: &'a mut dyn FnMut(&str) -> UpdateDisplayPayloadResponse,
 }
@@ -270,12 +270,16 @@ fn serve<S: Read + Write>(
                 );
                 frame::write(stream, &report, buffer).map_err(SessionError::Frame)?;
             }
-            Body::Request(request::Kind::ApplyDisplayRecipe(_))
+            Body::Request(request::Kind::ApplyDisplayRecipe(ref request))
                 if session.capabilities.contains(&Capability::Display) =>
             {
+                let mode = request
+                    .initial_mode
+                    .as_ref()
+                    .map(|mode| (mode.width, mode.height));
                 let report = Envelope::response(
                     request_id,
-                    response::Kind::ApplyDisplayRecipe((handlers.apply_display_recipe)()),
+                    response::Kind::ApplyDisplayRecipe((handlers.apply_display_recipe)(mode)),
                 );
                 frame::write(stream, &report, buffer).map_err(SessionError::Frame)?;
             }
@@ -474,7 +478,7 @@ mod tests {
         apply_gpu_recipe: &'a mut dyn FnMut() -> Vec<GpuRecipeStage>,
         probe_gpu: &'a mut dyn FnMut() -> ProbeGpuResponse,
         attach_display: &'a mut dyn FnMut(&DisplayShare) -> DisplayMount,
-        apply_display_recipe: &'a mut dyn FnMut() -> ApplyDisplayRecipeResponse,
+        apply_display_recipe: &'a mut dyn FnMut(Option<(u32, u32)>) -> ApplyDisplayRecipeResponse,
         update_display: &'a mut dyn FnMut(&str) -> UpdateDisplayPayloadResponse,
     ) -> Handlers<'a> {
         Handlers {
@@ -608,7 +612,7 @@ mod tests {
                 &mut apply_nothing,
                 &mut probe_nothing,
                 &mut |_share| DisplayMount::default(),
-                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
             ),
         )
@@ -690,7 +694,7 @@ mod tests {
                 &mut apply_nothing,
                 &mut probe_nothing,
                 &mut |_share| DisplayMount::default(),
-                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
             ),
         )
@@ -743,7 +747,7 @@ mod tests {
                 &mut apply_nothing,
                 &mut probe_nothing,
                 &mut |_share| DisplayMount::default(),
-                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
             ),
         )
@@ -800,7 +804,7 @@ mod tests {
                 &mut apply_nothing,
                 &mut probe_nothing,
                 &mut |_share| DisplayMount::default(),
-                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
             ),
         )
@@ -848,7 +852,7 @@ mod tests {
                 &mut apply_nothing,
                 &mut probe_nothing,
                 &mut |_share| DisplayMount::default(),
-                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
             ),
         )
@@ -918,7 +922,7 @@ mod tests {
                 &mut apply_nothing,
                 &mut probe_nothing,
                 &mut |_share| DisplayMount::default(),
-                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
             ),
         )
@@ -985,7 +989,7 @@ mod tests {
                 &mut apply,
                 &mut probe_nothing,
                 &mut |_share| DisplayMount::default(),
-                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
             ),
         )
@@ -1057,7 +1061,7 @@ mod tests {
                 &mut apply_nothing,
                 &mut probe,
                 &mut |_share| DisplayMount::default(),
-                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
             ),
         )
@@ -1115,7 +1119,7 @@ mod tests {
                 &mut apply_nothing,
                 &mut || panic!("a probe that was never agreed on must not be run"),
                 &mut |_share| DisplayMount::default(),
-                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
             ),
         )
@@ -1171,7 +1175,7 @@ mod tests {
                 &mut || panic!("a recipe that was never agreed on must not be applied"),
                 &mut probe_nothing,
                 &mut |_share| DisplayMount::default(),
-                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
             ),
         )
@@ -1229,7 +1233,7 @@ mod tests {
                 &mut apply_nothing,
                 &mut probe_nothing,
                 &mut |_share| DisplayMount::default(),
-                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
             ),
         )
@@ -1280,7 +1284,7 @@ mod tests {
                 &mut apply_nothing,
                 &mut probe_nothing,
                 &mut |_share| DisplayMount::default(),
-                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
             ),
         )
@@ -1317,7 +1321,7 @@ mod tests {
                 &mut apply_nothing,
                 &mut probe_nothing,
                 &mut |_share| DisplayMount::default(),
-                &mut ApplyDisplayRecipeResponse::default,
+                &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
             ),
         )

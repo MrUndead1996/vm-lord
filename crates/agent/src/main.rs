@@ -224,8 +224,8 @@ fn connect_to_host(secret: &Secret) -> bool {
             apply_gpu_recipe: &mut || gpu_kernel::apply(&STOPPING),
             probe_gpu: &mut || gpu_render::probe(&STOPPING),
             attach_display: &mut display_mounts::attach,
-            apply_display_recipe: &mut || {
-                let (stages, versions) = display_kernel::apply(&STOPPING);
+            apply_display_recipe: &mut |mode| {
+                let (stages, versions) = display_kernel::apply(&STOPPING, mode);
                 ApplyDisplayRecipeResponse {
                     stages,
                     versions: Some(versions),

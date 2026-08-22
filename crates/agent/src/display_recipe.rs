@@ -247,14 +247,128 @@ pub fn parse_module_version(text: &str) -> Option<String> {
     (!version.is_empty()).then(|| version.to_owned())
 }
 
+/// What the output comes up at when the host has not said, or has said
+/// something this module will not drive.
+pub const FALLBACK_MODE: (u32, u32) = (1920, 1080);
+
+/// The bounds `vmlord_drm`'s `mode_config` carries.
+///
+/// Written out a second time rather than taken from `vmlord-core`: this crate
+/// depends on `libc`, `serde_json`, `sha2` and the protocol crate and on
+/// nothing else, because it cross-compiles to static musl, and a dependency
+/// for four numbers would be the wrong trade. Change these and
+/// `vmlord_core::MIN_DISPLAY_WIDTH` and `VMLORD_MIN_WIDTH` in `vmlord_drm.c`
+/// together.
+const MIN_WIDTH: u32 = 640;
+const MIN_HEIGHT: u32 = 480;
+const MAX_WIDTH: u32 = 2560;
+const MAX_HEIGHT: u32 = 1440;
+
+/// The mode to bring the output up at, given what the host asked for.
+///
+/// The host sends only modes it validated, and this checks again anyway: a
+/// module parameter outside what the module drives is a device that exists and
+/// shows nothing, and the fallback is a working desktop.
+#[must_use]
+pub fn wanted_mode(asked: Option<(u32, u32)>) -> (u32, u32) {
+    match asked {
+        Some((width, height))
+            if (MIN_WIDTH..=MAX_WIDTH).contains(&width)
+                && (MIN_HEIGHT..=MAX_HEIGHT).contains(&height) =>
+        {
+            (width, height)
+        }
+        _ => FALLBACK_MODE,
+    }
+}
+
+/// What `/etc/modprobe.d/vmlord-display.conf` says, for a mode.
+///
+/// Written by the guest from what the host asked for, rather than copied out
+/// of the payload: the size belongs to one VM and a payload is shared by all
+/// of them.
+#[must_use]
+pub fn modprobe_options(width: u32, height: u32) -> String {
+    format!(
+        "# Written by vmlord-agent from the mode this VM has stored.\n\
+         # The output comes up at this size; changing it needs the module reloaded.\n\
+         options {MODULE} width={width} height={height}\n"
+    )
+}
+
+/// The size the loaded module was given, out of its `parameters` directory.
+///
+/// `None` is a module that does not say: absent files, or text that is not a
+/// number. Deliberately not a guess -- see [`needs_reload`].
+#[must_use]
+pub fn parse_module_parameters(width: &str, height: &str) -> Option<(u32, u32)> {
+    Some((width.trim().parse().ok()?, height.trim().parse().ok()?))
+}
+
+/// Whether a module that is already up has to be reloaded to reach `wanted`.
+///
+/// A module parameter is read once, when the module loads, so a stored mode
+/// that changed under a running module reaches the output no other way. A
+/// module that does not say what it was loaded with is left alone: a reload on
+/// a guess is a desktop dropped for nothing.
+#[must_use]
+pub fn needs_reload(loaded: Option<(u32, u32)>, wanted: (u32, u32)) -> bool {
+    loaded.is_some_and(|loaded| loaded != wanted)
+}
+
 #[cfg(test)]
 mod tests {
     use vmlord_agent_protocol::v1::{DisplayRecipeStageState, DisplayRecipeStep};
 
     use super::{
-        DKMS_PACKAGE, InstalledVersions, Report, STEPS, applies_to, dkms_reports_installed,
-        dkms_versions, has_recipe, module_is_loaded, needs_build, read_payload_facts,
+        DKMS_PACKAGE, FALLBACK_MODE, InstalledVersions, Report, STEPS, applies_to,
+        dkms_reports_installed, dkms_versions, has_recipe, modprobe_options, module_is_loaded,
+        needs_build, needs_reload, parse_module_parameters, read_payload_facts, wanted_mode,
     };
+
+    #[test]
+    fn a_mode_the_module_will_not_drive_falls_back() {
+        assert_eq!(wanted_mode(Some((2560, 1440))), (2560, 1440));
+        assert_eq!(wanted_mode(Some((640, 480))), (640, 480));
+        assert_eq!(wanted_mode(None), FALLBACK_MODE);
+        assert_eq!(
+            wanted_mode(Some((3840, 2160))),
+            FALLBACK_MODE,
+            "the host sends only what it validated, and the guest checks anyway"
+        );
+        assert_eq!(wanted_mode(Some((0, 0))), FALLBACK_MODE);
+    }
+
+    #[test]
+    fn the_modprobe_options_name_the_module_and_the_mode() {
+        let options = modprobe_options(1600, 900);
+
+        assert!(options.ends_with("options vmlord_drm width=1600 height=900\n"));
+        assert!(
+            options.starts_with('#'),
+            "a file VMLord wrote should say so to whoever finds it"
+        );
+    }
+
+    #[test]
+    fn the_loaded_mode_is_what_the_module_says_it_is() {
+        assert_eq!(
+            parse_module_parameters("1920\n", "1080\n"),
+            Some((1920, 1080))
+        );
+        assert_eq!(parse_module_parameters("", ""), None);
+        assert_eq!(parse_module_parameters("wide", "1080"), None);
+    }
+
+    #[test]
+    fn only_a_mode_that_is_known_to_differ_costs_a_reload() {
+        assert!(needs_reload(Some((1920, 1080)), (2560, 1440)));
+        assert!(!needs_reload(Some((1920, 1080)), (1920, 1080)));
+        assert!(
+            !needs_reload(None, (2560, 1440)),
+            "a module that does not say must not be dropped on a guess"
+        );
+    }
 
     fn payload_json(version: &str, release: &str) -> Vec<u8> {
         format!(
