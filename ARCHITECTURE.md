@@ -3049,6 +3049,113 @@ version that was working before, and `display-payload-update-rolled-back` says
 exactly that. `display-payload-update-failed` is the other case: neither
 version is running.
 
+## The desktop codec
+
+`vmlord-display-codec` is what turns a captured guest framebuffer into the
+bytes the frame channel carries, and what turns them back. Like the protocol it
+is portable by construction and has no dependencies at all: it is linked into a
+Windows viewer and into a static musl guest binary built without a C toolchain,
+and its output has to be the same bytes on both. It does not capture, does not
+open a socket and knows neither DRM nor Windows.
+
+A keyframe and a tile delta are the same container, distinguished by a flag in
+an eight-byte header that also repeats the tile grid. The grid is derivable
+from the session's `StreamConfig`, and repeating it costs four bytes and turns
+a `StreamConfig`-against-frame mismatch from a silently wrong picture into a
+named error. A keyframe carries every tile in raster order with no index at
+all; a delta carries only the tiles that changed, each behind a varint index,
+and the indices must strictly increase, which makes a delta canonical and
+catches a shuffled payload.
+
+Each tile is written in whichever encoding is shortest: `Raw`, `Zrle`, or --
+deltas only -- `XorZrle`, which is the tile XORed with the one the far side
+holds and then run-length coded. Every candidate is actually evaluated rather
+than guessed at, ties going to the lower method number, which is what makes the
+output deterministic: the same pixels produce the same bytes on every machine,
+and the golden vectors can hold the wire still.
+
+`Raw` carries no length field, and that is arithmetic rather than
+parsimony. The protocol caps a frame record at `width * height * 4` plus 64 KiB
+of slack, and the case that approaches the cap is a keyframe whose every tile
+is incompressible. At tile size 16 a 2560x1440 frame is 14400 tiles, so a
+four-byte length on each would spend 57 KB of that 64 KB before anything went
+wrong. Deriving a raw tile's length from the grid leaves one byte of overhead
+per tile. Edge tiles at the right and bottom edges are clipped, so a frame that
+is not a multiple of the tile size is the normal case rather than an error.
+
+The run-length coder works on 32-bit pixels rather than bytes -- a desktop
+repeats whole pixels, and a byte-oriented coder would have to rediscover that
+four times per pixel -- and under XOR a tile that changed in one corner is
+mostly zeros, which is the shape it is best at. The cursor is a stream of its
+own with its own two records and no shared state, because it moves far more
+often than the desktop changes and must be able to overtake a frame that is
+still being written.
+
+### Why the queue precedes the encoder
+
+The bounded queue keeps current state and discards what is stale, and *which*
+frames may be discarded is the whole of the design. Dropping an already encoded
+delta would be silent corruption: the next delta would be encoded against a
+frame the viewer never received and applied to the wrong base, and nothing
+anywhere would notice -- no error, no `RequestKeyframe`, just a picture that
+drifts.
+
+So the queue holds *captured* frames. `Encoder::submit` copies a frame into a
+staging slot, displacing whatever had not been encoded yet, and
+`Encoder::next_payload` encodes when the transport is ready to write. The
+encoder's reference frame is therefore, by construction, the last payload the
+caller was handed -- which is the last one written to the socket, since a
+failed write ends the channel's generation and the next one opens with a
+keyframe anyway. Damage hints accumulate across displaced frames for the same
+reason: a frame dropped before it was encoded still changed pixels the newer
+one keeps, and its hint is the only record of where they were.
+
+Damage is a hint and never a fact. Tiles a hint covers are compared against the
+reference; tiles it does not cover are not compared, and so are not advanced in
+the reference either. A hint that under-reports therefore loses pixels until a
+later hint or a keyframe covers them -- a bug in the capture backend -- but it
+cannot desynchronise the stream, and that is the property the tests hold.
+
+A keyframe is produced on the first frame, whenever the viewer asks through
+`RequestKeyframe`, and every `keyframe_interval` frames as a protective
+measure, 300 by default. A request that arrives with nothing newly captured is
+answered from the frame already staged rather than waiting for the guest to
+repaint. Geometry never changes inside an encoder: a resolution change is a new
+`StreamConfig`, hence a new encoder and a new decoder, which is also what makes
+the reference frame's size an invariant rather than a check.
+
+### What the benchmark measured
+
+`cargo display-bench` runs five synthetic scenes -- a static desktop, typing, a
+scrolling view, a moving window and fullscreen video -- and reports what each
+costs. At 1920x1080 over 300 frames, per delta:
+
+| scene | tile 16 | tile 32 | tile 64 |
+| --- | --- | --- | --- |
+| static desktop | nothing sent | nothing sent | nothing sent |
+| typing | 172 B | 177 B | 178 B |
+| moving window | 5.9 KB | 5.6 KB | 5.4 KB |
+| scrolling | 8.0 MB | 7.9 MB | 7.9 MB |
+| fullscreen video | 8.3 MB | 8.3 MB | 8.3 MB |
+
+Keyframes are 211 KB, 163 KB and 131 KB at the three tile sizes; encoding a
+quiet frame costs one to two milliseconds and a full one ten to twelve, and
+decoding is well under two.
+
+Two conclusions and one caveat. **LZ4 does not earn its place in the MVP**: on
+desktop-shaped frames ZRLE already compresses by three orders of magnitude, and
+on the two heavy scenes nothing compresses at all, so a second general-purpose
+compressor would be paying for itself in neither case. **The default tile size
+stays 32**, the value the handshake already names: deltas are almost
+independent of it, and the keyframe savings at 64 do not outweigh re-sending
+four times the pixels for a small change on content that is not synthetic.
+
+The caveat is that the scrolling and fullscreen scenes are noise, which is the
+worst case any lossless codec can be given, and the moving window is a flat
+rectangle, which is close to the best. What a real GNOME desktop costs is a
+measurement for task #115, when there is a real capture to make it with. The
+numbers here settle the codec's own decisions and nothing beyond them.
+
 
 ---
 

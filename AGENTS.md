@@ -98,6 +98,7 @@ Use the Cargo aliases from `.cargo/config.toml` rather than spelling targets out
   through WSL interop, so no Wine is involved.
 * `cargo agent` / `cargo agent-release` — build the Linux guest agent
   (`x86_64-unknown-linux-musl`, statically linked, no C toolchain needed).
+* `cargo display-bench` — run the desktop codec's benchmark scenes.
 * `cargo dist` — Windows-only release build into `dist/`.
 
 Never add a dependency that forces the agent to link against system C

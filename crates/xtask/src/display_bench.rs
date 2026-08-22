@@ -22,6 +22,10 @@ struct Report {
     frames: u32,
     keyframes: u32,
     mean_bytes: f64,
+    /// The mean over deltas alone. The all-frames mean of a quiet scene is
+    /// mostly its one keyframe divided by the frame count, which says nothing
+    /// about what steady state costs.
+    mean_delta_bytes: f64,
     worst_bytes: u64,
     ratio: f64,
     mean_encode_ms: f64,
@@ -87,6 +91,8 @@ fn measure(scene: Scene, geometry: Geometry, frames: u32) -> Result<Report, Stri
     let stride = geometry.width() as usize * 4;
 
     let mut keyframes = 0;
+    let mut deltas = 0u32;
+    let mut delta_bytes = 0u64;
     let mut total_bytes = 0u64;
     let mut worst_bytes = 0u64;
     let mut encode_nanos = 0u128;
@@ -123,6 +129,10 @@ fn measure(scene: Scene, geometry: Geometry, frames: u32) -> Result<Report, Stri
         total_bytes += bytes.len() as u64;
         worst_bytes = worst_bytes.max(bytes.len() as u64);
         keyframes += u32::from(keyframe);
+        if !keyframe {
+            deltas += 1;
+            delta_bytes += bytes.len() as u64;
+        }
 
         let started = Instant::now();
         let applied = if keyframe {
@@ -148,6 +158,11 @@ fn measure(scene: Scene, geometry: Geometry, frames: u32) -> Result<Report, Stri
         frames,
         keyframes,
         mean_bytes: total_bytes as f64 / frames_f,
+        mean_delta_bytes: if deltas == 0 {
+            0.0
+        } else {
+            delta_bytes as f64 / f64::from(deltas)
+        },
         worst_bytes,
         ratio: if total_bytes == 0 {
             f64::INFINITY
@@ -173,18 +188,27 @@ pub(crate) fn run<I: IntoIterator<Item = String>>(arguments: I) -> Result<(), St
         arguments.frames
     );
     println!(
-        "{:<18}{:>10}{:>12}{:>9}{:>12}{:>12}{:>12}{:>11}",
-        "scene", "keyframes", "mean bytes", "ratio", "worst bytes", "enc ms", "worst enc", "dec ms"
+        "{:<18}{:>10}{:>12}{:>13}{:>9}{:>12}{:>10}{:>11}{:>9}",
+        "scene",
+        "keyframes",
+        "mean bytes",
+        "mean delta",
+        "ratio",
+        "worst bytes",
+        "enc ms",
+        "worst enc",
+        "dec ms"
     );
 
     for scene in Scene::ALL {
         let report = measure(scene, geometry, arguments.frames)?;
         println!(
-            "{:<18}{:>4}/{:<5}{:>12.0}{:>9.1}{:>12}{:>12.2}{:>12.2}{:>11.2}",
+            "{:<18}{:>4}/{:<5}{:>12.0}{:>13.0}{:>9.1}{:>12}{:>10.2}{:>11.2}{:>9.2}",
             report.scene,
             report.keyframes,
             report.frames,
             report.mean_bytes,
+            report.mean_delta_bytes,
             report.ratio,
             report.worst_bytes,
             report.mean_encode_ms,
