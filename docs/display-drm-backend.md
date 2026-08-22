@@ -182,12 +182,22 @@ is that frame, and the pointer is missing from it -- it lives on the cursor
 plane now, which is exactly the composition this document says the capture
 backend owes us.
 
-So the shape holds end to end on the first proven target. What remains is
-not research:
+So the shape holds end to end on the first proven target. What remained was
+not research, and this is where each of those four stands:
 
-- the module's own name and packaging under VMLord, rather than AppSandbox's;
-- the mode list above 1920x1080 -- this run pinned the module to that size
-  through its modprobe.d file, so the ceiling is still unmeasured;
-- 22.04 and 26.04 builds (the patch compiles clean against 5.15, which is
-  evidence, not proof, for 22.04);
-- the capture backend itself, which is task #9's next step, not this one.
+- the module's own name and packaging under VMLord, rather than AppSandbox's
+  -- **done** in task #113: `vmlord_drm`, shipped as the DKMS package
+  `vmlord-display` inside a versioned display payload;
+- the mode list above 1920x1080 -- **done** in task #114. The connector offers
+  the standard list up to 2560x1440, and a `width`/`height` outside
+  640x480..2560x1440 is refused with a warning and falls back to 1920x1080.
+  The size is no longer pinned in a file the payload carries: `vmlord-agent`
+  writes the modprobe.d options from the mode the host has stored for that one
+  VM;
+- 22.04 and 26.04 builds -- **still open**. 5.15 now compiles on the
+  development machine after every change to the module, which makes 22.04 the
+  best-evidenced of the three and still not a booted guest. 6.8 and 7.x compile
+  only in `payloads/display/prepare.sh`'s container, and the runtime proof for
+  all three is task #128's mandatory matrix;
+- the capture backend itself -- **still task #115**, and it is what has to
+  composite the cursor plane that task #114 added.

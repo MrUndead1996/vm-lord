@@ -3006,6 +3006,14 @@ read-only and DKMS writes beside its sources), `MODULE_BUILD`, `MODULE_LOAD`
 driver is ours), and `SERVICES`/`SERVICES_START`, which are skipped with their
 reason until task #115 fills `content/services`.
 
+The modprobe options are written by the guest rather than copied out of the
+payload, from the mode the host has stored for that one VM -- a size belongs to
+a VM and a payload is shared by all of them. A VM with no stored mode gets
+1920x1080, which is every VM until task #120 saves one. A mode that changed
+under a module already loaded costs a `modprobe -r` and a `modprobe`, because a
+module parameter is read once; a module that does not say what it was loaded
+with is left alone, because a reload on a guess drops a working desktop.
+
 Idempotence is by fact and not by a flag: the payload's version installed, the
 module loaded and a device that answers short-circuits the three build stages,
 so every start after the first costs a few checks and needs no network. A
@@ -3014,15 +3022,23 @@ the module across it with VMLord not involved, and when it did not, the recipe
 finds no loaded module and builds again. A build that fails on the new kernel
 is a degraded display naming exactly that, and a VM that runs.
 
-`vmlord_drm` itself is one CRTC, one connector, a primary plane, GEM shmem,
-atomic modesetting and PRIME export, and nothing scans out: the framebuffer a
-compositor commits is the product, and capture reads it as an ordinary DRM
-client. Three properties are decisions task #111 measured -- a platform device
-under its own name (mutter's udev rules tag `platform-vkms` on `ID_PATH`), no
-`DRIVER_CURSOR_HOTSPOT` (mutter hides the cursor plane of drivers that declare
-it), and linear XRGB8888/ARGB8888 only (a capture client that mmaps a buffer
-cannot detile anything else). The cursor plane, the mode list and a real vblank
-are task #114's.
+`vmlord_drm` itself is one CRTC, one connector, a primary plane, a cursor
+plane, GEM shmem, an hrtimer vblank, atomic modesetting and PRIME export, and
+nothing scans out: the framebuffer a compositor commits is the product, and
+capture reads it as an ordinary DRM client. Three properties are decisions task
+#111 measured -- a platform device under its own name (mutter's udev rules tag
+`platform-vkms` on `ID_PATH`), no `DRIVER_CURSOR_HOTSPOT` (mutter hides the
+cursor plane of drivers that declare it), and linear XRGB8888/ARGB8888 only (a
+capture client that mmaps a buffer cannot detile anything else).
+
+The cursor plane is what mutter puts the pointer on, which is why compositing
+it back is capture's job rather than a convenience. The vblank is the output's
+only clock: nothing here scans out, so a commit would otherwise complete in no
+time at all and pace nothing. Modes run up to 2560x1440 from the standard list,
+plus the configured size marked preferred, with a physical size at 96 DPI and
+no synthesized EDID -- the name a monitor would carry costs a fifth kernel
+version guard and is deferred. The module declares its payload's version, which
+is what an update's verification compares against.
 
 ### Display: updating and rolling back
 
