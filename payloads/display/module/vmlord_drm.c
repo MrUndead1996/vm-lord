@@ -23,6 +23,7 @@
  *     else.
  */
 
+#include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/platform_device.h>
@@ -72,6 +73,9 @@ struct vmlord_device {
 	struct drm_connector connector;
 	struct drm_plane primary;
 	struct drm_plane cursor;
+	struct hrtimer vblank_timer;
+	/* How long one frame lasts at the enabled mode's refresh rate. */
+	ktime_t period;
 };
 
 static const uint32_t vmlord_formats[] = {
@@ -152,24 +156,83 @@ static const struct drm_plane_funcs vmlord_plane_funcs = {
 
 /* ------------------------------------------------------------------- crtc */
 
+/*
+ * The output's only clock.
+ *
+ * Nothing scans out here, so there is no hardware vblank to report and no
+ * counter to read: this timer is what makes a commit take a frame's worth of
+ * time instead of none at all. Without it a compositor is never paced, and a
+ * frame stream with no clock behind it is one the capture service of task #115
+ * would have to invent a clock for.
+ */
+static enum hrtimer_restart vmlord_vblank_timer(struct hrtimer *timer)
+{
+	struct vmlord_device *vmlord =
+		container_of(timer, struct vmlord_device, vblank_timer);
+
+	drm_crtc_handle_vblank(&vmlord->crtc);
+	hrtimer_forward_now(timer, vmlord->period);
+
+	return HRTIMER_RESTART;
+}
+
+static int vmlord_crtc_enable_vblank(struct drm_crtc *crtc)
+{
+	struct vmlord_device *vmlord =
+		container_of(crtc, struct vmlord_device, crtc);
+
+	hrtimer_start(&vmlord->vblank_timer, vmlord->period, HRTIMER_MODE_REL);
+
+	return 0;
+}
+
+static void vmlord_crtc_disable_vblank(struct drm_crtc *crtc)
+{
+	struct vmlord_device *vmlord =
+		container_of(crtc, struct vmlord_device, crtc);
+
+	hrtimer_cancel(&vmlord->vblank_timer);
+}
+
 static void vmlord_crtc_atomic_enable(struct drm_crtc *crtc,
 				      struct drm_atomic_state *state)
 {
+	struct vmlord_device *vmlord =
+		container_of(crtc, struct vmlord_device, crtc);
+	int vrefresh = drm_mode_vrefresh(&crtc->state->adjusted_mode);
+
+	/*
+	 * The period from the refresh rate of the mode being enabled, and
+	 * deliberately not framedur_ns off the vblank structure: how that
+	 * structure is reached moved between the kernels this module supports,
+	 * and dividing by a refresh rate did not move anywhere. A mode that
+	 * reports no refresh rate at all would be a division by zero, so 60 is
+	 * the floor rather than an assumption.
+	 */
+	if (vrefresh <= 0)
+		vrefresh = 60;
+	vmlord->period = ns_to_ktime(NSEC_PER_SEC / vrefresh);
+
+	/*
+	 * Runs .enable_vblank when a client is already waiting, which is what
+	 * arms the timer. Arming it here as well would arm it twice.
+	 */
+	drm_crtc_vblank_on(crtc);
 }
 
 static void vmlord_crtc_atomic_disable(struct drm_crtc *crtc,
 				       struct drm_atomic_state *state)
 {
+	drm_crtc_vblank_off(crtc);
 }
 
 /*
- * Completes the commit immediately.
+ * Hands the commit's event to the vblank that will complete it.
  *
- * This driver reports no vblank counter and arms no timer -- there is no
- * refresh to be in phase with until task #114 gives the output one. A
- * compositor waiting on the event of a commit that will never be answered is a
- * compositor that stops drawing, so the event is sent here, in the flush, and
- * the commit is as complete as it is ever going to be.
+ * The fallback below is not tidiness. A compositor waiting on an event that
+ * never arrives stops drawing, so a vblank that could not be enabled must not
+ * be able to freeze a desktop: the event is sent outright instead, which is
+ * what this driver did for every commit before it had a clock.
  */
 static void vmlord_crtc_atomic_flush(struct drm_crtc *crtc,
 				     struct drm_atomic_state *state)
@@ -180,8 +243,12 @@ static void vmlord_crtc_atomic_flush(struct drm_crtc *crtc,
 		return;
 
 	crtc->state->event = NULL;
+
 	spin_lock_irq(&crtc->dev->event_lock);
-	drm_crtc_send_vblank_event(crtc, event);
+	if (drm_crtc_vblank_get(crtc) != 0)
+		drm_crtc_send_vblank_event(crtc, event);
+	else
+		drm_crtc_arm_vblank_event(crtc, event);
 	spin_unlock_irq(&crtc->dev->event_lock);
 }
 
@@ -194,6 +261,8 @@ static const struct drm_crtc_helper_funcs vmlord_crtc_helper_funcs = {
 static const struct drm_crtc_funcs vmlord_crtc_funcs = {
 	.set_config = drm_atomic_helper_set_config,
 	.page_flip = drm_atomic_helper_page_flip,
+	.enable_vblank = vmlord_crtc_enable_vblank,
+	.disable_vblank = vmlord_crtc_disable_vblank,
 	.destroy = drm_crtc_cleanup,
 	.reset = drm_atomic_helper_crtc_reset,
 	.atomic_duplicate_state = drm_atomic_helper_crtc_duplicate_state,
@@ -361,11 +430,22 @@ static int vmlord_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, vmlord);
 
+	/*
+	 * A period before any mode is enabled, so that a vblank enabled early
+	 * has something to run at. atomic_enable replaces it with the real one.
+	 */
+	vmlord->period = ns_to_ktime(NSEC_PER_SEC / 60);
+	vmlord_hrtimer_setup(&vmlord->vblank_timer, vmlord_vblank_timer);
+
 	error = vmlord_mode_config_init(vmlord);
 	if (error)
 		return error;
 
 	error = vmlord_pipe_init(vmlord);
+	if (error)
+		return error;
+
+	error = drm_vblank_init(&vmlord->drm, 1);
 	if (error)
 		return error;
 
@@ -386,6 +466,12 @@ static void vmlord_remove(struct platform_device *pdev)
 
 	drm_dev_unplug(&vmlord->drm);
 	drm_atomic_helper_shutdown(&vmlord->drm);
+	/*
+	 * The shutdown above disables the CRTC, which cancels the timer through
+	 * .disable_vblank. This is the belt to that braces: a timer still armed
+	 * when the device is freed fires into memory that is gone.
+	 */
+	hrtimer_cancel(&vmlord->vblank_timer);
 }
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
