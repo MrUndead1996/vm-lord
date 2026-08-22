@@ -260,6 +260,7 @@ against the geometry it was constructed with, and every error is a returned
 * `Truncated`, `TrailingBytes`
 * `RunOverflow` — a ZRLE run longer than the tile it fills
 * `NoBase` — a delta with nothing to apply it to
+* `WrongPayloadKind` — a keyframe applied as a delta, or the reverse
 * `CursorTooLarge`
 
 ## Scenes
