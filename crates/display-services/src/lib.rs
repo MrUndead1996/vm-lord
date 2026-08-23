@@ -12,6 +12,7 @@ pub mod drm;
 pub mod ipc;
 pub mod pipeline;
 pub mod unix;
+pub mod vsock;
 
 /// The generated types for the broker's private schema.
 mod broker {
