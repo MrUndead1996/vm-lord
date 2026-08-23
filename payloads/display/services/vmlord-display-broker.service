@@ -1,0 +1,29 @@
+[Unit]
+Description=VMLord display broker
+Documentation=https://github.com/mrundead/vmlord
+# No secret, no session: this is a VM that was never provisioned for a display.
+ConditionPathExists=/etc/vmlord/agent.secret
+
+[Service]
+ExecStart=/usr/local/lib/vmlord/vmlord-display-broker
+# The DRM device appears after the module loads, which is after this unit
+# starts. Waiting for it is the broker's own job -- restarting until it shows up
+# would spend the crash-loop budget on the ordinary state of a booting guest.
+Restart=on-failure
+RestartSec=2
+StartLimitIntervalSec=60
+StartLimitBurst=5
+# GETFB2 will not hand a framebuffer's handles to anything less. Everything else
+# root could do is taken away.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+NoNewPrivileges=yes
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/run/vmlord
+RestrictAddressFamilies=AF_VSOCK AF_UNIX
+RestrictNamespaces=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -7,9 +7,11 @@ repository -- these files are what produces one.
 ## Building
 
 ```sh
+cargo display-services
 payloads/display/prepare.sh \
-    --spec   payloads/display/ubuntu-24.04-amd64/payload.spec.json \
-    --output target/display-payload
+    --spec     payloads/display/ubuntu-24.04-amd64/payload.spec.json \
+    --output   target/display-payload \
+    --services target/x86_64-unknown-linux-musl/release
 cargo run -p xtask -- display-payload pack \
     --recipe        target/display-payload/recipe.json \
     --input         target/display-payload/prepared \
@@ -36,16 +38,29 @@ prepared/payload.json     written by `pack`, not by the build
 prepared/sources.json     this repository at the commit that was built
 prepared/licenses/        GPL-2.0, the module's licence
 prepared/content/drm/     dkms.conf, Kbuild, the sources, modprobe.d, the unit
-prepared/content/services/  empty until task #115
+prepared/content/services/  the two guest programs and their units:
+                            vmlord-display-broker, vmlord-display-session,
+                            vmlord-display-broker.service,
+                            vmlord-display-session.service
 ```
+
+The services are built by the host toolchain rather than in the image. A static
+musl binary is the same on 22.04, 24.04 and 26.04, so building them three times
+would prove nothing the one build does not; `prepare.sh` copies them in and
+refuses to continue if `cargo display-services` has not been run.
 
 ## Provenance
 
 A display payload has no upstream to pin: it is built from this repository, so
 what `sources.json` records is this repository and the commit it was built at.
 `prepare.sh` refuses to build from a tree with uncommitted changes under
-`payloads/display`, because a commit that does not describe what was built is
-worse than no build at all.
+`payloads/display` or `crates/display-services`, because a commit that does not
+describe what was built is worse than no build at all. Both trees, since the
+recorded commit now describes the services in the archive as well as the module.
+
+`pack` refuses a recipe whose declared protocol range does not contain the
+version this build speaks. The range used to be a placeholder; the services in
+the archive are what makes it a claim.
 
 ## Open
 

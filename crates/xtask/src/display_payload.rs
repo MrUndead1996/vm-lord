@@ -50,8 +50,66 @@ pub(crate) fn parse<I: IntoIterator<Item = String>>(arguments: I) -> Result<Pack
     })
 }
 
+/// Whether a recipe's declared protocol range contains what this build speaks.
+///
+/// The host already declines a catalog entry whose range does not cover its
+/// version. This is the other half of that claim, checked where an archive is
+/// made rather than discovered inside a VM: the services in the archive are
+/// what the range is a promise about, and they are built from this tree.
+fn protocol_range_covers_this_build(
+    major: u32,
+    min_minor: u32,
+    max_minor: u32,
+) -> Result<(), String> {
+    let current = vmlord_display_protocol::handshake::CURRENT_VERSION;
+    if major != current.major || current.minor < min_minor || current.minor > max_minor {
+        return Err(format!(
+            "the recipe declares display protocol {major}.{min_minor}-{major}.{max_minor} and this build speaks {}.{}",
+            current.major, current.minor
+        ));
+    }
+
+    Ok(())
+}
+
+/// The `protocol` block of a recipe, and nothing else from it.
+///
+/// Read here rather than taken from the builder, which parses the recipe for
+/// its own purposes and does not hand it back. Two readers of one small file
+/// is cheaper than an accessor that exists for one caller.
+#[derive(serde::Deserialize)]
+struct RecipeProtocol {
+    protocol: DeclaredRange,
+}
+
+#[derive(serde::Deserialize)]
+struct DeclaredRange {
+    major: u32,
+    min_minor: u32,
+    max_minor: u32,
+}
+
+/// Checks the recipe's claim before anything is packed.
+fn check_recipe_protocol(recipe_path: &Path) -> Result<(), String> {
+    let bytes = fs::read(recipe_path)
+        .map_err(|error| format!("cannot read {}: {error}", recipe_path.display()))?;
+    let recipe: RecipeProtocol = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "{} is not a display payload recipe: {error}",
+            recipe_path.display()
+        )
+    })?;
+
+    protocol_range_covers_this_build(
+        recipe.protocol.major,
+        recipe.protocol.min_minor,
+        recipe.protocol.max_minor,
+    )
+}
+
 pub(crate) fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), String> {
     let command = parse(arguments)?;
+    check_recipe_protocol(&command.recipe)?;
     pack(PackRequest {
         prepared_directory: &command.input,
         recipe_path: &command.recipe,
@@ -109,7 +167,16 @@ pub(crate) fn stage_release_payload(source: &Path, destination: &Path) -> Result
 
 #[cfg(test)]
 mod tests {
-    use super::parse;
+    use super::{parse, protocol_range_covers_this_build};
+
+    #[test]
+    fn a_recipe_whose_range_excludes_this_build_is_refused() {
+        // The range used to be a placeholder. Now the services in the archive
+        // are what makes it a claim, so packing is where it is checked.
+        assert!(protocol_range_covers_this_build(1, 0, 0).is_ok());
+        assert!(protocol_range_covers_this_build(2, 0, 0).is_err());
+        assert!(protocol_range_covers_this_build(1, 3, 5).is_err());
+    }
 
     fn arguments(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| (*item).to_owned()).collect()

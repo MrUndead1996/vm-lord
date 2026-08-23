@@ -54,8 +54,9 @@ RUN set -eu; \
        "${PROTOCOL_MAJOR}" "${PROTOCOL_MIN_MINOR}" "${PROTOCOL_MAX_MINOR}" \
        "${SOURCE_URL}" "${COMMIT}" "${VERSION}" > /output/recipe.json
 
-# `content/services` leaves the build empty and stays empty until task #115 fills it.
-# It is created from the first version so that adding it later is not a second manifest
-# schema.
+# `content/services` leaves the build empty: the guest services are static musl binaries,
+# identical for every release, so `prepare.sh` installs them here after the image has run.
+# This image exists to prove the *module* compiles against a release's headers, and a Rust
+# toolchain in it would be a third toolchain for no gain.
 FROM scratch AS output
 COPY --from=layout /output /
