@@ -1,4 +1,4 @@
-//! The four modules that touch Win32, and the only `unsafe` in this crate.
+//! The five modules that touch Win32, and the only `unsafe` in this crate.
 //!
 //! The workspace denies `unsafe_code`; each declaration below re-allows it for
 //! one module and says what crosses that door. Everything else in the crate is
@@ -20,3 +20,8 @@ pub mod window;
 /// A D3D11 device, a swapchain, one texture, and the Direct2D overlay over it.
 #[allow(unsafe_code)]
 pub mod d3d;
+
+/// A low-level keyboard hook, so that the keys the shell takes first reach the
+/// guest instead.
+#[allow(unsafe_code)]
+pub mod hook;

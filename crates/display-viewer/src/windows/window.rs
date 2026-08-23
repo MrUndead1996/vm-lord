@@ -14,7 +14,7 @@ use std::{
     mem::ManuallyDrop,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::Sender,
     },
 };
@@ -24,20 +24,32 @@ use windows::{
         Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::Gdi::{CreateSolidBrush, UpdateWindow},
         System::LibraryLoader::GetModuleHandleW,
-        UI::WindowsAndMessaging::{
-            AdjustWindowRect, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
-            DispatchMessageW, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, IDC_ARROW,
-            LoadCursorW, MB_ICONERROR, MB_OK, MSG, MessageBoxW, PM_REMOVE, PeekMessageW,
-            PostMessageW, PostQuitMessage, RegisterClassW, SW_RESTORE, SW_SHOW,
-            SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
-            WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONUP, WM_QUIT, WM_SIZE, WNDCLASSW,
-            WS_OVERLAPPEDWINDOW,
+        UI::{
+            Controls::WM_MOUSELEAVE,
+            Input::KeyboardAndMouse::{
+                ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+            },
+            WindowsAndMessaging::{
+                AdjustWindowRect, AppendMenuW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
+                DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetClientRect, GetSystemMenu,
+                GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MB_ICONERROR, MB_OK, MF_SEPARATOR,
+                MF_STRING, MSG, MessageBoxW, PM_REMOVE, PeekMessageW, PostMessageW,
+                PostQuitMessage, RegisterClassW, SW_RESTORE, SW_SHOW, SetForegroundWindow,
+                SetWindowLongPtrW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_APP,
+                WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+                WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+                WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE,
+                WM_SYSCOMMAND, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+            },
         },
     },
     core::{HSTRING, PCWSTR},
 };
 
-use crate::status::{self, Button};
+use crate::{
+    input::{self, Report},
+    status::{self, Button},
+};
 
 /// The session thread has something for the window to draw.
 pub const WM_SIGNAL: u32 = WM_APP + 1;
@@ -47,6 +59,12 @@ pub const WM_FOCUS_REQUEST: u32 = WM_APP + 2;
 
 /// Another VMLord asked this window to close.
 pub const WM_CLOSE_REQUEST: u32 = WM_APP + 3;
+
+/// The system-menu item that sends `Ctrl+Alt+Del` to the guest.
+pub const SC_SEND_SAS: usize = 0x9010;
+
+/// The one that hands the keyboard back to Windows.
+pub const SC_RELEASE_KEYBOARD: usize = 0x9020;
 
 /// The class every viewer window is registered under.
 const CLASS_NAME: &str = "VMLordDisplayWindow";
@@ -62,6 +80,11 @@ pub struct Shared {
     /// A click is only ever a button while this is set: with the picture on
     /// screen there is nothing to press.
     pub failed: AtomicBool,
+    /// Whether `TrackMouseEvent` is armed, so that it is armed once per entry.
+    tracking: AtomicBool,
+    /// Which buttons are down, one bit each, so that the capture is released
+    /// when the last of them lifts rather than when the first does.
+    buttons: AtomicU32,
     events: Sender<UiEvent>,
 }
 
@@ -71,6 +94,8 @@ impl Shared {
     pub fn new(events: Sender<UiEvent>) -> Self {
         Self {
             failed: AtomicBool::new(false),
+            tracking: AtomicBool::new(false),
+            buttons: AtomicU32::new(0),
             events,
         }
     }
@@ -79,7 +104,10 @@ impl Shared {
     ///
     /// A window whose reader is gone is one that is closing, and blocking the
     /// pump to say so would be the wrong answer to it.
-    fn report(&self, event: UiEvent) {
+    ///
+    /// The keyboard hook reports through it too: it watches the same window
+    /// and its keys belong in the same queue as that window's mouse.
+    pub(crate) fn report(&self, event: UiEvent) {
         if self.events.send(event).is_err() {
             log::debug!("a {event:?} had nowhere to go: the session is already over");
         }
@@ -95,6 +123,8 @@ pub enum UiEvent {
     Resized(i32, i32),
     /// The user closed the window.
     Closing,
+    /// Something the user did with the keyboard or the mouse.
+    Input(Report),
 }
 
 /// One viewer window.
@@ -153,6 +183,24 @@ impl Window {
         // SAFETY: `hwnd` was just created and `pointer` came from
         // `Arc::into_raw`, so it is valid until `WM_DESTROY` takes it back.
         unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, pointer) };
+
+        // SAFETY: the window's own menu, which belongs to it until it is
+        // destroyed, and two strings that live across their calls.
+        unsafe {
+            let menu = GetSystemMenu(hwnd, false);
+            if !menu.is_invalid() {
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+                let send = HSTRING::from("Send Ctrl+Alt+Del");
+                let _ = AppendMenuW(menu, MF_STRING, SC_SEND_SAS, PCWSTR(send.as_ptr()));
+                let release = HSTRING::from("Release keyboard\tCtrl+Alt+Shift");
+                let _ = AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    SC_RELEASE_KEYBOARD,
+                    PCWSTR(release.as_ptr()),
+                );
+            }
+        }
 
         // SAFETY: `hwnd` is a window this process owns.
         unsafe {
@@ -343,18 +391,88 @@ extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
     let shared = ManuallyDrop::new(unsafe { Arc::from_raw(pointer as *const Shared) });
 
     match message {
-        WM_LBUTTONUP => {
-            // A click is a button only while the failed screen is up: with the
-            // guest's picture on screen there is nothing to press.
-            if shared.failed.load(Ordering::Relaxed) {
-                let (width, height) = client_size(hwnd);
-                let x = (lparam.0 & 0xffff) as i16 as i32;
-                let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
-                if let Some(button) = status::hit_test(width, height, x, y) {
-                    shared.report(UiEvent::Pressed(button));
+        WM_MOUSEMOVE => {
+            if !shared.failed.load(Ordering::Relaxed) {
+                if !shared.tracking.swap(true, Ordering::Relaxed) {
+                    track_leave(hwnd);
                 }
+                shared.report(UiEvent::Input(Report::Pointer {
+                    x: point(lparam.0, 0),
+                    y: point(lparam.0, 16),
+                }));
             }
             LRESULT(0)
+        }
+        WM_MOUSELEAVE => {
+            shared.tracking.store(false, Ordering::Relaxed);
+            shared.report(UiEvent::Input(Report::PointerLeft));
+            LRESULT(0)
+        }
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => {
+            if !shared.failed.load(Ordering::Relaxed)
+                && let Some(button) = button_of(message, wparam)
+            {
+                press(&shared, hwnd, button, true);
+            }
+            LRESULT(isize::from(message == WM_XBUTTONDOWN))
+        }
+        WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP => {
+            if shared.failed.load(Ordering::Relaxed) {
+                // A click is a button only while the failed screen is up: with
+                // the guest's picture on screen there is nothing to press.
+                if message == WM_LBUTTONUP {
+                    let (width, height) = client_size(hwnd);
+                    if let Some(button) =
+                        status::hit_test(width, height, point(lparam.0, 0), point(lparam.0, 16))
+                    {
+                        shared.report(UiEvent::Pressed(button));
+                    }
+                }
+            } else if let Some(button) = button_of(message, wparam) {
+                press(&shared, hwnd, button, false);
+            }
+            LRESULT(isize::from(message == WM_XBUTTONUP))
+        }
+        WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
+            if !shared.failed.load(Ordering::Relaxed) {
+                let delta = i32::from(((wparam.0 >> 16) & 0xffff) as i16);
+                let (horizontal, vertical) = if message == WM_MOUSEHWHEEL {
+                    (delta, 0)
+                } else {
+                    (0, delta)
+                };
+                shared.report(UiEvent::Input(Report::Wheel {
+                    horizontal,
+                    vertical,
+                }));
+            }
+            LRESULT(0)
+        }
+        WM_SETFOCUS => {
+            shared.report(UiEvent::Input(Report::FocusGained));
+            LRESULT(0)
+        }
+        WM_KILLFOCUS => {
+            shared.report(UiEvent::Input(Report::FocusLost));
+            LRESULT(0)
+        }
+        WM_SYSCOMMAND => {
+            match wparam.0 & 0xfff0 {
+                SC_SEND_SAS => {
+                    shared.report(UiEvent::Input(Report::SecureAttention));
+
+                    return LRESULT(0);
+                }
+                SC_RELEASE_KEYBOARD => {
+                    shared.report(UiEvent::Input(Report::ReleaseKeyboard));
+
+                    return LRESULT(0);
+                }
+                _ => {}
+            }
+
+            // SAFETY: the default handler, which owns Move, Size and Close.
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_SIZE => {
             let width = (lparam.0 & 0xffff) as i32;
@@ -389,17 +507,81 @@ extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
     }
 }
 
+/// One signed sixteen-bit half of an `lParam` point.
+fn point(lparam: isize, shift: u32) -> i32 {
+    i32::from(((lparam >> shift) & 0xffff) as i16)
+}
+
+/// The evdev button a mouse message names, if this build sends it.
+fn button_of(message: u32, wparam: WPARAM) -> Option<u16> {
+    Some(match message {
+        WM_LBUTTONDOWN | WM_LBUTTONUP => input::BTN_LEFT,
+        WM_RBUTTONDOWN | WM_RBUTTONUP => input::BTN_RIGHT,
+        WM_MBUTTONDOWN | WM_MBUTTONUP => input::BTN_MIDDLE,
+        WM_XBUTTONDOWN | WM_XBUTTONUP => match (wparam.0 >> 16) & 0xffff {
+            1 => input::BTN_SIDE,
+            2 => input::BTN_EXTRA,
+            _ => return None,
+        },
+        _ => return None,
+    })
+}
+
+/// Reports one button and keeps the capture for as long as any is held.
+///
+/// The capture is what makes a release outside the window still arrive, which
+/// is what keeps a drag from ending with a button the guest thinks is down.
+fn press(shared: &Shared, hwnd: HWND, button: u16, pressed: bool) {
+    let bit = 1u32 << u32::from(button - input::BTN_LEFT).min(31);
+    let held = if pressed {
+        shared.buttons.fetch_or(bit, Ordering::Relaxed) | bit
+    } else {
+        shared.buttons.fetch_and(!bit, Ordering::Relaxed) & !bit
+    };
+
+    // SAFETY: a capture on this process's own window.
+    unsafe {
+        if pressed {
+            let _ = SetCapture(hwnd);
+        } else if held == 0 {
+            let _ = ReleaseCapture();
+        }
+    }
+
+    shared.report(UiEvent::Input(Report::Button { button, pressed }));
+}
+
+/// Asks for one `WM_MOUSELEAVE` the next time the pointer goes.
+fn track_leave(hwnd: HWND) {
+    let mut track = TRACKMOUSEEVENT {
+        cbSize: u32::try_from(std::mem::size_of::<TRACKMOUSEEVENT>()).unwrap_or(0),
+        dwFlags: TME_LEAVE,
+        hwndTrack: hwnd,
+        dwHoverTime: 0,
+    };
+    // SAFETY: `track` lives across the call and names this process's window.
+    unsafe {
+        let _ = TrackMouseEvent(&raw mut track);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, atomic::Ordering, mpsc};
 
     use windows::Win32::{
         Foundation::{LPARAM, WPARAM},
-        UI::WindowsAndMessaging::{SendMessageW, WM_CLOSE, WM_LBUTTONUP},
+        UI::WindowsAndMessaging::{
+            SendMessageW, WM_CLOSE, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
+            WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SYSCOMMAND,
+        },
     };
 
-    use super::{Shared, UiEvent, WM_SIGNAL, Window};
-    use crate::status::{self, Button};
+    use super::{SC_RELEASE_KEYBOARD, SC_SEND_SAS, Shared, UiEvent, WM_SIGNAL, Window};
+    use crate::{
+        input::{BTN_RIGHT, Report},
+        status::{self, Button},
+    };
 
     fn shared() -> (Arc<Shared>, mpsc::Receiver<UiEvent>) {
         let (events, received) = mpsc::channel();
@@ -412,6 +594,152 @@ mod tests {
     /// event it is about rather than on an empty channel.
     fn drain(events: &mpsc::Receiver<UiEvent>) -> Vec<UiEvent> {
         events.try_iter().collect()
+    }
+
+    /// A shown window, with whatever showing it reported already taken.
+    fn opened(events: &mpsc::Receiver<UiEvent>, shared: &Arc<Shared>) -> Window {
+        let window = Window::open("test", 320, 240, Arc::clone(shared)).expect("a window");
+        let _ = drain(events);
+
+        window
+    }
+
+    #[test]
+    fn a_move_over_the_picture_is_reported_as_a_pointer_position() {
+        let (shared, events) = shared();
+        let window = opened(&events, &shared);
+
+        // SAFETY: a message sent to this process's own window.
+        unsafe {
+            SendMessageW(
+                window.handle(),
+                WM_MOUSEMOVE,
+                None,
+                Some(LPARAM((30 << 16) | 20)),
+            );
+        }
+
+        assert_eq!(
+            drain(&events),
+            vec![UiEvent::Input(Report::Pointer { x: 20, y: 30 })]
+        );
+    }
+
+    #[test]
+    fn a_press_and_release_are_reported_with_their_evdev_codes() {
+        let (shared, events) = shared();
+        let window = opened(&events, &shared);
+
+        // SAFETY: messages sent to this process's own window.
+        unsafe {
+            SendMessageW(window.handle(), WM_RBUTTONDOWN, None, Some(LPARAM(0)));
+            SendMessageW(window.handle(), WM_RBUTTONUP, None, Some(LPARAM(0)));
+        }
+
+        assert_eq!(
+            drain(&events),
+            vec![
+                UiEvent::Input(Report::Button {
+                    button: BTN_RIGHT,
+                    pressed: true
+                }),
+                UiEvent::Input(Report::Button {
+                    button: BTN_RIGHT,
+                    pressed: false
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_click_on_the_failed_screen_is_never_a_guest_press() {
+        let (shared, events) = shared();
+        let window = opened(&events, &shared);
+        shared.failed.store(true, Ordering::Relaxed);
+
+        // SAFETY: a message sent to this process's own window.
+        unsafe {
+            SendMessageW(window.handle(), WM_LBUTTONDOWN, None, Some(LPARAM(0)));
+        }
+
+        assert!(
+            drain(&events).is_empty(),
+            "with the overlay up there is no guest to click on"
+        );
+    }
+
+    #[test]
+    fn the_wheel_is_reported_in_the_units_it_arrived_in() {
+        let (shared, events) = shared();
+        let window = opened(&events, &shared);
+
+        // SAFETY: a message sent to this process's own window.
+        unsafe {
+            SendMessageW(
+                window.handle(),
+                WM_MOUSEWHEEL,
+                Some(WPARAM(((-240i32) as u32 as usize) << 16)),
+                Some(LPARAM(0)),
+            );
+        }
+
+        assert_eq!(
+            drain(&events),
+            vec![UiEvent::Input(Report::Wheel {
+                horizontal: 0,
+                vertical: -240
+            })]
+        );
+    }
+
+    #[test]
+    fn focus_is_reported_both_ways() {
+        let (shared, events) = shared();
+        let window = opened(&events, &shared);
+
+        // SAFETY: messages sent to this process's own window.
+        unsafe {
+            SendMessageW(window.handle(), WM_SETFOCUS, None, None);
+            SendMessageW(window.handle(), WM_KILLFOCUS, None, None);
+        }
+
+        assert_eq!(
+            drain(&events),
+            vec![
+                UiEvent::Input(Report::FocusGained),
+                UiEvent::Input(Report::FocusLost),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_menu_commands_are_reported_as_their_actions() {
+        let (shared, events) = shared();
+        let window = opened(&events, &shared);
+
+        // SAFETY: messages sent to this process's own window.
+        unsafe {
+            SendMessageW(
+                window.handle(),
+                WM_SYSCOMMAND,
+                Some(WPARAM(SC_SEND_SAS)),
+                Some(LPARAM(0)),
+            );
+            SendMessageW(
+                window.handle(),
+                WM_SYSCOMMAND,
+                Some(WPARAM(SC_RELEASE_KEYBOARD)),
+                Some(LPARAM(0)),
+            );
+        }
+
+        assert_eq!(
+            drain(&events),
+            vec![
+                UiEvent::Input(Report::SecureAttention),
+                UiEvent::Input(Report::ReleaseKeyboard),
+            ]
+        );
     }
 
     #[test]
