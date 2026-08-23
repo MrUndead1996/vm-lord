@@ -653,11 +653,16 @@ mod tests {
             let path = path.clone();
             move || {
                 let connection = Connection::connect(&path).unwrap();
+                // The growth, not the count: other tests in this process hold
+                // descriptors of their own, and what a leak looks like here is
+                // sixty-four more of them than there were a moment ago.
+                let before = open_descriptors();
                 for _ in 0..64 {
                     let (_, descriptors) = connection.receive().unwrap();
                     assert_eq!(descriptors.len(), 1);
                 }
-                open_descriptors()
+
+                open_descriptors().saturating_sub(before)
             }
         });
 
@@ -676,10 +681,10 @@ mod tests {
                 .unwrap();
         }
 
-        let after = client.join().unwrap();
+        let growth = client.join().unwrap();
         assert!(
-            after < 64,
-            "sixty-four descriptors were received and dropped; {after} are still open, which is a leak"
+            growth < 64,
+            "sixty-four descriptors were received and dropped; {growth} more are open than before, which is a leak"
         );
 
         fs::remove_file(&path).unwrap();
