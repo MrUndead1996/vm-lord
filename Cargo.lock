@@ -4647,6 +4647,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "vmlord-display-viewer"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "prost",
+ "prost-build",
+ "protox",
+ "vmlord-core",
+ "vmlord-display-codec",
+ "vmlord-display-protocol",
+ "windows 0.61.3",
+]
+
+[[package]]
 name = "vmlord-gpu-payload"
 version = "0.1.0"
 dependencies = [

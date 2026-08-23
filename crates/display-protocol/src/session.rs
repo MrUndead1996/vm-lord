@@ -7,6 +7,13 @@
 //! and if the guest services and the viewer each wrote their own half they
 //! would drift over exactly what must not drift: what goes into the hash, and
 //! in what order.
+//!
+//! A session need not be run by the process that opened it.
+//! [`Session::established_host`] takes a [`HandedOver`] -- what the handshake
+//! settled on, the session id, two channel keys and the control sequence -- and
+//! produces the established host half without a secret. That is how VMLord
+//! keeps the VM's secret while the viewer keeps the sockets, and it is the
+//! host's mirror of what the guest's broker does for its capture process.
 
 use std::{error::Error, fmt};
 
@@ -115,7 +122,10 @@ enum State {
 pub struct Session {
     role: Role,
     state: State,
-    secret: Secret,
+    /// The VM's secret, which only a session that runs its own handshake has.
+    /// A session built from a hand-over never sees one -- see
+    /// [`Session::established_host`].
+    secret: Option<Secret>,
     offer: Option<Offer>,
     support: Option<Support>,
     session_id: [u8; SESSION_ID_LEN],
@@ -131,6 +141,14 @@ pub struct Session {
     control_sequence: u32,
     /// Per channel, in `Channel` order: frame then input.
     channels: [ChannelState; 2],
+    /// The channel keys a hand-over carried, which outlive a reconnect.
+    ///
+    /// A session that handshook derives these from its session key and its
+    /// transcript whenever it needs them. One built from a hand-over has
+    /// neither, so it keeps what it was given: a channel key depends on the
+    /// session and the channel, never on the generation, so replacing a socket
+    /// does not replace it.
+    handover_keys: [Option<ChannelKey>; 2],
 }
 
 /// What one bound-or-binding frame or input socket holds.
@@ -141,6 +159,23 @@ struct ChannelState {
     guest_nonce: Option<[u8; NONCE_LEN]>,
     key: Option<ChannelKey>,
     sequence: u32,
+}
+
+/// An established session, as it crosses from one process to another.
+///
+/// Everything the receiving process needs and nothing it does not: no secret,
+/// no session key, no transcript. See [`Session::established_host`].
+pub struct HandedOver {
+    /// The 16 bytes that name the session across its three sockets.
+    pub session_id: [u8; SESSION_ID_LEN],
+    /// What the control handshake settled on.
+    pub negotiated: Negotiated,
+    /// The key the frame socket proves itself with.
+    pub frame_key: ChannelKey,
+    /// The key the input socket proves itself with.
+    pub input_key: ChannelKey,
+    /// The sequence the control channel carries on from.
+    pub control_sequence: u32,
 }
 
 impl Session {
@@ -187,7 +222,7 @@ impl Session {
         let mut session = Self {
             role: Role::Host,
             state: State::AwaitingServerHello,
-            secret: secret.duplicate(),
+            secret: Some(secret.duplicate()),
             offer: Some(offer),
             support: None,
             session_id,
@@ -201,6 +236,7 @@ impl Session {
             pending_auth: None,
             control_sequence: 0,
             channels: [ChannelState::default(), ChannelState::default()],
+            handover_keys: [None, None],
         };
 
         let record = session.control_record(ControlRecord::ClientHello, payload);
@@ -219,7 +255,7 @@ impl Session {
         Self {
             role: Role::Guest,
             state: State::AwaitingClientHello,
-            secret: secret.duplicate(),
+            secret: Some(secret.duplicate()),
             offer: None,
             support: Some(support),
             session_id: [0u8; SESSION_ID_LEN],
@@ -233,7 +269,83 @@ impl Session {
             pending_auth: None,
             control_sequence: 0,
             channels: [ChannelState::default(), ChannelState::default()],
+            handover_keys: [None, None],
         }
+    }
+
+    /// Builds the established host half of a session another process handshook.
+    ///
+    /// The process that holds the VM's secret runs the four control records and
+    /// hands the result here: what the handshake settled on, the session id,
+    /// the two channel keys, and where the control channel's numbering had got
+    /// to. This session derives nothing and holds no secret, which is the whole
+    /// point -- a viewer that is compromised loses one session's channel keys
+    /// and cannot open a second.
+    ///
+    /// The state is the one [`Session::handle`] would have reached, so
+    /// everything downstream -- [`Session::open_channel`],
+    /// [`Session::reconnect_channel`], [`Session::accept`] -- is this crate's
+    /// arithmetic rather than a caller's.
+    #[must_use]
+    pub fn established_host(handed_over: HandedOver) -> Self {
+        Self {
+            role: Role::Host,
+            state: State::Established,
+            secret: None,
+            offer: None,
+            support: None,
+            session_id: handed_over.session_id,
+            host_nonce: None,
+            guest_nonce: None,
+            transcript: Transcript::new(),
+            transcript_hash: None,
+            session_key: None,
+            negotiated: Some(handed_over.negotiated),
+            pending: None,
+            pending_auth: None,
+            control_sequence: handed_over.control_sequence,
+            channels: [ChannelState::default(), ChannelState::default()],
+            handover_keys: [Some(handed_over.frame_key), Some(handed_over.input_key)],
+        }
+    }
+
+    /// The sequence this session's next control record will carry.
+    ///
+    /// What a hand-over passes on, so that the process taking a session over
+    /// does not restart a stream the guest has already seen part of.
+    #[must_use]
+    pub fn control_sequence(&self) -> u32 {
+        self.control_sequence
+    }
+
+    /// Takes the next control sequence, advancing the counter.
+    ///
+    /// The session machine numbers the records it produces itself; this is for
+    /// the records a caller produces on an established session -- pings, pongs,
+    /// keyframe requests and the end of a session -- so that one counter serves
+    /// the whole channel.
+    pub fn take_control_sequence(&mut self) -> u32 {
+        let sequence = self.control_sequence;
+        self.control_sequence += 1;
+
+        sequence
+    }
+
+    /// Takes the next sequence on a bound channel, advancing the counter.
+    ///
+    /// The counterpart of [`Session::take_control_sequence`] for the records a
+    /// caller writes on a frame or input socket, so that the binding records
+    /// and the traffic after them share one counter.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Unexpected`] for [`Channel::Control`], which has its own.
+    pub fn take_channel_sequence(&mut self, channel: Channel) -> Result<u32, SessionError> {
+        let index = self.channel_index(channel)?;
+        let sequence = self.channels[index].sequence;
+        self.channels[index].sequence += 1;
+
+        Ok(sequence)
     }
 
     /// What the handshake settled on, once it has.
@@ -703,8 +815,18 @@ impl Session {
     /// Derives this session's key for `channel`, where it must be there.
     ///
     /// The infallible half of [`Session::derive_channel_key`], for the handlers
-    /// that only run once the session is established.
+    /// that only run once the session is established. A session built from a
+    /// hand-over has no session key to derive from and answers with the key it
+    /// was given.
     fn established_channel_key(&self, channel: Channel) -> ChannelKey {
+        let index = self
+            .channel_index(channel)
+            .expect("a channel key is never asked for on control");
+
+        if let Some(key) = self.handover_keys[index].as_ref() {
+            return ChannelKey::from_bytes(*key.to_bytes());
+        }
+
         keys::channel_key(
             self.session_key
                 .as_ref()
@@ -758,7 +880,9 @@ impl Session {
     fn derive_session_key(&mut self) {
         let hash = self.transcript.finish();
         let key = keys::session_key(
-            &self.secret,
+            self.secret
+                .as_ref()
+                .expect("a session that handshakes holds the secret"),
             &self.session_id,
             &self.host_nonce.expect("the client hello carried it"),
             &self.guest_nonce.expect("the server hello carried it"),
@@ -1414,5 +1538,168 @@ mod tests {
         );
 
         assert!(host.accept(&ping.header).is_ok());
+    }
+
+    /// Runs a full handshake and returns the host's session, the guest's, and
+    /// what a hand-over to another process would carry.
+    fn handshaken() -> (Session, Session, HandedOver) {
+        let secret = Secret::generate();
+        let (mut host, hello) = Session::host(
+            &secret,
+            Offer {
+                capabilities: vec![Capability::CursorStream],
+                mode: Mode::Auto,
+                width: 1920,
+                height: 1080,
+                tile_size: 32,
+            },
+        );
+        let mut guest = Session::guest(
+            &secret,
+            Support {
+                capabilities: vec![Capability::CursorStream],
+                modes: vec![Mode::Desktop],
+                tile_sizes: vec![16, 32, 64],
+                width: 1920,
+                height: 1080,
+            },
+        );
+
+        let server_hello = guest
+            .handle(&hello.header, &hello.payload)
+            .expect("a hello this guest can answer")
+            .reply
+            .expect("the guest answers a hello");
+        let server_auth = guest.pending_auth().expect("the guest queued its proof");
+
+        host.handle(&server_hello.header, &server_hello.payload)
+            .expect("an answer this host offered");
+        let client_auth = host
+            .handle(&server_auth.header, &server_auth.payload)
+            .expect("a proof this host can check")
+            .reply
+            .expect("the host answers with its own proof");
+        guest
+            .handle(&client_auth.header, &client_auth.payload)
+            .expect("a proof this guest can check");
+
+        let handed_over = HandedOver {
+            session_id: *host.session_id(),
+            negotiated: host.negotiated().expect("an established host").clone(),
+            frame_key: host
+                .derive_channel_key(Channel::Frame)
+                .expect("an established host"),
+            input_key: host
+                .derive_channel_key(Channel::Input)
+                .expect("an established host"),
+            control_sequence: host.control_sequence(),
+        };
+
+        (host, guest, handed_over)
+    }
+
+    /// Drives one channel bind between a handed-over host and a guest.
+    fn bind_from_hello(host: &mut Session, guest: &mut Session, hello: Record) -> Event {
+        let ack = guest
+            .handle(&hello.header, &hello.payload)
+            .expect("a channel hello this guest can answer")
+            .reply
+            .expect("the guest answers a channel hello");
+        let outcome = host
+            .handle(&ack.header, &ack.payload)
+            .expect("an ack this host can check");
+        let auth = outcome.reply.expect("the host answers with its own proof");
+        guest
+            .handle(&auth.header, &auth.payload)
+            .expect("a proof this guest can check");
+
+        outcome.event
+    }
+
+    #[test]
+    fn a_handed_over_session_binds_its_channels_without_the_secret() {
+        let (_, mut guest, handed_over) = handshaken();
+        let mut viewer = Session::established_host(handed_over);
+
+        let hello = viewer
+            .open_channel(Channel::Frame)
+            .expect("an established host opens channels");
+        assert_eq!(
+            bind_from_hello(&mut viewer, &mut guest, hello),
+            Event::ChannelBound(Channel::Frame)
+        );
+
+        let hello = viewer
+            .open_channel(Channel::Input)
+            .expect("an established host opens channels");
+        assert_eq!(
+            bind_from_hello(&mut viewer, &mut guest, hello),
+            Event::ChannelBound(Channel::Input)
+        );
+    }
+
+    #[test]
+    fn a_handed_over_session_reconnects_a_channel_at_the_next_generation() {
+        let (_, mut guest, handed_over) = handshaken();
+        let mut viewer = Session::established_host(handed_over);
+
+        let hello = viewer.open_channel(Channel::Frame).expect("generation 0");
+        bind_from_hello(&mut viewer, &mut guest, hello);
+        assert_eq!(viewer.generation(Channel::Frame), 0);
+
+        // The key survives the reconnect: it was handed over rather than
+        // derived, and there is no session key here to derive it again from.
+        let hello = viewer
+            .reconnect_channel(Channel::Frame)
+            .expect("a channel may be replaced");
+        assert_eq!(viewer.generation(Channel::Frame), 1);
+        assert_eq!(
+            bind_from_hello(&mut viewer, &mut guest, hello),
+            Event::ChannelBound(Channel::Frame)
+        );
+    }
+
+    #[test]
+    fn a_handed_over_session_refuses_a_record_from_the_generation_it_replaced() {
+        let (_, mut guest, handed_over) = handshaken();
+        let mut viewer = Session::established_host(handed_over);
+
+        let hello = viewer.open_channel(Channel::Frame).expect("generation 0");
+        bind_from_hello(&mut viewer, &mut guest, hello);
+        let hello = viewer
+            .reconnect_channel(Channel::Frame)
+            .expect("a channel may be replaced");
+        bind_from_hello(&mut viewer, &mut guest, hello);
+
+        let stale = Record::new(
+            Channel::Frame,
+            FrameRecord::Keyframe as u16,
+            0,
+            0,
+            0,
+            vec![],
+        );
+        assert!(matches!(
+            viewer.accept(&stale.header),
+            Err(SessionError::StaleGeneration {
+                expected: 1,
+                found: 0,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_handed_over_session_carries_on_the_control_numbering_it_was_given() {
+        let (host, _, handed_over) = handshaken();
+        // The host wrote a `ClientHello` and a `ClientAuth`, so the next
+        // control record it would write is sequence 2.
+        assert_eq!(host.control_sequence(), 2);
+
+        let mut viewer = Session::established_host(handed_over);
+        let ping = viewer.control_record(ControlRecord::Ping, Vec::new());
+
+        assert_eq!(ping.header.sequence, 2);
+        assert_eq!(viewer.control_sequence(), 3);
     }
 }

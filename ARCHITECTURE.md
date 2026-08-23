@@ -2910,6 +2910,54 @@ units and wait for the socket between them; a payload that carries no services
 is skipped rather than failed, because every payload built before this is one of
 those.
 
+### The native display viewer
+
+`crates/display-viewer` produces `vmlord-display.exe`: one process per display
+session, launched by VMLord with two anonymous pipes as its standard input and
+output. It is a process of its own because a session outlives the application
+that opened it -- closing or crashing VMLord leaves the desktop on screen, and a
+viewer that crashes does not touch the VM.
+
+The master secret stays in VMLord. The viewer holds the control socket and
+VMLord holds the secret, so neither can run the handshake alone: the viewer
+frames records off the socket and passes the bytes up the pipe without parsing
+them, VMLord drives its own `Session` over them, and when the handshake
+completes it hands over the session id, what was negotiated, the control
+sequence and two `ChannelKey`s. Those keys are good for one session and no
+longer, and nothing sensitive is ever on the command line or in the environment
+-- the viewer takes no arguments at all. `Session::established_host` is the
+protocol crate's side of that crossing: an established host session with no
+secret and no session key, whose channel keys were given rather than derived.
+
+From the hand-over on, the viewer is autonomous. It owns all three `AF_HYPERV`
+connections -- control `VMLD`, frame `VMLF`, input `VMLI`, addressed by the
+partition's runtime id and a service GUID derived from the vsock port -- pings
+every five seconds, rebinds a frame channel at the next generation when a record
+cannot be decoded, and asks VMLord for a fresh `ClientHello` (with the token it
+was launched with, so only that VMLord can answer) when control is lost. Frames
+are decoded by `vmlord-display-codec` and uploaded to a D3D11 texture as the
+rectangles that changed, never as whole frames.
+
+One window per VM. A named mutex `Local\VMLord.Display.{runtime-id}` answers
+whether a viewer already exists before anything else happens, and a named pipe
+`\\.\pipe\vmlord-display.{runtime-id}` -- authenticated by the launching
+user's default DACL -- carries the only two things a later VMLord may ask for:
+focus and close. Asking for a *new session* is deliberately not on that pipe.
+So a repeated Connect focuses the window that is there rather than opening a
+second one.
+
+`unsafe` lives in `src/windows/{hvsocket, ipc, window, d3d}.rs` and nowhere else
+in the crate: the workspace denies it, and those four module declarations are
+the only places it is re-allowed. Every other decision the viewer makes -- the
+status machine and its thirty-second retry budget, the decode path, the launch
+contract, the overlay's geometry -- is safe Rust with tests that need no
+partition. Framebuffer and cursor content is never logged, and this build has no
+screenshot feature.
+
+What is deliberately not there yet: keyboard and mouse input (#119); letterbox,
+fullscreen, dynamic resolution and saved window state (#120); and the HCS
+service entries and the Connect path that launches the binary (#121).
+
 ### Desktop profile and display provisioning
 
 What a VM asks of its desktop, what installing that desktop came to, and what
