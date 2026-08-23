@@ -8,6 +8,7 @@
 
 pub mod launch;
 pub mod log;
+pub mod status;
 
 /// The generated types for the launch pipes' private schema.
 pub mod viewer {
