@@ -263,7 +263,9 @@ mod tests {
                 let (kind, is_frame, bytes) = match payload {
                     Payload::Keyframe(bytes) => (FrameRecord::Keyframe, true, bytes.to_vec()),
                     Payload::TileDelta(bytes) => (FrameRecord::TileDelta, true, bytes.to_vec()),
-                    Payload::CursorImage(bytes) => (FrameRecord::CursorImage, false, bytes.to_vec()),
+                    Payload::CursorImage(bytes) => {
+                        (FrameRecord::CursorImage, false, bytes.to_vec())
+                    }
                     Payload::CursorPosition(bytes) => {
                         (FrameRecord::CursorPosition, false, bytes.to_vec())
                     }
@@ -301,7 +303,9 @@ mod tests {
     fn a_second_stream_config_replaces_the_decoder() {
         let mut video = Video::new();
         let first = config_record(320, 200, 32);
-        video.apply(&first.header, &first.payload).expect("a config");
+        video
+            .apply(&first.header, &first.payload)
+            .expect("a config");
 
         let second = config_record(640, 480, 64);
         video

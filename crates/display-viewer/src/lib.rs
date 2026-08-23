@@ -6,8 +6,11 @@
 //! the session states, the decode path -- and `src/windows/` is the four
 //! modules that touch Win32.
 
+#[cfg(test)]
+pub(crate) mod duplex;
 pub mod launch;
 pub mod log;
+pub mod relay;
 pub mod status;
 pub mod video;
 
