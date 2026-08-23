@@ -13,6 +13,7 @@ use std::{
     collections::HashSet,
     env,
     io::{self, ErrorKind},
+    os::fd::{AsFd, OwnedFd},
     path::PathBuf,
     sync::{Arc, Condvar, Mutex},
     thread,
@@ -64,6 +65,8 @@ pub struct Options {
     pub secret_path: PathBuf,
     /// The socket the unprivileged process connects to.
     pub socket: PathBuf,
+    /// Where the kernel's uinput device is.
+    pub uinput: PathBuf,
     /// The user that process runs as, which is the only one let in.
     pub user: String,
     /// How long to wait for the card.
@@ -87,6 +90,7 @@ impl Options {
             )
             .into(),
             socket: text("VMLORD_DISPLAY_SOCKET", SOCKET_PATH).into(),
+            uinput: text("VMLORD_DISPLAY_UINPUT", crate::uinput::DEVICE_PATH).into(),
             user: text("VMLORD_DISPLAY_USER", SERVICE_USER),
             device_deadline: DEVICE_DEADLINE,
         }
@@ -195,10 +199,21 @@ fn serve(options: &Options) -> io::Result<()> {
 
     let shared: Shared = Arc::new((Mutex::new(BrokerState::default()), Condvar::new()));
 
+    // Created once and held for the guest's lifetime: neither a rebound input
+    // channel nor a whole new session makes the desktop see its keyboard
+    // disconnect. A guest without them shows a read-only display.
+    let devices = open_devices(&options.uinput);
+    if devices.is_none() {
+        let (lock, _) = &*shared;
+        lock.lock().expect("the broker's lock is not poisoned").fault =
+            Some("this guest has no input devices".to_owned());
+    }
+
     thread::scope(|scope| {
         let ipc = {
             let shared = Arc::clone(&shared);
-            scope.spawn(move || serve_peers(&listener, uid, &shared))
+            let devices = devices.as_ref();
+            scope.spawn(move || serve_peers(&listener, uid, &shared, devices))
         };
         let capture = {
             let shared = Arc::clone(&shared);
@@ -214,6 +229,24 @@ fn serve(options: &Options) -> io::Result<()> {
     });
 
     Ok(())
+}
+
+/// The two input devices, or nothing at all.
+///
+/// A failure here degrades the display rather than breaking the VM, which is
+/// the rule #114 set for the DRM side: a desktop with no keyboard is worth
+/// more than a VM that refused to show one.
+fn open_devices(path: &std::path::Path) -> Option<(OwnedFd, OwnedFd)> {
+    match crate::uinput::create(path) {
+        Ok(devices) => Some(devices),
+        Err(error) => {
+            eprintln!(
+                "vmlord-display-broker: this guest has no input devices ({error}); the display will be read-only"
+            );
+
+            None
+        }
+    }
 }
 
 /// Reads the guest's secret, which is the one thing this process holds that the
@@ -247,7 +280,12 @@ fn service_account(user: &str) -> io::Result<(libc::uid_t, libc::gid_t)> {
 }
 
 /// Accepts the unprivileged process and reads what it asks for.
-fn serve_peers(listener: &Listener, expected_uid: libc::uid_t, shared: &Shared) {
+fn serve_peers(
+    listener: &Listener,
+    expected_uid: libc::uid_t,
+    shared: &Shared,
+    devices: Option<&(OwnedFd, OwnedFd)>,
+) {
     loop {
         if stopping(shared) {
             return;
@@ -265,13 +303,17 @@ fn serve_peers(listener: &Listener, expected_uid: libc::uid_t, shared: &Shared) 
             }
         };
 
-        adopt_peer(shared, &connection);
-        read_peer(&connection, shared);
+        adopt_peer(shared, &connection, devices);
+        read_peer(&connection, shared, devices);
     }
 }
 
 /// Makes a new connection the peer, and tells it what it missed.
-fn adopt_peer(shared: &Shared, connection: &Arc<Connection>) {
+fn adopt_peer(
+    shared: &Shared,
+    connection: &Arc<Connection>,
+    devices: Option<&(OwnedFd, OwnedFd)>,
+) {
     let (lock, signal) = &**shared;
     let mut state = lock.lock().expect("the broker's lock is not poisoned");
 
@@ -281,6 +323,9 @@ fn adopt_peer(shared: &Shared, connection: &Arc<Connection>) {
     state.sent.clear();
     state.wants_frame = false;
 
+    // The devices before the session: a peer that learned its parameters first
+    // would drop the input records it read before they arrived.
+    send_devices(connection, devices);
     if let Some(parameters) = state.session.clone() {
         let _ = connection.send(&Message::SessionOpened(parameters), &[]);
     }
@@ -288,7 +333,11 @@ fn adopt_peer(shared: &Shared, connection: &Arc<Connection>) {
 }
 
 /// Reads one peer until it goes away.
-fn read_peer(connection: &Arc<Connection>, shared: &Shared) {
+fn read_peer(
+    connection: &Arc<Connection>,
+    shared: &Shared,
+    devices: Option<&(OwnedFd, OwnedFd)>,
+) {
     loop {
         let Ok((message, _)) = connection.receive() else {
             return;
@@ -308,6 +357,7 @@ fn read_peer(connection: &Arc<Connection>, shared: &Shared) {
 
         match message {
             Message::Attach => {
+                send_devices(connection, devices);
                 if let Some(parameters) = state.session.clone() {
                     let _ = connection.send(&Message::SessionOpened(parameters), &[]);
                 }
@@ -324,6 +374,13 @@ fn read_peer(connection: &Arc<Connection>, shared: &Shared) {
             // peer's, and a peer that sends one is confused rather than hostile.
             other => eprintln!("vmlord-display-broker: ignoring {other:?} from the peer"),
         }
+    }
+}
+
+/// Hands the peer the two devices, if this guest has any.
+fn send_devices(connection: &Connection, devices: Option<&(OwnedFd, OwnedFd)>) {
+    if let Some((keyboard, pointer)) = devices {
+        let _ = connection.send(&Message::InputDevices, &[keyboard.as_fd(), pointer.as_fd()]);
     }
 }
 
@@ -601,5 +658,14 @@ mod tests {
         })
         .expect_err("a guest whose module never loaded has no display");
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn a_broker_with_no_uinput_carries_on_without_input() {
+        // A guest whose kernel has no uinput still shows a desktop. What it
+        // must not do is fail to start one.
+        let devices = super::open_devices(std::path::Path::new("/nonexistent/uinput"));
+
+        assert!(devices.is_none());
     }
 }
