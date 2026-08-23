@@ -232,6 +232,32 @@ pub fn decode(bytes: &[u8]) -> Result<Message, LaunchError> {
     Ok(message)
 }
 
+/// Reads the one message a viewer must be started with.
+///
+/// A viewer launched with no usable standard input -- double-clicked from
+/// Explorer, say -- has no VM to talk to and invents none. What comes back is
+/// the message to put in the error window before exiting.
+///
+/// # Errors
+///
+/// The text to show the user, for a pipe with nothing on it or a first message
+/// that is not [`Message::Launch`].
+pub fn first_parameters<R: Read, W: Write>(
+    link: &mut Link<R, W>,
+) -> Result<LaunchParameters, String> {
+    match link.read() {
+        Ok(Message::Launch(parameters)) => Ok(parameters),
+        Ok(other) => Err(format!(
+            "VMLord Display was started with a {other:?} rather than its launch parameters. \
+             It is opened from VMLord, through Connect on a VM's display."
+        )),
+        Err(error) => Err(format!(
+            "VMLord Display cannot be started on its own ({error}). \
+             It is opened from VMLord, through Connect on a VM's display."
+        )),
+    }
+}
+
 /// The pair of pipes, framed.
 ///
 /// Generic over the two halves so that a test can put them in memory: what the
@@ -498,5 +524,33 @@ mod tests {
         let mut link = Link::new(prefix.as_slice(), io::sink());
 
         assert!(matches!(link.read(), Err(LaunchError::TooLarge { .. })));
+    }
+
+    #[test]
+    fn a_viewer_started_without_launch_parameters_says_how_it_is_started() {
+        // What a double-click from Explorer produces: no parent, no pipe, no
+        // first message.
+        let mut link = Link::new(io::empty(), io::sink());
+        let outcome = super::first_parameters(&mut link);
+
+        let message = outcome.expect_err("there are no parameters on an empty pipe");
+        assert!(
+            message.contains("VMLord"),
+            "the message must name the only supported way to start this program"
+        );
+    }
+
+    #[test]
+    fn a_first_message_that_is_not_launch_parameters_is_refused() {
+        let mut pipe = Vec::new();
+        {
+            let mut link = Link::new(io::empty(), &mut pipe);
+            link.write(&Message::Command(Command::Focus))
+                .expect("an in-memory writer");
+        }
+
+        let mut link = Link::new(pipe.as_slice(), io::sink());
+
+        assert!(super::first_parameters(&mut link).is_err());
     }
 }

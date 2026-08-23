@@ -27,10 +27,11 @@ use windows::{
         UI::WindowsAndMessaging::{
             AdjustWindowRect, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow,
             DispatchMessageW, GWLP_USERDATA, GetClientRect, GetWindowLongPtrW, IDC_ARROW,
-            LoadCursorW, MSG, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage,
-            RegisterClassW, SW_RESTORE, SW_SHOW, SetForegroundWindow, SetWindowLongPtrW,
-            ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY,
-            WM_ERASEBKGND, WM_LBUTTONUP, WM_QUIT, WM_SIZE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+            LoadCursorW, MB_ICONERROR, MB_OK, MSG, MessageBoxW, PM_REMOVE, PeekMessageW,
+            PostMessageW, PostQuitMessage, RegisterClassW, SW_RESTORE, SW_SHOW,
+            SetForegroundWindow, SetWindowLongPtrW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
+            WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONUP, WM_QUIT, WM_SIZE, WNDCLASSW,
+            WS_OVERLAPPEDWINDOW,
         },
     },
     core::{HSTRING, PCWSTR},
@@ -246,6 +247,26 @@ impl Poster {
                 LPARAM(0),
             );
         }
+    }
+}
+
+/// Puts one message in front of the user and waits for them to dismiss it.
+///
+/// The only thing a viewer that cannot start has to say. A message box rather
+/// than a log line: a program with no console and no window has nowhere else to
+/// put it.
+pub fn report(message: &str) {
+    let text = HSTRING::from(message);
+    let title = HSTRING::from("VMLord Display");
+
+    // SAFETY: both strings are NUL-terminated and live across the call.
+    unsafe {
+        MessageBoxW(
+            None,
+            PCWSTR(text.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_ICONERROR | MB_OK,
+        );
     }
 }
 

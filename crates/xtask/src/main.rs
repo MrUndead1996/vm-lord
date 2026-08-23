@@ -24,9 +24,12 @@ const APP_TARGET: &str = "x86_64-pc-windows-msvc";
 const AGENT_TARGET: &str = "x86_64-unknown-linux-musl";
 
 /// What `dist` collects, as (target directory, file name) pairs.
-const ARTIFACTS: [(&str, &str); 4] = [
+const ARTIFACTS: [(&str, &str); 5] = [
     (APP_TARGET, "vmlord.exe"),
     (APP_TARGET, "vmlord-com1.exe"),
+    // The display window, opened by VMLord for one VM at a time. It ships
+    // beside `vmlord.exe` because that is where the launcher looks for it.
+    (APP_TARGET, "vmlord-display.exe"),
     // Staged next to the executables by `crates/vmlord/build.rs`; the legacy
     // backend loads it by name from the application's own directory.
     (APP_TARGET, "appsandbox_core.dll"),
@@ -68,6 +71,17 @@ fn dist(payloads: Vec<dist_arguments::DistPayload>) -> Result<(), String> {
     cargo(
         &workspace,
         &["build", "-p", "vmlord", "--release", "--target", APP_TARGET],
+    )?;
+    cargo(
+        &workspace,
+        &[
+            "build",
+            "-p",
+            "vmlord-display-viewer",
+            "--release",
+            "--target",
+            APP_TARGET,
+        ],
     )?;
     cargo(
         &workspace,
