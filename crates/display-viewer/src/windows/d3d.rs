@@ -51,6 +51,7 @@ use windows::{
 };
 
 use crate::{
+    placement::place,
     status::{Progress, Status, buttons},
     video,
 };
@@ -361,9 +362,9 @@ impl Renderer {
 
     /// Copies the stream's texture into the back buffer.
     ///
-    /// The overlapping region rather than a stretch: scaling, letterboxing and
-    /// what to do with a window that is not the guest's size are #120's, and
-    /// guessing at them here would only be something to undo.
+    /// Where the picture goes is [`crate::placement`]'s, not this method's:
+    /// the input mapping reads the same value, and #120 turns today's crop
+    /// into letterboxing by changing that one function rather than two.
     fn blit(&self) -> Result<(), String> {
         let (Some(texture), Some(geometry)) = (self.texture.as_ref(), self.stream) else {
             return Ok(());
@@ -376,28 +377,35 @@ impl Renderer {
         // SAFETY: `descriptor` lives across the call.
         unsafe { back.GetDesc(&raw mut descriptor) };
 
-        let width = geometry.width().min(descriptor.Width);
-        let height = geometry.height().min(descriptor.Height);
-        if width == 0 || height == 0 {
+        let client_width = i32::try_from(descriptor.Width).unwrap_or(i32::MAX);
+        let client_height = i32::try_from(descriptor.Height).unwrap_or(i32::MAX);
+        let Some(placement) = place(
+            geometry.width(),
+            geometry.height(),
+            client_width,
+            client_height,
+        ) else {
             return Ok(());
-        }
+        };
 
         let region = D3D11_BOX {
             left: 0,
             top: 0,
             front: 0,
-            right: width,
-            bottom: height,
+            right: placement.width,
+            bottom: placement.height,
             back: 1,
         };
+        let destination_x = u32::try_from(placement.x).unwrap_or(0);
+        let destination_y = u32::try_from(placement.y).unwrap_or(0);
         // SAFETY: both textures are `B8G8R8A8_UNORM` and the region is inside
         // each of them.
         unsafe {
             self.context.CopySubresourceRegion(
                 &back,
                 0,
-                0,
-                0,
+                destination_x,
+                destination_y,
                 0,
                 texture,
                 0,
