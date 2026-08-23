@@ -15,6 +15,9 @@ pub mod relay;
 pub mod status;
 pub mod video;
 
+#[cfg(windows)]
+pub mod windows;
+
 /// The generated types for the launch pipes' private schema.
 pub mod viewer {
     /// One version module, the way the wire contract has one.
