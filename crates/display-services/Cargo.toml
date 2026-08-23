@@ -22,6 +22,9 @@ bench = false
 [dependencies]
 libc = { version = "0.2", default-features = false }
 prost = "0.14"
+# For the one path the guest's secret lives at, so there is never a second
+# spelling of it. Pure Rust, like everything else the guest side links.
+vmlord-agent-protocol = { path = "../agent-protocol" }
 vmlord-display-codec = { path = "../display-codec" }
 vmlord-display-protocol = { path = "../display-protocol" }
 

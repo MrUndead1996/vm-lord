@@ -4641,6 +4641,7 @@ dependencies = [
  "prost",
  "prost-build",
  "protox",
+ "vmlord-agent-protocol",
  "vmlord-display-codec",
  "vmlord-display-protocol",
 ]

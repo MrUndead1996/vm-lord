@@ -126,6 +126,45 @@ impl Stream {
         self.descriptor.as_raw_fd()
     }
 
+    /// Makes a read that waits longer than `patience` give up.
+    ///
+    /// What this buys is not a limit on the session -- an idle desktop is the
+    /// ordinary state -- but a reader that comes up for air, so a thread
+    /// blocked on a quiet host still notices what the rest of the process has
+    /// decided. The protocol reports it as [`RecordError::Idle`], which is not
+    /// a fault.
+    ///
+    /// [`RecordError::Idle`]: vmlord_display_protocol::record::RecordError::Idle
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if the option cannot be set.
+    pub fn set_read_timeout(&self, patience: std::time::Duration) -> io::Result<()> {
+        let timeout = libc::timeval {
+            // The two fields change width between musl releases, so they are
+            // converted to whatever this target's `timeval` actually holds
+            // rather than to a type alias that is on its way out.
+            tv_sec: patience.as_secs() as _,
+            tv_usec: patience.subsec_micros() as _,
+        };
+        // SAFETY: `timeout` is a live, initialized `timeval` and the length is
+        // its exact size; the descriptor is this stream's own.
+        let result = unsafe {
+            libc::setsockopt(
+                self.descriptor.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                (&raw const timeout).cast(),
+                size_of_val(&timeout) as libc::socklen_t,
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+
     /// Ends the connection in both directions, waking whoever is reading it.
     ///
     /// This is how a blocked read is stopped: `shutdown` is safe to make from

@@ -1,6 +1,10 @@
 //! The privileged half of the guest display services.
 //!
-//! Filled in by task #115's broker task; this is the entry point the manifest
-//! and the systemd unit already name.
+//! It owns the DRM device, the VM's secret and the control channel, and hands
+//! the unprivileged half read-only dma-bufs and one channel key per socket.
 
-fn main() {}
+fn main() -> std::process::ExitCode {
+    vmlord_display_services::broker_main::run(
+        vmlord_display_services::broker_main::Options::from_env(),
+    )
+}

@@ -245,8 +245,12 @@ impl Control {
         self.write(stream, ControlRecord::DisplayState, state.encode_to_vec());
     }
 
-    /// Writes an `Error` record, for a request refused or a session ended.
-    fn report<S: Read + Write>(&mut self, stream: &mut S, code: ErrorCode, detail: &str) {
+    /// Writes an `Error` record, for a request refused or a fault to report.
+    ///
+    /// Public because a fault the broker meets is not always one this module
+    /// saw: a capture that fails is discovered by another thread, and the host
+    /// is owed the reason on the one socket it is listening to.
+    pub fn report<S: Read + Write>(&mut self, stream: &mut S, code: ErrorCode, detail: &str) {
         let error = vmlord_display_protocol::v1::Error {
             code: code as i32,
             detail: detail.to_owned(),
