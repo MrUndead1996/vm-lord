@@ -27,6 +27,9 @@ pub enum Message {
     },
     /// The viewer needs a whole frame.
     KeyframeRequested,
+    /// The guest's keyboard and pointer, whose descriptors are attached to the
+    /// datagram in that order.
+    InputDevices,
     /// What the planes hold at one vblank.
     Snapshot {
         /// The vblank this was taken at.
@@ -156,6 +159,7 @@ fn into_wire(message: &Message) -> envelope::Message {
         Message::KeyframeRequested => {
             envelope::Message::KeyframeRequested(broker::KeyframeRequested {})
         }
+        Message::InputDevices => envelope::Message::InputDevices(broker::InputDevices {}),
         Message::Snapshot {
             sequence,
             planes,
@@ -188,6 +192,7 @@ fn from_wire(message: envelope::Message) -> Result<Message, IpcError> {
             reason: closed.reason,
         },
         envelope::Message::KeyframeRequested(_) => Message::KeyframeRequested,
+        envelope::Message::InputDevices(_) => Message::InputDevices,
         envelope::Message::Snapshot(snapshot) => Message::Snapshot {
             sequence: snapshot.sequence,
             planes: snapshot
@@ -348,5 +353,12 @@ mod tests {
         };
 
         assert_eq!((planes[0].x, planes[0].y), (-30, -7));
+    }
+
+    #[test]
+    fn the_input_devices_message_survives_a_round_trip() {
+        let message = Message::InputDevices;
+
+        assert_eq!(decode(&encode(&message)).expect("a message"), message);
     }
 }
