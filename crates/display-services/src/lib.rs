@@ -6,6 +6,7 @@
 //! passthrough leaves the broker.
 
 pub mod capture;
+pub mod channel;
 pub mod cursor;
 pub mod drm;
 pub mod ipc;
