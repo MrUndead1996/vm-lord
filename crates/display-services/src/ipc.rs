@@ -341,7 +341,8 @@ mod tests {
             }],
             new_buffers: Vec::new(),
         });
-        let Message::Snapshot { planes, .. } = decode(&encoded).expect("a message this build wrote")
+        let Message::Snapshot { planes, .. } =
+            decode(&encoded).expect("a message this build wrote")
         else {
             panic!("a snapshot decodes as a snapshot");
         };

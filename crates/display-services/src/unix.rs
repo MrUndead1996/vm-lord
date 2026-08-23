@@ -248,7 +248,11 @@ impl Connection {
             // SAFETY: `header` points at buffers that live across the call, and
             // their lengths are their real ones.
             let read = unsafe {
-                libc::recvmsg(self.descriptor.as_raw_fd(), &mut header, libc::MSG_CMSG_CLOEXEC)
+                libc::recvmsg(
+                    self.descriptor.as_raw_fd(),
+                    &mut header,
+                    libc::MSG_CMSG_CLOEXEC,
+                )
             };
             if read < 0 {
                 let error = io::Error::last_os_error();
@@ -350,8 +354,7 @@ fn take_descriptors(header: &libc::msghdr) -> Vec<OwnedFd> {
             if (*control_message).cmsg_level == libc::SOL_SOCKET
                 && (*control_message).cmsg_type == libc::SCM_RIGHTS
             {
-                let payload = (*control_message).cmsg_len as usize
-                    - libc::CMSG_LEN(0) as usize;
+                let payload = (*control_message).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
                 let count = payload / mem::size_of::<RawFd>();
                 let data = libc::CMSG_DATA(control_message);
                 for index in 0..count {
@@ -420,7 +423,8 @@ fn unix_address(path: &Path) -> io::Result<libc::sockaddr_un> {
     Ok(address)
 }
 
-fn c_string(path: &Path) -> io::Result<std::ffi::CString> {
+/// A path as a NUL-terminated string, for the calls that take one.
+pub(crate) fn c_string(path: &Path) -> io::Result<std::ffi::CString> {
     std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|error| io::Error::new(ErrorKind::InvalidInput, error))
 }

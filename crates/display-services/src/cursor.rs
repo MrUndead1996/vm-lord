@@ -51,7 +51,9 @@ pub fn place(
 /// One axis of a placement: where it starts, what is cut off the near edge, and
 /// what is left after the far edge cuts too.
 fn axis(position: i32, size: u32, frame: u32) -> (u32, u32, u32) {
-    let leading = u32::try_from(-position.min(0)).unwrap_or(u32::MAX).min(size);
+    let leading = u32::try_from(-position.min(0))
+        .unwrap_or(u32::MAX)
+        .min(size);
     let start = u32::try_from(position.max(0)).unwrap_or(u32::MAX);
     if start >= frame {
         return (start.min(frame), leading, 0);
@@ -186,7 +188,10 @@ mod tests {
             0xff00_0000,
             "a transparent pixel changes nothing"
         );
-        assert_eq!(frame[0], 0xff00_0000, "and nothing outside the cursor moves");
+        assert_eq!(
+            frame[0], 0xff00_0000,
+            "and nothing outside the cursor moves"
+        );
     }
 
     #[test]
