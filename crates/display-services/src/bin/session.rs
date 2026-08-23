@@ -1,6 +1,11 @@
 //! The unprivileged half of the guest display services.
 //!
-//! Filled in by task #115's session task; this is the entry point the manifest
-//! and the systemd unit already name.
+//! It captures, encodes and speaks the frame and input channels, and holds
+//! nothing worth stealing: read-only mappings and one channel key per socket,
+//! good for one session and no longer.
 
-fn main() {}
+fn main() -> std::process::ExitCode {
+    vmlord_display_services::session_main::run(
+        vmlord_display_services::session_main::Options::from_env(),
+    )
+}

@@ -146,6 +146,16 @@ impl ChannelKey {
     pub fn to_bytes(&self) -> Zeroizing<[u8; SECRET_LEN]> {
         Zeroizing::new(*self.0)
     }
+
+    /// A key from the bytes [`ChannelKey::to_bytes`] produced.
+    ///
+    /// The other half of handing a channel key to another process. It derives
+    /// nothing and checks nothing: a key is whatever the process that derived
+    /// it says, and a wrong one simply fails to bind.
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; SECRET_LEN]) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
 }
 
 /// Derives the session key both peers authenticate with.

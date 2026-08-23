@@ -183,6 +183,12 @@ impl Stream {
     }
 }
 
+impl std::os::fd::AsRawFd for Stream {
+    fn as_raw_fd(&self) -> RawFd {
+        self.descriptor.as_raw_fd()
+    }
+}
+
 impl Read for Stream {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         // SAFETY: `buffer` is a valid mutable byte slice for this call.

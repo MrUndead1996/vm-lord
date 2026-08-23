@@ -13,6 +13,7 @@ pub mod cursor;
 pub mod drm;
 pub mod ipc;
 pub mod pipeline;
+pub mod session_main;
 pub mod unix;
 pub mod vsock;
 

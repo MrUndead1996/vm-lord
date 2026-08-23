@@ -159,6 +159,32 @@ impl Connection {
     /// # Errors
     ///
     /// [`io::Error`] if the peer is gone or the datagram cannot be written.
+    /// Makes calls on this connection return rather than wait.
+    ///
+    /// For a caller that owns a loop of its own and cannot afford to block in
+    /// the middle of it. A receive with nothing to take then fails with
+    /// `EAGAIN` instead of waiting.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if the flag cannot be set.
+    pub fn set_nonblocking(&self) -> io::Result<()> {
+        // SAFETY: `fcntl` with these commands takes a descriptor and an int,
+        // and the descriptor is this connection's own.
+        let flags = unsafe { libc::fcntl(self.descriptor.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: as above.
+        checked(unsafe {
+            libc::fcntl(
+                self.descriptor.as_raw_fd(),
+                libc::F_SETFL,
+                flags | libc::O_NONBLOCK,
+            )
+        })
+    }
+
     pub fn send(&self, message: &Message, descriptors: &[BorrowedFd<'_>]) -> io::Result<()> {
         assert!(
             descriptors.len() <= MAX_DESCRIPTORS,
