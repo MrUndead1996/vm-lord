@@ -32,8 +32,8 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{
-            CloseHandle, ERROR_ALREADY_EXISTS, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ,
-            GENERIC_WRITE, GetLastError, HANDLE,
+            CloseHandle, ERROR_ALREADY_EXISTS, ERROR_NO_DATA, ERROR_PIPE_BUSY,
+            ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
         },
         Storage::FileSystem::{
             CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_MODE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
@@ -217,10 +217,13 @@ fn serve(pipe: HANDLE, sink: &Sender<Command>, running: &Arc<AtomicBool>) {
         let connected = unsafe { ConnectNamedPipe(pipe, None) };
         if connected.is_err() {
             // SAFETY: A thread-local read of the last error. A client that got
-            // in before the call is `ERROR_PIPE_CONNECTED`, which is a
-            // connection rather than a failure.
+            // in before the call is `ERROR_PIPE_CONNECTED`, and one that wrote
+            // its message and hung up before it is `ERROR_NO_DATA` -- what it
+            // left is still in the pipe's buffer. Both are a connection to
+            // read rather than a failure.
             let code = unsafe { GetLastError() };
-            if code != ERROR_PIPE_CONNECTED {
+            if code != ERROR_PIPE_CONNECTED && code != ERROR_NO_DATA {
+                log::debug!("the command pipe stopped listening: {code:?}");
                 break;
             }
         }

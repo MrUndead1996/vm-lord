@@ -196,6 +196,31 @@ impl Default for Video {
     }
 }
 
+/// A cursor bitmap as an alpha icon wants it: BGRA, premultiplied.
+///
+/// The codec hands over straight alpha, and `CreateIconIndirect` composites
+/// premultiplied. Doing the multiply here rather than in the renderer keeps it
+/// where it can be tested without a device -- and keeps a bitmap that does not
+/// match its own dimensions from being read past: the output is always
+/// `width * height * 4` bytes, and a short input is padded with transparency.
+#[must_use]
+pub fn premultiplied(image: &OwnedCursorImage) -> Vec<u8> {
+    let pixels = image.width as usize * image.height as usize;
+    let mut out = vec![0u8; pixels * 4];
+
+    for (index, chunk) in image.pixels.chunks_exact(4).take(pixels).enumerate() {
+        let alpha = u32::from(chunk[3]);
+        let target = &mut out[index * 4..index * 4 + 4];
+        for channel in 0..3 {
+            target[channel] = u8::try_from(u32::from(chunk[channel]) * alpha / 255)
+                .expect("a product of two bytes divided by 255");
+        }
+        target[3] = chunk[3];
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use prost::Message as _;
@@ -496,5 +521,41 @@ mod tests {
         for rect in tiles {
             assert!(grid.contains(&rect), "{rect:?} is not a tile of the grid");
         }
+    }
+
+    #[test]
+    fn a_cursor_bitmap_is_premultiplied_without_reading_past_its_rows() {
+        use vmlord_display_codec::OwnedCursorImage;
+
+        let image = OwnedCursorImage {
+            // Two pixels: opaque white, then half-transparent white.
+            pixels: vec![255, 255, 255, 255, 255, 255, 255, 128],
+            width: 2,
+            height: 1,
+            hotspot_x: 0,
+            hotspot_y: 0,
+        };
+
+        let bytes = super::premultiplied(&image);
+
+        assert_eq!(bytes.len(), 8);
+        assert_eq!(&bytes[0..4], &[255, 255, 255, 255]);
+        // 255 * 128 / 255 == 128, in every channel but alpha.
+        assert_eq!(&bytes[4..8], &[128, 128, 128, 128]);
+    }
+
+    #[test]
+    fn a_cursor_bitmap_whose_pixels_do_not_match_its_size_is_padded_rather_than_read_past() {
+        use vmlord_display_codec::OwnedCursorImage;
+
+        let image = OwnedCursorImage {
+            pixels: vec![255; 4],
+            width: 4,
+            height: 4,
+            hotspot_x: 0,
+            hotspot_y: 0,
+        };
+
+        assert_eq!(super::premultiplied(&image).len(), 4 * 4 * 4);
     }
 }

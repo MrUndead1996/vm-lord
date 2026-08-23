@@ -17,7 +17,6 @@ pub mod ipc;
 #[allow(unsafe_code)]
 pub mod window;
 
-// A D3D11 device, a swapchain, one texture, and the Direct2D overlay over it.
-// Task 10.
-// #[allow(unsafe_code)]
-// pub mod d3d;
+/// A D3D11 device, a swapchain, one texture, and the Direct2D overlay over it.
+#[allow(unsafe_code)]
+pub mod d3d;
