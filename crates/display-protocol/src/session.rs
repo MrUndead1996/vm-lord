@@ -591,7 +591,7 @@ impl Session {
 
         let host_nonce = nonce_from_wire(&hello.nonce)?;
         let guest_nonce: [u8; NONCE_LEN] = keys::random_bytes();
-        let key = self.derive_channel_key(channel);
+        let key = self.established_channel_key(channel);
         let tag = keys::channel_tag(&key, Role::Guest, channel, &host_nonce, &guest_nonce);
 
         self.channels[index].generation = hello.generation;
@@ -629,7 +629,7 @@ impl Session {
         let guest_nonce = nonce_from_wire(&ack.nonce)?;
         let offered = Tag::from_wire(&ack.tag).map_err(SessionError::Field)?;
 
-        let key = self.derive_channel_key(channel);
+        let key = self.established_channel_key(channel);
         let expected = keys::channel_tag(&key, Role::Guest, channel, &host_nonce, &guest_nonce);
         if !keys::verify(&expected, &offered) {
             return Err(SessionError::BadTag);
@@ -666,7 +666,7 @@ impl Session {
             .host_nonce
             .ok_or(SessionError::NotEstablished)?;
         let guest_nonce = self.channel_guest_nonce(channel)?;
-        let key = self.derive_channel_key(channel);
+        let key = self.established_channel_key(channel);
 
         let expected = keys::channel_tag(&key, Role::Host, channel, &host_nonce, &guest_nonce);
         if !keys::verify(&expected, &offered) {
@@ -680,8 +680,31 @@ impl Session {
         })
     }
 
-    /// Derives this session's key for `channel`.
-    fn derive_channel_key(&self, channel: Channel) -> ChannelKey {
+    /// The key `channel` will prove itself with, derived rather than remembered.
+    ///
+    /// [`Session::channel_key`] answers only once a socket has bound; this
+    /// answers as soon as the control handshake is done, which is what lets the
+    /// process that holds the secret hand a key to the process that holds the
+    /// socket. Returns `None` before the handshake completes and for
+    /// [`Channel::Control`], which binds nothing.
+    #[must_use]
+    pub fn derive_channel_key(&self, channel: Channel) -> Option<ChannelKey> {
+        if self.channel_index(channel).is_err() {
+            return None;
+        }
+
+        Some(keys::channel_key(
+            self.session_key.as_ref()?,
+            self.transcript_hash.as_ref()?,
+            channel,
+        ))
+    }
+
+    /// Derives this session's key for `channel`, where it must be there.
+    ///
+    /// The infallible half of [`Session::derive_channel_key`], for the handlers
+    /// that only run once the session is established.
+    fn established_channel_key(&self, channel: Channel) -> ChannelKey {
         keys::channel_key(
             self.session_key
                 .as_ref()
@@ -955,6 +978,42 @@ mod tests {
             width: 1920,
             height: 1080,
         }
+    }
+
+    #[test]
+    fn a_channel_key_can_be_derived_before_its_socket_binds() {
+        let secret = Secret::generate();
+        let (host, guest) = handshake(&secret, offer(), support());
+
+        // `ChannelKey` deliberately does not hand out its bytes, so the two are
+        // compared by what they produce: a tag under the same inputs.
+        let host_nonce = [1u8; NONCE_LEN];
+        let guest_nonce = [2u8; NONCE_LEN];
+        let tag = |session: &Session| {
+            session.derive_channel_key(Channel::Frame).map(|key| {
+                *keys::channel_tag(&key, Role::Guest, Channel::Frame, &host_nonce, &guest_nonce)
+                    .as_bytes()
+            })
+        };
+
+        assert_eq!(
+            tag(&guest),
+            tag(&host),
+            "both ends derive the same key from the same transcript"
+        );
+        assert!(tag(&guest).is_some(), "and an established session has one");
+        assert!(
+            guest.derive_channel_key(Channel::Control).is_none(),
+            "the control channel establishes sessions rather than binding to one"
+        );
+    }
+
+    #[test]
+    fn no_channel_key_exists_before_the_handshake_finishes() {
+        let secret = Secret::generate();
+        let guest = Session::guest(&secret, support());
+
+        assert!(guest.derive_channel_key(Channel::Frame).is_none());
     }
 
     /// Runs the four-record handshake between a host and a guest that hold the

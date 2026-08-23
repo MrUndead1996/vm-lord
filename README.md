@@ -110,6 +110,7 @@ application and a Linux guest agent. The commands are Cargo aliases, defined in
 | --- | --- | --- |
 | `cargo build -p vmlord` | the application, for the host toolchain | Windows |
 | `cargo agent` / `cargo agent-release` | the guest agent, `x86_64-unknown-linux-musl` | Windows, Linux |
+| `cargo display-services` | the guest display services, `x86_64-unknown-linux-musl` | Windows, Linux |
 | `cargo check-windows` | compile-checks the application through `x86_64-pc-windows-gnu` | WSL |
 | `cargo test-windows` | builds and runs the Windows tests | WSL |
 | `cargo dist` | release build of everything, collected into `target/dist/` | Windows |

@@ -43,6 +43,23 @@ const MODULES_LOAD: &str = "/etc/modules-load.d/vmlord-display.conf";
 const MODPROBE_OPTIONS: &str = "/etc/modprobe.d/vmlord-display.conf";
 const UNBIND_UNIT: &str = "/etc/systemd/system/vmlord-display-unbind-simpledrm.service";
 const DRM_DEVICES: &str = "/sys/class/drm";
+
+/// Where the two guest programs are installed. Beside the module's own unit,
+/// and named by the units this task ships.
+const SERVICES_INSTALL: &str = "/usr/local/lib/vmlord";
+/// Where their units go.
+const SYSTEMD_UNITS: &str = "/etc/systemd/system";
+/// The account the unprivileged half runs as.
+const SERVICE_USER: &str = "vmlord-display";
+/// The two programs, in the order they are started.
+const SERVICE_BINARIES: [&str; 2] = ["vmlord-display-broker", "vmlord-display-session"];
+/// Their units, which are the binaries' names with a suffix.
+const SERVICE_UNITS: [&str; 2] = [
+    "vmlord-display-broker.service",
+    "vmlord-display-session.service",
+];
+/// The socket the two halves meet on, which is how "started" is confirmed.
+const BROKER_SOCKET: &str = "/run/vmlord/display-broker.sock";
 const MODULE_VERSION: &str = "/sys/module/vmlord_drm/version";
 const MODULE_PARAM_WIDTH: &str = "/sys/module/vmlord_drm/parameters/width";
 const MODULE_PARAM_HEIGHT: &str = "/sys/module/vmlord_drm/parameters/height";
@@ -173,7 +190,7 @@ fn run_stages(
 
     load_stage(report, mode)?;
     device_stage(report)?;
-    services_stages(report);
+    services_stages(report, &payload_services(), Path::new(SERVICES_INSTALL))?;
     Ok(())
 }
 
@@ -219,7 +236,8 @@ fn run_update(
 
     match attempt {
         Ok(()) => {
-            services_stages(report);
+            services_stages(report, &payload_services(), Path::new(SERVICES_INSTALL))
+                .map_err(failed)?;
             Ok(())
         }
         Err(reason) => Err(roll_back(&before, &payload.version, reason)),
@@ -622,30 +640,261 @@ fn device_stage(report: &mut Report) -> Result<(), String> {
 fn verify(report: &mut Report, target_version: &str) -> Result<(), String> {
     device_stage(report)?;
     match loaded_version() {
-        Some(loaded) if loaded == target_version => Ok(()),
-        Some(loaded) => Err(format!(
-            "{MODULE} {loaded} is loaded, and the update installed {target_version}"
-        )),
-        None => Err(format!("{MODULE} does not say which version is loaded")),
+        Some(loaded) if loaded == target_version => {}
+        Some(loaded) => {
+            return Err(format!(
+                "{MODULE} {loaded} is loaded, and the update installed {target_version}"
+            ));
+        }
+        None => return Err(format!("{MODULE} does not say which version is loaded")),
+    }
+
+    verify_services()
+}
+
+/// The services half of a verification.
+///
+/// A failed verification is what makes an update roll back, so a payload whose
+/// services do not come up rolls back rather than being declared installed. A
+/// payload that carries none is not a failure: it is every payload built before
+/// this task.
+fn verify_services() -> Result<(), String> {
+    let services = payload_services();
+    let carried = fs::read_dir(&services)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    if !carried {
+        return Ok(());
+    }
+
+    if services_need_install(&services, Path::new(SERVICES_INSTALL)) {
+        return Err(format!(
+            "the display services in {SERVICES_INSTALL} are not the ones this payload carries"
+        ));
+    }
+    for unit in SERVICE_UNITS {
+        if !unit_is_active(unit) {
+            return Err(format!("{unit} is not running after the update"));
+        }
+    }
+
+    Ok(())
+}
+
+/// Installs the two guest programs and their units, and starts them.
+///
+/// A payload that carries no services is skipped and never failed, with the
+/// reason said out loud: every payload built before this task is one of those,
+/// and reporting it as a failure would make every such guest degraded.
+///
+/// # Errors
+///
+/// The reason the stage failed, which ends the recipe and leaves the display
+/// degraded while the VM keeps running.
+fn services_stages(report: &mut Report, services: &Path, installed: &Path) -> Result<(), String> {
+    let carried: Vec<String> = fs::read_dir(services)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    if carried.is_empty() {
+        let reason = "this payload carries no display services";
+        report.skipped(DisplayRecipeStep::Services, reason);
+        report.skipped(DisplayRecipeStep::ServicesStart, reason);
+
+        return Ok(());
+    }
+
+    if let Err(reason) = install_services(report, services, installed) {
+        report.failed(DisplayRecipeStep::Services, reason.clone());
+
+        return Err(reason);
+    }
+
+    if let Err(reason) = start_services(report) {
+        report.failed(DisplayRecipeStep::ServicesStart, reason.clone());
+
+        return Err(reason);
+    }
+
+    Ok(())
+}
+
+/// Puts the binaries and the units where systemd will find them.
+fn install_services(report: &mut Report, services: &Path, installed: &Path) -> Result<(), String> {
+    ensure_service_user()?;
+
+    if !services_need_install(services, installed) {
+        report.skipped(
+            DisplayRecipeStep::Services,
+            format!(
+                "the display services in {} are what this payload carries",
+                installed.display()
+            ),
+        );
+
+        return Ok(());
+    }
+
+    fs::create_dir_all(installed)
+        .map_err(|error| format!("{} could not be created: {error}", installed.display()))?;
+    for binary in SERVICE_BINARIES {
+        install_file(&services.join(binary), &installed.join(binary), 0o755)?;
+    }
+    for unit in SERVICE_UNITS {
+        install_file(
+            &services.join(unit),
+            &Path::new(SYSTEMD_UNITS).join(unit),
+            0o644,
+        )?;
+    }
+
+    let reloaded = command::run("systemctl", &["daemon-reload"], &[], SHORT_BUDGET);
+    if !reloaded.succeeded() {
+        return Err(failure("systemctl daemon-reload", &reloaded));
+    }
+    for unit in SERVICE_UNITS {
+        let enabled = command::run("systemctl", &["enable", unit], &[], SHORT_BUDGET);
+        if !enabled.succeeded() {
+            return Err(failure(&format!("systemctl enable {unit}"), &enabled));
+        }
+    }
+
+    report.ok(
+        DisplayRecipeStep::Services,
+        format!(
+            "installed the display services in {} and asked for them on every boot",
+            installed.display()
+        ),
+    );
+
+    Ok(())
+}
+
+/// Restarts both units and waits until they are actually up.
+fn start_services(report: &mut Report) -> Result<(), String> {
+    for unit in SERVICE_UNITS {
+        let restarted = command::run("systemctl", &["restart", unit], &[], SHORT_BUDGET);
+        if !restarted.succeeded() {
+            return Err(failure(&format!("systemctl restart {unit}"), &restarted));
+        }
+    }
+
+    // `restart` returns when systemd has started the process, not when the two
+    // halves have met. What proves they have is the socket between them.
+    let deadline = std::time::Instant::now() + SHORT_BUDGET;
+    loop {
+        if SERVICE_UNITS.iter().all(|unit| unit_is_active(unit))
+            && Path::new(BROKER_SOCKET).exists()
+        {
+            report.ok(
+                DisplayRecipeStep::ServicesStart,
+                "the display broker and session are running".to_owned(),
+            );
+
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the display services did not come up within {} seconds",
+                SHORT_BUDGET.as_secs()
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
 }
 
-/// The two stages that wait on task #115.
+/// Whether a unit is running right now.
+fn unit_is_active(unit: &str) -> bool {
+    command::run(
+        "systemctl",
+        &["is-active", "--quiet", unit],
+        &[],
+        SHORT_BUDGET,
+    )
+    .succeeded()
+}
+
+/// Makes sure the account the unprivileged half runs as exists.
 ///
-/// Skipped and never failed, with the reason said out loud: a payload that
-/// carries no services is the ordinary state of every payload this task ships,
-/// and reporting it as a failure would make every guest degraded.
-fn services_stages(report: &mut Report) {
-    let services = Path::new(PAYLOAD_MOUNT).join("content").join("services");
-    let empty = fs::read_dir(&services).is_ok_and(|mut entries| entries.next().is_none())
-        || !services.exists();
-    let reason = if empty {
-        "this payload carries no display services"
-    } else {
-        "installing display services is not implemented by this build"
+/// A `useradd` that fails because the account is already there is not a
+/// failure; a `getent` that then still cannot find it is.
+fn ensure_service_user() -> Result<(), String> {
+    if command::run("getent", &["passwd", SERVICE_USER], &[], SHORT_BUDGET).succeeded() {
+        return Ok(());
+    }
+
+    let _ = command::run(
+        "useradd",
+        &[
+            "--system",
+            "--no-create-home",
+            "--shell",
+            "/usr/sbin/nologin",
+            SERVICE_USER,
+        ],
+        &[],
+        SHORT_BUDGET,
+    );
+    if command::run("getent", &["passwd", SERVICE_USER], &[], SHORT_BUDGET).succeeded() {
+        return Ok(());
+    }
+
+    Err(format!(
+        "the {SERVICE_USER} account could not be created, and the display session will not run as root"
+    ))
+}
+
+/// Whether what the payload carries differs from what is installed.
+///
+/// By content rather than by timestamp: a payload is unpacked fresh every time,
+/// so every file's mtime is new and nothing would ever be skipped. A file the
+/// payload does not carry is not a reason to reinstall -- an older payload is
+/// allowed to carry fewer things than this build knows about.
+fn services_need_install(services: &Path, installed: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(services) else {
+        return false;
     };
-    report.skipped(DisplayRecipeStep::Services, reason);
-    report.skipped(DisplayRecipeStep::ServicesStart, reason);
+
+    entries.filter_map(Result::ok).any(|entry| {
+        let Ok(carried) = fs::read(entry.path()) else {
+            return false;
+        };
+        match fs::read(installed.join(entry.file_name())) {
+            Ok(there) => sha256_hex(&there) != sha256_hex(&carried),
+            // Nothing installed under that name is something to install.
+            Err(_) => true,
+        }
+    })
+}
+
+/// Copies one file and gives it the mode it is meant to have.
+fn install_file(from: &Path, to: &Path, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bytes =
+        fs::read(from).map_err(|error| format!("{} could not be read: {error}", from.display()))?;
+    if let Some(directory) = to.parent() {
+        fs::create_dir_all(directory)
+            .map_err(|error| format!("{} could not be created: {error}", directory.display()))?;
+    }
+    // Removed first: a running binary cannot be written over, but it can be
+    // replaced, and systemd will start the new one on the next restart.
+    let _ = fs::remove_file(to);
+    fs::write(to, &bytes)
+        .map_err(|error| format!("{} could not be written: {error}", to.display()))?;
+    fs::set_permissions(to, fs::Permissions::from_mode(mode))
+        .map_err(|error| format!("{} could not be given mode {mode:o}: {error}", to.display()))?;
+
+    Ok(())
+}
+
+/// Where the mounted payload keeps the guest services.
+fn payload_services() -> PathBuf {
+    Path::new(PAYLOAD_MOUNT).join("content").join("services")
 }
 
 /// Whether a DRM device belonging to this module is there.
@@ -717,6 +966,60 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn services_that_are_already_installed_are_not_copied_again() {
+        let payload = temporary("services-payload");
+        let installed = temporary("services-installed");
+        fs::write(payload.join("vmlord-display-broker"), b"binary").unwrap();
+        fs::write(installed.join("vmlord-display-broker"), b"binary").unwrap();
+
+        assert!(
+            !super::services_need_install(&payload, &installed),
+            "a guest already running what the payload carries needs no copy"
+        );
+    }
+
+    #[test]
+    fn a_service_whose_bytes_differ_is_reinstalled() {
+        let payload = temporary("services-changed-payload");
+        let installed = temporary("services-changed-installed");
+        fs::write(payload.join("vmlord-display-broker"), b"new").unwrap();
+        fs::write(installed.join("vmlord-display-broker"), b"old").unwrap();
+
+        assert!(super::services_need_install(&payload, &installed));
+    }
+
+    #[test]
+    fn a_service_that_is_not_installed_at_all_is_installed() {
+        let payload = temporary("services-absent-payload");
+        let installed = temporary("services-absent-installed");
+        fs::write(payload.join("vmlord-display-broker"), b"new").unwrap();
+
+        assert!(super::services_need_install(&payload, &installed));
+    }
+
+    #[test]
+    fn a_payload_that_carries_no_services_still_skips_rather_than_fails() {
+        // Every payload built before this task is one of these, and a failure
+        // here would make every such guest degraded.
+        let payload = temporary("services-empty-payload");
+        let installed = temporary("services-empty-installed");
+        let mut report = crate::display_recipe::Report::new();
+
+        assert!(super::services_stages(&mut report, &payload, &installed).is_ok());
+        let stages = report.finish("the recipe did not need this stage");
+
+        assert!(
+            stages
+                .iter()
+                .filter(|stage| matches!(
+                    stage.step(),
+                    DisplayRecipeStep::Services | DisplayRecipeStep::ServicesStart
+                ))
+                .all(|stage| stage.state() == DisplayRecipeStageState::Skipped)
+        );
     }
 
     #[test]

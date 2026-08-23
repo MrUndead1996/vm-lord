@@ -4634,6 +4634,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vmlord-display-services"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "prost",
+ "prost-build",
+ "protox",
+ "vmlord-agent-protocol",
+ "vmlord-display-codec",
+ "vmlord-display-protocol",
+]
+
+[[package]]
 name = "vmlord-gpu-payload"
 version = "0.1.0"
 dependencies = [
@@ -5706,9 +5719,11 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "vmlord-display-codec",
  "vmlord-display-payload",
+ "vmlord-display-protocol",
  "vmlord-gpu-payload",
  "vmlord-payload",
 ]

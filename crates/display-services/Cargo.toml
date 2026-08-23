@@ -1,0 +1,46 @@
+[package]
+name = "vmlord-display-services"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+build = "build.rs"
+
+# Guest programs, so they are not part of the workspace's default build -- see
+# `default-members` in the root manifest. Build them with:
+#
+#     cargo display-services
+[[bin]]
+name = "vmlord-display-broker"
+path = "src/bin/broker.rs"
+bench = false
+
+[[bin]]
+name = "vmlord-display-session"
+path = "src/bin/session.rs"
+bench = false
+
+[dependencies]
+libc = { version = "0.2", default-features = false }
+prost = "0.14"
+# For the one path the guest's secret lives at, so there is never a second
+# spelling of it. Pure Rust, like everything else the guest side links.
+vmlord-agent-protocol = { path = "../agent-protocol" }
+vmlord-display-codec = { path = "../display-codec" }
+vmlord-display-protocol = { path = "../display-protocol" }
+
+[build-dependencies]
+prost-build = "0.14"
+# Compiles the `.proto` in-process, so no `protoc` has to be installed on the
+# machine that builds a guest.
+protox = "0.9"
+
+[lints]
+# These are guest programs that own DRM, socket and mapping ABIs directly.
+# `unix.rs`, `vsock.rs` and `drm/` are the only modules that need unsafe calls
+# into the kernel ABI.
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

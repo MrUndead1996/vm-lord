@@ -1,0 +1,27 @@
+[Unit]
+Description=VMLord display capture and session
+Documentation=https://github.com/mrundead/vmlord
+# After, and deliberately not BindsTo: a broker restart must not take the
+# capture process down, and the process reconnects to the socket on its own.
+After=vmlord-display-broker.service
+
+[Service]
+ExecStart=/usr/local/lib/vmlord/vmlord-display-session
+User=vmlord-display
+Restart=on-failure
+RestartSec=2
+StartLimitIntervalSec=60
+StartLimitBurst=5
+# It holds a channel key and a mapping, and needs no privilege at all.
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+RestrictAddressFamilies=AF_VSOCK AF_UNIX
+RestrictNamespaces=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

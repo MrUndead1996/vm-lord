@@ -16,15 +16,18 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 usage() {
 	cat <<'USAGE'
-usage: prepare.sh --spec <payload.spec.json> --output <directory>
+usage: prepare.sh --spec <payload.spec.json> --output <directory> --services <directory>
 
-  --spec    the release to build, e.g. payloads/display/ubuntu-24.04-amd64/payload.spec.json
-  --output  where the prepared tree and recipe.json are written
+  --spec      the release to build, e.g. payloads/display/ubuntu-24.04-amd64/payload.spec.json
+  --output    where the prepared tree and recipe.json are written
+  --services  where the guest services were built, e.g.
+              target/x86_64-unknown-linux-musl/release -- run `cargo display-services` first
 USAGE
 }
 
 spec=""
 output=""
+services=""
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--spec)
@@ -33,6 +36,10 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--output)
 		output="${2-}"
+		shift 2 || true
+		;;
+	--services)
+		services="${2-}"
 		shift 2 || true
 		;;
 	-h | --help)
@@ -47,8 +54,8 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
-[[ -n "$spec" && -n "$output" ]] || {
-	echo "missing --spec or --output" >&2
+[[ -n "$spec" && -n "$output" && -n "$services" ]] || {
+	echo "missing --spec, --output or --services" >&2
 	usage >&2
 	exit 2
 }
@@ -56,10 +63,15 @@ done
 	echo "no such spec: $spec" >&2
 	exit 2
 }
+[[ -d "$services" ]] || {
+	echo "no such services directory: $services" >&2
+	exit 2
+}
 
 mkdir -p "$output"
 output="$(cd "$output" && pwd)"
 spec="$(cd "$(dirname "$spec")" && pwd)/$(basename "$spec")"
+services="$(cd "$services" && pwd)"
 
 # One field per line, read without jq so that a host with no jq can still build. The spec
 # is ours and its shape is fixed, so a line-oriented read is enough -- and a field that is
@@ -91,11 +103,16 @@ done
 # built from. A dirty tree is refused rather than recorded, because a commit that does not
 # describe what was built is worse than no build.
 COMMIT="$(git -C "$HERE" rev-parse HEAD)"
-if ! git -C "$HERE" diff --quiet HEAD -- "$HERE"; then
-	echo "payloads/display has uncommitted changes; commit them before packing a payload" >&2
-	echo "-- the recipe records a commit, and it has to be one that describes the build." >&2
-	exit 1
-fi
+# Both trees, because the recipe's commit now describes the services in the archive as
+# well as the module: the binaries are built from crates/display-services, and a commit
+# that predates what was copied in would be a provenance that lies.
+for tree in "$HERE" "$HERE/../../crates/display-services"; do
+	if ! git -C "$HERE" diff --quiet HEAD -- "$tree"; then
+		echo "$tree has uncommitted changes; commit them before packing a payload" >&2
+		echo "-- the recipe records a commit, and it has to be one that describes the build." >&2
+		exit 1
+	fi
+done
 
 # BuildKit's local exporter merges into the destination rather than replacing it, so a
 # leftover tree from an earlier run would be packed as if this build had produced it.
@@ -114,5 +131,18 @@ DOCKER_BUILDKIT=1 docker build \
 	--build-arg "PROTOCOL_MAX_MINOR=$PROTOCOL_MAX_MINOR" \
 	--output "type=local,dest=$output" \
 	"$HERE"
+
+# The services are built by the host toolchain, not in the image: a static musl binary is
+# identical for 22.04, 24.04 and 26.04, and the container exists to prove the *module*
+# compiles against a release's headers. A Rust toolchain in there would be a third
+# toolchain for no gain.
+for binary in vmlord-display-broker vmlord-display-session; do
+	[[ -x "$services/$binary" ]] || {
+		echo "$services does not hold $binary; run 'cargo display-services' first" >&2
+		exit 1
+	}
+	install -m 0755 "$services/$binary" "$output/prepared/content/services/$binary"
+done
+install -m 0644 "$HERE/services/"*.service "$output/prepared/content/services/"
 
 echo "prepared tree and recipe.json written to $output"

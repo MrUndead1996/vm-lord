@@ -5,6 +5,7 @@ members = [
     "crates/core",
     "crates/display-codec",
     "crates/display-payload",
+    "crates/display-services",
     "crates/display-protocol",
     "crates/image",
     "crates/gpu-payload",
@@ -18,11 +19,12 @@ members = [
     "crates/vmlord",
     "crates/xtask",
 ]
-# `crates/agent` is a Linux guest program and cannot be built for the host
-# target, so it stays out of the default set that `cargo build` and
-# `cargo test` operate on. It is built on its own:
+# `crates/agent` and `crates/display-services` are Linux guest programs and
+# cannot be built for the host target, so they stay out of the default set that
+# `cargo build` and `cargo test` operate on. They are built on their own:
 #
 #     cargo agent
+#     cargo display-services
 #
 # `crates/xtask` is build automation rather than product code, and is likewise
 # reached through an alias -- see `.cargo/config.toml`.

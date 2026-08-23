@@ -199,5 +199,27 @@ not research, and this is where each of those four stands:
   best-evidenced of the three and still not a booted guest. 6.8 and 7.x compile
   only in `payloads/display/prepare.sh`'s container, and the runtime proof for
   all three is task #128's mandatory matrix;
-- the capture backend itself -- **still task #115**, and it is what has to
-  composite the cursor plane that task #114 added.
+- the capture backend itself -- **built** in task #115, and unproven in a guest.
+  What exists is two programs in `crates/display-services`, both static musl
+  binaries. The privileged one opens the card by driver name rather than by
+  number, takes `DRM_CLIENT_CAP_UNIVERSAL_PLANES` without ever becoming DRM
+  master, waits on the vblank the module's hrtimer drives, walks the planes with
+  `GETPLANERESOURCES`/`GETPLANE`/`OBJ_GETPROPERTIES` and reads each framebuffer
+  with `GETFB2` -- which is the one call that needs `CAP_SYS_ADMIN`, and the
+  whole reason the privileged half is a separate process. Each framebuffer is
+  exported once with `PRIME_HANDLE_TO_FD` and **without** `DRM_RDWR`, so what
+  the unprivileged half receives is a buffer it cannot write. The cursor plane
+  task #114 added is composited by `cursor::place`/`cursor::composite`, which
+  crop rather than clamp, since `CRTC_X`/`CRTC_Y` go negative at the left and
+  top edges while the protocol's coordinates do not; a peer that took
+  `CAPABILITY_CURSOR_STREAM` gets the cursor as its own records instead.
+
+  What is proven is only what a development machine can prove: the ioctl
+  request numbers and structure widths are checked against this machine's own
+  `drm.h` and `drm_mode.h`, the cursor arithmetic and the frame pipeline are
+  covered by unit tests, and the session process is driven end to end against a
+  real `Session::host` over socketpairs. **No guest has run either binary.**
+  There is no vsock loopback on the development kernel, so even the listener
+  test skips; the runtime proof is task #128's mandatory matrix, along with a
+  real mutter putting the pointer on the cursor plane, GDM before login, and
+  2560x1440.

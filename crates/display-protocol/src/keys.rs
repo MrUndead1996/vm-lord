@@ -130,6 +130,32 @@ impl ChannelKey {
     fn expose(&self) -> &[u8; SECRET_LEN] {
         &self.0
     }
+
+    /// The key's bytes, for the one caller that must hand it to another
+    /// process.
+    ///
+    /// [`SessionKey`] has no such method and must not grow one: a session key
+    /// opens every channel and outlives them, while this one opens a single
+    /// channel of a single session and is worthless the moment that session
+    /// ends. That is the whole reason the broker derives channel keys and
+    /// passes those on rather than the secret.
+    ///
+    /// The bytes come back in a [`Zeroizing`] wrapper, so a copy that is only
+    /// serialised and dropped does not stay in this process's memory.
+    #[must_use]
+    pub fn to_bytes(&self) -> Zeroizing<[u8; SECRET_LEN]> {
+        Zeroizing::new(*self.0)
+    }
+
+    /// A key from the bytes [`ChannelKey::to_bytes`] produced.
+    ///
+    /// The other half of handing a channel key to another process. It derives
+    /// nothing and checks nothing: a key is whatever the process that derived
+    /// it says, and a wrong one simply fails to bind.
+    #[must_use]
+    pub fn from_bytes(bytes: [u8; SECRET_LEN]) -> Self {
+        Self(Zeroizing::new(bytes))
+    }
 }
 
 /// Derives the session key both peers authenticate with.
