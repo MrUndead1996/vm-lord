@@ -22,24 +22,35 @@ use std::{
 use windows::{
     Win32::{
         Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
-        Graphics::Gdi::{CreateSolidBrush, UpdateWindow},
+        Graphics::Gdi::{
+            CreateSolidBrush, GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+            MonitorFromWindow, UpdateWindow,
+        },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
             Controls::WM_MOUSELEAVE,
+            HiDpi::{
+                AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+                GetDpiForWindow, SetProcessDpiAwarenessContext,
+            },
             Input::KeyboardAndMouse::{
                 ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
             },
             WindowsAndMessaging::{
-                AdjustWindowRect, AppendMenuW, CW_USEDEFAULT, CreateWindowExW, DefWindowProcW,
-                DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetClientRect, GetSystemMenu,
-                GetWindowLongPtrW, IDC_ARROW, LoadCursorW, MB_ICONERROR, MB_OK, MF_SEPARATOR,
+                AdjustWindowRect, AppendMenuW, CW_USEDEFAULT, CheckMenuRadioItem, CreateWindowExW,
+                DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GWL_STYLE,
+                GetClientRect, GetSystemMenu, GetWindowLongPtrW, GetWindowPlacement, HWND_TOP,
+                IDC_ARROW, LoadCursorW, MB_ICONERROR, MB_OK, MF_BYCOMMAND, MF_SEPARATOR,
                 MF_STRING, MSG, MessageBoxW, PM_REMOVE, PeekMessageW, PostMessageW,
-                PostQuitMessage, RegisterClassW, SW_RESTORE, SW_SHOW, SetForegroundWindow,
-                SetWindowLongPtrW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_APP,
-                WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-                WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+                PostQuitMessage, RegisterClassW, SW_RESTORE, SW_SHOW,
+                SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+                SetForegroundWindow, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
+                ShowWindow, TranslateMessage, WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_STYLE,
+                WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_KILLFOCUS, WM_LBUTTONDOWN,
+                WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
                 WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE,
                 WM_SYSCOMMAND, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+                WS_POPUP,
             },
         },
     },
@@ -48,6 +59,7 @@ use windows::{
 
 use crate::{
     input::{self, Report},
+    state::{Quality, WindowState},
     status::{self, Button},
 };
 
@@ -65,6 +77,18 @@ pub const SC_SEND_SAS: usize = 0x9010;
 
 /// The one that hands the keyboard back to Windows.
 pub const SC_RELEASE_KEYBOARD: usize = 0x9020;
+
+/// The one that fills the monitor, and leaves it again.
+///
+/// `WM_SYSCOMMAND` masks the low four bits off a command, so every id here is
+/// a multiple of sixteen below `0xF000`, where the system's own live.
+pub const SC_FULLSCREEN: usize = 0x9030;
+
+/// Let the viewer choose the encoding mode.
+pub const SC_QUALITY_AUTO: usize = 0x9040;
+
+/// Encode a desktop, whatever the picture is doing.
+pub const SC_QUALITY_DESKTOP: usize = 0x9050;
 
 /// The class every viewer window is registered under.
 const CLASS_NAME: &str = "VMLordDisplayWindow";
@@ -119,8 +143,12 @@ impl Shared {
 pub enum UiEvent {
     /// A button on the failed screen was pressed.
     Pressed(Button),
-    /// The client area is now this big.
+    /// The client area is now this big, in physical pixels.
     Resized(i32, i32),
+    /// The user asked to fill the monitor, or to stop.
+    ToggleFullscreen,
+    /// The user picked an encoding mode from the system menu.
+    Quality(Quality),
     /// The user closed the window.
     Closing,
     /// Something the user did with the keyboard or the mouse.
@@ -132,18 +160,30 @@ pub struct Window {
     hwnd: HWND,
     /// Kept so that the shared state outlives every message the window handles.
     shared: Arc<Shared>,
+    /// The style and the placement to go back to, while the window is filling
+    /// a monitor. `None` when it is not.
+    restore: Option<(WINDOW_STYLE, WINDOWPLACEMENT)>,
 }
 
 impl Window {
-    /// Opens a window whose *client* area is `width` by `height`.
+    /// Opens a window where `state` left one.
+    ///
+    /// The size in `state` is the *client* area in physical pixels, which is
+    /// what the guest's mode is set from: this process is per-monitor DPI
+    /// aware, so a client rectangle is pixels rather than the scaled units an
+    /// unaware process would be handed. A viewer that asked for its logical
+    /// size would put a 150% desktop on a 1707x960 output and then scale it
+    /// back up to the 2560x1440 panel it was already on.
     ///
     /// # Errors
     ///
     /// A message naming the Win32 call that refused.
-    pub fn open(title: &str, width: i32, height: i32, shared: Arc<Shared>) -> Result<Self, String> {
+    pub fn open(title: &str, state: &WindowState, shared: Arc<Shared>) -> Result<Self, String> {
         let class = HSTRING::from(CLASS_NAME);
         register_class(&class)?;
 
+        let width = i32::try_from(state.size.0).unwrap_or(1920);
+        let height = i32::try_from(state.size.1).unwrap_or(1080);
         // The size asked for is the client area; this is what the frame around
         // it adds.
         let mut rectangle = RECT {
@@ -165,8 +205,8 @@ impl Window {
                 PCWSTR(class.as_ptr()),
                 PCWSTR(title.as_ptr()),
                 WS_OVERLAPPEDWINDOW,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
+                state.position.map_or(CW_USEDEFAULT, |(x, _)| x),
+                state.position.map_or(CW_USEDEFAULT, |(_, y)| y),
                 rectangle.right - rectangle.left,
                 rectangle.bottom - rectangle.top,
                 None,
@@ -199,6 +239,21 @@ impl Window {
                     SC_RELEASE_KEYBOARD,
                     PCWSTR(release.as_ptr()),
                 );
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+                let full = HSTRING::from("Full screen\tF11");
+                let _ = AppendMenuW(menu, MF_STRING, SC_FULLSCREEN, PCWSTR(full.as_ptr()));
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+                // Two modes and not three: Motion is task #123's, and a menu
+                // offering a mode the guest refuses is a menu that lies.
+                let auto = HSTRING::from("Quality: Auto");
+                let _ = AppendMenuW(menu, MF_STRING, SC_QUALITY_AUTO, PCWSTR(auto.as_ptr()));
+                let desktop = HSTRING::from("Quality: Desktop");
+                let _ = AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    SC_QUALITY_DESKTOP,
+                    PCWSTR(desktop.as_ptr()),
+                );
             }
         }
 
@@ -207,8 +262,177 @@ impl Window {
             let _ = ShowWindow(hwnd, SW_SHOW);
             let _ = UpdateWindow(hwnd);
         }
+        correct_client_size(hwnd, width, height);
 
-        Ok(Self { hwnd, shared })
+        let window = Self {
+            hwnd,
+            shared,
+            restore: None,
+        };
+        window.check_quality(state.quality);
+        if state.fullscreen {
+            let mut window = window;
+            window.set_fullscreen(true);
+
+            return Ok(window);
+        }
+
+        Ok(window)
+    }
+
+    /// Marks which encoding mode is in force.
+    pub fn check_quality(&self, quality: Quality) {
+        let chosen = match quality {
+            Quality::Auto => SC_QUALITY_AUTO,
+            Quality::Desktop => SC_QUALITY_DESKTOP,
+        };
+
+        // SAFETY: the window's own menu, which belongs to it until it is
+        // destroyed.
+        unsafe {
+            let menu = GetSystemMenu(self.hwnd, false);
+            if !menu.is_invalid() {
+                let _ = CheckMenuRadioItem(
+                    menu,
+                    SC_QUALITY_AUTO as u32,
+                    SC_QUALITY_DESKTOP as u32,
+                    chosen as u32,
+                    MF_BYCOMMAND.0,
+                );
+            }
+        }
+    }
+
+    /// Whether the window is filling a monitor.
+    #[must_use]
+    pub fn is_fullscreen(&self) -> bool {
+        self.restore.is_some()
+    }
+
+    /// Fills the monitor the window is on, or goes back to where it was.
+    ///
+    /// Borderless rather than exclusive: an exclusive mode would take the
+    /// display for this process, and a viewer that owns the screen is one the
+    /// user cannot alt-tab out of when the guest stops answering. What is
+    /// taken here is a style and a rectangle, and both are given back.
+    pub fn set_fullscreen(&mut self, on: bool) {
+        if on == self.is_fullscreen() {
+            return;
+        }
+
+        if on {
+            let Some(monitor) = self.monitor_rectangle() else {
+                log::warn!("the window is on no monitor; full screen is not available");
+
+                return;
+            };
+            // SAFETY: `self.hwnd` names a window of this process, and the
+            // placement lives across its call.
+            let (style, placement) = unsafe {
+                let style = WINDOW_STYLE(GetWindowLongPtrW(self.hwnd, GWL_STYLE) as u32);
+                let mut placement = WINDOWPLACEMENT {
+                    length: u32::try_from(std::mem::size_of::<WINDOWPLACEMENT>()).unwrap_or(0),
+                    ..Default::default()
+                };
+                if GetWindowPlacement(self.hwnd, &raw mut placement).is_err() {
+                    log::warn!("the window's placement could not be read");
+
+                    return;
+                }
+
+                (style, placement)
+            };
+
+            // SAFETY: a style and a position on this process's own window.
+            unsafe {
+                SetWindowLongPtrW(
+                    self.hwnd,
+                    GWL_STYLE,
+                    ((style & !WS_OVERLAPPEDWINDOW) | WS_POPUP).0 as isize,
+                );
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    Some(HWND_TOP),
+                    monitor.left,
+                    monitor.top,
+                    monitor.right - monitor.left,
+                    monitor.bottom - monitor.top,
+                    SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
+                );
+            }
+            self.restore = Some((style, placement));
+        } else {
+            let Some((style, placement)) = self.restore.take() else {
+                return;
+            };
+            // SAFETY: a style and a placement this window handed over, put
+            // back on the window they came from.
+            unsafe {
+                SetWindowLongPtrW(self.hwnd, GWL_STYLE, style.0 as isize);
+                let _ = SetWindowPlacement(self.hwnd, &raw const placement);
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE
+                        | SWP_NOSIZE
+                        | SWP_NOZORDER
+                        | SWP_NOOWNERZORDER
+                        | SWP_FRAMECHANGED,
+                );
+            }
+        }
+    }
+
+    /// Where the window sits when it is not filling anything.
+    ///
+    /// The restored position rather than the current one, so that a window
+    /// closed full screen or maximised comes back where it was before.
+    #[must_use]
+    pub fn restored_position(&self) -> Option<(i32, i32)> {
+        if let Some((_, placement)) = self.restore.as_ref() {
+            return Some((
+                placement.rcNormalPosition.left,
+                placement.rcNormalPosition.top,
+            ));
+        }
+
+        let mut placement = WINDOWPLACEMENT {
+            length: u32::try_from(std::mem::size_of::<WINDOWPLACEMENT>()).unwrap_or(0),
+            ..Default::default()
+        };
+        // SAFETY: `self.hwnd` names a window of this process and the placement
+        // lives across the call.
+        unsafe { GetWindowPlacement(self.hwnd, &raw mut placement) }.ok()?;
+
+        Some((
+            placement.rcNormalPosition.left,
+            placement.rcNormalPosition.top,
+        ))
+    }
+
+    /// The monitor this window is mostly on, in virtual-desktop pixels.
+    fn monitor_rectangle(&self) -> Option<RECT> {
+        // SAFETY: `self.hwnd` names a window of this process.
+        let monitor: HMONITOR = unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) };
+        if monitor.is_invalid() {
+            return None;
+        }
+
+        let mut info = MONITORINFO {
+            cbSize: u32::try_from(std::mem::size_of::<MONITORINFO>()).unwrap_or(0),
+            ..Default::default()
+        };
+        // SAFETY: `monitor` came from `MonitorFromWindow` and `info` lives
+        // across the call with its size filled in.
+        if !unsafe { GetMonitorInfoW(monitor, &raw mut info) }.as_bool() {
+            return None;
+        }
+
+        Some(info.rcMonitor)
     }
 
     /// The window itself, for the renderer's swapchain.
@@ -315,6 +539,73 @@ pub fn report(message: &str) {
             PCWSTR(title.as_ptr()),
             MB_ICONERROR | MB_OK,
         );
+    }
+}
+
+/// Sizes a window whose client area came out other than what was asked for.
+///
+/// `AdjustWindowRect` above worked from 96 DPI frame metrics, because the
+/// window it was sizing did not exist yet and so was on no monitor. Now it is
+/// on one, and any difference is the frame's: without this correction, a
+/// window remembered at its own client size comes back a few pixels smaller on
+/// a scaled monitor -- and smaller again on every restart after that.
+fn correct_client_size(hwnd: HWND, width: i32, height: i32) {
+    let (actual_width, actual_height) = client_size(hwnd);
+    if actual_width <= 0 || actual_height <= 0 || (actual_width, actual_height) == (width, height) {
+        return;
+    }
+
+    let mut rectangle = RECT {
+        left: 0,
+        top: 0,
+        right: width,
+        bottom: height,
+    };
+    // SAFETY: `hwnd` names a window of this process and `rectangle` lives
+    // across the call.
+    unsafe {
+        let dpi = GetDpiForWindow(hwnd);
+        if AdjustWindowRectExForDpi(
+            &raw mut rectangle,
+            WS_OVERLAPPEDWINDOW,
+            false,
+            WINDOW_EX_STYLE(0),
+            dpi,
+        )
+        .is_err()
+        {
+            return;
+        }
+
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            0,
+            0,
+            rectangle.right - rectangle.left,
+            rectangle.bottom - rectangle.top,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOOWNERZORDER,
+        );
+    }
+}
+
+/// Makes this process see the screen in pixels rather than in scaled units.
+///
+/// Called before any window exists, and once. Without it Windows hands an
+/// unaware process a virtualised client rectangle -- 1707x960 on a 2560x1440
+/// panel at 150% -- and blits it back up, so a viewer that set the guest's
+/// mode from it would put a small desktop on a big screen and then blur it.
+/// Per-monitor v2 rather than system-wide, because a window dragged between
+/// monitors of different scales must keep reporting the pixels it covers.
+///
+/// A refusal is not fatal: the awareness may already have been set by a
+/// manifest, which is the same answer by another route.
+pub fn become_dpi_aware() {
+    // SAFETY: a process-wide setting with a documented context value.
+    if let Err(error) =
+        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
+    {
+        log::debug!("this process is already DPI aware, or cannot be told to be: {error}");
     }
 }
 
@@ -468,6 +759,21 @@ extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
 
                     return LRESULT(0);
                 }
+                SC_FULLSCREEN => {
+                    shared.report(UiEvent::ToggleFullscreen);
+
+                    return LRESULT(0);
+                }
+                SC_QUALITY_AUTO => {
+                    shared.report(UiEvent::Quality(Quality::Auto));
+
+                    return LRESULT(0);
+                }
+                SC_QUALITY_DESKTOP => {
+                    shared.report(UiEvent::Quality(Quality::Desktop));
+
+                    return LRESULT(0);
+                }
                 _ => {}
             }
 
@@ -577,9 +883,13 @@ mod tests {
         },
     };
 
-    use super::{SC_RELEASE_KEYBOARD, SC_SEND_SAS, Shared, UiEvent, WM_SIGNAL, Window};
+    use super::{
+        SC_FULLSCREEN, SC_QUALITY_DESKTOP, SC_RELEASE_KEYBOARD, SC_SEND_SAS, Shared, UiEvent,
+        WM_SIGNAL, Window,
+    };
     use crate::{
         input::{BTN_RIGHT, Report},
+        state::{Quality, WindowState},
         status::{self, Button},
     };
 
@@ -596,9 +906,18 @@ mod tests {
         events.try_iter().collect()
     }
 
+    /// A state that opens a window of this size where Windows chooses.
+    fn sized(width: u32, height: u32) -> WindowState {
+        WindowState {
+            size: (width, height),
+            ..WindowState::default()
+        }
+    }
+
     /// A shown window, with whatever showing it reported already taken.
     fn opened(events: &mpsc::Receiver<UiEvent>, shared: &Arc<Shared>) -> Window {
-        let window = Window::open("test", 320, 240, Arc::clone(shared)).expect("a window");
+        let window =
+            Window::open("test", &sized(320, 240), Arc::clone(shared)).expect("a window");
         let _ = drain(events);
 
         window
@@ -745,7 +1064,7 @@ mod tests {
     #[test]
     fn a_window_opens_at_the_size_it_was_asked_for() {
         let (shared, _events) = shared();
-        let window = Window::open("test - VMLord Display", 640, 480, shared)
+        let window = Window::open("test - VMLord Display", &sized(640, 480), shared)
             .expect("a window class and a window");
 
         assert_eq!(window.client_size(), (640, 480));
@@ -754,7 +1073,7 @@ mod tests {
     #[test]
     fn a_posted_signal_reaches_the_pump() {
         let (shared, _events) = shared();
-        let window = Window::open("test - VMLord Display", 320, 240, shared).expect("a window");
+        let window = Window::open("test - VMLord Display", &sized(320, 240), shared).expect("a window");
         let poster = window.poster();
 
         poster.post(WM_SIGNAL);
@@ -768,7 +1087,8 @@ mod tests {
     fn a_click_on_retry_is_reported_only_while_the_failed_screen_is_up() {
         let (shared, events) = shared();
         let window =
-            Window::open("test - VMLord Display", 800, 600, Arc::clone(&shared)).expect("a window");
+            Window::open("test - VMLord Display", &sized(800, 600), Arc::clone(&shared))
+                .expect("a window");
         let (_, (x, y, w, h)) = status::buttons(800, 600)[0];
         let point = isize::try_from(((y + h / 2) << 16) | (x + w / 2)).expect("a client point");
 
@@ -804,9 +1124,68 @@ mod tests {
     }
 
     #[test]
+    fn the_menu_reports_full_screen_and_the_quality_the_user_picked() {
+        let (shared, events) = shared();
+        let window = opened(&events, &shared);
+
+        // SAFETY: messages sent to this process's own window.
+        unsafe {
+            SendMessageW(
+                window.handle(),
+                WM_SYSCOMMAND,
+                Some(WPARAM(SC_FULLSCREEN)),
+                None,
+            );
+            SendMessageW(
+                window.handle(),
+                WM_SYSCOMMAND,
+                Some(WPARAM(SC_QUALITY_DESKTOP)),
+                None,
+            );
+        }
+
+        let reported = drain(&events);
+        assert!(reported.contains(&UiEvent::ToggleFullscreen));
+        assert!(reported.contains(&UiEvent::Quality(Quality::Desktop)));
+    }
+
+    #[test]
+    fn a_window_that_filled_a_monitor_goes_back_to_where_it_was() {
+        let (shared, events) = shared();
+        let mut window = opened(&events, &shared);
+        let before = window.restored_position();
+
+        window.set_fullscreen(true);
+        assert!(window.is_fullscreen());
+        assert_eq!(
+            window.restored_position(),
+            before,
+            "what is remembered is where the window was, not the monitor"
+        );
+
+        window.set_fullscreen(false);
+        assert!(!window.is_fullscreen());
+        assert_eq!(window.client_size(), (320, 240));
+    }
+
+    #[test]
+    fn a_window_opens_full_screen_when_that_is_where_it_was_left() {
+        let (shared, _events) = shared();
+        let state = WindowState {
+            size: (320, 240),
+            fullscreen: true,
+            ..WindowState::default()
+        };
+
+        let window = Window::open("test - VMLord Display", &state, shared).expect("a window");
+
+        assert!(window.is_fullscreen());
+    }
+
+    #[test]
     fn closing_the_window_is_reported_before_the_pump_ends() {
         let (shared, events) = shared();
-        let window = Window::open("test - VMLord Display", 320, 240, shared).expect("a window");
+        let window = Window::open("test - VMLord Display", &sized(320, 240), shared).expect("a window");
 
         // SAFETY: the window is open and owned by this test.
         unsafe {

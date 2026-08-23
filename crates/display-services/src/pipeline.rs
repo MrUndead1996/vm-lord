@@ -107,6 +107,31 @@ impl Pipeline {
         }
     }
 
+    /// Moves the pipeline to a new output geometry.
+    ///
+    /// A geometry never changes inside an encoder -- a tile grid is built on
+    /// one -- so this replaces it, and what follows on the socket is a
+    /// `StreamConfig` and a whole frame, exactly as a freshly bound socket
+    /// gets. The sequence counter carries on rather than restarting: the
+    /// socket did not change, and a peer that saw record 40 must not be sent
+    /// another one.
+    pub fn reconfigure(&mut self, geometry: Geometry) {
+        self.encoder = Encoder::new(EncoderConfig::new(geometry));
+        self.drawn_cursor = None;
+        self.composite = Vec::new();
+        // Nothing the peer holds can be a base any more: the next frame
+        // payload is a keyframe, and a delta would name a record of the old
+        // shape.
+        self.last_frame_sequence = 0;
+        self.request_keyframe();
+    }
+
+    /// The geometry this pipeline encodes.
+    #[must_use]
+    pub fn geometry(&self) -> Geometry {
+        self.encoder.geometry()
+    }
+
     /// Stages a captured frame, displacing any frame not yet encoded.
     ///
     /// When the peer declined the cursor stream, the cursor last given to

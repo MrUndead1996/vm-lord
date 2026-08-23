@@ -22,7 +22,8 @@ use vmlord_display_protocol::{
     session::{Event as SessionEvent, HandedOver, Negotiated, Session, SessionError},
     v1::{
         Capability, ControlRecord, DisplayState, Error as ErrorRecord, InputRecord, KeyEvent, Mode,
-        Ping, PointerButton, PointerMotion, PointerScroll, Pong, ProtocolVersion,
+        Ping, PointerButton, PointerMotion, PointerScroll, Pong, ProtocolVersion, SetMode,
+        SetResolution,
     },
 };
 
@@ -182,6 +183,30 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
     /// Recovery, not flow control: the decoder has nothing to apply a delta to.
     pub fn request_keyframe(&mut self) {
         self.write_control(ControlRecord::RequestKeyframe, Vec::new());
+    }
+
+    /// Asks the guest to put its output on a new size.
+    ///
+    /// A request and not a setting: what the compositor commits arrives as a
+    /// `StreamConfig` on the frame channel, and it need not be this. The
+    /// guest refusing a size answers with an `Error` instead, which is a log
+    /// line rather than a state -- the picture that is on screen is still the
+    /// one the guest has.
+    pub fn set_resolution(&mut self, width: u32, height: u32) {
+        log::info!("asking the guest for {width}x{height}");
+        self.write_control(
+            ControlRecord::SetResolution,
+            SetResolution { width, height }.encode_to_vec(),
+        );
+    }
+
+    /// Asks the guest for an encoding mode.
+    pub fn set_mode(&mut self, mode: Mode) {
+        log::info!("asking the guest for {mode:?}");
+        self.write_control(
+            ControlRecord::SetMode,
+            SetMode { mode: mode as i32 }.encode_to_vec(),
+        );
     }
 
     /// Sends one input event to the guest.
@@ -597,8 +622,8 @@ mod tests {
         keys::{self, ChannelKey, Role, Tag},
         record::{self, Channel, Limits, Record},
         v1::{
-            ChannelAck, ChannelAuth, ChannelHello, ControlRecord, FrameRecord, InputRecord, Ping,
-            PixelFormat as WireFormat, Pong, StreamConfig,
+            ChannelAck, ChannelAuth, ChannelHello, ControlRecord, FrameRecord, InputRecord, Mode,
+            Ping, PixelFormat as WireFormat, Pong, SetMode, SetResolution, StreamConfig,
         },
     };
 
@@ -1141,6 +1166,34 @@ mod tests {
             header = wait_for_record(&mut harness.control, &limits, &mut payload);
         }
         assert_eq!(header.channel, Channel::Control);
+    }
+
+    #[test]
+    fn a_settled_window_reaches_the_guest_as_a_resolution_and_a_mode() {
+        let now = Instant::now();
+        let (mut live, mut harness) = start(now);
+        let limits = Limits::new(0, 0);
+
+        live.set_resolution(1720, 970);
+        live.set_mode(Mode::Auto);
+
+        let mut payload = Vec::new();
+        let mut header = wait_for_record(&mut harness.control, &limits, &mut payload);
+        while header.message_type != ControlRecord::SetResolution as u16 {
+            header = wait_for_record(&mut harness.control, &limits, &mut payload);
+        }
+        let wanted = SetResolution::decode(payload.as_slice()).expect("a resolution");
+        assert_eq!((wanted.width, wanted.height), (1720, 970));
+
+        while header.message_type != ControlRecord::SetMode as u16 {
+            header = wait_for_record(&mut harness.control, &limits, &mut payload);
+        }
+        let mode = SetMode::decode(payload.as_slice()).expect("a mode");
+        assert_eq!(
+            mode.mode,
+            Mode::Auto as i32,
+            "Auto is the guest's to resolve: it is what knows what it can encode"
+        );
     }
 
     #[test]

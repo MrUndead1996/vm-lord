@@ -30,6 +30,14 @@ pub enum Message {
     /// The guest's keyboard and pointer, whose descriptors are attached to the
     /// datagram in that order.
     InputDevices,
+    /// The output is now this big, read off the framebuffer rather than off
+    /// what was asked for.
+    Geometry {
+        /// Its width in pixels.
+        width: u32,
+        /// Its height.
+        height: u32,
+    },
     /// What the planes hold at one vblank.
     Snapshot {
         /// The vblank this was taken at.
@@ -160,6 +168,10 @@ fn into_wire(message: &Message) -> envelope::Message {
             envelope::Message::KeyframeRequested(broker::KeyframeRequested {})
         }
         Message::InputDevices => envelope::Message::InputDevices(broker::InputDevices {}),
+        Message::Geometry { width, height } => envelope::Message::Geometry(broker::Geometry {
+            width: *width,
+            height: *height,
+        }),
         Message::Snapshot {
             sequence,
             planes,
@@ -193,6 +205,10 @@ fn from_wire(message: envelope::Message) -> Result<Message, IpcError> {
         },
         envelope::Message::KeyframeRequested(_) => Message::KeyframeRequested,
         envelope::Message::InputDevices(_) => Message::InputDevices,
+        envelope::Message::Geometry(geometry) => Message::Geometry {
+            width: geometry.width,
+            height: geometry.height,
+        },
         envelope::Message::Snapshot(snapshot) => Message::Snapshot {
             sequence: snapshot.sequence,
             planes: snapshot
@@ -276,6 +292,10 @@ mod tests {
                 reason: "control was lost".into(),
             },
             Message::KeyframeRequested,
+            Message::Geometry {
+                width: 2560,
+                height: 1440,
+            },
             Message::Snapshot {
                 sequence: 42,
                 planes: vec![PlaneLayout {

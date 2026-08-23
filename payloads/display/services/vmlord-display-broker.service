@@ -18,6 +18,10 @@ StartLimitBurst=5
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE
 NoNewPrivileges=yes
 ProtectHome=yes
+# `strict` leaves /dev, /proc and /sys writable, which this unit needs: the
+# output's mode is `/sys/module/vmlord_drm/parameters/mode`, and a viewer that
+# is resized cannot be answered without writing it. `ProtectKernelTunables`
+# would take that away and must not be added here.
 ProtectSystem=strict
 ReadWritePaths=/run/vmlord
 RestrictAddressFamilies=AF_VSOCK AF_UNIX

@@ -18,6 +18,7 @@ use windows::{
         Graphics::{
             Direct2D::{
                 Common::{D2D_RECT_F, D2D1_ALPHA_MODE_IGNORE, D2D1_COLOR_F, D2D1_PIXEL_FORMAT},
+                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
                 D2D1_DRAW_TEXT_OPTIONS_NONE, D2D1_FACTORY_TYPE_SINGLE_THREADED,
                 D2D1_RENDER_TARGET_PROPERTIES, D2D1_RENDER_TARGET_TYPE_DEFAULT,
                 D2D1_RENDER_TARGET_USAGE_NONE, D2D1CreateFactory, ID2D1Factory, ID2D1RenderTarget,
@@ -47,11 +48,11 @@ use windows::{
             CreateIconIndirect, DestroyIcon, GCLP_HCURSOR, HCURSOR, ICONINFO, SetClassLongPtrW,
         },
     },
-    core::HSTRING,
+    core::{HSTRING, Interface},
 };
 
 use crate::{
-    placement::place,
+    placement::{Placement, place},
     status::{Progress, Status, buttons},
     video,
 };
@@ -88,6 +89,14 @@ pub struct Renderer {
     /// The stream's own texture, which the back buffer is drawn from.
     texture: Option<ID3D11Texture2D>,
     stream: Option<Geometry>,
+    /// Whether anything has been uploaded into `texture` since it was made.
+    /// A texture with nothing in it is a black window, and there is a picture
+    /// to show instead until the guest's first keyframe of the new size lands.
+    shown: bool,
+    /// The stream before this one, kept only while the new one is still blank.
+    /// Dropped on the first upload, so at most one spare texture exists and
+    /// only across a resize.
+    previous: Option<(ID3D11Texture2D, Geometry)>,
     d2d: ID2D1Factory,
     dwrite: IDWriteFactory,
     cursor: Option<HCURSOR>,
@@ -122,6 +131,8 @@ impl Renderer {
             target: None,
             texture: None,
             stream: None,
+            shown: false,
+            previous: None,
             d2d,
             dwrite,
             cursor: None,
@@ -144,6 +155,13 @@ impl Renderer {
     ///
     /// A second config replaces the texture rather than resizing it: geometry
     /// never changes inside an encoder, so a new geometry is a new stream.
+    ///
+    /// The swap is atomic in the sense that matters: the new texture is built
+    /// first and nothing changes if the device refuses it, and the picture
+    /// that was on screen is kept and drawn scaled until the first keyframe of
+    /// the new stream arrives. A resize that blacked the window out for the
+    /// two hundred milliseconds a compositor takes to commit a mode would be
+    /// the same flicker this whole path exists to avoid.
     ///
     /// # Errors
     ///
@@ -178,8 +196,15 @@ impl Renderer {
             geometry.width(),
             geometry.height()
         );
+        // Only a texture with something in it is worth keeping, and only if
+        // the geometry actually moved: a repeated config of the same size
+        // would otherwise leave a stale picture in front of a live one.
+        if self.shown && self.stream != Some(geometry) {
+            self.previous = self.texture.take().zip(self.stream);
+        }
         self.texture = texture;
         self.stream = Some(geometry);
+        self.shown = false;
 
         Ok(())
     }
@@ -195,6 +220,15 @@ impl Renderer {
     #[must_use]
     pub fn uploaded_rectangles(&self) -> usize {
         self.uploaded
+    }
+
+    /// Whether what is on screen is the stream before this one.
+    ///
+    /// True between a `StreamConfig` and the first keyframe of the stream it
+    /// describes, which is what a resize looks like from here.
+    #[must_use]
+    pub fn is_showing_the_previous_stream(&self) -> bool {
+        !self.shown && self.previous.is_some()
     }
 
     /// Uploads the rectangles of `frame` that changed.
@@ -259,6 +293,12 @@ impl Renderer {
 
         log::trace!("{issued} rectangles uploaded, {bytes} bytes");
         self.uploaded = issued;
+        if issued > 0 {
+            self.shown = true;
+            // The new stream has pixels; the old one is no longer what to
+            // show, and its texture is no longer worth the memory.
+            self.previous = None;
+        }
 
         Ok(())
     }
@@ -360,25 +400,32 @@ impl Renderer {
             .map_err(|error| format!("the frame could not be presented: {error}"))
     }
 
-    /// Copies the stream's texture into the back buffer.
+    /// Draws the stream's texture into the back buffer.
     ///
     /// Where the picture goes is [`crate::placement`]'s, not this method's:
-    /// the input mapping reads the same value, and #120 turns today's crop
-    /// into letterboxing by changing that one function rather than two.
+    /// the input mapping reads the same value, so the pointer cannot drift
+    /// from the picture.
+    ///
+    /// Two paths, and the fast one is the ordinary one. A settled window and a
+    /// settled guest are the same size, and a copy of equal rectangles is what
+    /// that is: no sampling, no filter, every pixel the guest encoded. The
+    /// scaled path is the seconds between a drag and the guest's answer, and
+    /// what it draws may be the *previous* stream -- the new texture is blank
+    /// until its first keyframe, and a blank window is a worse answer than a
+    /// stretched picture.
     fn blit(&self) -> Result<(), String> {
-        let (Some(texture), Some(geometry)) = (self.texture.as_ref(), self.stream) else {
-            return Ok(());
-        };
-
         // SAFETY: buffer zero of this renderer's own swapchain.
         let back: ID3D11Texture2D = unsafe { self.swapchain()?.GetBuffer(0) }
             .map_err(|error| format!("the back buffer could not be taken: {error}"))?;
         let mut descriptor = D3D11_TEXTURE2D_DESC::default();
         // SAFETY: `descriptor` lives across the call.
         unsafe { back.GetDesc(&raw mut descriptor) };
-
         let client_width = i32::try_from(descriptor.Width).unwrap_or(i32::MAX);
         let client_height = i32::try_from(descriptor.Height).unwrap_or(i32::MAX);
+
+        let Some((texture, geometry)) = self.source() else {
+            return Ok(());
+        };
         let Some(placement) = place(
             geometry.width(),
             geometry.height(),
@@ -388,6 +435,33 @@ impl Renderer {
             return Ok(());
         };
 
+        if (placement.width, placement.height) == (geometry.width(), geometry.height()) {
+            return self.copy(&back, texture, &placement);
+        }
+
+        self.draw_scaled(texture, &placement)
+    }
+
+    /// Which texture is worth showing, and the geometry it is of.
+    fn source(&self) -> Option<(&ID3D11Texture2D, Geometry)> {
+        if self.shown
+            && let (Some(texture), Some(geometry)) = (self.texture.as_ref(), self.stream)
+        {
+            return Some((texture, geometry));
+        }
+
+        self.previous
+            .as_ref()
+            .map(|(texture, geometry)| (texture, *geometry))
+    }
+
+    /// The whole picture, pixel for pixel, at the placement's corner.
+    fn copy(
+        &self,
+        back: &ID3D11Texture2D,
+        texture: &ID3D11Texture2D,
+        placement: &Placement,
+    ) -> Result<(), String> {
         let region = D3D11_BOX {
             left: 0,
             top: 0,
@@ -402,7 +476,7 @@ impl Renderer {
         // each of them.
         unsafe {
             self.context.CopySubresourceRegion(
-                &back,
+                back,
                 0,
                 destination_x,
                 destination_y,
@@ -416,8 +490,70 @@ impl Renderer {
         Ok(())
     }
 
-    /// Draws the status overlay over the back buffer.
-    fn overlay(&self, progress: &Progress, vm_name: &str) -> Result<(), String> {
+    /// The picture sampled into the placement's rectangle.
+    ///
+    /// Direct2D rather than a shader of this crate's own: the overlay already
+    /// draws through it on the same back buffer and the same device, so what
+    /// this costs is a shared bitmap and a `DrawBitmap` rather than a pipeline,
+    /// its two shaders and the state around them.
+    fn draw_scaled(&self, texture: &ID3D11Texture2D, placement: &Placement) -> Result<(), String> {
+        let surface: IDXGISurface = texture
+            .cast()
+            .map_err(|error| format!("the stream's texture is not a surface: {error}"))?;
+        let target = self.surface_target()?;
+
+        let properties = D2D1_BITMAP_PROPERTIES {
+            pixelFormat: D2D1_PIXEL_FORMAT {
+                format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                alphaMode: D2D1_ALPHA_MODE_IGNORE,
+            },
+            dpiX: 96.0,
+            dpiY: 96.0,
+        };
+        let mut bitmap = None;
+        // SAFETY: `surface` is this device's own texture and lives across the
+        // call, the interface id names what is being passed, and `bitmap`
+        // receives the one reference this method then owns.
+        unsafe {
+            target.CreateSharedBitmap(
+                &IDXGISurface::IID,
+                surface.as_raw(),
+                Some(&raw const properties),
+                &raw mut bitmap,
+            )
+        }
+        .map_err(|error| format!("the stream's texture could not be shared: {error}"))?;
+        let Some(bitmap) = bitmap else {
+            return Err("the stream's texture was shared as nothing".to_owned());
+        };
+
+        let destination = rectangle(
+            placement.x as f32,
+            placement.y as f32,
+            placement.width as f32,
+            placement.height as f32,
+        );
+        // SAFETY: a draw between `BeginDraw` and `EndDraw` on this renderer's
+        // own target, with a bitmap it just created.
+        unsafe {
+            target.BeginDraw();
+            target.DrawBitmap(
+                &bitmap,
+                Some(&raw const destination),
+                1.0,
+                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
+                None,
+            );
+            target
+                .EndDraw(None, None)
+                .map_err(|error| format!("the scaled frame could not be drawn: {error}"))?;
+        }
+
+        Ok(())
+    }
+
+    /// A Direct2D target on the current back buffer.
+    fn surface_target(&self) -> Result<ID2D1RenderTarget, String> {
         // SAFETY: buffer zero of this renderer's own swapchain.
         let surface: IDXGISurface = unsafe { self.swapchain()?.GetBuffer(0) }
             .map_err(|error| format!("the back buffer could not be taken: {error}"))?;
@@ -434,11 +570,16 @@ impl Renderer {
             minLevel: Default::default(),
         };
         // SAFETY: `surface` and `properties` live across the call.
-        let target: ID2D1RenderTarget = unsafe {
+        unsafe {
             self.d2d
                 .CreateDxgiSurfaceRenderTarget(&surface, &raw const properties)
         }
-        .map_err(|error| format!("the overlay's surface could not be built: {error}"))?;
+        .map_err(|error| format!("the back buffer took no Direct2D target: {error}"))
+    }
+
+    /// Draws the status overlay over the back buffer.
+    fn overlay(&self, progress: &Progress, vm_name: &str) -> Result<(), String> {
+        let target = self.surface_target()?;
 
         let size = self.client_size();
         let label = self.text_format(LABEL_SIZE)?;
@@ -608,10 +749,14 @@ impl Renderer {
         log::warn!("rebuilding the graphics device, loss {}", self.losses);
 
         // Everything of the lost device goes first: DXGI refuses a second
-        // swapchain for a window that still has one, and the texture and the
-        // view belong to a device that is no longer there.
+        // swapchain for a window that still has one, and the textures and the
+        // view belong to a device that is no longer there. The frame that was
+        // on screen goes with them -- the caller asks the guest for a keyframe
+        // afterwards, because the lost device held the only copy of it.
         self.target = None;
         self.texture = None;
+        self.previous = None;
+        self.shown = false;
         self.swapchain = None;
 
         let (device, context) = create_device()?;
@@ -823,6 +968,7 @@ mod tests {
 
     use super::Renderer;
     use crate::{
+        state::WindowState,
         status::Progress,
         windows::window::{Shared, Window},
     };
@@ -833,10 +979,14 @@ mod tests {
         // binary, and a dropped receiver would only make `report` log.
         std::mem::forget(received);
 
+        let state = WindowState {
+            size: (640, 480),
+            ..WindowState::default()
+        };
+
         Window::open(
             "renderer test - VMLord Display",
-            640,
-            480,
+            &state,
             Arc::new(Shared::new(events)),
         )
         .expect("a window")
@@ -845,6 +995,16 @@ mod tests {
     fn geometry(width: u32, height: u32) -> Geometry {
         Geometry::new(width, height, TileSize::ThirtyTwo, PixelFormat::Bgra8888)
             .expect("a geometry the codec allows")
+    }
+
+    /// The damage a keyframe carries.
+    fn whole(width: u32, height: u32) -> Rect {
+        Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
     }
 
     #[test]
@@ -895,6 +1055,78 @@ mod tests {
 
         renderer.upload(&frame, &damage).expect("an upload");
         assert_eq!(renderer.uploaded_rectangles(), 2);
+    }
+
+    /// A progress that is showing the picture rather than the overlay.
+    fn running(now: Instant) -> Progress {
+        let mut progress = Progress::new(now);
+        progress.on(crate::status::Event::Connected, now);
+        progress.on(crate::status::Event::Established, now);
+        assert!(progress.is_running(), "the picture, not the overlay");
+
+        progress
+    }
+
+    #[test]
+    fn a_picture_the_size_of_the_window_is_copied_and_a_smaller_one_is_scaled() {
+        // The fast path is the ordinary one: a settled window and a settled
+        // guest are the same size, and a copy of equal rectangles is every
+        // pixel the guest encoded. The scaled path is the seconds between a
+        // drag and the guest's answer.
+        let window = window();
+        let mut renderer = Renderer::open(window.handle()).expect("a device");
+        let now = Instant::now();
+        let progress = running(now);
+
+        let exact = geometry(640, 480);
+        renderer.configure(exact).expect("a texture");
+        renderer
+            .upload(&vec![0x40; exact.frame_bytes()], &[whole(640, 480)])
+            .expect("an upload");
+        renderer.present(&progress, "ubuntu-24.04").expect("a copy");
+
+        let smaller = geometry(320, 240);
+        renderer.configure(smaller).expect("a texture");
+        renderer
+            .upload(&vec![0x80; smaller.frame_bytes()], &[whole(320, 240)])
+            .expect("an upload");
+        renderer
+            .present(&progress, "ubuntu-24.04")
+            .expect("a scaled draw");
+    }
+
+    #[test]
+    fn the_picture_that_was_on_screen_stays_up_until_the_new_one_has_pixels() {
+        // A resize that blacked the window out for the two hundred
+        // milliseconds a compositor takes to commit a mode would be the same
+        // flicker this whole path exists to avoid.
+        let window = window();
+        let mut renderer = Renderer::open(window.handle()).expect("a device");
+        let progress = running(Instant::now());
+
+        let first = geometry(320, 240);
+        renderer.configure(first).expect("a texture");
+        renderer
+            .upload(&vec![0x40; first.frame_bytes()], &[whole(320, 240)])
+            .expect("an upload");
+
+        renderer.configure(geometry(640, 480)).expect("a texture");
+        assert!(
+            renderer.is_showing_the_previous_stream(),
+            "a texture with nothing in it is a black window"
+        );
+        renderer
+            .present(&progress, "ubuntu-24.04")
+            .expect("the previous frame, scaled");
+
+        let second = geometry(640, 480);
+        renderer
+            .upload(&vec![0x80; second.frame_bytes()], &[whole(640, 480)])
+            .expect("an upload");
+        assert!(
+            !renderer.is_showing_the_previous_stream(),
+            "the new stream has pixels, so the old texture is not worth the memory"
+        );
     }
 
     #[test]

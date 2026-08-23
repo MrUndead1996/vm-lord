@@ -437,6 +437,11 @@ impl<F: Acceptor, I: Acceptor> Loop<F, I> {
 
                 Ok(None)
             }
+            Message::Geometry { width, height } => {
+                self.resize(width, height)?;
+
+                Ok(None)
+            }
             Message::InputDevices => {
                 let mut descriptors = descriptors.into_iter();
                 match (descriptors.next(), descriptors.next()) {
@@ -472,6 +477,51 @@ impl<F: Acceptor, I: Acceptor> Loop<F, I> {
         }
     }
 
+    /// Rebuilds the encoder for an output that changed size.
+    ///
+    /// A geometry never changes inside an encoder -- a tile grid is built on
+    /// one -- so a new size is a new encoder and a new stream: a `StreamConfig`
+    /// and then a whole frame, which is exactly what a freshly bound socket
+    /// gets. The socket itself is untouched, because nothing about the channel
+    /// changed; only what travels on it did.
+    ///
+    /// # Errors
+    ///
+    /// [`LoopError`] if the codec will not build a stream of this shape, or if
+    /// the config could not be written.
+    fn resize(&mut self, width: u32, height: u32) -> Result<(), LoopError> {
+        let Some(parameters) = self.parameters.as_mut() else {
+            return Ok(());
+        };
+        if (parameters.width, parameters.height) == (width, height) {
+            return Ok(());
+        }
+        parameters.width = width;
+        parameters.height = height;
+        let tile_size = parameters.tile_size;
+        self.limits.set_geometry(width, height);
+
+        let Some(frame) = self.frame.as_mut() else {
+            return Ok(());
+        };
+        let geometry = Geometry::new(
+            width,
+            height,
+            TileSize::from_pixels(tile_size)?,
+            PixelFormat::Xrgb8888,
+        )?;
+        // The tail is whatever was owed for the old geometry, and none of it
+        // describes this one. Dropping it costs the peer a frame it was going
+        // to be sent; keeping it would cost the peer a frame it cannot decode.
+        frame.tail.clear();
+        frame.pipeline.reconfigure(geometry);
+        frame.pipeline.write_stream_config(&mut frame.tail, &self.limits)?;
+        // A decoder that has just been built holds no cursor either.
+        self.cursor = None;
+
+        Ok(())
+    }
+
     /// Maps the buffers this snapshot brought with it.
     fn adopt(&mut self, planes: &[PlaneLayout], new_buffers: &[u64], descriptors: Vec<OwnedFd>) {
         for (id, descriptor) in new_buffers.iter().zip(descriptors) {
@@ -498,6 +548,14 @@ impl<F: Acceptor, I: Acceptor> Loop<F, I> {
         let Some(primary) = planes.iter().find(|plane| plane.kind == PlaneKind::Primary) else {
             return Ok(());
         };
+        // A frame captured either side of a mode change: the encoder is built
+        // on a geometry and cannot take another shape. Dropping it is right --
+        // the buffer of the new size is one vblank away, and the broker's
+        // `Geometry` arrives with it.
+        let encoded = frame.pipeline.geometry();
+        if (primary.width, primary.height) != (encoded.width(), encoded.height()) {
+            return Ok(());
+        }
 
         // The cursor goes in first: when the peer declined the cursor stream
         // the pipeline draws it into the frame, and a cursor submitted after
@@ -960,6 +1018,7 @@ mod tests {
         session::{Event, Offer, Session, Support},
         v1::{
             Capability, FrameRecord, InputRecord, KeyEvent, Mode, PointerButton, PointerMotion,
+            StreamConfig,
         },
     };
 
@@ -973,6 +1032,9 @@ mod tests {
     /// stalled socket is reachable without megabytes of pixels.
     const WIDTH: u32 = 64;
     const HEIGHT: u32 = 64;
+    /// What the output is resized to, and the cap the host reads records at.
+    const MAX_WIDTH: u32 = 128;
+    const MAX_HEIGHT: u32 = 96;
     const TILE: u32 = 32;
 
     /// One end of a `socketpair`, which is what stands in for a vsock.
@@ -1427,15 +1489,23 @@ mod tests {
 
         /// The frame records the host has received.
         fn host_reads_frame_records(&mut self) -> Vec<Header> {
+            self.host_reads_frame_stream()
+                .into_iter()
+                .map(|(header, _)| header)
+                .collect()
+        }
+
+        /// The same, with each record's payload.
+        fn host_reads_frame_stream(&mut self) -> Vec<(Header, Vec<u8>)> {
             self.read_available();
             let bytes = std::mem::take(&mut self.read_frames);
-            let limits = Limits::new(WIDTH, HEIGHT);
+            let limits = Limits::new(MAX_WIDTH, MAX_HEIGHT);
             let mut reader = bytes.as_slice();
             let mut payload = Vec::new();
             let mut headers = Vec::new();
             while !reader.is_empty() {
                 match record::read(&mut reader, &limits, &mut payload) {
-                    Ok(header) => headers.push(header),
+                    Ok(header) => headers.push((header, payload.clone())),
                     // A record that was cut in half by the read is not one to
                     // fail on: the next drain finishes it.
                     Err(_) => break,
@@ -1447,12 +1517,18 @@ mod tests {
 
         /// The broker sends one vblank's planes, with a memfd behind each.
         fn broker_sends_snapshot(&mut self, sequence: u64) {
-            let stride = WIDTH * 4;
+            self.broker_sends_snapshot_sized(sequence, WIDTH, HEIGHT);
+        }
+
+        /// The same, for an output that is not the one the session opened on.
+        fn broker_sends_snapshot_sized(&mut self, sequence: u64, width: u32, height: u32) {
+            let (width, height) = (width, height);
+            let stride = width * 4;
             // Noise rather than a flat colour: a uniform frame compresses to
             // almost nothing, and a socket that never fills would not test what
             // a slow one costs.
             let mut state = sequence.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-            let pixels: Vec<u8> = (0..(stride * HEIGHT))
+            let pixels: Vec<u8> = (0..(stride * height))
                 .map(|_| {
                     state ^= state << 13;
                     state ^= state >> 7;
@@ -1464,8 +1540,8 @@ mod tests {
             let planes = vec![PlaneLayout {
                 kind: PlaneKind::Primary,
                 buffer: sequence,
-                width: WIDTH,
-                height: HEIGHT,
+                width,
+                height,
                 stride,
                 format: crate::drm::uapi::DRM_FORMAT_XRGB8888,
                 x: 0,
@@ -1494,6 +1570,13 @@ mod tests {
                     &[],
                 )
                 .expect("a session closed");
+        }
+
+        /// The broker reports the size the output came up at.
+        fn broker_sends_geometry(&mut self, width: u32, height: u32) {
+            self.broker
+                .send(&Message::Geometry { width, height }, &[])
+                .expect("a geometry");
         }
 
         /// The broker relays a keyframe request.
@@ -1732,6 +1815,58 @@ mod tests {
         let records = world.host_reads_frame_records();
         assert_eq!(records[0].message_type, FrameRecord::StreamConfig as u16);
         assert_eq!(records[1].message_type, FrameRecord::Keyframe as u16);
+    }
+
+    #[test]
+    fn an_output_that_changed_size_starts_a_new_stream_on_the_same_socket() {
+        let mut world = World::open();
+        world.broker_sends_snapshot(1);
+        world.run_until_written();
+        let opening = world.host_reads_frame_records();
+        let last = opening.last().expect("the opening records").sequence;
+
+        world.broker_sends_geometry(MAX_WIDTH, MAX_HEIGHT);
+        world.broker_sends_snapshot_sized(2, MAX_WIDTH, MAX_HEIGHT);
+        world.run_until_written();
+
+        let records = world.host_reads_frame_stream();
+        let (header, payload) = records.first().expect("a stream config");
+        assert_eq!(header.message_type, FrameRecord::StreamConfig as u16);
+        let config = StreamConfig::decode(payload.as_slice()).expect("a stream config");
+        assert_eq!((config.width, config.height), (MAX_WIDTH, MAX_HEIGHT));
+        assert_eq!(
+            records[1].0.message_type,
+            FrameRecord::Keyframe as u16,
+            "a decoder built on a new geometry has nothing to apply a delta to"
+        );
+        assert!(
+            records[0].0.sequence > last,
+            "the socket did not change, so a peer that saw a record must not be sent it again"
+        );
+    }
+
+    #[test]
+    fn a_frame_of_the_old_shape_is_dropped_rather_than_ending_the_session() {
+        // Capture and the mode change are not in step: the vblank either side
+        // of a commit carries whichever buffer the compositor had. The
+        // encoder is built on a geometry and cannot take another shape.
+        let mut world = World::open();
+        world.broker_sends_snapshot(1);
+        world.run_until_written();
+        let _ = world.host_reads_frame_records();
+
+        world.broker_sends_geometry(MAX_WIDTH, MAX_HEIGHT);
+        world.broker_sends_snapshot(2);
+        world.run_until_written();
+
+        let records = world.host_reads_frame_stream();
+        assert_eq!(records[0].0.message_type, FrameRecord::StreamConfig as u16);
+        assert!(
+            records
+                .iter()
+                .all(|(header, _)| header.message_type != FrameRecord::TileDelta as u16),
+            "a frame of the old size is not one this stream can carry"
+        );
     }
 
     #[test]

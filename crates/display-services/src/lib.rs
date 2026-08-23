@@ -12,6 +12,7 @@ pub mod control;
 pub mod cursor;
 pub mod drm;
 pub mod ipc;
+pub mod output;
 pub mod pipeline;
 pub mod session_main;
 pub mod uinput;

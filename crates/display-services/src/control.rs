@@ -22,7 +22,10 @@ use vmlord_display_protocol::{
     },
 };
 
-use crate::ipc::{Message, SessionParameters};
+use crate::{
+    ipc::{Message, SessionParameters},
+    output,
+};
 
 /// What handling one control record means for the unprivileged process.
 #[derive(Debug)]
@@ -32,6 +35,14 @@ pub enum Outcome {
     Opened(SessionParameters),
     /// Something to pass straight on.
     Relay(Message),
+    /// The host asked the output to change size, and the size is one this
+    /// build will drive. Whether the compositor moves is not answered here.
+    Resize {
+        /// The width to ask the module for.
+        width: u32,
+        /// The height.
+        height: u32,
+    },
     /// The session is over, for the reason given. Fit for a journal, not for a
     /// decision.
     Closed(String),
@@ -210,14 +221,29 @@ impl Control {
                 Outcome::Nothing
             }
             Ok(ControlRecord::SetResolution) => {
-                // Changing the output's mode is another task's. What is
-                // answered here is the geometry that is actually on, because
-                // reporting the one that was asked for would be a lie a viewer
-                // would then scale against.
-                let _ = SetResolution::decode(payload);
-                self.state(stream);
+                let wanted = SetResolution::decode(payload).ok();
+                let admissible = wanted
+                    .as_ref()
+                    .and_then(|set| output::admissible(set.width, set.height));
 
-                Outcome::Nothing
+                match admissible {
+                    // Nothing is reported back here. The geometry that is
+                    // actually on is what a `DisplayState` may carry, and it
+                    // is not known until the compositor has committed a mode
+                    // and a framebuffer of the new size has been seen; saying
+                    // anything sooner would be a size the viewer would then
+                    // scale against.
+                    Some((width, height)) => Outcome::Resize { width, height },
+                    None => {
+                        self.report(
+                            stream,
+                            ErrorCode::ResolutionRejected,
+                            "a size outside what this output drives",
+                        );
+
+                        Outcome::Nothing
+                    }
+                }
             }
             Ok(ControlRecord::EndSession) => {
                 Outcome::Closed("the host ended the session".to_owned())
@@ -234,8 +260,24 @@ impl Control {
         }
     }
 
+    /// Moves the geometry this session reports to what the output came up at.
+    ///
+    /// The record caps move with it: a taller output is a bigger keyframe, and
+    /// the caps are what say how big a record may be.
+    pub fn set_geometry(&mut self, width: u32, height: u32) {
+        self.width = width;
+        self.height = height;
+        self.limits.set_geometry(width, height);
+    }
+
+    /// The geometry this session is on.
+    #[must_use]
+    pub fn geometry(&self) -> (u32, u32) {
+        (self.width, self.height)
+    }
+
     /// Reports the geometry that is actually on.
-    fn state<S: Read + Write>(&mut self, stream: &mut S) {
+    pub fn state<S: Read + Write>(&mut self, stream: &mut S) {
         let state = DisplayState {
             width: self.width,
             height: self.height,
@@ -443,6 +485,11 @@ mod tests {
         wire.offer(&record);
         let _ = control.pump(&mut wire);
 
+        state_from(&mut wire)
+    }
+
+    /// The `DisplayState` a duplex has been written, if there is one.
+    fn state_from(wire: &mut Duplex) -> DisplayState {
         wire.taken()
             .into_iter()
             .find_map(|(message_type, payload)| {
@@ -529,13 +576,55 @@ mod tests {
     }
 
     #[test]
-    fn set_resolution_answers_with_what_is_actually_applied() {
-        let state = drive_control_for_state(control_record_set_resolution(2560, 1440));
-        assert_eq!(
-            (state.width, state.height),
-            (1920, 1080),
-            "applying a resolution is another task's; saying it was applied would be a lie"
-        );
+    fn set_mode_auto_resolves_to_the_one_mode_this_build_encodes() {
+        let state = drive_control_for_state(control_record_set_mode(Mode::Auto));
+        assert_eq!(state.mode, Mode::Desktop as i32);
+    }
+
+    #[test]
+    fn set_resolution_is_a_request_to_the_output_and_not_an_answer_to_the_host() {
+        // Nothing is reported back at this point: what the output came up at
+        // is not known until a framebuffer of the new size has been seen, and
+        // saying anything sooner would be a size the viewer would scale
+        // against.
+        assert!(matches!(
+            drive(control_record_set_resolution(2560, 1440)),
+            Outcome::Resize {
+                width: 2560,
+                height: 1440
+            }
+        ));
+    }
+
+    #[test]
+    fn set_resolution_rounds_to_a_mode_the_output_can_build() {
+        // `drm_cvt_mode` rounds a width to a multiple of eight, so a request
+        // it cannot build would be one the guest never reports back -- and a
+        // host that asked again for it on every frame.
+        assert!(matches!(
+            drive(control_record_set_resolution(1727, 971)),
+            Outcome::Resize {
+                width: 1720,
+                height: 970
+            }
+        ));
+    }
+
+    #[test]
+    fn a_resolution_this_output_cannot_drive_is_refused_without_ending_the_session() {
+        let error = drive_control(control_record_set_resolution(320, 240));
+        assert_eq!(error, Some(ErrorCode::ResolutionRejected));
+    }
+
+    #[test]
+    fn the_geometry_a_display_state_reports_follows_the_output() {
+        let (_, _, mut control, mut wire) = opened();
+        control.set_geometry(1280, 720);
+        control.state(&mut wire);
+
+        let state = state_from(&mut wire);
+        assert_eq!((state.width, state.height), (1280, 720));
+        assert_eq!(control.geometry(), (1280, 720));
     }
 
     #[test]
