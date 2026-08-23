@@ -2851,6 +2851,65 @@ for `MODE_MOTION` is answered with `ERROR_CODE_UNSUPPORTED_MODE`. None of this
 is wired into a running VM yet: Connect still opens the AppSandbox IDD window,
 and it will until the native display path is proven end to end.
 
+### The guest display services
+
+Two programs, one crate (`crates/display-services`), both static musl binaries
+built by `cargo display-services`. They are two rather than one because exactly
+one thing on the guest side needs privilege: `DRM_IOCTL_MODE_GETFB2` will not
+hand a framebuffer's handles to anything without `CAP_SYS_ADMIN`. Everything
+that runs hot -- mapping, comparing tiles, encoding, writing sockets -- is the
+part most likely to hold a bug worth exploiting, so it runs as `vmlord-display`
+with `CapabilityBoundingSet=` and nothing to steal.
+
+`vmlord-display-broker` is root and small. It holds the DRM device, the VM's
+secret and the control channel, and it is an ordinary DRM client that never
+takes master -- the compositor holds that. `vmlord-display-session` is
+unprivileged and holds a read-only mapping and one channel key per socket, each
+good for one session and no longer.
+
+Between them is a root-owned `SOCK_SEQPACKET` socket at
+`/run/vmlord/display-broker.sock`. `SO_PEERCRED` is checked on accept, so a
+process that is not the service user is refused before it has said anything.
+Pixels cross it as dma-buf descriptors over `SCM_RIGHTS`, exported without
+`DRM_RDWR`: the unprivileged half maps the guest's own scanout buffer read-only
+and root never copies a frame. Each buffer crosses once and is named by its
+framebuffer id afterwards, since a descriptor costs a syscall and a slot in the
+peer's table.
+
+The three vsock ports are the protocol's: `VMLD` control, `VMLF` frames, `VMLI`
+input. The guest listens on all three and the host connects, and the two halves
+divide them -- the broker owns control, the session process owns the other two
+and never sees a device descriptor or an ioctl of its own. What crosses the IPC
+socket after a handshake is a `SessionParameters`: the session id, one channel
+key per socket, the geometry, and whether the peer took the cursor stream. Not
+the secret. What a compromised capture process could take from those bytes is
+one session, and only while that session runs.
+
+The three disconnect obligations are honoured where they are owed. A frame
+channel that binds sends `StreamConfig` and then a keyframe before any delta,
+because a decoder that has just been built has nothing to apply a delta to; a
+reconnect binds at the next generation and starts again the same way, and the
+loop notices a dropped socket by watching it for hangup rather than by
+discovering it on the write that fails. Losing control ends the session: both
+sockets are shut down and nothing more is asked for, because a process that
+keeps asking for frames is one that never stopped capturing. Input is bound and
+its records are read and dropped -- the handshake completes and the socket does
+not stall, and `/dev/uinput` is a later task's.
+
+Packaging runs from `cargo display-services` through `payloads/display/prepare.sh
+--services`, which installs both binaries and both units into the payload's
+`content/services/`. They are built by the host toolchain and not in the
+payload container: a static musl binary is identical for 22.04, 24.04 and
+26.04, and that container exists to prove the *module* compiles against a
+release's headers. `pack` then refuses a recipe whose declared protocol range
+does not contain the version this build speaks -- the range used to be a
+placeholder, and the services in the archive are what make it a claim. Inside
+the guest, `vmlord-agent`'s `SERVICES` and `SERVICES_START` recipe stages
+install them by content digest, create the `vmlord-display` account, enable both
+units and wait for the socket between them; a payload that carries no services
+is skipped rather than failed, because every payload built before this is one of
+those.
+
 ### Desktop profile and display provisioning
 
 What a VM asks of its desktop, what installing that desktop came to, and what
