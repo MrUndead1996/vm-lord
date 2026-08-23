@@ -13,10 +13,9 @@ pub mod hvsocket;
 #[allow(unsafe_code)]
 pub mod ipc;
 
-// A window class, a message pump, and the messages the session posts into it.
-// Task 9.
-// #[allow(unsafe_code)]
-// pub mod window;
+/// A window class, a message pump, and the messages the session posts into it.
+#[allow(unsafe_code)]
+pub mod window;
 
 // A D3D11 device, a swapchain, one texture, and the Direct2D overlay over it.
 // Task 10.
