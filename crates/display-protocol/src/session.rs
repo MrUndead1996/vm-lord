@@ -318,6 +318,36 @@ impl Session {
         self.control_sequence
     }
 
+    /// Takes the next control sequence, advancing the counter.
+    ///
+    /// The session machine numbers the records it produces itself; this is for
+    /// the records a caller produces on an established session -- pings, pongs,
+    /// keyframe requests and the end of a session -- so that one counter serves
+    /// the whole channel.
+    pub fn take_control_sequence(&mut self) -> u32 {
+        let sequence = self.control_sequence;
+        self.control_sequence += 1;
+
+        sequence
+    }
+
+    /// Takes the next sequence on a bound channel, advancing the counter.
+    ///
+    /// The counterpart of [`Session::take_control_sequence`] for the records a
+    /// caller writes on a frame or input socket, so that the binding records
+    /// and the traffic after them share one counter.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Unexpected`] for [`Channel::Control`], which has its own.
+    pub fn take_channel_sequence(&mut self, channel: Channel) -> Result<u32, SessionError> {
+        let index = self.channel_index(channel)?;
+        let sequence = self.channels[index].sequence;
+        self.channels[index].sequence += 1;
+
+        Ok(sequence)
+    }
+
     /// What the handshake settled on, once it has.
     #[must_use]
     pub fn negotiated(&self) -> Option<&Negotiated> {
@@ -1641,7 +1671,14 @@ mod tests {
             .expect("a channel may be replaced");
         bind_from_hello(&mut viewer, &mut guest, hello);
 
-        let stale = Record::new(Channel::Frame, FrameRecord::Keyframe as u16, 0, 0, 0, vec![]);
+        let stale = Record::new(
+            Channel::Frame,
+            FrameRecord::Keyframe as u16,
+            0,
+            0,
+            0,
+            vec![],
+        );
         assert!(matches!(
             viewer.accept(&stale.header),
             Err(SessionError::StaleGeneration {
