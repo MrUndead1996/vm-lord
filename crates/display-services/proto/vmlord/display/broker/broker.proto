@@ -19,6 +19,7 @@ message Envelope {
     KeyframeRequested keyframe_requested = 5;
     Snapshot snapshot = 6;
     Report report = 7;
+    InputDevices input_devices = 8;
   }
 }
 
@@ -49,6 +50,11 @@ message SessionClosed {
 
 // The viewer asked for a keyframe. Recovery, not flow control.
 message KeyframeRequested {}
+
+// The keyboard and the pointer, whose descriptors are attached to this
+// datagram in that order. Sent when the broker adopts a peer, and again in
+// answer to its Attach. A broker with no input devices never sends it.
+message InputDevices {}
 
 // What the planes hold at one vblank.
 message Snapshot {

@@ -14,16 +14,19 @@
 use std::{
     collections::HashMap,
     fmt,
+    fs::File,
     io::{self, ErrorKind, Read, Write},
     os::fd::{AsRawFd, OwnedFd, RawFd},
     path::PathBuf,
     time::Duration,
 };
 
+use prost::Message as _;
 use vmlord_display_codec::{CodecError, Geometry, PixelFormat, TileSize};
 use vmlord_display_protocol::{
     keys::ChannelKey,
     record::{self, Channel, Limits, RecordError},
+    v1::{InputRecord, KeyEvent, PointerButton, PointerMotion, PointerScroll},
 };
 
 use crate::{
@@ -33,6 +36,7 @@ use crate::{
     drm::uapi::DRM_FORMAT_ARGB8888,
     ipc::{Message, PlaneKind, PlaneLayout, SessionParameters},
     pipeline::{Pipeline, PipelineError},
+    uinput::{Keyboard, Pointer},
     unix::Connection,
 };
 
@@ -162,6 +166,11 @@ pub struct Loop<F: Acceptor, I: Acceptor> {
     /// every vblank would put a record on the wire for a pointer that has not
     /// moved, which is bandwidth spent to say nothing.
     cursor: Option<Placement>,
+    /// The guest's keyboard, once the broker has handed it over. `None` on a
+    /// guest whose kernel has no uinput, where input is read and dropped.
+    keyboard: Option<Keyboard<File>>,
+    /// Its pointer, on the same terms.
+    pointer: Option<Pointer<File>>,
     limits: Limits,
 }
 
@@ -181,6 +190,8 @@ impl<F: Acceptor, I: Acceptor> Loop<F, I> {
             asked_for_frame: false,
             input_records: 0,
             cursor: None,
+            keyboard: None,
+            pointer: None,
             limits: Limits::new(0, 0),
         }
     }
@@ -426,6 +437,20 @@ impl<F: Acceptor, I: Acceptor> Loop<F, I> {
 
                 Ok(None)
             }
+            Message::InputDevices => {
+                let mut descriptors = descriptors.into_iter();
+                match (descriptors.next(), descriptors.next()) {
+                    (Some(keyboard), Some(pointer)) => {
+                        self.keyboard = Some(Keyboard::new(File::from(keyboard)));
+                        self.pointer = Some(Pointer::new(File::from(pointer)));
+                    }
+                    _ => eprintln!(
+                        "vmlord-display-session: the broker offered input devices without their descriptors"
+                    ),
+                }
+
+                Ok(None)
+            }
             Message::Snapshot {
                 sequence,
                 planes,
@@ -571,11 +596,11 @@ impl<F: Acceptor, I: Acceptor> Loop<F, I> {
         }
     }
 
-    /// Reads whatever the input channel has, and drops it.
+    /// Reads whatever the input channel has and puts it on the devices.
     ///
-    /// Putting the events on a `/dev/uinput` device is a later task's. What is
-    /// owed here is a channel that completes its handshake and a record that is
-    /// consumed rather than left to stall the socket.
+    /// A guest whose broker found no uinput still reads the channel: an unread
+    /// record would stall the socket, and the host has nothing to do about a
+    /// kernel that has no uinput in it.
     fn read_input(&mut self) -> bool {
         let Some(socket) = self.input.as_mut() else {
             return false;
@@ -599,6 +624,7 @@ impl<F: Acceptor, I: Acceptor> Loop<F, I> {
                     return true;
                 }
                 self.input_records += 1;
+                self.apply_input(header.message_type, &payload);
 
                 true
             }
@@ -624,6 +650,77 @@ impl<F: Acceptor, I: Acceptor> Loop<F, I> {
         }
     }
 
+    /// Puts one input record on the devices, if there are any.
+    ///
+    /// A record type this build has no name for is ignored rather than
+    /// refused: the protocol's forward-compatibility rule is that an unknown
+    /// message changes nothing.
+    fn apply_input(&mut self, message_type: u16, payload: &[u8]) {
+        let Ok(record) = InputRecord::try_from(i32::from(message_type)) else {
+            return;
+        };
+        let Some(parameters) = self.parameters.as_ref() else {
+            return;
+        };
+        let (width, height) = (parameters.width, parameters.height);
+
+        let applied = match record {
+            InputRecord::KeyEvent => KeyEvent::decode(payload).map(|event| {
+                self.keyboard.as_mut().map_or(Ok(()), |keyboard| {
+                    keyboard.key(u16::try_from(event.keycode).unwrap_or(0), event.pressed)
+                })
+            }),
+            InputRecord::PointerMotion => PointerMotion::decode(payload).map(|motion| {
+                self.pointer
+                    .as_mut()
+                    .map_or(Ok(()), |pointer| pointer.motion(motion.x, motion.y, width, height))
+            }),
+            InputRecord::PointerButton => PointerButton::decode(payload).map(|event| {
+                self.pointer.as_mut().map_or(Ok(()), |pointer| {
+                    pointer.button(u16::try_from(event.button).unwrap_or(0), event.pressed)
+                })
+            }),
+            InputRecord::PointerScroll => PointerScroll::decode(payload).map(|scroll| {
+                self.pointer.as_mut().map_or(Ok(()), |pointer| {
+                    pointer.scroll(scroll.horizontal, scroll.vertical)
+                })
+            }),
+            InputRecord::ReleaseAll => {
+                self.release_input();
+
+                return;
+            }
+            _ => return,
+        };
+
+        match applied {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                eprintln!("vmlord-display-session: an input device refused an event: {error}");
+            }
+            Err(error) => {
+                eprintln!("vmlord-display-session: an input record would not decode: {error}");
+            }
+        }
+    }
+
+    /// Releases everything both devices believe is held.
+    ///
+    /// Called for every way the channel can end, because a key the guest is
+    /// still holding is worse than a session that was lost.
+    fn release_input(&mut self) {
+        if let Some(keyboard) = self.keyboard.as_mut()
+            && let Err(error) = keyboard.release_all()
+        {
+            eprintln!("vmlord-display-session: the keyboard would not release: {error}");
+        }
+        if let Some(pointer) = self.pointer.as_mut()
+            && let Err(error) = pointer.release_all()
+        {
+            eprintln!("vmlord-display-session: the pointer would not release: {error}");
+        }
+    }
+
     /// Closes both session sockets, waking anything blocked on them.
     fn close_session_sockets(&mut self) {
         if let Some(frame) = self.frame.take() {
@@ -632,8 +729,9 @@ impl<F: Acceptor, I: Acceptor> Loop<F, I> {
         self.close_input();
     }
 
-    /// Closes the input socket alone.
+    /// Closes the input socket alone, releasing whatever the guest still holds.
     fn close_input(&mut self) {
+        self.release_input();
         if let Some(input) = self.input.take() {
             shutdown(input.as_raw_fd());
         }
@@ -849,20 +947,23 @@ fn connect_to_broker(path: &std::path::Path) -> io::Result<Connection> {
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{self, Read, Write},
-        os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+        io::{self, ErrorKind, Read, Write},
+        os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
         sync::{Arc, Mutex},
         thread::JoinHandle,
     };
 
+    use prost::Message as _;
     use vmlord_display_protocol::{
         keys::Secret,
         record::{self, Channel, Header, Limits, Record},
         session::{Event, Offer, Session, Support},
-        v1::{Capability, FrameRecord, InputRecord, KeyEvent, Mode},
+        v1::{
+            Capability, FrameRecord, InputRecord, KeyEvent, Mode, PointerButton, PointerMotion,
+        },
     };
 
-    use super::{Acceptor, Loop, Socket, Step};
+    use super::{Acceptor, Loop, Socket, Step, set_nonblocking};
     use crate::{
         ipc::{Message, PlaneKind, PlaneLayout, SessionParameters},
         unix::{Connection, Listener},
@@ -1056,11 +1157,25 @@ mod tests {
         closed_at: Option<usize>,
         /// Where the socket lives, removed on drop.
         socket_path: std::path::PathBuf,
+        /// The read ends of the two device pipes, where the broker's real
+        /// uinput descriptors go.
+        keyboard: Option<std::io::PipeReader>,
+        pointer: Option<std::io::PipeReader>,
     }
 
     impl World {
-        /// A session that is open, with both processes and a real host.
+        /// A session that is open, with both processes, a real host and the
+        /// two input devices the broker hands over.
         fn open() -> Self {
+            Self::build(true)
+        }
+
+        /// The same on a guest whose kernel has no uinput.
+        fn open_without_devices() -> Self {
+            Self::build(false)
+        }
+
+        fn build(with_devices: bool) -> Self {
             let secret = Secret::generate();
             let (mut host, client_hello) = Session::host(
                 &secret,
@@ -1156,7 +1271,27 @@ mod tests {
                 from_session: Vec::new(),
                 closed_at: None,
                 socket_path,
+                keyboard: None,
+                pointer: None,
             };
+
+            if with_devices {
+                // Before the parameters, as the broker sends them: a session
+                // that learned its parameters first would drop the input
+                // records it read before the devices arrived.
+                let (keyboard_reader, keyboard_writer) = std::io::pipe().expect("a pipe");
+                let (pointer_reader, pointer_writer) = std::io::pipe().expect("a pipe");
+                world
+                    .broker
+                    .send(
+                        &Message::InputDevices,
+                        &[keyboard_writer.as_fd(), pointer_writer.as_fd()],
+                    )
+                    .expect("the devices go out");
+                world.keyboard = Some(keyboard_reader);
+                world.pointer = Some(pointer_reader);
+                world.step();
+            }
 
             world
                 .broker
@@ -1447,6 +1582,93 @@ mod tests {
                 .expect("the key event goes out");
         }
 
+        /// The host sends a pointer motion.
+        fn host_sends_motion(&mut self, x: u32, y: u32) {
+            self.send_record(
+                InputRecord::PointerMotion,
+                PointerMotion { x, y }.encode_to_vec(),
+            );
+        }
+
+        /// The host presses or releases a pointer button.
+        fn host_sends_button(&mut self, button: u32, pressed: bool) {
+            self.send_record(
+                InputRecord::PointerButton,
+                PointerButton { button, pressed }.encode_to_vec(),
+            );
+        }
+
+        /// The host asks the guest to release everything.
+        fn host_sends_release_all(&mut self) {
+            self.send_record(InputRecord::ReleaseAll, Vec::new());
+        }
+
+        /// The host drops its end of the input socket.
+        fn host_closes_input_socket(&mut self) {
+            // The last reference to the descriptor, so dropping it is what the
+            // session sees as the socket going away.
+            drop(self.host_input.take());
+        }
+
+        /// One record on the input channel, at the generation it is bound at.
+        fn send_record(&mut self, kind: InputRecord, payload: Vec<u8>) {
+            let generation = self
+                .host
+                .lock()
+                .expect("the world's lock is not poisoned")
+                .generation(Channel::Input);
+            let Some(input) = self.host_input.as_ref() else {
+                return;
+            };
+            let record = Record::new(Channel::Input, kind as u16, 1, 0, generation, payload);
+            let mut socket = HostEnd(Arc::clone(input));
+            record::write(&mut socket, &record, &Limits::new(WIDTH, HEIGHT))
+                .expect("the record goes out");
+        }
+
+        /// The `(type, code, value)` triples the keyboard has been sent.
+        fn keyboard_events(&mut self) -> Vec<(u16, u16, i32)> {
+            Self::device_events(self.keyboard.as_mut())
+        }
+
+        /// The same for the pointer.
+        fn pointer_events(&mut self) -> Vec<(u16, u16, i32)> {
+            Self::device_events(self.pointer.as_mut())
+        }
+
+        /// Whatever is on a device pipe right now, and no waiting.
+        ///
+        /// Non-blocking, because a device with nothing on it is what half of
+        /// these tests assert.
+        fn device_events(reader: Option<&mut std::io::PipeReader>) -> Vec<(u16, u16, i32)> {
+            let Some(reader) = reader else {
+                return Vec::new();
+            };
+            set_nonblocking(reader.as_raw_fd()).expect("a non-blocking pipe");
+
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                match reader.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("a device pipe failed: {error}"),
+                }
+            }
+
+            bytes
+                .chunks_exact(24)
+                .map(|event| {
+                    (
+                        u16::from_ne_bytes([event[16], event[17]]),
+                        u16::from_ne_bytes([event[18], event[19]]),
+                        i32::from_ne_bytes([event[20], event[21], event[22], event[23]]),
+                    )
+                })
+                .collect()
+        }
+
         /// How many input records the session process consumed.
         fn input_records_consumed(&self) -> u64 {
             self.loops.input_records()
@@ -1602,15 +1824,86 @@ mod tests {
     }
 
     #[test]
-    fn an_input_record_is_read_and_dropped() {
-        // A `/dev/uinput` device is a later task's. What this task owes is a
-        // channel that completes its handshake and a record that is consumed
-        // rather than left to stall the socket.
-        let mut world = World::open();
+    fn a_session_with_no_devices_still_consumes_its_records() {
+        // A guest whose broker found no uinput reads the channel and drops
+        // what it reads, rather than letting unread records stall the socket.
+        let mut world = World::open_without_devices();
         world.host_sends_key_event(30, true);
         world.run_until_idle();
 
         assert!(!world.input_socket_is_closed());
         assert_eq!(world.input_records_consumed(), 1);
+    }
+
+    #[test]
+    fn a_key_event_reaches_the_keyboard_device() {
+        let mut world = World::open();
+        world.host_sends_key_event(30, true);
+        world.run_until_idle();
+
+        assert_eq!(
+            world.keyboard_events(),
+            vec![(1, 30, 1), (0, 0, 0)],
+            "a key press and the report that closes it"
+        );
+    }
+
+    #[test]
+    fn a_pointer_motion_is_scaled_by_the_session_geometry() {
+        let mut world = World::open();
+        world.host_sends_motion(WIDTH - 1, HEIGHT - 1);
+        world.run_until_idle();
+
+        let events = world.pointer_events();
+        assert_eq!(events[0], (3, 0, 32767));
+        assert_eq!(events[1], (3, 1, 32767));
+    }
+
+    #[test]
+    fn a_record_from_a_stale_generation_never_reaches_a_device() {
+        let mut world = World::open();
+        world.host_sends_input_with_generation(0);
+        world.run_until_idle();
+
+        assert!(world.input_socket_is_closed());
+        assert!(
+            world
+                .keyboard_events()
+                .iter()
+                .all(|event| event.0 != 1 || event.2 != 1),
+            "a record from a connection that was replaced must not press a key"
+        );
+    }
+
+    #[test]
+    fn a_lost_input_channel_releases_what_the_guest_holds() {
+        let mut world = World::open();
+        world.host_sends_key_event(30, true);
+        world.run_until_idle();
+        let _ = world.keyboard_events();
+
+        world.host_closes_input_socket();
+        world.run_until_idle();
+
+        assert_eq!(
+            world.keyboard_events(),
+            vec![(1, 30, 0), (0, 0, 0)],
+            "a channel that went must leave no key down"
+        );
+    }
+
+    #[test]
+    fn a_release_all_record_releases_both_devices() {
+        let mut world = World::open();
+        world.host_sends_key_event(30, true);
+        world.host_sends_button(0x110, true);
+        world.run_until_idle();
+        let _ = (world.keyboard_events(), world.pointer_events());
+
+        world.host_sends_release_all();
+        world.run_until_idle();
+
+        assert_eq!(world.keyboard_events(), vec![(1, 30, 0), (0, 0, 0)]);
+        assert_eq!(world.pointer_events(), vec![(1, 0x110, 0), (0, 0, 0)]);
     }
 }

@@ -532,6 +532,47 @@ mod tests {
     }
 
     #[test]
+    fn two_device_descriptors_cross_in_the_order_they_were_sent() {
+        let path = socket_path("devices");
+        let listener = Listener::bind(&path, own_gid()).unwrap();
+
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || {
+                let connection = Connection::connect(&path).unwrap();
+                connection.receive().unwrap()
+            }
+        });
+
+        let server = listener.accept(own_uid()).unwrap();
+        let keyboard = memfd("keyboard", b"keys").unwrap();
+        let pointer = memfd("pointer", b"buttons").unwrap();
+        server
+            .send(&Message::InputDevices, &[keyboard.as_fd(), pointer.as_fd()])
+            .unwrap();
+
+        let (message, descriptors) = client.join().unwrap();
+        assert_eq!(message, Message::InputDevices);
+        assert_eq!(descriptors.len(), 2);
+
+        // Order is the whole contract: the keyboard first, the pointer second.
+        let mut received = descriptors.into_iter();
+        let mut contents = Vec::new();
+        fs::File::from(received.next().unwrap())
+            .read_to_end(&mut contents)
+            .unwrap();
+        assert_eq!(contents, b"keys");
+
+        contents.clear();
+        fs::File::from(received.next().unwrap())
+            .read_to_end(&mut contents)
+            .unwrap();
+        assert_eq!(contents, b"buttons");
+
+        fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
     fn a_peer_with_the_wrong_uid_is_refused() {
         let path = socket_path("peercred");
         let listener = Listener::bind(&path, own_gid()).unwrap();
@@ -612,11 +653,16 @@ mod tests {
             let path = path.clone();
             move || {
                 let connection = Connection::connect(&path).unwrap();
+                // The growth, not the count: other tests in this process hold
+                // descriptors of their own, and what a leak looks like here is
+                // sixty-four more of them than there were a moment ago.
+                let before = open_descriptors();
                 for _ in 0..64 {
                     let (_, descriptors) = connection.receive().unwrap();
                     assert_eq!(descriptors.len(), 1);
                 }
-                open_descriptors()
+
+                open_descriptors().saturating_sub(before)
             }
         });
 
@@ -635,10 +681,10 @@ mod tests {
                 .unwrap();
         }
 
-        let after = client.join().unwrap();
+        let growth = client.join().unwrap();
         assert!(
-            after < 64,
-            "sixty-four descriptors were received and dropped; {after} are still open, which is a leak"
+            growth < 64,
+            "sixty-four descriptors were received and dropped; {growth} more are open than before, which is a leak"
         );
 
         fs::remove_file(&path).unwrap();

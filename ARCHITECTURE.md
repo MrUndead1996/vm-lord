@@ -2892,9 +2892,9 @@ reconnect binds at the next generation and starts again the same way, and the
 loop notices a dropped socket by watching it for hangup rather than by
 discovering it on the write that fails. Losing control ends the session: both
 sockets are shut down and nothing more is asked for, because a process that
-keeps asking for frames is one that never stopped capturing. Input is bound and
-its records are read and dropped -- the handshake completes and the socket does
-not stall, and `/dev/uinput` is a later task's.
+keeps asking for frames is one that never stopped capturing. An input channel
+that is lost releases whatever the guest still holds before anything else,
+because a key left down is worse than a session left broken.
 
 Packaging runs from `cargo display-services` through `payloads/display/prepare.sh
 --services`, which installs both binaries and both units into the payload's
@@ -2946,17 +2946,65 @@ focus and close. Asking for a *new session* is deliberately not on that pipe.
 So a repeated Connect focuses the window that is there rather than opening a
 second one.
 
-`unsafe` lives in `src/windows/{hvsocket, ipc, window, d3d}.rs` and nowhere else
-in the crate: the workspace denies it, and those four module declarations are
-the only places it is re-allowed. Every other decision the viewer makes -- the
+`unsafe` lives in `src/windows/{hvsocket, ipc, window, d3d, hook}.rs` and
+nowhere else in the crate: the workspace denies it, and those five module
+declarations are the only places it is re-allowed. Every other decision the viewer makes -- the
 status machine and its thirty-second retry budget, the decode path, the launch
 contract, the overlay's geometry -- is safe Rust with tests that need no
 partition. Framebuffer and cursor content is never logged, and this build has no
 screenshot feature.
 
-What is deliberately not there yet: keyboard and mouse input (#119); letterbox,
-fullscreen, dynamic resolution and saved window state (#120); and the HCS
-service entries and the Connect path that launches the binary (#121).
+What is deliberately not there yet: letterbox, fullscreen, dynamic resolution
+and saved window state (#120); and the HCS service entries and the Connect path
+that launches the binary (#121).
+
+### Keyboard and mouse
+
+The guest has two input devices, not one: `VMLord Keyboard` and `VMLord
+Pointer`. libinput classifies a device by its capability bits, and a node
+carrying keys, absolute axes and buttons at once is resolved by heuristics that
+have changed between releases -- while this MVP has to behave the same on 22.04,
+24.04 and 26.04. Two unambiguous nodes remove the question.
+
+The broker creates them, because `/dev/uinput` is root's, and hands the
+descriptors to the session process over the socket that already carries
+framebuffers. That is not only cheaper than relaying every mouse movement
+through a second hop: when the session process dies its descriptors close, the
+kernel unregisters the device and releases every key it believed was held. "No
+stuck keys after a crash" is then the kernel's property rather than our
+diligence. A guest whose kernel has no uinput shows a read-only desktop and
+reports it, rather than failing to show one at all -- the same rule the DRM side
+follows.
+
+The absolute axes are declared `0..32767` once and never again. Deriving them
+from the resolution would mean recreating the device on every change of it,
+which #120 makes an ordinary event, and the desktop would watch its pointer
+disappear and come back; the session scales guest pixels onto the fixed range
+instead. The wheel travels at both resolutions: `REL_WHEEL_HI_RES` in the
+hundred-and-twentieths the wire uses, and the whole detents they add up to, with
+the remainder carried so slow scrolling is not lost.
+
+On the host, deciding and catching are separate. `placement.rs` says where the
+picture sits on the client area and maps a client point to a guest pixel;
+`input/` holds the scan-code table and the policy -- focus, hover, what is held,
+and every path that owes a release. Neither touches a Windows API, so the rules
+are tested anywhere. `windows/window.rs` catches the mouse, the focus and the
+system menu; `windows/hook.rs` is a `WH_KEYBOARD_LL` hook, installed on focus
+and removed on its loss, which is the only way `Super`, `Alt+Tab` and `Ctrl+Esc`
+reach GNOME rather than the Windows shell.
+
+Keys are carried as **scan codes**, not virtual keys. A virtual key has already
+had the host's layout applied to it and the guest then applies its own, so a
+host on a non-US layout sends the wrong keys and breaks `Ctrl`+letter; a scan
+code is a position on the keyboard, and the layout stays entirely the guest's.
+Three keys are the exception -- `Pause`, `NumLock` and `PrtScn` -- whose scan
+codes Windows reports ambiguously and which carry no layout to get wrong.
+
+While the hook is installed the keyboard is the guest's, `Alt+F4` included, so
+**`Ctrl+Alt+Left Shift`** is reserved: it hands the keyboard back, and the guest
+is sent a release. `Ctrl+Alt+Del` is a system-menu action rather than a
+shortcut, because the Secure Attention Sequence is routed by the kernel and no
+documented hook sees it -- and undocumented ones are out of the question.
 
 ### Desktop profile and display provisioning
 

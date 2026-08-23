@@ -21,12 +21,13 @@ use vmlord_display_protocol::{
     record::{self, Channel, Limits, Record, RecordError},
     session::{Event as SessionEvent, HandedOver, Negotiated, Session, SessionError},
     v1::{
-        Capability, ControlRecord, DisplayState, Error as ErrorRecord, InputRecord, Mode, Ping,
-        Pong, ProtocolVersion,
+        Capability, ControlRecord, DisplayState, Error as ErrorRecord, InputRecord, KeyEvent, Mode,
+        Ping, PointerButton, PointerMotion, PointerScroll, Pong, ProtocolVersion,
     },
 };
 
 use crate::{
+    input,
     launch::Handover,
     status::Event,
     video::{Update, Video, VideoError},
@@ -181,6 +182,46 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
     /// Recovery, not flow control: the decoder has nothing to apply a delta to.
     pub fn request_keyframe(&mut self) {
         self.write_control(ControlRecord::RequestKeyframe, Vec::new());
+    }
+
+    /// Sends one input event to the guest.
+    ///
+    /// A write that fails closes the socket rather than retrying: the bind
+    /// path reconnects it at the next generation, and the `ReleaseAll` that
+    /// opens every bind covers whatever was held when it broke. The frame
+    /// channel is untouched -- the picture does not stop because a key did.
+    pub fn send_input(&mut self, event: input::Event) {
+        if self.input.is_none() {
+            return;
+        }
+
+        let (message_type, payload) = encode_input(event);
+        let sequence = match self.session.take_channel_sequence(Channel::Input) {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                log::debug!("an input record could not be numbered: {error}");
+                self.input = None;
+
+                return;
+            }
+        };
+        let record = Record::new(
+            Channel::Input,
+            message_type as u16,
+            sequence,
+            0,
+            self.session.generation(Channel::Input),
+            payload,
+        );
+
+        let limits = self.control_limits;
+        let Some(socket) = self.input.as_mut() else {
+            return;
+        };
+        if let Err(error) = record::write(socket, &record, &limits) {
+            log::debug!("the input channel could not be written to: {error}");
+            self.input = None;
+        }
     }
 
     /// Tells the guest the session is over, best effort.
@@ -476,6 +517,44 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
     }
 }
 
+/// One event as the record type and payload the input channel carries.
+fn encode_input(event: input::Event) -> (InputRecord, Vec<u8>) {
+    match event {
+        input::Event::Key { keycode, pressed } => (
+            InputRecord::KeyEvent,
+            KeyEvent {
+                keycode: u32::from(keycode),
+                pressed,
+            }
+            .encode_to_vec(),
+        ),
+        input::Event::Motion { x, y } => (
+            InputRecord::PointerMotion,
+            PointerMotion { x, y }.encode_to_vec(),
+        ),
+        input::Event::Button { button, pressed } => (
+            InputRecord::PointerButton,
+            PointerButton {
+                button: u32::from(button),
+                pressed,
+            }
+            .encode_to_vec(),
+        ),
+        input::Event::Scroll {
+            horizontal,
+            vertical,
+        } => (
+            InputRecord::PointerScroll,
+            PointerScroll {
+                horizontal,
+                vertical,
+            }
+            .encode_to_vec(),
+        ),
+        input::Event::ReleaseAll => (InputRecord::ReleaseAll, Vec::new()),
+    }
+}
+
 /// Reads one record, waiting out a socket that has simply not answered yet.
 ///
 /// The one place the session thread waits on a socket rather than leaving it
@@ -700,6 +779,94 @@ mod tests {
                 input,
             },
         )
+    }
+
+    /// A live session with both channels bound, and the guest ends back.
+    fn established() -> (
+        Live<Duplex, Box<dyn FnMut(Channel) -> Result<Duplex, String>>>,
+        Harness,
+    ) {
+        let (mut live, mut harness) = start(Instant::now());
+        let mut signals = Vec::new();
+
+        let guest = std::thread::spawn(move || {
+            accept_bind(
+                &mut harness.frame,
+                Channel::Frame,
+                &ChannelKey::from_bytes(FRAME_KEY),
+            );
+            accept_bind(
+                &mut harness.input,
+                Channel::Input,
+                &ChannelKey::from_bytes(INPUT_KEY),
+            );
+
+            // The `ReleaseAll` every bind opens with, read here so that the
+            // records a test sends afterwards are the only ones it sees.
+            let limits = Limits::new(0, 0);
+            let mut payload = Vec::new();
+            let header = wait_for_record(&mut harness.input, &limits, &mut payload);
+            assert_eq!(header.message_type, InputRecord::ReleaseAll as u16);
+
+            harness
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline
+            && !signals
+                .iter()
+                .any(|signal| matches!(signal, Signal::Status(crate::status::Event::Established)))
+        {
+            live.pump(Instant::now(), &mut signals);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        (live, guest.join().expect("the guest thread"))
+    }
+
+    #[test]
+    fn an_input_event_reaches_the_guest_as_its_record() {
+        let (mut live, mut harness) = established();
+
+        live.send_input(crate::input::Event::Key {
+            keycode: 30,
+            pressed: true,
+        });
+        live.send_input(crate::input::Event::Motion { x: 100, y: 50 });
+
+        let limits = Limits::new(0, 0);
+        let mut payload = Vec::new();
+
+        let header = wait_for_record(&mut harness.input, &limits, &mut payload);
+        assert_eq!(header.message_type, InputRecord::KeyEvent as u16);
+        let key = vmlord_display_protocol::v1::KeyEvent::decode(payload.as_slice())
+            .expect("a key event");
+        assert_eq!((key.keycode, key.pressed), (30, true));
+
+        let header = wait_for_record(&mut harness.input, &limits, &mut payload);
+        assert_eq!(header.message_type, InputRecord::PointerMotion as u16);
+        let motion = vmlord_display_protocol::v1::PointerMotion::decode(payload.as_slice())
+            .expect("a motion");
+        assert_eq!((motion.x, motion.y), (100, 50));
+
+        // Sequence numbers advance, which is what the guest's replay check
+        // rests on. The bind's own `ReleaseAll` was the one before these.
+        assert!(header.sequence > 0);
+    }
+
+    #[test]
+    fn an_event_with_no_input_channel_is_dropped_rather_than_queued() {
+        // Between a channel's loss and its rebind there is nowhere to put an
+        // event, and holding one back would deliver it under a generation the
+        // guest has already refused.
+        let (mut live, _harness) = start(Instant::now());
+
+        live.send_input(crate::input::Event::Key {
+            keycode: 30,
+            pressed: true,
+        });
+
+        assert!(live.socket(Channel::Input).is_none());
     }
 
     #[test]

@@ -45,13 +45,16 @@ use std::{
 use vmlord_display_codec::{Geometry, Rect};
 use vmlord_display_protocol::record::Channel;
 use vmlord_display_viewer::{
+    input::{self, Report},
     launch::{self, Command, LaunchParameters, Link, Message},
     live::{Live, Signal},
     log as viewer_log,
+    placement::place,
     relay::{Relay, RelayError},
     status::{self, Button, Event, Progress, Status},
     windows::{
         d3d::Renderer,
+        hook::Hook,
         hvsocket::{CONNECT_TIMEOUT, ConnectError, HvSocket},
         ipc::{self, CommandServer, SingleInstance},
         window::{Shared, UiEvent, WM_SIGNAL, Window, report},
@@ -256,6 +259,8 @@ enum Order {
     Keyframe,
     /// The window is closing.
     End,
+    /// One input event for the guest.
+    Input(input::Event),
 }
 
 /// Everything the session thread owns.
@@ -412,15 +417,21 @@ where
     let mut signals = Vec::new();
 
     loop {
-        match session.orders.try_recv() {
-            Ok(Order::End) => {
-                live.end();
-                return Attempt::Stop;
+        // The whole queue, not one order a pass: with a 2 ms sleep in this
+        // loop, one at a time would cap pointer motion at 500 events a second
+        // and add latency under exactly the load that matters.
+        loop {
+            match session.orders.try_recv() {
+                Ok(Order::End) => {
+                    live.end();
+                    return Attempt::Stop;
+                }
+                Ok(Order::Keyframe) => live.request_keyframe(),
+                Ok(Order::Retry) => return Attempt::Restart,
+                Ok(Order::Input(event)) => live.send_input(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return Attempt::Stop,
             }
-            Ok(Order::Keyframe) => live.request_keyframe(),
-            Ok(Order::Retry) => return Attempt::Restart,
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => return Attempt::Stop,
         }
 
         signals.clear();
@@ -528,12 +539,25 @@ fn refresh(session: &Session) -> Option<Vec<u8>> {
 fn pump(mut context: Loop<'_>) -> ExitCode {
     let mut progress = Progress::new(Instant::now());
     let mut closing = false;
+    let mut policy = input::Policy::new();
+    let mut stream: Option<Geometry> = None;
+    // While this lives the keyboard is the guest's. It is taken on focus and
+    // given back the moment the window loses it -- or the user asks.
+    let mut hook: Option<Hook> = None;
 
     while context.window.pump() {
         let mut worked = false;
 
         while let Ok(signal) = context.signals.try_recv() {
             worked = true;
+            match &signal {
+                Signal::Configured(geometry) => {
+                    stream = Some(*geometry);
+                    reposition(&mut policy, stream, context.window);
+                }
+                Signal::Ended(_) => policy.report(Report::ChannelLost),
+                _ => {}
+            }
             apply(&mut context, &mut progress, signal);
         }
 
@@ -545,6 +569,19 @@ fn pump(mut context: Loop<'_>) -> ExitCode {
                     let _ = context.orders.send(Order::Retry);
                 }
                 UiEvent::Pressed(Button::Cancel) | UiEvent::Closing => closing = true,
+                UiEvent::Input(report) => {
+                    match report {
+                        Report::FocusGained => match Hook::install(context.shared) {
+                            Ok(installed) => hook = Some(installed),
+                            // A viewer without the hook still types; it only
+                            // loses the keys the shell takes first.
+                            Err(error) => log::warn!("{error}"),
+                        },
+                        Report::FocusLost | Report::ReleaseKeyboard => hook = None,
+                        _ => {}
+                    }
+                    policy.report(report);
+                }
                 UiEvent::Resized(width, height) => {
                     if let Err(error) = context
                         .renderer
@@ -552,6 +589,7 @@ fn pump(mut context: Loop<'_>) -> ExitCode {
                     {
                         log::warn!("the swapchain could not follow the window: {error}");
                     }
+                    reposition(&mut policy, stream, context.window);
                 }
             }
         }
@@ -564,6 +602,14 @@ fn pump(mut context: Loop<'_>) -> ExitCode {
             }
         }
 
+        for event in policy.drain() {
+            worked = true;
+            let _ = context.orders.send(Order::Input(event));
+        }
+        if policy.keyboard_release_requested() {
+            hook = None;
+        }
+
         progress.tick(Instant::now());
         context.shared.failed.store(
             matches!(progress.status(), Status::Failed(_)),
@@ -572,6 +618,10 @@ fn pump(mut context: Loop<'_>) -> ExitCode {
 
         // A stopped VM closes the window rather than showing a failure.
         if closing || matches!(progress.status(), Status::Gone) {
+            // A hook left installed would swallow the user's keyboard with
+            // nothing left to send it to.
+            drop(hook);
+
             return ExitCode::SUCCESS;
         }
 
@@ -583,7 +633,21 @@ fn pump(mut context: Loop<'_>) -> ExitCode {
         }
     }
 
+    drop(hook);
+
     ExitCode::SUCCESS
+}
+
+/// Tells the policy where the picture is, from the stream and the window.
+fn reposition(policy: &mut input::Policy, stream: Option<Geometry>, window: &Window) {
+    let Some(geometry) = stream else {
+        policy.set_placement(None);
+
+        return;
+    };
+
+    let (width, height) = window.client_size();
+    policy.set_placement(place(geometry.width(), geometry.height(), width, height));
 }
 
 /// Moves one signal into the status machine and the renderer.
