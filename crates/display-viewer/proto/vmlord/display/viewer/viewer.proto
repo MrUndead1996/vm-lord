@@ -1,0 +1,87 @@
+// What VMLord and one viewer process say to each other over the two anonymous
+// pipes the viewer was launched with.
+//
+// Private to this pair of processes: the wire contract with the guest is
+// `vmlord.display.v1`, and nothing here crosses a socket. The compatibility
+// rules of that schema apply here too -- never reuse or renumber a field.
+
+syntax = "proto3";
+
+package vmlord.display.viewer.v1;
+
+import "vmlord/display/v1/display.proto";
+
+// One message on a launch pipe. `revision` names the contract, so a mismatched
+// pair of processes fails at the first message rather than at a garbled stream.
+message Envelope {
+  uint32 revision = 1;
+
+  oneof kind {
+    LaunchParameters launch = 2;
+    Relay relay_to_viewer = 3;
+    Relay relay_from_viewer = 4;
+    Handover handover = 5;
+    RequestRelay request_relay = 6;
+    Command command = 7;
+  }
+}
+
+// Everything the viewer is told at startup. Sent once, first.
+message LaunchParameters {
+  // For the window title and the log; never parsed.
+  string vm_name = 1;
+  // The 16 bytes of the compute system's runtime id GUID.
+  bytes runtime_id = 2;
+  uint32 control_port = 3;
+  uint32 frame_port = 4;
+  uint32 input_port = 5;
+  // What VMLord offered, so the viewer can size its first window before the
+  // handshake settles anything.
+  uint32 width = 6;
+  uint32 height = 7;
+  uint32 tile_size = 8;
+  // The right to ask for a new session over these pipes. Not a key.
+  bytes token = 9;
+  // The `ClientHello` record -- header and payload -- to write to the control
+  // socket once it connects.
+  bytes client_hello = 10;
+}
+
+// Handshake bytes, verbatim. The viewer parses none of them.
+message Relay {
+  bytes bytes = 1;
+}
+
+// The one-shot derived credential. Sent once per handshake; relay mode ends
+// here and VMLord drops its own session.
+message Handover {
+  bytes session_id = 1;
+  bytes frame_key = 2;
+  bytes input_key = 3;
+  uint32 version_major = 4;
+  uint32 version_minor = 5;
+  repeated vmlord.display.v1.Capability capabilities = 6;
+  vmlord.display.v1.Mode mode = 7;
+  uint32 width = 8;
+  uint32 height = 9;
+  uint32 tile_size = 10;
+  // The next sequence the host's control channel is on, so that the viewer
+  // carries on the numbering VMLord left off at.
+  uint32 control_sequence = 11;
+}
+
+// The viewer asking for a new session after control was lost. The token is
+// what makes this answerable only by the VMLord instance that spawned it.
+message RequestRelay {
+  bytes token = 1;
+}
+
+message Command {
+  Kind kind = 1;
+
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    KIND_FOCUS = 1;
+    KIND_CLOSE = 2;
+  }
+}
