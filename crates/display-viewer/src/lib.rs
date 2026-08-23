@@ -9,6 +9,7 @@
 pub mod launch;
 pub mod log;
 pub mod status;
+pub mod video;
 
 /// The generated types for the launch pipes' private schema.
 pub mod viewer {
