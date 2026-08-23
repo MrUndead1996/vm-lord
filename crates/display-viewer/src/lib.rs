@@ -8,6 +8,7 @@
 
 #[cfg(test)]
 pub(crate) mod duplex;
+pub mod input;
 pub mod launch;
 pub mod live;
 pub mod log;
