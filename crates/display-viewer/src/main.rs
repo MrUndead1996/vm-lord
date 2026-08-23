@@ -45,6 +45,7 @@ use std::{
 use vmlord_display_codec::{Geometry, Rect};
 use vmlord_display_protocol::record::Channel;
 use vmlord_display_viewer::{
+    input,
     launch::{self, Command, LaunchParameters, Link, Message},
     live::{Live, Signal},
     log as viewer_log,
@@ -256,6 +257,8 @@ enum Order {
     Keyframe,
     /// The window is closing.
     End,
+    /// One input event for the guest.
+    Input(input::Event),
 }
 
 /// Everything the session thread owns.
@@ -412,15 +415,21 @@ where
     let mut signals = Vec::new();
 
     loop {
-        match session.orders.try_recv() {
-            Ok(Order::End) => {
-                live.end();
-                return Attempt::Stop;
+        // The whole queue, not one order a pass: with a 2 ms sleep in this
+        // loop, one at a time would cap pointer motion at 500 events a second
+        // and add latency under exactly the load that matters.
+        loop {
+            match session.orders.try_recv() {
+                Ok(Order::End) => {
+                    live.end();
+                    return Attempt::Stop;
+                }
+                Ok(Order::Keyframe) => live.request_keyframe(),
+                Ok(Order::Retry) => return Attempt::Restart,
+                Ok(Order::Input(event)) => live.send_input(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return Attempt::Stop,
             }
-            Ok(Order::Keyframe) => live.request_keyframe(),
-            Ok(Order::Retry) => return Attempt::Restart,
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => return Attempt::Stop,
         }
 
         signals.clear();
