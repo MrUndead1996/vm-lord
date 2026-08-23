@@ -159,11 +159,15 @@ impl Drop for MappedBuffer {
 
 /// Where a captured frame's pixels live.
 ///
-/// One variant, and an enum rather than a bare field, because this is where a
-/// backing that is handed on without ever being mapped goes.
+/// An enum rather than a bare field, because this is also where a backing that
+/// is handed on without ever being mapped goes.
 pub enum Backing {
-    /// Mapped for the CPU to read.
+    /// A mapping over a dma-buf the broker exported. What a guest actually
+    /// captures.
     Cpu(MappedBuffer),
+    /// Pixels this process owns. What tests and, one day, a software fallback
+    /// hand to the pipeline; the encoder cannot tell the difference.
+    Owned(Vec<u8>),
 }
 
 /// One frame, as capture produced it.
@@ -186,6 +190,44 @@ pub struct CapturedFrame {
     pub damage: Option<Vec<Rect>>,
     /// The pixels themselves.
     pub backing: Backing,
+}
+
+impl CapturedFrame {
+    /// A frame whose pixels this process owns.
+    ///
+    /// The pipeline's tests are its consumer, and so is a software fallback
+    /// that never touches DRM. It is not a test-only constructor: a variant
+    /// behind `#[cfg(test)]` would mean the tested path is not the shipped one.
+    #[must_use]
+    pub const fn from_pixels(
+        sequence: u64,
+        width: u32,
+        height: u32,
+        stride: u32,
+        format: PixelFormat,
+        pixels: Vec<u8>,
+    ) -> Self {
+        Self {
+            sequence,
+            width,
+            height,
+            stride,
+            format,
+            damage: None,
+            backing: Backing::Owned(pixels),
+        }
+    }
+
+    /// Runs `body` over the frame's pixels.
+    ///
+    /// A mapped frame is bracketed with the buffer's coherency calls; an owned
+    /// one needs none, and the caller cannot tell which it got.
+    pub fn read<T>(&self, body: impl FnOnce(&[u8]) -> T) -> T {
+        match &self.backing {
+            Backing::Cpu(mapped) => mapped.read(body),
+            Backing::Owned(pixels) => body(pixels),
+        }
+    }
 }
 
 #[cfg(test)]

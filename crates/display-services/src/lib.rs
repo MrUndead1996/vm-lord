@@ -9,6 +9,7 @@ pub mod capture;
 pub mod cursor;
 pub mod drm;
 pub mod ipc;
+pub mod pipeline;
 pub mod unix;
 
 /// The generated types for the broker's private schema.
