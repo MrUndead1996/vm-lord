@@ -41,9 +41,15 @@ decides what sits at that position.
 
 The source is `lParam` of the keyboard message -- bits 16-23 are the make
 code, bit 24 is the extended flag -- and the same fields of `KBDLLHOOKSTRUCT`
-under the hook. Two sequences need naming rather than table lookup: `PrtScn`
-arrives as `E0 2A E0 37` and `Pause` as the `E1` pair, and both collapse to one
-keycode (`KEY_SYSRQ`, `KEY_PAUSE`).
+under the hook.
+
+Three keys are the exception and are resolved by virtual key instead:
+`Pause`, `NumLock` and `PrtScn`. Windows delivers them from multi-byte
+sequences (`E1 1D 45`, `E0 2A E0 37`) already collapsed into one message, and
+what it puts in the scan-code field collides -- `Pause` and `NumLock` both
+report `0x45`. Reading `VK_PAUSE`, `VK_NUMLOCK` and `VK_SNAPSHOT` settles them
+in three lines and costs nothing the scan-code rule was protecting: none of
+the three carries a layout, so no host layout can misplace them.
 
 ### A low-level hook while the window has focus
 
@@ -152,8 +158,9 @@ Each keeps the set of what it currently holds, which is what `release_all`
 releases -- no more, and nothing it never pressed. A keycode outside the
 declared set is counted and dropped rather than written.
 
-**`ipc.rs` and the broker schema.** One new message, `InputDevices`, sent by
-the broker in answer to `Attach`, carrying the two descriptors. Descriptors are
+**`ipc.rs` and the broker schema.** One new message, `InputDevices`, carrying
+the two descriptors. The broker sends it where it already sends
+`SessionOpened`: when it adopts a peer, and in answer to that peer's `Attach`. Descriptors are
 named by the message they arrive on rather than by position, as `Snapshot`
 already does. Frame buffers never ride on this message, so the existing
 descriptor ceiling is untouched.
@@ -185,8 +192,8 @@ is the same either way.
 **`src/input.rs`** (new, portable). Two things, neither of which touches a
 Windows API:
 
-* the set-1 to evdev table, including the `E0` page and the two `E1`
-  sequences;
+* the set-1 to evdev table, both pages, and the three keys resolved by
+  virtual key;
 * the policy state machine. It is fed raw window facts (focus gained/lost,
   pointer moved to a client point, button down/up, wheel, hook key event,
   channel lost) and produces protocol events. It holds what is pressed, so
@@ -258,7 +265,8 @@ point passes through `Placement::to_guest` first, and a point that maps to
 
 Automatic:
 
-* the scan-code table on known codes, both pages and both `E1` sequences;
+* the scan-code table on known codes, both pages, and `Pause`, `NumLock` and
+  `PrtScn` resolved by virtual key;
 * the policy machine: focus gained and lost, hover in and out, a drag that
   leaves the picture and returns, release-all on every path that owes one,
   motion coalescing;
