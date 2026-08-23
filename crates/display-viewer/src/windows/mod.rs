@@ -8,10 +8,10 @@
 #[allow(unsafe_code)]
 pub mod hvsocket;
 
-// A named mutex and a named pipe: one window per VM, focused rather than
-// duplicated. Task 8.
-// #[allow(unsafe_code)]
-// pub mod ipc;
+/// A named mutex and a named pipe: one window per VM, focused rather than
+/// duplicated.
+#[allow(unsafe_code)]
+pub mod ipc;
 
 // A window class, a message pump, and the messages the session posts into it.
 // Task 9.
