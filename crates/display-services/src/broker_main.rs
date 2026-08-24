@@ -37,6 +37,13 @@ const DRIVER: &str = "vmlord_drm";
 /// Where the socket between the two processes lives.
 const SOCKET_PATH: &str = "/run/vmlord/display-broker.sock";
 
+/// Where the clipboard daemon of whoever is logged in connects.
+///
+/// A socket of its own rather than a second peer on the broker's: the two
+/// peers are different accounts, hold different keys and are authorised by
+/// different rules.
+const CLIPBOARD_SOCKET_PATH: &str = "/run/vmlord/display-clipboard.sock";
+
 /// The unprivileged user the session process runs as.
 const SERVICE_USER: &str = "vmlord-display";
 
@@ -66,6 +73,8 @@ pub struct Options {
     pub secret_path: PathBuf,
     /// The socket the unprivileged process connects to.
     pub socket: PathBuf,
+    /// The socket the clipboard daemon connects to.
+    pub clipboard_socket: PathBuf,
     /// Where the kernel's uinput device is.
     pub uinput: PathBuf,
     /// Where the module publishes the mode it drives.
@@ -93,6 +102,8 @@ impl Options {
             )
             .into(),
             socket: text("VMLORD_DISPLAY_SOCKET", SOCKET_PATH).into(),
+            clipboard_socket: text("VMLORD_DISPLAY_CLIPBOARD_SOCKET", CLIPBOARD_SOCKET_PATH)
+                .into(),
             uinput: text("VMLORD_DISPLAY_UINPUT", crate::uinput::DEVICE_PATH).into(),
             mode: text("VMLORD_DISPLAY_MODE", crate::output::MODE_PARAMETER).into(),
             user: text("VMLORD_DISPLAY_USER", SERVICE_USER),
@@ -154,6 +165,12 @@ struct BrokerState {
     peer: Option<Arc<Connection>>,
     /// The session that is open, if one is.
     session: Option<SessionParameters>,
+    /// The clipboard daemon, if one is connected. One at a time, like the
+    /// capture peer: there is one graphical session on the screen.
+    clipboard_peer: Option<Arc<Connection>>,
+    /// What that daemon needs of the session that is open: the session id and
+    /// the clipboard key, and neither of the other two keys.
+    clipboard: Option<(Vec<u8>, Vec<u8>)>,
     /// Changes whenever the host session opens or closes, even though the
     /// long-lived session process remains the same peer.
     session_epoch: u64,
@@ -217,6 +234,10 @@ fn serve(options: &Options) -> io::Result<()> {
         "binding the socket to the session process",
         Listener::bind(&options.socket, gid),
     )?;
+    let clipboard_listener = at(
+        "binding the socket to the clipboard daemon",
+        Listener::bind_open(&options.clipboard_socket),
+    )?;
     let control = at(
         "binding the control service",
         vsock::Listener::bind(CONTROL_PORT),
@@ -241,6 +262,10 @@ fn serve(options: &Options) -> io::Result<()> {
             let devices = devices.as_ref();
             scope.spawn(move || serve_peers(&listener, uid, &shared, devices))
         };
+        let clipboard = {
+            let shared = Arc::clone(&shared);
+            scope.spawn(move || serve_clipboard_peers(&clipboard_listener, &shared))
+        };
         let capture = {
             let shared = Arc::clone(&shared);
             scope.spawn(move || capture_frames(device, &shared))
@@ -251,6 +276,7 @@ fn serve(options: &Options) -> io::Result<()> {
         // means a thread has stopped and the others are owed the news.
         stop(&shared);
         let _ = ipc.join();
+        let _ = clipboard.join();
         let _ = capture.join();
     });
 
@@ -493,7 +519,9 @@ fn run_session(
         }
 
         match control.pump(stream) {
-            Outcome::Opened(parameters) => open_session(shared, parameters),
+            Outcome::Opened(parameters, clipboard_key) => {
+                open_session(shared, parameters, clipboard_key);
+            }
             Outcome::Relay(message) => send_to_peer(shared, &message),
             Outcome::Resize { width, height } => request_mode(output, control, stream, width, height),
             Outcome::Closed(reason) => return reason,
@@ -503,16 +531,27 @@ fn run_session(
 }
 
 /// Records the session and hands its keys to the peer.
-fn open_session(shared: &Shared, parameters: SessionParameters) {
+fn open_session(shared: &Shared, parameters: SessionParameters, clipboard_key: Vec<u8>) {
     let (lock, signal) = &**shared;
     let mut state = lock.lock().expect("the broker's lock is not poisoned");
 
     state.session_epoch = state.session_epoch.wrapping_add(1);
+    let session_id = parameters.session_id.clone();
     state.session = Some(parameters.clone());
+    state.clipboard = Some((session_id.clone(), clipboard_key.clone()));
     state.sent.clear();
     state.wants_frame = false;
     if let Some(peer) = state.peer.clone() {
         let _ = peer.send(&Message::SessionOpened(parameters), &[]);
+    }
+    if let Some(peer) = state.clipboard_peer.clone() {
+        let _ = peer.send(
+            &Message::ClipboardOpened {
+                session_id,
+                clipboard_key,
+            },
+            &[],
+        );
     }
     signal.notify_all();
 }
@@ -528,7 +567,11 @@ fn close_session(shared: &Shared, reason: &str) {
     }
     state.wants_frame = false;
     state.sent.clear();
-    if let Some(peer) = state.peer.clone() {
+    state.clipboard = None;
+    for peer in [state.peer.clone(), state.clipboard_peer.clone()]
+        .into_iter()
+        .flatten()
+    {
         let _ = peer.send(
             &Message::SessionClosed {
                 reason: reason.to_owned(),
@@ -537,6 +580,89 @@ fn close_session(shared: &Shared, reason: &str) {
         );
     }
     signal.notify_all();
+}
+
+/// Accepts the clipboard daemon of the session that is on screen, and no other.
+///
+/// The uid is looked up at every accept rather than once at start-up: the
+/// person at the screen is not decided when the broker starts, and a daemon
+/// left running by a user who has since been switched away stops being
+/// authorised without anything having to notice and evict it.
+fn serve_clipboard_peers(listener: &Listener, shared: &Shared) {
+    loop {
+        if stopping(shared) {
+            return;
+        }
+
+        let connection = match listener.accept_where(
+            |uid| crate::seat::active_graphical_uid() == Some(uid),
+            "the graphical session on seat0",
+        ) {
+            Ok(connection) => Arc::new(connection),
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+                eprintln!("vmlord-display-broker: refused a clipboard peer: {error}");
+                continue;
+            }
+            Err(error) => {
+                eprintln!("vmlord-display-broker: the clipboard socket failed: {error}");
+                return;
+            }
+        };
+
+        adopt_clipboard_peer(shared, &connection);
+        read_clipboard_peer(&connection, shared);
+    }
+}
+
+/// Makes a new connection the clipboard peer, and tells it what it missed.
+fn adopt_clipboard_peer(shared: &Shared, connection: &Arc<Connection>) {
+    let (lock, _) = &**shared;
+    let mut state = lock.lock().expect("the broker's lock is not poisoned");
+
+    state.clipboard_peer = Some(Arc::clone(connection));
+    send_clipboard_session(connection, state.clipboard.as_ref());
+}
+
+/// Reads the clipboard peer until it goes away.
+fn read_clipboard_peer(connection: &Arc<Connection>, shared: &Shared) {
+    loop {
+        let Ok((message, _)) = connection.receive() else {
+            return;
+        };
+
+        let (lock, _) = &**shared;
+        let state = lock.lock().expect("the broker's lock is not poisoned");
+        if !state
+            .clipboard_peer
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, connection))
+        {
+            return;
+        }
+
+        match message {
+            Message::Attach => send_clipboard_session(connection, state.clipboard.as_ref()),
+            // Never the contents of a selection: the daemon reports what went
+            // wrong, and what went wrong is a mime type and a reason.
+            Message::Report { detail } => {
+                eprintln!("vmlord-display-clipboard: {detail}");
+            }
+            other => eprintln!("vmlord-display-broker: ignoring {other:?} from the clipboard peer"),
+        }
+    }
+}
+
+/// Sends the session a clipboard daemon needs, if there is one open.
+fn send_clipboard_session(connection: &Arc<Connection>, clipboard: Option<&(Vec<u8>, Vec<u8>)>) {
+    if let Some((session_id, clipboard_key)) = clipboard {
+        let _ = connection.send(
+            &Message::ClipboardOpened {
+                session_id: session_id.clone(),
+                clipboard_key: clipboard_key.clone(),
+            },
+            &[],
+        );
+    }
 }
 
 /// Passes a message straight to the peer, if there is one.
@@ -1089,10 +1215,10 @@ mod tests {
             cursor_stream: true,
         };
 
-        super::open_session(&shared, parameters.clone());
+        super::open_session(&shared, parameters.clone(), vec![4; 32]);
         let first = shared.0.lock().unwrap().session_epoch;
         super::close_session(&shared, "test transition");
-        super::open_session(&shared, parameters);
+        super::open_session(&shared, parameters, vec![4; 32]);
         let second = shared.0.lock().unwrap().session_epoch;
 
         assert_ne!(first, second);

@@ -47,6 +47,26 @@ impl Listener {
     /// [`io::Error`] from any of the socket calls. A path that a killed broker
     /// left behind is removed rather than refused: a restart has to win.
     pub fn bind(path: &Path, group: libc::gid_t) -> io::Result<Self> {
+        Self::bind_with(path, group, 0o660)
+    }
+
+    /// Binds a socket a peer of unknown uid may reach.
+    ///
+    /// Mode `0666` and no group, because the process that connects is the
+    /// clipboard daemon of whoever logged in and that account is not known
+    /// here. What guards this socket is [`Listener::accept_where`], which is a
+    /// stronger check than a mode bit: it names the session that is on screen
+    /// rather than a set of accounts.
+    ///
+    /// # Errors
+    ///
+    /// As [`Listener::bind`].
+    pub fn bind_open(path: &Path) -> io::Result<Self> {
+        Self::bind_with(path, libc::gid_t::MAX, 0o666)
+    }
+
+    /// The body of both, so that one socket is bound in one place.
+    fn bind_with(path: &Path, group: libc::gid_t, mode: libc::mode_t) -> io::Result<Self> {
         let descriptor = socket(libc::SOCK_SEQPACKET)?;
         let _ = std::fs::remove_file(path);
 
@@ -68,7 +88,7 @@ impl Listener {
         checked(unsafe { libc::chown(c_path.as_ptr(), libc::uid_t::MAX, group) })?;
         // SAFETY: as above. The mode is set explicitly because the umask of
         // whoever started the unit is not something this code controls.
-        checked(unsafe { libc::chmod(c_path.as_ptr(), 0o660) })?;
+        checked(unsafe { libc::chmod(c_path.as_ptr(), mode) })?;
 
         // SAFETY: `descriptor` is an owned, bound socket.
         checked(unsafe { libc::listen(descriptor.as_raw_fd(), 8) })?;
@@ -84,6 +104,23 @@ impl Listener {
     /// whose connection is closed before this returns, or [`io::Error`] from
     /// the socket calls.
     pub fn accept(&self, expected_uid: libc::uid_t) -> io::Result<Connection> {
+        self.accept_where(|uid| uid == expected_uid, format_args!("uid {expected_uid}"))
+    }
+
+    /// Accepts one peer and refuses it unless `allow` says its uid may.
+    ///
+    /// The general form of [`Listener::accept`], for a socket whose peer is not
+    /// one fixed account. `expected` is what the refusal says the socket
+    /// serves; it names a rule rather than a uid, since the rule is the point.
+    ///
+    /// # Errors
+    ///
+    /// As [`Listener::accept`].
+    pub fn accept_where<A: Fn(libc::uid_t) -> bool, E: std::fmt::Display>(
+        &self,
+        allow: A,
+        expected: E,
+    ) -> io::Result<Connection> {
         // SAFETY: `descriptor` is an owned listening socket; passing null for
         // the address and its length asks the kernel not to report the peer's
         // address, which a Unix socket has none of worth reading.
@@ -104,11 +141,11 @@ impl Listener {
         };
 
         let credentials = peer_credentials(connection.descriptor.as_raw_fd())?;
-        if credentials.uid != expected_uid {
+        if !allow(credentials.uid) {
             return Err(io::Error::new(
                 ErrorKind::PermissionDenied,
                 format!(
-                    "uid {} connected to the display broker, which only serves uid {expected_uid}",
+                    "uid {} connected to the display broker, which only serves {expected}",
                     credentials.uid
                 ),
             ));
@@ -491,6 +528,40 @@ mod tests {
     fn own_gid() -> libc::gid_t {
         // SAFETY: `getgid` takes nothing, returns a value and cannot fail.
         unsafe { libc::getgid() }
+    }
+
+    #[test]
+    fn an_open_listener_accepts_the_uid_a_predicate_allows() {
+        let path = socket_path("open-allowed");
+        let listener = Listener::bind_open(&path).unwrap();
+        let mine = own_uid();
+
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || Connection::connect(&path).unwrap()
+        });
+        let accepted = listener.accept_where(|uid| uid == mine, "the session at the screen");
+
+        assert!(accepted.is_ok());
+        drop(client.join().unwrap());
+    }
+
+    #[test]
+    fn an_open_listener_refuses_the_uid_a_predicate_denies() {
+        let path = socket_path("open-refused");
+        let listener = Listener::bind_open(&path).unwrap();
+
+        let client = std::thread::spawn({
+            let path = path.clone();
+            move || Connection::connect(&path)
+        });
+        let refused = listener.accept_where(|_| false, "the session at the screen");
+
+        assert_eq!(
+            refused.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let _ = client.join().unwrap();
     }
 
     #[test]

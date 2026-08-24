@@ -20,6 +20,13 @@ pub enum Message {
     NextFrame,
     /// A control handshake completed.
     SessionOpened(SessionParameters),
+    /// A control handshake completed, as the clipboard daemon needs it.
+    ClipboardOpened {
+        /// The 16 bytes that name the session across its four sockets.
+        session_id: Vec<u8>,
+        /// The key the clipboard socket proves itself with.
+        clipboard_key: Vec<u8>,
+    },
     /// Control was lost, or the host is finished.
     SessionClosed {
         /// What to put in the journal. Never parsed.
@@ -159,6 +166,13 @@ fn into_wire(message: &Message) -> envelope::Message {
                 cursor_stream: parameters.cursor_stream,
             })
         }
+        Message::ClipboardOpened {
+            session_id,
+            clipboard_key,
+        } => envelope::Message::ClipboardOpened(broker::ClipboardOpened {
+            session_id: session_id.clone(),
+            clipboard_key: clipboard_key.clone(),
+        }),
         Message::SessionClosed { reason } => {
             envelope::Message::SessionClosed(broker::SessionClosed {
                 reason: reason.clone(),
@@ -200,6 +214,10 @@ fn from_wire(message: envelope::Message) -> Result<Message, IpcError> {
             tile_size: opened.tile_size,
             cursor_stream: opened.cursor_stream,
         }),
+        envelope::Message::ClipboardOpened(opened) => Message::ClipboardOpened {
+            session_id: opened.session_id,
+            clipboard_key: opened.clipboard_key,
+        },
         envelope::Message::SessionClosed(closed) => Message::SessionClosed {
             reason: closed.reason,
         },
@@ -288,6 +306,10 @@ mod tests {
             Message::Attach,
             Message::NextFrame,
             Message::SessionOpened(parameters()),
+            Message::ClipboardOpened {
+                session_id: vec![7; 16],
+                clipboard_key: vec![9; 32],
+            },
             Message::SessionClosed {
                 reason: "control was lost".into(),
             },

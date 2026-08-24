@@ -21,6 +21,7 @@ message Envelope {
     Report report = 7;
     InputDevices input_devices = 8;
     Geometry geometry = 9;
+    ClipboardOpened clipboard_opened = 10;
   }
 }
 
@@ -41,6 +42,15 @@ message SessionOpened {
   uint32 height = 5;
   uint32 tile_size = 6;
   bool cursor_stream = 7;
+}
+
+// A control handshake completed, as the clipboard daemon needs it: the session
+// it belongs to and the one channel key that daemon may use. The frame and
+// input keys are not here -- that daemon has no business with those sockets,
+// and a compromised one must not gain a picture or a keyboard.
+message ClipboardOpened {
+  bytes session_id = 1;
+  bytes clipboard_key = 2;
 }
 
 // Control was lost or the host sent EndSession. Stop capturing and release

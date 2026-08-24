@@ -14,6 +14,7 @@ pub mod drm;
 pub mod ipc;
 pub mod output;
 pub mod pipeline;
+pub mod seat;
 pub mod session_main;
 pub mod uinput;
 pub mod unix;
