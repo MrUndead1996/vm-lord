@@ -11,6 +11,7 @@
 //! message on its way somewhere else.
 
 use std::{
+    cell::OnceCell,
     mem::ManuallyDrop,
     sync::{
         Arc,
@@ -26,7 +27,12 @@ use windows::{
             CreateSolidBrush, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR,
             MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, UpdateWindow,
         },
-        System::LibraryLoader::GetModuleHandleW,
+        System::{
+            Com::{
+                CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+            },
+            LibraryLoader::GetModuleHandleW,
+        },
         UI::{
             Controls::WM_MOUSELEAVE,
             HiDpi::{
@@ -36,20 +42,21 @@ use windows::{
             Input::KeyboardAndMouse::{
                 ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
             },
+            Shell::{ITaskbarList2, TaskbarList},
             WindowsAndMessaging::{
                 AdjustWindowRect, AppendMenuW, CW_USEDEFAULT, CheckMenuRadioItem, CreateWindowExW,
-                DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GWL_STYLE,
-                GetClientRect, GetSystemMenu, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect,
-                HWND_TOP, IDC_ARROW, LoadCursorW, MB_ICONERROR, MB_OK, MF_BYCOMMAND, MF_SEPARATOR,
-                MF_STRING, MONITORINFOF_PRIMARY, MSG, MessageBoxW, PM_REMOVE, PeekMessageW,
-                PostMessageW, PostQuitMessage, RegisterClassW, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
-                SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
-                SetForegroundWindow, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
-                ShowWindow, TranslateMessage, WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_STYLE,
-                WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_KILLFOCUS, WM_LBUTTONDOWN,
-                WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-                WM_MOUSEWHEEL, WM_MOVE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS,
-                WM_SIZE, WM_SYSCOMMAND, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
+                DefWindowProcW, DestroyWindow, DispatchMessageW, GWL_EXSTYLE, GWL_STYLE,
+                GWLP_USERDATA, GetClientRect, GetSystemMenu, GetWindowLongPtrW, GetWindowPlacement,
+                GetWindowRect, HWND_TOP, IDC_ARROW, LoadCursorW, MB_ICONERROR, MB_OK, MF_BYCOMMAND,
+                MF_SEPARATOR, MF_STRING, MONITORINFOF_PRIMARY, MSG, MessageBoxW, PM_REMOVE,
+                PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SW_RESTORE, SW_SHOW,
+                SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+                SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPlacement,
+                SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
+                WINDOWPLACEMENT, WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_KILLFOCUS,
+                WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
+                WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+                WM_SETFOCUS, WM_SIZE, WM_SYSCOMMAND, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
                 WS_OVERLAPPEDWINDOW, WS_POPUP,
             },
         },
@@ -58,6 +65,7 @@ use windows::{
 };
 
 use crate::{
+    fullscreen::{self, Frame},
     input::{self, Report},
     monitors::{self, opening_position},
     state::{Quality, WindowState},
@@ -167,9 +175,14 @@ pub struct Window {
     hwnd: HWND,
     /// Kept so that the shared state outlives every message the window handles.
     shared: Arc<Shared>,
-    /// The style and the placement to go back to, while the window is filling
+    /// The frame and the placement to go back to, while the window is filling
     /// a monitor. `None` when it is not.
-    restore: Option<(WINDOW_STYLE, WINDOWPLACEMENT)>,
+    ///
+    /// Both are read off the window on the way in and put back untouched on
+    /// the way out: the placement carries the restored rectangle *and* whether
+    /// the window was maximised, and the frame carries the two style words
+    /// exactly as they were, extended styles included.
+    restore: Option<(Frame, WINDOWPLACEMENT)>,
 }
 
 impl Window {
@@ -335,78 +348,121 @@ impl Window {
     ///
     /// Borderless rather than exclusive: an exclusive mode would take the
     /// display for this process, and a viewer that owns the screen is one the
-    /// user cannot alt-tab out of when the guest stops answering. What is
-    /// taken here is a style and a rectangle, and both are given back.
+    /// user cannot alt-tab out of when the guest stops answering. Nothing here
+    /// touches the monitor's own mode. What is taken is a frame and a
+    /// rectangle, and both are given back.
+    ///
+    /// The monitor is the one the window is mostly on, read each time: a
+    /// window dragged to the second monitor fills the second monitor.
     pub fn set_fullscreen(&mut self, on: bool) {
         if on == self.is_fullscreen() {
             return;
         }
 
         if on {
-            let Some(monitor) = self.monitor_rectangle() else {
-                log::warn!("the window is on no monitor; full screen is not available");
-
-                return;
-            };
-            // SAFETY: `self.hwnd` names a window of this process, and the
-            // placement lives across its call.
-            let (style, placement) = unsafe {
-                let style = WINDOW_STYLE(GetWindowLongPtrW(self.hwnd, GWL_STYLE) as u32);
-                let mut placement = WINDOWPLACEMENT {
-                    length: u32::try_from(std::mem::size_of::<WINDOWPLACEMENT>()).unwrap_or(0),
-                    ..Default::default()
-                };
-                if GetWindowPlacement(self.hwnd, &raw mut placement).is_err() {
-                    log::warn!("the window's placement could not be read");
-
-                    return;
-                }
-
-                (style, placement)
-            };
-
-            // SAFETY: a style and a position on this process's own window.
-            unsafe {
-                SetWindowLongPtrW(
-                    self.hwnd,
-                    GWL_STYLE,
-                    ((style & !WS_OVERLAPPEDWINDOW) | WS_POPUP).0 as isize,
-                );
-                let _ = SetWindowPos(
-                    self.hwnd,
-                    Some(HWND_TOP),
-                    monitor.left,
-                    monitor.top,
-                    monitor.right - monitor.left,
-                    monitor.bottom - monitor.top,
-                    SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
-                );
-            }
-            self.restore = Some((style, placement));
+            self.enter_fullscreen();
         } else {
-            let Some((style, placement)) = self.restore.take() else {
-                return;
-            };
-            // SAFETY: a style and a placement this window handed over, put
-            // back on the window they came from.
+            self.leave_fullscreen();
+        }
+    }
+
+    /// Covers the monitor this window is on, keeping what it takes off.
+    fn enter_fullscreen(&mut self) {
+        let Some(monitor) = self.monitor_rectangle() else {
+            log::warn!("the window is on no monitor; full screen is not available");
+
+            return;
+        };
+        let frame = self.frame();
+        // Read before the window is restored down, so that a window that was
+        // maximised is maximised again on the way out: `showCmd` is what
+        // remembers that, and `rcNormalPosition` is where it came from.
+        let Some(placement) = self.placement() else {
+            log::warn!("the window's placement could not be read; full screen is not available");
+
+            return;
+        };
+
+        // A maximised window is sized by Win32 to its monitor's *work* area
+        // and does not answer `SetWindowPos`, so it is put down before the
+        // borderless frame goes on rather than after, while Win32 can still
+        // see the state it is being asked to leave.
+        if fullscreen::is_a_state(frame.style) {
+            // SAFETY: `self.hwnd` names a window of this process.
             unsafe {
-                SetWindowLongPtrW(self.hwnd, GWL_STYLE, style.0 as isize);
-                let _ = SetWindowPlacement(self.hwnd, &raw const placement);
-                let _ = SetWindowPos(
-                    self.hwnd,
-                    None,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE
-                        | SWP_NOSIZE
-                        | SWP_NOZORDER
-                        | SWP_NOOWNERZORDER
-                        | SWP_FRAMECHANGED,
-                );
+                let _ = ShowWindow(self.hwnd, SW_RESTORE);
             }
         }
+
+        let full = fullscreen::borderless(frame);
+        // SAFETY: two style words and a position on this process's own window.
+        // `SWP_FRAMECHANGED` is what makes Win32 recompute the non-client area
+        // it has just been told there is none of.
+        unsafe {
+            SetWindowLongPtrW(self.hwnd, GWL_STYLE, full.style as isize);
+            SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, full.ex_style as isize);
+            let _ = SetWindowPos(
+                self.hwnd,
+                Some(HWND_TOP),
+                monitor.left,
+                monitor.top,
+                monitor.right - monitor.left,
+                monitor.bottom - monitor.top,
+                SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
+            );
+        }
+        mark_fullscreen(self.hwnd, true);
+        self.restore = Some((frame, placement));
+    }
+
+    /// Puts back the frame and the place the window had before.
+    fn leave_fullscreen(&mut self) {
+        let Some((frame, placement)) = self.restore.take() else {
+            return;
+        };
+        mark_fullscreen(self.hwnd, false);
+        // SAFETY: two style words and a placement this window handed over, put
+        // back on the window they came from. The frame goes on first: a
+        // placement applied to a `WS_POPUP` window would be a rectangle
+        // measured against a frame that is not there yet.
+        unsafe {
+            SetWindowLongPtrW(self.hwnd, GWL_STYLE, frame.style as isize);
+            SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, frame.ex_style as isize);
+            let _ = SetWindowPlacement(self.hwnd, &raw const placement);
+            let _ = SetWindowPos(
+                self.hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED,
+            );
+        }
+    }
+
+    /// The two style words this window is wearing.
+    fn frame(&self) -> Frame {
+        // SAFETY: `self.hwnd` names a window of this process.
+        unsafe {
+            Frame {
+                style: GetWindowLongPtrW(self.hwnd, GWL_STYLE) as u32,
+                ex_style: GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) as u32,
+            }
+        }
+    }
+
+    /// Where this window is restored to, and whether it is maximised.
+    fn placement(&self) -> Option<WINDOWPLACEMENT> {
+        let mut placement = WINDOWPLACEMENT {
+            length: u32::try_from(std::mem::size_of::<WINDOWPLACEMENT>()).unwrap_or(0),
+            ..Default::default()
+        };
+        // SAFETY: `self.hwnd` names a window of this process and the placement
+        // lives across the call.
+        unsafe { GetWindowPlacement(self.hwnd, &raw mut placement) }.ok()?;
+
+        Some(placement)
     }
 
     /// Where the window sits when it is not filling anything.
@@ -459,10 +515,17 @@ impl Window {
     }
 
     /// Brings the window forward. What a repeated Connect means.
+    ///
+    /// A full-screen window is only raised. `SW_RESTORE` on one would be
+    /// Win32 undoing a state, and the state it would undo is the full screen
+    /// the user asked for: a second Connect, or a reconnect that focuses the
+    /// window again, must not be what drops the viewer back into a frame.
     pub fn focus(&self) {
         // SAFETY: `self.hwnd` is a window this process owns.
         unsafe {
-            let _ = ShowWindow(self.hwnd, SW_RESTORE);
+            if !self.is_fullscreen() {
+                let _ = ShowWindow(self.hwnd, SW_RESTORE);
+            }
             let _ = SetForegroundWindow(self.hwnd);
         }
     }
@@ -956,6 +1019,75 @@ fn press(shared: &Shared, hwnd: HWND, button: u16, pressed: bool) {
     shared.report(UiEvent::Input(Report::Button { button, pressed }));
 }
 
+/// Tells the shell whether this window is filling a monitor.
+///
+/// The rectangle alone is usually enough -- the shell notices a foreground
+/// window the exact size of its monitor and takes the taskbar out of the way
+/// -- but that is detection rather than a contract, and detection is what
+/// leaves a taskbar drawn over a viewer that is otherwise correct.
+/// `MarkFullscreenWindow` is the documented way to say it, and saying it is
+/// also how the taskbar comes back.
+///
+/// Nothing here is load-bearing: a shell that will not answer costs a taskbar
+/// on top of the picture, not a viewer, so every failure is a warning.
+fn mark_fullscreen(hwnd: HWND, on: bool) {
+    let Some(taskbar) = taskbar() else {
+        return;
+    };
+    // SAFETY: an interface this thread created and a window this process owns.
+    if let Err(error) = unsafe { taskbar.MarkFullscreenWindow(hwnd, on) } {
+        log::warn!("the shell would not be told about the full-screen window: {error}");
+    }
+}
+
+thread_local! {
+    /// The shell's taskbar object, asked for once per thread that needs it.
+    ///
+    /// Once, because a shell that has no answer has no answer, and a warning
+    /// per `F11` is a log nobody reads.
+    static TASKBAR: OnceCell<Option<ITaskbarList2>> = const { OnceCell::new() };
+}
+
+/// The shell's taskbar object, or `None` with the reason already logged.
+fn taskbar() -> Option<ITaskbarList2> {
+    TASKBAR.with(|cell| cell.get_or_init(create_taskbar).clone())
+}
+
+/// Creates it, on a thread that may or may not have COM up already.
+fn create_taskbar() -> Option<ITaskbarList2> {
+    // SAFETY: COM on this thread, and an in-process class the shell registers.
+    // `CoInitializeEx` is not undone: the pump thread lives as long as the
+    // process, and an apartment torn down under the shell's object would be
+    // worse than one that outlives it. An apartment somebody else already
+    // chose is theirs to keep, so the result is not checked -- the create
+    // below is what says whether this worked.
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let taskbar: ITaskbarList2 = match CoCreateInstance(
+            &TaskbarList,
+            None,
+            CLSCTX_INPROC_SERVER,
+        ) {
+            Ok(taskbar) => taskbar,
+            Err(error) => {
+                log::warn!(
+                    "the shell's taskbar list is not available, so the taskbar may stay over a full-screen window: {error}"
+                );
+
+                return None;
+            }
+        };
+        // Documented as the first call on the interface, before any other.
+        if let Err(error) = taskbar.HrInit() {
+            log::warn!("the shell's taskbar list would not start: {error}");
+
+            return None;
+        }
+
+        Some(taskbar)
+    }
+}
+
 /// Asks for one `WM_MOUSELEAVE` the next time the pointer goes.
 fn track_leave(hwnd: HWND) {
     let mut track = TRACKMOUSEEVENT {
@@ -977,8 +1109,9 @@ mod tests {
     use windows::Win32::{
         Foundation::{LPARAM, WPARAM},
         UI::WindowsAndMessaging::{
-            SendMessageW, WM_CLOSE, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-            WM_MOUSEWHEEL, WM_MOVE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SYSCOMMAND,
+            IsZoomed, SC_MAXIMIZE, SendMessageW, WM_CLOSE, WM_KILLFOCUS, WM_LBUTTONDOWN,
+            WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
+            WM_SETFOCUS, WM_SYSCOMMAND,
         },
     };
 
@@ -987,6 +1120,7 @@ mod tests {
         WM_SIGNAL, Window,
     };
     use crate::{
+        fullscreen::{EDGES, Frame, OVERLAPPED_WINDOW, POPUP},
         input::{BTN_RIGHT, Report},
         state::{Quality, WindowState},
         status::{self, Button},
@@ -1015,8 +1149,7 @@ mod tests {
 
     /// A shown window, with whatever showing it reported already taken.
     fn opened(events: &mpsc::Receiver<UiEvent>, shared: &Arc<Shared>) -> Window {
-        let window =
-            Window::open("test", &sized(320, 240), Arc::clone(shared)).expect("a window");
+        let window = Window::open("test", &sized(320, 240), Arc::clone(shared)).expect("a window");
         let _ = drain(events);
 
         window
@@ -1172,7 +1305,8 @@ mod tests {
     #[test]
     fn a_posted_signal_reaches_the_pump() {
         let (shared, _events) = shared();
-        let window = Window::open("test - VMLord Display", &sized(320, 240), shared).expect("a window");
+        let window =
+            Window::open("test - VMLord Display", &sized(320, 240), shared).expect("a window");
         let poster = window.poster();
 
         poster.post(WM_SIGNAL);
@@ -1185,9 +1319,12 @@ mod tests {
     #[test]
     fn a_click_on_retry_is_reported_only_while_the_failed_screen_is_up() {
         let (shared, events) = shared();
-        let window =
-            Window::open("test - VMLord Display", &sized(800, 600), Arc::clone(&shared))
-                .expect("a window");
+        let window = Window::open(
+            "test - VMLord Display",
+            &sized(800, 600),
+            Arc::clone(&shared),
+        )
+        .expect("a window");
         let (_, (x, y, w, h)) = status::buttons(800, 600)[0];
         let point = isize::try_from(((y + h / 2) << 16) | (x + w / 2)).expect("a client point");
 
@@ -1331,6 +1468,7 @@ mod tests {
         let (shared, events) = shared();
         let mut window = opened(&events, &shared);
         let before = window.position().expect("a restored window has a position");
+        let frame = window.frame();
 
         window.set_fullscreen(true);
         assert!(window.is_fullscreen());
@@ -1343,6 +1481,126 @@ mod tests {
             "what comes back is where the window was, not the monitor"
         );
         assert_eq!(window.client_size(), (320, 240));
+        assert_eq!(
+            window.frame(),
+            frame,
+            "the frame that comes back is the one that went away, both words of it"
+        );
+    }
+
+    #[test]
+    fn a_full_screen_window_wears_no_frame_at_all() {
+        // The whole of the bug: taking `WS_OVERLAPPEDWINDOW` off `GWL_STYLE`
+        // leaves `WS_EX_WINDOWEDGE` on `GWL_EXSTYLE`, and that is a border
+        // drawn round what is supposed to be the monitor.
+        let (shared, events) = shared();
+        let mut window = opened(&events, &shared);
+        assert_ne!(
+            window.frame().style & OVERLAPPED_WINDOW,
+            0,
+            "the window under test starts with a title bar to lose"
+        );
+
+        window.set_fullscreen(true);
+
+        let Frame { style, ex_style } = window.frame();
+        assert_eq!(style & OVERLAPPED_WINDOW, 0, "no caption and no border");
+        assert_eq!(style & POPUP, POPUP);
+        assert_eq!(ex_style & EDGES, 0, "no raised edge either");
+    }
+
+    #[test]
+    fn a_full_screen_window_covers_the_monitor_and_not_its_work_area() {
+        // The work area is the monitor minus the taskbar, and a full screen
+        // that stopped there is one with the taskbar still on it.
+        let (shared, events) = shared();
+        let mut window = opened(&events, &shared);
+
+        window.set_fullscreen(true);
+
+        let monitor = window.monitor_rectangle().expect("a monitor");
+        assert_eq!(
+            window.client_size(),
+            (monitor.right - monitor.left, monitor.bottom - monitor.top),
+            "the client area is the whole monitor: with no frame there is nothing else"
+        );
+    }
+
+    #[test]
+    fn a_maximised_window_still_fills_the_monitor_and_comes_back_maximised() {
+        // Win32 sizes a maximised window to the work area and ignores what
+        // `SetWindowPos` asks of it, so entering full screen from one used to
+        // leave the taskbar drawn over the guest.
+        let (shared, events) = shared();
+        let mut window = opened(&events, &shared);
+        // SAFETY: a message sent to this process's own window.
+        unsafe {
+            SendMessageW(
+                window.handle(),
+                WM_SYSCOMMAND,
+                Some(WPARAM(SC_MAXIMIZE as usize)),
+                None,
+            );
+        }
+        assert!(is_maximised(&window), "the window under test is maximised");
+
+        window.set_fullscreen(true);
+        let monitor = window.monitor_rectangle().expect("a monitor");
+        assert_eq!(
+            window.client_size(),
+            (monitor.right - monitor.left, monitor.bottom - monitor.top),
+            "a full screen entered from a maximised window is still the whole monitor"
+        );
+
+        window.set_fullscreen(false);
+        assert!(
+            is_maximised(&window),
+            "a window that was maximised is maximised again"
+        );
+    }
+
+    #[test]
+    fn focusing_a_full_screen_window_leaves_it_full_screen() {
+        // A second Connect, or a reconnect, focuses the window that is already
+        // open. `SW_RESTORE` on a full-screen one would undo the state the
+        // user asked for.
+        let (shared, events) = shared();
+        let mut window = opened(&events, &shared);
+        window.set_fullscreen(true);
+        let full = window.frame();
+
+        window.focus();
+
+        assert!(window.is_fullscreen());
+        assert_eq!(window.frame(), full);
+        let monitor = window.monitor_rectangle().expect("a monitor");
+        assert_eq!(
+            window.client_size(),
+            (monitor.right - monitor.left, monitor.bottom - monitor.top)
+        );
+    }
+
+    #[test]
+    fn asking_for_the_state_the_window_is_already_in_changes_nothing() {
+        // The guard matters: a second `set_fullscreen(true)` that saved the
+        // borderless frame would have nothing left to restore.
+        let (shared, events) = shared();
+        let mut window = opened(&events, &shared);
+        let frame = window.frame();
+
+        window.set_fullscreen(true);
+        window.set_fullscreen(true);
+        window.set_fullscreen(false);
+        window.set_fullscreen(false);
+
+        assert!(!window.is_fullscreen());
+        assert_eq!(window.frame(), frame);
+    }
+
+    /// Whether Win32 thinks this window is maximised.
+    fn is_maximised(window: &Window) -> bool {
+        // SAFETY: the window is open and owned by the test that asks.
+        unsafe { IsZoomed(window.handle()) }.as_bool()
     }
 
     #[test]
@@ -1362,7 +1620,8 @@ mod tests {
     #[test]
     fn closing_the_window_is_reported_before_the_pump_ends() {
         let (shared, events) = shared();
-        let window = Window::open("test - VMLord Display", &sized(320, 240), shared).expect("a window");
+        let window =
+            Window::open("test - VMLord Display", &sized(320, 240), shared).expect("a window");
 
         // SAFETY: the window is open and owned by this test.
         unsafe {

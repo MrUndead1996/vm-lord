@@ -3081,12 +3081,39 @@ difference between the answer and the window is exactly what the letterbox is
 for. A new session forgets, because the guest that was told is not the guest
 that is listening.
 
-**Full screen** is `F11`, borderless: a style and a rectangle, both given back
-on the way out. Exclusive would take the display for this process, and a viewer
-that owns the screen is one the user cannot leave when the guest stops
-answering. The key is swallowed in both directions by the keyboard hook -- a
-press the guest never saw must not be followed by a release it did -- which
-costs the guest its own `F11` while the viewer has focus.
+**Full screen** is `F11` or the system menu, borderless: a frame and a
+rectangle, both given back on the way out. Exclusive would take the display for
+this process, and a viewer that owns the screen is one the user cannot leave
+when the guest stops answering; nothing here touches the monitor's own mode.
+The key is swallowed in both directions by the keyboard hook -- a press the
+guest never saw must not be followed by a release it did -- which costs the
+guest its own `F11` while the viewer has focus.
+
+**The frame is two words, not one** (`viewer::fullscreen`). Taking
+`WS_OVERLAPPEDWINDOW` off `GWL_STYLE` is the caption and the sizing border;
+`GWL_EXSTYLE` still carries `WS_EX_WINDOWEDGE`, which Win32 adds to any window
+created with a caption and nobody ever asks for, and the edges beside it. Both
+words are computed on the way in and *saved* rather than recomputed on the way
+out: a frame restored by arithmetic is a frame that drifts. The rectangle is
+the whole monitor the window is mostly on, read at each entry -- so a window
+dragged to the second monitor fills the second monitor -- rather than that
+monitor's work area, because the taskbar is what a full screen covers.
+
+**A maximised window is put down first.** `WS_MAXIMIZE` is a state and not a
+frame: Win32 sizes a window wearing it to its monitor's work area and does not
+answer `SetWindowPos`, so a full screen entered from a maximised window would
+be one with the taskbar still drawn on it. The placement is read before the
+window is restored down, so `showCmd` remembers that it was maximised and
+`SetWindowPlacement` maximises it again on the way out. For the same reason
+focusing the window -- what a second Connect and a reconnect both do -- skips
+`SW_RESTORE` while it is full screen: that would undo the state the user asked
+for.
+
+**The shell is told** (`ITaskbarList2::MarkFullscreenWindow`), both ways. A
+foreground window the exact size of its monitor is usually enough for the
+taskbar to get out of the way by itself, but that is detection rather than a
+contract. Nothing in the viewer depends on the answer: a shell that refuses
+costs a taskbar over the picture, not a session, so it is a warning in the log.
 
 **What is remembered** is one small `key = value` file per VM under
 `%LOCALAPPDATA%\VMLord\display`: the restored position, the client size,
