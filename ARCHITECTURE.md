@@ -3321,7 +3321,18 @@ capture client that mmaps a buffer cannot detile anything else).
 The cursor plane is what mutter puts the pointer on, which is why compositing
 it back is capture's job rather than a convenience. The vblank is the output's
 only clock: nothing here scans out, so a commit would otherwise complete in no
-time at all and pace nothing. The connector offers exactly **one** mode,
+time at all and pace nothing. Each plane also exposes an immutable
+`VMLORD_GENERATION` property whose driver-owned value advances in
+`atomic_update`. Capture holds one outstanding frame request across vblanks
+and reads the framebuffer only after one of those generations changes. An
+older module with no property keeps the previous every-vblank behaviour, so a
+service update cannot freeze a guest whose payload has not yet been updated.
+Generation is sampled before and after the plane ioctls and the snapshot is
+retried across a concurrent commit. It is acknowledged only after delivery to
+the peer and host-session epoch that requested it; replacing either resets the
+observation so a reconnect receives the current static frame immediately.
+
+The connector offers exactly **one** mode,
 between 640x480 and 2560x1440, marked preferred, with a physical size at 96 DPI
 and no synthesized EDID -- the name a monitor would carry costs a fifth kernel
 version guard and is deferred. The module declares its payload's version, which
@@ -3434,7 +3445,10 @@ the reference frame's size an invariant rather than a check.
 
 `cargo display-bench` runs five synthetic scenes -- a static desktop, typing, a
 scrolling view, a moving window and fullscreen video -- and reports what each
-costs. At 1920x1080 over 300 frames, per delta:
+costs. Timing names `submit` (copying the captured pixels into staging),
+`encode` (`next_payload`) and the complete `frame` path separately; excluding
+`submit` would hide the dominant cost of a guest framebuffer mapping. At
+1920x1080 over 300 frames, per delta:
 
 | scene | tile 16 | tile 32 | tile 64 |
 | --- | --- | --- | --- |

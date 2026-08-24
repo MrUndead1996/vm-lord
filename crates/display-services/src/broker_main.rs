@@ -154,6 +154,9 @@ struct BrokerState {
     peer: Option<Arc<Connection>>,
     /// The session that is open, if one is.
     session: Option<SessionParameters>,
+    /// Changes whenever the host session opens or closes, even though the
+    /// long-lived session process remains the same peer.
+    session_epoch: u64,
     /// Whether the peer has asked for a frame and not yet been given one.
     wants_frame: bool,
     /// The framebuffers this peer has already been sent a descriptor for.
@@ -504,6 +507,7 @@ fn open_session(shared: &Shared, parameters: SessionParameters) {
     let (lock, signal) = &**shared;
     let mut state = lock.lock().expect("the broker's lock is not poisoned");
 
+    state.session_epoch = state.session_epoch.wrapping_add(1);
     state.session = Some(parameters.clone());
     state.sent.clear();
     state.wants_frame = false;
@@ -518,6 +522,7 @@ fn close_session(shared: &Shared, reason: &str) {
     let (lock, signal) = &**shared;
     let mut state = lock.lock().expect("the broker's lock is not poisoned");
 
+    state.session_epoch = state.session_epoch.wrapping_add(1);
     if state.session.take().is_some() {
         eprintln!("vmlord-display-broker: the session ended: {reason}");
     }
@@ -554,39 +559,55 @@ fn capture_frames(mut device: Device, shared: &Shared) {
     // being driven". Kept to pace the retry and to say so once rather than
     // sixty times a second.
     let mut unlit: u32 = 0;
+    let mut generations = SnapshotGenerations::default();
+    let mut requested_by = None;
+    let mut pacing = CapturePacing::default();
 
     loop {
-        let Some(peer) = wait_for_request(shared) else {
+        if requested_by.is_none() {
+            requested_by = wait_for_request(shared);
+            pacing.requested();
+        }
+        let Some(request) = requested_by.as_ref() else {
             return;
         };
-
-        if let Err(error) = device.wait_vblank() {
-            if error.kind() == ErrorKind::Interrupted {
-                continue;
-            }
-            // `EINVAL` is what the kernel answers while this output's vblank
-            // is off: no compositor has lit it yet, or the desktop has
-            // blanked. Neither is a fault -- there is simply nothing to
-            // capture this instant -- and ending the session over it would
-            // close a window that a moving mouse is about to fill.
-            if error.raw_os_error() == Some(libc::EINVAL) {
-                idle_until_the_output_is_lit(&mut unlit);
-                continue;
-            }
-            fault(shared, &format!("the output's clock failed: {error}"));
-            stop(shared);
-
-            return;
+        if !request_is_current(shared, request) {
+            requested_by = None;
+            generations = SnapshotGenerations::default();
+            continue;
         }
-        if unlit > 0 {
-            eprintln!(
-                "vmlord-display-broker: the output is lit again after {unlit} attempts at its clock"
-            );
-            unlit = 0;
+        let peer = &request.peer;
+
+        if pacing.wait_before_probe() {
+            if let Err(error) = device.wait_vblank() {
+                if error.kind() == ErrorKind::Interrupted {
+                    continue;
+                }
+                // `EINVAL` is what the kernel answers while this output's vblank
+                // is off: no compositor has lit it yet, or the desktop has
+                // blanked. Neither is a fault -- there is simply nothing to
+                // capture this instant -- and ending the session over it would
+                // close a window that a moving mouse is about to fill.
+                if error.raw_os_error() == Some(libc::EINVAL) {
+                    idle_until_the_output_is_lit(&mut unlit);
+                    continue;
+                }
+                fault(shared, &format!("the output's clock failed: {error}"));
+                stop(shared);
+
+                return;
+            }
+            pacing.vblank_seen();
+            if unlit > 0 {
+                eprintln!(
+                    "vmlord-display-broker: the output is lit again after {unlit} attempts at its clock"
+                );
+                unlit = 0;
+            }
         }
 
-        let planes = match device.snapshot() {
-            Ok(planes) => planes,
+        let snapshot = match device.snapshot() {
+            Ok(snapshot) => snapshot,
             Err(error) => {
                 fault(
                     shared,
@@ -604,6 +625,16 @@ fn capture_frames(mut device: Device, shared: &Shared) {
             }
         };
 
+        if !snapshot
+            .planes
+            .iter()
+            .any(|plane| plane.kind == PlaneKind::Primary)
+            || !generations.advanced(&snapshot.planes, snapshot.generation_supported)
+        {
+            pacing.unchanged();
+            continue;
+        }
+
         // The primary plane's framebuffer is the output's real size, and the
         // only place it is read from: a mode that was asked for is not one
         // the compositor is obliged to have committed.
@@ -612,7 +643,10 @@ fn capture_frames(mut device: Device, shared: &Shared) {
         // of the snapshot that carries the first buffer of the new size: its
         // encoder is built on a geometry, and a frame of another shape is one
         // it has to drop.
-        if let Some(primary) = planes.iter().find(|plane| plane.kind == PlaneKind::Primary)
+        if let Some(primary) = snapshot
+            .planes
+            .iter()
+            .find(|plane| plane.kind == PlaneKind::Primary)
             && observe_geometry(shared, primary.width, primary.height)
         {
             let _ = peer.send(
@@ -624,8 +658,103 @@ fn capture_frames(mut device: Device, shared: &Shared) {
             );
         }
 
-        send_snapshot(&device, &peer, shared, &planes);
+        if send_snapshot(&device, request, shared, &snapshot.planes) {
+            generations.observe(&snapshot.planes, snapshot.generation_supported);
+        } else {
+            generations = SnapshotGenerations::default();
+        }
+        requested_by = None;
     }
+}
+
+/// Avoids adding a whole refresh interval after the session finishes a frame.
+///
+/// A fresh request first probes the coherent DRM snapshot: a commit may have
+/// arrived while the previous frame was encoded and sent. Only an unchanged
+/// probe waits for another vblank before trying again.
+#[derive(Default)]
+struct CapturePacing {
+    wait_before_probe: bool,
+}
+
+impl CapturePacing {
+    fn requested(&mut self) {
+        self.wait_before_probe = false;
+    }
+
+    fn unchanged(&mut self) {
+        self.wait_before_probe = true;
+    }
+
+    fn vblank_seen(&mut self) {
+        self.wait_before_probe = false;
+    }
+
+    fn wait_before_probe(&self) -> bool {
+        self.wait_before_probe
+    }
+}
+
+/// The last driver commits capture handed to the session process.
+///
+/// Missing cursor is state in its own right. A missing generation, on the
+/// other hand, means an older module is loaded, so every vblank remains a
+/// candidate exactly as it was before generation reporting existed.
+#[derive(Default)]
+struct SnapshotGenerations {
+    initialized: bool,
+    primary: Option<u64>,
+    cursor: Option<u64>,
+}
+
+impl SnapshotGenerations {
+    fn advanced(&self, planes: &[PlaneState], generation_supported: bool) -> bool {
+        if !generation_supported {
+            return true;
+        }
+
+        let primary = planes
+            .iter()
+            .find(|plane| plane.kind == PlaneKind::Primary);
+        let cursor = planes
+            .iter()
+            .find(|plane| plane.kind == PlaneKind::Cursor);
+
+        let current_primary = primary.and_then(|plane| plane.generation);
+        let current_cursor = cursor.and_then(|plane| plane.generation);
+        !self.initialized
+            || self.primary != current_primary
+            || self.cursor != current_cursor
+    }
+
+    fn observe(&mut self, planes: &[PlaneState], generation_supported: bool) {
+        if !generation_supported {
+            return;
+        }
+
+        self.initialized = true;
+        self.primary = planes
+            .iter()
+            .find(|plane| plane.kind == PlaneKind::Primary)
+            .and_then(|plane| plane.generation);
+        self.cursor = planes
+            .iter()
+            .find(|plane| plane.kind == PlaneKind::Cursor)
+            .and_then(|plane| plane.generation);
+    }
+}
+
+/// Whether a pending request still belongs to the active session process.
+fn request_is_current(shared: &Shared, request: &PendingRequest) -> bool {
+    let (lock, _) = &**shared;
+    let state = lock.lock().expect("the broker's lock is not poisoned");
+
+    state.session.is_some()
+        && state.session_epoch == request.session_epoch
+        && state
+            .peer
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &request.peer))
 }
 
 /// Waits out an output nothing is driving, and says so the first time.
@@ -651,7 +780,12 @@ const UNLIT_POLL: Duration = Duration::from_millis(100);
 /// Waits until a frame is wanted, and says who wants it.
 ///
 /// `None` means the broker is stopping, which is the only way out.
-fn wait_for_request(shared: &Shared) -> Option<Arc<Connection>> {
+struct PendingRequest {
+    peer: Arc<Connection>,
+    session_epoch: u64,
+}
+
+fn wait_for_request(shared: &Shared) -> Option<PendingRequest> {
     let (lock, signal) = &**shared;
     let mut state = lock.lock().expect("the broker's lock is not poisoned");
 
@@ -665,7 +799,10 @@ fn wait_for_request(shared: &Shared) -> Option<Arc<Connection>> {
         {
             state.wants_frame = false;
 
-            return Some(peer);
+            return Some(PendingRequest {
+                peer,
+                session_epoch: state.session_epoch,
+            });
         }
 
         state = signal
@@ -675,9 +812,23 @@ fn wait_for_request(shared: &Shared) -> Option<Arc<Connection>> {
 }
 
 /// Sends one vblank's planes, with the descriptors this peer has not been sent.
-fn send_snapshot(device: &Device, peer: &Arc<Connection>, shared: &Shared, planes: &[PlaneState]) {
+fn send_snapshot(
+    device: &Device,
+    request: &PendingRequest,
+    shared: &Shared,
+    planes: &[PlaneState],
+) -> bool {
     let (lock, _) = &**shared;
     let mut state = lock.lock().expect("the broker's lock is not poisoned");
+    if state.session.is_none()
+        || state.session_epoch != request.session_epoch
+        || !state
+            .peer
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &request.peer))
+    {
+        return false;
+    }
 
     let mut layouts = Vec::with_capacity(planes.len());
     let mut new_buffers = Vec::new();
@@ -709,8 +860,11 @@ fn send_snapshot(device: &Device, peer: &Arc<Connection>, shared: &Shared, plane
         planes: layouts,
         new_buffers: new_buffers.clone(),
     };
-    if peer.send(&message, &descriptors).is_ok() {
+    if request.peer.send(&message, &descriptors).is_ok() {
         state.sent.extend(new_buffers.iter().map(|id| *id as u32));
+        true
+    } else {
+        false
     }
 }
 
@@ -838,7 +992,12 @@ fn stop(shared: &Shared) {
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, io, time::Duration};
+    use std::{
+        cell::Cell,
+        io,
+        sync::{Arc, Condvar, Mutex},
+        time::Duration,
+    };
 
     use super::{SOCKET_PATH, wait_for_device};
 
@@ -858,7 +1017,99 @@ mod tests {
             x: 0,
             y: 0,
             fresh,
+            generation: None,
         }
+    }
+
+    fn generated_plane(kind: crate::ipc::PlaneKind, generation: Option<u64>) -> super::PlaneState {
+        super::PlaneState {
+            kind,
+            generation,
+            ..plane(7, false)
+        }
+    }
+
+    #[test]
+    fn only_a_new_plane_generation_is_captured() {
+        let mut seen = super::SnapshotGenerations::default();
+        let first = [generated_plane(crate::ipc::PlaneKind::Primary, Some(10))];
+        let same = [generated_plane(crate::ipc::PlaneKind::Primary, Some(10))];
+        let next = [generated_plane(crate::ipc::PlaneKind::Primary, Some(11))];
+
+        assert!(seen.advanced(&first, true));
+        seen.observe(&first, true);
+        assert!(!seen.advanced(&same, true));
+        assert!(seen.advanced(&next, true));
+    }
+
+    #[test]
+    fn a_cursor_disappearing_is_a_new_snapshot() {
+        let mut seen = super::SnapshotGenerations::default();
+        let with_cursor = [
+            generated_plane(crate::ipc::PlaneKind::Primary, Some(10)),
+            generated_plane(crate::ipc::PlaneKind::Cursor, Some(20)),
+        ];
+        let without_cursor = [generated_plane(crate::ipc::PlaneKind::Primary, Some(10))];
+
+        assert!(seen.advanced(&with_cursor, true));
+        seen.observe(&with_cursor, true);
+        assert!(seen.advanced(&without_cursor, true));
+    }
+
+    #[test]
+    fn a_module_without_generations_keeps_the_compatible_capture_path() {
+        let mut seen = super::SnapshotGenerations::default();
+        let legacy = [generated_plane(crate::ipc::PlaneKind::Primary, None)];
+
+        assert!(seen.advanced(&legacy, false));
+        seen.observe(&legacy, false);
+        assert!(seen.advanced(&legacy, false));
+        assert!(seen.advanced(&[], false));
+    }
+
+    #[test]
+    fn a_generation_is_not_consumed_until_delivery_succeeds() {
+        let seen = super::SnapshotGenerations::default();
+        let frame = [generated_plane(crate::ipc::PlaneKind::Primary, Some(10))];
+
+        assert!(seen.advanced(&frame, true));
+        assert!(seen.advanced(&frame, true));
+    }
+
+    #[test]
+    fn reopening_on_the_same_peer_changes_the_session_epoch() {
+        let shared: super::Shared = Arc::new((Mutex::new(super::BrokerState::default()), Condvar::new()));
+        let parameters = crate::ipc::SessionParameters {
+            session_id: vec![1; 16],
+            frame_key: vec![2; 32],
+            input_key: vec![3; 32],
+            width: 1920,
+            height: 1080,
+            tile_size: 32,
+            cursor_stream: true,
+        };
+
+        super::open_session(&shared, parameters.clone());
+        let first = shared.0.lock().unwrap().session_epoch;
+        super::close_session(&shared, "test transition");
+        super::open_session(&shared, parameters);
+        let second = shared.0.lock().unwrap().session_epoch;
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_new_request_probes_before_waiting_for_another_vblank() {
+        let mut pacing = super::CapturePacing::default();
+
+        pacing.requested();
+        assert!(!pacing.wait_before_probe());
+
+        pacing.unchanged();
+        assert!(pacing.wait_before_probe());
+
+        pacing.vblank_seen();
+        assert!(!pacing.wait_before_probe());
     }
 
     #[test]

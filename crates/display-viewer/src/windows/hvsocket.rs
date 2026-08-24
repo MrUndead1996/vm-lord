@@ -51,12 +51,14 @@ const HV_PROTOCOL_RAW: i32 = 1;
 /// case where the partition is there and nothing is listening on it.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// How long a read waits before letting its caller do something else.
+/// How long an ordinary read waits for a quiet socket.
 ///
-/// A quarter of a second, matching the agent socket's poll: it is how long
-/// closing a window takes, and four wakeups a second on an idle desktop is what
-/// it costs.
-pub const READ_POLL: Duration = Duration::from_millis(250);
+/// The session loop checks control before frames. Waiting here would therefore
+/// delay every frame by the quiet control channel's timeout. A small non-zero
+/// bound is still required: a stream record can arrive across more than one
+/// `recv`, and `WouldBlock` in the middle of it means "not all bytes yet", not
+/// a broken channel.
+pub const READ_POLL: Duration = Duration::from_millis(5);
 
 /// The service GUID a Linux guest's vsock `port` arrives on.
 ///
@@ -350,7 +352,15 @@ fn timeval(duration: Duration) -> TIMEVAL {
 mod tests {
     use std::time::{Duration, Instant};
 
-    use super::{CONTROL_PORT, ConnectError, FRAME_PORT, HvSocket, INPUT_PORT, vsock_service_id};
+    use super::{
+        CONTROL_PORT, ConnectError, FRAME_PORT, HvSocket, INPUT_PORT, READ_POLL, vsock_service_id,
+    };
+
+    #[test]
+    fn ordinary_reads_never_stall_a_frame_for_a_refresh_interval() {
+        assert!(READ_POLL <= Duration::from_millis(5));
+        assert!(!READ_POLL.is_zero());
+    }
 
     #[test]
     fn the_three_ports_are_the_ones_the_guest_listens_on() {

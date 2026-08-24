@@ -462,13 +462,18 @@ impl<F: Acceptor, I: Acceptor> Loop<F, I> {
                 new_buffers,
             } => {
                 self.asked_for_frame = false;
+                // Start waiting for the next vblank before touching this
+                // frame. Mapping and submitting take several milliseconds at
+                // desktop resolutions; putting them ahead of NextFrame makes
+                // that work part of every frame interval and produces uneven
+                // pacing even when capture averages sixty frames a second.
+                self.ask_for_frame();
                 self.adopt(&planes, &new_buffers, descriptors);
                 if let Err(error) = self.submit(sequence, &planes) {
                     eprintln!(
                         "vmlord-display-session: dropping frame {sequence}: the encoder refused it: {error}"
                     );
                 }
-                self.ask_for_frame();
 
                 Ok(None)
             }

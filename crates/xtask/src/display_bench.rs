@@ -28,7 +28,9 @@ struct Report {
     mean_delta_bytes: f64,
     worst_bytes: u64,
     ratio: f64,
+    mean_submit_ms: f64,
     mean_encode_ms: f64,
+    mean_frame_ms: f64,
     worst_encode_ms: f64,
     mean_decode_ms: f64,
 }
@@ -95,12 +97,16 @@ fn measure(scene: Scene, geometry: Geometry, frames: u32) -> Result<Report, Stri
     let mut delta_bytes = 0u64;
     let mut total_bytes = 0u64;
     let mut worst_bytes = 0u64;
+    let mut submit_nanos = 0u128;
     let mut encode_nanos = 0u128;
+    let mut frame_nanos = 0u128;
     let mut worst_encode_nanos = 0u128;
     let mut decode_nanos = 0u128;
 
     for _ in 0..frames {
         let pixels = generator.next_frame().to_vec();
+        let frame_started = Instant::now();
+        let started = Instant::now();
         encoder
             .submit(
                 Frame {
@@ -110,6 +116,7 @@ fn measure(scene: Scene, geometry: Geometry, frames: u32) -> Result<Report, Stri
                 None,
             )
             .map_err(|error| format!("{scene:?}: {error}"))?;
+        submit_nanos += started.elapsed().as_nanos();
 
         let started = Instant::now();
         let payload = encoder.next_payload().map(|payload| match payload {
@@ -120,6 +127,7 @@ fn measure(scene: Scene, geometry: Geometry, frames: u32) -> Result<Report, Stri
         let elapsed = started.elapsed().as_nanos();
 
         encode_nanos += elapsed;
+        frame_nanos += frame_started.elapsed().as_nanos();
         worst_encode_nanos = worst_encode_nanos.max(elapsed);
 
         let Some((keyframe, bytes)) = payload else {
@@ -169,7 +177,9 @@ fn measure(scene: Scene, geometry: Geometry, frames: u32) -> Result<Report, Stri
         } else {
             raw / total_bytes as f64
         },
+        mean_submit_ms: submit_nanos as f64 / frames_f / 1e6,
         mean_encode_ms: encode_nanos as f64 / frames_f / 1e6,
+        mean_frame_ms: frame_nanos as f64 / frames_f / 1e6,
         worst_encode_ms: worst_encode_nanos as f64 / 1e6,
         mean_decode_ms: decode_nanos as f64 / frames_f / 1e6,
     })
@@ -188,14 +198,16 @@ pub(crate) fn run<I: IntoIterator<Item = String>>(arguments: I) -> Result<(), St
         arguments.frames
     );
     println!(
-        "{:<18}{:>10}{:>12}{:>13}{:>9}{:>12}{:>10}{:>11}{:>9}",
+        "{:<18}{:>10}{:>12}{:>13}{:>9}{:>12}{:>11}{:>10}{:>10}{:>11}{:>9}",
         "scene",
         "keyframes",
         "mean bytes",
         "mean delta",
         "ratio",
         "worst bytes",
+        "submit ms",
         "enc ms",
+        "frame ms",
         "worst enc",
         "dec ms"
     );
@@ -203,7 +215,7 @@ pub(crate) fn run<I: IntoIterator<Item = String>>(arguments: I) -> Result<(), St
     for scene in Scene::ALL {
         let report = measure(scene, geometry, arguments.frames)?;
         println!(
-            "{:<18}{:>4}/{:<5}{:>12.0}{:>13.0}{:>9.1}{:>12}{:>10.2}{:>11.2}{:>9.2}",
+            "{:<18}{:>4}/{:<5}{:>12.0}{:>13.0}{:>9.1}{:>12}{:>11.2}{:>10.2}{:>10.2}{:>11.2}{:>9.2}",
             report.scene,
             report.keyframes,
             report.frames,
@@ -211,7 +223,9 @@ pub(crate) fn run<I: IntoIterator<Item = String>>(arguments: I) -> Result<(), St
             report.mean_delta_bytes,
             report.ratio,
             report.worst_bytes,
+            report.mean_submit_ms,
             report.mean_encode_ms,
+            report.mean_frame_ms,
             report.worst_encode_ms,
             report.mean_decode_ms,
         );
@@ -235,6 +249,9 @@ mod tests {
         assert_eq!(report.frames, 4);
         assert!(report.keyframes >= 1);
         assert!(report.mean_bytes > 0.0);
+        assert!(report.mean_submit_ms > 0.0);
+        assert!(report.mean_frame_ms >= report.mean_submit_ms);
+        assert!(report.mean_frame_ms >= report.mean_encode_ms);
     }
 
     #[test]
