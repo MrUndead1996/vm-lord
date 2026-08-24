@@ -137,7 +137,8 @@ impl Device {
             return Ok(None);
         };
 
-        let path = crate::unix::c_string(&dev_root.join(card))?;
+        let node = dev_root.join(&card);
+        let path = crate::unix::c_string(&node)?;
         // SAFETY: `path` is a NUL-terminated path that lives across the call.
         let raw = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         if raw < 0 {
@@ -157,12 +158,23 @@ impl Device {
         // and `DROP_MASTER` takes no argument -- the null pointer is what the
         // ABI expects for an `_IO` request.
         let dropped = unsafe { libc::ioctl(descriptor.as_raw_fd(), DRM_IOCTL_DROP_MASTER as _, 0) };
-        if dropped < 0 {
-            // `EINVAL` is the answer when this process was not master, which is
-            // the ordinary case for a broker that restarted while the desktop
-            // was up. Anything else is worth a line and is still not fatal.
+        // Said out loud either way. Whether this process was handed the master
+        // is the difference between a compositor that can take this card and
+        // one that is answered `EBUSY`, and it is not otherwise visible from
+        // outside: nothing in `/proc` or `/sys` names a card's master.
+        if dropped >= 0 {
+            eprintln!(
+                "vmlord-display-broker: opened {} first, so the kernel made this process its                  DRM master; dropped it for the compositor",
+                node.display()
+            );
+        } else {
             let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::EINVAL) {
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                eprintln!(
+                    "vmlord-display-broker: opened {} without being made its DRM master,                      so something else holds it",
+                    node.display()
+                );
+            } else {
                 eprintln!("vmlord-display-broker: could not drop DRM master: {error}");
             }
         }

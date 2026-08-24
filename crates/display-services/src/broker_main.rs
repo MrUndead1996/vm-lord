@@ -544,6 +544,11 @@ fn send_to_peer(shared: &Shared, message: &Message) {
 
 /// Reads the planes at every vblank a frame was asked for.
 fn capture_frames(mut device: Device, shared: &Shared) {
+    // How many times in a row the clock has answered "this output is not
+    // being driven". Kept to pace the retry and to say so once rather than
+    // sixty times a second.
+    let mut unlit: u32 = 0;
+
     loop {
         let Some(peer) = wait_for_request(shared) else {
             return;
@@ -553,9 +558,24 @@ fn capture_frames(mut device: Device, shared: &Shared) {
             if error.kind() == ErrorKind::Interrupted {
                 continue;
             }
+            // `EINVAL` is what the kernel answers while this output's vblank
+            // is off: no compositor has lit it yet, or the desktop has
+            // blanked. Neither is a fault -- there is simply nothing to
+            // capture this instant -- and ending the session over it would
+            // close a window that a moving mouse is about to fill.
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                idle_until_the_output_is_lit(&mut unlit);
+                continue;
+            }
             fault(shared, &format!("the output's clock failed: {error}"));
 
             return;
+        }
+        if unlit > 0 {
+            eprintln!(
+                "vmlord-display-broker: the output is lit again after {unlit} attempts at its clock"
+            );
+            unlit = 0;
         }
 
         let planes = match device.snapshot() {
@@ -593,6 +613,26 @@ fn capture_frames(mut device: Device, shared: &Shared) {
         send_snapshot(&device, &peer, shared, &planes);
     }
 }
+
+/// Waits out an output nothing is driving, and says so the first time.
+///
+/// A desktop that has not been lit yet and one that has blanked look the same
+/// from here, and both end when something commits a mode -- which is an event
+/// this process does not get told about, so it asks again. The pace is a
+/// frame's worth of time: often enough that the picture returns immediately,
+/// rarely enough that an unlit guest costs nothing.
+fn idle_until_the_output_is_lit(attempts: &mut u32) {
+    if *attempts == 0 {
+        eprintln!(
+            "vmlord-display-broker: this output has no clock yet -- nothing has lit it.              Waiting; the desktop's compositor is what turns it on."
+        );
+    }
+    *attempts = attempts.saturating_add(1);
+    thread::sleep(UNLIT_POLL);
+}
+
+/// How long the capture loop rests while nothing is driving the output.
+const UNLIT_POLL: Duration = Duration::from_millis(100);
 
 /// Waits until a frame is wanted, and says who wants it.
 ///
