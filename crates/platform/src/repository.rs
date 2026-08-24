@@ -14,9 +14,10 @@ use std::{
 
 use uuid::Uuid;
 use vmlord_core::{
-    AgentStatus, Diagnostic, DiagnosticLevel, GpuAssignment, GpuMode, GuestReadinessTimeouts,
-    HostGpuCapabilities, NetworkMode, RepositoryError, SshAvailability, VmCreateRequest,
-    VmDeleteRequest, VmRepository, VmState, VmSummary, VmUpdateRequest,
+    AgentStatus, Diagnostic, DiagnosticLevel, DisplayProvisioning, GpuAssignment, GpuMode,
+    GuestDisplayReport, GuestReadinessTimeouts, HostGpuCapabilities, NetworkMode, RepositoryError,
+    SshAvailability, VmCreateRequest, VmDeleteRequest, VmRepository, VmState, VmSummary,
+    VmUpdateRequest,
 };
 
 use crate::{
@@ -532,6 +533,50 @@ impl HcsVmRepository {
             ),
         }
         self.listen_for_agent(mapping, self.runtime_id(mapping));
+    }
+
+    /// Writes down that a VM's desktop is installed, once its guest offers it.
+    ///
+    /// The build cannot answer this. Cloud-init installs the desktop on the
+    /// first boot, long after the creation pipeline has finished, and no guest
+    /// message reports the package set -- so the field it wrote has said
+    /// "still installing" ever since. What does answer it is the guest running
+    /// its display services on top of that desktop, which is the same fact a
+    /// viewer waits for.
+    ///
+    /// Stored rather than derived on every refresh, because the field is
+    /// stored for a reason: a stopped VM is to read as one whose desktop is
+    /// not running, not as one whose desktop never arrived.
+    fn record_installed_desktops(&self) {
+        let Ok(mappings) = self.store.list() else {
+            // A store that cannot be read is reported by everything else that
+            // reads it; a refresh must not turn that into a second sentence.
+            return;
+        };
+
+        for mapping in mappings {
+            if !mapping.desktop_profile.wants_desktop()
+                || mapping.display_provisioning == DisplayProvisioning::Ready
+                || !matches!(
+                    self.display_runs.snapshot(mapping.vm_id).guest,
+                    Some(GuestDisplayReport::Ready(_))
+                )
+            {
+                continue;
+            }
+
+            log::info!(
+                "VM \"{}\" offers its desktop, so its desktop is installed",
+                mapping.vm_name
+            );
+            let updated = VmComputeSystemMapping {
+                display_provisioning: DisplayProvisioning::Ready,
+                ..mapping
+            };
+            if let Err(error) = self.store.insert(updated) {
+                log::warn!("the installed desktop could not be recorded: {error}");
+            }
+        }
     }
 
     /// The partition a VM is running as right now.
@@ -1442,6 +1487,9 @@ impl VmRepository for HcsVmRepository {
         // reachable only here.
         let started = self.starts.take_started();
         self.adopt_started(started);
+        // The same call for the same reason: a guest that started offering its
+        // desktop since the last refresh has an installation to write down.
+        self.record_installed_desktops();
         // The same call, for the same reason: a shutdown request that has been
         // answered has handles to give up, and they are reachable only here.
         self.finish_shutdowns();
@@ -1638,9 +1686,9 @@ mod tests {
 
     use uuid::Uuid;
     use vmlord_core::{
-        AgentStatus, DiagnosticLevel, GpuMode, NetworkMode, RepositoryError, SshAuthentication,
-        SshAvailability, SshConfig, SshPort, VmDeleteRequest, VmGpuFacts, VmRepository, VmState,
-        VmSummary, VmUpdateRequest,
+        AgentStatus, DiagnosticLevel, DisplayProvisioning, GpuMode, GuestDisplayReport,
+        NetworkMode, RepositoryError, SshAuthentication, SshAvailability, SshConfig, SshPort,
+        VmDeleteRequest, VmGpuFacts, VmRepository, VmState, VmSummary, VmUpdateRequest,
     };
 
     use super::{
@@ -1871,6 +1919,83 @@ mod tests {
         fs::create_dir_all(&root).expect("test root should be created");
         let store = MetadataStore::new(root.join("vm-mapping.json"));
         (root, store)
+    }
+
+    /// A repository whose store is a file of this test's own.
+    fn repository_over(root: &std::path::Path) -> HcsVmRepository {
+        HcsVmRepository::new(
+            root,
+            Box::new(|_, _, _, _| {
+                Err(RepositoryError::new(
+                    "this test creates no VM from a cloud image",
+                ))
+            }),
+        )
+    }
+
+    /// A VM that asked for a desktop and is still waiting for one.
+    fn desktop_mapping() -> VmComputeSystemMapping {
+        VmComputeSystemMapping {
+            desktop_profile: vmlord_core::DesktopProfile::Gnome,
+            display_provisioning: DisplayProvisioning::Pending,
+            ..mapping(NetworkMode::None)
+        }
+    }
+
+    #[test]
+    fn a_guest_that_offers_its_desktop_records_the_desktop_as_installed() {
+        // Nothing else on the host can see that cloud-init finished: the
+        // guest running its display services on top of the desktop is the
+        // observation, and it is worth writing down once.
+        let (root, _store) = temp_store("desktop-installed");
+        let repository = repository_over(&root);
+        let mapping = desktop_mapping();
+        repository
+            .store
+            .insert(mapping.clone())
+            .expect("the mapping should be stored");
+        repository.display_runs.record_guest_display(
+            mapping.vm_id,
+            GuestDisplayReport::Ready(vmlord_core::GuestDisplayDetail::default()),
+        );
+
+        repository.record_installed_desktops();
+
+        assert_eq!(
+            repository
+                .store
+                .find_by_vm_id(mapping.vm_id)
+                .expect("the store answers")
+                .expect("the mapping is still there")
+                .display_provisioning,
+            DisplayProvisioning::Ready
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_desktop_no_guest_has_reported_is_left_as_it_was() {
+        let (root, _store) = temp_store("desktop-unreported");
+        let repository = repository_over(&root);
+        let mapping = desktop_mapping();
+        repository
+            .store
+            .insert(mapping.clone())
+            .expect("the mapping should be stored");
+
+        repository.record_installed_desktops();
+
+        assert_eq!(
+            repository
+                .store
+                .find_by_vm_id(mapping.vm_id)
+                .expect("the store answers")
+                .expect("the mapping is still there")
+                .display_provisioning,
+            DisplayProvisioning::Pending,
+            "nothing observed is not evidence of an installed desktop"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn mapping(network_mode: NetworkMode) -> VmComputeSystemMapping {
