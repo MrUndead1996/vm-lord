@@ -5,7 +5,7 @@
 
 use std::{
     io::{self, ErrorKind},
-    os::fd::{AsRawFd, BorrowedFd},
+    os::fd::{AsRawFd, BorrowedFd, OwnedFd},
     ptr, slice,
     sync::atomic::{AtomicBool, Ordering},
 };
@@ -20,15 +20,15 @@ use crate::drm::{
 /// A read-only mapping over an exported buffer.
 ///
 /// The mapping lives as long as the value; `Drop` unmaps it. The descriptor is
-/// not kept: `mmap` holds its own reference to the object, so the caller may
-/// close it.
+/// kept for the coherency calls even though `mmap` holds its own reference to
+/// the object.
 pub struct MappedBuffer {
     /// The mapping's base address. Never null: `map` fails instead.
     address: ptr::NonNull<u8>,
     /// Its length in bytes, which is what `read` hands out.
     length: usize,
     /// The descriptor, kept only for the coherency calls.
-    descriptor: libc::c_int,
+    descriptor: OwnedFd,
     /// Whether a failed sync has already been reported. A buffer that does not
     /// implement the call fails on every frame, and a warning per frame is a
     /// log nobody reads.
@@ -62,6 +62,7 @@ impl MappedBuffer {
         }
 
         let raw = descriptor.as_raw_fd();
+        let descriptor = descriptor.try_clone_to_owned()?;
         let mut status: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: `status` is a live, correctly shaped value and `raw` is a
         // descriptor the caller owns for the duration of the call.
@@ -98,7 +99,7 @@ impl MappedBuffer {
         Ok(Self {
             address,
             length,
-            descriptor: raw,
+            descriptor,
             sync_reported: AtomicBool::new(false),
         })
     }
@@ -137,7 +138,7 @@ impl MappedBuffer {
 
     /// One half of the coherency bracket, reported at most once.
     fn sync(&self, flags: u64) {
-        if sync_buffer(self.descriptor, flags).is_err()
+        if sync_buffer(self.descriptor.as_raw_fd(), flags).is_err()
             && !self.sync_reported.swap(true, Ordering::Relaxed)
         {
             eprintln!(
@@ -246,6 +247,22 @@ mod tests {
             assert_eq!(bytes.len(), 4096);
             assert!(bytes.iter().all(|byte| *byte == 0xab));
         });
+    }
+
+    #[test]
+    fn a_mapped_buffer_keeps_its_descriptor_alive() {
+        let fd = memfd("mapped-buffer-owner", &[0; 4096]).unwrap();
+        let mapped = MappedBuffer::map(fd.as_fd(), 4096).unwrap();
+        drop(fd);
+
+        let owns_descriptor = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .any(|target| target.to_string_lossy().contains("mapped-buffer-owner"));
+
+        assert!(owns_descriptor, "the mapping must keep its dma-buf fd open");
+        drop(mapped);
     }
 
     #[test]
