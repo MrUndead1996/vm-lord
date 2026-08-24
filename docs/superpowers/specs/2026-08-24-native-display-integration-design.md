@@ -197,8 +197,11 @@ Into the shared `Diagnostic` buffer, from the launch thread:
   application (error).
 
 Not into it: every retry, every reconnect of a frame channel, every ping. Those
-are the viewer's own log, `%LOCALAPPDATA%\VMLord\display`, which stays a
-per-VM file. Nothing formats a secret, a token, a channel key or a pixel: the
+are log records rather than diagnostics. The viewer writes them through the
+same `vmlord-core` logger VMLord uses, so they land in
+`%LOCALAPPDATA%\VMLord\logs\vmlord.log` beside the host's own -- what is
+per-VM under `%LOCALAPPDATA%\VMLord\display` is the remembered window state,
+not a log. Nothing formats a secret, a token, a channel key or a pixel: the
 keys are never `Display`, the token is compared as bytes, and no frame ever
 crosses this process.
 
