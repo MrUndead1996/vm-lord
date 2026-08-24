@@ -128,6 +128,17 @@ The guest reads the policy itself. A policy from a payload built newer than the
 agent fails the `USERSPACE` stage it belongs to — after the kernel module has
 already built, deliberately, so the failure is where it belongs.
 
+One process is deliberately left out of `bundled`: the desktop's compositor.
+That Mesa renders through `/dev/dxg` and cannot hand a buffer to a foreign KMS
+device, so a compositor holding `vmlord_drm` binds the device and then fails to
+allocate on it — `EGL_BAD_ALLOC`, no modeset, a black display. The display
+payload ships a drop-in on `org.gnome.Shell@.service` that puts the compositor
+back on the distribution's Mesa; everything launched from the session keeps the
+GPU. This is why the drop-in sets `LD_LIBRARY_PATH` rather than only unsetting
+the overrides: `bundled` also names its libraries in
+`/etc/ld.so.conf.d/vmlord-wsl-mesa.conf`, and an entry in the linker cache is
+not something an environment can take back.
+
 ## Modes, and when they can change
 
 | Mode | What is attached |

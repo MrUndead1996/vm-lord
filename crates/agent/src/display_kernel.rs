@@ -42,6 +42,11 @@ const DKMS_TREE: &str = "/var/lib/dkms";
 const MODULES_LOAD: &str = "/etc/modules-load.d/vmlord-display.conf";
 const MODPROBE_OPTIONS: &str = "/etc/modprobe.d/vmlord-display.conf";
 const UNBIND_UNIT: &str = "/etc/systemd/system/vmlord-display-unbind-simpledrm.service";
+/// Where a drop-in reaches the compositor of the greeter and of a logged-in
+/// user both: `org.gnome.Shell@.service` is a template, and a drop-in on the
+/// template applies to every instance of it.
+const COMPOSITOR_DROP_IN: &str =
+    "/etc/systemd/user/org.gnome.Shell@.service.d/vmlord-display-compositor-mesa.conf";
 const DRM_DEVICES: &str = "/sys/class/drm";
 
 /// Where the two guest programs are installed. Beside the module's own unit,
@@ -538,6 +543,12 @@ fn make_log(version: &str) -> Option<String> {
 /// The unit that unbinds `simple-framebuffer` is installed here too: simpledrm
 /// is builtin, so it cannot be blacklisted, and until it lets go of the console
 /// a compositor has two devices to choose between.
+///
+/// So is the drop-in that keeps the compositor on the distribution's Mesa,
+/// which is the other half of the same job: a device a compositor binds and
+/// then cannot allocate a buffer on is a device it will not light. It is
+/// written rather than applied -- a drop-in is read when the unit next starts,
+/// and on a normal boot this recipe runs before the greeter does.
 fn load_stage(report: &mut Report, mode: Option<(u32, u32)>) -> Result<(), String> {
     let wanted = wanted_mode(mode);
     let payload_drm = Path::new(PAYLOAD_MOUNT).join("content").join("drm");
@@ -561,7 +572,8 @@ fn load_stage(report: &mut Report, mode: Option<(u32, u32)>) -> Result<(), Strin
             )
             .map_err(|error| format!("{MODPROBE_OPTIONS} could not be written: {error}"))
         })
-        .and_then(|()| copy("vmlord-display-unbind-simpledrm.service", UNBIND_UNIT));
+        .and_then(|()| copy("vmlord-display-unbind-simpledrm.service", UNBIND_UNIT))
+        .and_then(|()| copy("vmlord-display-compositor-mesa.conf", COMPOSITOR_DROP_IN));
     if let Err(reason) = prepared {
         report.failed(DisplayRecipeStep::ModuleLoad, reason.clone());
         return Err(reason);
@@ -966,6 +978,38 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn the_compositor_drop_in_undoes_both_paths_to_the_payloads_mesa() {
+        // Two paths, and a drop-in that undid only one of them was measured on
+        // a live guest to change nothing: the linker cache still resolved
+        // libgbm to the payload's Mesa, the compositor still failed to lock a
+        // front buffer, and the connector stayed disabled. So this file has to
+        // keep saying both things -- the overrides off, and a library path that
+        // outranks the cache.
+        let drop_in =
+            include_str!("../../../payloads/display/module/vmlord-display-compositor-mesa.conf");
+
+        for variable in [
+            "GALLIUM_DRIVER",
+            "MESA_LOADER_DRIVER_OVERRIDE",
+            "__GLX_VENDOR_LIBRARY_NAME",
+            "VK_DRIVER_FILES",
+        ] {
+            assert!(
+                drop_in
+                    .lines()
+                    .any(|line| line.starts_with("UnsetEnvironment=") && line.contains(variable)),
+                "{variable} is one of the overrides the compositor must not inherit"
+            );
+        }
+        assert!(
+            drop_in
+                .lines()
+                .any(|line| line == "Environment=LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu"),
+            "unsetting LD_LIBRARY_PATH is not enough: the cache has to be outranked"
+        );
     }
 
     #[test]
