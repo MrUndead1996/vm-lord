@@ -169,6 +169,13 @@ pub(crate) struct DrainedEvents {
     pub diagnostics: Vec<Diagnostic>,
     /// The VMs whose held handle the events proved dead.
     pub released: Vec<Uuid>,
+    /// The VMs whose compute system stopped executing.
+    ///
+    /// A subset of [`DrainedEvents::released`], and a separate list because the
+    /// two mean different things: a released handle is also what a disconnected
+    /// service leaves behind, while this is a VM that is no longer running.
+    /// A guest that reboots keeps its compute system, so it is not here.
+    pub stopped: Vec<Uuid>,
     /// Whether this drain saw a `ServiceDisconnect` it did not drop as stale.
     ///
     /// One flag rather than one entry per VM: the service disconnecting is a
@@ -200,6 +207,7 @@ pub(crate) fn drain_events(
     let mut drained = DrainedEvents {
         diagnostics: Vec::new(),
         released: Vec::new(),
+        stopped: Vec::new(),
         service_disconnected: false,
     };
     for event in events {
@@ -215,6 +223,9 @@ pub(crate) fn drain_events(
         }
         if event.kind.releases_handle() {
             drained.released.push(event.vm_id);
+        }
+        if matches!(event.kind, HcsEventKind::Exited) {
+            drained.stopped.push(event.vm_id);
         }
         // Outside the branch above on purpose: a disconnect happens to release
         // the handle too, but what makes it worth reporting is the service being
@@ -645,6 +656,7 @@ mod tests {
         let DrainedEvents {
             diagnostics,
             released,
+            stopped,
             ..
         } = drain_events(&sink, nothing_superseded);
 
@@ -652,6 +664,12 @@ mod tests {
         assert_eq!(diagnostics[0].level, DiagnosticLevel::Info);
         assert!(diagnostics[0].message.contains("dev"));
         assert_eq!(released, vec![vm_id]);
+        assert_eq!(
+            stopped,
+            vec![vm_id],
+            "an exit is what a VM that stopped looks like, and what its \
+             display window is closed on"
+        );
     }
 
     #[test]
@@ -705,11 +723,17 @@ mod tests {
         let DrainedEvents {
             diagnostics,
             released,
+            stopped,
             ..
         } = drain_events(&sink, nothing_superseded);
 
         assert_eq!(diagnostics[0].level, DiagnosticLevel::Error);
         assert_eq!(released, vec![vm_id]);
+        assert!(
+            stopped.is_empty(),
+            "the service disconnecting says nothing about whether the VM is \
+             still running, so its display window is left alone"
+        );
     }
 
     #[test]
