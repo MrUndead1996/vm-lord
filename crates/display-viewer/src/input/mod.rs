@@ -321,10 +321,14 @@ mod tests {
     use super::{BTN_LEFT, BTN_RIGHT, Event, Policy, Report};
     use crate::{input::keymap, placement::place};
 
-    /// A policy over an 800x600 guest in a 1280x720 window, focused.
+    /// A policy over an 800x600 guest in a window of the same size, focused.
+    ///
+    /// The settled state: the window drives the guest's mode, so once a resize
+    /// has been answered the picture is the client area at 1:1. A point beyond
+    /// it is one a captured drag reported from outside the window.
     fn focused() -> Policy {
         let mut policy = Policy::new();
-        policy.set_placement(place(800, 600, 1280, 720));
+        policy.set_placement(place(800, 600, 800, 600));
         policy.report(Report::FocusGained);
         let _ = policy.drain();
 
@@ -513,6 +517,23 @@ mod tests {
         // With nothing held, motion off the picture stops again.
         policy.report(Report::Pointer { x: 2000, y: 900 });
         assert!(policy.drain().is_empty());
+    }
+
+    #[test]
+    fn a_point_on_a_letterbox_bar_is_not_a_point_on_the_desktop() {
+        // What a window that has been dragged and not yet answered looks like:
+        // the picture is centred with ground at two edges, and the ground is
+        // not the guest's.
+        let mut policy = Policy::new();
+        policy.set_placement(place(800, 600, 1000, 600));
+        policy.report(Report::FocusGained);
+        let _ = policy.drain();
+
+        policy.report(Report::Pointer { x: 50, y: 300 });
+        assert!(policy.drain().is_empty(), "the left bar is not the desktop");
+
+        policy.report(Report::Pointer { x: 100, y: 300 });
+        assert_eq!(policy.drain(), vec![Event::Motion { x: 0, y: 300 }]);
     }
 
     #[test]

@@ -1,11 +1,18 @@
 //! Where the guest's picture sits on the client area.
 //!
-//! One value, and both consumers read it: the renderer copies into it and the
-//! input policy maps points through it. Today it is the crop the renderer
-//! already performed -- the picture at the top left, cut off at the window's
-//! edges. #120 replaces [`place`] with letterboxing, and because there is one
-//! of it rather than one per consumer, the pointer follows the picture without
-//! a second change.
+//! One value, and both consumers read it: the renderer draws into it and the
+//! input policy maps points through it. Because there is one of them rather
+//! than one per consumer, the pointer cannot drift from the picture.
+//!
+//! The picture is letterboxed: scaled to fit, whole, centred, with the aspect
+//! ratio kept and the ground showing at two edges. Never stretched and never
+//! cropped -- a stretched desktop is one whose circles are ovals, and a
+//! cropped one is a desktop with a corner the user cannot reach.
+//!
+//! Most of the time there is nothing to scale. The window drives the guest's
+//! mode, so a settled window and a settled desktop are the same size and the
+//! renderer copies rather than samples. Scaling is what the seconds between a
+//! drag and the guest's answer look like.
 
 /// The rectangle the guest's picture occupies, and the frame it shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,7 +21,8 @@ pub struct Placement {
     pub x: i32,
     /// Its top edge in client pixels.
     pub y: i32,
-    /// How wide it is on screen, which #120 makes differ from the frame.
+    /// How wide it is on screen, which differs from the frame while the guest
+    /// is catching up with the window.
     pub width: u32,
     /// How tall it is on screen.
     pub height: u32,
@@ -26,9 +34,9 @@ pub struct Placement {
 
 /// Where a frame of this size sits on a client area of that size.
 ///
-/// Today: the top left corner, cut off at the window's edges, which is what
-/// the renderer already does. Returns `None` for a client area or a frame with
-/// no pixels in it, which is a window mid-resize rather than a fault.
+/// The largest rectangle of the frame's aspect ratio that fits, centred.
+/// Returns `None` for a client area or a frame with no pixels in it, which is
+/// a window mid-resize rather than a fault.
 #[must_use]
 pub fn place(
     guest_width: u32,
@@ -38,20 +46,45 @@ pub fn place(
 ) -> Option<Placement> {
     let client_width = u32::try_from(client_width).ok()?;
     let client_height = u32::try_from(client_height).ok()?;
-    let width = guest_width.min(client_width);
-    let height = guest_height.min(client_height);
-    if width == 0 || height == 0 {
+    if client_width == 0 || client_height == 0 || guest_width == 0 || guest_height == 0 {
         return None;
     }
 
+    // Wide arithmetic throughout: 2560 * 1440 overflows nothing, but the
+    // cross-multiplication of two of them would.
+    let by_width = u64::from(client_width) * u64::from(guest_height);
+    let by_height = u64::from(client_height) * u64::from(guest_width);
+    let (width, height) = if by_width <= by_height {
+        // The window is the narrower of the two shapes: the width is what
+        // runs out, and the bars are above and below.
+        (
+            client_width,
+            fit(client_width, guest_height, guest_width).max(1),
+        )
+    } else {
+        (
+            fit(client_height, guest_width, guest_height).max(1),
+            client_height,
+        )
+    };
+
     Some(Placement {
-        x: 0,
-        y: 0,
+        // Integer division leaves any odd pixel on the right or the bottom,
+        // which is a pixel of ground rather than a pixel of picture.
+        x: ((client_width - width) / 2) as i32,
+        y: ((client_height - height) / 2) as i32,
         width,
         height,
         guest_width,
         guest_height,
     })
+}
+
+/// One axis scaled by the ratio of the other two, in wide arithmetic.
+fn fit(along: u32, numerator: u32, denominator: u32) -> u32 {
+    let scaled = u64::from(along) * u64::from(numerator) / u64::from(denominator);
+
+    u32::try_from(scaled).unwrap_or(u32::MAX)
 }
 
 impl Placement {
@@ -113,18 +146,39 @@ mod tests {
     use super::{Placement, place};
 
     #[test]
-    fn a_picture_smaller_than_the_window_is_placed_whole() {
-        let placement = place(800, 600, 1280, 720).expect("a placement");
+    fn a_window_the_shape_of_the_frame_shows_it_whole_with_no_bars() {
+        let placement = place(1920, 1080, 1280, 720).expect("a placement");
 
         assert_eq!((placement.x, placement.y), (0, 0));
-        assert_eq!((placement.width, placement.height), (800, 600));
+        assert_eq!((placement.width, placement.height), (1280, 720));
     }
 
     #[test]
-    fn a_picture_larger_than_the_window_is_cut_at_its_edges() {
-        let placement = place(1920, 1080, 1280, 720).expect("a placement");
+    fn a_window_wider_than_the_frame_gets_bars_at_the_sides() {
+        // Pillarbox: the height runs out first, and the picture is centred in
+        // what is left. Never stretched -- a desktop whose circles are ovals.
+        let placement = place(1000, 1000, 1600, 1000).expect("a placement");
 
-        assert_eq!((placement.width, placement.height), (1280, 720));
+        assert_eq!((placement.width, placement.height), (1000, 1000));
+        assert_eq!((placement.x, placement.y), (300, 0));
+    }
+
+    #[test]
+    fn a_window_taller_than_the_frame_gets_bars_above_and_below() {
+        let placement = place(1000, 1000, 1000, 1600).expect("a placement");
+
+        assert_eq!((placement.width, placement.height), (1000, 1000));
+        assert_eq!((placement.x, placement.y), (0, 300));
+    }
+
+    #[test]
+    fn a_frame_larger_than_the_window_is_scaled_down_rather_than_cropped() {
+        // A desktop with a corner the user cannot reach is what cropping
+        // would cost, and the seconds between a drag and the guest's answer
+        // are exactly when it would happen.
+        let placement = place(1920, 1080, 960, 540).expect("a placement");
+
+        assert_eq!((placement.width, placement.height), (960, 540));
         assert_eq!(
             (placement.guest_width, placement.guest_height),
             (1920, 1080)
@@ -132,32 +186,41 @@ mod tests {
     }
 
     #[test]
+    fn an_odd_leftover_pixel_is_ground_rather_than_picture() {
+        let placement = place(100, 100, 201, 100).expect("a placement");
+
+        assert_eq!(placement.x, 50);
+        assert_eq!(placement.width, 100);
+    }
+
+    #[test]
     fn a_window_with_no_area_has_no_placement() {
         assert!(place(800, 600, 0, 720).is_none());
         assert!(place(800, 600, 1280, -1).is_none());
+        assert!(place(0, 600, 1280, 720).is_none());
     }
 
     #[test]
     fn a_point_on_the_picture_maps_to_the_pixel_under_it() {
-        let placement = place(800, 600, 1280, 720).expect("a placement");
+        let placement = place(800, 600, 800, 600).expect("a placement");
 
         assert_eq!(placement.to_guest(0, 0), Some((0, 0)));
         assert_eq!(placement.to_guest(799, 599), Some((799, 599)));
     }
 
     #[test]
-    fn a_point_off_the_picture_maps_to_nothing() {
-        let placement = place(800, 600, 1280, 720).expect("a placement");
+    fn a_point_on_a_bar_is_off_the_picture() {
+        // The pointer follows the picture rather than the window: a click on
+        // the ground is not a click on the desktop.
+        let placement = place(1000, 1000, 1600, 1000).expect("a placement");
 
-        assert_eq!(placement.to_guest(800, 300), None);
-        assert_eq!(placement.to_guest(300, 600), None);
-        assert_eq!(placement.to_guest(-1, 300), None);
+        assert_eq!(placement.to_guest(299, 500), None);
+        assert_eq!(placement.to_guest(1300, 500), None);
+        assert_eq!(placement.to_guest(300, 500), Some((0, 500)));
     }
 
     #[test]
-    fn a_placement_smaller_than_its_frame_scales_rather_than_crops() {
-        // Not what `place` builds today, and exactly what #120 will: the
-        // mapping is written for it so that #120 changes one function.
+    fn a_scaled_placement_maps_through_the_scale() {
         let placement = Placement {
             x: 40,
             y: 10,
@@ -177,9 +240,20 @@ mod tests {
     fn a_point_off_the_picture_still_clamps_onto_it() {
         // What a drag that leaves the window sends: motion continues, and
         // every coordinate on the wire is a pixel the guest has.
-        let placement = place(800, 600, 1280, 720).expect("a placement");
+        let placement = place(800, 600, 800, 600).expect("a placement");
 
         assert_eq!(placement.to_guest_clamped(-30, -30), (0, 0));
         assert_eq!(placement.to_guest_clamped(5000, 5000), (799, 599));
+    }
+
+    #[test]
+    fn a_frame_at_2560x1440_in_a_window_of_the_same_shape_needs_no_scale() {
+        // The MVP's target, and the state a settled window is in: the guest
+        // is on the mode the window asked for, so the renderer copies rather
+        // than samples.
+        let placement = place(2560, 1440, 2560, 1440).expect("a placement");
+
+        assert_eq!((placement.x, placement.y), (0, 0));
+        assert_eq!((placement.width, placement.height), (2560, 1440));
     }
 }

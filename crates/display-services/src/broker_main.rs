@@ -25,7 +25,8 @@ use vmlord_display_protocol::{keys::Secret, v1::ErrorCode};
 use crate::{
     control::{Control, Outcome, support_from},
     drm::{DRM_CLASS, DRM_DEVICES, Device, PlaneState},
-    ipc::{Message, PlaneLayout, SessionParameters},
+    ipc::{Message, PlaneKind, PlaneLayout, SessionParameters},
+    output::Output,
     unix::{Connection, Listener},
     vsock::{self, CONTROL_PORT},
 };
@@ -67,6 +68,8 @@ pub struct Options {
     pub socket: PathBuf,
     /// Where the kernel's uinput device is.
     pub uinput: PathBuf,
+    /// Where the module publishes the mode it drives.
+    pub mode: PathBuf,
     /// The user that process runs as, which is the only one let in.
     pub user: String,
     /// How long to wait for the card.
@@ -91,6 +94,7 @@ impl Options {
             .into(),
             socket: text("VMLORD_DISPLAY_SOCKET", SOCKET_PATH).into(),
             uinput: text("VMLORD_DISPLAY_UINPUT", crate::uinput::DEVICE_PATH).into(),
+            mode: text("VMLORD_DISPLAY_MODE", crate::output::MODE_PARAMETER).into(),
             user: text("VMLORD_DISPLAY_USER", SERVICE_USER),
             device_deadline: DEVICE_DEADLINE,
         }
@@ -157,6 +161,12 @@ struct BrokerState {
     sent: HashSet<u32>,
     /// A fault another thread found, for the control thread to report.
     fault: Option<String>,
+    /// The size of the framebuffer capture last saw, once it has seen one.
+    /// The one answer to "what is the output actually on", because it is the
+    /// buffer that gets encoded rather than the mode that was asked for.
+    geometry: Option<(u32, u32)>,
+    /// Whether that size has moved since the control thread last read it.
+    geometry_changed: bool,
     /// Whether the broker is on its way out.
     stopping: bool,
 }
@@ -198,6 +208,7 @@ fn serve(options: &Options) -> io::Result<()> {
     let control = vsock::Listener::bind(CONTROL_PORT)?;
 
     let shared: Shared = Arc::new((Mutex::new(BrokerState::default()), Condvar::new()));
+    let output = Output::new(&options.mode);
 
     // Created once and held for the guest's lifetime: neither a rebound input
     // channel nor a whole new session makes the desktop see its keyboard
@@ -219,7 +230,7 @@ fn serve(options: &Options) -> io::Result<()> {
             let shared = Arc::clone(&shared);
             scope.spawn(move || capture_frames(device, &shared))
         };
-        serve_sessions(&control, &secret, &shared);
+        serve_sessions(&control, &secret, &output, &shared);
 
         // Nothing above returns while the broker is healthy, so reaching here
         // means the control listener failed and the others are owed the news.
@@ -385,7 +396,12 @@ fn send_devices(connection: &Connection, devices: Option<&(OwnedFd, OwnedFd)>) {
 }
 
 /// Accepts one control connection at a time and runs its session.
-fn serve_sessions(listener: &vsock::Listener, secret: &Secret, shared: &Shared) {
+fn serve_sessions(
+    listener: &vsock::Listener,
+    secret: &Secret,
+    output: &Output,
+    shared: &Shared,
+) {
     loop {
         if stopping(shared) {
             return;
@@ -401,19 +417,39 @@ fn serve_sessions(listener: &vsock::Listener, secret: &Secret, shared: &Shared) 
         };
         let _ = stream.set_read_timeout(CONTROL_IDLE);
 
-        let (width, height) = geometry();
+        // What the module says it drives, rather than a constant: a guest
+        // whose agent wrote a mode into modprobe.d comes up on it, and a
+        // session opened after a resize starts where the last one left off.
+        let (width, height) = geometry(output, shared);
         let mut control = Control::new(secret, support_from(width, height));
-        let reason = run_session(&mut control, &mut stream, shared);
+        let reason = run_session(&mut control, &mut stream, output, shared);
 
         close_session(shared, &reason);
     }
 }
 
 /// One session, from the first record to the reason it ended.
-fn run_session(control: &mut Control, stream: &mut vsock::Stream, shared: &Shared) -> String {
+fn run_session(
+    control: &mut Control,
+    stream: &mut vsock::Stream,
+    output: &Output,
+    shared: &Shared,
+) -> String {
     loop {
         if stopping(shared) {
             return "the broker is shutting down".to_owned();
+        }
+
+        // A mode the compositor has actually committed, seen as a framebuffer
+        // of a new size. The capture process has already been told by the
+        // thread that saw it; what is owed here is the host's own record, so
+        // that a viewer knows the size it asked for is the size it has.
+        if let Some((width, height)) = take_geometry_change(shared)
+            && (width, height) != control.geometry()
+        {
+            eprintln!("vmlord-display-broker: the output came up at {width}x{height}");
+            control.set_geometry(width, height);
+            control.state(stream);
         }
 
         // A fault another thread found is reported on the one socket the host
@@ -428,6 +464,7 @@ fn run_session(control: &mut Control, stream: &mut vsock::Stream, shared: &Share
         match control.pump(stream) {
             Outcome::Opened(parameters) => open_session(shared, parameters),
             Outcome::Relay(message) => send_to_peer(shared, &message),
+            Outcome::Resize { width, height } => request_mode(output, control, stream, width, height),
             Outcome::Closed(reason) => return reason,
             Outcome::Nothing => {}
         }
@@ -511,6 +548,26 @@ fn capture_frames(mut device: Device, shared: &Shared) {
             }
         };
 
+        // The primary plane's framebuffer is the output's real size, and the
+        // only place it is read from: a mode that was asked for is not one
+        // the compositor is obliged to have committed.
+        //
+        // The peer is told here rather than by the control thread, and ahead
+        // of the snapshot that carries the first buffer of the new size: its
+        // encoder is built on a geometry, and a frame of another shape is one
+        // it has to drop.
+        if let Some(primary) = planes.iter().find(|plane| plane.kind == PlaneKind::Primary)
+            && observe_geometry(shared, primary.width, primary.height)
+        {
+            let _ = peer.send(
+                &Message::Geometry {
+                    width: primary.width,
+                    height: primary.height,
+                },
+                &[],
+            );
+        }
+
         send_snapshot(&device, &peer, shared, &planes);
     }
 }
@@ -583,12 +640,73 @@ fn send_snapshot(device: &Device, peer: &Arc<Connection>, shared: &Shared, plane
     }
 }
 
-/// The geometry the session is offered.
+/// The geometry a session opening now is offered.
 ///
-/// Fixed for now: reading the connector's current mode is the resolution task's,
-/// and this is the one geometry the module's default mode has.
-fn geometry() -> (u32, u32) {
-    (1920, 1080)
+/// What capture has seen if it has seen anything, and what the module says it
+/// drives otherwise -- which is the case for the first session of a guest,
+/// where nothing has been captured yet.
+fn geometry(output: &Output, shared: &Shared) -> (u32, u32) {
+    let (lock, _) = &**shared;
+    let seen = lock
+        .lock()
+        .expect("the broker's lock is not poisoned")
+        .geometry;
+
+    seen.unwrap_or_else(|| output.current())
+}
+
+/// Asks the module for a mode, and says so on the socket if it will not take it.
+///
+/// Nothing is reported to the host on success. A write that the module took is
+/// a hotplug, not a mode: the compositor commits one, and what it committed
+/// arrives as a framebuffer of a new size.
+fn request_mode(
+    output: &Output,
+    control: &mut Control,
+    stream: &mut vsock::Stream,
+    width: u32,
+    height: u32,
+) {
+    if let Err(error) = output.request(width, height) {
+        eprintln!(
+            "vmlord-display-broker: {} would not take {width}x{height}: {error}",
+            output.path().display()
+        );
+        control.report(
+            stream,
+            ErrorCode::ResolutionRejected,
+            "the output refused the mode",
+        );
+    }
+}
+
+/// Records the size capture last saw, and says whether it moved.
+fn observe_geometry(shared: &Shared, width: u32, height: u32) -> bool {
+    let (lock, signal) = &**shared;
+    let mut state = lock.lock().expect("the broker's lock is not poisoned");
+
+    if state.geometry == Some((width, height)) {
+        return false;
+    }
+    state.geometry = Some((width, height));
+    // For the control thread, which owes the host a `DisplayState` for it.
+    state.geometry_changed = true;
+    signal.notify_all();
+
+    true
+}
+
+/// The size capture saw, if it has moved since this was last called.
+fn take_geometry_change(shared: &Shared) -> Option<(u32, u32)> {
+    let (lock, _) = &**shared;
+    let mut state = lock.lock().expect("the broker's lock is not poisoned");
+
+    if !state.geometry_changed {
+        return None;
+    }
+    state.geometry_changed = false;
+
+    state.geometry
 }
 
 /// Records a fault for the control thread to report, and stops capture.

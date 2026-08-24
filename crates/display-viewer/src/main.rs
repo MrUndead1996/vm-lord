@@ -43,7 +43,7 @@ use std::{
 };
 
 use vmlord_display_codec::{Geometry, Rect};
-use vmlord_display_protocol::record::Channel;
+use vmlord_display_protocol::{record::Channel, v1::Mode};
 use vmlord_display_viewer::{
     input::{self, Report},
     launch::{self, Command, LaunchParameters, Link, Message},
@@ -51,13 +51,15 @@ use vmlord_display_viewer::{
     log as viewer_log,
     placement::place,
     relay::{Relay, RelayError},
+    resize::Resize,
+    state::{Quality, Store, WindowState},
     status::{self, Button, Event, Progress, Status},
     windows::{
         d3d::Renderer,
         hook::Hook,
         hvsocket::{CONNECT_TIMEOUT, ConnectError, HvSocket},
         ipc::{self, CommandServer, SingleInstance},
-        window::{Shared, UiEvent, WM_SIGNAL, Window, report},
+        window::{Shared, UiEvent, WM_SIGNAL, Window, become_dpi_aware, report},
     },
 };
 
@@ -78,6 +80,9 @@ const SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
 
 fn main() -> ExitCode {
     viewer_log::initialize();
+    // Before any window: a client rectangle in scaled units would put a small
+    // desktop on a big panel and blur it back up.
+    become_dpi_aware();
 
     let mut link = Link::new(io::stdin(), io::sink());
     let parameters = match launch::first_parameters(&mut link) {
@@ -125,12 +130,20 @@ fn run(parameters: LaunchParameters, claim: SingleInstance) -> ExitCode {
     let shared = Arc::new(Shared::new(ui_events));
     let title = format!("{} - VMLord Display", parameters.vm_name);
 
-    let window = match Window::open(
-        &title,
-        i32::try_from(parameters.width).unwrap_or(1280),
-        i32::try_from(parameters.height).unwrap_or(720),
-        Arc::clone(&shared),
-    ) {
+    // Where this VM's window was left. What VMLord offered is the fallback,
+    // because it is what the guest's module was configured with, and 1920x1080
+    // is the fallback to that.
+    let store = Store::for_vm(&parameters.vm_name);
+    let mut state = store.as_ref().map(Store::load).unwrap_or_else(|| {
+        let mut state = WindowState::default();
+        if parameters.width > 0 && parameters.height > 0 {
+            state.size = (parameters.width, parameters.height);
+        }
+
+        state
+    });
+
+    let mut window = match Window::open(&title, &state, Arc::clone(&shared)) {
         Ok(window) => window,
         Err(error) => {
             report(&format!("VMLord Display could not open a window: {error}"));
@@ -177,17 +190,31 @@ fn run(parameters: LaunchParameters, claim: SingleInstance) -> ExitCode {
         poster: window.poster(),
     });
 
-    let exit = pump(Loop {
-        window: &window,
-        renderer: &mut renderer,
-        shared: &shared,
-        vm_name: &parameters.vm_name,
-        frame: &frame,
-        signals: &signals,
-        orders: &orders_out,
-        ui: &ui,
-        commands: &commands_in,
-    });
+    let exit = pump(
+        Loop {
+            window: &mut window,
+            renderer: &mut renderer,
+            shared: &shared,
+            vm_name: &parameters.vm_name,
+            frame: &frame,
+            signals: &signals,
+            orders: &orders_out,
+            ui: &ui,
+            commands: &commands_in,
+        },
+        &mut state,
+    );
+
+    // Best effort, and last: a window position is not worth delaying a
+    // shutdown for, and losing it costs the next session nothing but a place.
+    if let Some(store) = store.as_ref()
+        && let Err(error) = store.save(&state)
+    {
+        log::warn!(
+            "this window's place could not be remembered in {}: {error}",
+            store.path().display()
+        );
+    }
 
     // Best effort, and bounded: a guest that has already gone is not worth
     // waiting on, and the VM is unaffected either way.
@@ -261,6 +288,15 @@ enum Order {
     End,
     /// One input event for the guest.
     Input(input::Event),
+    /// The window settled at a size, and the guest's output should follow.
+    Resolution {
+        /// Physical pixels of client area, never logical ones.
+        width: u32,
+        /// The same.
+        height: u32,
+    },
+    /// The user picked an encoding mode.
+    Mode(Mode),
 }
 
 /// Everything the session thread owns.
@@ -276,7 +312,7 @@ struct Session {
 
 /// Everything the main loop borrows.
 struct Loop<'a> {
-    window: &'a Window,
+    window: &'a mut Window,
     renderer: &'a mut Renderer,
     shared: &'a Arc<Shared>,
     vm_name: &'a str,
@@ -429,6 +465,8 @@ where
                 Ok(Order::Keyframe) => live.request_keyframe(),
                 Ok(Order::Retry) => return Attempt::Restart,
                 Ok(Order::Input(event)) => live.send_input(event),
+                Ok(Order::Resolution { width, height }) => live.set_resolution(width, height),
+                Ok(Order::Mode(mode)) => live.set_mode(mode),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Attempt::Stop,
             }
@@ -536,14 +574,22 @@ fn refresh(session: &Session) -> Option<Vec<u8>> {
 }
 
 /// The message pump, and everything that happens between messages.
-fn pump(mut context: Loop<'_>) -> ExitCode {
+///
+/// `state` is this VM's window as it will be remembered: the loop keeps it up
+/// to date rather than reading the window back at the end, because a window
+/// that is closing has already stopped being where it was.
+fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
     let mut progress = Progress::new(Instant::now());
     let mut closing = false;
     let mut policy = input::Policy::new();
     let mut stream: Option<Geometry> = None;
+    let mut resize = Resize::new();
     // While this lives the keyboard is the guest's. It is taken on focus and
     // given back the moment the window loses it -- or the user asks.
     let mut hook: Option<Hook> = None;
+
+    // The mode the window was left on, asked for once the session is up.
+    let mut mode_owed = true;
 
     while context.window.pump() {
         let mut worked = false;
@@ -555,7 +601,18 @@ fn pump(mut context: Loop<'_>) -> ExitCode {
                     stream = Some(*geometry);
                     reposition(&mut policy, stream, context.window);
                 }
-                Signal::Ended(_) => policy.report(Report::ChannelLost),
+                Signal::Ended(_) => {
+                    policy.report(Report::ChannelLost);
+                    // The guest that was told the window's size is not the
+                    // guest that will be listening next, so the window is
+                    // offered again rather than assumed to have been taken.
+                    // Held until the next session is running, because that is
+                    // when the request is drained.
+                    resize.forget();
+                    let (width, height) = context.window.client_size();
+                    resize.observe(width.max(0) as u32, height.max(0) as u32, Instant::now());
+                    mode_owed = true;
+                }
                 _ => {}
             }
             apply(&mut context, &mut progress, signal);
@@ -583,14 +640,44 @@ fn pump(mut context: Loop<'_>) -> ExitCode {
                     policy.report(report);
                 }
                 UiEvent::Resized(width, height) => {
-                    if let Err(error) = context
-                        .renderer
-                        .resize_swapchain(width.max(0) as u32, height.max(0) as u32)
-                    {
+                    let (width, height) = (width.max(0) as u32, height.max(0) as u32);
+                    if let Err(error) = context.renderer.resize_swapchain(width, height) {
                         log::warn!("the swapchain could not follow the window: {error}");
                     }
                     reposition(&mut policy, stream, context.window);
+                    // Held rather than sent: a drag is hundreds of these, and
+                    // each one taken at face value is a mode set in the guest.
+                    resize.observe(width, height, Instant::now());
+                    // What is remembered is the window, not the monitor a
+                    // full-screen one is covering.
+                    if !context.window.is_fullscreen() && width > 0 && height > 0 {
+                        state.size = (width, height);
+                    }
                 }
+                UiEvent::ToggleFullscreen => {
+                    let wanted = !context.window.is_fullscreen();
+                    context.window.set_fullscreen(wanted);
+                    state.fullscreen = context.window.is_fullscreen();
+                }
+                UiEvent::Quality(quality) => {
+                    state.quality = quality;
+                    context.window.check_quality(quality);
+                    let _ = context.orders.send(Order::Mode(mode_of(quality)));
+                }
+            }
+        }
+
+        // A settled window becomes one request, and only once the session is
+        // running: a `SetResolution` on a control channel that is still coming
+        // up is a record the guest has nowhere to put.
+        if progress.is_running() {
+            if mode_owed {
+                mode_owed = false;
+                let _ = context.orders.send(Order::Mode(mode_of(state.quality)));
+            }
+            if let Some((width, height)) = resize.due(Instant::now()) {
+                worked = true;
+                let _ = context.orders.send(Order::Resolution { width, height });
             }
         }
 
@@ -618,6 +705,7 @@ fn pump(mut context: Loop<'_>) -> ExitCode {
 
         // A stopped VM closes the window rather than showing a failure.
         if closing || matches!(progress.status(), Status::Gone) {
+            state.position = context.window.restored_position();
             // A hook left installed would swallow the user's keyboard with
             // nothing left to send it to.
             drop(hook);
@@ -634,8 +722,22 @@ fn pump(mut context: Loop<'_>) -> ExitCode {
     }
 
     drop(hook);
+    state.position = context.window.restored_position();
 
     ExitCode::SUCCESS
+}
+
+/// The wire mode a menu choice means.
+///
+/// `Auto` is a host-side policy, and until task #123 there is one mode to
+/// resolve it to. Sending `MODE_AUTO` rather than resolving it here is
+/// deliberate: the guest is the one that knows what it can encode, and it
+/// answers `Auto` with what it settled on.
+fn mode_of(quality: Quality) -> Mode {
+    match quality {
+        Quality::Auto => Mode::Auto,
+        Quality::Desktop => Mode::Desktop,
+    }
 }
 
 /// Tells the policy where the picture is, from the stream and the window.

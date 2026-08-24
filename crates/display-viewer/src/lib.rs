@@ -14,6 +14,8 @@ pub mod live;
 pub mod log;
 pub mod placement;
 pub mod relay;
+pub mod resize;
+pub mod state;
 pub mod status;
 pub mod video;
 

@@ -27,6 +27,7 @@
 #include <linux/ktime.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
+#include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/version.h>
 
@@ -78,13 +79,20 @@
 #define VMLORD_MAX_WIDTH  2560
 #define VMLORD_MAX_HEIGHT 1440
 
-static unsigned int width = 1920;
-static unsigned int height = 1080;
+#define VMLORD_DEFAULT_WIDTH  1920
+#define VMLORD_DEFAULT_HEIGHT 1080
+
+/*
+ * The mode this output drives. Read by get_modes on every probe, written at
+ * load through the two parameters below and afterwards through `mode`.
+ */
+static unsigned int width = VMLORD_DEFAULT_WIDTH;
+static unsigned int height = VMLORD_DEFAULT_HEIGHT;
 
 module_param(width, uint, 0444);
-MODULE_PARM_DESC(width, "width of the virtual output in pixels");
+MODULE_PARM_DESC(width, "width of the virtual output in pixels at load");
 module_param(height, uint, 0444);
-MODULE_PARM_DESC(height, "height of the virtual output in pixels");
+MODULE_PARM_DESC(height, "height of the virtual output in pixels at load");
 
 struct vmlord_device {
 	struct drm_device drm;
@@ -303,12 +311,17 @@ static u32 vmlord_millimetres(u32 pixels)
 }
 
 /*
- * The modes this output offers.
+ * The one mode this output offers.
  *
- * The standard list up to what this module will drive, plus the module's own
- * size marked preferred, so that a compositor started before anything has been
- * configured comes up at the size the host asked for and can still be resized
- * within the list.
+ * One rather than a list, and that is task #120's decision rather than an
+ * omission. The host's window is the authority on this output's size: the
+ * viewer asks for a mode, this module hotplugs the connector, and the
+ * compositor has to move because the mode it was on is no longer offered. A
+ * connector that kept the standard list would leave the compositor free to
+ * stay where it was -- a window that was resized and a desktop that was not.
+ *
+ * A guest-side resolution picker is what this costs, and the picture would
+ * disagree with the window if there were one.
  *
  * No EDID is synthesized. The two things one would buy are a physical size and
  * a monitor name; the size is a field and is set here, and the name costs a
@@ -318,26 +331,27 @@ static u32 vmlord_millimetres(u32 pixels)
 static int vmlord_connector_get_modes(struct drm_connector *connector)
 {
 	struct drm_display_mode *mode;
-	int count;
 
 	/*
 	 * Set on every probe rather than once at connector init: fill_modes is
 	 * entitled to reset display_info, and get_modes runs inside every probe.
+	 *
+	 * 96 DPI at every size is what keeps a compositor on scale 1 through a
+	 * resize: a physical size that stayed put while the mode changed would
+	 * be a monitor whose DPI moved, and mutter would answer it by scaling.
 	 */
 	connector->display_info.width_mm = vmlord_millimetres(width);
 	connector->display_info.height_mm = vmlord_millimetres(height);
 
-	count = drm_add_modes_noedid(connector, VMLORD_MAX_WIDTH,
-				     VMLORD_MAX_HEIGHT);
 	mode = drm_cvt_mode(connector->dev, width, height, 60, false, false,
 			    false);
-	if (mode) {
-		mode->type |= DRM_MODE_TYPE_PREFERRED;
-		drm_mode_probed_add(connector, mode);
-		count++;
-	}
+	if (!mode)
+		return 0;
 
-	return count;
+	mode->type |= DRM_MODE_TYPE_PREFERRED;
+	drm_mode_probed_add(connector, mode);
+
+	return 1;
 }
 
 static const struct drm_connector_helper_funcs vmlord_connector_helper_funcs = {
@@ -460,6 +474,71 @@ static int vmlord_pipe_init(struct vmlord_device *vmlord)
 					    &vmlord->encoder);
 }
 
+/* ------------------------------------------------------------ hot resize */
+
+/*
+ * The device a write to `mode` reaches, and the lock that keeps such a write
+ * from racing the probe that publishes it or the remove that takes it back.
+ */
+static struct vmlord_device *vmlord_active;
+static DEFINE_MUTEX(vmlord_active_lock);
+
+/*
+ * The host asking this output to change size, as `WxH`.
+ *
+ * What it does is re-probe the connector, not commit a mode: this module is
+ * not the DRM master and may not set one. get_modes then offers the new size
+ * and nothing else, so the compositor -- which is the master -- has no mode to
+ * stay on and commits the new one itself. That is the whole of the guest-side
+ * validation the resolution contract promises: a size outside what this module
+ * drives is refused here, and what actually came up is read back off the
+ * framebuffer rather than assumed.
+ */
+static int vmlord_set_mode(const char *value, const struct kernel_param *kp)
+{
+	struct vmlord_device *vmlord;
+	unsigned int wanted_width;
+	unsigned int wanted_height;
+
+	if (sscanf(value, "%ux%u", &wanted_width, &wanted_height) != 2)
+		return -EINVAL;
+
+	if (wanted_width < VMLORD_MIN_WIDTH || wanted_width > VMLORD_MAX_WIDTH ||
+	    wanted_height < VMLORD_MIN_HEIGHT ||
+	    wanted_height > VMLORD_MAX_HEIGHT)
+		return -ERANGE;
+
+	mutex_lock(&vmlord_active_lock);
+	if (wanted_width == width && wanted_height == height) {
+		mutex_unlock(&vmlord_active_lock);
+		return 0;
+	}
+	width = wanted_width;
+	height = wanted_height;
+	vmlord = vmlord_active;
+	mutex_unlock(&vmlord_active_lock);
+
+	/* Nothing to re-probe before the device exists: the size is enough. */
+	if (vmlord)
+		drm_kms_helper_hotplug_event(&vmlord->drm);
+
+	return 0;
+}
+
+static int vmlord_get_mode(char *buffer, const struct kernel_param *kp)
+{
+	/* The buffer a module parameter is read into is a whole page. */
+	return sprintf(buffer, "%ux%u\n", width, height);
+}
+
+static const struct kernel_param_ops vmlord_mode_ops = {
+	.set = vmlord_set_mode,
+	.get = vmlord_get_mode,
+};
+
+module_param_cb(mode, &vmlord_mode_ops, NULL, 0644);
+MODULE_PARM_DESC(mode, "WxH this output drives, writable while it runs");
+
 static int vmlord_probe(struct platform_device *pdev)
 {
 	struct vmlord_device *vmlord;
@@ -514,6 +593,10 @@ static int vmlord_probe(struct platform_device *pdev)
 	if (error)
 		return error;
 
+	mutex_lock(&vmlord_active_lock);
+	vmlord_active = vmlord;
+	mutex_unlock(&vmlord_active_lock);
+
 	drm_info(&vmlord->drm, "VMLord virtual display at %ux%u\n", width,
 		 height);
 	return 0;
@@ -522,6 +605,11 @@ static int vmlord_probe(struct platform_device *pdev)
 static void vmlord_remove(struct platform_device *pdev)
 {
 	struct vmlord_device *vmlord = platform_get_drvdata(pdev);
+
+	/* Before anything is torn down: a `mode` write must find nothing. */
+	mutex_lock(&vmlord_active_lock);
+	vmlord_active = NULL;
+	mutex_unlock(&vmlord_active_lock);
 
 	drm_dev_unplug(&vmlord->drm);
 	drm_atomic_helper_shutdown(&vmlord->drm);

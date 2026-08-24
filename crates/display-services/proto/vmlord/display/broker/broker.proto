@@ -20,6 +20,7 @@ message Envelope {
     Snapshot snapshot = 6;
     Report report = 7;
     InputDevices input_devices = 8;
+    Geometry geometry = 9;
   }
 }
 
@@ -55,6 +56,15 @@ message KeyframeRequested {}
 // datagram in that order. Sent when the broker adopts a peer, and again in
 // answer to its Attach. A broker with no input devices never sends it.
 message InputDevices {}
+
+// The output changed size and this is what it is now, read off the
+// framebuffer the compositor committed rather than off what was asked for.
+// The session process rebuilds its encoder and owes its peer a StreamConfig
+// and a keyframe.
+message Geometry {
+  uint32 width = 1;
+  uint32 height = 2;
+}
 
 // What the planes hold at one vblank.
 message Snapshot {

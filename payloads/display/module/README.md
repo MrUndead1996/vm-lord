@@ -11,13 +11,23 @@ framebuffer a compositor commits *is* the product, and VMLord's capture service
 reads it as an ordinary DRM client -- `drmModeGetFB2`, `drmPrimeHandleToFD`,
 `mmap` -- without taking DRM master.
 
-Modes run up to 2560x1440, from the standard list plus the module's own size
-marked preferred. That size comes from the `width` and `height` parameters,
+The connector offers **one** mode, between 640x480 and 2560x1440, marked
+preferred. Its size at load comes from the `width` and `height` parameters,
 which `vmlord-agent` writes into `/etc/modprobe.d/vmlord-display.conf` from the
 mode the host has stored for one VM; a size outside the bounds is refused with
 a warning and falls back to 1920x1080. There is no vblank hardware to be in
 phase with, so the timer is the output's only clock -- and without one a
 compositor is never paced.
+
+While the module runs, that size is `/sys/module/vmlord_drm/parameters/mode`,
+written as `WxH` by the display broker when the host's window is resized. A
+write validates the bounds, moves the preferred mode and hotplugs the
+connector; the compositor, which is the DRM master, is what actually commits
+the mode. Offering exactly one mode is what makes that commit certain: a
+connector that kept the standard list would leave a compositor free to stay on
+the mode it was already on, which is a window that was resized and a desktop
+that was not. What it costs is a guest-side resolution picker -- and a picture
+that disagreed with the window is what there would be if there were one.
 
 Three properties are decisions rather than style, all three measured by task
 #111 (`docs/display-drm-backend.md`):
@@ -32,6 +42,8 @@ Three properties are decisions rather than style, all three measured by task
 
 ## What it is not
 
+* **No guest-side mode list.** The host's window is the authority on this
+  output's size; see above.
 * **No synthesized EDID.** The connector reports a physical size at 96 DPI and
   no monitor name, so GNOME Settings calls it an unknown display. A hand-built
   128-byte block would fix the name and would cost a fifth version guard across

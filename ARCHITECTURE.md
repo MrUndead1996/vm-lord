@@ -2954,9 +2954,8 @@ contract, the overlay's geometry -- is safe Rust with tests that need no
 partition. Framebuffer and cursor content is never logged, and this build has no
 screenshot feature.
 
-What is deliberately not there yet: letterbox, fullscreen, dynamic resolution
-and saved window state (#120); and the HCS service entries and the Connect path
-that launches the binary (#121).
+What is deliberately not there yet: the HCS service entries and the Connect
+path that launches the binary (#121).
 
 ### Keyboard and mouse
 
@@ -3005,6 +3004,88 @@ While the hook is installed the keyboard is the guest's, `Alt+F4` included, so
 is sent a release. `Ctrl+Alt+Del` is a system-menu action rather than a
 shortcut, because the Secure Attention Sequence is routed by the kernel and no
 documented hook sees it -- and undocumented ones are out of the question.
+
+### Resizing the desktop
+
+The window is the authority on the guest's resolution. Dragging the viewer's
+edge changes the desktop inside it, rather than scaling a fixed desktop into a
+different rectangle, and the whole path exists to make that certain rather than
+likely.
+
+**The host holds a size until it stops moving.** A drag is hundreds of
+`WM_SIZE` messages and each one taken at face value would be a mode set, a
+hotplug, a compositor commit and a keyframe; `resize.rs` waits 250 ms of
+stillness before asking for one. What it sends is the *physical* client area:
+the viewer calls `SetProcessDpiAwarenessContext` with per-monitor v2 before it
+opens anything, because an unaware process is handed a virtualised rectangle --
+1707x960 on a 2560x1440 panel at 150% -- and a viewer that set the guest's mode
+from it would put a small desktop on a big screen and then blur it back up.
+
+**The guest validates and applies.** The broker rounds the request to what
+`drm_cvt_mode` builds (a width to a multiple of eight, a height to an even
+number), refuses anything outside 640x480..2560x1440 with
+`ERROR_CODE_RESOLUTION_REJECTED`, and writes what is left to
+`/sys/module/vmlord_drm/parameters/mode`. The module moves its preferred mode
+and hotplugs the connector; it cannot commit a mode, because the compositor
+holds DRM master and this is an ordinary client.
+
+That is why the connector offers **one** mode. On a hotplug a compositor
+re-derives its configuration, and a connector that still listed the mode it was
+already on leaves it free to stay there -- a window that was resized and a
+desktop that was not. With one mode there is nothing to stay on. What it costs
+is a resolution picker inside the guest, and a picture that disagreed with the
+window is what there would be if there were one.
+
+**Nothing is reported until it has happened.** A `SetResolution` is answered
+with silence. The size the session runs at is read off the primary plane's
+framebuffer by the thread that captures it, never off the mode that was asked
+for, and only when that changes does anything move: the capture process is told
+first and directly, ahead of the snapshot carrying the first buffer of the new
+size, so its encoder is rebuilt before a frame of the new shape reaches it; the
+host then gets a `DisplayState` from the control thread. A frame captured on
+the wrong side of a commit is dropped rather than encoded -- a tile grid is
+built on a geometry and cannot take another shape.
+
+**The picture never goes black or stretches.** `placement.rs` letterboxes:
+scaled to fit, whole, centred, aspect ratio kept. Nothing is cropped, because a
+desktop with a corner the user cannot reach is worse than one with bars, and
+nothing is stretched, because a desktop whose circles are ovals is worse than
+either. The renderer copies rather than samples whenever the picture is the
+size of the rectangle it goes in, which is what a settled window and a settled
+guest always are; the sampled path is the seconds in between. Across a
+`StreamConfig` the old texture is kept and drawn scaled until the new one has
+its first keyframe -- the alternative is a black window for as long as a
+compositor takes to commit a mode.
+
+**The loop is closed by construction.** The guest's answer is usually not the
+request -- 1727 asked for, 1720 applied -- so a viewer that compared the answer
+against its own window would ask again, forever. What is compared is request
+against request: a size already asked for is never asked for twice, and the
+difference between the answer and the window is exactly what the letterbox is
+for. A new session forgets, because the guest that was told is not the guest
+that is listening.
+
+**Full screen** is `F11`, borderless: a style and a rectangle, both given back
+on the way out. Exclusive would take the display for this process, and a viewer
+that owns the screen is one the user cannot leave when the guest stops
+answering. The key is swallowed in both directions by the keyboard hook -- a
+press the guest never saw must not be followed by a release it did -- which
+costs the guest its own `F11` while the viewer has focus.
+
+**What is remembered** is one small `key = value` file per VM under
+`%LOCALAPPDATA%\VMLord\display`: the restored position, the client size,
+whether it was full screen, and the quality the user picked. Not settings --
+nobody edits it and losing it costs a window position -- so a file that is
+missing, truncated or from a later version reads as the defaults, and the
+default size is 1920x1080. The size kept is the window's, never the monitor a
+full-screen one is covering, and the position is the *restored* one, so a
+window closed maximised comes back where it was before it was.
+
+**Auto and Desktop** are the two entries on the system menu, and Motion is not
+there: task #123 owns it, and a menu offering a mode the guest refuses is a
+menu that lies. `Auto` is sent as `MODE_AUTO` rather than resolved on the host
+-- the guest is what knows what it can encode, and it answers with what it
+settled on, which in this build is always Desktop.
 
 ### Desktop profile and display provisioning
 
@@ -3189,11 +3270,14 @@ capture client that mmaps a buffer cannot detile anything else).
 The cursor plane is what mutter puts the pointer on, which is why compositing
 it back is capture's job rather than a convenience. The vblank is the output's
 only clock: nothing here scans out, so a commit would otherwise complete in no
-time at all and pace nothing. Modes run up to 2560x1440 from the standard list,
-plus the configured size marked preferred, with a physical size at 96 DPI and
-no synthesized EDID -- the name a monitor would carry costs a fifth kernel
+time at all and pace nothing. The connector offers exactly **one** mode,
+between 640x480 and 2560x1440, marked preferred, with a physical size at 96 DPI
+and no synthesized EDID -- the name a monitor would carry costs a fifth kernel
 version guard and is deferred. The module declares its payload's version, which
 is what an update's verification compares against.
+
+One mode rather than a list is what makes a resize certain, and it is task
+#120's decision rather than an omission -- see *Resizing the desktop* below.
 
 ### Display: updating and rolling back
 
