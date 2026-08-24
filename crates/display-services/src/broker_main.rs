@@ -561,10 +561,12 @@ fn capture_frames(mut device: Device, shared: &Shared) {
     let mut unlit: u32 = 0;
     let mut generations = SnapshotGenerations::default();
     let mut requested_by = None;
+    let mut pacing = CapturePacing::default();
 
     loop {
         if requested_by.is_none() {
             requested_by = wait_for_request(shared);
+            pacing.requested();
         }
         let Some(request) = requested_by.as_ref() else {
             return;
@@ -576,29 +578,32 @@ fn capture_frames(mut device: Device, shared: &Shared) {
         }
         let peer = &request.peer;
 
-        if let Err(error) = device.wait_vblank() {
-            if error.kind() == ErrorKind::Interrupted {
-                continue;
-            }
-            // `EINVAL` is what the kernel answers while this output's vblank
-            // is off: no compositor has lit it yet, or the desktop has
-            // blanked. Neither is a fault -- there is simply nothing to
-            // capture this instant -- and ending the session over it would
-            // close a window that a moving mouse is about to fill.
-            if error.raw_os_error() == Some(libc::EINVAL) {
-                idle_until_the_output_is_lit(&mut unlit);
-                continue;
-            }
-            fault(shared, &format!("the output's clock failed: {error}"));
-            stop(shared);
+        if pacing.wait_before_probe() {
+            if let Err(error) = device.wait_vblank() {
+                if error.kind() == ErrorKind::Interrupted {
+                    continue;
+                }
+                // `EINVAL` is what the kernel answers while this output's vblank
+                // is off: no compositor has lit it yet, or the desktop has
+                // blanked. Neither is a fault -- there is simply nothing to
+                // capture this instant -- and ending the session over it would
+                // close a window that a moving mouse is about to fill.
+                if error.raw_os_error() == Some(libc::EINVAL) {
+                    idle_until_the_output_is_lit(&mut unlit);
+                    continue;
+                }
+                fault(shared, &format!("the output's clock failed: {error}"));
+                stop(shared);
 
-            return;
-        }
-        if unlit > 0 {
-            eprintln!(
-                "vmlord-display-broker: the output is lit again after {unlit} attempts at its clock"
-            );
-            unlit = 0;
+                return;
+            }
+            pacing.vblank_seen();
+            if unlit > 0 {
+                eprintln!(
+                    "vmlord-display-broker: the output is lit again after {unlit} attempts at its clock"
+                );
+                unlit = 0;
+            }
         }
 
         let snapshot = match device.snapshot() {
@@ -620,7 +625,13 @@ fn capture_frames(mut device: Device, shared: &Shared) {
             }
         };
 
-        if !generations.advanced(&snapshot.planes, snapshot.generation_supported) {
+        if !snapshot
+            .planes
+            .iter()
+            .any(|plane| plane.kind == PlaneKind::Primary)
+            || !generations.advanced(&snapshot.planes, snapshot.generation_supported)
+        {
+            pacing.unchanged();
             continue;
         }
 
@@ -653,6 +664,34 @@ fn capture_frames(mut device: Device, shared: &Shared) {
             generations = SnapshotGenerations::default();
         }
         requested_by = None;
+    }
+}
+
+/// Avoids adding a whole refresh interval after the session finishes a frame.
+///
+/// A fresh request first probes the coherent DRM snapshot: a commit may have
+/// arrived while the previous frame was encoded and sent. Only an unchanged
+/// probe waits for another vblank before trying again.
+#[derive(Default)]
+struct CapturePacing {
+    wait_before_probe: bool,
+}
+
+impl CapturePacing {
+    fn requested(&mut self) {
+        self.wait_before_probe = false;
+    }
+
+    fn unchanged(&mut self) {
+        self.wait_before_probe = true;
+    }
+
+    fn vblank_seen(&mut self) {
+        self.wait_before_probe = false;
+    }
+
+    fn wait_before_probe(&self) -> bool {
+        self.wait_before_probe
     }
 }
 
@@ -1057,6 +1096,20 @@ mod tests {
         let second = shared.0.lock().unwrap().session_epoch;
 
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn a_new_request_probes_before_waiting_for_another_vblank() {
+        let mut pacing = super::CapturePacing::default();
+
+        pacing.requested();
+        assert!(!pacing.wait_before_probe());
+
+        pacing.unchanged();
+        assert!(pacing.wait_before_probe());
+
+        pacing.vblank_seen();
+        assert!(!pacing.wait_before_probe());
     }
 
     #[test]
