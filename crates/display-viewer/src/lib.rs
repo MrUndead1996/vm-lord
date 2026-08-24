@@ -6,6 +6,7 @@
 //! the session states, the decode path -- and `src/windows/` is the four
 //! modules that touch Win32.
 
+pub mod clipboard;
 #[cfg(test)]
 pub(crate) mod duplex;
 pub mod fullscreen;

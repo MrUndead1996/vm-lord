@@ -24,6 +24,11 @@ prost = "0.14"
 vmlord-core = { path = "../core" }
 vmlord-display-codec = { path = "../display-codec" }
 vmlord-display-protocol = { path = "../display-protocol" }
+# The clipboard's only codec. GTK applications often offer a picture as PNG and
+# nothing else, and no Windows clipboard format holds one; a DIB does, and this
+# is what gets between them.
+png = "0.18"
+
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct2D",
@@ -37,6 +42,8 @@ windows = { workspace = true, features = [
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_System_Com",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_LibraryLoader",
