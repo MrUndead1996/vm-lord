@@ -25,7 +25,8 @@ use crate::ipc::PlaneKind;
 
 use uapi::{
     DMA_BUF_IOCTL_SYNC, DRM_CLIENT_CAP_UNIVERSAL_PLANES, DRM_FORMAT_ARGB8888,
-    DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_XRGB8888, DRM_IOCTL_GEM_CLOSE, DRM_IOCTL_MODE_GETFB2,
+    DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_XRGB8888, DRM_IOCTL_DROP_MASTER, DRM_IOCTL_GEM_CLOSE,
+    DRM_IOCTL_MODE_GETFB2,
     DRM_IOCTL_MODE_GETPLANE, DRM_IOCTL_MODE_GETPLANERESOURCES, DRM_IOCTL_MODE_GETPROPERTY,
     DRM_IOCTL_MODE_OBJ_GETPROPERTIES, DRM_IOCTL_PRIME_HANDLE_TO_FD, DRM_IOCTL_SET_CLIENT_CAP,
     DRM_IOCTL_WAIT_VBLANK, DRM_MODE_OBJECT_PLANE, DRM_VBLANK_RELATIVE, DmaBufSync, DrmGemClose,
@@ -138,13 +139,33 @@ impl Device {
 
         let path = crate::unix::c_string(&dev_root.join(card))?;
         // SAFETY: `path` is a NUL-terminated path that lives across the call.
-        // No master is taken and none is asked for: the compositor holds it.
         let raw = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         if raw < 0 {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: `open` returned a descriptor this process now owns.
         let descriptor = unsafe { OwnedFd::from_raw_fd(raw) };
+
+        // The kernel makes the first client to open a primary node its master,
+        // asked for or not, and this broker starts at boot -- before any
+        // compositor. Holding it would answer the compositor's `SET_MASTER`
+        // with `EBUSY`, and the desktop would light some other card instead.
+        // Nothing here needs it: reading planes and waiting for the clock are
+        // an ordinary client's business.
+        //
+        // SAFETY: `descriptor` is an owned descriptor for a DRM primary node,
+        // and `DROP_MASTER` takes no argument -- the null pointer is what the
+        // ABI expects for an `_IO` request.
+        let dropped = unsafe { libc::ioctl(descriptor.as_raw_fd(), DRM_IOCTL_DROP_MASTER as _, 0) };
+        if dropped < 0 {
+            // `EINVAL` is the answer when this process was not master, which is
+            // the ordinary case for a broker that restarted while the desktop
+            // was up. Anything else is worth a line and is still not fatal.
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EINVAL) {
+                eprintln!("vmlord-display-broker: could not drop DRM master: {error}");
+            }
+        }
 
         let mut capability = DrmSetClientCap {
             capability: DRM_CLIENT_CAP_UNIVERSAL_PLANES,
@@ -466,10 +487,11 @@ mod tests {
     use super::{
         card_named,
         uapi::{
-            DRM_IOCTL_GEM_CLOSE, DRM_IOCTL_MODE_GETFB2, DRM_IOCTL_MODE_OBJ_GETPROPERTIES,
-            DRM_IOCTL_PRIME_HANDLE_TO_FD, DRM_IOCTL_SET_CLIENT_CAP, DRM_IOCTL_WAIT_VBLANK,
-            DmaBufSync, DrmGemClose, DrmModeFbCmd2, DrmModeGetPlane, DrmModeObjGetProperties,
-            DrmPrimeHandle, DrmSetClientCap, DrmWaitVblank, io_write, io_write_read,
+            DRM_IOCTL_DROP_MASTER, DRM_IOCTL_GEM_CLOSE, DRM_IOCTL_MODE_GETFB2,
+            DRM_IOCTL_MODE_OBJ_GETPROPERTIES, DRM_IOCTL_PRIME_HANDLE_TO_FD,
+            DRM_IOCTL_SET_CLIENT_CAP, DRM_IOCTL_WAIT_VBLANK, DmaBufSync, DrmGemClose,
+            DrmModeFbCmd2, DrmModeGetPlane, DrmModeObjGetProperties, DrmPrimeHandle,
+            DrmSetClientCap, DrmWaitVblank, io_none, io_write, io_write_read,
         },
     };
 
@@ -488,6 +510,7 @@ mod tests {
         // why, so these are spelled out rather than trusted.
         assert_eq!(io_write(0x64, 0x09, 8), 0x4008_6409);
         assert_eq!(io_write_read(0x64, 0x2d, 12), 0xc00c_642d);
+        assert_eq!(io_none(0x64, 0x1f), 0x0000_641f);
 
         assert_eq!(DRM_IOCTL_GEM_CLOSE, 0x4008_6409);
         assert_eq!(DRM_IOCTL_SET_CLIENT_CAP, 0x4010_640d);
@@ -495,6 +518,10 @@ mod tests {
         assert_eq!(DRM_IOCTL_WAIT_VBLANK, 0xc018_643a);
         assert_eq!(DRM_IOCTL_MODE_OBJ_GETPROPERTIES, 0xc020_64b9);
         assert_eq!(DRM_IOCTL_MODE_GETFB2, 0xc068_64ce);
+        // `_IO('d', 0x1f)`: no size and no direction. Encoded as `_IOW` it
+        // would be a request the kernel has never heard of, and the master
+        // this process holds would stay held.
+        assert_eq!(DRM_IOCTL_DROP_MASTER, 0x0000_641f);
     }
 
     #[test]

@@ -18,6 +18,12 @@ pub const fn io_write_read(kind: u32, number: u32, size: u32) -> libc::c_ulong {
     ((3 << 30) | (size << 16) | (kind << 8) | number) as libc::c_ulong
 }
 
+/// `_IOC(_IOC_NONE, ..)`, the encoding `_IO` builds: no argument, no size.
+#[must_use]
+pub const fn io_none(kind: u32, number: u32) -> libc::c_ulong {
+    ((kind << 8) | number) as libc::c_ulong
+}
+
 /// The `'d'` every DRM request is built on.
 const DRM: u32 = 0x64;
 
@@ -34,6 +40,14 @@ pub const DRM_IOCTL_SET_CLIENT_CAP: libc::c_ulong =
 /// Exports a GEM handle as a dma-buf descriptor.
 pub const DRM_IOCTL_PRIME_HANDLE_TO_FD: libc::c_ulong =
     io_write_read(DRM, 0x2d, size_of::<DrmPrimeHandle>() as u32);
+
+/// Gives up the mastership the kernel hands the first client to open a card.
+///
+/// Not an optional courtesy. A primary node's first opener becomes its master
+/// whether it asked or not, and the compositor's `SET_MASTER` then fails with
+/// `EBUSY` -- which is a guest whose desktop never lights this output. The
+/// broker starts at boot and is regularly that first opener.
+pub const DRM_IOCTL_DROP_MASTER: libc::c_ulong = io_none(DRM, 0x1f);
 
 /// Waits for the output's clock, which for task #114's module is an hrtimer.
 pub const DRM_IOCTL_WAIT_VBLANK: libc::c_ulong =
