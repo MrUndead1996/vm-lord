@@ -245,13 +245,19 @@ fn serve(options: &Options) -> io::Result<()> {
         serve_sessions(&control, &secret, &output, &shared);
 
         // Nothing above returns while the broker is healthy, so reaching here
-        // means the control listener failed and the others are owed the news.
+        // means a thread has stopped and the others are owed the news.
         stop(&shared);
         let _ = ipc.join();
         let _ = capture.join();
     });
 
-    Ok(())
+    // A fault is why this broker is no longer able to show anything, and
+    // exiting with it is what asks systemd for a fresh one. Returning success
+    // here would leave `Restart=on-failure` with nothing to act on.
+    match take_fault(&shared) {
+        Some(reason) => Err(io::Error::other(reason)),
+        None => Ok(()),
+    }
 }
 
 /// Names the step an error came from.
@@ -568,6 +574,7 @@ fn capture_frames(mut device: Device, shared: &Shared) {
                 continue;
             }
             fault(shared, &format!("the output's clock failed: {error}"));
+            stop(shared);
 
             return;
         }
@@ -585,6 +592,13 @@ fn capture_frames(mut device: Device, shared: &Shared) {
                     shared,
                     &format!("reading the output's planes failed: {error}"),
                 );
+                // And the whole broker with it. A capture thread that has
+                // returned leaves a process that still answers on the control
+                // port and can never fill a session again: every Connect after
+                // it opens a window that stays black. Ending here hands the
+                // restart to systemd, which is what `Restart=on-failure` and
+                // the crash-loop budget beside it are for.
+                stop(shared);
 
                 return;
             }
