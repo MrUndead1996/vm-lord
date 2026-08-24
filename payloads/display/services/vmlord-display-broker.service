@@ -13,9 +13,11 @@ Restart=on-failure
 RestartSec=2
 StartLimitIntervalSec=60
 StartLimitBurst=5
-# GETFB2 will not hand a framebuffer's handles to anything less. Everything else
-# root could do is taken away.
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+# GETFB2 will not hand a framebuffer's handles to anything less than
+# CAP_SYS_ADMIN, and the socket this process binds is handed to the service
+# user by group -- which is CAP_CHOWN, because root belongs to no such group.
+# Everything else root could do is taken away.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_CHOWN
 NoNewPrivileges=yes
 ProtectHome=yes
 # `strict` leaves /dev, /proc and /sys writable, which this unit needs: the

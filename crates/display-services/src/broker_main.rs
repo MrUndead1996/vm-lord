@@ -194,18 +194,30 @@ pub fn run(options: Options) -> std::process::ExitCode {
 
 /// The body of [`run`], so that every failure is one `?` away from a log line.
 fn serve(options: &Options) -> io::Result<()> {
-    let secret = read_secret(&options.secret_path)?;
+    let secret = at("reading the VM's secret", read_secret(&options.secret_path))?;
 
-    let device = wait_for_device(options.device_deadline, || {
-        Device::find(&options.driver, &options.sysfs_class, &options.dev_root)
-    })?;
+    let device = at(
+        "waiting for the display device",
+        wait_for_device(options.device_deadline, || {
+            Device::find(&options.driver, &options.sysfs_class, &options.dev_root)
+        }),
+    )?;
 
-    let (uid, gid) = service_account(&options.user)?;
+    let (uid, gid) = at("looking up the service account", service_account(&options.user))?;
     if let Some(directory) = options.socket.parent() {
-        std::fs::create_dir_all(directory)?;
+        at(
+            "creating the socket's directory",
+            std::fs::create_dir_all(directory),
+        )?;
     }
-    let listener = Listener::bind(&options.socket, gid)?;
-    let control = vsock::Listener::bind(CONTROL_PORT)?;
+    let listener = at(
+        "binding the socket to the session process",
+        Listener::bind(&options.socket, gid),
+    )?;
+    let control = at(
+        "binding the control service",
+        vsock::Listener::bind(CONTROL_PORT),
+    )?;
 
     let shared: Shared = Arc::new((Mutex::new(BrokerState::default()), Condvar::new()));
     let output = Output::new(&options.mode);
@@ -240,6 +252,16 @@ fn serve(options: &Options) -> io::Result<()> {
     });
 
     Ok(())
+}
+
+/// Names the step an error came from.
+///
+/// Every failure in `serve` is one `?` from the single line this unit writes
+/// before it exits, and a bare `Operation not permitted` there names neither
+/// the call that was refused nor the privilege it wanted. The step is what
+/// turns that line into a diagnosis.
+fn at<T>(step: &'static str, outcome: io::Result<T>) -> io::Result<T> {
+    outcome.map_err(|error| io::Error::new(error.kind(), format!("{step}: {error}")))
 }
 
 /// The two input devices, or nothing at all.
@@ -759,6 +781,25 @@ mod tests {
         include_str!("../../../payloads/display/services/vmlord-display-broker.service");
 
     #[test]
+    fn a_startup_failure_names_the_step_it_failed_at() {
+        let refused = super::at(
+            "binding the socket to the session process",
+            Err::<(), _>(io::Error::from(io::ErrorKind::PermissionDenied)),
+        )
+        .expect_err("what was passed in");
+
+        assert!(
+            refused.to_string().contains("binding the socket"),
+            "a bare `Operation not permitted` names neither the call nor the privilege"
+        );
+        assert_eq!(
+            refused.kind(),
+            io::ErrorKind::PermissionDenied,
+            "the kind survives, because a caller may still branch on it"
+        );
+    }
+
+    #[test]
     fn the_unit_creates_the_directory_the_socket_lives_in() {
         // systemd sets up the mount namespace before ExecStart, so a directory
         // named there has to exist before this process could create it -- and
@@ -779,6 +820,22 @@ mod tests {
         assert!(
             !BROKER_UNIT.contains(&format!("ReadWritePaths=/run/{directory}")),
             "a ReadWritePaths on a directory nothing creates is what fails at NAMESPACE;              RuntimeDirectory already makes it writable"
+        );
+    }
+
+    #[test]
+    fn the_unit_grants_the_capability_the_socket_is_handed_over_with() {
+        // The socket is bound by root and read by the service user, so `bind`
+        // gives it that user's group -- and changing a file's group to one the
+        // caller does not belong to is `CAP_CHOWN`, which root does not have
+        // once the bounding set has taken it away. Without it the broker exits
+        // with EPERM before it has listened for anything.
+        assert!(
+            BROKER_UNIT
+                .lines()
+                .find(|line| line.starts_with("CapabilityBoundingSet="))
+                .is_some_and(|line| line.contains("CAP_CHOWN")),
+            "the broker chowns its socket, so the bounding set has to allow it"
         );
     }
 
