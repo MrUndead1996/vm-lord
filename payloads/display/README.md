@@ -38,10 +38,12 @@ prepared/payload.json     written by `pack`, not by the build
 prepared/sources.json     this repository at the commit that was built
 prepared/licenses/        GPL-2.0, the module's licence
 prepared/content/drm/     dkms.conf, Kbuild, the sources, modprobe.d, the unit
-prepared/content/services/  the two guest programs and their units:
+prepared/content/services/  the three guest programs and their units:
                             vmlord-display-broker, vmlord-display-session,
+                            vmlord-display-clipboard,
                             vmlord-display-broker.service,
-                            vmlord-display-session.service
+                            vmlord-display-session.service,
+                            vmlord-display-clipboard.service (a user unit)
 ```
 
 The services are built by the host toolchain rather than in the image. A static

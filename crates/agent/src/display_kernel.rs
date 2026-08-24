@@ -57,15 +57,25 @@ const DRM_DEVICES: &str = "/sys/class/drm";
 const SERVICES_INSTALL: &str = "/usr/local/lib/vmlord";
 /// Where their units go.
 const SYSTEMD_UNITS: &str = "/etc/systemd/system";
+/// Where a user unit goes, for whichever session starts next.
+const SYSTEMD_USER_UNITS: &str = "/etc/systemd/user";
 /// The account the unprivileged half runs as.
 const SERVICE_USER: &str = "vmlord-display";
-/// The two programs, in the order they are started.
-const SERVICE_BINARIES: [&str; 2] = ["vmlord-display-broker", "vmlord-display-session"];
-/// Their units, which are the binaries' names with a suffix.
-const SERVICE_UNITS: [&str; 2] = [
+/// The three programs, in the order they are started.
+const SERVICE_BINARIES: [&str; 3] = [
+    "vmlord-display-broker",
+    "vmlord-display-session",
+    "vmlord-display-clipboard",
+];
+/// The units systemd starts at boot, which are those binaries' names with a
+/// suffix.
+const SYSTEM_UNITS: [&str; 2] = [
     "vmlord-display-broker.service",
     "vmlord-display-session.service",
 ];
+/// The unit that starts inside a user's graphical session instead, because a
+/// selection exists only there.
+const USER_UNITS: [&str; 1] = ["vmlord-display-clipboard.service"];
 /// The socket the two halves meet on, which is how "started" is confirmed.
 const BROKER_SOCKET: &str = "/run/vmlord/display-broker.sock";
 const MODULE_VERSION: &str = "/sys/module/vmlord_drm/version";
@@ -711,7 +721,7 @@ fn verify_services() -> Result<(), String> {
             "the display services in {SERVICES_INSTALL} are not the ones this payload carries"
         ));
     }
-    for unit in SERVICE_UNITS {
+    for unit in SYSTEM_UNITS {
         if !unit_is_active(unit) {
             return Err(format!("{unit} is not running after the update"));
         }
@@ -783,10 +793,17 @@ fn install_services(report: &mut Report, services: &Path, installed: &Path) -> R
     for binary in SERVICE_BINARIES {
         install_file(&services.join(binary), &installed.join(binary), 0o755)?;
     }
-    for unit in SERVICE_UNITS {
+    for unit in SYSTEM_UNITS {
         install_file(
             &services.join(unit),
             &Path::new(SYSTEMD_UNITS).join(unit),
+            0o644,
+        )?;
+    }
+    for unit in USER_UNITS {
+        install_file(
+            &services.join(unit),
+            &Path::new(SYSTEMD_USER_UNITS).join(unit),
             0o644,
         )?;
     }
@@ -795,10 +812,28 @@ fn install_services(report: &mut Report, services: &Path, installed: &Path) -> R
     if !reloaded.succeeded() {
         return Err(failure("systemctl daemon-reload", &reloaded));
     }
-    for unit in SERVICE_UNITS {
+    for unit in SYSTEM_UNITS {
         let enabled = command::run("systemctl", &["enable", unit], &[], SHORT_BUDGET);
         if !enabled.succeeded() {
             return Err(failure(&format!("systemctl enable {unit}"), &enabled));
+        }
+    }
+    // `--global` rather than `--user`: this recipe runs as root and outside any
+    // session, and the unit has to be wanted by whichever session starts next.
+    // Enabling it per user would mean knowing a name that is not decided until
+    // somebody logs in.
+    for unit in USER_UNITS {
+        let enabled = command::run(
+            "systemctl",
+            &["--global", "enable", unit],
+            &[],
+            SHORT_BUDGET,
+        );
+        if !enabled.succeeded() {
+            return Err(failure(
+                &format!("systemctl --global enable {unit}"),
+                &enabled,
+            ));
         }
     }
 
@@ -815,7 +850,11 @@ fn install_services(report: &mut Report, services: &Path, installed: &Path) -> R
 
 /// Restarts both units and waits until they are actually up.
 fn start_services(report: &mut Report) -> Result<(), String> {
-    for unit in SERVICE_UNITS {
+    // The user unit is not restarted and not waited for: it starts with a
+    // graphical session, and this recipe runs as root while there may be no
+    // session at all. A guest with nobody logged in has no clipboard yet, which
+    // is not a failure of the installation.
+    for unit in SYSTEM_UNITS {
         let restarted = command::run("systemctl", &["restart", unit], &[], SHORT_BUDGET);
         if !restarted.succeeded() {
             return Err(failure(&format!("systemctl restart {unit}"), &restarted));
@@ -826,7 +865,7 @@ fn start_services(report: &mut Report) -> Result<(), String> {
     // halves have met. What proves they have is the socket between them.
     let deadline = std::time::Instant::now() + SHORT_BUDGET;
     loop {
-        if SERVICE_UNITS.iter().all(|unit| unit_is_active(unit))
+        if SYSTEM_UNITS.iter().all(|unit| unit_is_active(unit))
             && Path::new(BROKER_SOCKET).exists()
         {
             report.ok(
@@ -1068,6 +1107,18 @@ mod tests {
             super::UDEV_RULES.contains("/62-"),
             "the file has to sort after 61-mutter.rules, whose tag it adds to"
         );
+    }
+
+    #[test]
+    fn the_payload_carries_three_programs_and_one_of_them_is_a_user_unit() {
+        assert_eq!(super::SERVICE_BINARIES.len(), 3);
+        assert!(
+            super::SERVICE_BINARIES.contains(&"vmlord-display-clipboard"),
+            "the clipboard daemon ships with the other two"
+        );
+        assert_eq!(super::SYSTEM_UNITS.len(), 2);
+        assert_eq!(super::USER_UNITS, ["vmlord-display-clipboard.service"]);
+        assert_eq!(super::SYSTEMD_USER_UNITS, "/etc/systemd/user");
     }
 
     #[test]
