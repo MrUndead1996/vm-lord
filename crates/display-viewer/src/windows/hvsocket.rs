@@ -54,10 +54,11 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long an ordinary read waits for a quiet socket.
 ///
 /// The session loop checks control before frames. Waiting here would therefore
-/// delay every frame by the quiet control channel's timeout. The sockets are
-/// non-blocking, and the few operations that genuinely await a reply own their
-/// deadline and retry loop, so an ordinary read only probes readiness.
-pub const READ_POLL: Duration = Duration::ZERO;
+/// delay every frame by the quiet control channel's timeout. A small non-zero
+/// bound is still required: a stream record can arrive across more than one
+/// `recv`, and `WouldBlock` in the middle of it means "not all bytes yet", not
+/// a broken channel.
+pub const READ_POLL: Duration = Duration::from_millis(5);
 
 /// The service GUID a Linux guest's vsock `port` arrives on.
 ///
@@ -356,8 +357,9 @@ mod tests {
     };
 
     #[test]
-    fn ordinary_reads_never_wait_for_a_quiet_socket() {
-        assert_eq!(READ_POLL, Duration::ZERO);
+    fn ordinary_reads_never_stall_a_frame_for_a_refresh_interval() {
+        assert!(READ_POLL <= Duration::from_millis(5));
+        assert!(!READ_POLL.is_zero());
     }
 
     #[test]
