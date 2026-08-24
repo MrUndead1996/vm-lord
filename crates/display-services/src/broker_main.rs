@@ -840,6 +840,30 @@ mod tests {
     }
 
     #[test]
+    fn the_crash_loop_budget_is_where_systemd_reads_it() {
+        // Under [Service] systemd answers these with `Unknown key ...,
+        // ignoring`: a rate limit that is silently not one, and a unit that
+        // restarts forever on a fault nobody is told about.
+        const SESSION_UNIT: &str =
+            include_str!("../../../payloads/display/services/vmlord-display-session.service");
+
+        for unit in [BROKER_UNIT, SESSION_UNIT] {
+            // Split on the section header itself: a comment may well mention
+            // the name of the section it is warning about.
+            let service = unit
+                .split_once("\n[Service]\n")
+                .expect("every unit has a service section")
+                .1;
+
+            assert!(unit.contains("StartLimitIntervalSec="));
+            assert!(
+                !service.contains("StartLimit"),
+                "the crash-loop budget belongs to [Unit]"
+            );
+        }
+    }
+
+    #[test]
     fn a_broker_restart_does_not_take_the_directory_from_the_session() {
         // The capture process holds a namespace over the same directory and
         // reconnects through the same path. A runtime directory removed on
