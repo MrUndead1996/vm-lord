@@ -694,9 +694,7 @@ fn send_snapshot(device: &Device, peer: &Arc<Connection>, shared: &Shared, plane
             y: plane.y,
         });
 
-        // A descriptor costs a syscall and a slot in the peer's table, so each
-        // buffer crosses once and is named by its id thereafter.
-        if state.sent.contains(&plane.fb_id) {
+        if !owes_descriptor(plane, &state.sent) {
             continue;
         }
         let Some(buffer) = device.buffer(plane.fb_id) else {
@@ -714,6 +712,20 @@ fn send_snapshot(device: &Device, peer: &Arc<Connection>, shared: &Shared, plane
     if peer.send(&message, &descriptors).is_ok() {
         state.sent.extend(new_buffers.iter().map(|id| *id as u32));
     }
+}
+
+/// Whether this plane's buffer has to cross to the peer now.
+///
+/// A descriptor costs a syscall and a slot in the peer's table, so each buffer
+/// crosses once and is named by its framebuffer id thereafter. The kernel
+/// hands those ids out again, though: a framebuffer that is destroyed leaves
+/// its number for the next one, and the peer would go on reading the buffer
+/// that number used to mean. Task #121 watched a login do exactly that -- the
+/// greeter's cursor gave its id to the new session's desktop, and the picture
+/// froze on the last frame the greeter drew. So a plane whose buffer is not
+/// the one that id named before is sent again, whatever the peer holds.
+fn owes_descriptor(plane: &PlaneState, sent: &HashSet<u32>) -> bool {
+    plane.fresh || !sent.contains(&plane.fb_id)
 }
 
 /// The geometry a session opening now is offered.
@@ -833,6 +845,44 @@ mod tests {
     /// The unit that ships in the payload, as the guest will read it.
     const BROKER_UNIT: &str =
         include_str!("../../../payloads/display/services/vmlord-display-broker.service");
+
+    /// A plane over a framebuffer id, with everything else out of the way.
+    fn plane(fb_id: u32, fresh: bool) -> super::PlaneState {
+        super::PlaneState {
+            kind: crate::ipc::PlaneKind::Primary,
+            fb_id,
+            width: 1920,
+            height: 1080,
+            stride: 1920 * 4,
+            format: 0,
+            x: 0,
+            y: 0,
+            fresh,
+        }
+    }
+
+    #[test]
+    fn a_framebuffer_id_that_now_names_another_buffer_is_sent_again() {
+        // The kernel hands framebuffer ids out again. A login does it: the
+        // greeter's cursor is destroyed and the new session's desktop takes
+        // its number. A peer told once and never again goes on reading the
+        // cursor -- which is what froze the picture on the last frame the
+        // greeter drew.
+        let sent = std::collections::HashSet::from([7]);
+
+        assert!(
+            super::owes_descriptor(&plane(7, true), &sent),
+            "the id is the same and the buffer is not, so the peer holds the wrong one"
+        );
+        assert!(
+            !super::owes_descriptor(&plane(7, false), &sent),
+            "the same buffer under the same id crosses once"
+        );
+        assert!(
+            super::owes_descriptor(&plane(9, false), &sent),
+            "a buffer the peer has never been sent has to cross"
+        );
+    }
 
     #[test]
     fn a_startup_failure_names_the_step_it_failed_at() {
