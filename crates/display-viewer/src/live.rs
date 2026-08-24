@@ -123,6 +123,7 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
             .map_err(|_| "the hand-over's session id is not sixteen bytes".to_owned())?;
         let frame_key = channel_key(&handover.frame_key, "frame")?;
         let input_key = channel_key(&handover.input_key, "input")?;
+        let clipboard_key = channel_key(&handover.clipboard_key, "clipboard")?;
 
         let negotiated = Negotiated {
             version: ProtocolVersion {
@@ -156,6 +157,7 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
                 negotiated,
                 frame_key,
                 input_key,
+                clipboard_key,
                 control_sequence: handover.control_sequence,
             }),
             control,
@@ -350,7 +352,11 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
         match channel {
             Channel::Frame => self.frame = Some(socket),
             Channel::Input => self.input = Some(socket),
-            Channel::Control => unreachable!("control is not bound"),
+            // Neither is this session's to bind: control established it, and
+            // the clipboard is bound by the thread that owns that socket.
+            Channel::Control | Channel::Clipboard => {
+                unreachable!("this session binds frame and input only")
+            }
         }
 
         Ok(())
@@ -528,6 +534,7 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
             Channel::Frame => self.frame.as_ref(),
             Channel::Input => self.input.as_ref(),
             Channel::Control => Some(&self.control),
+            Channel::Clipboard => None,
         }
     }
 
@@ -646,12 +653,14 @@ mod tests {
     const SESSION_ID: [u8; 16] = [7; 16];
     const FRAME_KEY: [u8; 32] = [1; 32];
     const INPUT_KEY: [u8; 32] = [2; 32];
+    const CLIPBOARD_KEY: [u8; 32] = [3; 32];
 
     fn handover() -> Handover {
         Handover {
             session_id: SESSION_ID.to_vec(),
             frame_key: FRAME_KEY.to_vec(),
             input_key: INPUT_KEY.to_vec(),
+            clipboard_key: CLIPBOARD_KEY.to_vec(),
             version_major: 1,
             version_minor: 0,
             capabilities: vec![1],

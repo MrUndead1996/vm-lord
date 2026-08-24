@@ -427,7 +427,11 @@ fn attempt(session: &Session, hello: &[u8]) -> Attempt {
         let port = match channel {
             Channel::Frame => frame_port,
             Channel::Input => input_port,
-            Channel::Control => return Err("control is not rebound".to_owned()),
+            // Control established the session and is not rebound; the
+            // clipboard is connected by the thread that owns that socket.
+            Channel::Control | Channel::Clipboard => {
+                return Err(format!("the {channel} channel is not this session's to open"));
+            }
         };
 
         HvSocket::connect(&runtime_id, port, CONNECT_TIMEOUT).map_err(|error| error.to_string())

@@ -25,7 +25,8 @@ use vmlord_display_protocol::{
 use vmlord_display_viewer::launch::{Handover, LaunchParameters, Message};
 
 use crate::hvsocket::{
-    DISPLAY_CONTROL_VSOCK_PORT, DISPLAY_FRAME_VSOCK_PORT, DISPLAY_INPUT_VSOCK_PORT,
+    DISPLAY_CLIPBOARD_VSOCK_PORT, DISPLAY_CONTROL_VSOCK_PORT, DISPLAY_FRAME_VSOCK_PORT,
+    DISPLAY_INPUT_VSOCK_PORT,
 };
 
 /// The width a VM with no stored mode is offered.
@@ -102,7 +103,11 @@ impl Driver {
     ) -> (Self, LaunchParameters) {
         let offer = Offer {
             // What the guest announces and what this viewer implements.
-            capabilities: vec![Capability::CursorStream, Capability::DynamicResolution],
+            capabilities: vec![
+                Capability::CursorStream,
+                Capability::DynamicResolution,
+                Capability::Clipboard,
+            ],
             // A host-side policy that resolves to `Desktop` until a motion
             // codec exists. The guest is what resolves it.
             mode: Mode::Auto,
@@ -121,6 +126,7 @@ impl Driver {
             control_port: DISPLAY_CONTROL_VSOCK_PORT,
             frame_port: DISPLAY_FRAME_VSOCK_PORT,
             input_port: DISPLAY_INPUT_VSOCK_PORT,
+            clipboard_port: DISPLAY_CLIPBOARD_VSOCK_PORT,
             width: offer.width,
             height: offer.height,
             tile_size: offer.tile_size,
@@ -251,11 +257,15 @@ impl Driver {
         let input = session
             .derive_channel_key(Channel::Input)
             .ok_or_else(|| missing("input key"))?;
+        let clipboard = session
+            .derive_channel_key(Channel::Clipboard)
+            .ok_or_else(|| missing("clipboard key"))?;
 
         Ok(Handover {
             session_id: session.session_id().to_vec(),
             frame_key: frame.to_bytes().to_vec(),
             input_key: input.to_bytes().to_vec(),
+            clipboard_key: clipboard.to_bytes().to_vec(),
             version_major: negotiated.version.major,
             version_minor: negotiated.version.minor,
             capabilities: negotiated
@@ -346,7 +356,11 @@ mod tests {
     /// What the MVP guest announces.
     fn support() -> Support {
         Support {
-            capabilities: vec![Capability::CursorStream, Capability::DynamicResolution],
+            capabilities: vec![
+                Capability::CursorStream,
+                Capability::DynamicResolution,
+                Capability::Clipboard,
+            ],
             modes: vec![Mode::Desktop],
             tile_sizes: vec![16, 32, 64],
             width: 1920,
@@ -416,6 +430,11 @@ mod tests {
         assert_eq!(handover.session_id.len(), 16);
         assert_eq!(handover.frame_key.len(), 32);
         assert_eq!(handover.input_key.len(), 32);
+        assert_eq!(handover.clipboard_key.len(), 32);
+        assert_ne!(
+            handover.clipboard_key, handover.frame_key,
+            "one channel's key never opens another's socket"
+        );
         assert_eq!((handover.width, handover.height), (1920, 1080));
         assert_eq!(
             handover.mode,
@@ -438,6 +457,7 @@ mod tests {
         assert_eq!(parameters.control_port, 0x564D_4C44);
         assert_eq!(parameters.frame_port, 0x564D_4C46);
         assert_eq!(parameters.input_port, 0x564D_4C49);
+        assert_eq!(parameters.clipboard_port, 0x564D_4C43);
         assert_eq!(parameters.token.len(), 32);
     }
 

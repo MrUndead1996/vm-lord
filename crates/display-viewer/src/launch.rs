@@ -71,6 +71,8 @@ pub struct LaunchParameters {
     pub frame_port: u32,
     /// The vsock port the input service listens on.
     pub input_port: u32,
+    /// The vsock port the clipboard service listens on.
+    pub clipboard_port: u32,
     /// The width VMLord offered, for the window before the handshake settles.
     pub width: u32,
     /// The height VMLord offered.
@@ -111,6 +113,8 @@ pub struct Handover {
     pub tile_size: u32,
     /// The sequence the host's control channel carries on from.
     pub control_sequence: u32,
+    /// The key the clipboard socket proves itself with.
+    pub clipboard_key: Vec<u8>,
 }
 
 /// Turns a message into the bytes an envelope carries, without the prefix.
@@ -123,6 +127,7 @@ pub fn encode(message: &Message) -> Vec<u8> {
             control_port: parameters.control_port,
             frame_port: parameters.frame_port,
             input_port: parameters.input_port,
+            clipboard_port: parameters.clipboard_port,
             width: parameters.width,
             height: parameters.height,
             tile_size: parameters.tile_size,
@@ -139,6 +144,7 @@ pub fn encode(message: &Message) -> Vec<u8> {
             session_id: handover.session_id.clone(),
             frame_key: handover.frame_key.clone(),
             input_key: handover.input_key.clone(),
+            clipboard_key: handover.clipboard_key.clone(),
             version_major: handover.version_major,
             version_minor: handover.version_minor,
             capabilities: handover.capabilities.clone(),
@@ -196,6 +202,7 @@ pub fn decode(bytes: &[u8]) -> Result<Message, LaunchError> {
             control_port: parameters.control_port,
             frame_port: parameters.frame_port,
             input_port: parameters.input_port,
+            clipboard_port: parameters.clipboard_port,
             width: parameters.width,
             height: parameters.height,
             tile_size: parameters.tile_size,
@@ -208,6 +215,7 @@ pub fn decode(bytes: &[u8]) -> Result<Message, LaunchError> {
             session_id: handover.session_id,
             frame_key: handover.frame_key,
             input_key: handover.input_key,
+            clipboard_key: handover.clipboard_key,
             version_major: handover.version_major,
             version_minor: handover.version_minor,
             capabilities: handover.capabilities,
@@ -427,6 +435,7 @@ mod tests {
             control_port: 0x564D_4C44,
             frame_port: 0x564D_4C46,
             input_port: 0x564D_4C49,
+            clipboard_port: 0x564D_4C43,
             width: 1920,
             height: 1080,
             tile_size: 32,
@@ -440,6 +449,7 @@ mod tests {
             session_id: vec![3; 16],
             frame_key: vec![4; 32],
             input_key: vec![5; 32],
+            clipboard_key: vec![6; 32],
             version_major: 1,
             version_minor: 0,
             capabilities: vec![1],
