@@ -21,6 +21,7 @@ mod cycle;
 mod delete;
 mod dhcp;
 mod display_exports;
+mod display_launches;
 mod display_prepare;
 mod display_runs;
 mod display_session;
