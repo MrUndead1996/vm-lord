@@ -659,6 +659,7 @@ impl HcsVmRepository {
 
         self.display_launches.start(LaunchRequest {
             vm_name: name,
+            vm_id: mapping.vm_id,
             secret,
             runtime_id,
             mode: mapping.display_mode,
@@ -1384,6 +1385,10 @@ impl VmRepository for HcsVmRepository {
         self.agent_sessions.cancel(mapping.vm_id);
         self.gpu_runs.forget(mapping.vm_id);
         self.display_runs.forget(mapping.vm_id);
+        // Nothing is left behind the display window either, and the `Exited`
+        // event that says so is worth neither the wait nor the assumption that
+        // it will arrive.
+        self.display_launches.close(mapping.vm_id);
         self.connections.remove(mapping.vm_id);
         Ok(())
     }
@@ -1606,6 +1611,12 @@ impl VmRepository for HcsVmRepository {
             self.agent_sessions.cancel(vm_id);
             self.gpu_runs.forget(vm_id);
             self.connections.remove(vm_id);
+        }
+        for vm_id in drained.stopped {
+            // A window onto a partition that is gone can only sit and retry, so
+            // it goes with the VM. Only a VM that stopped is here: a guest that
+            // reboots keeps its compute system, and its window reconnects.
+            self.display_launches.close(vm_id);
         }
         if drained.service_disconnected && !self.service_disconnect_reported {
             self.service_disconnect_reported = true;

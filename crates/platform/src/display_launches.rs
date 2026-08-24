@@ -6,6 +6,11 @@
 //! forward and exits. What is kept here is only the threads holding the launch
 //! pipes.
 //!
+//! What is tracked beyond the threads is the pair of ids one window is
+//! addressed by: the VM it belongs to, and the partition whose runtime id names
+//! its command pipe. That is what lets a VM that stopped take its window with
+//! it -- see [`DisplayLaunches::close`].
+//!
 //! Those threads are never joined at shutdown. A display session outliving the
 //! application is the property the separate process was built for: closing
 //! VMLord closes the pipes, which costs the viewer the right to ask for a
@@ -27,7 +32,10 @@ use std::{
 use uuid::Uuid;
 use vmlord_core::{Diagnostic, DiagnosticLevel, DisplayMode, RepositoryError};
 use vmlord_display_protocol::keys::Secret;
-use vmlord_display_viewer::launch::{Link, Message};
+use vmlord_display_viewer::{
+    launch::{self, Link, Message},
+    windows::ipc,
+};
 
 use crate::display_session::Driver;
 
@@ -40,6 +48,8 @@ type Diagnostics = Arc<Mutex<Vec<Diagnostic>>>;
 /// Everything one launch needs.
 pub(crate) struct LaunchRequest<'a> {
     pub(crate) vm_name: &'a str,
+    /// The VM this window belongs to, which is what a stopped VM is named by.
+    pub(crate) vm_id: Uuid,
     /// The VM's secret, from which this session's keys are derived. It stays
     /// on this side of the pipes.
     pub(crate) secret: Secret,
@@ -73,16 +83,39 @@ pub(crate) fn viewer_path() -> Result<PathBuf, RepositoryError> {
 /// One viewer's thread.
 struct Worker {
     vm_name: String,
+    /// The VM whose desktop this window shows.
+    vm_id: Uuid,
+    /// The partition this viewer addresses, which is also what names its
+    /// command pipe: it is how a window is asked to close.
+    runtime_id: Uuid,
     /// Set by the thread as it leaves, by whichever exit, so that a thread
     /// that died is still joined rather than left in the list forever.
     finished: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
+/// How a window is asked to close: its command pipe, addressed by runtime id.
+///
+/// Behind a function so that the tests can watch what would be sent without a
+/// viewer process to send it to.
+type ViewerCloser = Arc<dyn Fn(&[u8; 16]) -> Result<(), String> + Send + Sync>;
+
 /// The display windows this process has opened.
-#[derive(Default)]
 pub(crate) struct DisplayLaunches {
     workers: Mutex<Vec<Worker>>,
+    closer: ViewerCloser,
+}
+
+impl Default for DisplayLaunches {
+    fn default() -> Self {
+        Self {
+            workers: Mutex::new(Vec::new()),
+            closer: Arc::new(|runtime_id: &[u8; 16]| {
+                ipc::send_command(runtime_id, launch::Command::Close)
+                    .map_err(|error| error.to_string())
+            }),
+        }
+    }
 }
 
 impl DisplayLaunches {
@@ -159,10 +192,40 @@ impl DisplayLaunches {
         );
         workers.push(Worker {
             vm_name,
+            vm_id: request.vm_id,
+            runtime_id: request.runtime_id,
             finished,
             handle: Some(handle),
         });
         Ok(())
+    }
+
+    /// Asks the display window of `vm_id`, if this process opened one, to
+    /// close.
+    ///
+    /// Sent over the viewer's command pipe rather than the launch pipe: that is
+    /// the channel the window itself reads, and closing the launch pipe would
+    /// only cost the viewer the right to ask for a fresh session -- which is
+    /// what keeps a desktop on screen when VMLord exits.
+    ///
+    /// A viewer that cannot be reached is not an error worth a diagnostic: a
+    /// window the user has already closed is exactly what that looks like.
+    pub(crate) fn close(&self, vm_id: Uuid) {
+        let mut workers = self.lock();
+        collect_finished(&mut workers);
+
+        for worker in workers.iter().filter(|worker| worker.vm_id == vm_id) {
+            log::info!(
+                "closing the display window of VM \"{}\": the VM has stopped",
+                worker.vm_name
+            );
+            if let Err(error) = (self.closer)(worker.runtime_id.as_bytes()) {
+                log::info!(
+                    "the display window of VM \"{}\" could not be asked to close: {error}",
+                    worker.vm_name
+                );
+            }
+        }
     }
 
     /// Recovers a poisoned lock rather than propagating the panic: a launch
@@ -312,13 +375,46 @@ impl Drop for Finish {
 mod tests {
     use std::{
         path::PathBuf,
-        sync::{Arc, Mutex},
+        sync::{Arc, Mutex, atomic::AtomicBool},
     };
 
     use uuid::Uuid;
     use vmlord_display_protocol::keys::Secret;
 
-    use super::{DisplayLaunches, LaunchRequest};
+    use super::{DisplayLaunches, LaunchRequest, Worker};
+
+    /// What a viewer's command pipe carried, without a viewer.
+    type Closed = Arc<Mutex<Vec<[u8; 16]>>>;
+
+    /// Launches holding `workers`, whose close requests are recorded rather
+    /// than sent.
+    fn launches(workers: Vec<Worker>) -> (DisplayLaunches, Closed) {
+        let closed: Closed = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&closed);
+        let launches = DisplayLaunches {
+            workers: Mutex::new(workers),
+            closer: Arc::new(move |runtime_id: &[u8; 16]| {
+                recorder
+                    .lock()
+                    .expect("an uncontended lock")
+                    .push(*runtime_id);
+                Ok(())
+            }),
+        };
+
+        (launches, closed)
+    }
+
+    /// A worker for a window that is still open.
+    fn worker(vm_name: &str, vm_id: Uuid, runtime_id: Uuid) -> Worker {
+        Worker {
+            vm_name: vm_name.to_owned(),
+            vm_id,
+            runtime_id,
+            finished: Arc::new(AtomicBool::new(false)),
+            handle: Some(std::thread::spawn(|| {})),
+        }
+    }
 
     #[test]
     fn a_viewer_that_is_not_beside_the_application_is_refused_by_name() {
@@ -328,6 +424,7 @@ mod tests {
         let error = launches
             .start(LaunchRequest {
                 vm_name: "dev",
+                vm_id: Uuid::from_u128(3),
                 secret: Secret::generate(),
                 runtime_id: Uuid::from_u128(7),
                 mode: None,
@@ -360,6 +457,37 @@ mod tests {
                 .expect("this process has a path")
                 .parent(),
             "the viewer ships beside the application, as `cargo dist` puts it"
+        );
+    }
+
+    #[test]
+    fn the_window_of_the_vm_that_stopped_is_asked_to_close_by_its_runtime_id() {
+        let stopped = Uuid::from_u128(1);
+        let (launches, closed) = launches(vec![
+            worker("dev", stopped, Uuid::from_u128(11)),
+            worker("build", Uuid::from_u128(2), Uuid::from_u128(22)),
+        ]);
+
+        launches.close(stopped);
+
+        assert_eq!(
+            *closed.lock().expect("an uncontended lock"),
+            vec![*Uuid::from_u128(11).as_bytes()],
+            "only the window of the VM that stopped is closed, and it is \
+             addressed by the partition it was opened on"
+        );
+    }
+
+    #[test]
+    fn a_vm_with_no_window_of_this_process_closes_nothing() {
+        let (launches, closed) =
+            launches(vec![worker("dev", Uuid::from_u128(1), Uuid::from_u128(11))]);
+
+        launches.close(Uuid::from_u128(9));
+
+        assert!(
+            closed.lock().expect("an uncontended lock").is_empty(),
+            "a VM VMLord never opened a display for has no window to close"
         );
     }
 }

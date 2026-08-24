@@ -2968,8 +2968,16 @@ an established handshake with the hand-over. It is driven by
 parameters and keeps a thread on its pipes -- a thread deliberately never
 joined, because a display session outlives the application that opened it:
 VMLord exiting closes the pipes, which costs the viewer the right to ask for a
-fresh session and nothing else. Stopping a VM sends nothing either; the
-partition goes and the viewer's next connect fails with it. A repeated Connect
+fresh session and nothing else. Stopping a VM does close its window: the
+`SystemExited` event names the VM, and `DisplayLaunches::close` asks the viewer
+it opened for that VM to close over the command pipe, addressed by the runtime
+id the launch recorded. The forced stop asks straight away rather than waiting
+for the event it also has no guarantee of. The command pipe rather than the
+launch pipe, because that is the channel the window itself reads -- and only an
+exit, so a guest that reboots keeps both its compute system and its window,
+which reconnects when the guest's services come back. A window this process
+never opened is left to notice on its own: the partition goes and its next
+connect fails with it. A repeated Connect
 starts a second process, which finds the named mutex taken, asks the window
 that is already open to come forward, and exits.
 
