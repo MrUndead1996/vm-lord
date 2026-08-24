@@ -602,7 +602,7 @@ fn encode_input(event: input::Event) -> (InputRecord, Vec<u8>) {
 /// The one place the session thread waits on a socket rather than leaving it
 /// for the next pump: a bind is a three-record exchange, and half of one is no
 /// use to anybody.
-fn read_awaited<S: Read + Write>(
+pub(crate) fn read_awaited<S: Read + Write>(
     socket: &mut S,
     limits: &Limits,
     payload: &mut Vec<u8>,
@@ -621,7 +621,7 @@ fn read_awaited<S: Read + Write>(
 }
 
 /// Reads a channel key out of a hand-over.
-fn channel_key(bytes: &[u8], what: &str) -> Result<ChannelKey, String> {
+pub(crate) fn channel_key(bytes: &[u8], what: &str) -> Result<ChannelKey, String> {
     let bytes: [u8; 32] = bytes
         .try_into()
         .map_err(|_| format!("the hand-over's {what} key is not thirty-two bytes"))?;

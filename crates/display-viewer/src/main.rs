@@ -43,10 +43,13 @@ use std::{
 };
 
 use vmlord_display_codec::{Geometry, Rect};
-use vmlord_display_protocol::{record::Channel, v1::Mode};
+use vmlord_display_protocol::{
+    record::Channel,
+    v1::{Capability, Mode},
+};
 use vmlord_display_viewer::{
     input::{self, Report},
-    launch::{self, Command, LaunchParameters, Link, Message},
+    launch::{self, Command, Handover, LaunchParameters, Link, Message},
     live::{Live, Signal},
     log as viewer_log,
     placement::place,
@@ -55,6 +58,7 @@ use vmlord_display_viewer::{
     state::{Quality, Store, WindowState},
     status::{self, Button, Event, Progress, Status},
     windows::{
+        clipboard::{self, Focus},
         d3d::Renderer,
         hook::Hook,
         hvsocket::{CONNECT_TIMEOUT, ConnectError, HvSocket},
@@ -178,6 +182,7 @@ fn run(parameters: LaunchParameters, claim: SingleInstance) -> ExitCode {
     let (signals_out, signals) = mpsc::channel();
     let (orders_out, orders) = mpsc::channel();
 
+    let clipboard: Arc<Mutex<Option<Sender<Focus>>>> = Arc::default();
     let reader = spawn_reader(to_session, window.poster());
     let writer = spawn_writer(outgoing);
     let session = spawn_session(Session {
@@ -188,6 +193,7 @@ fn run(parameters: LaunchParameters, claim: SingleInstance) -> ExitCode {
         orders,
         frame: Arc::clone(&frame),
         poster: window.poster(),
+        clipboard: Arc::clone(&clipboard),
     });
 
     let exit = pump(
@@ -201,6 +207,7 @@ fn run(parameters: LaunchParameters, claim: SingleInstance) -> ExitCode {
             orders: &orders_out,
             ui: &ui,
             commands: &commands_in,
+            clipboard: &clipboard,
         },
         &mut state,
     );
@@ -308,6 +315,13 @@ struct Session {
     orders: Receiver<Order>,
     frame: Arc<Mutex<SharedFrame>>,
     poster: vmlord_display_viewer::windows::window::Poster,
+    /// Where the window's focus reports are sent, once a clipboard thread
+    /// exists to hear them.
+    ///
+    /// Shared rather than owned by either side: the window knows about focus
+    /// and the session knows when a clipboard channel is worth having, and the
+    /// thread that carries selections is made and dropped once per session.
+    clipboard: Arc<Mutex<Option<Sender<Focus>>>>,
 }
 
 /// Everything the main loop borrows.
@@ -321,6 +335,7 @@ struct Loop<'a> {
     orders: &'a Sender<Order>,
     ui: &'a Receiver<UiEvent>,
     commands: &'a Receiver<Command>,
+    clipboard: &'a Arc<Mutex<Option<Sender<Focus>>>>,
 }
 
 /// Reads standard input until VMLord closes it.
@@ -420,6 +435,11 @@ fn attempt(session: &Session, hello: &[u8]) -> Attempt {
         }
     };
 
+    // Its own thread and its own socket, so that a selection being read out of
+    // the Windows clipboard cannot delay a frame. It ends when the sender the
+    // holder keeps is dropped, which is at the end of this session.
+    let clipboard = start_clipboard(session, &handover);
+
     let runtime_id = session.parameters.runtime_id;
     let frame_port = session.parameters.frame_port;
     let input_port = session.parameters.input_port;
@@ -445,7 +465,61 @@ fn attempt(session: &Session, hello: &[u8]) -> Attempt {
         }
     };
 
-    drive(session, &mut live)
+    let outcome = drive(session, &mut live);
+    stop_clipboard(session, clipboard);
+
+    outcome
+}
+
+/// Starts this session's clipboard thread, if the session has a clipboard.
+///
+/// A session without the capability gets no thread and no socket: the guest
+/// either ships the daemon or it does not, and there is nothing to retry.
+fn start_clipboard(session: &Session, handover: &Handover) -> Option<JoinHandle<()>> {
+    if !handover
+        .capabilities
+        .contains(&i32::from(Capability::Clipboard))
+    {
+        log::info!("this guest has no clipboard");
+
+        return None;
+    }
+
+    let (handle, sender) = clipboard::spawn(clipboard::Parameters {
+        runtime_id: session.parameters.runtime_id,
+        port: session.parameters.clipboard_port,
+        handover: handover.clone(),
+    });
+    *session
+        .clipboard
+        .lock()
+        .expect("the clipboard sender is not poisoned") = Some(sender);
+
+    Some(handle)
+}
+
+/// Ends this session's clipboard thread by taking the sender it listens on.
+fn stop_clipboard(session: &Session, handle: Option<JoinHandle<()>>) {
+    *session
+        .clipboard
+        .lock()
+        .expect("the clipboard sender is not poisoned") = None;
+
+    // Not joined: the thread ends on its own once its sender is gone, and a
+    // session's end is not worth waiting on a socket for.
+    drop(handle);
+}
+
+/// Tells the clipboard thread about focus, if there is one to tell.
+fn tell_clipboard(holder: &Arc<Mutex<Option<Sender<Focus>>>>, focus: Focus) {
+    let sender = holder
+        .lock()
+        .expect("the clipboard sender is not poisoned")
+        .clone();
+
+    if let Some(sender) = sender {
+        let _ = sender.send(focus);
+    }
 }
 
 /// Pumps one established session until it ends.
@@ -632,13 +706,22 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
                 UiEvent::Pressed(Button::Cancel) | UiEvent::Closing => closing = true,
                 UiEvent::Input(report) => {
                     match report {
-                        Report::FocusGained => match Hook::install(context.shared) {
-                            Ok(installed) => hook = Some(installed),
-                            // A viewer without the hook still types; it only
-                            // loses the keys the shell takes first.
-                            Err(error) => log::warn!("{error}"),
-                        },
-                        Report::FocusLost | Report::ReleaseKeyboard => hook = None,
+                        Report::FocusGained => {
+                            tell_clipboard(context.clipboard, Focus::Gained);
+                            match Hook::install(context.shared) {
+                                Ok(installed) => hook = Some(installed),
+                                // A viewer without the hook still types; it only
+                                // loses the keys the shell takes first.
+                                Err(error) => log::warn!("{error}"),
+                            }
+                        }
+                        Report::FocusLost | Report::ReleaseKeyboard => {
+                            // The clipboard follows the keyboard: a VM in the
+                            // background neither reads what its user copies
+                            // elsewhere nor replaces what is on their clipboard.
+                            tell_clipboard(context.clipboard, Focus::Lost);
+                            hook = None;
+                        }
                         _ => {}
                     }
                     policy.report(report);
