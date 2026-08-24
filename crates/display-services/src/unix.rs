@@ -104,7 +104,10 @@ impl Listener {
     /// whose connection is closed before this returns, or [`io::Error`] from
     /// the socket calls.
     pub fn accept(&self, expected_uid: libc::uid_t) -> io::Result<Connection> {
-        self.accept_where(|uid| uid == expected_uid, format_args!("uid {expected_uid}"))
+        self.accept_where(
+            |uid| uid == expected_uid,
+            format_args!("uid {expected_uid}"),
+        )
     }
 
     /// Accepts one peer and refuses it unless `allow` says its uid may.

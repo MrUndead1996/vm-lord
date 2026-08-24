@@ -1,4 +1,4 @@
-//! The three sockets the host connects to.
+//! The four sockets the host connects to.
 //!
 //! The guest listens and the host connects, which is the opposite of the agent
 //! protocol: a session lives as long as a viewer window, so no viewer means no
@@ -17,6 +17,13 @@ pub const FRAME_PORT: u32 = 0x564D_4C46;
 
 /// Where keys and pointer events come back. `"VMLI"`.
 pub const INPUT_PORT: u32 = 0x564D_4C49;
+
+/// Where selections cross, in both directions. `"VMLC"`.
+///
+/// Bound by the clipboard daemon in the user's session rather than by either
+/// system service, which is what keeps a stalled compositor call out of the
+/// capture loop.
+pub const CLIPBOARD_PORT: u32 = 0x564D_4C43;
 
 /// How many connections the kernel holds while this side is busy.
 ///

@@ -102,8 +102,7 @@ impl Options {
             )
             .into(),
             socket: text("VMLORD_DISPLAY_SOCKET", SOCKET_PATH).into(),
-            clipboard_socket: text("VMLORD_DISPLAY_CLIPBOARD_SOCKET", CLIPBOARD_SOCKET_PATH)
-                .into(),
+            clipboard_socket: text("VMLORD_DISPLAY_CLIPBOARD_SOCKET", CLIPBOARD_SOCKET_PATH).into(),
             uinput: text("VMLORD_DISPLAY_UINPUT", crate::uinput::DEVICE_PATH).into(),
             mode: text("VMLORD_DISPLAY_MODE", crate::output::MODE_PARAMETER).into(),
             user: text("VMLORD_DISPLAY_USER", SERVICE_USER),
@@ -223,7 +222,10 @@ fn serve(options: &Options) -> io::Result<()> {
         }),
     )?;
 
-    let (uid, gid) = at("looking up the service account", service_account(&options.user))?;
+    let (uid, gid) = at(
+        "looking up the service account",
+        service_account(&options.user),
+    )?;
     if let Some(directory) = options.socket.parent() {
         at(
             "creating the socket's directory",
@@ -252,8 +254,9 @@ fn serve(options: &Options) -> io::Result<()> {
     let devices = open_devices(&options.uinput);
     if devices.is_none() {
         let (lock, _) = &*shared;
-        lock.lock().expect("the broker's lock is not poisoned").fault =
-            Some("this guest has no input devices".to_owned());
+        lock.lock()
+            .expect("the broker's lock is not poisoned")
+            .fault = Some("this guest has no input devices".to_owned());
     }
 
     thread::scope(|scope| {
@@ -377,11 +380,7 @@ fn serve_peers(
 }
 
 /// Makes a new connection the peer, and tells it what it missed.
-fn adopt_peer(
-    shared: &Shared,
-    connection: &Arc<Connection>,
-    devices: Option<&(OwnedFd, OwnedFd)>,
-) {
+fn adopt_peer(shared: &Shared, connection: &Arc<Connection>, devices: Option<&(OwnedFd, OwnedFd)>) {
     let (lock, signal) = &**shared;
     let mut state = lock.lock().expect("the broker's lock is not poisoned");
 
@@ -401,11 +400,7 @@ fn adopt_peer(
 }
 
 /// Reads one peer until it goes away.
-fn read_peer(
-    connection: &Arc<Connection>,
-    shared: &Shared,
-    devices: Option<&(OwnedFd, OwnedFd)>,
-) {
+fn read_peer(connection: &Arc<Connection>, shared: &Shared, devices: Option<&(OwnedFd, OwnedFd)>) {
     loop {
         let Ok((message, _)) = connection.receive() else {
             return;
@@ -453,12 +448,7 @@ fn send_devices(connection: &Connection, devices: Option<&(OwnedFd, OwnedFd)>) {
 }
 
 /// Accepts one control connection at a time and runs its session.
-fn serve_sessions(
-    listener: &vsock::Listener,
-    secret: &Secret,
-    output: &Output,
-    shared: &Shared,
-) {
+fn serve_sessions(listener: &vsock::Listener, secret: &Secret, output: &Output, shared: &Shared) {
     loop {
         if stopping(shared) {
             return;
@@ -523,7 +513,9 @@ fn run_session(
                 open_session(shared, parameters, clipboard_key);
             }
             Outcome::Relay(message) => send_to_peer(shared, &message),
-            Outcome::Resize { width, height } => request_mode(output, control, stream, width, height),
+            Outcome::Resize { width, height } => {
+                request_mode(output, control, stream, width, height)
+            }
             Outcome::Closed(reason) => return reason,
             Outcome::Nothing => {}
         }
@@ -839,18 +831,12 @@ impl SnapshotGenerations {
             return true;
         }
 
-        let primary = planes
-            .iter()
-            .find(|plane| plane.kind == PlaneKind::Primary);
-        let cursor = planes
-            .iter()
-            .find(|plane| plane.kind == PlaneKind::Cursor);
+        let primary = planes.iter().find(|plane| plane.kind == PlaneKind::Primary);
+        let cursor = planes.iter().find(|plane| plane.kind == PlaneKind::Cursor);
 
         let current_primary = primary.and_then(|plane| plane.generation);
         let current_cursor = cursor.and_then(|plane| plane.generation);
-        !self.initialized
-            || self.primary != current_primary
-            || self.cursor != current_cursor
+        !self.initialized || self.primary != current_primary || self.cursor != current_cursor
     }
 
     fn observe(&mut self, planes: &[PlaneState], generation_supported: bool) {
@@ -1204,7 +1190,8 @@ mod tests {
 
     #[test]
     fn reopening_on_the_same_peer_changes_the_session_epoch() {
-        let shared: super::Shared = Arc::new((Mutex::new(super::BrokerState::default()), Condvar::new()));
+        let shared: super::Shared =
+            Arc::new((Mutex::new(super::BrokerState::default()), Condvar::new()));
         let parameters = crate::ipc::SessionParameters {
             session_id: vec![1; 16],
             frame_key: vec![2; 32],

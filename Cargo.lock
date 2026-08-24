@@ -4644,6 +4644,7 @@ dependencies = [
  "vmlord-agent-protocol",
  "vmlord-display-codec",
  "vmlord-display-protocol",
+ "zbus",
 ]
 
 [[package]]
