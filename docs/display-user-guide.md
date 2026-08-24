@@ -17,7 +17,7 @@
 Select the running VM and press **Connect**. VMLord launches
 `vmlord-display.exe`; pressing Connect again focuses the existing window. The
 viewer authenticates the guest over the per-VM secret, then binds separate
-control, frame, and input HvSocket channels.
+control, frame, input, and clipboard HvSocket channels.
 
 - Sign in through GDM with the account created for the VM.
 - Resize the window to request a matching guest mode. Modes are limited to one
@@ -26,6 +26,23 @@ control, frame, and input HvSocket channels.
   the VM, and opening it again starts a fresh authenticated session.
 - A transient channel or guest-service restart reconnects automatically. A VM
   reset keeps the window waiting until the guest services return.
+
+## The clipboard
+
+Copying in the guest and pasting on the host works in both directions, for
+text, HTML and images.
+
+- It follows the window. A selection crosses only while the display window has
+  keyboard focus, so a VM in the background neither reads what you copy
+  elsewhere nor replaces what is on your clipboard. What you copied while the
+  window was unfocused is offered to the guest when you come back to it.
+- It needs a signed-in desktop. The clipboard lives inside GNOME, so nothing
+  crosses at the GDM login screen; it starts working once you have logged in.
+- Nothing crosses until it is pasted. Each side announces what it has and sends
+  the contents only when the other asks for them.
+- Text and HTML are limited to 8 MiB and a picture to 32 MiB. A larger
+  selection is refused without disturbing the session.
+- Files are not carried. Copying files in either direction pastes nothing.
 
 Display traffic does not traverse the VM's IP network. Removing network access
 after provisioning does not disconnect an existing display, but future package

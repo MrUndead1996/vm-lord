@@ -2745,8 +2745,9 @@ against the same wire. Like the agent's contract it is portable by
 construction -- no Windows APIs, no Linux syscalls, no sockets -- and it knows
 nothing about what a frame's bytes mean.
 
-A session is three HvSocket services rather than one: `VMLD` for control,
-`VMLF` for frames, `VMLI` for input, named the way `VMLA` is. **The guest
+A session is four HvSocket services rather than one: `VMLD` for control,
+`VMLF` for frames, `VMLI` for input, `VMLC` for the clipboard, named the way
+`VMLA` is. **The guest
 listens and the host connects**, which is the opposite of the agent socket and
 is deliberate. The agent's connection is a standing report that lives as long
 as the VM; a display session begins when a user presses Connect and ends when
@@ -2805,9 +2806,9 @@ info. Nothing new is minted and nothing new is delivered. The unprivileged
 capture process never holds the secret: the privileged broker, which is root
 anyway because it needs DRM and uinput, derives the session key and hands only
 that on, so compromising the capture process costs one session rather than the
-VM's identity. Frame and input channels then get a key of their own from that
-session key and the transcript hash, and prove it in a three-record exchange of
-their own; because the channel key depends on the transcript, a socket cannot
+VM's identity. The frame, input and clipboard channels then get a key of their own
+from that session key and the transcript hash, and prove it in a three-record
+exchange of their own; because the channel key depends on the transcript, a socket cannot
 be carried in from another session or offered by a process that took no part in
 the control handshake.
 
@@ -2882,10 +2883,11 @@ and root never copies a frame. Each buffer crosses once and is named by its
 framebuffer id afterwards, since a descriptor costs a syscall and a slot in the
 peer's table.
 
-The three vsock ports are the protocol's: `VMLD` control, `VMLF` frames, `VMLI`
-input. The guest listens on all three and the host connects, and the two halves
-divide them -- the broker owns control, the session process owns the other two
-and never sees a device descriptor or an ioctl of its own. What crosses the IPC
+The four vsock ports are the protocol's: `VMLD` control, `VMLF` frames, `VMLI`
+input, `VMLC` the clipboard. The guest listens on all four and the host
+connects, and three processes divide them -- the broker owns control, the
+session process owns frames and input and never sees a device descriptor or an
+ioctl of its own, and the clipboard daemon owns the fourth. What crosses the IPC
 socket after a handshake is a `SessionParameters`: the session id, one channel
 key per socket, the geometry, and whether the peer took the cursor stream. Not
 the secret. What a compromised capture process could take from those bytes is
@@ -3028,6 +3030,60 @@ While the hook is installed the keyboard is the guest's, `Alt+F4` included, so
 is sent a release. `Ctrl+Alt+Del` is a system-menu action rather than a
 shortcut, because the Secure Attention Sequence is routed by the kernel and no
 documented hook sees it -- and undocumented ones are out of the question.
+
+### The clipboard
+
+A selection exists only inside a compositor, which is what makes the clipboard
+unlike everything else in this stack: frames come off a DRM device, input goes
+to uinput devices, and both are blind to who is logged in. So the clipboard has
+a component of its own -- `vmlord-display-clipboard`, a **user** unit that
+starts with the graphical session, because only a process inside that session
+can reach the session bus where mutter answers.
+
+It reaches the clipboard through `org.gnome.Mutter.RemoteDesktop`, the
+interface `gnome-remote-desktop` drives, which has carried a clipboard since
+GNOME 42. Three of its properties decided the design and none are documented:
+a session may be started with no ScreenCast beside it, so this is a small
+daemon rather than a screen-sharing stack; `EnableClipboard` with mime types
+makes a client the owner and mutter then refuses to let it read its own
+selection, so the daemon listens until the host actually sends something; and
+the descriptor `SelectionRead` returns is non-blocking, so reading a selection
+is a poll loop -- which is where the size cap and the deadline live.
+
+The daemon holds no secret and binds `VMLC` itself, with a key the broker sends
+it over a second socket, `/run/vmlord/display-clipboard.sock`. That socket
+cannot be owned by a group the way the capture process's is: the daemon runs as
+whichever human logged in, and that account is not known when the VM is
+provisioned. It is authorised by peer credentials instead -- the uid must be
+the one logind reports for the active graphical session on `seat0`, looked up
+at every accept. The clipboard therefore belongs to the person at the virtual
+screen: a second user over SSH cannot take it, and a daemon left behind by a
+user who has been switched away stops being authorised without anything having
+to evict it.
+
+Both ends run one state machine, `vmlord_display_protocol::clipboard`, which is
+where the allowlist, the caps and the cancellation rules live. A limit only the
+viewer enforced would be one a guest could ignore. The model is pull in both
+directions: a side announces what its selection can produce and sends nothing
+until the other asks, so a picture copied in a guest costs nothing until
+somebody pastes it. Text, HTML and one picture are carried -- `image/bmp` in
+preference to `image/png`, because a DIB is a BMP without its file header and
+needs no codec. Arbitrary registered Windows formats are not passed through,
+which is what AppSandbox did and what an allowlist exists to refuse, and files
+are refused outright: they need a model this design does not have, and they are
+task #139.
+
+Two rules keep it honest. A selection crosses only while the viewer's window
+has keyboard focus, so a VM in the background cannot read what its user copies
+elsewhere or replace what is on their clipboard; a change made while the window
+was unfocused is announced when focus returns. And each side suppresses its own
+echo with what it already has -- the host with `GetClipboardSequenceNumber`
+taken as it writes, the guest with `session-is-owner` out of mutter's
+`SelectionOwnerChanged` -- because without that, applying the other side's
+selection would immediately offer it back.
+
+Nothing about a selection is logged. A mime type, a byte count, a transfer id
+and an outcome are what a clipboard problem is diagnosed from, on both sides.
 
 ### Resizing the desktop
 
