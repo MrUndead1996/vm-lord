@@ -13,7 +13,7 @@
 pub mod uapi;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::{self, ErrorKind},
     os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
@@ -44,6 +44,8 @@ pub const DRM_DEVICES: &str = "/dev/dri";
 const PLANE_TYPE_PRIMARY: u64 = 1;
 /// `DRM_PLANE_TYPE_CURSOR`.
 const PLANE_TYPE_CURSOR: u64 = 2;
+/// Driver-owned property incremented whenever a plane is committed.
+const VMLORD_GENERATION: &str = "VMLORD_GENERATION";
 
 /// One plane's framebuffer and where it sits, at one vblank.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +74,17 @@ pub struct PlaneState {
     /// buffer by its id -- the peer this is sent to, above all -- has to be
     /// told when the id changed hands.
     pub fresh: bool,
+    /// The driver commit that last changed this plane. `None` keeps capture
+    /// compatible with an older module that does not expose generations.
+    pub generation: Option<u64>,
+}
+
+/// A coherent view of every active plane at one driver commit.
+pub struct Snapshot {
+    /// Planes with a framebuffer attached.
+    pub planes: Vec<PlaneState>,
+    /// Whether every plane exposes the generation property.
+    pub generation_supported: bool,
 }
 
 /// The guest's own output, opened for reading.
@@ -251,11 +264,44 @@ impl Device {
     /// [`ErrorKind::Unsupported`] for a format or modifier this build cannot
     /// map -- the module or the compositor changed underneath us -- and
     /// [`io::Error`] for a failed ioctl.
-    pub fn snapshot(&mut self) -> io::Result<Vec<PlaneState>> {
+    pub fn snapshot(&mut self) -> io::Result<Snapshot> {
+        let plane_ids = self.plane_ids()?;
+        let mut fresh_during_retry = HashSet::new();
+        let (mut planes, generation_supported) = coherent_snapshot(|| {
+            let before = self.plane_generations(&plane_ids)?;
+            let planes = self.snapshot_once(&plane_ids)?;
+            fresh_during_retry.extend(
+                planes
+                    .iter()
+                    .filter(|plane| plane.fresh)
+                    .map(|plane| plane.fb_id),
+            );
+            let after = if before.is_some() {
+                self.plane_generations(&plane_ids)?
+            } else {
+                None
+            };
+
+            Ok((before, planes, after))
+        })?;
+
+        for plane in &mut planes {
+            plane.fresh |= fresh_during_retry.contains(&plane.fb_id);
+        }
+
+        Ok(Snapshot {
+            planes,
+            generation_supported,
+        })
+    }
+
+    /// Reads active plane state once. The generation bracket in `snapshot`
+    /// decides whether these separately issued ioctls described one commit.
+    fn snapshot_once(&mut self, plane_ids: &[u32]) -> io::Result<Vec<PlaneState>> {
         let mut states = Vec::new();
         let mut seen = Vec::new();
 
-        for plane_id in self.plane_ids()? {
+        for &plane_id in plane_ids {
             let mut plane = DrmModeGetPlane {
                 plane_id,
                 ..DrmModeGetPlane::default()
@@ -294,6 +340,7 @@ impl Device {
             seen.push(plane.fb_id);
             states.push(PlaneState {
                 fresh,
+                generation: properties.get(VMLORD_GENERATION).copied(),
                 kind,
                 fb_id: plane.fb_id,
                 width: framebuffer.width,
@@ -310,6 +357,20 @@ impl Device {
         self.buffers.retain(|fb_id, _| seen.contains(fb_id));
 
         Ok(states)
+    }
+
+    /// Every plane's driver generation, or `None` for a legacy module.
+    fn plane_generations(&mut self, plane_ids: &[u32]) -> io::Result<Option<Vec<(u32, u64)>>> {
+        let mut generations = Vec::with_capacity(plane_ids.len());
+        for &plane_id in plane_ids {
+            let properties = self.plane_properties(plane_id)?;
+            let Some(generation) = properties.get(VMLORD_GENERATION).copied() else {
+                return Ok(None);
+            };
+            generations.push((plane_id, generation));
+        }
+
+        Ok(Some(generations))
     }
 
     /// The exported buffer behind a framebuffer id, for sending on.
@@ -476,6 +537,27 @@ impl Device {
     }
 }
 
+type PlaneGenerations = Vec<(u32, u64)>;
+
+/// Repeats a multi-ioctl state read until no driver commit split it.
+fn coherent_snapshot<T>(
+    mut attempt: impl FnMut() -> io::Result<(
+        Option<PlaneGenerations>,
+        T,
+        Option<PlaneGenerations>,
+    )>,
+) -> io::Result<(T, bool)> {
+    loop {
+        let (before, state, after) = attempt()?;
+        let Some(before) = before else {
+            return Ok((state, false));
+        };
+        if after.as_ref() == Some(&before) {
+            return Ok((state, true));
+        }
+    }
+}
+
 /// The inode of an exported dma-buf, which is the buffer's own name.
 ///
 /// Every dma-buf gets one file in the kernel's anonymous filesystem, and
@@ -532,7 +614,7 @@ fn signed(value: u64) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{collections::VecDeque, fs, io, path::PathBuf};
 
     use super::{
         card_named,
@@ -552,6 +634,23 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn a_commit_between_state_reads_retries_the_snapshot() {
+        let mut attempts = VecDeque::from([
+            (Some(vec![(35, 10)]), "stale", Some(vec![(35, 11)])),
+            (Some(vec![(35, 11)]), "current", Some(vec![(35, 11)])),
+        ]);
+
+        let (state, generation_supported) = super::coherent_snapshot(|| {
+            Ok::<_, io::Error>(attempts.pop_front().expect("only two attempts"))
+        })
+        .unwrap();
+
+        assert_eq!(state, "current");
+        assert!(generation_supported);
+        assert!(attempts.is_empty());
     }
 
     #[test]

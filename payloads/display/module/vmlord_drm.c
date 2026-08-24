@@ -53,6 +53,7 @@
 #include <drm/drm_modeset_helper_vtables.h>
 #include <drm/drm_plane.h>
 #include <drm/drm_print.h>
+#include <drm/drm_property.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_vblank.h>
 
@@ -121,6 +122,8 @@ struct vmlord_device {
 	struct drm_connector connector;
 	struct drm_plane primary;
 	struct drm_plane cursor;
+	struct drm_property *generation_property;
+	atomic64_t generation;
 	struct hrtimer vblank_timer;
 	/* How long one frame lasts at the enabled mode's refresh rate. */
 	ktime_t period;
@@ -186,6 +189,18 @@ static int vmlord_plane_atomic_check(struct drm_plane *plane,
 static void vmlord_plane_atomic_update(struct drm_plane *plane,
 				       struct drm_atomic_state *state)
 {
+	struct vmlord_device *vmlord =
+		container_of(plane->dev, struct vmlord_device, drm);
+	u64 generation = atomic64_inc_return(&vmlord->generation);
+
+	/*
+	 * Capture reads this immutable property with the rest of the plane state.
+	 * A vblank whose value did not move has no new pixels to read. The value is
+	 * global rather than per-plane so every commit has one unambiguous order.
+	 */
+	drm_object_property_set_value(&plane->base,
+				      vmlord->generation_property,
+				      generation);
 }
 
 static const struct drm_plane_helper_funcs vmlord_plane_helper_funcs = {
@@ -449,6 +464,13 @@ static int vmlord_pipe_init(struct vmlord_device *vmlord)
 	struct drm_device *drm = &vmlord->drm;
 	int error;
 
+	vmlord->generation_property =
+		drm_property_create_range(drm, DRM_MODE_PROP_IMMUTABLE,
+					  "VMLORD_GENERATION", 0, U64_MAX);
+	if (!vmlord->generation_property)
+		return -ENOMEM;
+	atomic64_set(&vmlord->generation, 0);
+
 	error = drm_universal_plane_init(drm, &vmlord->primary, 1,
 					 &vmlord_plane_funcs, vmlord_formats,
 					 ARRAY_SIZE(vmlord_formats),
@@ -456,6 +478,8 @@ static int vmlord_pipe_init(struct vmlord_device *vmlord)
 					 DRM_PLANE_TYPE_PRIMARY, "primary");
 	if (error)
 		return error;
+	drm_object_attach_property(&vmlord->primary.base,
+				   vmlord->generation_property, 0);
 	drm_plane_helper_add(&vmlord->primary, &vmlord_plane_helper_funcs);
 
 	error = drm_universal_plane_init(drm, &vmlord->cursor, 1,
@@ -466,6 +490,8 @@ static int vmlord_pipe_init(struct vmlord_device *vmlord)
 					 DRM_PLANE_TYPE_CURSOR, "cursor");
 	if (error)
 		return error;
+	drm_object_attach_property(&vmlord->cursor.base,
+				   vmlord->generation_property, 0);
 	drm_plane_helper_add(&vmlord->cursor, &vmlord_plane_helper_funcs);
 
 	error = drm_crtc_init_with_planes(drm, &vmlord->crtc, &vmlord->primary,

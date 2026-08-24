@@ -47,6 +47,11 @@ Three properties are decisions rather than style, all three measured by task
 * its formats are XRGB8888 and ARGB8888 with `DRM_FORMAT_MOD_LINEAR` only,
   because a capture client that mmaps a buffer cannot detile anything else.
 
+Each plane also carries the immutable `VMLORD_GENERATION` property. Its value
+is owned by the driver and advances in `atomic_update`, allowing capture to
+distinguish a real compositor commit from the synthetic 60 Hz vblank clock
+without reading the full framebuffer.
+
 ## What is shipped beside it
 
 Two files that are configuration rather than code, both copied into a guest by
