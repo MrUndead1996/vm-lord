@@ -4728,6 +4728,7 @@ dependencies = [
  "vmlord-core",
  "vmlord-display-payload",
  "vmlord-display-protocol",
+ "vmlord-display-viewer",
  "vmlord-gpu-payload",
  "vmlord-image",
  "vmlord-keys",
