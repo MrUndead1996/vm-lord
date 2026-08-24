@@ -463,7 +463,11 @@ impl<F: Acceptor, I: Acceptor> Loop<F, I> {
             } => {
                 self.asked_for_frame = false;
                 self.adopt(&planes, &new_buffers, descriptors);
-                self.submit(sequence, &planes)?;
+                if let Err(error) = self.submit(sequence, &planes) {
+                    eprintln!(
+                        "vmlord-display-session: dropping frame {sequence}: the encoder refused it: {error}"
+                    );
+                }
                 self.ask_for_frame();
 
                 Ok(None)
@@ -1520,6 +1524,53 @@ mod tests {
             self.broker_sends_snapshot_sized(sequence, WIDTH, HEIGHT);
         }
 
+        /// Sends a snapshot with a cursor the codec refuses. This is what a
+        /// malformed capture must cost: one frame, not the capture session.
+        fn broker_sends_snapshot_with_oversized_cursor(&mut self, sequence: u64) {
+            let primary = crate::unix::memfd("frame", &vec![0; (WIDTH * HEIGHT * 4) as usize])
+                .expect("a framebuffer");
+            let cursor = crate::unix::memfd("oversized-cursor", &vec![0; 257 * 4])
+                .expect("an oversized cursor bitmap");
+            let primary_buffer = sequence * 2;
+            let cursor_buffer = primary_buffer + 1;
+            let planes = vec![
+                PlaneLayout {
+                    kind: PlaneKind::Primary,
+                    buffer: primary_buffer,
+                    width: WIDTH,
+                    height: HEIGHT,
+                    stride: WIDTH * 4,
+                    format: crate::drm::uapi::DRM_FORMAT_XRGB8888,
+                    x: 0,
+                    y: 0,
+                },
+                PlaneLayout {
+                    kind: PlaneKind::Cursor,
+                    buffer: cursor_buffer,
+                    width: 257,
+                    height: 1,
+                    stride: 257 * 4,
+                    format: crate::drm::uapi::DRM_FORMAT_ARGB8888,
+                    x: 0,
+                    y: 0,
+                },
+            ];
+
+            self.broker
+                .send(
+                    &Message::Snapshot {
+                        sequence,
+                        planes,
+                        new_buffers: vec![primary_buffer, cursor_buffer],
+                    },
+                    &[
+                        std::os::fd::AsFd::as_fd(&primary),
+                        std::os::fd::AsFd::as_fd(&cursor),
+                    ],
+                )
+                .expect("a snapshot with an oversized cursor");
+        }
+
         /// The same, for an output that is not the one the session opened on.
         fn broker_sends_snapshot_sized(&mut self, sequence: u64, width: u32, height: u32) {
             let (width, height) = (width, height);
@@ -1609,6 +1660,15 @@ mod tests {
             self.from_session[at..]
                 .iter()
                 .any(|message| matches!(message, Message::NextFrame))
+        }
+
+        /// How many snapshots the session has acknowledged by asking for the
+        /// next one.
+        fn broker_received_next_frames(&self) -> usize {
+            self.from_session
+                .iter()
+                .filter(|message| matches!(message, Message::NextFrame))
+                .count()
         }
 
         /// The host drops its frame socket and opens another.
@@ -1866,6 +1926,29 @@ mod tests {
                 .iter()
                 .all(|(header, _)| header.message_type != FrameRecord::TileDelta as u16),
             "a frame of the old size is not one this stream can carry"
+        );
+    }
+
+    #[test]
+    fn a_frame_the_encoder_refuses_is_dropped_and_capture_continues() {
+        let mut world = World::open();
+        let asked_before = world.broker_received_next_frames();
+
+        world.broker_sends_snapshot_with_oversized_cursor(1);
+        world.step();
+
+        assert_eq!(
+            world.broker_received_next_frames(),
+            asked_before + 1,
+            "a refused frame still earns the broker's next-frame request"
+        );
+
+        world.broker_sends_snapshot(2);
+        world.run_until_written();
+
+        assert!(
+            !world.host_reads_frame_records().is_empty(),
+            "the frame after a rejected one still reaches the viewer"
         );
     }
 
