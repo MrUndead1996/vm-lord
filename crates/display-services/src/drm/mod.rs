@@ -503,7 +503,8 @@ mod tests {
             DRM_IOCTL_MODE_OBJ_GETPROPERTIES, DRM_IOCTL_PRIME_HANDLE_TO_FD,
             DRM_IOCTL_SET_CLIENT_CAP, DRM_IOCTL_WAIT_VBLANK, DmaBufSync, DrmGemClose,
             DrmModeFbCmd2, DrmModeGetPlane, DrmModeObjGetProperties, DrmPrimeHandle,
-            DrmSetClientCap, DrmWaitVblank, io_none, io_write, io_write_read,
+            DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888, DrmSetClientCap, DrmWaitVblank, io_none,
+            io_write, io_write_read,
         },
     };
 
@@ -534,6 +535,23 @@ mod tests {
         // would be a request the kernel has never heard of, and the master
         // this process holds would stay held.
         assert_eq!(DRM_IOCTL_DROP_MASTER, 0x0000_641f);
+    }
+
+    #[test]
+    fn the_formats_are_the_fourccs_drm_fourcc_h_publishes() {
+        // Both of these were once hand-written hexadecimal with two digits
+        // transposed -- ` RX4` and `ARC4` rather than `XR24` and `AR24` -- and
+        // nothing noticed, because a fourcc nobody publishes matches no
+        // framebuffer at all: every plane was refused as unmappable, and the
+        // picture was black while the guest's desktop was perfectly fine.
+        assert_eq!(DRM_FORMAT_XRGB8888, 0x3432_5258);
+        assert_eq!(DRM_FORMAT_ARGB8888, 0x3432_5241);
+        assert_eq!(
+            DRM_FORMAT_XRGB8888.to_le_bytes(),
+            *b"XR24",
+            "a fourcc is its four letters, least significant first"
+        );
+        assert_eq!(DRM_FORMAT_ARGB8888.to_le_bytes(), *b"AR24");
     }
 
     #[test]
