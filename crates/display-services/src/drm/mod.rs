@@ -25,7 +25,8 @@ use crate::ipc::PlaneKind;
 
 use uapi::{
     DMA_BUF_IOCTL_SYNC, DRM_CLIENT_CAP_UNIVERSAL_PLANES, DRM_FORMAT_ARGB8888,
-    DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_XRGB8888, DRM_IOCTL_GEM_CLOSE, DRM_IOCTL_MODE_GETFB2,
+    DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_XRGB8888, DRM_IOCTL_DROP_MASTER, DRM_IOCTL_GEM_CLOSE,
+    DRM_IOCTL_MODE_GETFB2,
     DRM_IOCTL_MODE_GETPLANE, DRM_IOCTL_MODE_GETPLANERESOURCES, DRM_IOCTL_MODE_GETPROPERTY,
     DRM_IOCTL_MODE_OBJ_GETPROPERTIES, DRM_IOCTL_PRIME_HANDLE_TO_FD, DRM_IOCTL_SET_CLIENT_CAP,
     DRM_IOCTL_WAIT_VBLANK, DRM_MODE_OBJECT_PLANE, DRM_VBLANK_RELATIVE, DmaBufSync, DrmGemClose,
@@ -63,6 +64,14 @@ pub struct PlaneState {
     pub x: i32,
     /// The plane's top edge on the CRTC, negative at the top edge.
     pub y: i32,
+    /// Whether the buffer behind [`Self::fb_id`] is not the one that id named
+    /// the last time this plane was read.
+    ///
+    /// A framebuffer id is the kernel's, and the kernel hands it out again
+    /// once the framebuffer it named is destroyed. Anything that remembers a
+    /// buffer by its id -- the peer this is sent to, above all -- has to be
+    /// told when the id changed hands.
+    pub fresh: bool,
 }
 
 /// The guest's own output, opened for reading.
@@ -72,6 +81,14 @@ pub struct Device {
     /// descriptor, and a compositor cycles through a handful of buffers, so
     /// they are kept rather than re-exported every frame.
     buffers: HashMap<u32, OwnedFd>,
+    /// Which buffer each framebuffer id last named, as the dma-buf's inode.
+    ///
+    /// Kept past the descriptor it belongs to: a compositor that flips between
+    /// two buffers leaves one of them off every other vblank, and forgetting
+    /// what its id meant would make the next vblank look like a new buffer.
+    /// What this is for is the other case -- an id the kernel gave to
+    /// something else.
+    identities: HashMap<u32, u64>,
     /// Property names by id, learned once. Ids are per device and do not move.
     property_names: HashMap<u32, String>,
 }
@@ -136,15 +153,47 @@ impl Device {
             return Ok(None);
         };
 
-        let path = crate::unix::c_string(&dev_root.join(card))?;
+        let node = dev_root.join(&card);
+        let path = crate::unix::c_string(&node)?;
         // SAFETY: `path` is a NUL-terminated path that lives across the call.
-        // No master is taken and none is asked for: the compositor holds it.
         let raw = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
         if raw < 0 {
             return Err(io::Error::last_os_error());
         }
         // SAFETY: `open` returned a descriptor this process now owns.
         let descriptor = unsafe { OwnedFd::from_raw_fd(raw) };
+
+        // The kernel makes the first client to open a primary node its master,
+        // asked for or not, and this broker starts at boot -- before any
+        // compositor. Holding it would answer the compositor's `SET_MASTER`
+        // with `EBUSY`, and the desktop would light some other card instead.
+        // Nothing here needs it: reading planes and waiting for the clock are
+        // an ordinary client's business.
+        //
+        // SAFETY: `descriptor` is an owned descriptor for a DRM primary node,
+        // and `DROP_MASTER` takes no argument -- the null pointer is what the
+        // ABI expects for an `_IO` request.
+        let dropped = unsafe { libc::ioctl(descriptor.as_raw_fd(), DRM_IOCTL_DROP_MASTER as _, 0) };
+        // Said out loud either way. Whether this process was handed the master
+        // is the difference between a compositor that can take this card and
+        // one that is answered `EBUSY`, and it is not otherwise visible from
+        // outside: nothing in `/proc` or `/sys` names a card's master.
+        if dropped >= 0 {
+            eprintln!(
+                "vmlord-display-broker: opened {} first, so the kernel made this process its                  DRM master; dropped it for the compositor",
+                node.display()
+            );
+        } else {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                eprintln!(
+                    "vmlord-display-broker: opened {} without being made its DRM master,                      so something else holds it",
+                    node.display()
+                );
+            } else {
+                eprintln!("vmlord-display-broker: could not drop DRM master: {error}");
+            }
+        }
 
         let mut capability = DrmSetClientCap {
             capability: DRM_CLIENT_CAP_UNIVERSAL_PLANES,
@@ -159,6 +208,7 @@ impl Device {
         Ok(Some(Self {
             descriptor,
             buffers: HashMap::new(),
+            identities: HashMap::new(),
             property_names: HashMap::new(),
         }))
     }
@@ -240,9 +290,10 @@ impl Device {
                 ));
             }
 
-            self.export(plane.fb_id, framebuffer.handles[0])?;
+            let fresh = self.export(plane.fb_id, framebuffer.handles[0])?;
             seen.push(plane.fb_id);
             states.push(PlaneState {
+                fresh,
                 kind,
                 fb_id: plane.fb_id,
                 width: framebuffer.width,
@@ -377,7 +428,7 @@ impl Device {
     ///
     /// The handle `GETFB2` created is closed either way: handles live in this
     /// file, and a walk that leaked one per frame would exhaust the device.
-    fn export(&mut self, fb_id: u32, handle: u32) -> io::Result<()> {
+    fn export(&mut self, fb_id: u32, handle: u32) -> io::Result<bool> {
         if handle == 0 {
             return Err(io::Error::new(
                 ErrorKind::Unsupported,
@@ -385,20 +436,23 @@ impl Device {
             ));
         }
 
-        let exported = if self.buffers.contains_key(&fb_id) {
-            Ok(None)
-        } else {
-            self.prime(handle).map(Some)
-        };
+        // Exported every time, because the buffer itself is the only honest
+        // answer to "is this the one that was here before?": the framebuffer
+        // id is not, and the GEM handle is a name this call was just given.
+        // An ioctl and a descriptor a vblank is what that costs.
+        let exported = self.prime(handle);
 
         let mut close = DrmGemClose { handle, pad: 0 };
         let _ = ioctl(self.descriptor.as_raw_fd(), DRM_IOCTL_GEM_CLOSE, &mut close);
 
-        if let Some(descriptor) = exported? {
+        let descriptor = exported?;
+        let inode = inode_of(&descriptor)?;
+        let fresh = self.identities.insert(fb_id, inode) != Some(inode);
+        if fresh || !self.buffers.contains_key(&fb_id) {
             self.buffers.insert(fb_id, descriptor);
         }
 
-        Ok(())
+        Ok(fresh)
     }
 
     fn prime(&self, handle: u32) -> io::Result<OwnedFd> {
@@ -420,6 +474,23 @@ impl Device {
         // SAFETY: the kernel filled in a descriptor this process now owns.
         Ok(unsafe { OwnedFd::from_raw_fd(request.fd) })
     }
+}
+
+/// The inode of an exported dma-buf, which is the buffer's own name.
+///
+/// Every dma-buf gets one file in the kernel's anonymous filesystem, and
+/// exporting the same buffer again answers with that same file. So two exports
+/// with one inode are one buffer, and two inodes are two -- whatever ids the
+/// framebuffers they hang off happen to have been given.
+fn inode_of(descriptor: &OwnedFd) -> io::Result<u64> {
+    // SAFETY: `stat` is written by the call and `descriptor` is a live fd.
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    // SAFETY: the descriptor is owned and `stat` is valid for writes.
+    if unsafe { libc::fstat(descriptor.as_raw_fd(), &raw mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(stat.st_ino)
 }
 
 /// Brackets a CPU read of a dma-buf.
@@ -466,10 +537,12 @@ mod tests {
     use super::{
         card_named,
         uapi::{
-            DRM_IOCTL_GEM_CLOSE, DRM_IOCTL_MODE_GETFB2, DRM_IOCTL_MODE_OBJ_GETPROPERTIES,
-            DRM_IOCTL_PRIME_HANDLE_TO_FD, DRM_IOCTL_SET_CLIENT_CAP, DRM_IOCTL_WAIT_VBLANK,
-            DmaBufSync, DrmGemClose, DrmModeFbCmd2, DrmModeGetPlane, DrmModeObjGetProperties,
-            DrmPrimeHandle, DrmSetClientCap, DrmWaitVblank, io_write, io_write_read,
+            DRM_IOCTL_DROP_MASTER, DRM_IOCTL_GEM_CLOSE, DRM_IOCTL_MODE_GETFB2,
+            DRM_IOCTL_MODE_OBJ_GETPROPERTIES, DRM_IOCTL_PRIME_HANDLE_TO_FD,
+            DRM_IOCTL_SET_CLIENT_CAP, DRM_IOCTL_WAIT_VBLANK, DmaBufSync, DrmGemClose,
+            DrmModeFbCmd2, DrmModeGetPlane, DrmModeObjGetProperties, DrmPrimeHandle,
+            DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888, DrmSetClientCap, DrmWaitVblank, io_none,
+            io_write, io_write_read,
         },
     };
 
@@ -488,6 +561,7 @@ mod tests {
         // why, so these are spelled out rather than trusted.
         assert_eq!(io_write(0x64, 0x09, 8), 0x4008_6409);
         assert_eq!(io_write_read(0x64, 0x2d, 12), 0xc00c_642d);
+        assert_eq!(io_none(0x64, 0x1f), 0x0000_641f);
 
         assert_eq!(DRM_IOCTL_GEM_CLOSE, 0x4008_6409);
         assert_eq!(DRM_IOCTL_SET_CLIENT_CAP, 0x4010_640d);
@@ -495,6 +569,27 @@ mod tests {
         assert_eq!(DRM_IOCTL_WAIT_VBLANK, 0xc018_643a);
         assert_eq!(DRM_IOCTL_MODE_OBJ_GETPROPERTIES, 0xc020_64b9);
         assert_eq!(DRM_IOCTL_MODE_GETFB2, 0xc068_64ce);
+        // `_IO('d', 0x1f)`: no size and no direction. Encoded as `_IOW` it
+        // would be a request the kernel has never heard of, and the master
+        // this process holds would stay held.
+        assert_eq!(DRM_IOCTL_DROP_MASTER, 0x0000_641f);
+    }
+
+    #[test]
+    fn the_formats_are_the_fourccs_drm_fourcc_h_publishes() {
+        // Both of these were once hand-written hexadecimal with two digits
+        // transposed -- ` RX4` and `ARC4` rather than `XR24` and `AR24` -- and
+        // nothing noticed, because a fourcc nobody publishes matches no
+        // framebuffer at all: every plane was refused as unmappable, and the
+        // picture was black while the guest's desktop was perfectly fine.
+        assert_eq!(DRM_FORMAT_XRGB8888, 0x3432_5258);
+        assert_eq!(DRM_FORMAT_ARGB8888, 0x3432_5241);
+        assert_eq!(
+            DRM_FORMAT_XRGB8888.to_le_bytes(),
+            *b"XR24",
+            "a fourcc is its four letters, least significant first"
+        );
+        assert_eq!(DRM_FORMAT_ARGB8888.to_le_bytes(), *b"AR24");
     }
 
     #[test]

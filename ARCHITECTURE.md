@@ -764,8 +764,11 @@ available whichever state the VM is in;
 Delete stays limited to stopped VMs. `Open COM port` is enabled only while the
 VM runs, and reopens the serial console described under "The COM1 diagnostic
 console" -- the UI calls `WorkspaceApp::open_console` and nothing else, since a
-named pipe is the platform layer's business. Snapshots remain future
-application-layer work.
+named pipe is the platform layer's business. `Connect` follows the derived
+display status rather than the VM's state -- a running VM whose desktop is
+still installing has nothing to open a window on -- and shows that status's own
+sentence while it cannot be pressed. Snapshots remain future application-layer
+work.
 
 Under `VMLORD_BACKEND=legacy`, the same actions reach AppSandbox's C API
 instead: Start invokes `asb_vm_start`; Stop invokes the graceful
@@ -2847,9 +2850,18 @@ dead one.
 `MODE_AUTO`, `MODE_DESKTOP` and `MODE_MOTION` all exist in the contract, and
 the MVP guest announces `MODE_DESKTOP` alone. `MODE_AUTO` names a host-side
 policy that resolves to `MODE_DESKTOP` until a motion codec exists; a request
-for `MODE_MOTION` is answered with `ERROR_CODE_UNSUPPORTED_MODE`. None of this
-is wired into a running VM yet: Connect still opens the AppSandbox IDD window,
-and it will until the native display path is proven end to end.
+for `MODE_MOTION` is answered with `ERROR_CODE_UNSUPPORTED_MODE`.
+
+Connect on the native backend opens this stack. Every VM's compute system
+lists all three services beside the agent's -- an entry there is the
+partition's permission for a service to exist, not a claim that the guest
+binds it, so a headless VM lists them too and a VM created before they existed
+has to be recreated rather than migrated. The repository refuses a session
+before it starts one, a sentence per reason: a VM created without a desktop, a
+desktop still installing, a VM that is not running, a guest that has not
+offered its display. What gets past that is one viewer process per Connect.
+The legacy backend still opens the AppSandbox IDD window, and will until #129
+removes it.
 
 ### The guest display services
 
@@ -2954,8 +2966,18 @@ contract, the overlay's geometry -- is safe Rust with tests that need no
 partition. Framebuffer and cursor content is never logged, and this build has no
 screenshot feature.
 
-What is deliberately not there yet: the HCS service entries and the Connect
-path that launches the binary (#121).
+VMLord's half of that crossing is `platform::display_session`: a state machine
+over launch-pipe messages that holds the VM's secret and the protocol
+`Session`, answers a relayed record with the record to send back, and answers
+an established handshake with the hand-over. It is driven by
+`platform::display_launches`, which starts the process, writes its launch
+parameters and keeps a thread on its pipes -- a thread deliberately never
+joined, because a display session outlives the application that opened it:
+VMLord exiting closes the pipes, which costs the viewer the right to ask for a
+fresh session and nothing else. Stopping a VM sends nothing either; the
+partition goes and the viewer's next connect fails with it. A repeated Connect
+starts a second process, which finds the named mutex taken, asks the window
+that is already open to come forward, and exits.
 
 ### Keyboard and mouse
 
@@ -3129,10 +3151,26 @@ into a `VmDisplayStatus` -- `DisplayState` for the glance (`Disabled`,
 `Provisioning`, `WaitingForGuest`, `Ready`, `Degraded`), `DisplayStage` for
 where the reading came from, `DisplayStatusCode` for exactly why, and a message
 for the detail. The shape is the GPU's on purpose: a backend reports facts and
-never names a state, the UI paints a state and never works one out. Nothing
-fills the guest half of the facts yet -- the services that would report it are
-#115 -- so a native VM reads as waiting for its guest once its desktop is
-installed.
+never names a state, the UI paints a state and never works one out.
+
+Readiness is the display recipe's last stage. The guest marks `SERVICES_START`
+`Ok` only once both units are active and the socket between them exists, which
+is exactly the fact a viewer needs, so the host reads it out of the report the
+agent already delivers rather than asking a second question over that channel.
+A recipe that skipped the stage -- a payload built before the services existed
+-- is a display that will never arrive and is reported as failed rather than
+waited for. The recipe is applied once per agent session, so a guest that
+reconnects re-reports, and nothing survives the run: a readiness observed
+before a stop says nothing about a guest that is not running.
+
+That same report is what finally moves `DisplayProvisioning` off `Pending`.
+Nothing on the host can watch cloud-init install a desktop -- it happens on the
+first boot, long after the creation pipeline has finished, and no guest message
+reports the package set -- but a guest running its display services is running
+them on top of that desktop. The first time one reports, the stored
+provisioning is written as `Ready`, which is also what keeps a stopped VM
+reading as a VM whose desktop is not running rather than one whose desktop
+never arrived.
 
 The desktop itself comes from the distribution's own archives. `DistroProfile`
 carries a `DesktopSetup` -- the packages and the display manager unit -- and
@@ -3238,7 +3276,8 @@ digest -- before anything is copied), `BUILD_DEPENDENCIES` (`dkms`,
 `MODULE_SOURCE` (copied to `/usr/src/vmlord-display-<version>`, because 9p is
 read-only and DKMS writes beside its sources), `MODULE_BUILD`, `MODULE_LOAD`
 (`modules-load.d`, the modprobe options, the unit that unbinds
-`simple-framebuffer`, and `modprobe`), `DEVICE` (a `/dev/dri/card*` whose
+`simple-framebuffer`, the drop-in that keeps the compositor on the
+distribution's Mesa, and `modprobe`), `DEVICE` (a `/dev/dri/card*` whose
 driver is ours), and `SERVICES`/`SERVICES_START`, which are skipped with their
 reason until task #115 fills `content/services`.
 
@@ -3249,6 +3288,18 @@ a VM and a payload is shared by all of them. A VM with no stored mode gets
 under a module already loaded costs a `modprobe -r` and a `modprobe`, because a
 module parameter is read once; a module that does not say what it was loaded
 with is left alone, because a reload on a guess drops a working desktop.
+
+The drop-in is the opposite kind of file: identical for every VM, so it is
+copied out of the payload. It lands on `org.gnome.Shell@.service`, which is a
+template, so it reaches the greeter's compositor and a logged-in user's both,
+and it says two things -- the GPU recipe's Mesa overrides unset, and
+`LD_LIBRARY_PATH` pointed at the distribution's libraries. Both, because the
+GPU recipe reaches a process by two paths: the environment it exports, and
+`/etc/ld.so.conf.d/vmlord-wsl-mesa.conf`, which no environment can undo. A
+compositor left on the payload's Mesa binds our device, fails to allocate a
+buffer on it, and never finishes its modeset; applications, which is where the
+GPU was wanted, keep the whole environment. A drop-in is read when a unit next
+starts, and on a normal boot this recipe runs before the greeter does.
 
 Idempotence is by fact and not by a flag: the payload's version installed, the
 module loaded and a device that answers short-circuits the three build stages,

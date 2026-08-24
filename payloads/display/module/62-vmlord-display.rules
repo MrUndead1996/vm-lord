@@ -1,0 +1,21 @@
+# Keep the desktop on VMLord's output, and only on it.
+#
+# A Hyper-V guest has a synthetic display of its own -- simpledrm at first,
+# hyperv_drm once that is unbound -- and a compositor that finds two cards
+# lights both. The second monitor is one nobody can see: it is drawn on the
+# Hyper-V console, not in the viewer's window. Worse than useless, because an
+# absolute pointer is mapped across the whole desktop, so with a 1024x768
+# monitor beside a 1920x1080 one the guest's cursor lands about a third to the
+# right of where the user pointed and clicks miss whatever they aimed at.
+# Task #121 measured exactly that on a live guest.
+#
+# `mutter-device-ignore` is the tag mutter already reads for a card that is not
+# a display -- 61-mutter.rules uses it for vkms -- and this file sorts after
+# that one so the tag is added rather than overwritten.
+#
+# The TEST is what keeps this from taking the only display a guest has: with no
+# vmlord_drm loaded -- a payload that failed to build, a kernel it will not
+# compile against -- the Hyper-V card stays exactly what it was, and the guest
+# has a desktop on the console instead of none at all.
+SUBSYSTEM=="drm", KERNEL=="card[0-9]*", DRIVERS=="hyperv_drm", \
+    TEST=="/sys/devices/platform/vmlord_drm.0/drm", TAG+="mutter-device-ignore"

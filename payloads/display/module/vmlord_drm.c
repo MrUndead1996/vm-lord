@@ -79,6 +79,26 @@
 #define VMLORD_MAX_WIDTH  2560
 #define VMLORD_MAX_HEIGHT 1440
 
+/*
+ * The smallest framebuffer this device accepts, which is a different number
+ * from the smallest mode it offers.
+ *
+ * mode_config's minimum bounds every framebuffer that is created on the device,
+ * the 256x256 cursor buffer a compositor allocates included -- and a minimum of
+ * 640x480 there refused that cursor's ADDFB2 with EINVAL. Mutter, which will
+ * not light an output whose cursor plane it could not fill, left the connector
+ * disabled and the desktop black. Task #131 measured it on a live guest:
+ *
+ *     drm_internal_framebuffer_create: bad framebuffer width 256,
+ *                                      should be >= 640 && <= 2560
+ *
+ * The mode bounds above stay where they are. They are a statement about what
+ * the host's window may ask this output to be, and they were never about
+ * buffers.
+ */
+#define VMLORD_MIN_FB_WIDTH  64
+#define VMLORD_MIN_FB_HEIGHT 64
+
 #define VMLORD_DEFAULT_WIDTH  1920
 #define VMLORD_DEFAULT_HEIGHT 1080
 
@@ -407,8 +427,8 @@ static int vmlord_mode_config_init(struct vmlord_device *vmlord)
 	if (error)
 		return error;
 
-	drm->mode_config.min_width = VMLORD_MIN_WIDTH;
-	drm->mode_config.min_height = VMLORD_MIN_HEIGHT;
+	drm->mode_config.min_width = VMLORD_MIN_FB_WIDTH;
+	drm->mode_config.min_height = VMLORD_MIN_FB_HEIGHT;
 	drm->mode_config.max_width = VMLORD_MAX_WIDTH;
 	drm->mode_config.max_height = VMLORD_MAX_HEIGHT;
 	drm->mode_config.preferred_depth = 24;

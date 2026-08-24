@@ -41,6 +41,8 @@ RUN set -eu; \
              /output/prepared/licenses; \
     cp /src/module/vmlord_drm.c /src/module/vmlord_compat.h \
        /src/module/vmlord-display-unbind-simpledrm.service \
+       /src/module/vmlord-display-compositor-mesa.conf \
+       /src/module/62-vmlord-display.rules \
        /output/prepared/content/drm/; \
     sed "s/^VMLORD_VERSION ?= .*/VMLORD_VERSION ?= ${VERSION}/" /src/module/Kbuild \
        > /output/prepared/content/drm/Kbuild; \

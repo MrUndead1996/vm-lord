@@ -194,18 +194,30 @@ pub fn run(options: Options) -> std::process::ExitCode {
 
 /// The body of [`run`], so that every failure is one `?` away from a log line.
 fn serve(options: &Options) -> io::Result<()> {
-    let secret = read_secret(&options.secret_path)?;
+    let secret = at("reading the VM's secret", read_secret(&options.secret_path))?;
 
-    let device = wait_for_device(options.device_deadline, || {
-        Device::find(&options.driver, &options.sysfs_class, &options.dev_root)
-    })?;
+    let device = at(
+        "waiting for the display device",
+        wait_for_device(options.device_deadline, || {
+            Device::find(&options.driver, &options.sysfs_class, &options.dev_root)
+        }),
+    )?;
 
-    let (uid, gid) = service_account(&options.user)?;
+    let (uid, gid) = at("looking up the service account", service_account(&options.user))?;
     if let Some(directory) = options.socket.parent() {
-        std::fs::create_dir_all(directory)?;
+        at(
+            "creating the socket's directory",
+            std::fs::create_dir_all(directory),
+        )?;
     }
-    let listener = Listener::bind(&options.socket, gid)?;
-    let control = vsock::Listener::bind(CONTROL_PORT)?;
+    let listener = at(
+        "binding the socket to the session process",
+        Listener::bind(&options.socket, gid),
+    )?;
+    let control = at(
+        "binding the control service",
+        vsock::Listener::bind(CONTROL_PORT),
+    )?;
 
     let shared: Shared = Arc::new((Mutex::new(BrokerState::default()), Condvar::new()));
     let output = Output::new(&options.mode);
@@ -233,13 +245,29 @@ fn serve(options: &Options) -> io::Result<()> {
         serve_sessions(&control, &secret, &output, &shared);
 
         // Nothing above returns while the broker is healthy, so reaching here
-        // means the control listener failed and the others are owed the news.
+        // means a thread has stopped and the others are owed the news.
         stop(&shared);
         let _ = ipc.join();
         let _ = capture.join();
     });
 
-    Ok(())
+    // A fault is why this broker is no longer able to show anything, and
+    // exiting with it is what asks systemd for a fresh one. Returning success
+    // here would leave `Restart=on-failure` with nothing to act on.
+    match take_fault(&shared) {
+        Some(reason) => Err(io::Error::other(reason)),
+        None => Ok(()),
+    }
+}
+
+/// Names the step an error came from.
+///
+/// Every failure in `serve` is one `?` from the single line this unit writes
+/// before it exits, and a bare `Operation not permitted` there names neither
+/// the call that was refused nor the privilege it wanted. The step is what
+/// turns that line into a diagnosis.
+fn at<T>(step: &'static str, outcome: io::Result<T>) -> io::Result<T> {
+    outcome.map_err(|error| io::Error::new(error.kind(), format!("{step}: {error}")))
 }
 
 /// The two input devices, or nothing at all.
@@ -522,6 +550,11 @@ fn send_to_peer(shared: &Shared, message: &Message) {
 
 /// Reads the planes at every vblank a frame was asked for.
 fn capture_frames(mut device: Device, shared: &Shared) {
+    // How many times in a row the clock has answered "this output is not
+    // being driven". Kept to pace the retry and to say so once rather than
+    // sixty times a second.
+    let mut unlit: u32 = 0;
+
     loop {
         let Some(peer) = wait_for_request(shared) else {
             return;
@@ -531,9 +564,25 @@ fn capture_frames(mut device: Device, shared: &Shared) {
             if error.kind() == ErrorKind::Interrupted {
                 continue;
             }
+            // `EINVAL` is what the kernel answers while this output's vblank
+            // is off: no compositor has lit it yet, or the desktop has
+            // blanked. Neither is a fault -- there is simply nothing to
+            // capture this instant -- and ending the session over it would
+            // close a window that a moving mouse is about to fill.
+            if error.raw_os_error() == Some(libc::EINVAL) {
+                idle_until_the_output_is_lit(&mut unlit);
+                continue;
+            }
             fault(shared, &format!("the output's clock failed: {error}"));
+            stop(shared);
 
             return;
+        }
+        if unlit > 0 {
+            eprintln!(
+                "vmlord-display-broker: the output is lit again after {unlit} attempts at its clock"
+            );
+            unlit = 0;
         }
 
         let planes = match device.snapshot() {
@@ -543,6 +592,13 @@ fn capture_frames(mut device: Device, shared: &Shared) {
                     shared,
                     &format!("reading the output's planes failed: {error}"),
                 );
+                // And the whole broker with it. A capture thread that has
+                // returned leaves a process that still answers on the control
+                // port and can never fill a session again: every Connect after
+                // it opens a window that stays black. Ending here hands the
+                // restart to systemd, which is what `Restart=on-failure` and
+                // the crash-loop budget beside it are for.
+                stop(shared);
 
                 return;
             }
@@ -571,6 +627,26 @@ fn capture_frames(mut device: Device, shared: &Shared) {
         send_snapshot(&device, &peer, shared, &planes);
     }
 }
+
+/// Waits out an output nothing is driving, and says so the first time.
+///
+/// A desktop that has not been lit yet and one that has blanked look the same
+/// from here, and both end when something commits a mode -- which is an event
+/// this process does not get told about, so it asks again. The pace is a
+/// frame's worth of time: often enough that the picture returns immediately,
+/// rarely enough that an unlit guest costs nothing.
+fn idle_until_the_output_is_lit(attempts: &mut u32) {
+    if *attempts == 0 {
+        eprintln!(
+            "vmlord-display-broker: this output has no clock yet -- nothing has lit it.              Waiting; the desktop's compositor is what turns it on."
+        );
+    }
+    *attempts = attempts.saturating_add(1);
+    thread::sleep(UNLIT_POLL);
+}
+
+/// How long the capture loop rests while nothing is driving the output.
+const UNLIT_POLL: Duration = Duration::from_millis(100);
 
 /// Waits until a frame is wanted, and says who wants it.
 ///
@@ -618,9 +694,7 @@ fn send_snapshot(device: &Device, peer: &Arc<Connection>, shared: &Shared, plane
             y: plane.y,
         });
 
-        // A descriptor costs a syscall and a slot in the peer's table, so each
-        // buffer crosses once and is named by its id thereafter.
-        if state.sent.contains(&plane.fb_id) {
+        if !owes_descriptor(plane, &state.sent) {
             continue;
         }
         let Some(buffer) = device.buffer(plane.fb_id) else {
@@ -638,6 +712,20 @@ fn send_snapshot(device: &Device, peer: &Arc<Connection>, shared: &Shared, plane
     if peer.send(&message, &descriptors).is_ok() {
         state.sent.extend(new_buffers.iter().map(|id| *id as u32));
     }
+}
+
+/// Whether this plane's buffer has to cross to the peer now.
+///
+/// A descriptor costs a syscall and a slot in the peer's table, so each buffer
+/// crosses once and is named by its framebuffer id thereafter. The kernel
+/// hands those ids out again, though: a framebuffer that is destroyed leaves
+/// its number for the next one, and the peer would go on reading the buffer
+/// that number used to mean. Task #121 watched a login do exactly that -- the
+/// greeter's cursor gave its id to the new session's desktop, and the picture
+/// froze on the last frame the greeter drew. So a plane whose buffer is not
+/// the one that id named before is sent again, whatever the peer holds.
+fn owes_descriptor(plane: &PlaneState, sent: &HashSet<u32>) -> bool {
+    plane.fresh || !sent.contains(&plane.fb_id)
 }
 
 /// The geometry a session opening now is offered.
@@ -752,7 +840,140 @@ fn stop(shared: &Shared) {
 mod tests {
     use std::{cell::Cell, io, time::Duration};
 
-    use super::wait_for_device;
+    use super::{SOCKET_PATH, wait_for_device};
+
+    /// The unit that ships in the payload, as the guest will read it.
+    const BROKER_UNIT: &str =
+        include_str!("../../../payloads/display/services/vmlord-display-broker.service");
+
+    /// A plane over a framebuffer id, with everything else out of the way.
+    fn plane(fb_id: u32, fresh: bool) -> super::PlaneState {
+        super::PlaneState {
+            kind: crate::ipc::PlaneKind::Primary,
+            fb_id,
+            width: 1920,
+            height: 1080,
+            stride: 1920 * 4,
+            format: 0,
+            x: 0,
+            y: 0,
+            fresh,
+        }
+    }
+
+    #[test]
+    fn a_framebuffer_id_that_now_names_another_buffer_is_sent_again() {
+        // The kernel hands framebuffer ids out again. A login does it: the
+        // greeter's cursor is destroyed and the new session's desktop takes
+        // its number. A peer told once and never again goes on reading the
+        // cursor -- which is what froze the picture on the last frame the
+        // greeter drew.
+        let sent = std::collections::HashSet::from([7]);
+
+        assert!(
+            super::owes_descriptor(&plane(7, true), &sent),
+            "the id is the same and the buffer is not, so the peer holds the wrong one"
+        );
+        assert!(
+            !super::owes_descriptor(&plane(7, false), &sent),
+            "the same buffer under the same id crosses once"
+        );
+        assert!(
+            super::owes_descriptor(&plane(9, false), &sent),
+            "a buffer the peer has never been sent has to cross"
+        );
+    }
+
+    #[test]
+    fn a_startup_failure_names_the_step_it_failed_at() {
+        let refused = super::at(
+            "binding the socket to the session process",
+            Err::<(), _>(io::Error::from(io::ErrorKind::PermissionDenied)),
+        )
+        .expect_err("what was passed in");
+
+        assert!(
+            refused.to_string().contains("binding the socket"),
+            "a bare `Operation not permitted` names neither the call nor the privilege"
+        );
+        assert_eq!(
+            refused.kind(),
+            io::ErrorKind::PermissionDenied,
+            "the kind survives, because a caller may still branch on it"
+        );
+    }
+
+    #[test]
+    fn the_unit_creates_the_directory_the_socket_lives_in() {
+        // systemd sets up the mount namespace before ExecStart, so a directory
+        // named there has to exist before this process could create it -- and
+        // `bind` would fail on a missing parent even if the namespace were set
+        // up. `RuntimeDirectory=` is what creates it, early enough for both.
+        let directory = std::path::Path::new(SOCKET_PATH)
+            .parent()
+            .expect("the socket has a directory")
+            .file_name()
+            .expect("that directory has a name")
+            .to_str()
+            .expect("a name this repository wrote");
+
+        assert!(
+            BROKER_UNIT.contains(&format!("RuntimeDirectory={directory}")),
+            "the unit must create /run/{directory} rather than assume it"
+        );
+        assert!(
+            !BROKER_UNIT.contains(&format!("ReadWritePaths=/run/{directory}")),
+            "a ReadWritePaths on a directory nothing creates is what fails at NAMESPACE;              RuntimeDirectory already makes it writable"
+        );
+    }
+
+    #[test]
+    fn the_unit_grants_the_capability_the_socket_is_handed_over_with() {
+        // The socket is bound by root and read by the service user, so `bind`
+        // gives it that user's group -- and changing a file's group to one the
+        // caller does not belong to is `CAP_CHOWN`, which root does not have
+        // once the bounding set has taken it away. Without it the broker exits
+        // with EPERM before it has listened for anything.
+        assert!(
+            BROKER_UNIT
+                .lines()
+                .find(|line| line.starts_with("CapabilityBoundingSet="))
+                .is_some_and(|line| line.contains("CAP_CHOWN")),
+            "the broker chowns its socket, so the bounding set has to allow it"
+        );
+    }
+
+    #[test]
+    fn the_crash_loop_budget_is_where_systemd_reads_it() {
+        // Under [Service] systemd answers these with `Unknown key ...,
+        // ignoring`: a rate limit that is silently not one, and a unit that
+        // restarts forever on a fault nobody is told about.
+        const SESSION_UNIT: &str =
+            include_str!("../../../payloads/display/services/vmlord-display-session.service");
+
+        for unit in [BROKER_UNIT, SESSION_UNIT] {
+            // Split on the section header itself: a comment may well mention
+            // the name of the section it is warning about.
+            let service = unit
+                .split_once("\n[Service]\n")
+                .expect("every unit has a service section")
+                .1;
+
+            assert!(unit.contains("StartLimitIntervalSec="));
+            assert!(
+                !service.contains("StartLimit"),
+                "the crash-loop budget belongs to [Unit]"
+            );
+        }
+    }
+
+    #[test]
+    fn a_broker_restart_does_not_take_the_directory_from_the_session() {
+        // The capture process holds a namespace over the same directory and
+        // reconnects through the same path. A runtime directory removed on
+        // every restart would fail its namespace setup instead.
+        assert!(BROKER_UNIT.contains("RuntimeDirectoryPreserve=yes"));
+    }
 
     #[test]
     fn a_device_that_is_not_there_yet_is_waited_for_rather_than_failed_on() {

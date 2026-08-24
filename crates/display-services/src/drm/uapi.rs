@@ -18,6 +18,12 @@ pub const fn io_write_read(kind: u32, number: u32, size: u32) -> libc::c_ulong {
     ((3 << 30) | (size << 16) | (kind << 8) | number) as libc::c_ulong
 }
 
+/// `_IOC(_IOC_NONE, ..)`, the encoding `_IO` builds: no argument, no size.
+#[must_use]
+pub const fn io_none(kind: u32, number: u32) -> libc::c_ulong {
+    ((kind << 8) | number) as libc::c_ulong
+}
+
 /// The `'d'` every DRM request is built on.
 const DRM: u32 = 0x64;
 
@@ -34,6 +40,14 @@ pub const DRM_IOCTL_SET_CLIENT_CAP: libc::c_ulong =
 /// Exports a GEM handle as a dma-buf descriptor.
 pub const DRM_IOCTL_PRIME_HANDLE_TO_FD: libc::c_ulong =
     io_write_read(DRM, 0x2d, size_of::<DrmPrimeHandle>() as u32);
+
+/// Gives up the mastership the kernel hands the first client to open a card.
+///
+/// Not an optional courtesy. A primary node's first opener becomes its master
+/// whether it asked or not, and the compositor's `SET_MASTER` then fails with
+/// `EBUSY` -- which is a guest whose desktop never lights this output. The
+/// broker starts at boot and is regularly that first opener.
+pub const DRM_IOCTL_DROP_MASTER: libc::c_ulong = io_none(DRM, 0x1f);
 
 /// Waits for the output's clock, which for task #114's module is an hrtimer.
 pub const DRM_IOCTL_WAIT_VBLANK: libc::c_ulong =
@@ -63,11 +77,27 @@ pub const DRM_IOCTL_MODE_GETFB2: libc::c_ulong =
 pub const DMA_BUF_IOCTL_SYNC: libc::c_ulong =
     io_write(DMA_BUF, 0x00, size_of::<DmaBufSync>() as u32);
 
+/// A DRM fourcc, built the way `drm_fourcc.h` builds one: four ASCII
+/// characters, least significant first.
+///
+/// Spelled as letters rather than as a hexadecimal literal because both of
+/// these constants were once written out by hand with two digits transposed,
+/// and a fourcc that is one nibble wrong is not a format the kernel has ever
+/// heard of: every framebuffer is then refused as unmappable, and a desktop
+/// that works perfectly shows up as a black window.
+#[must_use]
+pub const fn fourcc(code: &[u8; 4]) -> u32 {
+    (code[0] as u32)
+        | ((code[1] as u32) << 8)
+        | ((code[2] as u32) << 16)
+        | ((code[3] as u32) << 24)
+}
+
 /// Blue, green, red, one ignored byte. What a desktop's primary plane is.
-pub const DRM_FORMAT_XRGB8888: u32 = 0x3458_5220;
+pub const DRM_FORMAT_XRGB8888: u32 = fourcc(b"XR24");
 
 /// The same with an alpha channel. What a cursor plane is.
-pub const DRM_FORMAT_ARGB8888: u32 = 0x3443_5241;
+pub const DRM_FORMAT_ARGB8888: u32 = fourcc(b"AR24");
 
 /// The only modifier a capture that mmaps a buffer can read.
 pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;

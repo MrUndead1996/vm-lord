@@ -230,6 +230,7 @@ mod tests {
                 previous: Some("0.1.0".into()),
                 loaded: Some("0.2.0".into()),
                 failure: None,
+                guest: None,
             },
         };
 
@@ -254,6 +255,7 @@ mod tests {
                     DisplayStatusCode::PayloadUpdateRolledBack,
                     "0.2.0 did not verify; 0.1.0 is running again",
                 )),
+                guest: None,
             },
         };
 

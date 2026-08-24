@@ -53,6 +53,16 @@ const BIND_REPLY_WAIT: Duration = Duration::from_secs(2);
 /// How long the bind sleeps between polls of a socket that is merely quiet.
 const BIND_POLL: Duration = Duration::from_millis(1);
 
+/// How many frame records one pass reads before it hands back what it has.
+///
+/// A guest capturing a desktop leaves no gap between records, so a drain that
+/// ends only at a quiet socket has no end: the pass never returns, and what it
+/// has already collected -- the status the window shows, the pixels it draws --
+/// waits for a silence that never comes. Thirty-two records against the two
+/// milliseconds the session loop sleeps is some sixteen thousand a second, far
+/// more than a sixty-frame desktop asks for and still a pass that ends.
+const FRAMES_PER_PASS: usize = 32;
+
 /// What one pump produced.
 #[derive(Debug)]
 pub enum Signal {
@@ -441,7 +451,7 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
 
     /// Reads whatever the frame channel has, and decodes it.
     fn read_frames(&mut self, now: Instant, signals: &mut Vec<Signal>) {
-        loop {
+        for _ in 0..FRAMES_PER_PASS {
             let Some(socket) = self.frame.as_mut() else {
                 return;
             };
@@ -983,6 +993,37 @@ mod tests {
                 .any(|signal| matches!(signal, Signal::Damage(_)))
         );
         assert_eq!(live.video().geometry(), Some(geometry()));
+    }
+
+    #[test]
+    fn a_guest_that_never_stops_sending_does_not_keep_the_pass_from_returning() {
+        // A desktop under capture leaves no gap between records, so a drain
+        // that ends only at an idle socket ends never: everything the pass
+        // collected -- the status the window shows, the pixels it draws --
+        // waits behind a loop that has no reason to stop.
+        let (mut live, mut harness) = established();
+        let limits = Limits::new(320, 200);
+        record::write(&mut harness.frame, &stream_config_record(3, 0), &limits)
+            .expect("an in-memory socket");
+        // Enough waiting frames that draining them all is unmistakable.
+        let flood = 200u32;
+        for offset in 0..flood {
+            record::write(&mut harness.frame, &keyframe_record(4 + offset, 0), &limits)
+                .expect("an in-memory socket");
+        }
+
+        let mut signals = Vec::new();
+        live.pump(Instant::now(), &mut signals);
+
+        let damage = signals
+            .iter()
+            .filter(|signal| matches!(signal, Signal::Damage(_)))
+            .count();
+        assert!(
+            damage < flood as usize,
+            "one pass read all {flood} waiting frames, so nothing it collected reached the \
+             window until the guest fell silent"
+        );
     }
 
     #[test]

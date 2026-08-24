@@ -4,6 +4,12 @@ Documentation=https://github.com/mrundead/vmlord
 # No secret, no session: this is a VM that was never provisioned for a display.
 ConditionPathExists=/etc/vmlord/agent.secret
 
+# The crash-loop budget. It belongs to the unit and not to the service:
+# systemd reads these two here, and answers them under [Service] with
+# `Unknown key ... ignoring` -- a rate limit that silently is not one.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 [Service]
 ExecStart=/usr/local/lib/vmlord/vmlord-display-broker
 # The DRM device appears after the module loads, which is after this unit
@@ -11,11 +17,11 @@ ExecStart=/usr/local/lib/vmlord/vmlord-display-broker
 # would spend the crash-loop budget on the ordinary state of a booting guest.
 Restart=on-failure
 RestartSec=2
-StartLimitIntervalSec=60
-StartLimitBurst=5
-# GETFB2 will not hand a framebuffer's handles to anything less. Everything else
-# root could do is taken away.
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE
+# GETFB2 will not hand a framebuffer's handles to anything less than
+# CAP_SYS_ADMIN, and the socket this process binds is handed to the service
+# user by group -- which is CAP_CHOWN, because root belongs to no such group.
+# Everything else root could do is taken away.
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_CHOWN
 NoNewPrivileges=yes
 ProtectHome=yes
 # `strict` leaves /dev, /proc and /sys writable, which this unit needs: the
@@ -23,7 +29,15 @@ ProtectHome=yes
 # is resized cannot be answered without writing it. `ProtectKernelTunables`
 # would take that away and must not be added here.
 ProtectSystem=strict
-ReadWritePaths=/run/vmlord
+# The directory the socket between the two processes lives in. systemd creates
+# it before the mount namespace is set up, which is the only moment early
+# enough: a `ReadWritePaths=` naming a directory nothing creates fails the unit
+# at NAMESPACE, and `bind` would fail on the missing parent even if it did not.
+# Preserved across a restart because the capture process holds a namespace over
+# the same directory and reconnects through the same path -- a directory
+# removed on every restart would take that process down with it.
+RuntimeDirectory=vmlord
+RuntimeDirectoryPreserve=yes
 RestrictAddressFamilies=AF_VSOCK AF_UNIX
 RestrictNamespaces=yes
 MemoryDenyWriteExecute=yes

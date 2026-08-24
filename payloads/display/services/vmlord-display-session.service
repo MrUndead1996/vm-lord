@@ -5,13 +5,17 @@ Documentation=https://github.com/mrundead/vmlord
 # capture process down, and the process reconnects to the socket on its own.
 After=vmlord-display-broker.service
 
+# The crash-loop budget. It belongs to the unit and not to the service:
+# systemd reads these two here, and answers them under [Service] with
+# `Unknown key ... ignoring` -- a rate limit that silently is not one.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
 [Service]
 ExecStart=/usr/local/lib/vmlord/vmlord-display-session
 User=vmlord-display
 Restart=on-failure
 RestartSec=2
-StartLimitIntervalSec=60
-StartLimitBurst=5
 # It holds a channel key and a mapping, and needs no privilege at all.
 CapabilityBoundingSet=
 NoNewPrivileges=yes

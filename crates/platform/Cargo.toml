@@ -19,6 +19,10 @@ vmlord-seed = { path = "../seed" }
 # VM directory to fill.
 vmlord-display-payload = { path = "../display-payload" }
 vmlord-display-protocol = { path = "../display-protocol" }
+# The launch contract's private schema, which the viewer defines and this side
+# speaks. Linked rather than copied: two encoders of one wire format are two
+# things to keep in step.
+vmlord-display-viewer = { path = "../display-viewer" }
 vmlord-gpu-payload = { path = "../gpu-payload" }
 vmlord-payload = { path = "../payload" }
 arcbox-dhcp = "0.6"

@@ -42,6 +42,14 @@ const DKMS_TREE: &str = "/var/lib/dkms";
 const MODULES_LOAD: &str = "/etc/modules-load.d/vmlord-display.conf";
 const MODPROBE_OPTIONS: &str = "/etc/modprobe.d/vmlord-display.conf";
 const UNBIND_UNIT: &str = "/etc/systemd/system/vmlord-display-unbind-simpledrm.service";
+/// Where a drop-in reaches the compositor of the greeter and of a logged-in
+/// user both: `org.gnome.Shell@.service` is a template, and a drop-in on the
+/// template applies to every instance of it.
+const COMPOSITOR_DROP_IN: &str =
+    "/etc/systemd/user/org.gnome.Shell@.service.d/vmlord-display-compositor-mesa.conf";
+/// Where the rule that keeps the desktop on this output goes. The number puts
+/// it after mutter's own `61-mutter.rules`, whose tag it adds to.
+const UDEV_RULES: &str = "/etc/udev/rules.d/62-vmlord-display.rules";
 const DRM_DEVICES: &str = "/sys/class/drm";
 
 /// Where the two guest programs are installed. Beside the module's own unit,
@@ -538,6 +546,12 @@ fn make_log(version: &str) -> Option<String> {
 /// The unit that unbinds `simple-framebuffer` is installed here too: simpledrm
 /// is builtin, so it cannot be blacklisted, and until it lets go of the console
 /// a compositor has two devices to choose between.
+///
+/// So is the drop-in that keeps the compositor on the distribution's Mesa,
+/// which is the other half of the same job: a device a compositor binds and
+/// then cannot allocate a buffer on is a device it will not light. It is
+/// written rather than applied -- a drop-in is read when the unit next starts,
+/// and on a normal boot this recipe runs before the greeter does.
 fn load_stage(report: &mut Report, mode: Option<(u32, u32)>) -> Result<(), String> {
     let wanted = wanted_mode(mode);
     let payload_drm = Path::new(PAYLOAD_MOUNT).join("content").join("drm");
@@ -561,7 +575,9 @@ fn load_stage(report: &mut Report, mode: Option<(u32, u32)>) -> Result<(), Strin
             )
             .map_err(|error| format!("{MODPROBE_OPTIONS} could not be written: {error}"))
         })
-        .and_then(|()| copy("vmlord-display-unbind-simpledrm.service", UNBIND_UNIT));
+        .and_then(|()| copy("vmlord-display-unbind-simpledrm.service", UNBIND_UNIT))
+        .and_then(|()| copy("vmlord-display-compositor-mesa.conf", COMPOSITOR_DROP_IN))
+        .and_then(|()| copy("62-vmlord-display.rules", UDEV_RULES));
     if let Err(reason) = prepared {
         report.failed(DisplayRecipeStep::ModuleLoad, reason.clone());
         return Err(reason);
@@ -628,11 +644,34 @@ fn device_stage(report: &mut Report) -> Result<(), String> {
         report.failed(DisplayRecipeStep::Device, reason.clone());
         return Err(reason);
     }
+    keep_the_desktop_on_this_output();
     report.ok(
         DisplayRecipeStep::Device,
         format!("a {MODULE} display device is present"),
     );
     Ok(())
+}
+
+/// Asks udev to look at the display cards again, now that this one is here.
+///
+/// The rule that hides the Hyper-V card is written for a guest where this
+/// module is loaded, and it says so with a `TEST` on this device. At boot the
+/// synthetic card is there long before the module is, so the rule ran and
+/// found nothing; this is what makes it run again while the answer is yes.
+/// Before any compositor starts, because a tag is read when a card is
+/// enumerated and not after.
+///
+/// Nothing here fails a stage: a guest whose udev refused is a guest with a
+/// second monitor nobody can see, which is worse than one monitor and better
+/// than no display.
+fn keep_the_desktop_on_this_output() {
+    let _ = command::run("udevadm", &["control", "--reload"], &[], SHORT_BUDGET);
+    let _ = command::run(
+        "udevadm",
+        &["trigger", "--subsystem-match=drm", "--action=change"],
+        &[],
+        SHORT_BUDGET,
+    );
 }
 
 /// Checks the update did what it said: the target version loaded, on a device
@@ -966,6 +1005,69 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn the_compositor_drop_in_undoes_both_paths_to_the_payloads_mesa() {
+        // Two paths, and a drop-in that undid only one of them was measured on
+        // a live guest to change nothing: the linker cache still resolved
+        // libgbm to the payload's Mesa, the compositor still failed to lock a
+        // front buffer, and the connector stayed disabled. So this file has to
+        // keep saying both things -- the overrides off, and a library path that
+        // outranks the cache.
+        let drop_in =
+            include_str!("../../../payloads/display/module/vmlord-display-compositor-mesa.conf");
+
+        for variable in [
+            "GALLIUM_DRIVER",
+            "MESA_LOADER_DRIVER_OVERRIDE",
+            "__GLX_VENDOR_LIBRARY_NAME",
+            "VK_DRIVER_FILES",
+        ] {
+            assert!(
+                drop_in
+                    .lines()
+                    .any(|line| line.starts_with("UnsetEnvironment=") && line.contains(variable)),
+                "{variable} is one of the overrides the compositor must not inherit"
+            );
+        }
+        assert!(
+            drop_in
+                .lines()
+                .any(|line| line == "Environment=LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu"),
+            "unsetting LD_LIBRARY_PATH is not enough: the cache has to be outranked"
+        );
+    }
+
+    #[test]
+    fn the_udev_rule_hides_the_synthetic_display_only_where_this_one_exists() {
+        // A Hyper-V guest has a display of its own, and a compositor that finds
+        // two cards lights both. The second monitor is drawn on the Hyper-V
+        // console, where the viewer cannot see it, and it stretches the desktop
+        // an absolute pointer is mapped across -- so the guest's cursor lands
+        // well to the right of where the user pointed. Task #121 measured that.
+        let rule = include_str!("../../../payloads/display/module/62-vmlord-display.rules");
+        let matched = rule
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<String>();
+
+        assert!(
+            matched.contains("TAG+=\"mutter-device-ignore\""),
+            "the tag is what mutter reads; nothing else here hides a card"
+        );
+        assert!(
+            matched.contains("DRIVERS==\"hyperv_drm\""),
+            "the card to hide is the synthetic one, named by its driver"
+        );
+        assert!(
+            matched.contains("TEST==\"/sys/devices/platform/vmlord_drm.0/drm\""),
+            "without this a guest whose module never built loses its only display"
+        );
+        assert!(
+            super::UDEV_RULES.contains("/62-"),
+            "the file has to sort after 61-mutter.rules, whose tag it adds to"
+        );
     }
 
     #[test]

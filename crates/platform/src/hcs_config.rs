@@ -123,10 +123,7 @@ impl HcsVmConfigBuilder {
                     )]),
                     hv_socket: HvSocket {
                         config: HvSocketConfig {
-                            service_table: BTreeMap::from([(
-                                agent_service_key(),
-                                HvSocketService::agent(),
-                            )]),
+                            service_table: service_table(),
                         },
                     },
                     keyboard: EmptyObject {},
@@ -164,6 +161,23 @@ impl HcsVmConfigBuilder {
 /// the compute system from.
 fn agent_service_key() -> String {
     format!("{:?}", crate::hvsocket::agent_service_id())
+}
+
+/// Every HvSocket service a VM is given, keyed by service GUID.
+///
+/// The agent's, which the guest connects out on, and the display's three,
+/// which the guest listens on. All four are listed for every VM, desktop or
+/// not: an entry is the partition's permission for a service to exist, not a
+/// claim that anything inside the guest is using it, and a headless guest
+/// simply never binds the display ports. Making them conditional would mean a
+/// VM that changes profile later has to have this document rewritten.
+fn service_table() -> BTreeMap<String, HvSocketService> {
+    let mut table = BTreeMap::from([(agent_service_key(), HvSocketService::vmlord())]);
+    for id in crate::hvsocket::display_service_ids() {
+        table.insert(format!("{id:?}"), HvSocketService::vmlord());
+    }
+
+    table
 }
 
 /// Returns the named pipe the VM's first serial port is wired to.
@@ -690,7 +704,7 @@ struct HvSocketConfig {
 /// One HvSocket service a VM may talk on, and who may listen for it.
 #[derive(Serialize)]
 struct HvSocketService {
-    /// Who on the host may bind this service for this VM.
+    /// Who on the host may hold this service's end for this VM.
     ///
     /// SDDL, and deliberately narrow: SYSTEM and the local administrators, who
     /// are the only accounts that can drive HCS in the first place. The
@@ -703,8 +717,13 @@ struct HvSocketService {
 }
 
 impl HvSocketService {
-    /// The service the guest's agent connects to.
-    const fn agent() -> Self {
+    /// A service only VMLord may take: the agent's, and the display's three.
+    ///
+    /// One constructor because one descriptor is right for all four. The
+    /// agent's service is one the guest connects out on and the display's are
+    /// ones it listens on, and neither is a reason to widen who on the host
+    /// may hold the other end.
+    const fn vmlord() -> Self {
         Self {
             bind_security_descriptor: "D:P(A;;FA;;;SY)(A;;FA;;;BA)",
         }
@@ -875,6 +894,55 @@ mod tests {
     /// the way the code does would agree with any change to it.
     const AGENT_SERVICE_KEY: &str = "564D4C41-FACB-11E6-BD58-64006A7986D3";
 
+    /// The display's three, spelled out for the same reason: these are the
+    /// addresses a viewer's connects arrive at inside the partition.
+    const DISPLAY_CONTROL_SERVICE_KEY: &str = "564D4C44-FACB-11E6-BD58-64006A7986D3";
+    const DISPLAY_FRAME_SERVICE_KEY: &str = "564D4C46-FACB-11E6-BD58-64006A7986D3";
+    const DISPLAY_INPUT_SERVICE_KEY: &str = "564D4C49-FACB-11E6-BD58-64006A7986D3";
+
+    /// The service table of a VM built from a cloud image.
+    fn service_table_of_a_built_vm() -> serde_json::Map<String, Value> {
+        let json: Value = serde_json::from_str(
+            &HcsVmConfigBuilder::build(
+                &cloud_request(),
+                Path::new(r"C:\vms\test-vm\disks\system.vhdx"),
+                Path::new(r"C:\vms\test-vm\seed.iso"),
+                None,
+                &state_paths(),
+                VM_ID,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        json.pointer("/VirtualMachine/Devices/HvSocket/HvSocketConfig/ServiceTable")
+            .and_then(Value::as_object)
+            .expect("the VM should have a service table")
+            .clone()
+    }
+
+    #[test]
+    fn every_vm_is_given_the_three_services_its_display_runs_over() {
+        // Listed for every VM, desktop or not: the entry is the partition's
+        // permission for the service to exist, and a headless guest never
+        // binds the ports. A VM created without them cannot be given them
+        // afterwards, because a start rebuilds the compute system from this
+        // document.
+        let table = service_table_of_a_built_vm();
+
+        for key in [
+            DISPLAY_CONTROL_SERVICE_KEY,
+            DISPLAY_FRAME_SERVICE_KEY,
+            DISPLAY_INPUT_SERVICE_KEY,
+        ] {
+            assert_eq!(
+                table[key].pointer("/BindSecurityDescriptor"),
+                Some(&json!("D:P(A;;FA;;;SY)(A;;FA;;;BA)")),
+                "a display service is as narrow as the agent's"
+            );
+        }
+    }
+
     #[test]
     fn every_vm_is_given_the_service_its_agent_connects_to() {
         // Without the entry the host cannot bind the service and the guest's
@@ -896,7 +964,7 @@ mod tests {
             .pointer("/VirtualMachine/Devices/HvSocket/HvSocketConfig/ServiceTable")
             .and_then(Value::as_object)
             .expect("the VM should have a service table");
-        assert_eq!(table.len(), 1);
+        assert_eq!(table.len(), 4, "the agent's service and the display's three");
         assert_eq!(
             table[AGENT_SERVICE_KEY].pointer("/BindSecurityDescriptor"),
             Some(&json!("D:P(A;;FA;;;SY)(A;;FA;;;BA)")),
@@ -946,6 +1014,15 @@ mod tests {
                         "ComPorts": { "0": { "NamedPipe": com1_pipe_path(VM_ID) } },
                         "HvSocket": { "HvSocketConfig": { "ServiceTable": {
                             AGENT_SERVICE_KEY: {
+                                "BindSecurityDescriptor": "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+                            },
+                            DISPLAY_CONTROL_SERVICE_KEY: {
+                                "BindSecurityDescriptor": "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+                            },
+                            DISPLAY_FRAME_SERVICE_KEY: {
+                                "BindSecurityDescriptor": "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+                            },
+                            DISPLAY_INPUT_SERVICE_KEY: {
                                 "BindSecurityDescriptor": "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
                             }
                         }}},
