@@ -113,7 +113,7 @@ application and a Linux guest agent. The commands are Cargo aliases, defined in
 | `cargo display-services` | the guest display services, `x86_64-unknown-linux-musl` | Windows, Linux |
 | `cargo check-windows` | compile-checks the application and the display viewer through `x86_64-pc-windows-gnu` | WSL |
 | `cargo test-windows` | builds and runs the Windows tests, the display viewer's included | WSL |
-| `cargo dist` | release build of everything -- `vmlord.exe`, `vmlord-com1.exe`, `vmlord-display.exe` and the agent -- collected into `target/dist/` | Windows |
+| `cargo dist` | release build of everything -- `vmlord.exe`, `vmlord-com1.exe`, `vmlord-display.exe`, the agent, and the retained legacy backend DLL -- collected into `target/dist/` | Windows |
 | `cargo gpu-payload pack ...` | release tooling that packs a prepared GPU payload | Windows, Linux |
 
 Prerequisites:
@@ -138,8 +138,11 @@ Start-Process -FilePath .\target\debug\vmlord.exe -Verb RunAs -Wait
 
 The HCS backend requires elevation, so `cargo run` cannot launch the UAC-marked
 executable directly. The build stages the prebuilt
-`third_party/appsandbox/x64/appsandbox_core.dll` next to the executable. See
-`third_party/appsandbox/NOTICE.md` for the pinned artifact and license details.
+`third_party/appsandbox/x64/appsandbox_core.dll` next to the executable for the
+remaining legacy lifecycle and configuration operations. VMLord does not load
+its display export and does not ship separate AppSandbox IDD or guest
+display/input artifacts. See `third_party/appsandbox/NOTICE.md` for the pinned
+artifact and license details.
 
 The shell targets `x86_64-pc-windows-msvc` and creates Linux workspaces either
 from a local ISO, which boots to the distribution's own installer, or from an
@@ -157,5 +160,9 @@ host, a guest and a payload must be, and
 **[docs/gpu-pv-troubleshooting.md](docs/gpu-pv-troubleshooting.md)** for
 reading a GPU status that is not what it should be.
 
-Display and snapshots remain migration work. AppSandbox macOS code, WebView UI,
-provisioning tools, and display resources are not included.
+The native display supports GNOME on Wayland for Ubuntu 22.04, 24.04 and 26.04
+amd64. See the **[display compatibility matrix](docs/display-compatibility.md)**,
+**[user guide](docs/display-user-guide.md)** and
+**[troubleshooting guide](docs/display-troubleshooting.md)**. Snapshots remain
+migration work. AppSandbox macOS code, WebView UI, provisioning tools, and
+display resources are not included.

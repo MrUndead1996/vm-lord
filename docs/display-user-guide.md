@@ -1,0 +1,48 @@
+# Display user guide
+
+## Create a desktop VM
+
+1. Create an Ubuntu cloud-image VM with the `GNOME` desktop profile. Supported
+   releases are listed in the [compatibility matrix](display-compatibility.md).
+2. Give the VM network access to Ubuntu's package repositories for its first
+   provisioning run. Two CPU cores and 4 GiB RAM are the recommended minimum.
+3. Start the VM. VMLord installs GNOME, builds the `vmlord_drm` DKMS module,
+   starts the guest display services, and reports their state in the VM list.
+4. Wait until the display status says it is ready. Provisioning can take
+   several minutes on the first boot; the VM remains usable through COM1 or
+   SSH while display setup is degraded.
+
+## Open and use the display
+
+Select the running VM and press **Connect**. VMLord launches
+`vmlord-display.exe`; pressing Connect again focuses the existing window. The
+viewer authenticates the guest over the per-VM secret, then binds separate
+control, frame, and input HvSocket channels.
+
+- Sign in through GDM with the account created for the VM.
+- Resize the window to request a matching guest mode. Modes are limited to one
+  monitor and at most 2560x1440.
+- Close the window to end capture. Closing or crashing the viewer does not stop
+  the VM, and opening it again starts a fresh authenticated session.
+- A transient channel or guest-service restart reconnects automatically. A VM
+  reset keeps the window waiting until the guest services return.
+
+Display traffic does not traverse the VM's IP network. Removing network access
+after provisioning does not disconnect an existing display, but future package
+or DKMS repairs may need Ubuntu's repositories again.
+
+## Updating the guest display payload
+
+When VMLord reports a newer display payload, update it while the VM is running.
+The guest verifies the new module and services before accepting them. If the
+new version fails verification, it rolls back to the previous working version
+and reports that result instead of silently leaving the desktop unusable.
+
+## Logs and diagnostics
+
+Application and viewer logs are written to the configured VMLord log file
+(by default `%LOCALAPPDATA%\VMLord\logs\vmlord.log`). The VM's display status
+is the first diagnostic to read: it distinguishes provisioning, payload,
+module, device, service, and connection failures. See
+[display troubleshooting](display-troubleshooting.md) for the corresponding
+checks.

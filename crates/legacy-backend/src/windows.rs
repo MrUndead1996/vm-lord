@@ -19,7 +19,6 @@ type AsbInit = unsafe extern "system" fn() -> i32;
 type AsbVmStart = unsafe extern "system" fn(AsbVm, i32, i32, *const u16) -> i32;
 type AsbVmShutdown = unsafe extern "system" fn(AsbVm) -> i32;
 type AsbVmStop = unsafe extern "system" fn(AsbVm) -> i32;
-type AsbVmOpenDisplay = unsafe extern "system" fn(AsbVm) -> i32;
 type AsbVmSetDword = unsafe extern "system" fn(AsbVm, u32) -> i32;
 type AsbVmSetInt = unsafe extern "system" fn(AsbVm, i32) -> i32;
 
@@ -43,7 +42,6 @@ struct Api {
     vm_start: AsbVmStart,
     vm_shutdown: AsbVmShutdown,
     vm_stop: AsbVmStop,
-    vm_open_display: Option<AsbVmOpenDisplay>,
     detach: AsbDetach,
     reconnect_running: AsbReconnectRunning,
     set_log_callback: AsbSetCallback,
@@ -320,26 +318,7 @@ impl VmRepository for AppSandboxBackend {
     }
 
     fn open_display(&mut self, name: &str) -> Result<(), RepositoryError> {
-        let vm = self.vm_by_name(name)?;
-        if unsafe { (self.api.vm_is_running)(vm) == 0 } {
-            return Err(RepositoryError::new(format!(
-                "VM \"{name}\" is not running"
-            )));
-        }
-        let open_display = self.api.vm_open_display.ok_or_else(|| {
-            RepositoryError::new(
-                "the installed AppSandbox backend is too old for display connections; update appsandbox_core.dll",
-            )
-        })?;
-        let result = unsafe { open_display(vm) };
-        if result < 0 {
-            return Err(RepositoryError::new(format!(
-                "AppSandbox failed to open the display for VM \"{name}\" (HRESULT 0x{:08X})",
-                result as u32
-            )));
-        }
-
-        Ok(())
+        Err(legacy_display_retired(name))
     }
 
     // `open_ssh` is deliberately not implemented: VMLord connects over SSH from
@@ -493,7 +472,6 @@ impl Api {
             vm_start: export!(b"asb_vm_start\0", AsbVmStart),
             vm_shutdown: export!(b"asb_vm_shutdown\0", AsbVmShutdown),
             vm_stop: export!(b"asb_vm_stop\0", AsbVmStop),
-            vm_open_display: optional_export!(b"asb_vm_open_display\0", AsbVmOpenDisplay),
             detach: export!(b"asb_detach\0", AsbDetach),
             reconnect_running: export!(b"asb_reconnect_running\0", AsbReconnectRunning),
             set_log_callback: export!(b"asb_set_log_callback\0", AsbSetCallback),
@@ -522,6 +500,13 @@ fn check_lifecycle_result(action: &str, name: &str, result: i32) -> Result<(), R
         )));
     }
     Ok(())
+}
+
+fn legacy_display_retired(name: &str) -> RepositoryError {
+    RepositoryError::new(format!(
+        "the legacy AppSandbox backend cannot open the display for VM \"{name}\"; \
+         unset VMLORD_BACKEND to use the native display"
+    ))
 }
 
 fn check_update_result(field: &str, name: &str, result: i32) -> Result<(), RepositoryError> {
@@ -630,7 +615,17 @@ fn network_mode(value: i32) -> NetworkMode {
 
 #[cfg(test)]
 mod tests {
-    use super::reconnect_running_without_handle_vm_name;
+    use super::{legacy_display_retired, reconnect_running_without_handle_vm_name};
+
+    #[test]
+    fn legacy_display_is_retired_in_favour_of_the_native_backend() {
+        let error = legacy_display_retired("ubuntu");
+
+        assert_eq!(
+            error.to_string(),
+            "the legacy AppSandbox backend cannot open the display for VM \"ubuntu\"; unset VMLORD_BACKEND to use the native display"
+        );
+    }
 
     #[test]
     fn parses_reconnect_running_without_handle_message() {

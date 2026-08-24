@@ -159,17 +159,11 @@ This is the only layer allowed to interact with operating system APIs.
 
 # Current Backend
 
-The AppSandbox backend is currently responsible for:
-
-* HCS integration
-* VM lifecycle
-* networking
-* display
-* GPU configuration
-
-Rust communicates with it through FFI.
-
-The backend is considered an implementation detail.
+The native Rust backend owns HCS integration, VM lifecycle, networking, GPU-PV
+and display for supported VMLord VMs. The AppSandbox backend is a transitional
+fallback for legacy VM lifecycle and configuration only. Its display ABI is no
+longer loaded or called: AppSandbox IDD and its guest display/input components
+are outside the VMLord display path.
 
 ## Implemented scaffold
 
@@ -652,10 +646,9 @@ the migration leaves it something the native backend cannot do; any other value
 (including an unset one) selects the native backend, so a typo cannot silently
 keep VMLord on the backend being retired.
 
-The native backend deliberately reports less than AppSandbox did while the
-remaining migration tasks land: GPU mode is `None` and its GPU facts are empty,
-guest agent status is `Unknown`, and display connections report that the backend does not support
-them. SSH is not among them any more -- it is the native backend's alone, as
+The native backend reports persisted GPU and display configuration together
+with the facts observed from the running guest agent. SSH is the native
+backend's alone, as
 "Running the OpenSSH client" describes, and availability is read from the VM's
 mapping, which records what its creation asked for. Network mode is reported from the VM's mapping, because the
 edit form is filled from `VmSummary`: a summary that always said `None` would
@@ -770,16 +763,15 @@ still installing has nothing to open a window on -- and shows that status's own
 sentence while it cannot be pressed. Snapshots remain future application-layer
 work.
 
-Under `VMLORD_BACKEND=legacy`, the same actions reach AppSandbox's C API
-instead: Start invokes `asb_vm_start`; Stop invokes the graceful
+Under `VMLORD_BACKEND=legacy`, lifecycle and configuration actions still reach
+AppSandbox's C API: Start invokes `asb_vm_start`; Stop invokes the graceful
 `asb_vm_shutdown`; Force stop invokes `asb_vm_stop`; Edit uses AppSandbox's
-configuration setters; Connect invokes `asb_vm_open_display`, which opens or
-focuses the temporary AppSandbox IDD window after the guest display driver is
-ready. It calls `asb_detach` on exit so it never stops VMs. `Open SSH` is not
-among them: the legacy backend reports every VM's SSH as unavailable and answers
-that SSH connections are not supported, because a connection needs the key, the
-port and the `known_hosts` file only the native backend has. It reads no
-`asb_vm_ssh_*` export and launches no terminal of its own.
+configuration setters. Connect is retired for this backend and directs the
+user to the native backend. The adapter neither resolves nor calls
+`asb_vm_open_display`, so no VMLord path can open the AppSandbox IDD window. It
+calls `asb_detach` on exit so it never stops VMs. `Open SSH` is not among the
+legacy operations either: a connection needs the key, port and `known_hosts`
+file only the native backend has.
 
 ### Image download
 
@@ -2852,7 +2844,7 @@ the MVP guest announces `MODE_DESKTOP` alone. `MODE_AUTO` names a host-side
 policy that resolves to `MODE_DESKTOP` until a motion codec exists; a request
 for `MODE_MOTION` is answered with `ERROR_CODE_UNSUPPORTED_MODE`.
 
-Connect on the native backend opens this stack. Every VM's compute system
+Connect opens this native stack. Every VM's compute system
 lists all three services beside the agent's -- an entry there is the
 partition's permission for a service to exist, not a claim that the guest
 binds it, so a headless VM lists them too and a VM created before they existed
@@ -2860,8 +2852,10 @@ has to be recreated rather than migrated. The repository refuses a session
 before it starts one, a sentence per reason: a VM created without a desktop, a
 desktop still installing, a VM that is not running, a guest that has not
 offered its display. What gets past that is one viewer process per Connect.
-The legacy backend still opens the AppSandbox IDD window, and will until #129
-removes it.
+The legacy backend exposes no display operation. The retained
+`appsandbox_core.dll` serves only legacy lifecycle and configuration operations;
+VMLord distributes no standalone AppSandbox host IDD or guest display/input
+artifact.
 
 ### The guest display services
 

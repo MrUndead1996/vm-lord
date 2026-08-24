@@ -30,8 +30,9 @@ const ARTIFACTS: [(&str, &str); 5] = [
     // The display window, opened by VMLord for one VM at a time. It ships
     // beside `vmlord.exe` because that is where the launcher looks for it.
     (APP_TARGET, "vmlord-display.exe"),
-    // Staged next to the executables by `crates/vmlord/build.rs`; the legacy
-    // backend loads it by name from the application's own directory.
+    // The only AppSandbox artifact in the distribution. It is retained for
+    // legacy lifecycle/configuration calls; VMLord loads no display export and
+    // ships no standalone AppSandbox IDD or guest display/input files.
     (APP_TARGET, "appsandbox_core.dll"),
     (AGENT_TARGET, "vmlord-agent"),
 ];

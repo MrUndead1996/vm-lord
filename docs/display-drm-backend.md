@@ -114,10 +114,11 @@ Consequences for the module's design:
 
 ## Target releases
 
-Ubuntu 24.04 amd64 is proven, and is the first target. 22.04 (5.15) and
-26.04 are untested for the module build: the GEM shmem helpers and the
-plane helper signatures move between those kernels, so each release needs
-its own build, which is what DKMS is for.
+Ubuntu 22.04, 24.04 and 26.04 amd64 are proven by the native display parity
+matrix. GEM shmem helpers and plane helper signatures move between their
+kernels, so each release still builds the same DKMS source against its own
+headers. See [display compatibility](display-compatibility.md) for the supported
+user-facing matrix; this document records the original backend decision.
 
 ## What the module has to guard by kernel version
 
