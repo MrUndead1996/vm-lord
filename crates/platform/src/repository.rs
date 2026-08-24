@@ -29,6 +29,7 @@ use crate::{
     cleanup,
     com1_terminal::{Com1Launcher, Com1Sessions},
     cycle::{CycleOutcome, VmBuildCycle},
+    display_launches::{self, DisplayLaunches, LaunchRequest},
     display_runs::DisplayRuns,
     display_update,
     gpu_runs::GpuRuns,
@@ -96,6 +97,9 @@ pub struct HcsVmRepository {
     ssh_launcher: Arc<SshLauncher>,
     /// The sessions being opened right now, each on a thread of its own.
     ssh_launches: SshLaunches,
+    /// The display windows this process has opened, each with a thread on its
+    /// launch pipes. Never joined at shutdown: a session outlives VMLord.
+    display_launches: DisplayLaunches,
     /// Shared with the worker threads that deliver shutdown requests, which is
     /// why it is behind an `Arc`.
     shutdown: Arc<VmShutdownPipeline>,
@@ -159,6 +163,7 @@ impl HcsVmRepository {
             gpu_runs,
             ssh_launcher: Arc::new(SshLauncher::production()),
             ssh_launches: SshLaunches::default(),
+            display_launches: DisplayLaunches::default(),
             shutdown: Arc::new(VmShutdownPipeline::production()),
             shutdowns: ShutdownWorkers::default(),
             force_stop: VmForceStopPipeline::production(),
@@ -577,6 +582,89 @@ impl HcsVmRepository {
                 log::warn!("the installed desktop could not be recorded: {error}");
             }
         }
+    }
+
+    /// Opens the display of a VM HCS reports as being in `state`.
+    ///
+    /// Split from [`VmRepository::open_display`] at the one call that needs
+    /// HCS, the way the console is, so that what it refuses can be tested
+    /// without a compute system.
+    ///
+    /// Every refusal is its own sentence. A person told "the VM is not
+    /// running" and a person told "the guest has not offered its desktop yet"
+    /// have different things to do next, and the UI keeps the button disabled
+    /// unless the display is connectable -- so what these answer is a click
+    /// that raced a refresh.
+    fn open_display_in_state(
+        &mut self,
+        mapping: &VmComputeSystemMapping,
+        state: Option<HcsSystemState>,
+    ) -> Result<(), RepositoryError> {
+        let name = &mapping.vm_name;
+        if !mapping.desktop_profile.wants_desktop() {
+            return Err(refused(format!(
+                "VM \"{name}\" was created without a desktop, so it has no display to open"
+            )));
+        }
+        match &mapping.display_provisioning {
+            DisplayProvisioning::Ready => {}
+            DisplayProvisioning::Degraded(failure) => {
+                return Err(refused(format!(
+                    "the desktop of VM \"{name}\" is not installed: {}",
+                    failure.message
+                )));
+            }
+            // `Pending`, and `NotRequested` beside a desktop profile, are both
+            // an installation nothing has seen through.
+            _ => {
+                return Err(refused(format!(
+                    "the desktop of VM \"{name}\" has not finished installing"
+                )));
+            }
+        }
+
+        refuse_unless_running(name, state, "so its display cannot be opened")?;
+
+        let facts = self.display_runs.snapshot(mapping.vm_id);
+        if let Some(failure) = &facts.failure {
+            return Err(refused(format!(
+                "the display of VM \"{name}\" is not working: {}",
+                failure.message
+            )));
+        }
+        match &facts.guest {
+            Some(GuestDisplayReport::Ready(_)) => {}
+            Some(GuestDisplayReport::Failed(failure)) => {
+                return Err(refused(format!(
+                    "the guest of VM \"{name}\" cannot offer its display: {}",
+                    failure.message
+                )));
+            }
+            // A guest that has said nothing has not failed, and a viewer
+            // pointed at a service nothing binds would sit and retry.
+            _ => {
+                return Err(refused(format!(
+                    "the guest of VM \"{name}\" has not offered its display yet"
+                )));
+            }
+        }
+
+        let Some(runtime_id) = self.runtime_id(mapping) else {
+            return Err(refused(format!(
+                "VMLord cannot tell which partition VM \"{name}\" is running as"
+            )));
+        };
+        let vm_directory = layout::vm_directory(&self.storage_root, name)?;
+        let secret = read_display_secret(&layout::agent_secret_path(&vm_directory), name)?;
+
+        self.display_launches.start(LaunchRequest {
+            vm_name: name,
+            secret,
+            runtime_id,
+            mode: mapping.display_mode,
+            viewer: display_launches::viewer_path()?,
+            diagnostics: Arc::clone(&self.diagnostics),
+        })
     }
 
     /// The partition a VM is running as right now.
@@ -1395,6 +1483,20 @@ impl VmRepository for HcsVmRepository {
         self.open_ssh_in_state(&mapping, state)
     }
 
+    /// Opens the native display of a running VM.
+    ///
+    /// The state is asked of HCS rather than taken from the list the user
+    /// clicked in, for the reason [`VmRepository::open_ssh`] does it: a click
+    /// can be a refresh out of date.
+    fn open_display(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.require_initialized()?;
+        self.builds.refuse_if_building(name)?;
+
+        let mapping = self.mapping(name)?;
+        let state = self.reported_state(&mapping)?;
+        self.open_display_in_state(&mapping, state)
+    }
+
     /// Moves a running VM's display payload to the newest version this build
     /// carries for it.
     ///
@@ -1634,6 +1736,38 @@ fn refuse_unless_running(
     let error = RepositoryError::new(format!("VM \"{vm_name}\" is {description}, {consequence}"));
     log::error!("{error}");
     Err(error)
+}
+
+/// A refusal, logged where it was decided.
+///
+/// Every caller is a preflight that answers a person who clicked something,
+/// so the message is the whole of what went wrong and there is nothing else
+/// to attach to it.
+fn refused(message: String) -> RepositoryError {
+    let error = RepositoryError::new(message);
+    log::warn!("{error}");
+    error
+}
+
+/// Reads the VM's secret in the form the display protocol takes it.
+///
+/// The same bytes in the same file the agent protocol minted and reads: a
+/// display session's keys are derived from the VM's identity, and nothing new
+/// is minted or delivered for one. The text is held in `Zeroizing` on the way
+/// through, and no error quotes it.
+fn read_display_secret(
+    path: &Path,
+    vm_name: &str,
+) -> Result<vmlord_display_protocol::keys::Secret, RepositoryError> {
+    let text = zeroize::Zeroizing::new(fs::read_to_string(path).map_err(|error| {
+        refused(format!(
+            "the secret of VM \"{vm_name}\" could not be read from {}: {error}",
+            path.display()
+        ))
+    })?);
+
+    vmlord_display_protocol::keys::Secret::from_base64(&text)
+        .map_err(|error| refused(format!("the secret of VM \"{vm_name}\" is unusable: {error}")))
 }
 
 /// Turns every reader that stopped for the wrong reason into a diagnostic, and
@@ -3013,19 +3147,93 @@ mod tests {
         assert_not_initialized(repository.list_vms().map(|_| ()));
         assert_not_initialized(repository.open_console("dev"));
         assert_not_initialized(repository.open_ssh("dev"));
+        assert_not_initialized(repository.open_display("dev"));
+    }
+
+    /// The preflight, in the order it runs. Everything past it needs a
+    /// partition and belongs to the end-to-end matrix rather than here.
+    fn refusal(mapping: &VmComputeSystemMapping, state: Option<HcsSystemState>) -> String {
+        let mut repository = repository();
+        let ready = vmlord_core::GuestDisplayReport::Ready(
+            vmlord_core::GuestDisplayDetail::default(),
+        );
+        // Recorded for every case, so that each test refuses for its own
+        // reason rather than for a guest that happens to have said nothing.
+        repository
+            .display_runs
+            .record_guest_display(mapping.vm_id, ready);
+
+        repository
+            .open_display_in_state(mapping, state)
+            .expect_err("no test here reaches a partition")
+            .to_string()
     }
 
     #[test]
-    fn a_display_connection_reports_that_the_native_backend_lacks_it() {
-        let mut repository = repository();
+    fn a_headless_vm_says_it_was_created_without_a_desktop() {
+        let message = refusal(&mapping(NetworkMode::None), Some(HcsSystemState::Running));
 
-        assert!(
-            repository
-                .open_display("dev")
-                .unwrap_err()
-                .to_string()
-                .contains("not supported")
+        assert!(message.contains("without a desktop"), "{message}");
+    }
+
+    #[test]
+    fn a_desktop_that_is_still_installing_is_not_a_desktop_to_connect_to() {
+        let message = refusal(&desktop_mapping(), Some(HcsSystemState::Running));
+
+        assert!(message.contains("finished installing"), "{message}");
+    }
+
+    #[test]
+    fn a_stopped_vm_has_no_display_to_open() {
+        let mapping = VmComputeSystemMapping {
+            display_provisioning: DisplayProvisioning::Ready,
+            ..desktop_mapping()
+        };
+
+        let message = refusal(&mapping, Some(HcsSystemState::Stopped));
+
+        assert!(message.contains("stopped"), "{message}");
+        assert!(message.contains("display cannot be opened"), "{message}");
+    }
+
+    #[test]
+    fn a_guest_that_has_not_reported_is_not_a_guest_that_failed() {
+        let mut repository = repository();
+        let mapping = VmComputeSystemMapping {
+            display_provisioning: DisplayProvisioning::Ready,
+            ..desktop_mapping()
+        };
+
+        let message = repository
+            .open_display_in_state(&mapping, Some(HcsSystemState::Running))
+            .expect_err("a guest that has said nothing offers nothing")
+            .to_string();
+
+        assert!(message.contains("has not offered its display yet"), "{message}");
+    }
+
+    #[test]
+    fn a_guest_that_cannot_offer_its_display_says_why_in_its_own_words() {
+        let mut repository = repository();
+        let mapping = VmComputeSystemMapping {
+            display_provisioning: DisplayProvisioning::Ready,
+            ..desktop_mapping()
+        };
+        repository.display_runs.record_guest_display(
+            mapping.vm_id,
+            GuestDisplayReport::Failed(vmlord_core::DisplayFailure::new(
+                vmlord_core::DisplayStage::Guest,
+                vmlord_core::DisplayStatusCode::GuestServicesFailed,
+                "the display broker did not come up",
+            )),
         );
+
+        let message = repository
+            .open_display_in_state(&mapping, Some(HcsSystemState::Running))
+            .expect_err("a guest that failed offers nothing")
+            .to_string();
+
+        assert!(message.contains("the display broker did not come up"), "{message}");
     }
 
     /// The drain runs inside `take_diagnostics` because that is already called
