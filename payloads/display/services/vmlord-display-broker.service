@@ -23,7 +23,15 @@ ProtectHome=yes
 # is resized cannot be answered without writing it. `ProtectKernelTunables`
 # would take that away and must not be added here.
 ProtectSystem=strict
-ReadWritePaths=/run/vmlord
+# The directory the socket between the two processes lives in. systemd creates
+# it before the mount namespace is set up, which is the only moment early
+# enough: a `ReadWritePaths=` naming a directory nothing creates fails the unit
+# at NAMESPACE, and `bind` would fail on the missing parent even if it did not.
+# Preserved across a restart because the capture process holds a namespace over
+# the same directory and reconnects through the same path -- a directory
+# removed on every restart would take that process down with it.
+RuntimeDirectory=vmlord
+RuntimeDirectoryPreserve=yes
 RestrictAddressFamilies=AF_VSOCK AF_UNIX
 RestrictNamespaces=yes
 MemoryDenyWriteExecute=yes

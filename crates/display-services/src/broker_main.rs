@@ -752,7 +752,43 @@ fn stop(shared: &Shared) {
 mod tests {
     use std::{cell::Cell, io, time::Duration};
 
-    use super::wait_for_device;
+    use super::{SOCKET_PATH, wait_for_device};
+
+    /// The unit that ships in the payload, as the guest will read it.
+    const BROKER_UNIT: &str =
+        include_str!("../../../payloads/display/services/vmlord-display-broker.service");
+
+    #[test]
+    fn the_unit_creates_the_directory_the_socket_lives_in() {
+        // systemd sets up the mount namespace before ExecStart, so a directory
+        // named there has to exist before this process could create it -- and
+        // `bind` would fail on a missing parent even if the namespace were set
+        // up. `RuntimeDirectory=` is what creates it, early enough for both.
+        let directory = std::path::Path::new(SOCKET_PATH)
+            .parent()
+            .expect("the socket has a directory")
+            .file_name()
+            .expect("that directory has a name")
+            .to_str()
+            .expect("a name this repository wrote");
+
+        assert!(
+            BROKER_UNIT.contains(&format!("RuntimeDirectory={directory}")),
+            "the unit must create /run/{directory} rather than assume it"
+        );
+        assert!(
+            !BROKER_UNIT.contains(&format!("ReadWritePaths=/run/{directory}")),
+            "a ReadWritePaths on a directory nothing creates is what fails at NAMESPACE;              RuntimeDirectory already makes it writable"
+        );
+    }
+
+    #[test]
+    fn a_broker_restart_does_not_take_the_directory_from_the_session() {
+        // The capture process holds a namespace over the same directory and
+        // reconnects through the same path. A runtime directory removed on
+        // every restart would fail its namespace setup instead.
+        assert!(BROKER_UNIT.contains("RuntimeDirectoryPreserve=yes"));
+    }
 
     #[test]
     fn a_device_that_is_not_there_yet_is_waited_for_rather_than_failed_on() {
