@@ -3097,6 +3097,27 @@ default size is 1920x1080. The size kept is the window's, never the monitor a
 full-screen one is covering, and the position is the *restored* one, so a
 window closed maximised comes back where it was before it was.
 
+**The position is reported rather than read back.** A window that is closing
+has already been destroyed by the time the loop notices -- `WM_CLOSE` destroys
+it inside the pump -- and a destroyed window has no placement to ask for. So
+every `WM_MOVE` from a window that is neither full screen nor maximised is a
+`Moved` event, the loop keeps the last one, and opening the window reports the
+place Windows chose for it: a session that never drags the window still has a
+place to remember. The coordinates are the *window* rectangle in virtual-desktop
+pixels rather than a `WINDOWPLACEMENT`, whose rectangle is in workspace
+coordinates and would walk the window by the height of the taskbar on every
+restart. Nothing is scaled between sessions because the viewer is per-monitor
+DPI aware: a coordinate means the same thing on a 100% monitor and on a 150%
+one.
+
+**A remembered position is checked against the monitors there are now**
+(`viewer::monitors`): a desktop can lose the monitor a window was on, or be
+rebuilt with the negative half on the other side. A window with a grabbable
+strip of itself on some monitor's work area opens exactly where it was, hanging
+off an edge included -- that is where the user put it. A window with less than
+that showing opens centred on the monitor it is nearest to, and on the primary
+one when it is near none. An enumeration that answers nothing moves nothing.
+
 **Auto and Desktop** are the two entries on the system menu, and Motion is not
 there: task #123 owns it, and a menu offering a mode the guest refuses is a
 menu that lies. `Auto` is sent as `MODE_AUTO` rather than resolved on the host

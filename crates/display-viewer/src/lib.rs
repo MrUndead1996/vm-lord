@@ -12,6 +12,7 @@ pub mod input;
 pub mod launch;
 pub mod live;
 pub mod log;
+pub mod monitors;
 pub mod placement;
 pub mod relay;
 pub mod resize;
