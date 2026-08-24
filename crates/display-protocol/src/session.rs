@@ -851,7 +851,9 @@ impl Session {
         match channel {
             Channel::Frame => Ok(0),
             Channel::Input => Ok(1),
-            Channel::Control => Err(SessionError::Unexpected {
+            // Task 2 gives the clipboard a slot of its own; until then it is
+            // as unbindable as control.
+            Channel::Control | Channel::Clipboard => Err(SessionError::Unexpected {
                 channel,
                 message_type: 0,
             }),
