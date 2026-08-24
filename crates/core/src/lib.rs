@@ -23,7 +23,10 @@ pub use gpu::{
     GuestGpuReport, HostGpuAdapter, HostGpuCapabilities, NativeGpuDetail, VmGpuFacts, VmGpuStatus,
     WSL_LIB_SHARE,
 };
-pub use logging::{LoggingError, initialize as initialize_logging};
+pub use logging::{
+    LoggingError, initialize as initialize_logging,
+    initialize_without_console as initialize_logging_without_console,
+};
 pub use progress::{
     BuildMonitor, BuildProgress, BuildStep, DownloadPhase, ProgressPublisher, ProgressThrottle,
 };

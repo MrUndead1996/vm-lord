@@ -11,7 +11,32 @@ use log::{LevelFilter, Log, Metadata, Record, SetLoggerError};
 use crate::{AppSettings, LogLevel};
 
 /// Initializes the application-wide logger using the configured output file and level.
+///
+/// Records go to the log file and to standard output, which is what a program
+/// started from a console wants.
 pub fn initialize(settings: &AppSettings) -> Result<(), LoggingError> {
+    install(settings, Console::Echo)
+}
+
+/// The same, for a process whose standard output is not a console.
+///
+/// `vmlord-display` is started by VMLord with a pipe as its standard output,
+/// and that pipe carries length-prefixed launch messages. A log record written
+/// there is not a stray line in a terminal: it is bytes in the middle of a
+/// frame, and the reader on the other end takes the first four of them for a
+/// length. Anything that writes to a pipe it did not frame belongs here.
+pub fn initialize_without_console(settings: &AppSettings) -> Result<(), LoggingError> {
+    install(settings, Console::Silent)
+}
+
+/// Whether records are echoed to standard output as well as written to file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Console {
+    Echo,
+    Silent,
+}
+
+fn install(settings: &AppSettings, console: Console) -> Result<(), LoggingError> {
     let log_directory =
         settings
             .log_file_path
@@ -37,12 +62,24 @@ pub fn initialize(settings: &AppSettings) -> Result<(), LoggingError> {
     let level = level_filter(settings.log_level);
     let logger = Box::leak(Box::new(ApplicationLogger {
         level,
+        console,
         file: Mutex::new(file),
     }));
 
     log::set_logger(logger).map_err(LoggingError::AlreadyInitialized)?;
     log::set_max_level(level);
     Ok(())
+}
+
+/// Writes one record to the file, and to the console only when asked.
+///
+/// Its own function so that the one decision this logger makes can be tested
+/// without installing a logger or owning a terminal.
+fn emit(line: &str, console: Console, out: &mut impl Write, file: &mut impl Write) {
+    if console == Console::Echo {
+        let _ = writeln!(out, "{line}");
+    }
+    let _ = writeln!(file, "{line}");
 }
 
 fn level_filter(level: LogLevel) -> LevelFilter {
@@ -57,6 +94,7 @@ fn level_filter(level: LogLevel) -> LevelFilter {
 
 struct ApplicationLogger {
     level: LevelFilter,
+    console: Console,
     file: Mutex<File>,
 }
 
@@ -76,14 +114,17 @@ impl Log for ApplicationLogger {
             record.target(),
             record.args()
         );
-        let _ = writeln!(io::stdout().lock(), "{line}");
         if let Ok(mut file) = self.file.lock() {
-            let _ = writeln!(file, "{line}");
+            emit(&line, self.console, &mut io::stdout().lock(), &mut *file);
+        } else if self.console == Console::Echo {
+            let _ = writeln!(io::stdout().lock(), "{line}");
         }
     }
 
     fn flush(&self) {
-        let _ = io::stdout().lock().flush();
+        if self.console == Console::Echo {
+            let _ = io::stdout().lock().flush();
+        }
         if let Ok(mut file) = self.file.lock() {
             let _ = file.flush();
         }
@@ -146,7 +187,7 @@ impl std::error::Error for LoggingError {
 mod tests {
     use log::LevelFilter;
 
-    use super::level_filter;
+    use super::{Console, emit, level_filter};
     use crate::LogLevel;
 
     #[test]
@@ -156,5 +197,29 @@ mod tests {
         assert_eq!(level_filter(LogLevel::Info), LevelFilter::Info);
         assert_eq!(level_filter(LogLevel::Debug), LevelFilter::Debug);
         assert_eq!(level_filter(LogLevel::Trace), LevelFilter::Trace);
+    }
+
+    #[test]
+    fn a_process_whose_output_is_a_pipe_writes_no_record_into_it() {
+        // `vmlord-display`'s standard output carries length-prefixed launch
+        // messages. One log line in there is four bytes read as a length.
+        let mut out = Vec::new();
+        let mut file = Vec::new();
+
+        emit("[INFO ] something happened", Console::Silent, &mut out, &mut file);
+
+        assert!(out.is_empty(), "nothing may reach a pipe this logger did not frame");
+        assert!(String::from_utf8_lossy(&file).contains("something happened"));
+    }
+
+    #[test]
+    fn a_process_started_from_a_console_still_gets_its_records_there() {
+        let mut out = Vec::new();
+        let mut file = Vec::new();
+
+        emit("[INFO ] something happened", Console::Echo, &mut out, &mut file);
+
+        assert!(String::from_utf8_lossy(&out).contains("something happened"));
+        assert!(String::from_utf8_lossy(&file).contains("something happened"));
     }
 }

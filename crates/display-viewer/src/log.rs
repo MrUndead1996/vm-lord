@@ -10,7 +10,8 @@
 //! one quietly.
 
 /// Brings the application log up, so that a viewer's story lands in the same
-/// file as VMLord's.
+/// file as VMLord's -- and nowhere near its standard output, which is the
+/// launch pipe.
 ///
 /// A viewer that cannot log still shows a desktop: a failure here is reported
 /// to standard error and nothing else. Losing the log is not worth losing the
@@ -21,7 +22,9 @@ pub fn initialize() {
 
     match settings {
         Ok(settings) => {
-            if let Err(error) = vmlord_core::initialize_logging(&settings) {
+            // Never to standard output: that pipe carries framed launch
+            // messages, and a log line written into it is read as a length.
+            if let Err(error) = vmlord_core::initialize_logging_without_console(&settings) {
                 eprintln!("VMLord Display: the log could not be opened: {error}");
             }
         }
