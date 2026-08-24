@@ -1625,6 +1625,26 @@ fn ssh_detail(vm: &VmSummary) -> String {
     }
 }
 
+/// Whether Connect is offered, and what to say when it is not.
+///
+/// The display's own status rather than "the VM is running": a running VM
+/// whose desktop is still installing has nothing to open a window on, and a
+/// running VM whose guest has not offered its display would leave a viewer
+/// retrying a service nothing binds. The sentence explaining either is the
+/// application layer's, which is why this reads one rather than writing one.
+fn connect_offer(status: Option<&VmDisplayStatus>) -> (bool, Option<&str>) {
+    match status {
+        Some(status) if status.is_connectable() => (true, None),
+        Some(status) => (false, Some(status.message.as_str())),
+        // A VM the application has derived nothing for yet -- one refresh old
+        // at most. Offering a window on it would be offering a guess.
+        None => (
+            false,
+            Some("The display of this VM has not been reported yet"),
+        ),
+    }
+}
+
 fn render_selected_vm(
     ui: &mut egui::Ui,
     vms: &[VmSummary],
@@ -1659,11 +1679,12 @@ fn render_selected_vm(
             Some("Available when the VM has finished building"),
         );
         ui.separator();
+        let (can_connect, waiting_for) = connect_offer(display_status);
         if let Some(clicked_action) = render_action_group(
             ui,
             &[(VmAction::Connect, "Connect")],
-            is_running,
-            Some("Available only when the VM is running"),
+            can_connect,
+            waiting_for,
         ) {
             action = Some(clicked_action);
         }
@@ -2203,11 +2224,58 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use vmlord_core::{
-        GpuAvailability, GpuFailure, GpuStatusCode, SshAuthentication, SshAvailability, SshConfig,
-        VmGpuFacts,
+        DisplayStage, DisplayState, DisplayStatusCode, GpuAvailability, GpuFailure, GpuStatusCode,
+        SshAuthentication, SshAvailability, SshConfig, VmGpuFacts,
     };
 
     use super::*;
+
+    /// One derived display status, as the application layer hands it over.
+    fn display_status(state: DisplayState, message: &str) -> VmDisplayStatus {
+        VmDisplayStatus {
+            state,
+            stage: DisplayStage::Guest,
+            code: DisplayStatusCode::GuestReady,
+            running_version: None,
+            available_version: None,
+            message: message.to_owned(),
+            guest: None,
+            can_retry: false,
+            observed_at: std::time::SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn connect_is_offered_only_when_the_display_can_be_connected_to() {
+        let ready = display_status(DisplayState::Ready, "The guest offers its desktop.");
+
+        assert_eq!(connect_offer(Some(&ready)), (true, None));
+    }
+
+    #[test]
+    fn a_display_that_is_not_ready_says_what_it_is_waiting_for() {
+        let waiting = display_status(
+            DisplayState::WaitingForGuest,
+            "The desktop is installed; waiting for the guest to offer it.",
+        );
+
+        assert_eq!(
+            connect_offer(Some(&waiting)),
+            (
+                false,
+                Some("The desktop is installed; waiting for the guest to offer it.")
+            ),
+            "the reason is the application layer's sentence, not one invented here"
+        );
+    }
+
+    #[test]
+    fn a_vm_with_no_derived_status_is_not_offered_a_window() {
+        let (offered, reason) = connect_offer(None);
+
+        assert!(!offered);
+        assert!(reason.is_some());
+    }
 
     /// Creating a VM no longer ends at a registered compute system, so the two
     /// steps that follow have to be legible in the list rather than reading as
