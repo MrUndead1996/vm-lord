@@ -58,6 +58,25 @@ guest says", and today the guest says neither: the compositor is GNOME's
 business and the DRM output name never leaves the device stage's message. An
 invented value would be worse than an absent one.
 
+### A desktop that is running is a desktop that installed
+
+`display_provisioning` has the same problem the guest report has, one step
+earlier: it is written once when the VM is created -- `Pending` for a GNOME
+profile -- and nothing has ever moved it. The application refuses to look past
+a provisioning that is not `Ready`, so a guest offering its desktop right now
+would still be reported as one whose desktop is still installing.
+
+Nothing on the host can observe the installation directly: cloud-init installs
+the packages on the first boot, long after the creation pipeline has finished,
+and no guest message reports the package set. What can be observed is the guest
+running its display services on top of that desktop -- the same fact Connect
+waits for. So the first time a VM's guest reports readiness, the stored
+provisioning is written as `Ready`.
+
+Stored rather than derived on every refresh, because the field is stored for a
+reason: a stopped VM should read as a VM whose desktop is not running, not as
+one whose desktop never arrived.
+
 ### Three service entries, on every VM
 
 `Devices/HvSocket/HvSocketConfig/ServiceTable` gains three entries beside the
@@ -206,7 +225,7 @@ second set of failure states, and this task is Connect.
 | `crates/platform/src/display_launches.rs` | new: the launch threads in flight |
 | `crates/platform/src/agent_session.rs` | the recipe report also yields readiness |
 | `crates/platform/src/display_runs.rs` | records and returns the guest report |
-| `crates/platform/src/repository.rs` | `open_display`: preflight, then launch |
+| `crates/platform/src/repository.rs` | `open_display`: preflight, then launch; a desktop recorded as installed |
 | `crates/platform/Cargo.toml` | depends on `vmlord-display-viewer` for `launch` |
 | `crates/ui/src/lib.rs` | Connect gated on the display status |
 | `ARCHITECTURE.md` | the two "not wired yet" paragraphs become what it does |
@@ -233,6 +252,8 @@ Everything but the partition is testable, and that is most of it.
   `ClientHello` that differs from the first, because the nonces do.
 * **Readiness mapping** -- one test per row of the table above, over
   `ApplyDisplayRecipeResponse` values.
+* **The recorded installation** -- a guest that reports readiness moves a
+  `Pending` provisioning to `Ready` and leaves anything else alone.
 * **The preflight** -- one test per refusal, asserting the sentence names the
   reason and not another one.
 * **The UI predicate** -- Connect's enabled state follows `is_connectable`.
