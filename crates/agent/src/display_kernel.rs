@@ -47,6 +47,9 @@ const UNBIND_UNIT: &str = "/etc/systemd/system/vmlord-display-unbind-simpledrm.s
 /// template applies to every instance of it.
 const COMPOSITOR_DROP_IN: &str =
     "/etc/systemd/user/org.gnome.Shell@.service.d/vmlord-display-compositor-mesa.conf";
+/// Where the rule that keeps the desktop on this output goes. The number puts
+/// it after mutter's own `61-mutter.rules`, whose tag it adds to.
+const UDEV_RULES: &str = "/etc/udev/rules.d/62-vmlord-display.rules";
 const DRM_DEVICES: &str = "/sys/class/drm";
 
 /// Where the two guest programs are installed. Beside the module's own unit,
@@ -573,7 +576,8 @@ fn load_stage(report: &mut Report, mode: Option<(u32, u32)>) -> Result<(), Strin
             .map_err(|error| format!("{MODPROBE_OPTIONS} could not be written: {error}"))
         })
         .and_then(|()| copy("vmlord-display-unbind-simpledrm.service", UNBIND_UNIT))
-        .and_then(|()| copy("vmlord-display-compositor-mesa.conf", COMPOSITOR_DROP_IN));
+        .and_then(|()| copy("vmlord-display-compositor-mesa.conf", COMPOSITOR_DROP_IN))
+        .and_then(|()| copy("62-vmlord-display.rules", UDEV_RULES));
     if let Err(reason) = prepared {
         report.failed(DisplayRecipeStep::ModuleLoad, reason.clone());
         return Err(reason);
@@ -640,11 +644,34 @@ fn device_stage(report: &mut Report) -> Result<(), String> {
         report.failed(DisplayRecipeStep::Device, reason.clone());
         return Err(reason);
     }
+    keep_the_desktop_on_this_output();
     report.ok(
         DisplayRecipeStep::Device,
         format!("a {MODULE} display device is present"),
     );
     Ok(())
+}
+
+/// Asks udev to look at the display cards again, now that this one is here.
+///
+/// The rule that hides the Hyper-V card is written for a guest where this
+/// module is loaded, and it says so with a `TEST` on this device. At boot the
+/// synthetic card is there long before the module is, so the rule ran and
+/// found nothing; this is what makes it run again while the answer is yes.
+/// Before any compositor starts, because a tag is read when a card is
+/// enumerated and not after.
+///
+/// Nothing here fails a stage: a guest whose udev refused is a guest with a
+/// second monitor nobody can see, which is worse than one monitor and better
+/// than no display.
+fn keep_the_desktop_on_this_output() {
+    let _ = command::run("udevadm", &["control", "--reload"], &[], SHORT_BUDGET);
+    let _ = command::run(
+        "udevadm",
+        &["trigger", "--subsystem-match=drm", "--action=change"],
+        &[],
+        SHORT_BUDGET,
+    );
 }
 
 /// Checks the update did what it said: the target version loaded, on a device
@@ -1009,6 +1036,37 @@ mod tests {
                 .lines()
                 .any(|line| line == "Environment=LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu"),
             "unsetting LD_LIBRARY_PATH is not enough: the cache has to be outranked"
+        );
+    }
+
+    #[test]
+    fn the_udev_rule_hides_the_synthetic_display_only_where_this_one_exists() {
+        // A Hyper-V guest has a display of its own, and a compositor that finds
+        // two cards lights both. The second monitor is drawn on the Hyper-V
+        // console, where the viewer cannot see it, and it stretches the desktop
+        // an absolute pointer is mapped across -- so the guest's cursor lands
+        // well to the right of where the user pointed. Task #121 measured that.
+        let rule = include_str!("../../../payloads/display/module/62-vmlord-display.rules");
+        let matched = rule
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .collect::<String>();
+
+        assert!(
+            matched.contains("TAG+=\"mutter-device-ignore\""),
+            "the tag is what mutter reads; nothing else here hides a card"
+        );
+        assert!(
+            matched.contains("DRIVERS==\"hyperv_drm\""),
+            "the card to hide is the synthetic one, named by its driver"
+        );
+        assert!(
+            matched.contains("TEST==\"/sys/devices/platform/vmlord_drm.0/drm\""),
+            "without this a guest whose module never built loses its only display"
+        );
+        assert!(
+            super::UDEV_RULES.contains("/62-"),
+            "the file has to sort after 61-mutter.rules, whose tag it adds to"
         );
     }
 
