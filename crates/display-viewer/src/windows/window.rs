@@ -23,8 +23,8 @@ use windows::{
     Win32::{
         Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM},
         Graphics::Gdi::{
-            CreateSolidBrush, GetMonitorInfoW, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-            MonitorFromWindow, UpdateWindow,
+            CreateSolidBrush, EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR,
+            MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, UpdateWindow,
         },
         System::LibraryLoader::GetModuleHandleW,
         UI::{
@@ -39,18 +39,18 @@ use windows::{
             WindowsAndMessaging::{
                 AdjustWindowRect, AppendMenuW, CW_USEDEFAULT, CheckMenuRadioItem, CreateWindowExW,
                 DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GWL_STYLE,
-                GetClientRect, GetSystemMenu, GetWindowLongPtrW, GetWindowPlacement, HWND_TOP,
-                IDC_ARROW, LoadCursorW, MB_ICONERROR, MB_OK, MF_BYCOMMAND, MF_SEPARATOR,
-                MF_STRING, MSG, MessageBoxW, PM_REMOVE, PeekMessageW, PostMessageW,
-                PostQuitMessage, RegisterClassW, SW_RESTORE, SW_SHOW,
+                GetClientRect, GetSystemMenu, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect,
+                HWND_TOP, IDC_ARROW, LoadCursorW, MB_ICONERROR, MB_OK, MF_BYCOMMAND, MF_SEPARATOR,
+                MF_STRING, MONITORINFOF_PRIMARY, MSG, MessageBoxW, PM_REMOVE, PeekMessageW,
+                PostMessageW, PostQuitMessage, RegisterClassW, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL,
                 SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
                 SetForegroundWindow, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos,
                 ShowWindow, TranslateMessage, WINDOWPLACEMENT, WINDOW_EX_STYLE, WINDOW_STYLE,
                 WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_KILLFOCUS, WM_LBUTTONDOWN,
                 WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
-                WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE,
-                WM_SYSCOMMAND, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW,
-                WS_POPUP,
+                WM_MOUSEWHEEL, WM_MOVE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS,
+                WM_SIZE, WM_SYSCOMMAND, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
+                WS_OVERLAPPEDWINDOW, WS_POPUP,
             },
         },
     },
@@ -59,6 +59,7 @@ use windows::{
 
 use crate::{
     input::{self, Report},
+    monitors::{self, opening_position},
     state::{Quality, WindowState},
     status::{self, Button},
 };
@@ -145,6 +146,12 @@ pub enum UiEvent {
     Pressed(Button),
     /// The client area is now this big, in physical pixels.
     Resized(i32, i32),
+    /// The restored window's top left is now here, in virtual-desktop pixels.
+    ///
+    /// Reported only for a window that is neither full screen nor maximised:
+    /// what is remembered between sessions is where the user put the window,
+    /// not the monitor a full-screen one happens to be covering.
+    Moved(i32, i32),
     /// The user asked to fill the monitor, or to stop.
     ToggleFullscreen,
     /// The user picked an encoding mode from the system menu.
@@ -196,6 +203,14 @@ impl Window {
         unsafe { AdjustWindowRect(&raw mut rectangle, WS_OVERLAPPEDWINDOW, false) }
             .map_err(|error| format!("the window size could not be worked out: {error}"))?;
 
+        // A desktop can change between two sessions: the monitor the window
+        // was on is unplugged, or the arrangement is rebuilt the other way
+        // round. A window opened where nobody can see it looks like a viewer
+        // that failed to start.
+        let position = state
+            .position
+            .and_then(|position| opening_position(position, state.size, &work_areas()));
+
         let title = HSTRING::from(title);
         // SAFETY: both strings are NUL-terminated and live across the call, and
         // the class was registered above.
@@ -205,8 +220,8 @@ impl Window {
                 PCWSTR(class.as_ptr()),
                 PCWSTR(title.as_ptr()),
                 WS_OVERLAPPEDWINDOW,
-                state.position.map_or(CW_USEDEFAULT, |(x, _)| x),
-                state.position.map_or(CW_USEDEFAULT, |(_, y)| y),
+                position.map_or(CW_USEDEFAULT, |(x, _)| x),
+                position.map_or(CW_USEDEFAULT, |(_, y)| y),
                 rectangle.right - rectangle.left,
                 rectangle.bottom - rectangle.top,
                 None,
@@ -269,6 +284,13 @@ impl Window {
             shared,
             restore: None,
         };
+        // Said once here rather than left to the first drag: a session that
+        // never moves the window still has a place worth remembering, and
+        // whether showing a window reports its own `WM_MOVE` is Windows'
+        // business rather than something to depend on.
+        if let Some((x, y)) = window.position() {
+            window.shared.report(UiEvent::Moved(x, y));
+        }
         window.check_quality(state.quality);
         if state.fullscreen {
             let mut window = window;
@@ -389,29 +411,12 @@ impl Window {
 
     /// Where the window sits when it is not filling anything.
     ///
-    /// The restored position rather than the current one, so that a window
-    /// closed full screen or maximised comes back where it was before.
+    /// `None` while it is full screen or maximised: neither is a place the
+    /// user left the window, and remembering one would open the next session
+    /// covering a monitor the window was never really on.
     #[must_use]
-    pub fn restored_position(&self) -> Option<(i32, i32)> {
-        if let Some((_, placement)) = self.restore.as_ref() {
-            return Some((
-                placement.rcNormalPosition.left,
-                placement.rcNormalPosition.top,
-            ));
-        }
-
-        let mut placement = WINDOWPLACEMENT {
-            length: u32::try_from(std::mem::size_of::<WINDOWPLACEMENT>()).unwrap_or(0),
-            ..Default::default()
-        };
-        // SAFETY: `self.hwnd` names a window of this process and the placement
-        // lives across the call.
-        unsafe { GetWindowPlacement(self.hwnd, &raw mut placement) }.ok()?;
-
-        Some((
-            placement.rcNormalPosition.left,
-            placement.rcNormalPosition.top,
-        ))
+    pub fn position(&self) -> Option<(i32, i32)> {
+        restored_origin(self.hwnd)
     }
 
     /// The monitor this window is mostly on, in virtual-desktop pixels.
@@ -662,6 +667,92 @@ fn client_size(hwnd: HWND) -> (i32, i32) {
     )
 }
 
+/// The top left of a window that is sitting on the desktop normally.
+///
+/// `None` for a window that is full screen -- which this viewer makes with
+/// `WS_POPUP` -- or maximised or minimised: those are states rather than
+/// places, and the place to come back to is the one from before them.
+fn restored_origin(hwnd: HWND) -> Option<(i32, i32)> {
+    // SAFETY: `hwnd` names a window of this process.
+    let style = WINDOW_STYLE(unsafe { GetWindowLongPtrW(hwnd, GWL_STYLE) } as u32);
+    if style & WS_POPUP != WINDOW_STYLE(0) {
+        return None;
+    }
+
+    let mut placement = WINDOWPLACEMENT {
+        length: u32::try_from(std::mem::size_of::<WINDOWPLACEMENT>()).unwrap_or(0),
+        ..Default::default()
+    };
+    // SAFETY: as above, and the placement lives across the call.
+    unsafe { GetWindowPlacement(hwnd, &raw mut placement) }.ok()?;
+    if placement.showCmd != SW_SHOWNORMAL.0 as u32 {
+        return None;
+    }
+
+    let mut rectangle = RECT::default();
+    // SAFETY: as above, and the rectangle lives across the call. The window
+    // rectangle rather than the placement's, because a placement is in
+    // workspace coordinates -- the same window, offset by whatever the
+    // taskbar takes -- and what opens a window is screen coordinates.
+    unsafe { GetWindowRect(hwnd, &raw mut rectangle) }.ok()?;
+
+    Some((rectangle.left, rectangle.top))
+}
+
+/// The work area of every monitor attached right now, the primary one first.
+///
+/// Work areas rather than whole monitors: a title bar under the taskbar is one
+/// the user cannot grab, so it does not count as somewhere the window is.
+fn work_areas() -> Vec<monitors::Rect> {
+    let mut found: Vec<(bool, monitors::Rect)> = Vec::new();
+    // SAFETY: `collect_monitor` only ever writes through the pointer handed
+    // to it, which is this vector for as long as the enumeration runs.
+    unsafe {
+        let _ = EnumDisplayMonitors(
+            None,
+            None,
+            Some(collect_monitor),
+            LPARAM(&raw mut found as isize),
+        );
+    }
+    // The primary monitor first, so that a window with no monitor left of its
+    // own lands on the one the user is most likely looking at.
+    found.sort_by_key(|(primary, _)| !primary);
+
+    found.into_iter().map(|(_, area)| area).collect()
+}
+
+/// One monitor, appended to the vector `lparam` names.
+extern "system" fn collect_monitor(
+    monitor: HMONITOR,
+    _context: HDC,
+    _rectangle: *mut RECT,
+    lparam: LPARAM,
+) -> windows::core::BOOL {
+    let mut info = MONITORINFO {
+        cbSize: u32::try_from(std::mem::size_of::<MONITORINFO>()).unwrap_or(0),
+        ..Default::default()
+    };
+    // SAFETY: `monitor` came from the enumeration and `info` lives across the
+    // call with its size filled in.
+    if unsafe { GetMonitorInfoW(monitor, &raw mut info) }.as_bool() {
+        // SAFETY: the pointer is the vector `work_areas` passed in, alive for
+        // the whole enumeration, and this callback is the only writer.
+        let found = unsafe { &mut *(lparam.0 as *mut Vec<(bool, monitors::Rect)>) };
+        found.push((
+            info.dwFlags & MONITORINFOF_PRIMARY != 0,
+            monitors::Rect {
+                left: info.rcWork.left,
+                top: info.rcWork.top,
+                right: info.rcWork.right,
+                bottom: info.rcWork.bottom,
+            },
+        ));
+    }
+
+    true.into()
+}
+
 /// What the window does with each message.
 ///
 /// The shared state is read back from `GWLP_USERDATA` without taking ownership:
@@ -780,6 +871,14 @@ extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
             // SAFETY: the default handler, which owns Move, Size and Close.
             unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
+        WM_MOVE => {
+            // Read back rather than taken from `lparam`: that is the client
+            // area's corner, and what opens a window again is the frame's.
+            if let Some((x, y)) = restored_origin(hwnd) {
+                shared.report(UiEvent::Moved(x, y));
+            }
+            LRESULT(0)
+        }
         WM_SIZE => {
             let width = (lparam.0 & 0xffff) as i32;
             let height = ((lparam.0 >> 16) & 0xffff) as i32;
@@ -879,7 +978,7 @@ mod tests {
         Foundation::{LPARAM, WPARAM},
         UI::WindowsAndMessaging::{
             SendMessageW, WM_CLOSE, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-            WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SYSCOMMAND,
+            WM_MOUSEWHEEL, WM_MOVE, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SYSCOMMAND,
         },
     };
 
@@ -1150,21 +1249,99 @@ mod tests {
     }
 
     #[test]
+    fn a_window_that_moves_reports_where_it_went() {
+        // What is remembered is reported while the window is still there: at
+        // the end of a session the window has already been destroyed, and a
+        // destroyed window has no position to read back.
+        let (shared, events) = shared();
+        let window = opened(&events, &shared);
+
+        // SAFETY: a message sent to this process's own window.
+        unsafe {
+            SendMessageW(window.handle(), WM_MOVE, None, None);
+        }
+
+        let reported = drain(&events);
+        let position = window.position().expect("a restored window has a position");
+        assert!(
+            reported.contains(&UiEvent::Moved(position.0, position.1)),
+            "a moved window reports its place: {reported:?}"
+        );
+    }
+
+    #[test]
+    fn a_window_reports_where_it_opened_before_anyone_moves_it() {
+        // A session that never drags the window still has a place to remember:
+        // the one Windows chose for it the first time.
+        let (shared, events) = shared();
+        let window =
+            Window::open("test - VMLord Display", &sized(320, 240), shared).expect("a window");
+
+        let position = window.position().expect("a restored window has a position");
+        assert!(
+            drain(&events).contains(&UiEvent::Moved(position.0, position.1)),
+            "the place a window opened at is reported like any other"
+        );
+    }
+
+    #[test]
+    fn a_full_screen_window_reports_no_place_to_remember() {
+        // The monitor it is covering is not where the user left the window.
+        let (shared, events) = shared();
+        let mut window = opened(&events, &shared);
+        window.set_fullscreen(true);
+        let _ = drain(&events);
+
+        // SAFETY: a message sent to this process's own window.
+        unsafe {
+            SendMessageW(window.handle(), WM_MOVE, None, None);
+        }
+
+        assert!(
+            !drain(&events)
+                .iter()
+                .any(|event| matches!(event, UiEvent::Moved(_, _))),
+            "a full-screen window has no restored place to report"
+        );
+        assert_eq!(window.position(), None);
+    }
+
+    #[test]
+    fn a_window_remembered_where_no_monitor_is_any_more_opens_on_one() {
+        // The unplugged second monitor, or the arrangement rebuilt the other
+        // way round: the coordinates are real and nobody can see them.
+        let (shared, _events) = shared();
+        let state = WindowState {
+            position: Some((-30_000, -30_000)),
+            size: (320, 240),
+            ..WindowState::default()
+        };
+
+        let window = Window::open("test - VMLord Display", &state, shared).expect("a window");
+
+        let position = window.position().expect("a restored window has a position");
+        assert!(
+            position != (-30_000, -30_000) && position.0 > -30_000 && position.1 > -30_000,
+            "a window with no monitor left opens on one that is there: {position:?}"
+        );
+    }
+
+    #[test]
     fn a_window_that_filled_a_monitor_goes_back_to_where_it_was() {
         let (shared, events) = shared();
         let mut window = opened(&events, &shared);
-        let before = window.restored_position();
+        let before = window.position().expect("a restored window has a position");
 
         window.set_fullscreen(true);
         assert!(window.is_fullscreen());
-        assert_eq!(
-            window.restored_position(),
-            before,
-            "what is remembered is where the window was, not the monitor"
-        );
 
         window.set_fullscreen(false);
         assert!(!window.is_fullscreen());
+        assert_eq!(
+            window.position(),
+            Some(before),
+            "what comes back is where the window was, not the monitor"
+        );
         assert_eq!(window.client_size(), (320, 240));
     }
 

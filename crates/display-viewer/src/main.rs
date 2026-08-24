@@ -654,6 +654,12 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
                         state.size = (width, height);
                     }
                 }
+                UiEvent::Moved(x, y) => {
+                    // Only a restored window reports this, so what is kept is
+                    // the place the user left the window rather than the
+                    // monitor a full-screen one is covering.
+                    state.position = Some((x, y));
+                }
                 UiEvent::ToggleFullscreen => {
                     let wanted = !context.window.is_fullscreen();
                     context.window.set_fullscreen(wanted);
@@ -705,7 +711,6 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
 
         // A stopped VM closes the window rather than showing a failure.
         if closing || matches!(progress.status(), Status::Gone) {
-            state.position = context.window.restored_position();
             // A hook left installed would swallow the user's keyboard with
             // nothing left to send it to.
             drop(hook);
@@ -722,7 +727,6 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
     }
 
     drop(hook);
-    state.position = context.window.restored_position();
 
     ExitCode::SUCCESS
 }
