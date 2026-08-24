@@ -3276,7 +3276,8 @@ digest -- before anything is copied), `BUILD_DEPENDENCIES` (`dkms`,
 `MODULE_SOURCE` (copied to `/usr/src/vmlord-display-<version>`, because 9p is
 read-only and DKMS writes beside its sources), `MODULE_BUILD`, `MODULE_LOAD`
 (`modules-load.d`, the modprobe options, the unit that unbinds
-`simple-framebuffer`, and `modprobe`), `DEVICE` (a `/dev/dri/card*` whose
+`simple-framebuffer`, the drop-in that keeps the compositor on the
+distribution's Mesa, and `modprobe`), `DEVICE` (a `/dev/dri/card*` whose
 driver is ours), and `SERVICES`/`SERVICES_START`, which are skipped with their
 reason until task #115 fills `content/services`.
 
@@ -3287,6 +3288,18 @@ a VM and a payload is shared by all of them. A VM with no stored mode gets
 under a module already loaded costs a `modprobe -r` and a `modprobe`, because a
 module parameter is read once; a module that does not say what it was loaded
 with is left alone, because a reload on a guess drops a working desktop.
+
+The drop-in is the opposite kind of file: identical for every VM, so it is
+copied out of the payload. It lands on `org.gnome.Shell@.service`, which is a
+template, so it reaches the greeter's compositor and a logged-in user's both,
+and it says two things -- the GPU recipe's Mesa overrides unset, and
+`LD_LIBRARY_PATH` pointed at the distribution's libraries. Both, because the
+GPU recipe reaches a process by two paths: the environment it exports, and
+`/etc/ld.so.conf.d/vmlord-wsl-mesa.conf`, which no environment can undo. A
+compositor left on the payload's Mesa binds our device, fails to allocate a
+buffer on it, and never finishes its modeset; applications, which is where the
+GPU was wanted, keep the whole environment. A drop-in is read when a unit next
+starts, and on a normal boot this recipe runs before the greeter does.
 
 Idempotence is by fact and not by a flag: the payload's version installed, the
 module loaded and a device that answers short-circuits the three build stages,

@@ -29,6 +29,13 @@ the mode it was already on, which is a window that was resized and a desktop
 that was not. What it costs is a guest-side resolution picker -- and a picture
 that disagreed with the window is what there would be if there were one.
 
+The smallest *framebuffer* the device accepts is 64x64, which is deliberately
+not the smallest mode it offers. `mode_config`'s minimum bounds every buffer
+created on the device, a compositor's 256x256 cursor included, so the mode
+bounds cannot be reused there: with 640x480 in that field the cursor's ADDFB2
+came back `EINVAL`, mutter would not light an output whose cursor plane it
+could not fill, and the desktop stayed black (task #131).
+
 Three properties are decisions rather than style, all three measured by task
 #111 (`docs/display-drm-backend.md`):
 
@@ -39,6 +46,20 @@ Three properties are decisions rather than style, all three measured by task
   hide a driver's cursor plane;
 * its formats are XRGB8888 and ARGB8888 with `DRM_FORMAT_MOD_LINEAR` only,
   because a capture client that mmaps a buffer cannot detile anything else.
+
+## What is shipped beside it
+
+Two files that are configuration rather than code, both copied into a guest by
+`MODULE_LOAD`:
+
+* `vmlord-display-unbind-simpledrm.service` unbinds `simple-framebuffer`, which
+  is builtin and so cannot be blacklisted;
+* `vmlord-display-compositor-mesa.conf` is a drop-in on
+  `org.gnome.Shell@.service` that keeps the compositor on the distribution's
+  Mesa. Under GPU-PV the payload's Mesa renders through `/dev/dxg` and cannot
+  hand a buffer to a foreign KMS device, so a compositor left on it binds this
+  device and then cannot draw on it. Applications keep the GPU; only the
+  compositor is moved off it.
 
 ## What it is not
 
