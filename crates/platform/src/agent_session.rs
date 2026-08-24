@@ -28,7 +28,8 @@ use vmlord_agent_protocol::{
         ApplyDisplayRecipeRequest, ApplyDisplayRecipeResponse, ApplyGpuRecipeRequest,
         ApplyGpuRecipeResponse, AttachDisplayPayloadRequest, AttachDisplayPayloadResponse,
         AttachGpuSharesRequest, AttachGpuSharesResponse, AuthenticateRequest, Capability,
-        DisplayMountState, DisplayRecipeStageState, DisplayShare as WireDisplayShare,
+        DisplayMountState, DisplayRecipeStageState, DisplayRecipeStep,
+        DisplayShare as WireDisplayShare,
         DisplayUpdateOutcome, Envelope, ErrorCode, GpuMountState, GpuProbeCheckState,
         GpuProbeVerdict, GpuRecipeStageState, GpuShareRole, HeartbeatResponse, HelloResponse,
         ProbeGpuRequest, ProbeGpuResponse, ProtocolVersion, UpdateDisplayPayloadRequest,
@@ -37,7 +38,8 @@ use vmlord_agent_protocol::{
 };
 use vmlord_core::{
     DisplayFailure, DisplayMode, DisplayShare, DisplayStage, DisplayStatusCode, GpuFailure,
-    GpuShareManifest, GpuShareRole as CoreShareRole, GpuStatusCode, GuestGpuDetail, GuestGpuReport,
+    GpuShareManifest, GpuShareRole as CoreShareRole, GpuStatusCode, GuestDisplayDetail,
+    GuestDisplayReport, GuestGpuDetail, GuestGpuReport,
 };
 
 use crate::agent::{DisplayUpdate, DisplayUpdateAnswer};
@@ -109,6 +111,12 @@ pub(crate) struct GuestDisplayPayloadReport {
     pub(crate) previous: Option<String>,
     pub(crate) loaded: Option<String>,
     pub(crate) failure: Option<DisplayFailure>,
+    /// What the guest's own display services are doing, when this report says.
+    ///
+    /// `None` is a report with nothing to say about them -- a share that did
+    /// not mount, or an update, which changes versions and not readiness --
+    /// and leaves whatever was last observed standing.
+    pub(crate) guest: Option<GuestDisplayReport>,
 }
 
 /// Where a display report goes, for the same reason the GPU's has a sink.
@@ -601,6 +609,10 @@ fn report_display_update(
         previous: some_version(&versions.previous),
         loaded: some_version(&versions.loaded),
         failure,
+        // An update moves versions. Whether anything is listening is what the
+        // recipe reported when the session opened, and is not this answer's
+        // to change.
+        guest: None,
     };
     sink(payload.clone());
 
@@ -719,11 +731,42 @@ fn report_display_recipe(
             )
         });
 
+    // The last stage is the readiness a viewer waits for: the guest marks it
+    // `Ok` only once both units are active and the socket between them exists,
+    // which is what proves the two halves met. Reading it here is why no
+    // second question has to be asked over this channel.
+    let services = report
+        .stages
+        .iter()
+        .find(|stage| stage.step() == DisplayRecipeStep::ServicesStart)
+        .map(|stage| stage.state());
+    let guest = match (services, &failure) {
+        (Some(DisplayRecipeStageState::Ok), _) => {
+            Some(GuestDisplayReport::Ready(GuestDisplayDetail::default()))
+        }
+        // A payload built before the services existed carries none, and a
+        // guest that has nothing to start will never offer a display. Saying
+        // so beats a wait that cannot end.
+        (Some(DisplayRecipeStageState::Skipped), _) => {
+            Some(GuestDisplayReport::Failed(DisplayFailure::new(
+                DisplayStage::Payload,
+                DisplayStatusCode::PayloadInvalid,
+                "this display payload carries no display services",
+            )))
+        }
+        (_, Some(failure)) => Some(GuestDisplayReport::Failed(failure.clone())),
+        // A recipe that reached neither says nothing about the guest's
+        // services, and inventing an answer would either promise a desktop
+        // that is not there or condemn one that is.
+        _ => None,
+    };
+
     sink(GuestDisplayPayloadReport {
         installed: some_version(&versions.installed),
         previous: some_version(&versions.previous),
         loaded: some_version(&versions.loaded),
         failure,
+        guest,
     });
 }
 
@@ -1177,19 +1220,92 @@ mod tests {
             AttachGpuSharesResponse, AuthenticateResponse, Capability, DisplayMountState,
             DisplayRecipeStage, DisplayRecipeStageState, Envelope, ErrorCode, GpuMount,
             GpuMountState, GpuProbeCheck, GpuProbeCheckState, GpuProbeStep, GpuProbeVerdict,
-            GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep, GpuShareRole, HeartbeatRequest,
-            HelloRequest, ProbeGpuResponse, ProtocolVersion, envelope, request, response,
+            DisplayRecipeStep, GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep, GpuShareRole,
+            HeartbeatRequest, HelloRequest, ProbeGpuResponse, ProtocolVersion, envelope, request,
+            response,
         },
     };
 
     use vmlord_core::{
         DisplayShare, DisplayStage, DisplayStatusCode, GpuShareManifest, GpuStatusCode,
-        GuestGpuDetail, GuestGpuReport,
+        GuestDisplayReport, GuestGpuDetail, GuestGpuReport,
     };
 
     use super::{
-        AgentSession, GuestDisplaySink, GuestGpuSink, SessionError, SessionWork, open, serve,
+        AgentSession, GuestDisplaySink, GuestGpuSink, SessionError, SessionWork, open,
+        report_display_recipe, serve,
     };
+
+    /// The readiness a recipe with these stages reports, if any.
+    fn readiness(stages: Vec<DisplayRecipeStage>) -> Option<GuestDisplayReport> {
+        let report = ApplyDisplayRecipeResponse {
+            stages,
+            versions: None,
+        };
+        let seen = Mutex::new(None);
+
+        report_display_recipe(&report, "dev", &|report| {
+            *seen.lock().expect("an uncontended lock") = report.guest;
+        });
+
+        seen.into_inner().expect("an uncontended lock")
+    }
+
+    /// One recipe stage, as the guest reports it.
+    fn stage(step: DisplayRecipeStep, state: DisplayRecipeStageState) -> DisplayRecipeStage {
+        DisplayRecipeStage {
+            step: step as i32,
+            state: state as i32,
+            message: "what the guest said".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_guest_whose_services_are_running_offers_its_display() {
+        assert!(matches!(
+            readiness(vec![stage(
+                DisplayRecipeStep::ServicesStart,
+                DisplayRecipeStageState::Ok,
+            )]),
+            Some(GuestDisplayReport::Ready(_))
+        ));
+    }
+
+    #[test]
+    fn a_payload_that_carries_no_services_is_a_display_that_will_never_arrive() {
+        let Some(GuestDisplayReport::Failed(failure)) = readiness(vec![stage(
+            DisplayRecipeStep::ServicesStart,
+            DisplayRecipeStageState::Skipped,
+        )]) else {
+            panic!("a payload with no services cannot offer a display");
+        };
+
+        assert_eq!(failure.code, DisplayStatusCode::PayloadInvalid);
+    }
+
+    #[test]
+    fn a_recipe_that_stopped_reports_the_guest_as_failed_for_the_same_reason() {
+        let Some(GuestDisplayReport::Failed(failure)) = readiness(vec![stage(
+            DisplayRecipeStep::ModuleBuild,
+            DisplayRecipeStageState::Failed,
+        )]) else {
+            panic!("a recipe that stopped is a guest that offers nothing");
+        };
+
+        assert_eq!(failure.code, DisplayStatusCode::PayloadBuildFailed);
+    }
+
+    #[test]
+    fn a_recipe_that_reached_neither_says_nothing_about_the_guest() {
+        assert_eq!(
+            readiness(vec![stage(
+                DisplayRecipeStep::Distribution,
+                DisplayRecipeStageState::Ok,
+            )]),
+            None,
+            "a guest that has not got there yet has not failed either"
+        );
+    }
 
     const VM: &str = "dev-linux";
 

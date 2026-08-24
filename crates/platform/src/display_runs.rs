@@ -15,7 +15,9 @@ use std::{
 };
 
 use uuid::Uuid;
-use vmlord_core::{DisplayFailure, DisplayPayloadFacts, DisplayShare, VmDisplayFacts};
+use vmlord_core::{
+    DisplayFailure, DisplayPayloadFacts, DisplayShare, GuestDisplayReport, VmDisplayFacts,
+};
 
 /// One VM's display, for the run it is in the middle of.
 #[derive(Clone, Default)]
@@ -47,6 +49,19 @@ impl DisplayRuns {
         let entry = runs.entry(vm_id).or_default();
         entry.facts.payload.available = available;
         entry.facts.failure = failure;
+        entry.facts.observed_at = Some(SystemTime::now());
+    }
+
+    /// Records what a VM's guest said about the display services inside it.
+    ///
+    /// Separate from the payload versions because the two are observed
+    /// separately: an update changes what is installed and says nothing about
+    /// whether anything is listening, and a guest that reports its services
+    /// says nothing new about versions.
+    pub(crate) fn record_guest_display(&self, vm_id: Uuid, report: GuestDisplayReport) {
+        let mut runs = self.lock();
+        let entry = runs.entry(vm_id).or_default();
+        entry.facts.guest = Some(report);
         entry.facts.observed_at = Some(SystemTime::now());
     }
 
@@ -113,7 +128,9 @@ impl DisplayRuns {
 #[cfg(test)]
 mod tests {
     use uuid::Uuid;
-    use vmlord_core::{DisplayFailure, DisplayStage, DisplayStatusCode};
+    use vmlord_core::{
+        DisplayFailure, DisplayStage, DisplayStatusCode, GuestDisplayDetail, GuestDisplayReport,
+    };
 
     use super::DisplayRuns;
 
@@ -144,6 +161,20 @@ mod tests {
         assert!(
             facts.payload.update_available(),
             "a guest one version behind the release is a guest with an update waiting"
+        );
+    }
+
+    #[test]
+    fn what_the_guest_says_about_its_services_survives_a_payload_report() {
+        let runs = DisplayRuns::default();
+        let vm = Uuid::from_u128(1);
+
+        runs.record_guest_display(vm, GuestDisplayReport::Ready(GuestDisplayDetail::default()));
+        runs.record_guest_payload(vm, Some("0.2.0".into()), None, Some("0.2.0".into()), None);
+
+        assert!(
+            matches!(runs.snapshot(vm).guest, Some(GuestDisplayReport::Ready(_))),
+            "a version report is not a reason to forget that the guest offers a display"
         );
     }
 

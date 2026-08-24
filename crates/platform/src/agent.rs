@@ -238,6 +238,9 @@ impl AgentConnection {
                         &running,
                         &|report| facts.record_guest(vm_id, report),
                         &|report| {
+                            if let Some(guest) = report.guest {
+                                display_facts.record_guest_display(vm_id, guest);
+                            }
                             display_facts.record_guest_payload(
                                 vm_id,
                                 report.installed,
