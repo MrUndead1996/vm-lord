@@ -1142,8 +1142,8 @@ fn render_edit_vm_dialog(
                         // backend refuses this change under a live VM, and a
                         // control that looks available and is not is worse than
                         // one that says why.
-                        if let Some(reason) = locked {
-                            combo.response.on_disabled_hover_text(reason);
+                        if let Some(reason) = &locked {
+                            combo.response.on_disabled_hover_text(reason.clone());
                         }
                     });
                     ui.end_row();
@@ -1182,8 +1182,8 @@ fn render_edit_vm_dialog(
                             // mode: this change is made inside the running
                             // guest, and a control that looks available and is
                             // not is worse than one that says why.
-                            if let Some(reason) = locked {
-                                port.on_disabled_hover_text(reason);
+                            if let Some(reason) = &locked {
+                                port.on_disabled_hover_text(reason.clone());
                             }
                         });
                         ui.end_row();
@@ -1416,23 +1416,28 @@ fn gpu_status_detail(status: Option<&VmGpuStatus>) -> String {
     // Only a VM the last refresh did not list has no status, and that VM is
     // not on screen to be asked about.
     let Some(status) = status else {
-        return "Unknown".into();
+        return t!("common.unknown").to_string();
     };
 
-    let mut detail = format!("{}: {}", gpu_state_label(status.state), status.message);
+    let mut detail = t!(
+        "selected_vm.status_detail",
+        label = gpu_state_label(status.state),
+        message = status.message
+    )
+    .to_string();
     if let Some(adapter) = status
         .native
         .as_ref()
         .and_then(|native| native.adapter.as_ref())
     {
-        detail.push_str(&format!(" Adapter: {adapter}."));
+        detail.push_str(&t!("selected_vm.adapter", adapter = adapter));
     }
     if let Some(node) = status
         .guest
         .as_ref()
         .and_then(|guest| guest.render_node.as_ref())
     {
-        detail.push_str(&format!(" Render node: {node}."));
+        detail.push_str(&t!("selected_vm.render_node", node = node));
     }
     // The stable code, so that what is on screen can be found in the log. Only
     // where something is wrong: a working GPU needs no identifier to match a
@@ -1486,10 +1491,10 @@ fn gpu_capability_warnings(
 /// change under a live VM would leave a stored mode that does not describe the
 /// GPU the guest actually has. RAM and CPU are different: they are read from
 /// the configuration on the next start, and nothing claims otherwise.
-fn gpu_mode_locked(state: &VmState) -> Option<&'static str> {
+fn gpu_mode_locked(state: &VmState) -> Option<String> {
     match state {
         VmState::Stopped => None,
-        _ => Some("Stop the VM to change its GPU mode."),
+        _ => Some(t!("actions.gpu_mode_locked").to_string()),
     }
 }
 
@@ -1500,16 +1505,13 @@ fn gpu_mode_locked(state: &VmState) -> Option<&'static str> {
 /// credential VMLord can present on its own. A stopped VM has nothing to reach,
 /// and a password-mode VM has nothing to present -- neither is a refusal worth
 /// discovering after the click.
-fn ssh_port_locked(state: &VmState, authentication: SshAuthentication) -> Option<&'static str> {
+fn ssh_port_locked(state: &VmState, authentication: SshAuthentication) -> Option<String> {
     if authentication == SshAuthentication::Password {
-        return Some(
-            "This VM logs in by password, which nobody can type into a command VMLord runs on \
-             its own. Change the port inside the guest.",
-        );
+        return Some(t!("actions.ssh_port_password_locked").to_string());
     }
     match state {
         VmState::Running { .. } => None,
-        _ => Some("Start the VM to change its SSH port: the change is made inside the guest."),
+        _ => Some(t!("actions.ssh_port_locked").to_string()),
     }
 }
 
@@ -1585,9 +1587,14 @@ fn display_status_detail(profile: DesktopProfile, status: Option<&VmDisplayStatu
     let Some(status) = status else {
         return desktop_profile_label(profile);
     };
-    let mut detail = format!("{}: {}", display_state_label(status.state), status.message);
+    let mut detail = t!(
+        "selected_vm.status_detail",
+        label = display_state_label(status.state),
+        message = status.message
+    )
+    .to_string();
     if status.can_retry {
-        detail.push_str(" The desktop can be installed again.");
+        detail.push_str(&t!("selected_vm.desktop_reinstallable"));
     }
     detail
 }
@@ -1729,7 +1736,9 @@ fn render_vm_list(ui: &mut egui::Ui, vms: &[VmSummary], selected_vm_name: &mut O
 /// "Open SSH" and not "Open in Windows Terminal": which terminal host the
 /// session lands in is decided when it is launched, and a button that named one
 /// would be wrong on the machine where the other answers.
-const SSH_ACTION_LABEL: &str = "Open SSH";
+fn ssh_action_label() -> String {
+    t!("actions.open_ssh").to_string()
+}
 
 /// What the SSH action can offer for one VM right now.
 ///
@@ -1737,21 +1746,21 @@ const SSH_ACTION_LABEL: &str = "Open SSH";
 /// cannot be pressed yet" are different things to see: the first says this VM
 /// was created without SSH and never will have it, the second says to wait, and
 /// names what for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum SshOffer {
     /// This VM has no SSH access at all, so there is no action to show.
     Absent,
     /// SSH is configured, but the guest cannot be reached yet.
-    Waiting(&'static str),
+    Waiting(String),
     Ready,
 }
 
 impl SshOffer {
     /// The tooltip of a button that cannot be pressed, and nothing for one that
     /// can.
-    const fn waiting_for(self) -> Option<&'static str> {
+    fn waiting_for(&self) -> Option<&str> {
         match self {
-            Self::Waiting(reason) => Some(reason),
+            Self::Waiting(reason) => Some(reason.as_str()),
             Self::Absent | Self::Ready => None,
         }
     }
@@ -1770,14 +1779,12 @@ fn ssh_offer(vm: &VmSummary) -> SshOffer {
     }
 
     match vm.state {
-        VmState::Building { .. } => {
-            SshOffer::Waiting("Available once the VM has been built and started")
-        }
+        VmState::Building { .. } => SshOffer::Waiting(t!("actions.after_start").to_string()),
         VmState::Stopped | VmState::Starting => {
-            SshOffer::Waiting("Available when the VM is running")
+            SshOffer::Waiting(t!("actions.while_running").to_string())
         }
         VmState::Running { .. } if vm.ip_address.is_none() => {
-            SshOffer::Waiting("Available when the guest has an address on the VMLord network")
+            SshOffer::Waiting(t!("actions.needs_address").to_string())
         }
         VmState::Running { .. } => SshOffer::Ready,
     }
@@ -1791,19 +1798,25 @@ fn ssh_offer(vm: &VmSummary) -> SshOffer {
 /// one would be a guess.
 fn ssh_detail(vm: &VmSummary) -> String {
     let Some(ssh) = vm.ssh.config() else {
-        return "Disabled".into();
+        return t!("common.disabled").to_string();
     };
 
     match vm.ip_address {
-        Some(address) => format!(
-            "{}@{}:{} ({} login)",
-            ssh.username, address, ssh.port, ssh.authentication
+        Some(address) => t!(
+            "ssh.endpoint",
+            user = ssh.username,
+            host = address,
+            port = ssh.port,
+            login = ssh.authentication
         ),
-        None => format!(
-            "{} on port {} ({} login); the address appears when the VM is running",
-            ssh.username, ssh.port, ssh.authentication
+        None => t!(
+            "ssh.endpoint_pending",
+            user = ssh.username,
+            port = ssh.port,
+            login = ssh.authentication
         ),
     }
+    .to_string()
 }
 
 /// Whether Connect is offered, and what to say when it is not.
@@ -1813,16 +1826,13 @@ fn ssh_detail(vm: &VmSummary) -> String {
 /// running VM whose guest has not offered its display would leave a viewer
 /// retrying a service nothing binds. The sentence explaining either is the
 /// application layer's, which is why this reads one rather than writing one.
-fn connect_offer(status: Option<&VmDisplayStatus>) -> (bool, Option<&str>) {
+fn connect_offer(status: Option<&VmDisplayStatus>) -> (bool, Option<String>) {
     match status {
         Some(status) if status.is_connectable() => (true, None),
-        Some(status) => (false, Some(status.message.as_str())),
+        Some(status) => (false, Some(status.message.clone())),
         // A VM the application has derived nothing for yet -- one refresh old
         // at most. Offering a window on it would be offering a guess.
-        None => (
-            false,
-            Some("The display of this VM has not been reported yet"),
-        ),
+        None => (false, Some(t!("actions.display_not_reported").to_string())),
     }
 }
 
@@ -1842,23 +1852,15 @@ fn connect_offer(status: Option<&VmDisplayStatus>) -> (bool, Option<&str>) {
 /// and none of them is the UI's to word.
 fn update_display_offer(state: VmState, status: Option<&VmDisplayStatus>) -> (bool, String) {
     if !matches!(state, VmState::Running { .. }) {
-        return (false, "Available only when the VM is running".to_owned());
+        return (false, t!("actions.only_while_running").to_string());
     }
     let Some(status) = status else {
-        return (
-            false,
-            "The display of this VM has not been reported yet".to_owned(),
-        );
+        return (false, t!("actions.display_not_reported").to_string());
     };
     // Before the versions, because they are the ones the update started from:
     // what a second press would ask for is a version already being moved to.
     if status.updating {
-        return (
-            false,
-            "An update of this VM is already under way; how it ended appears in the \
-             diagnostics"
-                .to_owned(),
-        );
+        return (false, t!("actions.display_update_running").to_string());
     }
     let Some(running) = status.running_version.as_deref() else {
         return (false, status.message.clone());
@@ -1867,13 +1869,16 @@ fn update_display_offer(state: VmState, status: Option<&VmDisplayStatus>) -> (bo
     match status.available_version.as_deref() {
         Some(available) => (
             true,
-            format!("Moves the guest from display payload {running} to {available}"),
+            t!(
+                "actions.display_update_offer",
+                running = running,
+                available = available
+            )
+            .to_string(),
         ),
         None => (
             false,
-            format!(
-                "The guest runs display payload {running}, and this release carries nothing else"
-            ),
+            t!("actions.display_up_to_date", running = running).to_string(),
         ),
     }
 }
@@ -1885,19 +1890,29 @@ fn update_display_offer(state: VmState, status: Option<&VmDisplayStatus>) -> (bo
 /// tooltip is only found by someone who already suspects it.
 fn display_payload_detail(status: Option<&VmDisplayStatus>) -> String {
     let Some(status) = status else {
-        return "Not reported".into();
+        return t!("selected_vm.not_reported").to_string();
     };
 
     match (
         status.running_version.as_deref(),
         status.available_version.as_deref(),
     ) {
-        (Some(running), Some(available)) if status.updating => {
-            format!("{running} (updating to {available})")
-        }
-        (Some(running), Some(available)) => format!("{running} (this release offers {available})"),
+        (Some(running), Some(available)) if status.updating => t!(
+            "selected_vm.payload_updating",
+            running = running,
+            available = available
+        )
+        .to_string(),
+        (Some(running), Some(available)) => t!(
+            "selected_vm.payload_offered",
+            running = running,
+            available = available
+        )
+        .to_string(),
         (Some(running), None) => running.to_owned(),
-        (None, Some(available)) => format!("Not reported; this release offers {available}"),
+        (None, Some(available)) => {
+            t!("selected_vm.payload_none_yet", available = available).to_string()
+        }
         (None, None) => "Not reported".into(),
     }
 }
@@ -1916,11 +1931,13 @@ fn render_selected_vm(
 
     ui.add_space(12.0);
     ui.separator();
-    ui.heading(format!("Selected VM: {}", vm.name));
+    ui.heading(t!("selected_vm.title", name = vm.name).to_string());
 
+    let start = t!("actions.start").to_string();
+    let stop = t!("actions.stop").to_string();
     let primary_action = match vm.state {
-        VmState::Stopped | VmState::Building { .. } => (VmAction::Start, "Start"),
-        VmState::Starting | VmState::Running { .. } => (VmAction::Stop, "Stop"),
+        VmState::Stopped | VmState::Building { .. } => (VmAction::Start, start.as_str()),
+        VmState::Starting | VmState::Running { .. } => (VmAction::Stop, stop.as_str()),
     };
     let is_running = matches!(vm.state, VmState::Running { .. });
     // A VM that is still being created has nothing to start, stop, edit or
@@ -1931,17 +1948,20 @@ fn render_selected_vm(
     ui.horizontal(|ui| {
         action = render_action_group(
             ui,
-            &[primary_action, (VmAction::ForceStop, "Force stop")],
+            &[
+                primary_action,
+                (VmAction::ForceStop, &t!("actions.force_stop")),
+            ],
             !is_building,
-            Some("Available when the VM has finished building"),
+            Some(&t!("actions.after_build")),
         );
         ui.separator();
         let (can_connect, waiting_for) = connect_offer(display_status);
         if let Some(clicked_action) = render_action_group(
             ui,
-            &[(VmAction::Connect, "Connect")],
+            &[(VmAction::Connect, &t!("actions.connect"))],
             can_connect,
-            waiting_for,
+            waiting_for.as_deref(),
         ) {
             action = Some(clicked_action);
         }
@@ -1951,7 +1971,7 @@ fn render_selected_vm(
         let (can_update, update_offer) = update_display_offer(vm.state, display_status);
         if let Some(clicked_action) = render_action_group(
             ui,
-            &[(VmAction::UpdateDisplay, "Update display")],
+            &[(VmAction::UpdateDisplay, &t!("actions.update_display"))],
             can_update,
             Some(update_offer.as_str()),
         ) {
@@ -1964,7 +1984,7 @@ fn render_selected_vm(
         if ssh != SshOffer::Absent
             && let Some(clicked_action) = render_action_group(
                 ui,
-                &[(VmAction::Ssh, SSH_ACTION_LABEL)],
+                &[(VmAction::Ssh, &ssh_action_label())],
                 ssh == SshOffer::Ready,
                 ssh.waiting_for(),
             )
@@ -1975,9 +1995,9 @@ fn render_selected_vm(
         // address and no sshd, only a running compute system to own the pipe.
         if let Some(clicked_action) = render_action_group(
             ui,
-            &[(VmAction::Console, "Open COM port")],
+            &[(VmAction::Console, &t!("actions.open_com_port"))],
             is_running,
-            Some("Available only when the VM is running"),
+            Some(&t!("actions.only_while_running")),
         ) {
             action = Some(clicked_action);
         }
@@ -1987,9 +2007,9 @@ fn render_selected_vm(
         // row disappears on its own.
         if let Some(clicked_action) = render_action_group(
             ui,
-            &[(VmAction::CancelCreate, "Cancel creation")],
+            &[(VmAction::CancelCreate, &t!("actions.cancel_creation"))],
             is_building,
-            Some("Available only while the VM is being created"),
+            Some(&t!("actions.only_while_building")),
         ) {
             action = Some(clicked_action);
         }
@@ -1998,17 +2018,17 @@ fn render_selected_vm(
         // start. Deleting one is not.
         if let Some(clicked_action) = render_action_group(
             ui,
-            &[(VmAction::Edit, "Edit")],
+            &[(VmAction::Edit, &t!("actions.edit"))],
             !is_building,
-            Some("Changes to a running VM apply after a restart"),
+            Some(&t!("actions.restart_needed")),
         ) {
             action = Some(clicked_action);
         }
         if let Some(clicked_action) = render_action_group(
             ui,
-            &[(VmAction::Delete, "Delete")],
+            &[(VmAction::Delete, &t!("actions.delete"))],
             can_delete,
-            Some("Available only when the VM is stopped"),
+            Some(&t!("actions.only_while_stopped")),
         ) {
             action = Some(clicked_action);
         }
@@ -2021,44 +2041,56 @@ fn render_selected_vm(
         .show(ui, |ui| {
             detail_row(
                 ui,
-                "IP address",
+                &t!("selected_vm.ip_address"),
                 vm.ip_address
-                    .map_or_else(|| "Unavailable".into(), |ip| ip.to_string()),
+                    .map_or_else(|| t!("common.unavailable").to_string(), |ip| ip.to_string()),
             );
-            detail_row(ui, "Operating system", vm.os_type.clone());
-            detail_row(ui, "Status", vm_state(vm.state).into());
+            detail_row(
+                ui,
+                &t!("selected_vm.operating_system"),
+                vm.os_type.clone(),
+            );
+            detail_row(ui, &t!("vm_table.status"), vm_state(vm.state));
             if let VmState::Building { progress } = vm.state {
                 render_build_progress(ui, progress);
             }
             detail_row(
                 ui,
-                "Agent status",
-                agent_status_label(agent_status(vm.state)).into(),
+                &t!("vm_table.agent_status"),
+                agent_status_label(agent_status(vm.state)),
             );
             detail_row(
                 ui,
-                "Network type",
-                network_mode_label(vm.network_mode).into(),
+                &t!("vm_table.network_type"),
+                network_mode_label(vm.network_mode),
             );
-            detail_row(ui, "CPU", format!("{} cores", vm.cpu_cores));
-            detail_row(ui, "RAM", format!("{} MiB", vm.ram_mb));
-            detail_row(ui, "Disk", format!("{} GiB", vm.disk_gb));
-            detail_row(ui, "GPU", gpu_mode_label(vm.gpu_mode).into());
-            detail_row(ui, "GPU status", gpu_status_detail(gpu_status));
+            detail_row(ui, &t!("vm_table.cpu"), cores_label(vm.cpu_cores));
             detail_row(
                 ui,
-                "Desktop",
-                desktop_profile_label(vm.desktop_profile).into(),
+                &t!("vm_table.ram"),
+                t!("vm_table.mebibytes", count = vm.ram_mb).to_string(),
             );
             detail_row(
                 ui,
-                "Desktop status",
+                &t!("vm_table.disk"),
+                t!("vm_table.gibibytes", count = vm.disk_gb).to_string(),
+            );
+            detail_row(ui, "GPU", gpu_mode_label(vm.gpu_mode));
+            detail_row(ui, &t!("selected_vm.gpu_status"), gpu_status_detail(gpu_status));
+            detail_row(
+                ui,
+                &t!("create_vm.desktop"),
+                desktop_profile_label(vm.desktop_profile),
+            );
+            detail_row(
+                ui,
+                &t!("selected_vm.desktop_status"),
                 display_status_detail(vm.desktop_profile, display_status),
             );
             if vm.desktop_profile.wants_desktop() {
                 detail_row(
                     ui,
-                    "Display payload",
+                    &t!("selected_vm.display_payload"),
                     display_payload_detail(display_status),
                 );
             }
@@ -2079,7 +2111,7 @@ fn render_action_group(
         for (action, label) in actions {
             let response = render_action_icon(ui, *action, enabled);
             let tooltip = disabled_tooltip
-                .map(|reason| format!("{label}: {reason}"))
+                .map(|reason| t!("selected_vm.locked_reason", label = label, reason = reason).to_string())
                 .unwrap_or_else(|| (*label).into());
             if enabled {
                 response.clone().on_hover_text(tooltip);
@@ -2331,13 +2363,13 @@ fn render_build_progress(ui: &mut egui::Ui, progress: BuildProgress) {
         return;
     };
 
-    ui.strong("Progress");
+    ui.strong(t!("selected_vm.progress").to_string());
     ui.vertical(|ui| {
         if let Some(percent) = download_percentage(progress) {
             ui.add(
                 egui::ProgressBar::new(percent as f32 / 100.0)
                     .desired_width(260.0)
-                    .text(format!("{percent}%")),
+                    .text(t!("selected_vm.percent", percent = percent).to_string()),
             );
         }
         ui.label(detail);
@@ -2463,29 +2495,31 @@ fn download_percentage(progress: BuildProgress) -> Option<u64> {
 /// already says everything, not that progress was lost.
 fn build_detail(progress: BuildProgress) -> Option<String> {
     Some(match progress.download? {
-        DownloadPhase::Connecting => "Connecting to the image server".into(),
+        DownloadPhase::Connecting => t!("build.connecting").to_string(),
         DownloadPhase::Downloading {
             downloaded,
             total: Some(total),
-        } => format!(
-            "Downloaded {} of {} ({}%)",
-            mebibytes(downloaded),
-            mebibytes(total),
-            percentage(downloaded, total)
-        ),
+        } => t!(
+            "build.downloaded_of",
+            done = mebibytes(downloaded),
+            total = mebibytes(total),
+            percent = percentage(downloaded, total)
+        )
+        .to_string(),
         // A server that sent no length leaves nothing to divide by; the count
         // still shows the download is moving.
         DownloadPhase::Downloading {
             downloaded,
             total: None,
-        } => format!("Downloaded {}", mebibytes(downloaded)),
-        DownloadPhase::Verifying { hashed, total } => format!(
-            "Checking the image: {} of {} ({}%)",
-            mebibytes(hashed),
-            mebibytes(total),
-            percentage(hashed, total)
-        ),
-        DownloadPhase::Completed => "Image ready".into(),
+        } => t!("build.downloaded", done = mebibytes(downloaded)).to_string(),
+        DownloadPhase::Verifying { hashed, total } => t!(
+            "build.checking",
+            done = mebibytes(hashed),
+            total = mebibytes(total),
+            percent = percentage(hashed, total)
+        )
+        .to_string(),
+        DownloadPhase::Completed => t!("build.image_ready").to_string(),
     })
 }
 
@@ -2599,6 +2633,22 @@ mod tests {
     }
 
     #[test]
+    fn the_actions_are_translated() {
+        assert_eq!(t!("actions.start", locale = "ru-RU"), "Запустить");
+        assert_eq!(
+            t!(
+                "ssh.endpoint",
+                locale = "ru-RU",
+                user = "dev",
+                host = "172.30.0.5",
+                port = 2222,
+                login = "key"
+            ),
+            "dev@172.30.0.5:2222 (вход: key)"
+        );
+    }
+
+    #[test]
     fn the_settings_dialog_is_translated() {
         assert_eq!(t!("settings.title", locale = "ru-RU"), "Настройки приложения");
         assert_ne!(
@@ -2687,7 +2737,7 @@ mod tests {
             connect_offer(Some(&waiting)),
             (
                 false,
-                Some("The desktop is installed; waiting for the guest to offer it.")
+                Some("The desktop is installed; waiting for the guest to offer it.".to_owned())
             ),
             "the reason is the application layer's sentence, not one invented here"
         );
@@ -3373,8 +3423,8 @@ mod tests {
     /// window the session lands in is the platform layer's business.
     #[test]
     fn the_action_is_named_after_what_it_opens() {
-        assert_eq!(SSH_ACTION_LABEL, "Open SSH");
-        assert!(!format!("{SSH_ACTION_LABEL:?}").contains("Terminal"));
+        assert_eq!(ssh_action_label(), "Open SSH");
+        assert!(!ssh_action_label().contains("Terminal"));
     }
 
     /// The one check the domain cannot make: it is about the list on screen,
