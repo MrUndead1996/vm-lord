@@ -79,9 +79,11 @@ without the diagnostics layer: neither has a panel to show them in.
   the `Diagnostics` alias in `display_launches.rs` go entirely. A worker thread
   that needed a clone of the shared buffer now writes `warn!` and is done; the
   plumbing that carried the handle disappears with it.
-* `app::collect_diagnostics`. `app::diagnostics` remains, reading the sink.
-  Every site that called `collect_diagnostics` calls `repository.refresh()`
-  instead, so the housekeeping keeps happening exactly as often as before.
+* `app::collect_diagnostics` stops draining the repository and drains the sink
+  instead. It does not disappear: `take` empties the sink, and the panel shows
+  a history, so what was taken has to be accumulated somewhere. Every site that
+  called it also calls `repository.refresh()`, so the housekeeping keeps
+  happening exactly as often as before.
 
 ### Test subscribers
 
@@ -207,10 +209,10 @@ guarantee comes from the compiler rather than from vigilance.
 What it covers:
 
 * `Password`, which is already built this way in `core/provisioning.rs`.
-* The private key from `keys`, and the agent secret: both gain the same
-  redacting `Debug`.
-* The cloud-init user-data document as a whole -- it carries the password hash.
-  Nothing logs it today, and the rule is what keeps it that way.
+* `VmKeyPair`, `Seed`, `SeedRequest` and `auth::Secret`, which already have no
+  `Debug` at all and say so in their own comments. Nothing needs writing here;
+  what is missing is a test that fails when one of them grows a `Debug`, and
+  the rule written down where it is read before the mistake rather than after.
 
 The rule goes into ARCHITECTURE.md as a paragraph, alongside the pixel rule
 already stated at the head of `display-viewer/src/log.rs`, and is held up by
@@ -251,7 +253,8 @@ New tests:
 
 * the diagnostics layer keeps a marked event and drops an unmarked one
 * `vm` is picked up from the enclosing span when the event does not carry it
-* a secret does not appear in the records of a real operation
+* a secret does not appear in the records of a real document build, and that
+  test is watched to fail once, with a `Debug` added on purpose
 * `RepositoryError::windows` displays exactly as before
 
 Run with `cargo check-windows` and `cargo test-windows`.

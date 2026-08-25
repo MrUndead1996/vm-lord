@@ -459,8 +459,6 @@ Create `crates/core/src/diagnostics.rs` with only a `tests` module for now:
 ```rust
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use tracing_subscriber::layer::SubscriberExt as _;
 
     use super::{DiagnosticLevel, DiagnosticsLayer, DiagnosticsSink, Subsystem};
@@ -564,7 +562,6 @@ mod tests {
 
         assert_eq!(sink.take().len(), 1);
         assert!(sink.take().is_empty(), "a record is shown once");
-        let _ = Arc::strong_count(&sink.0);
     }
 }
 ```
@@ -897,15 +894,77 @@ pub use diagnostics::{
 pub use logging::initialize_with_diagnostics;
 ```
 
-- [ ] **Step 9: Run the tests**
+- [ ] **Step 9: Port the viewer's capturing logger**
 
-Run: `cargo test-windows -p vmlord-core diagnostics`
-Expected: PASS — all six.
+`crates/display-viewer/src/log.rs`'s `capture` module installs a `log::Log`
+globally through a `OnceLock`, which Task 2 left stranded. Replace it with a
+layer the tests install per test, which is what makes them stop interfering
+with each other:
 
-- [ ] **Step 10: Commit**
+```rust
+/// A subscriber that keeps every record, for the tests that assert what is
+/// not in them.
+#[cfg(test)]
+pub mod capture {
+    use std::sync::{Arc, Mutex};
+
+    use tracing::{Event, Subscriber, field::{Field, Visit}};
+    use tracing_subscriber::{layer::Context, Layer};
+
+    #[derive(Clone, Default)]
+    pub struct Records(Arc<Mutex<Vec<String>>>);
+
+    impl Records {
+        /// Everything recorded so far, joined.
+        pub fn text(&self) -> String {
+            self.0
+                .lock()
+                .expect("no test panics while holding the records")
+                .join("\n")
+        }
+    }
+
+    pub struct Capture(pub Records);
+
+    impl<S: Subscriber> Layer<S> for Capture {
+        fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+            let mut message = String::new();
+            event.record(&mut MessageVisitor(&mut message));
+            self.0
+                 .0
+                .lock()
+                .expect("no test panics while holding the records")
+                .push(message);
+        }
+    }
+
+    struct MessageVisitor<'a>(&'a mut String);
+
+    impl Visit for MessageVisitor<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                *self.0 = format!("{value:?}");
+            }
+        }
+    }
+}
+```
+
+Each test that called `capture::install()` and `capture::text()` now builds a
+`Records`, installs `Capture` through `tracing::subscriber::with_default`, and
+reads `records.text()` afterwards. Add `tracing-subscriber` to
+`crates/display-viewer`'s `[dev-dependencies]`.
+
+- [ ] **Step 10: Run the tests**
+
+Run: `cargo test-windows -p vmlord-core diagnostics` then
+`cargo test-windows -p vmlord-display-viewer`
+Expected: PASS — the six new tests, and the viewer's tests back on their feet.
+
+- [ ] **Step 11: Commit**
 
 ```bash
-git add crates/core/src/diagnostics.rs crates/core/src/lib.rs crates/core/src/logging.rs
+git add crates/core/src/diagnostics.rs crates/core/src/lib.rs crates/core/src/logging.rs crates/display-viewer
 git commit -m "TASK-8: Collect marked events into a diagnostics sink"
 ```
 
@@ -986,13 +1045,15 @@ fn on_new_span(
 
 - [ ] **Step 4: Fall back to it in `on_event`**
 
-Change the bound and the `vm` line:
+Change the bound, and rename `on_event`'s context parameter from `_` to
+`context` so the fallback can look the span up:
 
 ```rust
 impl<S> Layer<S> for DiagnosticsLayer
 where
     S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
 {
+    fn on_event(&self, event: &Event<'_>, context: Context<'_, S>) {
 ```
 
 and, after the `marked` check:
@@ -1690,116 +1751,91 @@ git commit -m "TASK-8: Show a diagnostic's moment, VM and code"
 
 ### Task 11: Redaction
 
+Reading the code first changes this task. The rule the spec states is already
+kept, and kept the way the spec asks for: `VmKeyPair` (`crates/keys/src/lib.rs:19`)
+has no `Debug` "by design", `Seed` (`crates/seed/src/lib.rs:59`) has none
+because `user_data` holds the password hash, `SeedRequest` has none, and
+`auth::Secret` (`crates/agent-protocol/src/auth.rs:53`) has none. Each says so
+in a comment.
+
+So there are no redacting `Debug` implementations to write. What is missing is
+what makes the rule survive: a test that fails when somebody gives one of those
+types a `Debug`, and the rule written down where it can be read before the
+mistake rather than after. The written half is Task 12.
+
 **Files:**
-- Modify: `crates/keys/src/lib.rs`
 - Modify: `crates/seed/src/user_data.rs`
-- Modify: `crates/platform/src/create.rs`
+- Modify: `crates/seed/Cargo.toml` (`[dev-dependencies]`)
 
 **Interfaces:**
-- Produces: the private key type, the agent secret and the generated user-data document each have a `Debug` that shows no value and no `Display` at all.
+- Consumes: the capture layer from Task 3 Step 9.
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Write the failing test**
 
-In `crates/keys/src/lib.rs`'s `tests` module:
+The end-to-end assertion is the one worth having: run the real document build
+with a real hash and a real agent secret, and read back everything it recorded.
+`request()` at `crates/seed/src/user_data.rs:344` already returns a
+`SeedRequest<'static>` with a `$6$` hash in it.
 
-```rust
-#[test]
-fn a_private_key_does_not_print_itself() {
-    // `tracing` needs `Display` or `Debug` to record a field, so a type with
-    // neither showing its value cannot be logged by accident. This test is
-    // what keeps that true when the type is next edited.
-    let pair = super::generate("dev-linux").expect("a key pair is generated");
-
-    assert_eq!(format!("{:?}", pair.private_key), "PrivateKey(<redacted>)");
-}
-```
-
-In `crates/seed/src/user_data.rs`'s `tests` module:
+Add to `crates/seed/src/user_data.rs`'s `tests` module:
 
 ```rust
 #[test]
-fn a_user_data_document_does_not_print_itself() {
-    // It carries the SHA-512-crypt entry for the account's password.
-    let request = super::tests::password_request();
-    let document = super::render(&request);
+fn building_the_documents_records_no_secret() {
+    // `build` logs what it built. This test is what stops that line growing a
+    // value: the hash and the agent secret must not be in any record, and a
+    // `Debug` added to `SeedRequest` or `Seed` would put them there.
+    let records = capture::Records::default();
+    let subscriber = tracing_subscriber::registry().with(capture::Capture(records.clone()));
 
-    assert_eq!(format!("{document:?}"), "UserData(<redacted>)");
-}
-```
-
-- [ ] **Step 2: Run and watch them fail**
-
-Run: `cargo test-windows -p vmlord-keys -p vmlord-seed redact`
-Expected: FAIL — the derived `Debug` prints the value.
-
-- [ ] **Step 3: Write the redacting types**
-
-Wrap each secret in a newtype whose `Debug` is written by hand, following `Password` in `crates/core/src/provisioning.rs:112`:
-
-```rust
-/// The private half of a VM's key pair.
-///
-/// No `Display`, and a `Debug` that shows nothing: `tracing` records a field
-/// only through one of those two traits, so a type with neither cannot reach
-/// the log. The compiler, and not vigilance, is what keeps it out.
-pub struct PrivateKey(String);
-
-impl fmt::Debug for PrivateKey {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("PrivateKey(<redacted>)")
-    }
-}
-
-impl PrivateKey {
-    /// The bytes, for the one caller that writes them to a file.
-    #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        self.0.as_bytes()
-    }
-}
-```
-
-and the same shape for `UserData` in `seed` and for the agent secret in `platform/src/create.rs`.
-
-- [ ] **Step 4: Fix the call sites**
-
-Run: `cargo check-windows` and follow the errors: each place that wrote the secret to a file now calls `as_bytes`. Any place that cannot be fixed that way is a place that was about to print a secret, and is the reason for the task.
-
-- [ ] **Step 5: Write the end-to-end test**
-
-In `crates/platform/src/create.rs`'s `tests` module:
-
-```rust
-#[test]
-fn building_a_seed_writes_no_secret_into_the_log() {
-    let sink = vmlord_core::DiagnosticsSink::new();
-    let records = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let subscriber = tracing_subscriber::registry()
-        .with(vmlord_core::DiagnosticsLayer::new(sink.clone()))
-        .with(super::tests::capture(records.clone()));
-
+    let mut request = request();
+    request.agent_secret = Some("c2VjcmV0LWFnZW50LXRva2Vu");
     tracing::subscriber::with_default(subscriber, || {
-        let _ = super::tests::build_seed_with_password("hunter2");
+        let _seed = crate::build(&request);
     });
 
-    let text = records.lock().expect("no test panics here").join("\n");
-    assert!(!text.contains("hunter2"), "{text}");
-    assert!(!text.contains("$6$"), "no crypt entry either: {text}");
+    let text = records.text();
+    assert!(!text.contains("$6$"), "no crypt entry may be recorded: {text}");
+    assert!(
+        !text.contains("c2VjcmV0LWFnZW50LXRva2Vu"),
+        "no agent secret may be recorded: {text}"
+    );
 }
 ```
 
-with `capture` a small `Layer` that pushes each event's rendered message into the shared vector — the same shape as the existing capture in `crates/display-viewer/src/log.rs`, ported from `Log` to `Layer`.
+with the capture module from Task 3 Step 9 lifted into
+`crates/seed/src/user_data.rs`'s `tests` module verbatim -- it is a dozen lines
+and a shared test-only crate for it would be a dependency nobody else wants.
 
-- [ ] **Step 6: Run the tests**
+- [ ] **Step 2: Add the dev-dependency**
 
-Run: `cargo test-windows`
+In `crates/seed/Cargo.toml`, under `[dev-dependencies]`:
+
+```toml
+tracing-subscriber = { workspace = true }
+```
+
+- [ ] **Step 3: Run and watch it pass**
+
+Run: `cargo test-windows -p vmlord-seed building_the_documents_records_no_secret`
+Expected: PASS. This test guards rather than drives: it passes on the first run
+because the discipline is already kept, and it is here so that it stops passing
+the moment somebody breaks it.
+
+- [ ] **Step 4: Prove the test can fail**
+
+Temporarily add `#[derive(Debug)]` to `SeedRequest` and change `build`'s
+`tracing::debug!` line to record `?request`. Rerun the test.
+Expected: FAIL, naming the crypt entry. Revert both edits and rerun.
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+A guard test nobody has seen fail is a guard test nobody knows works.
+
+- [ ] **Step 5: Commit**
 
 ```bash
-git add crates/keys crates/seed crates/platform
-git commit -m "TASK-8: Keep secrets out of the log by making them unprintable"
+git add crates/seed
+git commit -m "TASK-8: Hold the line that keeps secrets out of records"
 ```
 
 ---
@@ -1865,3 +1901,4 @@ git commit -m "TASK-8: Record how diagnostics work now"
 - [ ] Confirm `grep -rn 'log::\(error\|warn\|info\|debug\|trace\)!' --include='*.rs' crates` returns nothing.
 - [ ] Confirm `grep -rn 'take_diagnostics' --include='*.rs' crates` returns nothing.
 - [ ] Confirm `grep -rn 'push_shared_diagnostic\|push_diagnostic' --include='*.rs' crates` returns nothing.
+- [ ] Confirm `VmKeyPair`, `Seed`, `SeedRequest` and `auth::Secret` still have no `Debug`.
