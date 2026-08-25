@@ -40,8 +40,8 @@ pub fn fetch_image(
     progress: &ProgressPublisher<DownloadPhase>,
     cancel: &AtomicBool,
 ) -> Result<PathBuf, DownloadError> {
-    let expected =
-        normalized_checksum(request.expected_sha256).inspect_err(|error| log::error!("{error}"))?;
+    let expected = normalized_checksum(request.expected_sha256)
+        .inspect_err(|error| tracing::error!("{error}"))?;
     let mut throttle = ProgressThrottle::new(progress.clone());
 
     fs::create_dir_all(request.cache_directory)
@@ -52,16 +52,17 @@ pub fn fetch_image(
     let part_path = request.cache_directory.join(format!("{file_name}.part"));
 
     if final_path.is_file() && cache_hit(&final_path, &expected, &mut throttle, cancel)? {
-        log::info!("using the cached image at {}", final_path.display());
+        tracing::info!("using the cached image at {}", final_path.display());
         throttle.publish_now(DownloadPhase::Completed);
         return Ok(final_path);
     }
 
-    let mut part = PartFile::open_locked(part_path).inspect_err(|error| log::error!("{error}"))?;
+    let mut part =
+        PartFile::open_locked(part_path).inspect_err(|error| tracing::error!("{error}"))?;
 
-    log::info!("downloading {} into {}", request.url, final_path.display());
+    tracing::info!("downloading {} into {}", request.url, final_path.display());
     download_into(&mut part, request.url, &mut throttle, cancel)
-        .inspect_err(|error| log::error!("failed to download {}: {error}", request.url))?;
+        .inspect_err(|error| tracing::error!("failed to download {}: {error}", request.url))?;
 
     let actual = part.checksum(&mut throttle, cancel)?;
     if actual != expected {
@@ -69,12 +70,12 @@ pub fn fetch_image(
         // its name is worth keeping for the next attempt.
         part.truncate()?;
         let error = DownloadError::ChecksumMismatch { expected, actual };
-        log::error!("{error}");
+        tracing::error!("{error}");
         return Err(error);
     }
 
     publish_into_cache(&mut part, &final_path)?;
-    log::info!("image ready at {}", final_path.display());
+    tracing::info!("image ready at {}", final_path.display());
     throttle.publish_now(DownloadPhase::Completed);
     Ok(final_path)
 }
@@ -94,7 +95,7 @@ fn cache_hit(
         return Ok(true);
     }
 
-    log::warn!(
+    tracing::warn!(
         "the cached image at {} hashes to {actual} instead of {expected}; \
          discarding it and downloading again",
         final_path.display()
@@ -125,7 +126,7 @@ fn cache_hit(
 /// returns and drops it, which is before any caller sees the path.
 fn publish_into_cache(part: &mut PartFile, final_path: &Path) -> Result<(), DownloadError> {
     if final_path.exists() {
-        log::info!(
+        tracing::info!(
             "another download finished {} first; keeping its copy",
             final_path.display()
         );
@@ -152,17 +153,17 @@ fn download_into(
         let content_range = header(&response, "content-range");
         match resume_decision(response.status().as_u16(), content_range.as_deref(), from)? {
             ResumeOutcome::Append { .. } => {
-                log::debug!("resuming {url} at byte {from}");
+                tracing::debug!("resuming {url} at byte {from}");
             }
             ResumeOutcome::StartOver => {
-                log::warn!(
+                tracing::warn!(
                     "the server ignored the range request for {url}; downloading from the start"
                 );
                 part.truncate()?;
                 from = 0;
             }
             ResumeOutcome::RangeUnsatisfiable => {
-                log::warn!(
+                tracing::warn!(
                     "the server rejected the range request for {url}; the partial file is stale"
                 );
                 part.truncate()?;
@@ -190,7 +191,7 @@ fn download_into(
     let mut buffer = vec![0u8; READ_CHUNK];
     loop {
         if cancel.load(Ordering::Relaxed) {
-            log::debug!("the download of {url} was cancelled at byte {downloaded}");
+            tracing::debug!("the download of {url} was cancelled at byte {downloaded}");
             return Err(DownloadError::Cancelled);
         }
         let read = reader
@@ -206,7 +207,7 @@ fn download_into(
     throttle.publish_now(DownloadPhase::Downloading { downloaded, total });
 
     part.sync()?;
-    log::debug!("{url} delivered {downloaded} bytes");
+    tracing::debug!("{url} delivered {downloaded} bytes");
     Ok(())
 }
 

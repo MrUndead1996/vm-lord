@@ -182,7 +182,7 @@ fn agent_install_commands() -> Vec<Vec<String>> {
 fn disable_ssh(request: &SeedRequest<'_>) -> Vec<Vec<String>> {
     let units = request.ssh_daemon.units.all();
 
-    log::debug!("the seed disables the SSH daemon: {}", units.join(", "));
+    tracing::debug!("the seed disables the SSH daemon: {}", units.join(", "));
     let mut command = vec![
         "systemctl".to_owned(),
         "disable".to_owned(),

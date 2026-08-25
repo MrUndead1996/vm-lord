@@ -32,7 +32,7 @@ pub(crate) fn dns_servers(subnet: Ipv4Subnet) -> Vec<Ipv4Addr> {
     let configured = match AdapterAddresses::query() {
         Ok(adapters) => adapters.ipv4_dns_servers(),
         Err(error) => {
-            log::warn!(
+            tracing::warn!(
                 "the host's DNS servers could not be read ({error}); \
                  guests are offered the public resolvers instead"
             );
@@ -41,7 +41,7 @@ pub(crate) fn dns_servers(subnet: Ipv4Subnet) -> Vec<Ipv4Addr> {
     };
 
     let servers = usable(configured, subnet);
-    log::debug!(
+    tracing::debug!(
         "guests of the VMLord network are offered DNS {}",
         servers
             .iter()
@@ -65,7 +65,9 @@ fn usable(configured: Vec<Ipv4Addr>, subnet: Ipv4Subnet) -> Vec<Ipv4Addr> {
             || server.is_unspecified()
             || Ipv4Subnet::new(server, 32).overlaps(subnet)
         {
-            log::debug!("the host resolver {server} cannot serve a guest of the VMLord network");
+            tracing::debug!(
+                "the host resolver {server} cannot serve a guest of the VMLord network"
+            );
             continue;
         }
         if !servers.contains(&server) {
@@ -74,7 +76,7 @@ fn usable(configured: Vec<Ipv4Addr>, subnet: Ipv4Subnet) -> Vec<Ipv4Addr> {
     }
 
     if servers.is_empty() {
-        log::warn!(
+        tracing::warn!(
             "the host has no DNS server a guest could reach; \
              guests are offered the public resolvers instead"
         );
@@ -136,7 +138,7 @@ impl AdapterAddresses {
             None,
             last.to_hresult().0,
         );
-        log::error!("{error}");
+        tracing::error!("{error}");
         Err(error)
     }
 

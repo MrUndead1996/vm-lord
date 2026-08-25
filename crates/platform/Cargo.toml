@@ -26,7 +26,7 @@ vmlord-display-viewer = { path = "../display-viewer" }
 vmlord-gpu-payload = { path = "../gpu-payload" }
 vmlord-payload = { path = "../payload" }
 arcbox-dhcp = "0.6"
-log.workspace = true
+tracing.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # `getrandom` is off deliberately: the salt comes from `BCryptGenRandom`, the

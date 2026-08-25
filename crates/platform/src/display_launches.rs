@@ -215,12 +215,12 @@ impl DisplayLaunches {
         collect_finished(&mut workers);
 
         for worker in workers.iter().filter(|worker| worker.vm_id == vm_id) {
-            log::info!(
+            tracing::info!(
                 "closing the display window of VM \"{}\": the VM has stopped",
                 worker.vm_name
             );
             if let Err(error) = (self.closer)(worker.runtime_id.as_bytes()) {
-                log::info!(
+                tracing::info!(
                     "the display window of VM \"{}\" could not be asked to close: {error}",
                     worker.vm_name
                 );
@@ -253,7 +253,7 @@ fn serve(
         let message = match from_viewer.read() {
             Ok(message) => message,
             Err(error) => {
-                log::info!("the launch pipe of VM \"{vm_name}\" ended: {error}");
+                tracing::info!("the launch pipe of VM \"{vm_name}\" ended: {error}");
                 return;
             }
         };
@@ -264,7 +264,7 @@ fn serve(
         }
         for message in answer.to_viewer {
             if let Err(error) = to_viewer.write(&message) {
-                log::info!("the launch pipe of VM \"{vm_name}\" could not be written: {error}");
+                tracing::info!("the launch pipe of VM \"{vm_name}\" could not be written: {error}");
                 return;
             }
         }
@@ -278,7 +278,7 @@ fn serve(
 fn wait_for(mut child: Child, vm_name: &str, diagnostics: &Diagnostics) {
     match child.wait() {
         Ok(status) if status.success() => {
-            log::info!("the display window of VM \"{vm_name}\" was closed");
+            tracing::info!("the display window of VM \"{vm_name}\" was closed");
         }
         Ok(status) => report(
             diagnostics,
@@ -286,7 +286,7 @@ fn wait_for(mut child: Child, vm_name: &str, diagnostics: &Diagnostics) {
             format!("The display window of VM \"{vm_name}\" stopped unexpectedly ({status})"),
         ),
         Err(error) => {
-            log::warn!("VMLord lost track of the display window of VM \"{vm_name}\": {error}");
+            tracing::warn!("VMLord lost track of the display window of VM \"{vm_name}\": {error}");
         }
     }
 }
@@ -305,7 +305,7 @@ fn spawn(viewer: &Path, vm_name: &str) -> Result<Child, RepositoryError> {
             let error = RepositoryError::new(format!(
                 "the display window of VM \"{vm_name}\" could not be started: {error}"
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })
 }
@@ -333,8 +333,8 @@ fn report(diagnostics: &Diagnostics, level: DiagnosticLevel, message: String) {
 /// Puts one diagnostic where the UI will find it, and in the log.
 fn push(diagnostics: &Diagnostics, diagnostic: Diagnostic) {
     match diagnostic.level {
-        DiagnosticLevel::Error => log::error!("{}", diagnostic.message),
-        _ => log::info!("{}", diagnostic.message),
+        DiagnosticLevel::Error => tracing::error!("{}", diagnostic.message),
+        _ => tracing::info!("{}", diagnostic.message),
     }
     diagnostics
         .lock()
@@ -351,7 +351,7 @@ fn collect_finished(workers: &mut Vec<Worker>) {
             if let Some(handle) = worker.handle.take()
                 && handle.join().is_err()
             {
-                log::error!(
+                tracing::error!(
                     "the thread serving the display window of VM \"{}\" panicked",
                     worker.vm_name
                 );

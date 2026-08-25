@@ -15,9 +15,7 @@ use tracing::{
     subscriber::SetGlobalDefaultError,
 };
 use tracing_log::log_tracer::SetLoggerError;
-use tracing_subscriber::{
-    Layer, layer::Context, layer::SubscriberExt as _, registry::LookupSpan,
-};
+use tracing_subscriber::{Layer, layer::Context, layer::SubscriberExt as _, registry::LookupSpan};
 
 use crate::{AppSettings, LogLevel};
 

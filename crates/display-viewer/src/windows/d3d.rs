@@ -191,7 +191,7 @@ impl Renderer {
         }
         .map_err(|error| format!("the stream's texture could not be created: {error}"))?;
 
-        log::info!(
+        tracing::info!(
             "the viewer's texture is {}x{}",
             geometry.width(),
             geometry.height()
@@ -291,7 +291,7 @@ impl Renderer {
             bytes += clipped.width as usize * clipped.height as usize * 4;
         }
 
-        log::trace!("{issued} rectangles uploaded, {bytes} bytes");
+        tracing::trace!("{issued} rectangles uploaded, {bytes} bytes");
         self.uploaded = issued;
         if issued > 0 {
             self.shown = true;
@@ -739,14 +739,14 @@ impl Renderer {
     /// A message when a device could not be opened at all.
     pub fn recover(&mut self) -> Result<bool, String> {
         if self.losses >= MAX_DEVICE_LOSSES {
-            log::warn!(
+            tracing::warn!(
                 "the graphics device was lost {} times; not recovering again",
                 self.losses
             );
             return Ok(false);
         }
         self.losses += 1;
-        log::warn!("rebuilding the graphics device, loss {}", self.losses);
+        tracing::warn!("rebuilding the graphics device, loss {}", self.losses);
 
         // Everything of the lost device goes first: DXGI refuses a second
         // swapchain for a window that still has one, and the textures and the
@@ -808,7 +808,7 @@ fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
         match create_device_of(driver) {
             Ok(pair) => return Ok(pair),
             Err(error) => {
-                log::debug!("no {driver:?} device: {error}");
+                tracing::debug!("no {driver:?} device: {error}");
                 last = error;
             }
         }

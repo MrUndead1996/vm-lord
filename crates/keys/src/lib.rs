@@ -55,7 +55,7 @@ pub fn generate(vm_name: &str) -> Result<VmKeyPair, RepositoryError> {
         .to_openssh()
         .map_err(|error| failed("serialize the public key", vm_name, &error))?;
 
-    log::debug!("generated an ed25519 key pair for VM \"{vm_name}\"");
+    tracing::debug!("generated an ed25519 key pair for VM \"{vm_name}\"");
     Ok(VmKeyPair {
         private_openssh,
         public_openssh,
@@ -77,7 +77,7 @@ fn failed(operation: &str, vm_name: &str, error: &ssh_key::Error) -> RepositoryE
     let error = RepositoryError::new(format!(
         "failed to {operation} for VM \"{vm_name}\": {error}"
     ));
-    log::error!("{error}");
+    tracing::error!("{error}");
     error
 }
 

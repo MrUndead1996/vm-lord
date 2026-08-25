@@ -52,11 +52,11 @@ impl VmShutdownPipeline {
     pub fn shutdown(&self, store: &MetadataStore, vm_name: &str) -> Result<(), RepositoryError> {
         let mapping = store.find_by_vm_name(vm_name)?.ok_or_else(|| {
             let error = RepositoryError::new(format!("no HCS mapping found for VM \"{vm_name}\""));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
 
-        log::info!(
+        tracing::info!(
             "requesting graceful shutdown of VM \"{}\" ({}) as HCS compute system \"{}\"",
             mapping.vm_name,
             mapping.vm_id,
@@ -64,10 +64,10 @@ impl VmShutdownPipeline {
         );
 
         (self.system_shutter)(&mapping.hcs_compute_system_id).inspect_err(|error| {
-            log::error!("failed to shut down VM \"{}\": {error}", mapping.vm_name);
+            tracing::error!("failed to shut down VM \"{}\": {error}", mapping.vm_name);
         })?;
 
-        log::info!(
+        tracing::info!(
             "the guest of VM \"{}\" ({}) accepted the shutdown request",
             mapping.vm_name,
             mapping.vm_id

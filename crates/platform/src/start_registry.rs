@@ -72,7 +72,7 @@ impl StartRegistry {
         let mut starts = self.lock();
         if starts.contains_key(vm_name) {
             let error = RepositoryError::new(format!("VM \"{vm_name}\" is already being started"));
-            log::error!("{error}");
+            tracing::error!("{error}");
             return Err(error);
         }
 
@@ -101,11 +101,11 @@ impl StartRegistry {
                 let error = RepositoryError::new(format!(
                     "the thread starting VM \"{vm_name}\" could not be started: {error}"
                 ));
-                log::error!("{error}");
+                tracing::error!("{error}");
                 error
             })?;
 
-        log::info!("started VM \"{vm_name}\" in the background");
+        tracing::info!("started VM \"{vm_name}\" in the background");
         starts.insert(
             vm_name.to_owned(),
             Start {
@@ -126,7 +126,7 @@ impl StartRegistry {
             return Ok(());
         }
         let error = RepositoryError::new(format!("VM \"{vm_name}\" is still starting"));
-        log::error!("{error}");
+        tracing::error!("{error}");
         Err(error)
     }
 
@@ -154,7 +154,7 @@ impl StartRegistry {
             if let Some(worker) = start.worker.take()
                 && worker.join().is_err()
             {
-                log::error!("the thread starting VM \"{vm_name}\" panicked");
+                tracing::error!("the thread starting VM \"{vm_name}\" panicked");
             }
         }
     }
@@ -179,7 +179,7 @@ impl StartRegistry {
             if let Some(worker) = start.worker.take()
                 && worker.join().is_err()
             {
-                log::error!("the thread starting VM \"{vm_name}\" panicked");
+                tracing::error!("the thread starting VM \"{vm_name}\" panicked");
             }
         }
     }

@@ -52,7 +52,7 @@ impl PartFile {
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                log::debug!("{} is locked by another downloader", path.display());
+                tracing::debug!("{} is locked by another downloader", path.display());
                 return Err(DownloadError::AlreadyInProgress { path });
             }
             Err(TryLockError::Error(source)) => {

@@ -178,7 +178,7 @@ impl Provisioning {
         validate_guest_setting("keyboard layout", &self.keyboard)?;
         validate_guest_setting("timezone", &self.timezone)?;
 
-        log::debug!(
+        tracing::debug!(
             "provisioning user \"{}\" ({}, {}, {}), password {}, {}",
             self.username,
             self.locale,
@@ -332,7 +332,7 @@ fn validate_guest_setting(field: &str, value: &str) -> Result<(), RepositoryErro
 /// mistyping a field, not the system failing.
 fn rejected(message: impl Into<String>) -> RepositoryError {
     let error = RepositoryError::new(message);
-    log::warn!("rejected VM request: {error}");
+    tracing::warn!("rejected VM request: {error}");
     error
 }
 

@@ -72,11 +72,11 @@ impl VmDeletionPipeline {
     ) -> Result<(), RepositoryError> {
         let mapping = store.find_by_vm_name(vm_name)?.ok_or_else(|| {
             let error = RepositoryError::new(format!("no HCS mapping found for VM \"{vm_name}\""));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
 
-        log::info!(
+        tracing::info!(
             "deleting VM \"{}\" ({}) as HCS compute system \"{}\", {}",
             mapping.vm_name,
             mapping.vm_id,
@@ -104,7 +104,7 @@ impl VmDeletionPipeline {
         }
 
         if !failures.is_empty() {
-            log::warn!(
+            tracing::warn!(
                 "VM \"{}\" ({}) stays known to VMLord because its deletion did not complete",
                 mapping.vm_name,
                 mapping.vm_id
@@ -117,13 +117,13 @@ impl VmDeletionPipeline {
 
         store.remove(mapping.vm_id)?;
         if !delete_disks {
-            log::warn!(
+            tracing::warn!(
                 "the disks of VM \"{}\" were kept under {}",
                 mapping.vm_name,
                 vm_directory.display()
             );
         }
-        log::info!("deleted VM \"{}\" ({})", mapping.vm_name, mapping.vm_id);
+        tracing::info!("deleted VM \"{}\" ({})", mapping.vm_name, mapping.vm_id);
         Ok(())
     }
 }
@@ -214,7 +214,7 @@ fn remove_files(vm_directory: &Path, delete_disks: bool) -> Result<(), Repositor
 /// Removes `path`, treating a file that is not there as already removed.
 fn remove_file_if_present(path: &Path, description: &str) -> Result<(), RepositoryError> {
     if !path.exists() {
-        log::debug!(
+        tracing::debug!(
             "{description} of the deleted VM at {} is already gone",
             path.display()
         );
@@ -225,10 +225,10 @@ fn remove_file_if_present(path: &Path, description: &str) -> Result<(), Reposito
             "failed to remove {description} of the deleted VM at {}: {error}",
             path.display()
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })?;
-    log::debug!(
+    tracing::debug!(
         "removed {description} of the deleted VM at {}",
         path.display()
     );
@@ -239,7 +239,7 @@ fn remove_file_if_present(path: &Path, description: &str) -> Result<(), Reposito
 /// already removed.
 fn remove_directory_if_present(path: &Path, description: &str) -> Result<(), RepositoryError> {
     if !path.exists() {
-        log::debug!(
+        tracing::debug!(
             "{description} of the deleted VM at {} is already gone",
             path.display()
         );
@@ -250,10 +250,10 @@ fn remove_directory_if_present(path: &Path, description: &str) -> Result<(), Rep
             "failed to remove {description} of the deleted VM at {}: {error}",
             path.display()
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })?;
-    log::debug!(
+    tracing::debug!(
         "removed {description} of the deleted VM at {}",
         path.display()
     );

@@ -99,7 +99,7 @@ pub(crate) fn checksum_reader(
     progress: &mut ProgressThrottle<DownloadPhase>,
     cancel: &AtomicBool,
 ) -> Result<String, DownloadError> {
-    log::debug!("hashing {} ({total} bytes)", path.display());
+    tracing::debug!("hashing {} ({total} bytes)", path.display());
 
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; HASH_CHUNK];
@@ -107,7 +107,7 @@ pub(crate) fn checksum_reader(
     progress.publish_now(DownloadPhase::Verifying { hashed, total });
     loop {
         if cancel.load(Ordering::Relaxed) {
-            log::debug!("hashing {} was cancelled", path.display());
+            tracing::debug!("hashing {} was cancelled", path.display());
             return Err(DownloadError::Cancelled);
         }
         let read = reader
@@ -126,7 +126,7 @@ pub(crate) fn checksum_reader(
     // `format!("{digest:x}")` does not compile; the hex is built by hand.
     let digest = hasher.finalize();
     let checksum: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    log::debug!("{} hashes to {checksum}", path.display());
+    tracing::debug!("{} hashes to {checksum}", path.display());
     Ok(checksum)
 }
 

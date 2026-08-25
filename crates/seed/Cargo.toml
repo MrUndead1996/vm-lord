@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-log.workspace = true
+tracing.workspace = true
 vmlord-core = { path = "../core" }
 # For the one path the host and the guest must spell the same way: where the
 # agent's secret lands inside the VM.

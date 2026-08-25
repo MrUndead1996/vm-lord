@@ -167,13 +167,15 @@ impl VmConnections {
     pub fn remove(&mut self, vm_id: Uuid) {
         if let Some(held) = self.systems.remove(&vm_id) {
             match held.watch {
-                Some(_) => log::debug!(
+                Some(_) => tracing::debug!(
                     "closed the compute-system handle held for VM {vm_id} and removed \
                      its HCS event watch (generation {})",
                     held.generation
                 ),
                 None => {
-                    log::debug!("closed the unwatched compute-system handle held for VM {vm_id}")
+                    tracing::debug!(
+                        "closed the unwatched compute-system handle held for VM {vm_id}"
+                    )
                 }
             }
         }
@@ -232,15 +234,15 @@ fn reconnect_with(
     open: impl Fn(&VmComputeSystemMapping) -> Result<Option<HcsSystem>, RepositoryError>,
 ) -> Result<ReconnectReport, RepositoryError> {
     let mappings = store.list().inspect_err(|error| {
-        log::error!("cannot reconnect to any VM: {error}");
+        tracing::error!("cannot reconnect to any VM: {error}");
     })?;
-    log::info!("reconnecting to {} known VM(s)", mappings.len());
+    tracing::info!("reconnecting to {} known VM(s)", mappings.len());
 
     let mut connections = VmConnections::with_events(events.clone());
     let mut outcomes = Vec::with_capacity(mappings.len());
 
     for mapping in mappings {
-        log::debug!(
+        tracing::debug!(
             "reconnecting to VM \"{}\" ({}) through HCS compute system \"{}\"",
             mapping.vm_name,
             mapping.vm_id,
@@ -248,13 +250,13 @@ fn reconnect_with(
         );
         let outcome = match open(&mapping) {
             Ok(Some(system)) => {
-                log::info!(
+                tracing::info!(
                     "reconnected to VM \"{}\" ({})",
                     mapping.vm_name,
                     mapping.vm_id
                 );
                 if let Err(error) = connections.insert(&mapping, system) {
-                    log::warn!(
+                    tracing::warn!(
                         "reconnected to VM \"{}\" ({}) but cannot watch its HCS events: {error}",
                         mapping.vm_name,
                         mapping.vm_id
@@ -263,7 +265,7 @@ fn reconnect_with(
                 ReconnectOutcome::Reconnected
             }
             Ok(None) => {
-                log::warn!(
+                tracing::warn!(
                     "HCS does not report a compute system for VM \"{}\" ({}); \
                      it is stopped or was deleted outside VMLord",
                     mapping.vm_name,
@@ -272,7 +274,7 @@ fn reconnect_with(
                 ReconnectOutcome::Absent
             }
             Err(error) => {
-                log::error!(
+                tracing::error!(
                     "failed to reconnect to VM \"{}\" ({}): {error}",
                     mapping.vm_name,
                     mapping.vm_id
@@ -283,7 +285,7 @@ fn reconnect_with(
         outcomes.push(ReconnectedVm { mapping, outcome });
     }
 
-    log::info!(
+    tracing::info!(
         "reconnected to {} of {} known VM(s); {} absent, {} failed",
         connections.len(),
         outcomes.len(),

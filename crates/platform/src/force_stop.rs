@@ -67,11 +67,11 @@ impl VmForceStopPipeline {
     pub fn force_stop(&self, store: &MetadataStore, vm_name: &str) -> Result<(), RepositoryError> {
         let mapping = store.find_by_vm_name(vm_name)?.ok_or_else(|| {
             let error = RepositoryError::new(format!("no HCS mapping found for VM \"{vm_name}\""));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
 
-        log::info!(
+        tracing::info!(
             "forcibly stopping VM \"{}\" ({}) as HCS compute system \"{}\"",
             mapping.vm_name,
             mapping.vm_id,
@@ -81,13 +81,13 @@ impl VmForceStopPipeline {
         self.detach_adapter(&mapping);
 
         (self.system_terminator)(&mapping.hcs_compute_system_id).inspect_err(|error| {
-            log::error!(
+            tracing::error!(
                 "failed to forcibly stop VM \"{}\": {error}",
                 mapping.vm_name
             );
         })?;
 
-        log::info!(
+        tracing::info!(
             "forcibly stopped VM \"{}\" ({})",
             mapping.vm_name,
             mapping.vm_id
@@ -107,7 +107,7 @@ impl VmForceStopPipeline {
             .then_some(mapping.endpoint_id)
             .flatten();
         let Some(endpoint_id) = attached else {
-            log::debug!(
+            tracing::debug!(
                 "VM \"{}\" has no attached endpoint; terminating it without a detach",
                 mapping.vm_name
             );
@@ -115,7 +115,7 @@ impl VmForceStopPipeline {
         };
 
         if let Err(error) = (self.adapter_detacher)(&mapping.hcs_compute_system_id, endpoint_id) {
-            log::warn!(
+            tracing::warn!(
                 "the adapter of VM \"{}\" could not be detached before it was forcibly stopped: \
                  {error}; HNS keeps endpoint {endpoint_id} attached to the compute system being \
                  destroyed, so the next start has to replace the endpoint and the guest may be \
@@ -138,7 +138,7 @@ fn detach_network_adapter(id: &str, endpoint_id: Uuid) -> Result<(), RepositoryE
     match HcsSystem::open_if_present(id, HCS_ACCESS_ALL)? {
         Some(system) => system.remove_network_adapter(endpoint_id),
         None => {
-            log::debug!("HCS no longer knows compute system \"{id}\"; nothing to detach");
+            tracing::debug!("HCS no longer knows compute system \"{id}\"; nothing to detach");
             Ok(())
         }
     }

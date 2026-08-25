@@ -29,11 +29,10 @@ use vmlord_agent_protocol::{
         ApplyGpuRecipeResponse, AttachDisplayPayloadRequest, AttachDisplayPayloadResponse,
         AttachGpuSharesRequest, AttachGpuSharesResponse, AuthenticateRequest, Capability,
         DisplayMountState, DisplayRecipeStageState, DisplayRecipeStep,
-        DisplayShare as WireDisplayShare,
-        DisplayUpdateOutcome, Envelope, ErrorCode, GpuMountState, GpuProbeCheckState,
-        GpuProbeVerdict, GpuRecipeStageState, GpuShareRole, HeartbeatResponse, HelloResponse,
-        ProbeGpuRequest, ProbeGpuResponse, ProtocolVersion, UpdateDisplayPayloadRequest,
-        UpdateDisplayPayloadResponse, envelope, request, response,
+        DisplayShare as WireDisplayShare, DisplayUpdateOutcome, Envelope, ErrorCode, GpuMountState,
+        GpuProbeCheckState, GpuProbeVerdict, GpuRecipeStageState, GpuShareRole, HeartbeatResponse,
+        HelloResponse, ProbeGpuRequest, ProbeGpuResponse, ProtocolVersion,
+        UpdateDisplayPayloadRequest, UpdateDisplayPayloadResponse, envelope, request, response,
     },
 };
 use vmlord_core::{
@@ -188,7 +187,7 @@ pub(crate) fn open<S: Read + Write>(
     let session = greet(stream, vm_name, &mut buffer)?;
     authenticate(stream, secret, vm_name, &mut buffer)?;
 
-    log::info!(
+    tracing::info!(
         "the agent of VM \"{vm_name}\" is build \"{}\" and opened a session on protocol \
          {}.{} with {} agreed capability(ies)",
         session.build,
@@ -217,7 +216,7 @@ pub(crate) fn serve<S: Read + Write>(
     vm_name: &str,
 ) -> Result<(), SessionError> {
     let mut buffer = Vec::new();
-    log::debug!(
+    tracing::debug!(
         "serving the agent of VM \"{vm_name}\" on protocol {}.{}",
         session.version.major,
         session.version.minor
@@ -243,7 +242,7 @@ pub(crate) fn serve<S: Read + Write>(
         let envelope = match frame::read(stream, &mut buffer) {
             Ok(envelope) => envelope,
             Err(FrameError::Closed) => {
-                log::info!("the agent of VM \"{vm_name}\" closed its session");
+                tracing::info!("the agent of VM \"{vm_name}\" closed its session");
                 return Ok(());
             }
             // `Idle` is reported only before a peer starts another frame, so
@@ -335,7 +334,7 @@ pub(crate) fn serve<S: Read + Write>(
             // A response to a request this side did not send, or one it has
             // already had an answer to. Worth a line and nothing more: there is
             // no id left to fail, and the session is otherwise intact.
-            Body::Response(_) => log::warn!(
+            Body::Response(_) => tracing::warn!(
                 "the agent of VM \"{vm_name}\" answered request {request_id}, which VMLord \
                  never sent"
             ),
@@ -367,7 +366,7 @@ fn attach_shares<S: Read + Write>(
     if !session.capabilities.contains(&Capability::Gpu) {
         // An agent too old to have the capability cannot mount anything, and
         // sending it a manifest would be a request it would refuse.
-        log::warn!(
+        tracing::warn!(
             "the agent of VM \"{vm_name}\" does not speak the GPU capability, so its {} \
              share(s) are exported but not mounted",
             manifest.shares.len()
@@ -382,7 +381,7 @@ fn attach_shares<S: Read + Write>(
         }),
     );
     frame::write(stream, &request, buffer).map_err(SessionError::Frame)?;
-    log::debug!(
+    tracing::debug!(
         "VMLord offered the agent of VM \"{vm_name}\" {} GPU share(s)",
         manifest.shares.len()
     );
@@ -407,7 +406,7 @@ fn apply_recipe<S: Read + Write>(
         request::Kind::ApplyGpuRecipe(ApplyGpuRecipeRequest {}),
     );
     frame::write(stream, &request, buffer).map_err(SessionError::Frame)?;
-    log::debug!("VMLord asked the agent of VM \"{vm_name}\" to apply its GPU recipe");
+    tracing::debug!("VMLord asked the agent of VM \"{vm_name}\" to apply its GPU recipe");
 
     Ok(Some(APPLY_REQUEST_ID))
 }
@@ -428,7 +427,7 @@ fn probe_gpu<S: Read + Write>(
         request::Kind::ProbeGpu(ProbeGpuRequest {}),
     );
     frame::write(stream, &request, buffer).map_err(SessionError::Frame)?;
-    log::debug!("VMLord asked the agent of VM \"{vm_name}\" to probe its GPU");
+    tracing::debug!("VMLord asked the agent of VM \"{vm_name}\" to probe its GPU");
 
     Ok(Some(PROBE_REQUEST_ID))
 }
@@ -470,7 +469,7 @@ fn attach_display<S: Read + Write>(
         return Ok(None);
     };
     if !session.capabilities.contains(&Capability::Display) {
-        log::warn!(
+        tracing::warn!(
             "the agent of VM \"{vm_name}\" does not speak the display capability, so its \
              display payload is exported but not mounted"
         );
@@ -486,7 +485,7 @@ fn attach_display<S: Read + Write>(
         }),
     );
     frame::write(stream, &request, buffer).map_err(SessionError::Frame)?;
-    log::debug!("VMLord offered the agent of VM \"{vm_name}\" its display payload share");
+    tracing::debug!("VMLord offered the agent of VM \"{vm_name}\" its display payload share");
 
     Ok(Some(DISPLAY_ATTACH_REQUEST_ID))
 }
@@ -514,7 +513,7 @@ fn apply_display_recipe<S: Read + Write>(
         }),
     );
     frame::write(stream, &request, buffer).map_err(SessionError::Frame)?;
-    log::debug!(
+    tracing::debug!(
         "VMLord asked the agent of VM \"{vm_name}\" to apply its display recipe{}",
         match mode {
             Some(mode) => format!(" at {mode}"),
@@ -548,7 +547,7 @@ fn start_update<S: Read + Write>(
         }),
     );
     frame::write(stream, &request, buffer).map_err(SessionError::Frame)?;
-    log::info!(
+    tracing::info!(
         "VMLord asked the agent of VM \"{vm_name}\" to move its display payload to {}",
         update.target_version
     );
@@ -569,12 +568,12 @@ fn report_display_update(
 ) -> DisplayUpdateAnswer {
     for stage in &report.stages {
         match stage.state() {
-            DisplayRecipeStageState::Failed => log::warn!(
+            DisplayRecipeStageState::Failed => tracing::warn!(
                 "the agent of VM \"{vm_name}\" did not finish update stage {:?}: {}",
                 stage.step(),
                 stage.message
             ),
-            state => log::debug!(
+            state => tracing::debug!(
                 "the agent of VM \"{vm_name}\" update stage {:?} ({state:?}): {}",
                 stage.step(),
                 stage.message
@@ -617,15 +616,15 @@ fn report_display_update(
     sink(payload.clone());
 
     match outcome {
-        DisplayUpdateOutcome::Updated => log::info!(
+        DisplayUpdateOutcome::Updated => tracing::info!(
             "the agent of VM \"{vm_name}\" is running display payload {}",
             versions.loaded
         ),
-        DisplayUpdateOutcome::RolledBack => log::warn!(
+        DisplayUpdateOutcome::RolledBack => tracing::warn!(
             "the display payload update of VM \"{vm_name}\" did not verify; {} is running again",
             versions.loaded
         ),
-        _ => log::error!("the display payload update of VM \"{vm_name}\" left nothing running"),
+        _ => tracing::error!("the display payload update of VM \"{vm_name}\" left nothing running"),
     }
 
     DisplayUpdateAnswer {
@@ -659,14 +658,14 @@ fn report_display_mount(
 
     match mount.state() {
         DisplayMountState::Mounted | DisplayMountState::AlreadyMounted => {
-            log::info!(
+            tracing::info!(
                 "the agent of VM \"{vm_name}\" has its display payload at {}",
                 mount.mount_point
             );
             true
         }
         state => {
-            log::warn!(
+            tracing::warn!(
                 "the agent of VM \"{vm_name}\" did not mount its display payload ({state:?}): {}",
                 mount.message
             );
@@ -695,17 +694,17 @@ fn report_display_recipe(
 ) {
     for stage in &report.stages {
         match stage.state() {
-            DisplayRecipeStageState::Ok => log::debug!(
+            DisplayRecipeStageState::Ok => tracing::debug!(
                 "the agent of VM \"{vm_name}\" finished display recipe stage {:?}: {}",
                 stage.step(),
                 stage.message
             ),
-            DisplayRecipeStageState::Skipped => log::info!(
+            DisplayRecipeStageState::Skipped => tracing::info!(
                 "the agent of VM \"{vm_name}\" skipped display recipe stage {:?}: {}",
                 stage.step(),
                 stage.message
             ),
-            state => log::warn!(
+            state => tracing::warn!(
                 "the agent of VM \"{vm_name}\" did not finish display recipe stage {:?} \
                  ({state:?}): {}",
                 stage.step(),
@@ -802,12 +801,12 @@ fn some_version(value: &str) -> Option<String> {
 fn report_mounts(report: &AttachGpuSharesResponse, vm_name: &str) {
     for mount in &report.mounts {
         match mount.state() {
-            GpuMountState::Mounted => log::debug!(
+            GpuMountState::Mounted => tracing::debug!(
                 "the agent of VM \"{vm_name}\" mounted {} at {}",
                 mount.share,
                 mount.path
             ),
-            state => log::warn!(
+            state => tracing::warn!(
                 "the agent of VM \"{vm_name}\" did not mount {} ({state:?}): {}",
                 mount.share,
                 mount.message
@@ -816,7 +815,7 @@ fn report_mounts(report: &AttachGpuSharesResponse, vm_name: &str) {
     }
 
     if !report.libraries_refreshed && !report.mounts.is_empty() {
-        log::warn!(
+        tracing::warn!(
             "the agent of VM \"{vm_name}\" could not tell the dynamic linker about its GPU \
              libraries"
         );
@@ -831,7 +830,7 @@ fn report_mounts(report: &AttachGpuSharesResponse, vm_name: &str) {
 fn report_recipe(report: &ApplyGpuRecipeResponse, vm_name: &str, sink: GuestGpuSink<'_>) -> bool {
     for stage in &report.stages {
         match stage.state() {
-            GpuRecipeStageState::Ok => log::debug!(
+            GpuRecipeStageState::Ok => tracing::debug!(
                 "the agent of VM \"{vm_name}\" finished GPU recipe stage {:?}: {}",
                 stage.step(),
                 stage.message
@@ -840,12 +839,12 @@ fn report_recipe(report: &ApplyGpuRecipeResponse, vm_name: &str, sink: GuestGpuS
             // how a recipe reports "there was nothing for me to do here", and
             // a guest that ends up with no device after a recipe that failed
             // nowhere is explained by exactly these lines.
-            GpuRecipeStageState::Skipped => log::info!(
+            GpuRecipeStageState::Skipped => tracing::info!(
                 "the agent of VM \"{vm_name}\" skipped GPU recipe stage {:?}: {}",
                 stage.step(),
                 stage.message
             ),
-            state => log::warn!(
+            state => tracing::warn!(
                 "the agent of VM \"{vm_name}\" did not finish GPU recipe stage {:?} ({state:?}): \
                  {}",
                 stage.step(),
@@ -880,24 +879,24 @@ fn report_recipe(report: &ApplyGpuRecipeResponse, vm_name: &str, sink: GuestGpuS
 /// a `VmGpuFacts` is the application layer's work.
 fn report_probe(report: &ProbeGpuResponse, vm_name: &str, sink: GuestGpuSink<'_>) {
     match report.verdict() {
-        GpuProbeVerdict::Renders => log::info!(
+        GpuProbeVerdict::Renders => tracing::info!(
             "the agent of VM \"{vm_name}\" renders on {}",
             report.renderer
         ),
         verdict => {
-            log::warn!("the agent of VM \"{vm_name}\" does not render on its GPU ({verdict:?})")
+            tracing::warn!("the agent of VM \"{vm_name}\" does not render on its GPU ({verdict:?})")
         }
     }
 
     for check in &report.checks {
         match check.state() {
-            GpuProbeCheckState::Ok | GpuProbeCheckState::Skipped => log::debug!(
+            GpuProbeCheckState::Ok | GpuProbeCheckState::Skipped => tracing::debug!(
                 "the agent of VM \"{vm_name}\" GPU check {:?} ({:?}): {}",
                 check.step(),
                 check.state(),
                 check.message
             ),
-            state => log::warn!(
+            state => tracing::warn!(
                 "the agent of VM \"{vm_name}\" failed GPU check {:?} ({state:?}): {}",
                 check.step(),
                 check.message
@@ -962,7 +961,7 @@ fn greet<S: Read + Write>(
     };
     let capabilities = handshake::agreed_capabilities(HOST_CAPABILITIES, &hello.capabilities);
 
-    log::debug!(
+    tracing::debug!(
         "the agent of VM \"{vm_name}\" speaks protocol {}.{}",
         remote.major,
         remote.minor
@@ -1047,7 +1046,7 @@ fn authenticate<S: Read + Write>(
                 "this session has not answered its challenge yet",
             )
         };
-        log::warn!(
+        tracing::warn!(
             "the agent of VM \"{vm_name}\" sent request {request_id} before answering its \
              challenge; it was refused"
         );
@@ -1059,7 +1058,7 @@ fn authenticate<S: Read + Write>(
 fn answer(request_id: u32, kind: &request::Kind, vm_name: &str) -> Envelope {
     match kind {
         request::Kind::Heartbeat(_) => {
-            log::trace!("the agent of VM \"{vm_name}\" is alive");
+            tracing::trace!("the agent of VM \"{vm_name}\" is alive");
             Envelope::response(request_id, response::Kind::Heartbeat(HeartbeatResponse {}))
         }
         // A second hello would renegotiate a session that is already running,
@@ -1139,7 +1138,7 @@ fn body(envelope: Envelope, vm_name: &str) -> Result<Body, SessionError> {
     match envelope.body {
         Some(envelope::Body::Request(request)) => {
             request.kind.map(Body::Request).ok_or_else(|| {
-                log::warn!(
+                tracing::warn!(
                     "the agent of VM \"{vm_name}\" sent request {request_id} with no kind this \
                  build knows"
                 );
@@ -1148,7 +1147,7 @@ fn body(envelope: Envelope, vm_name: &str) -> Result<Body, SessionError> {
         }
         Some(envelope::Body::Response(response)) => {
             response.kind.map(Body::Response).ok_or_else(|| {
-                log::warn!(
+                tracing::warn!(
                     "the agent of VM \"{vm_name}\" answered request {request_id} with no kind \
                      this build knows"
                 );
@@ -1218,9 +1217,9 @@ mod tests {
         v1::{
             ApplyDisplayRecipeResponse, ApplyGpuRecipeResponse, AttachDisplayPayloadResponse,
             AttachGpuSharesResponse, AuthenticateResponse, Capability, DisplayMountState,
-            DisplayRecipeStage, DisplayRecipeStageState, Envelope, ErrorCode, GpuMount,
-            GpuMountState, GpuProbeCheck, GpuProbeCheckState, GpuProbeStep, GpuProbeVerdict,
-            DisplayRecipeStep, GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep, GpuShareRole,
+            DisplayRecipeStage, DisplayRecipeStageState, DisplayRecipeStep, Envelope, ErrorCode,
+            GpuMount, GpuMountState, GpuProbeCheck, GpuProbeCheckState, GpuProbeStep,
+            GpuProbeVerdict, GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep, GpuShareRole,
             HeartbeatRequest, HelloRequest, ProbeGpuResponse, ProtocolVersion, envelope, request,
             response,
         },

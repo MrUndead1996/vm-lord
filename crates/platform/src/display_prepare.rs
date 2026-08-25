@@ -60,7 +60,7 @@ pub(crate) fn prepare(
     // installation media becomes whatever the person installing it chose, and
     // the catalog is keyed by what a guest *is*.
     let Some(target) = mapping.guest_target.as_ref() else {
-        log::info!(
+        tracing::info!(
             "VM \"{}\" records no guest, so no display payload can be chosen for it",
             mapping.vm_name
         );
@@ -86,7 +86,7 @@ pub(crate) fn prepare(
         Ok(staged) => staged,
         Err(error) => {
             let failure = failure_for(&error);
-            log::warn!(
+            tracing::warn!(
                 "VM \"{}\" starts without a display payload: {error}",
                 mapping.vm_name
             );
@@ -100,7 +100,7 @@ pub(crate) fn prepare(
 
     let export = display_exports::build(vm_directory, Some(&staged.active), canonicalize);
     if export.is_none() {
-        log::warn!(
+        tracing::warn!(
             "VM \"{}\" staged a display payload at {} that cannot be exported",
             mapping.vm_name,
             staged.active.display()

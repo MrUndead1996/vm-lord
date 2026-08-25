@@ -61,7 +61,7 @@ fn reconcile(live: &[HcsSystemSummary], mappings: Vec<VmComputeSystemMapping>) -
                 // Every listing of a stopped VM lands here, so this stays at
                 // debug: HCS destroying a compute system as it stops is the
                 // expected outcome, not something to warn about.
-                log::debug!(
+                tracing::debug!(
                     "HCS does not report compute system \"{}\" of VM \"{}\" ({}); \
                      it is stopped",
                     mapping.hcs_compute_system_id,
@@ -80,7 +80,7 @@ fn reconcile(live: &[HcsSystemSummary], mappings: Vec<VmComputeSystemMapping>) -
             // the user cannot stop is worse than a stopped one shown as
             // running.
             let state = HcsSystemState::from_enumeration(system.state.clone());
-            log::debug!(
+            tracing::debug!(
                 "HCS reports VM \"{}\" ({}) as {state:?}",
                 mapping.vm_name,
                 mapping.vm_id
@@ -102,7 +102,7 @@ pub fn open_by_vm_id(
 ) -> Result<HcsSystem, RepositoryError> {
     let mapping = store.find_by_vm_id(vm_id)?.ok_or_else(|| {
         let error = RepositoryError::new(format!("no HCS mapping found for VM {vm_id}"));
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })?;
     open_mapping(&mapping, requested_access)
@@ -116,7 +116,7 @@ pub fn open_by_vm_name(
 ) -> Result<HcsSystem, RepositoryError> {
     let mapping = store.find_by_vm_name(vm_name)?.ok_or_else(|| {
         let error = RepositoryError::new(format!("no HCS mapping found for VM \"{vm_name}\""));
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })?;
     open_mapping(&mapping, requested_access)
@@ -126,7 +126,7 @@ fn open_mapping(
     mapping: &VmComputeSystemMapping,
     requested_access: u32,
 ) -> Result<HcsSystem, RepositoryError> {
-    log::debug!(
+    tracing::debug!(
         "opening HCS compute system \"{}\" for VM \"{}\" ({})",
         mapping.hcs_compute_system_id,
         mapping.vm_name,

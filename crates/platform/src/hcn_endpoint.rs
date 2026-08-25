@@ -103,7 +103,7 @@ impl HcnEndpoint {
         address: Option<&EndpointAddress>,
     ) -> Result<Self, RepositoryError> {
         let settings = endpoint_settings(vm_name, address)?;
-        log::debug!("creating HCN endpoint {id} for VM \"{vm_name}\"");
+        tracing::debug!("creating HCN endpoint {id} for VM \"{vm_name}\"");
 
         let guid = GUID::from_u128(id.as_u128());
         let settings = HSTRING::from(settings);
@@ -115,11 +115,11 @@ impl HcnEndpoint {
         unsafe { HcnCreateEndpoint(network.handle(), &guid, &settings, &mut endpoint, None) }
             .map_err(|error| {
                 let error = windows_error("create HCN endpoint", Some(vm_name), error);
-                log::error!("{error}");
+                tracing::error!("{error}");
                 error
             })?;
 
-        log::info!("created HCN endpoint {id} for VM \"{vm_name}\"");
+        tracing::info!("created HCN endpoint {id} for VM \"{vm_name}\"");
         Ok(Self(endpoint))
     }
 
@@ -127,7 +127,7 @@ impl HcnEndpoint {
     pub fn open(id: Uuid) -> Result<Self, RepositoryError> {
         Self::try_open(id).map_err(|error| {
             let error = windows_error("open HCN endpoint", None, error);
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })
     }
@@ -141,12 +141,12 @@ impl HcnEndpoint {
         match Self::try_open(id) {
             Ok(endpoint) => Ok(Some(endpoint)),
             Err(error) if is_endpoint_absent(&error) => {
-                log::debug!("HNS does not know endpoint {id}");
+                tracing::debug!("HNS does not know endpoint {id}");
                 Ok(None)
             }
             Err(error) => {
                 let error = windows_error("open HCN endpoint", None, error);
-                log::error!("{error}");
+                tracing::error!("{error}");
                 Err(error)
             }
         }
@@ -173,14 +173,14 @@ impl HcnEndpoint {
             let error = RepositoryError::new(format!(
                 "the properties HNS reported for the endpoint are not valid JSON: {error}"
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
 
         mac_address(&properties).ok_or_else(|| {
             let error =
                 RepositoryError::new("HNS reported no MAC address for the endpoint".to_owned());
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })
     }
@@ -196,7 +196,7 @@ impl HcnEndpoint {
             let error = RepositoryError::new(format!(
                 "the properties HNS reported for the endpoint are not valid JSON: {error}"
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
 
@@ -213,7 +213,7 @@ impl HcnEndpoint {
         unsafe { HcnQueryEndpointProperties(self.0, &query, &mut properties, None) }.map_err(
             |error| {
                 let error = windows_error("query HCN endpoint properties", None, error);
-                log::error!("{error}");
+                tracing::error!("{error}");
                 error
             },
         )?;
@@ -237,7 +237,7 @@ impl HcnEndpoint {
             match endpoint_network(id) {
                 Ok(Some(network)) if network == VMLORD_NETWORK_ID => in_network.push(id),
                 Ok(_) => {}
-                Err(error) => log::warn!(
+                Err(error) => tracing::warn!(
                     "HNS endpoint {id} is left alone because the network it is in \
                      could not be read: {error}"
                 ),
@@ -253,20 +253,20 @@ impl HcnEndpoint {
     /// outcome, not a failure.
     pub fn delete(id: Uuid) -> Result<(), RepositoryError> {
         let guid = GUID::from_u128(id.as_u128());
-        log::debug!("deleting HCN endpoint {id}");
+        tracing::debug!("deleting HCN endpoint {id}");
         // SAFETY: `guid` is valid for the duration of the call.
         match unsafe { HcnDeleteEndpoint(&guid, None) } {
             Ok(()) => {
-                log::info!("deleted HCN endpoint {id}");
+                tracing::info!("deleted HCN endpoint {id}");
                 Ok(())
             }
             Err(error) if is_endpoint_absent(&error) => {
-                log::debug!("HCN endpoint {id} was already gone");
+                tracing::debug!("HCN endpoint {id} was already gone");
                 Ok(())
             }
             Err(error) => {
                 let error = windows_error("delete HCN endpoint", None, error);
-                log::error!("{error}");
+                tracing::error!("{error}");
                 Err(error)
             }
         }
@@ -288,7 +288,7 @@ fn enumerate_ids() -> Result<Vec<Uuid>, RepositoryError> {
     // On success HCN transfers ownership of the returned string to this process.
     unsafe { HcnEnumerateEndpoints(&query, &mut endpoints, None) }.map_err(|error| {
         let error = windows_error("enumerate HCN endpoints", None, error);
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })?;
 
@@ -310,7 +310,7 @@ fn endpoint_network(id: Uuid) -> Result<Option<u128>, RepositoryError> {
             let error = RepositoryError::new(format!(
                 "the properties HNS reported for endpoint {id} are not valid JSON: {error}"
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
 
@@ -329,7 +329,7 @@ fn endpoint_ids(document: &str) -> Result<Vec<Uuid>, RepositoryError> {
         let error = RepositoryError::new(format!(
             "the endpoint list HNS reported is not a JSON array of identifiers: {error}"
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })?;
 
@@ -338,7 +338,7 @@ fn endpoint_ids(document: &str) -> Result<Vec<Uuid>, RepositoryError> {
         .filter_map(|id| {
             Uuid::parse_str(id)
                 .inspect_err(|error| {
-                    log::debug!(
+                    tracing::debug!(
                         "HNS listed \"{id}\", which is not an endpoint identifier: {error}"
                     );
                 })
@@ -355,7 +355,7 @@ fn network(properties: &serde_json::Value) -> Option<u128> {
     let network = properties.get("HostComputeNetwork")?.as_str()?;
     Uuid::parse_str(network)
         .inspect_err(|error| {
-            log::debug!("HNS reported \"{network}\" as an endpoint's network: {error}");
+            tracing::debug!("HNS reported \"{network}\" as an endpoint's network: {error}");
         })
         .ok()
         .map(|network| network.as_u128())

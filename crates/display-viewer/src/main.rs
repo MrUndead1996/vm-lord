@@ -92,7 +92,7 @@ fn main() -> ExitCode {
     let parameters = match launch::first_parameters(&mut link) {
         Ok(parameters) => parameters,
         Err(message) => {
-            log::error!("{message}");
+            tracing::error!("{message}");
             report(&message);
             return ExitCode::FAILURE;
         }
@@ -103,7 +103,7 @@ fn main() -> ExitCode {
         Ok(None) => focus_the_window_that_is_already_open(&parameters),
         Err(error) => {
             let message = format!("VMLord Display could not start: {error}");
-            log::error!("{message}");
+            tracing::error!("{message}");
             report(&message);
             ExitCode::FAILURE
         }
@@ -112,7 +112,7 @@ fn main() -> ExitCode {
 
 /// A second Connect on a VM that already has a window.
 fn focus_the_window_that_is_already_open(parameters: &LaunchParameters) -> ExitCode {
-    log::info!(
+    tracing::info!(
         "a viewer for {} is already running; asking it to come forward",
         parameters.vm_name
     );
@@ -122,7 +122,7 @@ fn focus_the_window_that_is_already_open(parameters: &LaunchParameters) -> ExitC
         Err(error) => {
             // The mutex was held but nobody answered: a viewer that is on its
             // way out. Saying so beats opening a second window over it.
-            log::warn!("the running viewer could not be reached: {error}");
+            tracing::warn!("the running viewer could not be reached: {error}");
             ExitCode::FAILURE
         }
     }
@@ -217,7 +217,7 @@ fn run(parameters: LaunchParameters, claim: SingleInstance) -> ExitCode {
     if let Some(store) = store.as_ref()
         && let Err(error) = store.save(&state)
     {
-        log::warn!(
+        tracing::warn!(
             "this window's place could not be remembered in {}: {error}",
             store.path().display()
         );
@@ -237,7 +237,7 @@ fn run(parameters: LaunchParameters, claim: SingleInstance) -> ExitCode {
     // both end with the process, which is what closing the pipes does to them.
     drop(reader);
     drop(writer);
-    log::info!("the display viewer for {} is closing", parameters.vm_name);
+    tracing::info!("the display viewer for {} is closing", parameters.vm_name);
 
     exit
 }
@@ -354,7 +354,7 @@ fn spawn_reader(
                     poster.post(WM_SIGNAL);
                 }
                 Err(error) => {
-                    log::info!("the launch pipe ended: {error}");
+                    tracing::info!("the launch pipe ended: {error}");
                     return;
                 }
             }
@@ -368,7 +368,7 @@ fn spawn_writer(outgoing: Receiver<Message>) -> JoinHandle<()> {
         let mut link = Link::new(io::empty(), io::stdout());
         while let Ok(message) = outgoing.recv() {
             if let Err(error) = link.write(&message) {
-                log::info!("the launch pipe could not be written to: {error}");
+                tracing::info!("the launch pipe could not be written to: {error}");
                 return;
             }
         }
@@ -429,7 +429,7 @@ fn attempt(session: &Session, hello: &[u8]) -> Attempt {
                 return Attempt::Stop;
             }
             Err(error) => {
-                log::warn!("the handshake did not finish: {error}");
+                tracing::warn!("the handshake did not finish: {error}");
                 return Attempt::Restart;
             }
         }
@@ -450,7 +450,9 @@ fn attempt(session: &Session, hello: &[u8]) -> Attempt {
             // Control established the session and is not rebound; the
             // clipboard is connected by the thread that owns that socket.
             Channel::Control | Channel::Clipboard => {
-                return Err(format!("the {channel} channel is not this session's to open"));
+                return Err(format!(
+                    "the {channel} channel is not this session's to open"
+                ));
             }
         };
 
@@ -460,7 +462,7 @@ fn attempt(session: &Session, hello: &[u8]) -> Attempt {
     let mut live = match Live::new(handover, control, connect, Instant::now()) {
         Ok(live) => live,
         Err(error) => {
-            log::error!("the hand-over could not be used: {error}");
+            tracing::error!("the hand-over could not be used: {error}");
             return Attempt::Restart;
         }
     };
@@ -480,7 +482,7 @@ fn start_clipboard(session: &Session, handover: &Handover) -> Option<JoinHandle<
         .capabilities
         .contains(&i32::from(Capability::Clipboard))
     {
-        log::info!("this guest has no clipboard");
+        tracing::info!("this guest has no clipboard");
 
         return None;
     }
@@ -556,7 +558,7 @@ where
         let mut ended = false;
         for signal in signals.drain(..) {
             if let Signal::Ended(reason) = &signal {
-                log::warn!("the session ended: {reason}");
+                tracing::warn!("the session ended: {reason}");
                 ended = true;
             }
             publish(session, live, signal);
@@ -611,13 +613,13 @@ fn connect_control(session: &Session) -> Option<HvSocket> {
         ) {
             Ok(socket) => return Some(socket),
             Err(ConnectError::PartitionGone) => {
-                log::info!("the VM is not running; the viewer is closing");
+                tracing::info!("the VM is not running; the viewer is closing");
                 let _ = session.signals.send(Signal::Status(Event::PartitionGone));
                 session.poster.post(WM_SIGNAL);
                 return None;
             }
             Err(error) => {
-                log::debug!("the control socket is not up yet: {error}");
+                tracing::debug!("the control socket is not up yet: {error}");
                 thread::sleep(CONNECT_BACKOFF);
             }
         }
@@ -712,7 +714,7 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
                                 Ok(installed) => hook = Some(installed),
                                 // A viewer without the hook still types; it only
                                 // loses the keys the shell takes first.
-                                Err(error) => log::warn!("{error}"),
+                                Err(error) => tracing::warn!("{error}"),
                             }
                         }
                         Report::FocusLost | Report::ReleaseKeyboard => {
@@ -729,7 +731,7 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
                 UiEvent::Resized(width, height) => {
                     let (width, height) = (width.max(0) as u32, height.max(0) as u32);
                     if let Err(error) = context.renderer.resize_swapchain(width, height) {
-                        log::warn!("the swapchain could not follow the window: {error}");
+                        tracing::warn!("the swapchain could not follow the window: {error}");
                     }
                     reposition(&mut policy, stream, context.window);
                     // Held rather than sent: a drag is hundreds of these, and
@@ -848,19 +850,19 @@ fn apply(context: &mut Loop<'_>, progress: &mut Progress, signal: Signal) {
     match signal {
         Signal::Configured(geometry) => {
             if let Err(error) = context.renderer.configure(geometry) {
-                log::error!("the stream could not be shown: {error}");
+                tracing::error!("the stream could not be shown: {error}");
             }
         }
         Signal::Cursor(image) => {
             if let Err(error) = context.renderer.set_cursor(&image) {
-                log::warn!("the guest's cursor could not be shown: {error}");
+                tracing::warn!("the guest's cursor could not be shown: {error}");
             }
         }
         // Where the guest thinks its pointer is. The host's own cursor is what
         // the user sees until #119 wires input up.
         Signal::Moved(_) | Signal::Damage(_) => {}
         Signal::Status(event) => progress.on(event, Instant::now()),
-        Signal::Ended(reason) => log::info!("the session is over: {reason}"),
+        Signal::Ended(reason) => tracing::info!("the session is over: {reason}"),
     }
 }
 
@@ -875,7 +877,7 @@ fn upload(context: &mut Loop<'_>) {
 
     let damage = std::mem::take(&mut frame.damage);
     if let Err(error) = context.renderer.upload(&frame.pixels, &damage) {
-        log::warn!("the frame could not be uploaded: {error}");
+        tracing::warn!("the frame could not be uploaded: {error}");
     }
 }
 
@@ -885,13 +887,13 @@ fn draw(context: &mut Loop<'_>, progress: &Progress) {
         return;
     };
 
-    log::warn!("the frame could not be presented: {error}");
+    tracing::warn!("the frame could not be presented: {error}");
     match context.renderer.recover() {
         // The device that was lost held the only copy of what was on screen.
         Ok(true) => {
             let _ = context.orders.send(Order::Keyframe);
         }
-        Ok(false) => log::error!("the graphics device cannot be recovered again"),
-        Err(error) => log::error!("the graphics device could not be rebuilt: {error}"),
+        Ok(false) => tracing::error!("the graphics device cannot be recovered again"),
+        Err(error) => tracing::error!("the graphics device could not be rebuilt: {error}"),
     }
 }

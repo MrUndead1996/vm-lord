@@ -13,7 +13,7 @@ fn main() {
     let repository = match &settings {
         Ok((_, settings)) => match vmlord_core::initialize_logging(settings) {
             Ok(()) => {
-                log::info!(
+                tracing::info!(
                     "logging initialized at {} with {:?} level",
                     settings.log_file_path.display(),
                     settings.log_level
@@ -44,7 +44,7 @@ fn main() {
 }
 
 fn load_backend(settings: &AppSettings) -> Box<dyn VmRepository> {
-    log::info!(
+    tracing::info!(
         "using the native HCS backend with VM storage at {}",
         settings.vm_storage_path.display()
     );

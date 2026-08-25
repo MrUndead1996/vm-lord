@@ -168,7 +168,7 @@ impl VmBuildCycle {
             Err(error) => {
                 // The creation pipeline rolls itself back, so there is nothing
                 // here left to undo.
-                log::error!("creating VM \"{}\" failed: {error}", request.name);
+                tracing::error!("creating VM \"{}\" failed: {error}", request.name);
                 return CycleReport {
                     outcome: CycleOutcome::Failed {
                         reason: error.to_string(),
@@ -186,7 +186,7 @@ impl VmBuildCycle {
         let session = match (self.start)(store, &request.name, vm_directory) {
             Ok(session) => session,
             Err(error) => {
-                log::error!(
+                tracing::error!(
                     "VM \"{}\" was created but could not be started: {error}",
                     request.name
                 );
@@ -212,7 +212,7 @@ impl VmBuildCycle {
 
         let started = StartedVm { mapping, session };
         if !has_a_guest_to_ask(request) {
-            log::info!(
+            tracing::info!(
                 "VM \"{}\" is created and started; it boots installation media, so there is no \
                  guest to ask about readiness",
                 request.name
@@ -227,7 +227,7 @@ impl VmBuildCycle {
         let waited = self.readiness.wait(&started.mapping, vm_directory, monitor);
         match waited {
             Ok(GuestReady::Ready) => {
-                log::info!("VM \"{}\" is created, started and ready", request.name);
+                tracing::info!("VM \"{}\" is created, started and ready", request.name);
                 CycleReport {
                     outcome: CycleOutcome::Ready,
                     started: Some(started),
@@ -275,20 +275,20 @@ impl VmBuildCycle {
         vm_directory: &Path,
         running: Running,
     ) -> CycleReport {
-        log::warn!(
+        tracing::warn!(
             "rolling back the creation of VM \"{}\": whatever it had built is being removed",
             request.name
         );
         if running == Running::Yes
             && let Err(error) = (self.force_stop)(store, &request.name)
         {
-            log::error!(
+            tracing::error!(
                 "VM \"{}\" could not be stopped while its creation was rolled back: {error}",
                 request.name
             );
         }
         if let Err(error) = (self.delete)(store, &request.name, vm_directory) {
-            log::error!(
+            tracing::error!(
                 "VM \"{}\" could not be removed while its creation was rolled back: {error}",
                 request.name
             );

@@ -95,7 +95,7 @@ impl Video {
                 .map(Update::Moved)
                 .map_err(|error| Self::rebind("a cursor position", error)),
             _ => {
-                log::debug!(
+                tracing::debug!(
                     "a frame record of type {} is one this build does not read",
                     header.message_type
                 );
@@ -128,7 +128,7 @@ impl Video {
         let geometry = Geometry::new(config.width, config.height, tile_size, pixel_format)
             .map_err(|error| VideoError::Fatal(format!("the stream's geometry: {error}")))?;
 
-        log::info!(
+        tracing::info!(
             "the display stream is {}x{}, {}-pixel tiles, {pixel_format:?}",
             geometry.width(),
             geometry.height(),
@@ -149,7 +149,7 @@ impl Video {
             .to_vec();
 
         self.last_frame = Some(header.sequence);
-        log::trace!(
+        tracing::trace!(
             "keyframe {} restored {} tiles",
             header.sequence,
             damage.len()
@@ -174,7 +174,7 @@ impl Video {
             .to_vec();
 
         self.last_frame = Some(header.sequence);
-        log::trace!("delta {} changed {} tiles", header.sequence, damage.len());
+        tracing::trace!("delta {} changed {} tiles", header.sequence, damage.len());
 
         Ok(Update::Damage(damage))
     }
@@ -476,18 +476,17 @@ mod tests {
 
     #[test]
     fn a_decoded_stream_never_reaches_the_log() {
-        crate::log::capture::install();
-
-        let mut video = Video::new();
-        let config = config_record(320, 200, 32);
-        video
-            .apply(&config.header, &config.payload)
-            .expect("a config");
-        for record in stream(4) {
-            let _ = video.apply(&record.header, &record.payload);
-        }
-
-        let text = crate::log::capture::text();
+        let (video, text) = crate::log::capture::capture(|| {
+            let mut video = Video::new();
+            let config = config_record(320, 200, 32);
+            video
+                .apply(&config.header, &config.payload)
+                .expect("a config");
+            for record in stream(4) {
+                let _ = video.apply(&record.header, &record.payload);
+            }
+            video
+        });
         let pixels = video.frame().expect("a decoded frame").to_vec();
         // Sixteen bytes is four pixels: long enough that a match is not a
         // coincidence, short enough to catch a partial dump.

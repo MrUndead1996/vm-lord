@@ -201,7 +201,9 @@ pub(crate) fn drain_events(
 ) -> DrainedEvents {
     let (events, dropped) = sink.drain();
     if dropped > 0 {
-        log::warn!("{dropped} HCS event(s) were discarded because VMLord's event queue was full");
+        tracing::warn!(
+            "{dropped} HCS event(s) were discarded because VMLord's event queue was full"
+        );
     }
 
     let mut drained = DrainedEvents {
@@ -212,7 +214,7 @@ pub(crate) fn drain_events(
     };
     for event in events {
         if superseded(event.vm_id, event.generation) {
-            log::debug!(
+            tracing::debug!(
                 "dropping a stale HCS event for VM \"{}\" ({}): it was queued by \
                  watch generation {}, which VMLord has since replaced",
                 event.vm_name,
@@ -250,21 +252,25 @@ fn report(event: &HcsVmEvent) -> Option<Diagnostic> {
 
     match &event.kind {
         HcsEventKind::Exited => {
-            log::info!("VM \"{name}\" ({vm_id}) exited; HCS reported: {details}");
+            tracing::info!("VM \"{name}\" ({vm_id}) exited; HCS reported: {details}");
             Some(diagnostic(
                 DiagnosticLevel::Info,
                 format!("VM \"{name}\" stopped"),
             ))
         }
         HcsEventKind::CrashInitiated => {
-            log::warn!("the guest of VM \"{name}\" ({vm_id}) is crashing; HCS reported: {details}");
+            tracing::warn!(
+                "the guest of VM \"{name}\" ({vm_id}) is crashing; HCS reported: {details}"
+            );
             Some(diagnostic(
                 DiagnosticLevel::Warning,
                 format!("The guest of VM \"{name}\" is crashing"),
             ))
         }
         HcsEventKind::CrashReport => {
-            log::error!("the guest of VM \"{name}\" ({vm_id}) crashed; HCS reported: {details}");
+            tracing::error!(
+                "the guest of VM \"{name}\" ({vm_id}) crashed; HCS reported: {details}"
+            );
             Some(diagnostic(
                 DiagnosticLevel::Error,
                 format!(
@@ -274,7 +280,7 @@ fn report(event: &HcsVmEvent) -> Option<Diagnostic> {
             ))
         }
         HcsEventKind::ServiceDisconnect => {
-            log::error!(
+            tracing::error!(
                 "the Host Compute Service disconnected from VM \"{name}\" ({vm_id}); \
                  HCS reported: {details}"
             );
@@ -284,7 +290,7 @@ fn report(event: &HcsVmEvent) -> Option<Diagnostic> {
             ))
         }
         HcsEventKind::Ignored(event_type) => {
-            log::debug!(
+            tracing::debug!(
                 "VM \"{name}\" ({vm_id}) reported HCS event type {event_type}, \
                  which VMLord does not act on; HCS reported: {details}"
             );
@@ -401,7 +407,7 @@ impl SystemWatch {
             ));
         }
 
-        log::debug!(
+        tracing::debug!(
             "watching the HCS events of VM \"{vm_name}\" ({vm_id}) as generation {generation}"
         );
         Ok(Self { system, context })
@@ -434,7 +440,7 @@ impl Drop for SystemWatch {
                 // calling `Arc::from_raw` is what leaks it, and leaking one
                 // small allocation is not comparable to a thread inside HCS
                 // dereferencing freed memory.
-                log::error!(
+                tracing::error!(
                     "could not remove the HCS event callback of VM {:?}: {error}; \
                      its context is leaked deliberately rather than freed while \
                      HCS may still call into it",

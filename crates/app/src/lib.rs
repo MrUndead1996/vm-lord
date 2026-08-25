@@ -209,7 +209,7 @@ impl WorkspaceApp {
             .store
             .save(&settings)
             .map_err(SettingsUpdateError::Save)?;
-        log::info!(
+        tracing::info!(
             "application settings saved; log file is {} and level is {:?}",
             settings.log_file_path.display(),
             settings.log_level
@@ -250,17 +250,17 @@ impl WorkspaceApp {
     }
 
     pub fn start(&mut self) {
-        log::info!("initializing VM backend");
+        tracing::info!("initializing VM backend");
         match self.repository.initialize() {
             Ok(()) => {
-                log::info!("VM backend initialized");
+                tracing::info!("VM backend initialized");
                 self.status = BackendStatus::Ready;
                 self.host_gpu = self.read_host_gpu();
                 self.refresh();
                 return;
             }
             Err(error) => {
-                log::error!("failed to initialize VM backend: {error}");
+                tracing::error!("failed to initialize VM backend: {error}");
                 self.status = BackendStatus::Unavailable(error.to_string());
             }
         }
@@ -281,7 +281,7 @@ impl WorkspaceApp {
         match self.repository.host_gpu_capabilities() {
             Ok(capabilities) => Some(capabilities),
             Err(error) => {
-                log::info!("this backend does not report host GPU capabilities: {error}");
+                tracing::info!("this backend does not report host GPU capabilities: {error}");
                 None
             }
         }
@@ -454,7 +454,7 @@ impl WorkspaceApp {
                 "VM \"{}\" is running; stop it before deleting it",
                 request.name
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             self.diagnostics.push(Diagnostic {
                 level: DiagnosticLevel::Error,
                 message: error.to_string(),
@@ -464,7 +464,7 @@ impl WorkspaceApp {
 
         let name = request.name.clone();
         let kept_disks = !request.delete_disks;
-        log::info!("requesting deletion of VM {name}");
+        tracing::info!("requesting deletion of VM {name}");
 
         match self.repository.delete_vm(request) {
             Ok(()) => {
@@ -485,7 +485,7 @@ impl WorkspaceApp {
                 Ok(())
             }
             Err(error) => {
-                log::error!("failed to delete VM {name}: {error}");
+                tracing::error!("failed to delete VM {name}: {error}");
                 self.diagnostics.push(Diagnostic {
                     level: DiagnosticLevel::Error,
                     message: format!("Failed to delete VM \"{name}\": {error}"),
@@ -711,7 +711,7 @@ impl WorkspaceApp {
         operation: impl FnOnce(&mut dyn VmRepository) -> Result<(), RepositoryError>,
     ) -> Result<(), RepositoryError> {
         self.require_ready_backend(&format!("VM {action}"))?;
-        log::info!("requesting VM {action} for {name}");
+        tracing::info!("requesting VM {action} for {name}");
 
         match operation(self.repository.as_mut()) {
             Ok(()) => {
@@ -723,7 +723,7 @@ impl WorkspaceApp {
                 Ok(())
             }
             Err(error) => {
-                log::error!("failed to {action} VM {name}: {error}");
+                tracing::error!("failed to {action} VM {name}: {error}");
                 self.diagnostics.push(Diagnostic {
                     level: DiagnosticLevel::Error,
                     message: format!("Failed to {action} VM \"{name}\": {error}"),
@@ -1216,7 +1216,11 @@ mod tests {
             .diagnostics()
             .iter()
             .any(|diagnostic| diagnostic.message == "Updating the display payload of VM \"dev\"");
-        assert!(accepted, "the request is worth one line: {:?}", app.diagnostics());
+        assert!(
+            accepted,
+            "the request is worth one line: {:?}",
+            app.diagnostics()
+        );
         assert!(
             !app.diagnostics()
                 .iter()
@@ -1231,12 +1235,18 @@ mod tests {
     fn a_vm_being_updated_reports_itself_as_updating() {
         let mut app = WorkspaceApp::new(Box::new(updatable_repository()));
         app.start();
-        assert!(!app.display_status("dev").expect("a derived status").updating);
+        assert!(
+            !app.display_status("dev")
+                .expect("a derived status")
+                .updating
+        );
 
         app.update_display_payload("dev").expect("accepted");
 
         assert!(
-            app.display_status("dev").expect("a derived status").updating,
+            app.display_status("dev")
+                .expect("a derived status")
+                .updating,
             "the refresh the click ends with is what shows the update in flight"
         );
     }

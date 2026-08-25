@@ -142,7 +142,7 @@ impl Progress {
         // own, so the budget it began carries on into Waiting rather than
         // starting again there. Every other state that retries gets its own.
         if matches!(self.status, Status::Starting) {
-            log::info!("the display session is Waiting");
+            tracing::info!("the display session is Waiting");
             self.status = Status::Waiting;
         }
 
@@ -166,7 +166,7 @@ impl Progress {
             return;
         }
 
-        log::info!("the display session is {status:?}");
+        tracing::info!("the display session is {status:?}");
         self.status = status;
         self.entered = now;
     }

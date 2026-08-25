@@ -262,7 +262,7 @@ impl GuestReadiness {
         // to wait for and nobody in the guest to ask. The build succeeds, and
         // says what it could not check.
         let Some(config) = mapping.ssh.clone() else {
-            log::warn!(
+            tracing::warn!(
                 "VM \"{}\" was created without SSH access, so nothing can be asked whether \
                  cloud-init has finished",
                 mapping.vm_name
@@ -278,7 +278,7 @@ impl GuestReadiness {
         // and a wait that spends its address timeout first says the same thing
         // ninety seconds later.
         config.validate().map_err(|error| {
-            log::error!(
+            tracing::error!(
                 "VM \"{}\" cannot be asked anything over SSH: {error}",
                 mapping.vm_name
             );
@@ -294,7 +294,7 @@ impl GuestReadiness {
                 detail: error.to_string(),
             }
         })?;
-        log::debug!(
+        tracing::debug!(
             "VM \"{}\" has address {ip}; waiting for it to answer on port {}",
             mapping.vm_name,
             endpoint.port
@@ -309,7 +309,7 @@ impl GuestReadiness {
             // offer instead: an open port is the whole of what a password-mode
             // wait can establish, and it establishes it honestly.
             Question::PortOnly => {
-                log::warn!(
+                tracing::warn!(
                     "VM \"{}\" answers on port {}, but it has no deploy key, so cloud-init was \
                      not asked whether it has finished",
                     mapping.vm_name,
@@ -327,14 +327,14 @@ impl GuestReadiness {
             Question::CloudInit(client) => client,
         };
 
-        log::debug!(
+        tracing::debug!(
             "VM \"{}\" answers on port {}; asking cloud-init whether it has finished",
             mapping.vm_name,
             endpoint.port
         );
         let command = readiness_command(&client, &endpoint, vm_directory, self.timeouts.connect);
         let run = (self.ssh)(&command, self.timeouts.cloud_init, monitor).map_err(|error| {
-            log::error!(
+            tracing::error!(
                 "could not ask VM \"{}\" whether cloud-init has finished: {error}",
                 mapping.vm_name
             );
@@ -352,17 +352,17 @@ impl GuestReadiness {
         };
         match &result {
             Ok(GuestReady::Ready) => {
-                log::info!("VM \"{}\" reports that cloud-init is done", mapping.vm_name);
+                tracing::info!("VM \"{}\" reports that cloud-init is done", mapping.vm_name);
             }
-            Ok(GuestReady::Degraded { detail }) => log::warn!(
+            Ok(GuestReady::Degraded { detail }) => tracing::warn!(
                 "VM \"{}\" is up, but cloud-init finished degraded: {detail}",
                 mapping.vm_name
             ),
-            Ok(GuestReady::Unverified { detail }) => log::warn!(
+            Ok(GuestReady::Unverified { detail }) => tracing::warn!(
                 "VM \"{}\" is up, but its readiness was not verified: {detail}",
                 mapping.vm_name
             ),
-            Err(failure) => log::error!("VM \"{}\" is not ready: {failure}", mapping.vm_name),
+            Err(failure) => tracing::error!("VM \"{}\" is not ready: {failure}", mapping.vm_name),
         }
         result
     }
@@ -380,7 +380,7 @@ impl GuestReadiness {
             SshAuthentication::VmlordKey => match self.client.clone() {
                 Some(client) => Ok(Question::CloudInit(client)),
                 None => {
-                    log::error!("{}", ReadinessFailure::NoSshClient);
+                    tracing::error!("{}", ReadinessFailure::NoSshClient);
                     Err(ReadinessFailure::NoSshClient)
                 }
             },
@@ -401,7 +401,7 @@ impl GuestReadiness {
             match (self.address)(mapping) {
                 Ok(Some(ip)) => return Ok(ip),
                 Ok(None) => {}
-                Err(error) => log::debug!(
+                Err(error) => tracing::debug!(
                     "the address of VM \"{}\" is not readable yet: {error}",
                     mapping.vm_name
                 ),
@@ -437,7 +437,7 @@ impl GuestReadiness {
             match (self.port)(ip, port, self.timeouts.connect) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    log::debug!(
+                    tracing::debug!(
                         "VM \"{}\" does not answer on {ip}:{port} yet: {error}",
                         mapping.vm_name
                     );
@@ -584,18 +584,18 @@ fn run_ssh(
             "failed to open the readiness transcript {}: {error}",
             command.transcript.display()
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })?;
     let errors = transcript.try_clone().map_err(|error| {
         let error = RepositoryError::new(format!(
             "failed to capture the errors of the readiness command: {error}"
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })?;
 
-    log::debug!(
+    tracing::debug!(
         "running {} to wait for cloud-init; its output goes to {}",
         invocation.program.display(),
         command.transcript.display()
@@ -612,7 +612,7 @@ fn run_ssh(
                 "failed to run {}: {error}",
                 invocation.program.display()
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
 
@@ -631,18 +631,18 @@ fn run_ssh(
                     "failed to wait for {}: {error}",
                     invocation.program.display()
                 ));
-                log::error!("{error}");
+                tracing::error!("{error}");
                 return Err(error);
             }
         }
 
         if monitor.is_cancelled() {
-            log::warn!("killing the readiness command because the build was cancelled");
+            tracing::warn!("killing the readiness command because the build was cancelled");
             kill(&mut child);
             return Ok(SshRun::Cancelled);
         }
         if started.elapsed() >= deadline {
-            log::error!(
+            tracing::error!(
                 "the readiness command did not finish within {} seconds; killing it",
                 deadline.as_secs()
             );
@@ -659,11 +659,11 @@ fn run_ssh(
 /// Kills a child and reaps it, so that no zombie handle is left behind.
 fn kill(child: &mut Child) {
     if let Err(error) = child.kill() {
-        log::warn!("the readiness command could not be killed: {error}");
+        tracing::warn!("the readiness command could not be killed: {error}");
         return;
     }
     if let Err(error) = child.wait() {
-        log::warn!("the killed readiness command could not be reaped: {error}");
+        tracing::warn!("the killed readiness command could not be reaped: {error}");
     }
 }
 

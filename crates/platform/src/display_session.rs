@@ -155,7 +155,7 @@ impl Driver {
                 // A viewer that sends what only VMLord sends is a build that
                 // disagrees with this one, and the launch contract's revision
                 // check catches the ordinary form of that.
-                log::warn!(
+                tracing::warn!(
                     "the display window of VM \"{}\" sent a {} VMLord does not answer",
                     self.vm_name,
                     name_of(&other)
@@ -170,7 +170,7 @@ impl Driver {
         if self.session.is_none() {
             // The session is the viewer's from the hand-over on, so a record
             // arriving here is one the far side no longer needs answered.
-            log::debug!(
+            tracing::debug!(
                 "a record arrived for VM \"{}\" after its session was handed over",
                 self.vm_name
             );
@@ -213,7 +213,9 @@ impl Driver {
 
         let mut answer = Answer::nothing();
         if let Some(reply) = outcome.reply {
-            answer.to_viewer.push(Message::RelayToViewer(framed(&reply)));
+            answer
+                .to_viewer
+                .push(Message::RelayToViewer(framed(&reply)));
         }
         if outcome.event == Event::ControlEstablished {
             match self.hand_over() {
@@ -296,7 +298,7 @@ impl Driver {
 
         let (session, hello) = Session::host(&self.secret, self.offer.clone());
         self.session = Some(session);
-        log::info!(
+        tracing::info!(
             "the display window of VM \"{}\" lost control and asked for another session",
             self.vm_name
         );
@@ -324,7 +326,9 @@ fn same_bytes(left: &[u8], right: &[u8]) -> bool {
         && left
             .iter()
             .zip(right)
-            .fold(0_u8, |difference, (left, right)| difference | (left ^ right))
+            .fold(0_u8, |difference, (left, right)| {
+                difference | (left ^ right)
+            })
             == 0
 }
 
@@ -445,12 +449,8 @@ mod tests {
 
     #[test]
     fn the_launch_parameters_name_the_partition_and_the_three_ports() {
-        let (_driver, parameters) = Driver::open(
-            "dev",
-            Secret::generate(),
-            Uuid::from_u128(7),
-            None,
-        );
+        let (_driver, parameters) =
+            Driver::open("dev", Secret::generate(), Uuid::from_u128(7), None);
 
         assert_eq!(parameters.vm_name, "dev");
         assert_eq!(parameters.runtime_id, *Uuid::from_u128(7).as_bytes());
@@ -501,9 +501,7 @@ mod tests {
     fn a_request_carrying_the_wrong_token_is_refused_and_reported() {
         let (mut driver, _guest_secret, _hello, _token) = driver(None);
 
-        let answer = driver.handle(Message::RequestRelay {
-            token: vec![0; 32],
-        });
+        let answer = driver.handle(Message::RequestRelay { token: vec![0; 32] });
 
         assert!(answer.to_viewer.is_empty());
         assert_eq!(answer.diagnostics.len(), 1);

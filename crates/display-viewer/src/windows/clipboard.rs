@@ -101,7 +101,7 @@ pub fn spawn(parameters: Parameters) -> (JoinHandle<()>, Sender<Focus>) {
         if let Err(reason) = serve(&parameters, &receiver) {
             // One line, and the session carries on without a clipboard: a
             // viewer that cannot paste still shows a desktop and still types.
-            log::warn!("the clipboard is not available: {reason}");
+            tracing::warn!("the clipboard is not available: {reason}");
             // The window still has to be able to drop its sender, so the
             // thread drains rather than exits with a live channel.
             while receiver.recv().is_ok() {}
@@ -179,7 +179,7 @@ fn serve(parameters: &Parameters, focus: &Receiver<Focus>) -> Result<(), String>
         if socket.is_none() && now >= next_bind {
             match bind(&mut session, parameters, &mut greeted) {
                 Ok(bound) => {
-                    log::info!(
+                    tracing::info!(
                         "the clipboard channel bound at generation {}",
                         session.generation(Channel::Clipboard)
                     );
@@ -188,7 +188,7 @@ fn serve(parameters: &Parameters, focus: &Receiver<Focus>) -> Result<(), String>
                     held.clear();
                 }
                 Err(reason) => {
-                    log::debug!("the clipboard channel could not bind: {reason}");
+                    tracing::debug!("the clipboard channel could not bind: {reason}");
                     next_bind = now + BIND_BACKOFF;
                 }
             }
@@ -211,7 +211,7 @@ fn serve(parameters: &Parameters, focus: &Receiver<Focus>) -> Result<(), String>
                 }
                 Err(record::RecordError::Idle) => {}
                 Err(error) => {
-                    log::info!("the clipboard channel ended: {error}");
+                    tracing::info!("the clipboard channel ended: {error}");
                     socket = None;
                     next_bind = Instant::now() + BIND_BACKOFF;
                 }
@@ -230,7 +230,7 @@ fn serve(parameters: &Parameters, focus: &Receiver<Focus>) -> Result<(), String>
             &mut written,
         );
         if lost {
-            log::info!("the clipboard channel could not be written to");
+            tracing::info!("the clipboard channel could not be written to");
             socket = None;
             next_bind = Instant::now() + BIND_BACKOFF;
         }
@@ -270,26 +270,26 @@ fn carry_out<S: Read + Write>(
                 };
                 let record = record_of(&message, sequence, session.generation(Channel::Clipboard));
                 if let Err(error) = record::write(open, &record, limits) {
-                    log::debug!("a clipboard record could not be written: {error}");
+                    tracing::debug!("a clipboard record could not be written: {error}");
                     socket = None;
                     lost = true;
                 }
             }
             Op::Produce { kind, transfer } => match read_kind(kind, html) {
                 Some(bytes) => {
-                    log::debug!("sending {} bytes of {}", bytes.len(), kind.mime());
+                    tracing::debug!("sending {} bytes of {}", bytes.len(), kind.mime());
                     queue.extend(exchange.produced(transfer, bytes, Instant::now()));
                 }
                 None => queue.extend(exchange.unavailable(transfer)),
             },
             Op::Apply { pieces } => {
-                log::debug!("taking a guest selection of {} format(s)", pieces.len());
+                tracing::debug!("taking a guest selection of {} format(s)", pieces.len());
                 match apply(&pieces, html) {
                     Ok(sequence) => {
                         *written = sequence;
                         *held = pieces;
                     }
-                    Err(reason) => log::warn!("the selection could not be applied: {reason}"),
+                    Err(reason) => tracing::warn!("the selection could not be applied: {reason}"),
                 }
             }
         }
@@ -529,7 +529,7 @@ fn read_kind(kind: Kind, html: u32) -> Option<Vec<u8>> {
         Kind::Png => match win32::png_of_bmp(&win32::bmp_of_dib(&global_bytes(CF_DIB)?)) {
             Ok(png) => Some(png),
             Err(error) => {
-                log::debug!("a picture could not be encoded: {error}");
+                tracing::debug!("a picture could not be encoded: {error}");
 
                 None
             }
@@ -567,7 +567,7 @@ fn apply(pieces: &[Piece], html: u32) -> Result<u32, String> {
                         formats.push((CF_DIB, dib));
                     }
                 }
-                Err(error) => log::debug!("a picture could not be decoded: {error}"),
+                Err(error) => tracing::debug!("a picture could not be decoded: {error}"),
             },
         }
     }

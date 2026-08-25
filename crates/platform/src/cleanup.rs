@@ -44,7 +44,7 @@ pub(crate) type EndpointTeardown = Box<dyn Fn(Uuid) -> Result<(), RepositoryErro
 /// that is a fact about its state rather than a failure to remove it.
 pub(crate) fn teardown_compute_system(id: &str) -> Result<(), RepositoryError> {
     let Some(system) = HcsSystem::open_if_present(id, HCS_ACCESS_ALL)? else {
-        log::debug!("HCS compute system \"{id}\" is already gone; nothing to tear down");
+        tracing::debug!("HCS compute system \"{id}\" is already gone; nothing to tear down");
         return Ok(());
     };
     system.terminate_and_wait(TEARDOWN_TIMEOUT)
@@ -75,14 +75,14 @@ pub(crate) fn teardown_compute_system(id: &str) -> Result<(), RepositoryError> {
 pub(crate) fn remove_orphan_endpoints(store: &MetadataStore) -> Result<(), RepositoryError> {
     let orphans = orphan_endpoints(&HcnEndpoint::list_in_vmlord_network()?, &store.list()?);
     if orphans.is_empty() {
-        log::debug!("every endpoint in the VMLord network belongs to a VM VMLord knows");
+        tracing::debug!("every endpoint in the VMLord network belongs to a VM VMLord knows");
         return Ok(());
     }
 
     // Info rather than a diagnostic: collecting these is routine housekeeping
     // with nothing for the user to do about it, and the endpoints belong to VMs
     // that no longer exist.
-    log::info!(
+    tracing::info!(
         "removing {} endpoint(s) in the VMLord network that no VM owns",
         orphans.len()
     );
@@ -122,7 +122,7 @@ fn orphan_endpoints(listed: &[Uuid], mappings: &[VmComputeSystemMapping]) -> Vec
 /// as already removed.
 pub(crate) fn remove_vm_directory(vm_directory: &Path) -> Result<(), RepositoryError> {
     if !vm_directory.exists() {
-        log::debug!("VM directory {} is already gone", vm_directory.display());
+        tracing::debug!("VM directory {} is already gone", vm_directory.display());
         return Ok(());
     }
 
@@ -131,17 +131,17 @@ pub(crate) fn remove_vm_directory(vm_directory: &Path) -> Result<(), RepositoryE
             "failed to remove VM directory {}: {error}",
             vm_directory.display()
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })?;
-    log::debug!("removed VM directory {}", vm_directory.display());
+    tracing::debug!("removed VM directory {}", vm_directory.display());
     Ok(())
 }
 
 /// Folds the failures a best-effort cleanup collected into a single error.
 pub(crate) fn combine_failures(prefix: &str, failures: Vec<String>) -> RepositoryError {
     let error = RepositoryError::new(format!("{prefix}: {}", failures.join("; ")));
-    log::error!("{error}");
+    tracing::error!("{error}");
     error
 }
 

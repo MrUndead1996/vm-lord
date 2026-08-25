@@ -4586,8 +4586,8 @@ name = "vmlord"
 version = "0.1.0"
 dependencies = [
  "embed-resource",
- "log",
  "rfd",
+ "tracing",
  "vmlord-app",
  "vmlord-core",
  "vmlord-image",
@@ -4624,7 +4624,7 @@ dependencies = [
 name = "vmlord-app"
 version = "0.1.0"
 dependencies = [
- "log",
+ "tracing",
  "vmlord-core",
 ]
 
@@ -4650,9 +4650,9 @@ version = "0.1.0"
 name = "vmlord-display-payload"
 version = "0.1.0"
 dependencies = [
- "log",
  "serde",
  "serde_json",
+ "tracing",
  "vmlord-payload",
 ]
 
@@ -4691,11 +4691,12 @@ dependencies = [
 name = "vmlord-display-viewer"
 version = "0.1.0"
 dependencies = [
- "log",
  "png",
  "prost",
  "prost-build",
  "protox",
+ "tracing",
+ "tracing-subscriber",
  "vmlord-core",
  "vmlord-display-codec",
  "vmlord-display-protocol",
@@ -4706,10 +4707,10 @@ dependencies = [
 name = "vmlord-gpu-payload"
 version = "0.1.0"
 dependencies = [
- "log",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tracing",
  "vmlord-payload",
  "zip",
 ]
@@ -4718,9 +4719,9 @@ dependencies = [
 name = "vmlord-image"
 version = "0.1.0"
 dependencies = [
- "log",
  "qcow",
  "sha2 0.11.0",
+ "tracing",
  "ureq",
  "vmlord-core",
 ]
@@ -4729,8 +4730,8 @@ dependencies = [
 name = "vmlord-keys"
 version = "0.1.0"
 dependencies = [
- "log",
  "ssh-key",
+ "tracing",
  "vmlord-core",
  "zeroize",
 ]
@@ -4739,10 +4740,10 @@ dependencies = [
 name = "vmlord-payload"
 version = "0.1.0"
 dependencies = [
- "log",
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tracing",
  "zip",
 ]
 
@@ -4751,10 +4752,10 @@ name = "vmlord-platform"
 version = "0.1.0"
 dependencies = [
  "arcbox-dhcp",
- "log",
  "serde",
  "serde_json",
  "sha-crypt",
+ "tracing",
  "uuid",
  "vmlord-agent-protocol",
  "vmlord-core",
@@ -4775,8 +4776,8 @@ dependencies = [
 name = "vmlord-seed"
 version = "0.1.0"
 dependencies = [
- "log",
  "serde_yaml_ng",
+ "tracing",
  "vmlord-agent-protocol",
  "vmlord-core",
 ]

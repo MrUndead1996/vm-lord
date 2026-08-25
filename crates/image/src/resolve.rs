@@ -37,17 +37,17 @@ pub fn resolve_image(
     profile: &DistroProfile,
     release: &str,
 ) -> Result<ResolvedImage, ResolveError> {
-    let release = validated_release(release).inspect_err(|error| log::error!("{error}"))?;
+    let release = validated_release(release).inspect_err(|error| tracing::error!("{error}"))?;
     let file_name = profile.file_name(release);
     let checksums_url = profile.checksums_url(release);
 
-    log::debug!("looking up {file_name} in {checksums_url}");
-    let published = fetch_text(&checksums_url).inspect_err(|error| log::error!("{error}"))?;
+    tracing::debug!("looking up {file_name} in {checksums_url}");
+    let published = fetch_text(&checksums_url).inspect_err(|error| tracing::error!("{error}"))?;
     let sha256 = parse_sha256sums(&published, &file_name, &checksums_url)
-        .inspect_err(|error| log::error!("{error}"))?;
+        .inspect_err(|error| tracing::error!("{error}"))?;
 
     let url = profile.image_url(release);
-    log::info!("{} {release} resolves to {url} ({sha256})", profile.name);
+    tracing::info!("{} {release} resolves to {url} ({sha256})", profile.name);
     Ok(ResolvedImage {
         url,
         sha256,

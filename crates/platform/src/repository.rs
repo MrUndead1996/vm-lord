@@ -191,7 +191,7 @@ impl HcsVmRepository {
             // The composition root calls this before any build thread exists,
             // so this is the only reference to the cycle.
             Some(cycle) => cycle.set_timeouts(timeouts),
-            None => log::error!(
+            None => tracing::error!(
                 "the readiness timeouts stay at their defaults: a build is already running \
                  with the cycle they would have changed"
             ),
@@ -209,7 +209,7 @@ impl HcsVmRepository {
     fn mapping(&self, vm_name: &str) -> Result<VmComputeSystemMapping, RepositoryError> {
         self.store.find_by_vm_name(vm_name)?.ok_or_else(|| {
             let error = RepositoryError::new(format!("VM \"{vm_name}\" was not found"));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })
     }
@@ -232,7 +232,7 @@ impl HcsVmRepository {
             "VM \"{}\" is {description}; stop it before deleting it",
             mapping.vm_name
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         Err(error)
     }
 
@@ -301,7 +301,7 @@ impl HcsVmRepository {
                  opening another",
                 mapping.vm_name
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             return Err(error);
         }
 
@@ -310,7 +310,7 @@ impl HcsVmRepository {
             .com1_launcher
             .launch(mapping, &vm_directory, Com1LogMode::Append)?;
         self.com1_sessions.insert(session);
-        log::info!(
+        tracing::info!(
             "the COM1 console of VM \"{}\" was reopened on request",
             mapping.vm_name
         );
@@ -348,13 +348,13 @@ impl HcsVmRepository {
         match opened {
             Ok(session) => {
                 self.com1_sessions.insert(session);
-                log::info!(
+                tracing::info!(
                     "the COM1 console of VM \"{}\" was opened to show its shutdown",
                     mapping.vm_name
                 );
             }
             Err(error) => {
-                log::warn!(
+                tracing::warn!(
                     "VM \"{}\" is being shut down without its console: {error}",
                     mapping.vm_name
                 );
@@ -382,7 +382,7 @@ impl HcsVmRepository {
         for finished in self.shutdowns.take_finished() {
             match finished.result {
                 Ok(()) => {
-                    log::info!(
+                    tracing::info!(
                         "the guest of VM \"{}\" was asked to shut down",
                         finished.vm_name
                     );
@@ -401,7 +401,7 @@ impl HcsVmRepository {
                     self.connections.remove(finished.vm_id);
                 }
                 Err(error) => {
-                    log::error!("failed to stop VM \"{}\": {error}", finished.vm_name);
+                    tracing::error!("failed to stop VM \"{}\": {error}", finished.vm_name);
                     self.push_diagnostic(
                         DiagnosticLevel::Error,
                         format!("Failed to stop VM \"{}\": {error}", finished.vm_name),
@@ -468,7 +468,7 @@ impl HcsVmRepository {
                         "cannot open an SSH session to VM \"{}\": {failure}",
                         mapping.vm_name
                     );
-                    log::error!("{message}");
+                    tracing::error!("{message}");
                     push_shared_diagnostic(&diagnostics, DiagnosticLevel::Error, message);
                 }
             }
@@ -489,7 +489,7 @@ impl HcsVmRepository {
     /// `&mut self`, which a build thread does not have.
     fn adopt_started(&mut self, started: Vec<StartedVm>) {
         for StartedVm { mapping, session } in started {
-            log::debug!(
+            tracing::debug!(
                 "taking over the console and the compute system of VM \"{}\", built in the \
                  background",
                 mapping.vm_name
@@ -514,7 +514,7 @@ impl HcsVmRepository {
         match HcsSystem::open_if_present(&mapping.hcs_compute_system_id, HCS_ACCESS_ALL) {
             Ok(Some(system)) => {
                 if let Err(error) = self.connections.insert(mapping, system) {
-                    log::warn!(
+                    tracing::warn!(
                         "VM \"{}\" ({}) started and is held, but VMLord cannot watch \
                          its HCS events: {error}",
                         mapping.vm_name,
@@ -529,12 +529,12 @@ impl HcsVmRepository {
                     );
                 }
             }
-            Ok(None) => log::warn!(
+            Ok(None) => tracing::warn!(
                 "VM \"{}\" ({}) started, but HCS no longer reports its compute system",
                 mapping.vm_name,
                 mapping.vm_id
             ),
-            Err(error) => log::warn!(
+            Err(error) => tracing::warn!(
                 "VM \"{}\" ({}) started, but VMLord could not hold a handle to it: {error}",
                 mapping.vm_name,
                 mapping.vm_id
@@ -573,7 +573,7 @@ impl HcsVmRepository {
                 continue;
             }
 
-            log::info!(
+            tracing::info!(
                 "VM \"{}\" offers its desktop, so its desktop is installed",
                 mapping.vm_name
             );
@@ -582,7 +582,7 @@ impl HcsVmRepository {
                 ..mapping
             };
             if let Err(error) = self.store.insert(updated) {
-                log::warn!("the installed desktop could not be recorded: {error}");
+                tracing::warn!("the installed desktop could not be recorded: {error}");
             }
         }
     }
@@ -678,7 +678,7 @@ impl HcsVmRepository {
     fn runtime_id(&self, mapping: &VmComputeSystemMapping) -> Option<Uuid> {
         list_known_vms(&self.client, &self.store)
             .inspect_err(|error| {
-                log::warn!(
+                tracing::warn!(
                     "VMLord cannot tell which partition VM \"{}\" is running as: {error}",
                     mapping.vm_name
                 );
@@ -700,7 +700,7 @@ impl HcsVmRepository {
     /// this one" honestly reads as.
     fn listen_for_agent(&mut self, mapping: &VmComputeSystemMapping, runtime_id: Option<Uuid>) {
         let Some(runtime_id) = runtime_id else {
-            log::warn!(
+            tracing::warn!(
                 "VM \"{}\" ({}) is running, but HCS names no partition for it, so VMLord \
                  cannot listen for its agent",
                 mapping.vm_name,
@@ -711,7 +711,7 @@ impl HcsVmRepository {
         let vm_directory = match layout::vm_directory(&self.storage_root, &mapping.vm_name) {
             Ok(directory) => directory,
             Err(error) => {
-                log::warn!("VMLord cannot listen for the agent of this VM: {error}");
+                tracing::warn!("VMLord cannot listen for the agent of this VM: {error}");
                 return;
             }
         };
@@ -739,7 +739,7 @@ impl HcsVmRepository {
             self.display_runs.clone(),
         ) {
             Ok(connection) => self.agent_sessions.insert(connection),
-            Err(error) => log::warn!(
+            Err(error) => tracing::warn!(
                 "VM \"{}\" ({}) is running, but VMLord is not listening for its agent: {error}",
                 mapping.vm_name,
                 mapping.vm_id
@@ -828,7 +828,7 @@ impl HcsVmRepository {
         let endpoint = match HcnEndpoint::open_if_present(endpoint_id) {
             Ok(Some(endpoint)) => endpoint,
             Ok(None) => {
-                log::debug!(
+                tracing::debug!(
                     "HNS no longer knows endpoint {endpoint_id} of running VM \"{}\", \
                      so it is listed without an address",
                     mapping.vm_name
@@ -836,7 +836,7 @@ impl HcsVmRepository {
                 return None;
             }
             Err(error) => {
-                log::debug!(
+                tracing::debug!(
                     "cannot open endpoint {endpoint_id} of VM \"{}\": {error}",
                     mapping.vm_name
                 );
@@ -847,14 +847,14 @@ impl HcsVmRepository {
         let address = match endpoint.address() {
             Ok(Some(address)) => address,
             Ok(None) => {
-                log::debug!(
+                tracing::debug!(
                     "HNS reports no address for endpoint {endpoint_id} of VM \"{}\"",
                     mapping.vm_name
                 );
                 return None;
             }
             Err(error) => {
-                log::debug!(
+                tracing::debug!(
                     "cannot read the address of endpoint {endpoint_id} of VM \"{}\": {error}",
                     mapping.vm_name
                 );
@@ -901,7 +901,7 @@ impl HcsVmRepository {
             .map(|directory| layout::system_disk_path(&directory))
             .and_then(|path| vhd::virtual_size_bytes(&path));
         let Ok(bytes) = size.inspect_err(|error| {
-            log::debug!(
+            tracing::debug!(
                 "cannot read the system disk of VM \"{}\": {error}",
                 mapping.vm_name
             );
@@ -916,7 +916,7 @@ impl HcsVmRepository {
             disk_gb,
             ..mapping.clone()
         }) {
-            log::warn!(
+            tracing::warn!(
                 "could not record the disk size of VM \"{}\": {error}",
                 mapping.vm_name
             );
@@ -941,13 +941,13 @@ impl HcsVmRepository {
     /// that is already there.
     fn ensure_network(&self) {
         if let Err(error) = HcnNetwork::ensure() {
-            log::warn!(
+            tracing::warn!(
                 "the VMLord network is not available; VMs that ask for one cannot start \
                  until it is: {error}"
             );
         }
         if let Err(error) = cleanup::remove_orphan_endpoints(&self.store) {
-            log::warn!("the VMLord network was not tidied up: {error}");
+            tracing::warn!("the VMLord network was not tidied up: {error}");
         }
     }
 
@@ -958,7 +958,7 @@ impl HcsVmRepository {
                 "failed to read the HCS configuration of VM \"{vm_name}\" from {}: {error}",
                 path.display()
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })
     }
@@ -1018,7 +1018,7 @@ fn vm_state(
             },
         },
         Some(other) => {
-            log::debug!(
+            tracing::debug!(
                 "VM \"{}\" ({}) is listed as stopped because HCS reports {other:?}",
                 mapping.vm_name,
                 mapping.vm_id
@@ -1041,7 +1041,7 @@ fn guest_ip(vm_name: &str, address: &EndpointAddress) -> Option<IpAddr> {
         .ip_address
         .parse()
         .inspect_err(|error| {
-            log::debug!(
+            tracing::debug!(
                 "HNS reported \"{}\" as the address of VM \"{vm_name}\", \
                  which is not an IP address: {error}",
                 address.ip_address
@@ -1068,7 +1068,7 @@ fn record_network_mode(
         network_mode,
         ..mapping.clone()
     })?;
-    log::info!(
+    tracing::info!(
         "VM \"{}\" ({}) now asks for {:?} networking; the change applies the next time it starts",
         mapping.vm_name,
         mapping.vm_id,
@@ -1090,7 +1090,7 @@ fn record_gpu_mode(
         gpu_mode,
         ..mapping.clone()
     })?;
-    log::info!(
+    tracing::info!(
         "VM \"{}\" ({}) now asks for GPU mode {gpu_mode:?}; the change applies the next \
          time it starts",
         mapping.vm_name,
@@ -1124,7 +1124,7 @@ fn refuse_gpu_mode_change(
     let error = RepositoryError::new(format!(
         "VM \"{vm_name}\" is {description}; stop it before changing its GPU mode"
     ));
-    log::error!("{error}");
+    tracing::error!("{error}");
     Err(error)
 }
 
@@ -1160,7 +1160,7 @@ impl VmRepository for HcsVmRepository {
             &known,
             &self.storage_root,
         ) {
-            log::warn!("{failure}");
+            tracing::warn!("{failure}");
             self.push_diagnostic(DiagnosticLevel::Warning, failure);
         }
         // A VM that survived the previous VMLord process has an agent inside it
@@ -1175,7 +1175,7 @@ impl VmRepository for HcsVmRepository {
         // endpoint the cleanup would then collect as one nobody owns.
         self.ensure_network();
         self.initialized = true;
-        log::info!(
+        tracing::info!(
             "the HCS backend is ready with {} reconnected VM(s) under {}",
             self.connections.len(),
             self.storage_root.display()
@@ -1197,7 +1197,7 @@ impl VmRepository for HcsVmRepository {
             || self.builds.contains(&request.name)
         {
             let error = RepositoryError::new(format!("VM \"{}\" already exists", request.name));
-            log::error!("{error}");
+            tracing::error!("{error}");
             return Err(error);
         }
         let vm_directory = layout::vm_directory(&self.storage_root, &request.name)?;
@@ -1206,7 +1206,7 @@ impl VmRepository for HcsVmRepository {
                 "VM directory already exists: {}",
                 vm_directory.display()
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             return Err(error);
         }
 
@@ -1218,7 +1218,7 @@ impl VmRepository for HcsVmRepository {
             let report = cycle.run(&store, &request, &vm_directory, monitor);
             match report.outcome {
                 CycleOutcome::Ready => {
-                    log::info!("VM \"{name}\" finished building and its guest is ready");
+                    tracing::info!("VM \"{name}\" finished building and its guest is ready");
                 }
                 CycleOutcome::Degraded { detail } => push_shared_diagnostic(
                     &diagnostics,
@@ -1289,14 +1289,14 @@ impl VmRepository for HcsVmRepository {
                 request.name,
                 path.display()
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
 
         record_network_mode(&self.store, &mapping, request.network_mode)?;
         record_gpu_mode(&self.store, &mapping, request.gpu_mode)?;
 
-        log::info!(
+        tracing::info!(
             "VM \"{}\" ({}) now requests {} MiB and {} CPU core(s); \
              the change applies the next time it starts",
             mapping.vm_name,
@@ -1339,7 +1339,7 @@ impl VmRepository for HcsVmRepository {
                 Err(error) => {
                     let message =
                         format!("VM \"{}\" could not be started: {error}", mapping.vm_name);
-                    log::error!("{message}");
+                    tracing::error!("{message}");
                     diagnostics
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1598,7 +1598,7 @@ impl VmRepository for HcsVmRepository {
                         outcome.failure.clone(),
                     );
                     let (level, message) = display_update::report(&vm_name, &outcome);
-                    log::info!("{message}");
+                    tracing::info!("{message}");
                     push_shared_diagnostic(&diagnostics, level, message);
                 }
                 // Nothing was moved: an update that was refused is an update
@@ -1608,7 +1608,7 @@ impl VmRepository for HcsVmRepository {
                     let message = format!(
                         "Failed to update the display payload of VM \"{vm_name}\": {error}"
                     );
-                    log::error!("{message}");
+                    tracing::error!("{message}");
                     push_shared_diagnostic(&diagnostics, DiagnosticLevel::Error, message);
                 }
             }
@@ -1678,7 +1678,7 @@ impl VmRepository for HcsVmRepository {
             // `initialize`, so this run is over as far as HCS events go. Saying
             // so is the honest minimum: silently losing the feature would leave
             // the user believing a crash would still be reported.
-            log::warn!(
+            tracing::warn!(
                 "the Host Compute Service disconnected, so every HCS event watch \
                  was released; VMLord reports no further HCS events until it is \
                  restarted"
@@ -1803,7 +1803,7 @@ fn refuse_unless_running(
     };
 
     let error = RepositoryError::new(format!("VM \"{vm_name}\" is {description}, {consequence}"));
-    log::error!("{error}");
+    tracing::error!("{error}");
     Err(error)
 }
 
@@ -1814,7 +1814,7 @@ fn refuse_unless_running(
 /// to attach to it.
 fn refused(message: String) -> RepositoryError {
     let error = RepositoryError::new(message);
-    log::warn!("{error}");
+    tracing::warn!("{error}");
     error
 }
 
@@ -1835,8 +1835,11 @@ fn read_display_secret(
         ))
     })?);
 
-    vmlord_display_protocol::keys::Secret::from_base64(&text)
-        .map_err(|error| refused(format!("the secret of VM \"{vm_name}\" is unusable: {error}")))
+    vmlord_display_protocol::keys::Secret::from_base64(&text).map_err(|error| {
+        refused(format!(
+            "the secret of VM \"{vm_name}\" is unusable: {error}"
+        ))
+    })
 }
 
 /// Turns every reader that stopped for the wrong reason into a diagnostic, and
@@ -1856,7 +1859,7 @@ fn console_failure_diagnostics(
                 "COM1 diagnostics for VM \"{}\" stopped unexpectedly; see {log_path}",
                 failure.vm_name
             );
-            log::error!("{message}");
+            tracing::error!("{message}");
             Diagnostic {
                 level: DiagnosticLevel::Error,
                 message,
@@ -3223,9 +3226,8 @@ mod tests {
     /// partition and belongs to the end-to-end matrix rather than here.
     fn refusal(mapping: &VmComputeSystemMapping, state: Option<HcsSystemState>) -> String {
         let mut repository = repository();
-        let ready = vmlord_core::GuestDisplayReport::Ready(
-            vmlord_core::GuestDisplayDetail::default(),
-        );
+        let ready =
+            vmlord_core::GuestDisplayReport::Ready(vmlord_core::GuestDisplayDetail::default());
         // Recorded for every case, so that each test refuses for its own
         // reason rather than for a guest that happens to have said nothing.
         repository
@@ -3278,7 +3280,10 @@ mod tests {
             .expect_err("a guest that has said nothing offers nothing")
             .to_string();
 
-        assert!(message.contains("has not offered its display yet"), "{message}");
+        assert!(
+            message.contains("has not offered its display yet"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -3302,7 +3307,10 @@ mod tests {
             .expect_err("a guest that failed offers nothing")
             .to_string();
 
-        assert!(message.contains("the display broker did not come up"), "{message}");
+        assert!(
+            message.contains("the display broker did not come up"),
+            "{message}"
+        );
     }
 
     /// The drain runs inside `take_diagnostics` because that is already called

@@ -71,7 +71,7 @@ pub(crate) fn prepare(
         cancel,
     );
     let adapters = partition_adapters().unwrap_or_else(|error| {
-        log::warn!(
+        tracing::warn!(
             "the GPU adapters of this host could not be enumerated for VM \"{}\": {error}",
             mapping.vm_name
         );
@@ -107,20 +107,20 @@ pub(crate) fn prepare(
     // outcomes -- everything attached, some of it attached, nothing to attach
     // -- would otherwise look identical in a log.
     match &assignment {
-        GpuAssignment::Complete(detail) => log::info!(
+        GpuAssignment::Complete(detail) => tracing::info!(
             "VM \"{}\" is offered {} share(s) for {} GPU adapter(s)",
             mapping.vm_name,
             manifest.shares.len(),
             detail.adapters
         ),
-        GpuAssignment::Partial { detail, reason } => log::warn!(
+        GpuAssignment::Partial { detail, reason } => tracing::warn!(
             "VM \"{}\" gets less GPU than it asked for, across {} adapter(s): {}",
             mapping.vm_name,
             detail.adapters,
             reason.message
         ),
         GpuAssignment::Failed(reason) => {
-            log::warn!("VM \"{}\" gets no GPU: {}", mapping.vm_name, reason.message)
+            tracing::warn!("VM \"{}\" gets no GPU: {}", mapping.vm_name, reason.message)
         }
         GpuAssignment::Unknown => {}
     }
@@ -200,7 +200,7 @@ fn stage(
     cancel: &AtomicBool,
 ) -> Option<StagedGpuPayload> {
     let Some(target) = &mapping.guest_target else {
-        log::info!(
+        tracing::info!(
             "VM \"{}\" was not built from a cloud image, so VMLord has no GPU payload to \
              stage for it",
             mapping.vm_name
@@ -220,7 +220,7 @@ fn stage(
         cancel,
     }) {
         Ok(staged) => {
-            log::info!(
+            tracing::info!(
                 "VM \"{}\" is staged with GPU payload {} at {}",
                 mapping.vm_name,
                 staged.payload_id(),
@@ -229,7 +229,7 @@ fn stage(
             Some(staged)
         }
         Err(error) => {
-            log::warn!(
+            tracing::warn!(
                 "no GPU payload was staged for VM \"{}\": {error}",
                 mapping.vm_name
             );

@@ -62,7 +62,7 @@ pub(crate) fn build(volume_id: &str, entries: &[(&str, &[u8])]) -> Vec<u8> {
         .collect();
     let total_sectors = lba;
 
-    log::debug!(
+    tracing::debug!(
         "packing an ISO9660 image: volume \"{volume_id}\", {} files, {total_sectors} sectors",
         entries.len()
     );

@@ -80,21 +80,21 @@ impl Drop for CreationGuard<'_> {
         if !self.armed {
             return;
         }
-        log::error!(
+        tracing::error!(
             "creating the VM at {} was interrupted; removing what it had created",
             self.vm_directory.display()
         );
         if self.system_created
             && let Err(error) = (self.teardown)(self.hcs_compute_system_id)
         {
-            log::error!(
+            tracing::error!(
                 "the compute system \"{}\" of the interrupted creation could not be \
                  torn down: {error}",
                 self.hcs_compute_system_id
             );
         }
         if let Err(error) = cleanup::remove_vm_directory(self.vm_directory) {
-            log::error!(
+            tracing::error!(
                 "the directory of the interrupted creation at {} could not be removed: {error}",
                 self.vm_directory.display()
             );
@@ -209,7 +209,7 @@ impl VmCreationPipeline {
         )?;
         let media_path = hcs_config::media_path(request, &seed_path).to_path_buf();
 
-        log::info!(
+        tracing::info!(
             "creating VM \"{}\" ({vm_id}) as HCS compute system \"{hcs_compute_system_id}\"",
             request.name
         );
@@ -222,7 +222,7 @@ impl VmCreationPipeline {
                 "failed to create VM directory {}: {error}",
                 vm_directory.display()
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
 
@@ -287,7 +287,7 @@ impl VmCreationPipeline {
                     image,
                     provisioning,
                 } => {
-                    log::debug!(
+                    tracing::debug!(
                         "importing {} {} into {}",
                         image.profile.name,
                         image.release,
@@ -351,7 +351,7 @@ impl VmCreationPipeline {
         guard.armed = false;
         match result {
             Ok(()) => {
-                log::info!("created VM \"{}\" ({vm_id})", request.name);
+                tracing::info!("created VM \"{}\" ({vm_id})", request.name);
                 Ok(mapping)
             }
             Err(error) => Err(self.rollback(vm_directory, &mapping, guard.system_created, error)),
@@ -426,7 +426,9 @@ fn read_agent_beside_executable() -> Option<Vec<u8>> {
     let executable = match std::env::current_exe() {
         Ok(executable) => executable,
         Err(error) => {
-            log::warn!("cannot locate the VMLord executable to find {AGENT_FILE_NAME}: {error}");
+            tracing::warn!(
+                "cannot locate the VMLord executable to find {AGENT_FILE_NAME}: {error}"
+            );
             return None;
         }
     };
@@ -434,7 +436,7 @@ fn read_agent_beside_executable() -> Option<Vec<u8>> {
     match fs::read(&agent_path) {
         Ok(agent) => Some(agent),
         Err(error) => {
-            log::warn!(
+            tracing::warn!(
                 "cannot read the guest agent at {}: {error}; cloud VMs will not include a tools volume",
                 agent_path.display()
             );
@@ -487,7 +489,7 @@ fn write_provisioning(
             format!("{}\n", agent_secret.as_str()).as_bytes(),
             "the agent secret",
         )?;
-        log::debug!("wrote the agent secret at {}", agent_secret_path.display());
+        tracing::debug!("wrote the agent secret at {}", agent_secret_path.display());
     }
 
     let seed = vmlord_seed::build(&vmlord_seed::SeedRequest {
@@ -513,12 +515,12 @@ fn write_provisioning(
     });
 
     write_restricted(seed_path, &vmlord_seed::image(&seed), "the cloud-init seed")?;
-    log::debug!("wrote the cloud-init seed at {}", seed_path.display());
+    tracing::debug!("wrote the cloud-init seed at {}", seed_path.display());
     if let Some(agent) = agent {
         let tools_path = layout::tools_path(vm_directory);
         fs::write(&tools_path, vmlord_seed::tools_image(agent))
             .map_err(|error| write_failure(&tools_path, "the cloud-init tools volume", &error))?;
-        log::debug!(
+        tracing::debug!(
             "wrote the cloud-init tools volume at {}",
             tools_path.display()
         );
@@ -554,7 +556,7 @@ fn write_failure(path: &Path, description: &str, error: &std::io::Error) -> Repo
         "failed to write {description} at {}: {error}",
         path.display()
     ));
-    log::error!("{error}");
+    tracing::error!("{error}");
     error
 }
 
