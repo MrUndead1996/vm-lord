@@ -4625,6 +4625,7 @@ name = "vmlord-app"
 version = "0.1.0"
 dependencies = [
  "tracing",
+ "tracing-subscriber",
  "vmlord-core",
 ]
 
@@ -4756,6 +4757,7 @@ dependencies = [
  "serde_json",
  "sha-crypt",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "vmlord-agent-protocol",
  "vmlord-core",

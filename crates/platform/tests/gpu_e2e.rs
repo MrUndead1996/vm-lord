@@ -172,19 +172,19 @@ fn tear_down(repository: &mut HcsVmRepository, name: &str) {
     });
 }
 
-/// One application refresh: list the VMs, then drain the diagnostics.
+/// One application refresh: list the VMs, then reap and read.
 ///
-/// Both halves, because `take_diagnostics` is the `&mut self` call where the
-/// repository joins what has finished -- an answered shutdown, a compute
-/// system HCS has released and, with it, the GPU facts of the run that ended.
-/// The application makes both calls on every refresh; a test that only listed
-/// would wait forever for a change that is applied in the call it never makes.
+/// Both halves, because `refresh` is the `&mut self` call where the repository
+/// joins what has finished -- an answered shutdown, a compute system HCS has
+/// released and, with it, the GPU facts of the run that ended. The application
+/// makes both calls on every refresh; a test that only listed would wait
+/// forever for a change that is applied in the call it never makes.
 ///
-/// What was drained is appended to `seen`, so a wait that times out can report
+/// What was recorded is appended to `seen`, so a wait that times out can report
 /// everything it was told rather than whatever the last call happened to hold.
 fn refresh(repository: &mut HcsVmRepository, seen: &mut Vec<Diagnostic>) -> Vec<VmSummary> {
     let listed = repository.list_vms().expect("listing should work");
-    seen.extend(repository.take_diagnostics());
+    seen.extend(drain(repository));
     listed
 }
 
@@ -791,4 +791,34 @@ fn a_deleted_gpu_vm_leaves_no_payload_behind() {
         "deletion left the VM's directory behind: {}",
         vm_directory.display()
     );
+}
+
+/// The diagnostics this test binary records.
+///
+/// One subscriber for the process rather than one per test: these tests are
+/// `#[ignore]`d and run one at a time against a real host, so a shared sink is
+/// enough, and a scoped one would have to be threaded through every helper.
+fn records() -> &'static vmlord_core::DiagnosticsSink {
+    static SINK: std::sync::OnceLock<vmlord_core::DiagnosticsSink> = std::sync::OnceLock::new();
+    SINK.get_or_init(|| {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let sink = vmlord_core::DiagnosticsSink::new();
+        let subscriber =
+            tracing_subscriber::registry().with(vmlord_core::DiagnosticsLayer::new(sink.clone()));
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("nothing else installs a subscriber in this test binary");
+        sink
+    })
+}
+
+/// One application refresh: reap what has finished, then read what it recorded.
+///
+/// `refresh` is the `&mut self` call where the repository joins what is over --
+/// an answered shutdown, a compute system HCS has released and, with it, the
+/// facts of the run that ended. A test that only listed would wait forever for
+/// a change that is applied in the call it never makes.
+fn drain(repository: &mut vmlord_platform::HcsVmRepository) -> Vec<vmlord_core::Diagnostic> {
+    repository.refresh();
+    records().take()
 }

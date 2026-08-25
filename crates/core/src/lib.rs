@@ -7,7 +7,7 @@ mod error;
 pub mod gpu;
 mod logging;
 
-pub use diagnostics::{DiagnosticsLayer, DiagnosticsSink, Subsystem};
+pub use diagnostics::{Diagnostic, DiagnosticLevel, DiagnosticsLayer, DiagnosticsSink, Subsystem};
 pub use error::RepositoryError;
 pub mod progress;
 pub mod provisioning;
@@ -221,19 +221,6 @@ pub enum NetworkMode {
     Unknown(i32),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Diagnostic {
-    pub level: DiagnosticLevel,
-    pub message: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DiagnosticLevel {
-    Info,
-    Warning,
-    Error,
-}
-
 pub trait VmRepository {
     fn initialize(&mut self) -> Result<(), RepositoryError>;
     fn create_vm(&mut self, request: VmCreateRequest) -> Result<(), RepositoryError>;
@@ -319,14 +306,22 @@ pub trait VmRepository {
         ))
     }
     fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError>;
-    fn take_diagnostics(&mut self) -> Vec<Diagnostic>;
+    /// Reaps what background work has finished, on the one `&mut self` call
+    /// the application makes on every refresh.
+    ///
+    /// Named for what it does rather than for what it used to return: finished
+    /// builds and starts are adopted here, answered shutdowns give up their
+    /// handles, desktops that appeared are written down, and HCS events are
+    /// drained. Diagnostics no longer come back from it -- they are recorded as
+    /// events on the way through, and read from the sink instead.
+    fn refresh(&mut self);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DesktopProfile, Diagnostic, GpuMode, NetworkMode, RepositoryError, VmCreateRequest,
-        VmDeleteRequest, VmRepository, VmSource, VmSummary, VmUpdateRequest,
+        DesktopProfile, GpuMode, NetworkMode, RepositoryError, VmCreateRequest, VmDeleteRequest,
+        VmRepository, VmSource, VmSummary, VmUpdateRequest,
     };
 
     fn valid_request() -> VmCreateRequest {
@@ -541,9 +536,7 @@ mod tests {
             fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError> {
                 Ok(Vec::new())
             }
-            fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
-                Vec::new()
-            }
+            fn refresh(&mut self) {}
         }
 
         let error = SilentBackend

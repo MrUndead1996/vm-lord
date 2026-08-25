@@ -6,9 +6,9 @@ pub mod gpu;
 use std::{collections::HashMap, fmt, path::PathBuf, time::SystemTime};
 
 use vmlord_core::{
-    AppSettings, Diagnostic, DiagnosticLevel, GuestDefaults, HostGpuCapabilities, RepositoryError,
-    SettingsError, SettingsStore, VmCreateRequest, VmDeleteRequest, VmDisplayStatus, VmGpuStatus,
-    VmRepository, VmState, VmSummary, VmUpdateRequest,
+    AppSettings, Diagnostic, DiagnosticsSink, GuestDefaults, HostGpuCapabilities, RepositoryError,
+    SettingsError, SettingsStore, Subsystem, VmCreateRequest, VmDeleteRequest, VmDisplayStatus,
+    VmGpuStatus, VmRepository, VmState, VmSummary, VmUpdateRequest,
 };
 
 pub use display::derive_status as derive_display_status;
@@ -120,7 +120,16 @@ pub struct WorkspaceApp {
     /// form redraws sixty times a second, and a host does not change between
     /// two openings of a dialog.
     host_gpu: Option<HostGpuCapabilities>,
+    /// The records already read out of the sink.
+    ///
+    /// Held rather than shown straight from the sink because the panel is a
+    /// history and `take` empties what it returns.
     diagnostics: Vec<Diagnostic>,
+    /// Where the diagnostics layer leaves records, when one was installed.
+    ///
+    /// `None` in tests and in a process that brought no panel up: a
+    /// `WorkspaceApp` without a sink simply has nothing to read.
+    sink: Option<DiagnosticsSink>,
 }
 
 struct SettingsContext {
@@ -143,7 +152,18 @@ impl WorkspaceApp {
             display_status: HashMap::new(),
             host_gpu: None,
             diagnostics: Vec::new(),
+            sink: None,
         }
+    }
+
+    /// Reads the panel's records from `sink`.
+    ///
+    /// Given rather than made here: the sink belongs to the subscriber the
+    /// composition root installed, and there is exactly one of it.
+    #[must_use]
+    pub fn with_diagnostics(mut self, sink: DiagnosticsSink) -> Self {
+        self.sink = Some(sink);
+        self
     }
 
     #[must_use]
@@ -215,10 +235,7 @@ impl WorkspaceApp {
             settings.log_level
         );
         context.current = settings;
-        self.diagnostics.push(Diagnostic {
-            level: DiagnosticLevel::Info,
-            message: "Application settings saved".into(),
-        });
+        vmlord_core::diagnostic!(Info, Subsystem::App, "Application settings saved");
         Ok(())
     }
 
@@ -331,18 +348,17 @@ impl WorkspaceApp {
 
         match self.repository.create_vm(request) {
             Ok(()) => {
-                self.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Info,
-                    message: "VM creation accepted".into(),
-                });
+                vmlord_core::diagnostic!(Info, Subsystem::Hcs, "VM creation accepted");
                 self.refresh();
                 Ok(())
             }
             Err(error) => {
-                self.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Error,
-                    message: format!("Failed to create VM: {error}"),
-                });
+                vmlord_core::diagnostic!(
+                    Error,
+                    Subsystem::Hcs,
+                    code = error.code().unwrap_or_default(),
+                    "Failed to create VM: {error}"
+                );
                 self.collect_diagnostics();
                 Err(error)
             }
@@ -364,18 +380,12 @@ impl WorkspaceApp {
             let error = RepositoryError::new(
                 "RAM must be 2 MiB-aligned and at least 512 MiB for VM updates",
             );
-            self.diagnostics.push(Diagnostic {
-                level: DiagnosticLevel::Error,
-                message: error.to_string(),
-            });
+            vmlord_core::diagnostic!(Error, Subsystem::App, "{error}");
             return Err(error);
         }
         if request.cpu_cores == 0 {
             let error = RepositoryError::new("CPU cores must be at least 1 for VM updates");
-            self.diagnostics.push(Diagnostic {
-                level: DiagnosticLevel::Error,
-                message: error.to_string(),
-            });
+            vmlord_core::diagnostic!(Error, Subsystem::App, "{error}");
             return Err(error);
         }
 
@@ -387,26 +397,31 @@ impl WorkspaceApp {
         let name = request.name.clone();
         match self.repository.update_vm(request) {
             Ok(()) => {
-                self.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Info,
-                    message: format!("VM \"{name}\" update accepted"),
-                });
+                vmlord_core::diagnostic!(
+                    Info,
+                    Subsystem::Hcs,
+                    vm = name,
+                    "VM \"{name}\" update accepted"
+                );
                 if applies_after_restart {
-                    self.diagnostics.push(Diagnostic {
-                        level: DiagnosticLevel::Warning,
-                        message: format!(
-                            "VM \"{name}\" is running; the new configuration applies after a restart"
-                        ),
-                    });
+                    vmlord_core::diagnostic!(
+                        Warning,
+                        Subsystem::Hcs,
+                        vm = name,
+                        "VM \"{name}\" is running; the new configuration applies after a restart"
+                    );
                 }
                 self.refresh();
                 Ok(())
             }
             Err(error) => {
-                self.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Error,
-                    message: format!("Failed to update VM \"{name}\": {error}"),
-                });
+                vmlord_core::diagnostic!(
+                    Error,
+                    Subsystem::Hcs,
+                    vm = name,
+                    code = error.code().unwrap_or_default(),
+                    "Failed to update VM \"{name}\": {error}"
+                );
                 self.collect_diagnostics();
                 Err(error)
             }
@@ -443,10 +458,7 @@ impl WorkspaceApp {
             .map(|vm| vm.state)
             .ok_or_else(|| {
                 let error = RepositoryError::new(format!("VM \"{}\" was not found", request.name));
-                self.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Error,
-                    message: error.to_string(),
-                });
+                vmlord_core::diagnostic!(Error, Subsystem::App, "{error}");
                 error
             })?;
         if !matches!(vm_state, VmState::Stopped) {
@@ -455,10 +467,7 @@ impl WorkspaceApp {
                 request.name
             ));
             tracing::error!("{error}");
-            self.diagnostics.push(Diagnostic {
-                level: DiagnosticLevel::Error,
-                message: error.to_string(),
-            });
+            vmlord_core::diagnostic!(Error, Subsystem::App, "{error}");
             return Err(error);
         }
 
@@ -468,28 +477,28 @@ impl WorkspaceApp {
 
         match self.repository.delete_vm(request) {
             Ok(()) => {
-                self.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Info,
-                    message: format!("VM \"{name}\" deleted"),
-                });
+                vmlord_core::diagnostic!(Info, Subsystem::Hcs, vm = name, "VM \"{name}\" deleted");
                 if kept_disks {
-                    self.diagnostics.push(Diagnostic {
-                        level: DiagnosticLevel::Warning,
-                        message: format!(
-                            "The disks of VM \"{name}\" were kept; its directory still exists \
-                             and a new VM cannot reuse that name until it is removed"
-                        ),
-                    });
+                    vmlord_core::diagnostic!(
+                        Warning,
+                        Subsystem::Hcs,
+                        vm = name,
+                        "The disks of VM \"{name}\" were kept; its directory still exists \
+                         and a new VM cannot reuse that name until it is removed"
+                    );
                 }
                 self.refresh();
                 Ok(())
             }
             Err(error) => {
                 tracing::error!("failed to delete VM {name}: {error}");
-                self.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Error,
-                    message: format!("Failed to delete VM \"{name}\": {error}"),
-                });
+                vmlord_core::diagnostic!(
+                    Error,
+                    Subsystem::Hcs,
+                    vm = name,
+                    code = error.code().unwrap_or_default(),
+                    "Failed to delete VM \"{name}\": {error}"
+                );
                 self.collect_diagnostics();
                 Err(error)
             }
@@ -506,17 +515,22 @@ impl WorkspaceApp {
 
         match self.repository.cancel_create(name) {
             Ok(()) => {
-                self.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Info,
-                    message: format!("Cancelling the creation of VM \"{name}\""),
-                });
+                vmlord_core::diagnostic!(
+                    Info,
+                    Subsystem::Hcs,
+                    vm = name,
+                    "Cancelling the creation of VM \"{name}\""
+                );
                 Ok(())
             }
             Err(error) => {
-                self.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Error,
-                    message: format!("Failed to cancel the creation of VM \"{name}\": {error}"),
-                });
+                vmlord_core::diagnostic!(
+                    Error,
+                    Subsystem::Hcs,
+                    vm = name,
+                    code = error.code().unwrap_or_default(),
+                    "Failed to cancel the creation of VM \"{name}\": {error}"
+                );
                 self.collect_diagnostics();
                 Err(error)
             }
@@ -528,17 +542,22 @@ impl WorkspaceApp {
 
         match self.repository.open_display(name) {
             Ok(()) => {
-                self.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Info,
-                    message: format!("Display for VM \"{name}\" opened"),
-                });
+                vmlord_core::diagnostic!(
+                    Info,
+                    Subsystem::Display,
+                    vm = name,
+                    "Display for VM \"{name}\" opened"
+                );
                 Ok(())
             }
             Err(error) => {
-                self.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Error,
-                    message: format!("Failed to open display for VM \"{name}\": {error}"),
-                });
+                vmlord_core::diagnostic!(
+                    Error,
+                    Subsystem::Display,
+                    vm = name,
+                    code = error.code().unwrap_or_default(),
+                    "Failed to open display for VM \"{name}\": {error}"
+                );
                 self.collect_diagnostics();
                 Err(error)
             }
@@ -566,10 +585,12 @@ impl WorkspaceApp {
 
         match self.repository.update_display_payload(name) {
             Ok(()) => {
-                self.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Info,
-                    message: format!("Updating the display payload of VM \"{name}\""),
-                });
+                vmlord_core::diagnostic!(
+                    Info,
+                    Subsystem::Display,
+                    vm = name,
+                    "Updating the display payload of VM \"{name}\""
+                );
                 // Refreshed so that the VM shows as updating from this click
                 // rather than from the next tick: what the button does next is
                 // decided by the status this derives.
@@ -577,12 +598,13 @@ impl WorkspaceApp {
                 Ok(())
             }
             Err(error) => {
-                self.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Error,
-                    message: format!(
-                        "Failed to update the display payload of VM \"{name}\": {error}"
-                    ),
-                });
+                vmlord_core::diagnostic!(
+                    Error,
+                    Subsystem::Display,
+                    vm = name,
+                    code = error.code().unwrap_or_default(),
+                    "Failed to update the display payload of VM \"{name}\": {error}"
+                );
                 self.collect_diagnostics();
                 Err(error)
             }
@@ -605,18 +627,23 @@ impl WorkspaceApp {
 
         match self.repository.open_ssh(name) {
             Ok(()) => {
-                self.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Info,
-                    message: format!("Opening an SSH session for VM \"{name}\""),
-                });
+                vmlord_core::diagnostic!(
+                    Info,
+                    Subsystem::Network,
+                    vm = name,
+                    "Opening an SSH session for VM \"{name}\""
+                );
                 self.collect_diagnostics();
                 Ok(())
             }
             Err(error) => {
-                self.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Error,
-                    message: format!("Failed to open SSH session for VM \"{name}\": {error}"),
-                });
+                vmlord_core::diagnostic!(
+                    Error,
+                    Subsystem::Network,
+                    vm = name,
+                    code = error.code().unwrap_or_default(),
+                    "Failed to open SSH session for VM \"{name}\": {error}"
+                );
                 self.collect_diagnostics();
                 Err(error)
             }
@@ -633,17 +660,22 @@ impl WorkspaceApp {
 
         match self.repository.open_console(name) {
             Ok(()) => {
-                self.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Info,
-                    message: format!("COM port console for VM \"{name}\" opened"),
-                });
+                vmlord_core::diagnostic!(
+                    Info,
+                    Subsystem::Display,
+                    vm = name,
+                    "COM port console for VM \"{name}\" opened"
+                );
                 Ok(())
             }
             Err(error) => {
-                self.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Error,
-                    message: format!("Failed to open the COM port of VM \"{name}\": {error}"),
-                });
+                vmlord_core::diagnostic!(
+                    Error,
+                    Subsystem::Display,
+                    vm = name,
+                    code = error.code().unwrap_or_default(),
+                    "Failed to open the COM port of VM \"{name}\": {error}"
+                );
                 self.collect_diagnostics();
                 Err(error)
             }
@@ -680,15 +712,19 @@ impl WorkspaceApp {
     }
 
     #[must_use]
-    pub fn diagnostics(&self) -> &[Diagnostic] {
+    /// The panel's records, newest last.
+    ///
+    /// Takes `&mut self` because it reads the sink first: a record written a
+    /// moment ago -- the answer to the click that is being drawn -- would
+    /// otherwise not appear until the next refresh, which is a whole second of
+    /// a button that looks like it did nothing.
+    pub fn diagnostics(&mut self) -> &[Diagnostic] {
+        self.read_records();
         &self.diagnostics
     }
 
     pub fn log_vm_action(&mut self, action: VmAction) {
-        self.diagnostics.push(Diagnostic {
-            level: vmlord_core::DiagnosticLevel::Info,
-            message: format!("{} pressed", action.label()),
-        });
+        vmlord_core::diagnostic!(Info, Subsystem::App, "{} pressed", action.label());
     }
 
     fn require_ready_backend(&mut self, action: &str) -> Result<(), RepositoryError> {
@@ -697,10 +733,7 @@ impl WorkspaceApp {
         }
 
         let error = RepositoryError::new(format!("{action} requires a ready backend"));
-        self.diagnostics.push(Diagnostic {
-            level: DiagnosticLevel::Error,
-            message: error.to_string(),
-        });
+        vmlord_core::diagnostic!(Error, Subsystem::App, "{error}");
         Err(error)
     }
 
@@ -715,27 +748,51 @@ impl WorkspaceApp {
 
         match operation(self.repository.as_mut()) {
             Ok(()) => {
-                self.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Info,
-                    message: format!("VM \"{name}\" {action} request accepted"),
-                });
+                vmlord_core::diagnostic!(
+                    Info,
+                    Subsystem::Hcs,
+                    vm = name,
+                    "VM \"{name}\" {action} request accepted"
+                );
                 self.refresh();
                 Ok(())
             }
             Err(error) => {
-                tracing::error!("failed to {action} VM {name}: {error}");
-                self.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Error,
-                    message: format!("Failed to {action} VM \"{name}\": {error}"),
-                });
+                vmlord_core::diagnostic!(
+                    Error,
+                    Subsystem::Hcs,
+                    vm = name,
+                    code = error.code().unwrap_or_default(),
+                    "Failed to {action} VM \"{name}\": {error}"
+                );
                 self.collect_diagnostics();
                 Err(error)
             }
         }
     }
 
+    /// Reaps what the backend has finished, then reads what was recorded.
+    ///
+    /// The reaping comes first and happens whether or not there is a sink:
+    /// `refresh` is where finished builds and starts are adopted and answered
+    /// shutdowns give up their handles, and skipping it would leak them. The
+    /// records are the second half, and a `WorkspaceApp` without a panel has
+    /// none to read.
     fn collect_diagnostics(&mut self) {
-        self.diagnostics.extend(self.repository.take_diagnostics());
+        self.repository.refresh();
+        self.read_records();
+    }
+
+    /// Moves whatever the layer has recorded into the panel's history.
+    ///
+    /// Separate from `collect_diagnostics` because reading records is cheap and
+    /// reaping is not: the panel is drawn sixty times a second, and doing the
+    /// backend's housekeeping that often would be absurd.
+    fn read_records(&mut self) {
+        let Some(sink) = &self.sink else {
+            return;
+        };
+        self.diagnostics.extend(sink.take());
         const MAX_DIAGNOSTICS: usize = 100;
         if self.diagnostics.len() > MAX_DIAGNOSTICS {
             self.diagnostics
@@ -787,9 +844,7 @@ impl VmRepository for UnavailableRepository {
         Err(RepositoryError::new(self.message.clone()))
     }
 
-    fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
-        Vec::new()
-    }
+    fn refresh(&mut self) {}
 }
 
 #[cfg(test)]
@@ -822,9 +877,6 @@ mod tests {
         reports_host_gpu: bool,
         host_gpu_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         actions: Vec<String>,
-        /// What the backend has to say next, which a real one accumulates while
-        /// it works and hands over when it is asked.
-        pending_diagnostics: Vec<Diagnostic>,
     }
 
     impl VmRepository for FakeRepository {
@@ -957,10 +1009,12 @@ mod tests {
                      answer on port 22: connection refused"
                 )));
             }
-            self.pending_diagnostics.push(Diagnostic {
-                level: DiagnosticLevel::Info,
-                message: format!("SSH session for VM \"{name}\": ssh.exe -p 22 -l user 172.30.0.5"),
-            });
+            vmlord_core::diagnostic!(
+                Info,
+                Subsystem::Network,
+                vm = name,
+                "SSH session for VM \"{name}\": ssh.exe -p 22 -l user 172.30.0.5"
+            );
             Ok(())
         }
 
@@ -974,21 +1028,34 @@ mod tests {
             Ok(())
         }
 
-        fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
-            let mut diagnostics = vec![Diagnostic {
-                level: DiagnosticLevel::Info,
-                message: "ready".into(),
-            }];
-            diagnostics.append(&mut self.pending_diagnostics);
-            diagnostics
+        fn refresh(&mut self) {
+            vmlord_core::diagnostic!(Info, Subsystem::App, "ready");
         }
     }
 
     /// The button that calls this arrives with #65; the contract arrives here,
     /// so that adding the button is adding a button.
+    /// Installs a diagnostics sink for the rest of this test, and hands it back
+    /// to be given to the application.
+    ///
+    /// Thread-local through `set_default`, so tests running side by side read
+    /// their own records; the guard has to be kept alive, which is why it comes
+    /// back with the sink.
+    #[must_use]
+    fn records() -> (DiagnosticsSink, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let sink = DiagnosticsSink::new();
+        let guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(vmlord_core::DiagnosticsLayer::new(sink.clone())),
+        );
+        (sink, guard)
+    }
+
     #[test]
     fn cancelling_a_creation_a_backend_cannot_cancel_is_reported() {
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()));
+        let (sink, _guard) = records();
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default())).with_diagnostics(sink);
         app.start();
 
         let error = app
@@ -1009,6 +1076,7 @@ mod tests {
     /// retry, on a VM that is otherwise fine.
     #[test]
     fn the_application_layer_reads_a_display_status_out_of_what_the_backend_stored() {
+        let (sink, _guard) = records();
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             vm_is_running: true,
             desktop_profile: vmlord_core::DesktopProfile::Gnome,
@@ -1020,7 +1088,8 @@ mod tests {
                 ),
             ),
             ..FakeRepository::default()
-        }));
+        }))
+        .with_diagnostics(sink);
         app.start();
 
         let status = app
@@ -1042,6 +1111,7 @@ mod tests {
     /// ever having named a state.
     #[test]
     fn the_application_layer_reads_a_gpu_status_out_of_the_backend_s_facts() {
+        let (sink, _guard) = records();
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             vm_is_running: true,
             gpu_mode: vmlord_core::GpuMode::Mirror,
@@ -1061,7 +1131,8 @@ mod tests {
                 observed_at: None,
             },
             ..FakeRepository::default()
-        }));
+        }))
+        .with_diagnostics(sink);
         app.start();
 
         let status = app.gpu_status("dev").expect("the listed VM has a status");
@@ -1079,7 +1150,8 @@ mod tests {
     /// none rather than a stale one.
     #[test]
     fn a_vm_the_backend_does_not_list_has_no_gpu_status() {
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()));
+        let (sink, _guard) = records();
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default())).with_diagnostics(sink);
         app.start();
 
         assert!(app.gpu_status("never-created").is_none());
@@ -1089,7 +1161,8 @@ mod tests {
     /// root -- not the form -- that knows what the host says (#60).
     #[test]
     fn guest_defaults_are_offered_and_can_be_replaced_by_the_composition_root() {
-        let app = WorkspaceApp::new(Box::new(FakeRepository::default()));
+        let (sink, _guard) = records();
+        let app = WorkspaceApp::new(Box::new(FakeRepository::default())).with_diagnostics(sink);
 
         assert_eq!(app.guest_defaults(), &GuestDefaults::default());
 
@@ -1107,7 +1180,8 @@ mod tests {
     /// it before the VM -- and therefore the file -- exists.
     #[test]
     fn the_key_path_of_a_vm_comes_from_the_backend() {
-        let app = WorkspaceApp::new(Box::new(FakeRepository::default()));
+        let (sink, _guard) = records();
+        let app = WorkspaceApp::new(Box::new(FakeRepository::default())).with_diagnostics(sink);
 
         assert_eq!(
             app.ssh_key_path("dev"),
@@ -1122,7 +1196,8 @@ mod tests {
 
     #[test]
     fn start_loads_vm_list() {
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()));
+        let (sink, _guard) = records();
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default())).with_diagnostics(sink);
         app.start();
         assert_eq!(app.status(), &BackendStatus::Ready);
         assert_eq!(app.vms().len(), 1);
@@ -1131,10 +1206,12 @@ mod tests {
 
     #[test]
     fn initialization_error_is_visible() {
+        let (sink, _guard) = records();
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             should_fail: true,
             ..FakeRepository::default()
-        }));
+        }))
+        .with_diagnostics(sink);
         app.start();
         assert_eq!(
             app.status(),
@@ -1156,7 +1233,8 @@ mod tests {
 
     #[test]
     fn lifecycle_actions_are_available_to_ui_clients() {
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()));
+        let (sink, _guard) = records();
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default())).with_diagnostics(sink);
         app.start();
 
         app.start_vm("dev").unwrap();
@@ -1206,7 +1284,8 @@ mod tests {
 
     #[test]
     fn updates_a_display_payload_through_the_repository() {
-        let mut app = WorkspaceApp::new(Box::new(updatable_repository()));
+        let (sink, _guard) = records();
+        let mut app = WorkspaceApp::new(Box::new(updatable_repository())).with_diagnostics(sink);
         app.start();
 
         app.update_display_payload("dev")
@@ -1233,7 +1312,8 @@ mod tests {
     /// panel reads to say one is under way.
     #[test]
     fn a_vm_being_updated_reports_itself_as_updating() {
-        let mut app = WorkspaceApp::new(Box::new(updatable_repository()));
+        let (sink, _guard) = records();
+        let mut app = WorkspaceApp::new(Box::new(updatable_repository())).with_diagnostics(sink);
         app.start();
         assert!(
             !app.display_status("dev")
@@ -1253,7 +1333,8 @@ mod tests {
 
     #[test]
     fn a_display_payload_update_of_a_stopped_vm_is_refused_and_says_why() {
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()));
+        let (sink, _guard) = records();
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default())).with_diagnostics(sink);
         app.start();
 
         let error = app
@@ -1271,7 +1352,8 @@ mod tests {
 
     #[test]
     fn opens_display_through_repository() {
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()));
+        let (sink, _guard) = records();
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default())).with_diagnostics(sink);
         app.start();
 
         app.connect_display("dev").unwrap();
@@ -1285,10 +1367,12 @@ mod tests {
 
     #[test]
     fn opens_ssh_session_through_repository() {
+        let (sink, _guard) = records();
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             vm_is_running: true,
             ..FakeRepository::default()
-        }));
+        }))
+        .with_diagnostics(sink);
         app.start();
 
         app.open_ssh("dev").unwrap();
@@ -1307,7 +1391,8 @@ mod tests {
     /// log a person actually reads.
     #[test]
     fn the_command_a_session_opened_with_reaches_the_log() {
-        let mut app = app_with(true);
+        let (sink, _guard) = records();
+        let mut app = app_with(true, sink);
 
         app.open_ssh("dev").unwrap();
 
@@ -1329,7 +1414,8 @@ mod tests {
     /// than as a failure this layer describes in its own words.
     #[test]
     fn a_refused_ssh_session_is_reported_with_the_backends_own_reason() {
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()));
+        let (sink, _guard) = records();
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default())).with_diagnostics(sink);
         app.start();
 
         let error = app.open_ssh("dev").unwrap_err();
@@ -1348,10 +1434,12 @@ mod tests {
 
     #[test]
     fn opens_the_com_port_through_the_repository() {
+        let (sink, _guard) = records();
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             vm_is_running: true,
             ..FakeRepository::default()
-        }));
+        }))
+        .with_diagnostics(sink);
         app.start();
 
         app.open_console("dev").unwrap();
@@ -1367,7 +1455,8 @@ mod tests {
     /// backend's message to pass on, not one to invent here.
     #[test]
     fn a_refused_com_port_is_reported_with_the_reason() {
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()));
+        let (sink, _guard) = records();
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default())).with_diagnostics(sink);
         app.start();
 
         app.open_console("dev").unwrap_err();
@@ -1383,6 +1472,7 @@ mod tests {
 
     #[test]
     fn updates_and_persists_application_settings() {
+        let (sink, _guard) = records();
         let directory = std::env::temp_dir().join(format!(
             "vmlord-app-settings-test-{}",
             SystemTime::now()
@@ -1408,6 +1498,7 @@ mod tests {
             guest_readiness: vmlord_core::GuestReadinessTimeouts::default(),
         };
         let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()))
+            .with_diagnostics(sink)
             .with_settings(store.clone(), initial_settings);
 
         app.update_settings(updated_settings.clone()).unwrap();
@@ -1424,18 +1515,21 @@ mod tests {
 
     #[test]
     fn vm_action_is_logged() {
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()));
+        let (sink, _guard) = records();
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default())).with_diagnostics(sink);
 
         app.log_vm_action(VmAction::Create);
 
         assert_eq!(app.diagnostics()[0].message, "Create VM pressed");
     }
 
-    fn app_with(vm_is_running: bool) -> WorkspaceApp {
+    /// An application already started, reading the sink its caller installed.
+    fn app_with(vm_is_running: bool, sink: DiagnosticsSink) -> WorkspaceApp {
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             vm_is_running,
             ..FakeRepository::default()
-        }));
+        }))
+        .with_diagnostics(sink);
         app.start();
         app
     }
@@ -1449,7 +1543,8 @@ mod tests {
 
     #[test]
     fn deletes_a_stopped_vm_through_the_repository() {
-        let mut app = app_with(false);
+        let (sink, _guard) = records();
+        let mut app = app_with(false, sink);
 
         app.delete_vm(delete_request(true)).unwrap();
 
@@ -1462,7 +1557,8 @@ mod tests {
 
     #[test]
     fn refuses_to_delete_a_running_vm() {
-        let mut app = app_with(true);
+        let (sink, _guard) = records();
+        let mut app = app_with(true, sink);
 
         let error = app
             .delete_vm(delete_request(true))
@@ -1478,7 +1574,8 @@ mod tests {
 
     #[test]
     fn refuses_to_delete_an_unknown_vm() {
-        let mut app = app_with(false);
+        let (sink, _guard) = records();
+        let mut app = app_with(false, sink);
 
         let error = app
             .delete_vm(VmDeleteRequest {
@@ -1492,10 +1589,12 @@ mod tests {
 
     #[test]
     fn refuses_to_delete_without_a_ready_backend() {
+        let (sink, _guard) = records();
         let mut app = WorkspaceApp::new(Box::new(FakeRepository {
             should_fail: true,
             ..FakeRepository::default()
-        }));
+        }))
+        .with_diagnostics(sink);
         app.start();
 
         let error = app
@@ -1507,7 +1606,8 @@ mod tests {
 
     #[test]
     fn warns_when_the_disks_are_kept() {
-        let mut app = app_with(false);
+        let (sink, _guard) = records();
+        let mut app = app_with(false, sink);
 
         app.delete_vm(delete_request(false)).unwrap();
 
@@ -1521,7 +1621,8 @@ mod tests {
 
     #[test]
     fn deleting_with_the_disks_does_not_warn_about_them() {
-        let mut app = app_with(false);
+        let (sink, _guard) = records();
+        let mut app = app_with(false, sink);
 
         app.delete_vm(delete_request(true)).unwrap();
 
@@ -1531,12 +1632,14 @@ mod tests {
     }
     #[test]
     fn the_host_is_read_once_when_the_backend_comes_up() {
+        let (sink, _guard) = records();
         let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut application = WorkspaceApp::new(Box::new(FakeRepository {
             reports_host_gpu: true,
             host_gpu_reads: std::sync::Arc::clone(&reads),
             ..FakeRepository::default()
-        }));
+        }))
+        .with_diagnostics(sink);
 
         application.start();
         application.refresh();
@@ -1552,7 +1655,9 @@ mod tests {
 
     #[test]
     fn a_backend_that_cannot_answer_leaves_the_host_unknown() {
-        let mut application = WorkspaceApp::new(Box::new(FakeRepository::default()));
+        let (sink, _guard) = records();
+        let mut application =
+            WorkspaceApp::new(Box::new(FakeRepository::default())).with_diagnostics(sink);
 
         application.start();
 
@@ -1564,13 +1669,15 @@ mod tests {
 
     #[test]
     fn a_backend_that_never_came_up_is_never_asked_about_the_host() {
+        let (sink, _guard) = records();
         let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut application = WorkspaceApp::new(Box::new(FakeRepository {
             should_fail: true,
             reports_host_gpu: true,
             host_gpu_reads: std::sync::Arc::clone(&reads),
             ..FakeRepository::default()
-        }));
+        }))
+        .with_diagnostics(sink);
 
         application.start();
 

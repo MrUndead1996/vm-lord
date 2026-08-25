@@ -166,7 +166,7 @@ fn a_created_vm_becomes_ready_before_its_build_finishes() {
         .expect("listing should work")
         .into_iter()
         .find(|vm| vm.name == "ready-vm");
-    let diagnostics = repository.take_diagnostics();
+    let diagnostics = drain(&mut repository);
     let transcript = fs::read_to_string(root.join("ready-vm").join("cloud-init-status.log"));
 
     // Best-effort cleanup regardless of the assertions below.
@@ -219,10 +219,7 @@ fn wait_until_build_finishes(
             Some(vm) if matches!(vm.state, VmState::Building { .. }) => seen_building = true,
             Some(_) => return Ok(seen_building),
             None => {
-                return Err(format!(
-                    "the build failed: {:?}",
-                    repository.take_diagnostics()
-                ));
+                return Err(format!("the build failed: {:?}", drain(repository)));
             }
         }
         if Instant::now() >= deadline {
@@ -319,7 +316,7 @@ fn a_cancelled_build_leaves_nothing_behind() {
             .iter()
             .any(|vm| vm.name == "bg-cancel");
         if !listed {
-            break Ok(repository.take_diagnostics());
+            break Ok(drain(&mut repository));
         }
         if std::time::Instant::now() >= deadline {
             break Err("the cancelled build did not go away".to_owned());
@@ -452,7 +449,7 @@ fn a_terminated_vm_reports_its_exit() {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut diagnostics = Vec::new();
     while Instant::now() < deadline {
-        diagnostics.extend(repository.take_diagnostics());
+        diagnostics.extend(drain(&mut repository));
         if diagnostics
             .iter()
             .any(|diagnostic| diagnostic.message == expected)
@@ -2253,4 +2250,34 @@ fn the_com_port_of_a_running_vm_is_opened_once() {
     let _ = fs::remove_dir_all(&root);
 
     outcome.expect("the COM port of a running VM is opened once and only while it runs");
+}
+
+/// The diagnostics this test binary records.
+///
+/// One subscriber for the process rather than one per test: these tests are
+/// `#[ignore]`d and run one at a time against a real host, so a shared sink is
+/// enough, and a scoped one would have to be threaded through every helper.
+fn records() -> &'static vmlord_core::DiagnosticsSink {
+    static SINK: std::sync::OnceLock<vmlord_core::DiagnosticsSink> = std::sync::OnceLock::new();
+    SINK.get_or_init(|| {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let sink = vmlord_core::DiagnosticsSink::new();
+        let subscriber =
+            tracing_subscriber::registry().with(vmlord_core::DiagnosticsLayer::new(sink.clone()));
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("nothing else installs a subscriber in this test binary");
+        sink
+    })
+}
+
+/// One application refresh: reap what has finished, then read what it recorded.
+///
+/// `refresh` is the `&mut self` call where the repository joins what is over --
+/// an answered shutdown, a compute system HCS has released and, with it, the
+/// facts of the run that ended. A test that only listed would wait forever for
+/// a change that is applied in the call it never makes.
+fn drain(repository: &mut vmlord_platform::HcsVmRepository) -> Vec<vmlord_core::Diagnostic> {
+    repository.refresh();
+    records().take()
 }

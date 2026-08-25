@@ -30,7 +30,7 @@ use std::{
 };
 
 use uuid::Uuid;
-use vmlord_core::{Diagnostic, DiagnosticLevel, DisplayMode, RepositoryError};
+use vmlord_core::{DiagnosticLevel, DisplayMode, RepositoryError, Subsystem};
 use vmlord_display_protocol::keys::Secret;
 use vmlord_display_viewer::{
     launch::{self, Link, Message},
@@ -41,9 +41,6 @@ use crate::display_session::Driver;
 
 /// The viewer binary, which ships beside the application -- see `cargo dist`.
 const VIEWER: &str = "vmlord-display.exe";
-
-/// Where the diagnostics of a launch go: the buffer the UI already drains.
-type Diagnostics = Arc<Mutex<Vec<Diagnostic>>>;
 
 /// Everything one launch needs.
 pub(crate) struct LaunchRequest<'a> {
@@ -58,7 +55,6 @@ pub(crate) struct LaunchRequest<'a> {
     /// The mode stored for this VM, if one has been.
     pub(crate) mode: Option<DisplayMode>,
     pub(crate) viewer: PathBuf,
-    pub(crate) diagnostics: Diagnostics,
 }
 
 /// Where the viewer is, given where the application is.
@@ -165,7 +161,6 @@ impl DisplayLaunches {
             })?;
 
         let vm_name = request.vm_name.to_owned();
-        let diagnostics = Arc::clone(&request.diagnostics);
         let finished = Arc::new(AtomicBool::new(false));
         let handle = std::thread::Builder::new()
             .name(format!("vmlord-display-{vm_name}"))
@@ -174,8 +169,8 @@ impl DisplayLaunches {
                 let vm_name = vm_name.clone();
                 move || {
                     let _finish = Finish(finished);
-                    serve(&mut driver, reader, to_viewer, &vm_name, &diagnostics);
-                    wait_for(child, &vm_name, &diagnostics);
+                    serve(&mut driver, reader, to_viewer, &vm_name);
+                    wait_for(child, &vm_name);
                 }
             })
             .map_err(|error| {
@@ -186,9 +181,9 @@ impl DisplayLaunches {
             })?;
 
         report(
-            &request.diagnostics,
+            &vm_name,
             DiagnosticLevel::Info,
-            format!("Opening the display of VM \"{vm_name}\""),
+            &format!("Opening the display of VM \"{vm_name}\""),
         );
         workers.push(Worker {
             vm_name,
@@ -246,7 +241,6 @@ fn serve(
     reader: ChildStdout,
     mut to_viewer: Link<io::Empty, ChildStdin>,
     vm_name: &str,
-    diagnostics: &Diagnostics,
 ) {
     let mut from_viewer = Link::new(reader, io::sink());
     loop {
@@ -259,8 +253,8 @@ fn serve(
         };
 
         let answer = driver.handle(message);
-        for diagnostic in answer.diagnostics {
-            push(diagnostics, diagnostic);
+        for (level, message) in answer.diagnostics {
+            report(vm_name, level, &message);
         }
         for message in answer.to_viewer {
             if let Err(error) = to_viewer.write(&message) {
@@ -275,15 +269,15 @@ fn serve(
 ///
 /// A window that was closed exits cleanly and is worth a log line and nothing
 /// more: closing it is what a person does with a window.
-fn wait_for(mut child: Child, vm_name: &str, diagnostics: &Diagnostics) {
+fn wait_for(mut child: Child, vm_name: &str) {
     match child.wait() {
         Ok(status) if status.success() => {
             tracing::info!("the display window of VM \"{vm_name}\" was closed");
         }
         Ok(status) => report(
-            diagnostics,
+            vm_name,
             DiagnosticLevel::Error,
-            format!("The display window of VM \"{vm_name}\" stopped unexpectedly ({status})"),
+            &format!("The display window of VM \"{vm_name}\" stopped unexpectedly ({status})"),
         ),
         Err(error) => {
             tracing::warn!("VMLord lost track of the display window of VM \"{vm_name}\": {error}");
@@ -326,20 +320,23 @@ fn pipes(child: &mut Child, vm_name: &str) -> Result<(ChildStdout, ChildStdin), 
     Ok((reader, writer))
 }
 
-fn report(diagnostics: &Diagnostics, level: DiagnosticLevel, message: String) {
-    push(diagnostics, Diagnostic { level, message });
-}
-
-/// Puts one diagnostic where the UI will find it, and in the log.
-fn push(diagnostics: &Diagnostics, diagnostic: Diagnostic) {
-    match diagnostic.level {
-        DiagnosticLevel::Error => tracing::error!("{}", diagnostic.message),
-        _ => tracing::info!("{}", diagnostic.message),
+/// Records one finding of a launch, naming the VM it is about.
+///
+/// The VM is named rather than inherited from a span: every one of these runs
+/// on the launch's own thread, which is inside no operation's span. The level
+/// arrives at runtime, so the literal the macro needs is chosen by matching.
+fn report(vm_name: &str, level: DiagnosticLevel, message: &str) {
+    match level {
+        DiagnosticLevel::Info => {
+            vmlord_core::diagnostic!(Info, Subsystem::Display, vm = vm_name, "{message}")
+        }
+        DiagnosticLevel::Warning => {
+            vmlord_core::diagnostic!(Warning, Subsystem::Display, vm = vm_name, "{message}")
+        }
+        DiagnosticLevel::Error => {
+            vmlord_core::diagnostic!(Error, Subsystem::Display, vm = vm_name, "{message}")
+        }
     }
-    diagnostics
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(diagnostic);
 }
 
 /// Joins and drops every worker whose viewer has gone.
@@ -378,6 +375,7 @@ mod tests {
         sync::{Arc, Mutex, atomic::AtomicBool},
     };
 
+    use tracing_subscriber::layer::SubscriberExt as _;
     use uuid::Uuid;
     use vmlord_display_protocol::keys::Secret;
 
@@ -419,26 +417,29 @@ mod tests {
     #[test]
     fn a_viewer_that_is_not_beside_the_application_is_refused_by_name() {
         let launches = DisplayLaunches::default();
-        let diagnostics = Arc::new(Mutex::new(Vec::new()));
+        let records = vmlord_core::DiagnosticsSink::new();
+        let subscriber = tracing_subscriber::registry()
+            .with(vmlord_core::DiagnosticsLayer::new(records.clone()));
 
-        let error = launches
-            .start(LaunchRequest {
-                vm_name: "dev",
-                vm_id: Uuid::from_u128(3),
-                secret: Secret::generate(),
-                runtime_id: Uuid::from_u128(7),
-                mode: None,
-                viewer: PathBuf::from(r"C:\nowhere\vmlord-display.exe"),
-                diagnostics: Arc::clone(&diagnostics),
-            })
-            .expect_err("there is no viewer at that path");
+        let error = tracing::subscriber::with_default(subscriber, || {
+            launches
+                .start(LaunchRequest {
+                    vm_name: "dev",
+                    vm_id: Uuid::from_u128(3),
+                    secret: Secret::generate(),
+                    runtime_id: Uuid::from_u128(7),
+                    mode: None,
+                    viewer: PathBuf::from(r"C:\nowhere\vmlord-display.exe"),
+                })
+                .expect_err("there is no viewer at that path")
+        });
 
         assert!(
             error.to_string().contains("vmlord-display.exe"),
             "the message must name the file that is missing: {error}"
         );
         assert!(
-            diagnostics.lock().expect("an uncontended lock").is_empty(),
+            records.take().is_empty(),
             "a launch that never started reports through its error, not twice"
         );
     }

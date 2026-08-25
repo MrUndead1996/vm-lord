@@ -15,7 +15,7 @@
 //! session and no longer.
 
 use uuid::Uuid;
-use vmlord_core::{Diagnostic, DiagnosticLevel, DisplayMode};
+use vmlord_core::{DiagnosticLevel, DisplayMode};
 use vmlord_display_protocol::{
     keys::{self, Secret},
     record::{self, Channel, Limits, Record},
@@ -57,8 +57,13 @@ fn control_limits() -> Limits {
 pub(crate) struct Answer {
     /// What to write back down the pipe, in order.
     pub(crate) to_viewer: Vec<Message>,
-    /// What the rest of VMLord is to be told, if anything.
-    pub(crate) diagnostics: Vec<Diagnostic>,
+    /// What the rest of VMLord is to be told, if anything: a level and a
+    /// sentence.
+    ///
+    /// Not a whole record: which subsystem this is and which VM it is about
+    /// are known by the launcher that reports it, and a driver that had to
+    /// name them would be repeating what its caller already knows.
+    pub(crate) diagnostics: Vec<(DiagnosticLevel, String)>,
 }
 
 impl Answer {
@@ -74,7 +79,7 @@ impl Answer {
     fn reported(level: DiagnosticLevel, message: String) -> Self {
         Self {
             to_viewer: Vec::new(),
-            diagnostics: vec![Diagnostic { level, message }],
+            diagnostics: vec![(level, message)],
         }
     }
 }
@@ -220,19 +225,16 @@ impl Driver {
         if outcome.event == Event::ControlEstablished {
             match self.hand_over() {
                 Ok(handover) => {
-                    answer.diagnostics.push(Diagnostic {
-                        level: DiagnosticLevel::Info,
-                        message: format!(
+                    answer.diagnostics.push((
+                        DiagnosticLevel::Info,
+                        format!(
                             "Display of VM \"{}\" opened at {}x{}",
                             self.vm_name, handover.width, handover.height
                         ),
-                    });
+                    ));
                     answer.to_viewer.push(Message::Handover(handover));
                 }
-                Err(reason) => answer.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Error,
-                    message: reason,
-                }),
+                Err(reason) => answer.diagnostics.push((DiagnosticLevel::Error, reason)),
             }
             self.session = None;
         }

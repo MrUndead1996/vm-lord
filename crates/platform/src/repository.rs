@@ -9,15 +9,15 @@ use std::{
     fs,
     net::IpAddr,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 
 use uuid::Uuid;
 use vmlord_core::{
-    AgentStatus, Diagnostic, DiagnosticLevel, DisplayProvisioning, GpuAssignment, GpuMode,
-    GuestDisplayReport, GuestReadinessTimeouts, HostGpuCapabilities, NetworkMode, RepositoryError,
-    SshAvailability, VmCreateRequest, VmDeleteRequest, VmDisplayFacts, VmRepository, VmState,
-    VmSummary, VmUpdateRequest,
+    AgentStatus, DiagnosticLevel, DisplayProvisioning, GpuAssignment, GpuMode, GuestDisplayReport,
+    GuestReadinessTimeouts, HostGpuCapabilities, NetworkMode, RepositoryError, SshAvailability,
+    Subsystem, VmCreateRequest, VmDeleteRequest, VmDisplayFacts, VmRepository, VmState, VmSummary,
+    VmUpdateRequest,
 };
 
 use crate::{
@@ -107,10 +107,6 @@ pub struct HcsVmRepository {
     shutdowns: ShutdownWorkers,
     force_stop: VmForceStopPipeline,
     delete: VmDeletionPipeline,
-    // `list_vms` takes `&self` but still has findings worth surfacing, and a
-    // build thread reports its failure the same way, so the diagnostics buffer
-    // is both shared and interior-mutable.
-    diagnostics: Arc<Mutex<Vec<Diagnostic>>>,
     /// The display payload updates in flight, one thread each.
     display_updates: display_updates::DisplayUpdates,
     initialized: bool,
@@ -170,7 +166,6 @@ impl HcsVmRepository {
             shutdowns: ShutdownWorkers::default(),
             force_stop: VmForceStopPipeline::production(),
             delete: VmDeletionPipeline::production(),
-            diagnostics: Arc::new(Mutex::new(Vec::new())),
             display_updates: display_updates::DisplayUpdates::default(),
             events,
             initialized: false,
@@ -292,9 +287,7 @@ impl HcsVmRepository {
         // is over. Reaping it here is what makes reopening possible at all --
         // and its failure, if it stopped for a reason worth reporting, is
         // reported rather than dropped on the way.
-        for diagnostic in console_failure_diagnostics(&mut self.com1_sessions, &self.storage_root) {
-            self.push_diagnostic(diagnostic.level, diagnostic.message);
-        }
+        report_console_failures(&mut self.com1_sessions, &self.storage_root);
         if self.com1_sessions.contains(mapping.vm_id) {
             let error = RepositoryError::new(format!(
                 "VM \"{}\" already has a COM1 console open; close its window before \
@@ -331,9 +324,7 @@ impl HcsVmRepository {
     fn show_shutdown_console(&mut self, mapping: &VmComputeSystemMapping) {
         // A console whose window has been closed leaves a session behind that
         // is over; reaping it here is what makes reopening possible at all.
-        for diagnostic in console_failure_diagnostics(&mut self.com1_sessions, &self.storage_root) {
-            self.push_diagnostic(diagnostic.level, diagnostic.message);
-        }
+        report_console_failures(&mut self.com1_sessions, &self.storage_root);
         if self.com1_sessions.contains(mapping.vm_id) {
             return;
         }
@@ -358,13 +349,13 @@ impl HcsVmRepository {
                     "VM \"{}\" is being shut down without its console: {error}",
                     mapping.vm_name
                 );
-                self.push_diagnostic(
-                    DiagnosticLevel::Warning,
-                    format!(
-                        "VM \"{}\" is being shut down, but its COM1 console could not be \
-                         opened to show it: {error}",
-                        mapping.vm_name
-                    ),
+                vmlord_core::diagnostic!(
+                    Warning,
+                    Subsystem::Display,
+                    vm = mapping.vm_name.as_str(),
+                    "VM \"{}\" is being shut down, but its COM1 console could not be \
+                     opened to show it: {error}",
+                    mapping.vm_name
                 );
             }
         }
@@ -401,10 +392,13 @@ impl HcsVmRepository {
                     self.connections.remove(finished.vm_id);
                 }
                 Err(error) => {
-                    tracing::error!("failed to stop VM \"{}\": {error}", finished.vm_name);
-                    self.push_diagnostic(
-                        DiagnosticLevel::Error,
-                        format!("Failed to stop VM \"{}\": {error}", finished.vm_name),
+                    vmlord_core::diagnostic!(
+                        Error,
+                        Subsystem::Hcs,
+                        vm = finished.vm_name.as_str(),
+                        code = error.code().unwrap_or_default(),
+                        "Failed to stop VM \"{}\": {error}",
+                        finished.vm_name
                     );
                 }
             }
@@ -444,7 +438,6 @@ impl HcsVmRepository {
 
         let vm_directory = layout::vm_directory(&self.storage_root, &mapping.vm_name)?;
         let launcher = Arc::clone(&self.ssh_launcher);
-        let diagnostics = Arc::clone(&self.diagnostics);
         let mapping = mapping.clone();
 
         self.ssh_launches.start(&mapping.vm_name.clone(), move || {
@@ -454,32 +447,23 @@ impl HcsVmRepository {
                 // only account VMLord can give of what it asked for -- which
                 // key, which known-hosts file, which port -- and it is the
                 // first thing worth reading when a guest refuses a login.
-                Ok(invocation) => push_shared_diagnostic(
-                    &diagnostics,
-                    DiagnosticLevel::Info,
-                    format!(
-                        "SSH session for VM \"{}\": {}",
-                        mapping.vm_name,
-                        invocation.command_line()
-                    ),
+                Ok(invocation) => vmlord_core::diagnostic!(
+                    Info,
+                    Subsystem::Network,
+                    vm = mapping.vm_name.as_str(),
+                    "SSH session for VM \"{}\": {}",
+                    mapping.vm_name,
+                    invocation.command_line()
                 ),
-                Err(failure) => {
-                    let message = format!(
-                        "cannot open an SSH session to VM \"{}\": {failure}",
-                        mapping.vm_name
-                    );
-                    tracing::error!("{message}");
-                    push_shared_diagnostic(&diagnostics, DiagnosticLevel::Error, message);
-                }
+                Err(failure) => vmlord_core::diagnostic!(
+                    Error,
+                    Subsystem::Network,
+                    vm = mapping.vm_name.as_str(),
+                    "cannot open an SSH session to VM \"{}\": {failure}",
+                    mapping.vm_name
+                ),
             }
         })
-    }
-
-    fn push_diagnostic(&self, level: DiagnosticLevel, message: String) {
-        self.diagnostics
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(Diagnostic { level, message });
     }
 
     /// Takes over the VMs that background builds have started.
@@ -520,12 +504,12 @@ impl HcsVmRepository {
                         mapping.vm_name,
                         mapping.vm_id
                     );
-                    self.push_diagnostic(
-                        DiagnosticLevel::Warning,
-                        format!(
-                            "VM \"{}\" started, but VMLord cannot report its HCS events",
-                            mapping.vm_name
-                        ),
+                    vmlord_core::diagnostic!(
+                        Warning,
+                        Subsystem::Hcs,
+                        vm = mapping.vm_name.as_str(),
+                        "VM \"{}\" started, but VMLord cannot report its HCS events",
+                        mapping.vm_name
                     );
                 }
             }
@@ -667,7 +651,6 @@ impl HcsVmRepository {
             runtime_id,
             mode: mapping.display_mode,
             viewer: display_launches::viewer_path()?,
-            diagnostics: Arc::clone(&self.diagnostics),
         })
     }
 
@@ -874,12 +857,12 @@ impl HcsVmRepository {
         self.read_configuration(&mapping.vm_name)
             .and_then(|document| hcs_config::read_topology(&document))
             .inspect_err(|error| {
-                self.push_diagnostic(
-                    DiagnosticLevel::Warning,
-                    format!(
-                        "Cannot read the configuration of VM \"{}\": {error}",
-                        mapping.vm_name
-                    ),
+                vmlord_core::diagnostic!(
+                    Warning,
+                    Subsystem::Hcs,
+                    vm = mapping.vm_name.as_str(),
+                    "Cannot read the configuration of VM \"{}\": {error}",
+                    mapping.vm_name
                 );
             })
             .ok()
@@ -1140,12 +1123,12 @@ impl VmRepository for HcsVmRepository {
         let report = reconnect_known_vms(&self.store, &self.events)?;
         for reconnected in &report.outcomes {
             if let ReconnectOutcome::Failed(error) = &reconnected.outcome {
-                self.push_diagnostic(
-                    DiagnosticLevel::Warning,
-                    format!(
-                        "Could not reconnect to VM \"{}\": {error}",
-                        reconnected.mapping.vm_name
-                    ),
+                vmlord_core::diagnostic!(
+                    Warning,
+                    Subsystem::Hcs,
+                    vm = reconnected.mapping.vm_name.as_str(),
+                    "Could not reconnect to VM \"{}\": {error}",
+                    reconnected.mapping.vm_name
                 );
             }
         }
@@ -1160,8 +1143,7 @@ impl VmRepository for HcsVmRepository {
             &known,
             &self.storage_root,
         ) {
-            tracing::warn!("{failure}");
-            self.push_diagnostic(DiagnosticLevel::Warning, failure);
+            vmlord_core::diagnostic!(Warning, Subsystem::Display, "{failure}");
         }
         // A VM that survived the previous VMLord process has an agent inside it
         // that is trying to reconnect, so the offer it connects to is put back
@@ -1213,7 +1195,6 @@ impl VmRepository for HcsVmRepository {
 
         let cycle = Arc::clone(&self.cycle);
         let store = self.store.clone();
-        let diagnostics = Arc::clone(&self.diagnostics);
         let name = request.name.clone();
         self.builds.start(request.clone(), move |monitor| {
             let report = cycle.run(&store, &request, &vm_directory, monitor);
@@ -1221,32 +1202,37 @@ impl VmRepository for HcsVmRepository {
                 CycleOutcome::Ready => {
                     tracing::info!("VM \"{name}\" finished building and its guest is ready");
                 }
-                CycleOutcome::Degraded { detail } => push_shared_diagnostic(
-                    &diagnostics,
-                    DiagnosticLevel::Warning,
-                    format!("VM \"{name}\" is up, but cloud-init finished degraded: {detail}"),
+                // The VM is named on every one of these: a build runs on its
+                // own thread, which is inside no operation's span.
+                CycleOutcome::Degraded { detail } => vmlord_core::diagnostic!(
+                    Warning,
+                    Subsystem::Provisioning,
+                    vm = name.as_str(),
+                    "VM \"{name}\" is up, but cloud-init finished degraded: {detail}"
                 ),
-                CycleOutcome::Unverified { detail } => push_shared_diagnostic(
-                    &diagnostics,
-                    DiagnosticLevel::Warning,
-                    format!("VM \"{name}\" was created and started, but is not confirmed ready: {detail}"),
+                CycleOutcome::Unverified { detail } => vmlord_core::diagnostic!(
+                    Warning,
+                    Subsystem::Provisioning,
+                    vm = name.as_str(),
+                    "VM \"{name}\" was created and started, but is not confirmed ready: {detail}"
                 ),
-                CycleOutcome::NotReady { reason } => push_shared_diagnostic(
-                    &diagnostics,
-                    DiagnosticLevel::Error,
-                    format!(
-                        "VM \"{name}\" was created and started, but never became ready: {reason}"
-                    ),
+                CycleOutcome::NotReady { reason } => vmlord_core::diagnostic!(
+                    Error,
+                    Subsystem::Provisioning,
+                    vm = name.as_str(),
+                    "VM \"{name}\" was created and started, but never became ready: {reason}"
                 ),
-                CycleOutcome::Failed { reason } => push_shared_diagnostic(
-                    &diagnostics,
-                    DiagnosticLevel::Error,
-                    format!("Failed to create VM \"{name}\": {reason}"),
+                CycleOutcome::Failed { reason } => vmlord_core::diagnostic!(
+                    Error,
+                    Subsystem::Provisioning,
+                    vm = name.as_str(),
+                    "Failed to create VM \"{name}\": {reason}"
                 ),
-                CycleOutcome::Cancelled => push_shared_diagnostic(
-                    &diagnostics,
-                    DiagnosticLevel::Info,
-                    format!("Creating VM \"{name}\" was cancelled"),
+                CycleOutcome::Cancelled => vmlord_core::diagnostic!(
+                    Info,
+                    Subsystem::Provisioning,
+                    vm = name.as_str(),
+                    "Creating VM \"{name}\" was cancelled"
                 ),
             }
             report.started
@@ -1315,7 +1301,7 @@ impl VmRepository for HcsVmRepository {
     /// running: a start with a GPU stages a payload first, which unpacks an
     /// archive and hashes the staged tree, and neither can happen on the
     /// thread that draws the window. What the thread produces is taken over on
-    /// the next refresh -- see [`HcsVmRepository::take_diagnostics`] -- and
+    /// the next refresh -- see [`HcsVmRepository::refresh`] -- and
     /// what it could not do arrives there as a diagnostic.
     ///
     /// Everything that can be refused cheaply and certainly is refused here,
@@ -1334,22 +1320,19 @@ impl VmRepository for HcsVmRepository {
         let vm_directory = layout::vm_directory(&self.storage_root, name)?;
         let store = self.store.clone();
         let start = Arc::clone(&self.start);
-        let diagnostics = Arc::clone(&self.diagnostics);
 
         self.starts.start(name, move || {
             match start.start(&store, &mapping.vm_name, &vm_directory) {
                 Ok(session) => Some(StartedVm { mapping, session }),
                 Err(error) => {
-                    let message =
-                        format!("VM \"{}\" could not be started: {error}", mapping.vm_name);
-                    tracing::error!("{message}");
-                    diagnostics
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .push(Diagnostic {
-                            level: DiagnosticLevel::Error,
-                            message,
-                        });
+                    vmlord_core::diagnostic!(
+                        Error,
+                        Subsystem::Hcs,
+                        vm = mapping.vm_name.as_str(),
+                        code = error.code().unwrap_or_default(),
+                        "VM \"{}\" could not be started: {error}",
+                        mapping.vm_name
+                    );
                     None
                 }
             }
@@ -1578,7 +1561,6 @@ impl VmRepository for HcsVmRepository {
         let cache_root = display_update::cache_root(&self.storage_root);
         let installed = self.display_runs.snapshot(vm_id).payload.installed;
         let display_runs = self.display_runs.clone();
-        let diagnostics = Arc::clone(&self.diagnostics);
 
         self.display_updates.start(&mapping.vm_name, move || {
             let outcome = display_update::run(&display_update::UpdateRequest {
@@ -1608,20 +1590,39 @@ impl VmRepository for HcsVmRepository {
                         outcome.payload.loaded.clone(),
                         outcome.failure.clone(),
                     );
+                    // The level is the outcome's, not this line's, so the
+                    // literal the macro needs is chosen by matching on it.
                     let (level, message) = display_update::report(&vm_name, &outcome);
-                    tracing::info!("{message}");
-                    push_shared_diagnostic(&diagnostics, level, message);
+                    match level {
+                        DiagnosticLevel::Info => vmlord_core::diagnostic!(
+                            Info,
+                            Subsystem::Display,
+                            vm = vm_name.as_str(),
+                            "{message}"
+                        ),
+                        DiagnosticLevel::Warning => vmlord_core::diagnostic!(
+                            Warning,
+                            Subsystem::Display,
+                            vm = vm_name.as_str(),
+                            "{message}"
+                        ),
+                        DiagnosticLevel::Error => vmlord_core::diagnostic!(
+                            Error,
+                            Subsystem::Display,
+                            vm = vm_name.as_str(),
+                            "{message}"
+                        ),
+                    }
                 }
                 // Nothing was moved: an update that was refused is an update
                 // that did not happen, so there are no facts to record and only
                 // the reason to report.
-                Err(error) => {
-                    let message = format!(
-                        "Failed to update the display payload of VM \"{vm_name}\": {error}"
-                    );
-                    tracing::error!("{message}");
-                    push_shared_diagnostic(&diagnostics, DiagnosticLevel::Error, message);
-                }
+                Err(error) => vmlord_core::diagnostic!(
+                    Error,
+                    Subsystem::Display,
+                    vm = vm_name.as_str(),
+                    "Failed to update the display payload of VM \"{vm_name}\": {error}"
+                ),
             }
         })
     }
@@ -1648,7 +1649,7 @@ impl VmRepository for HcsVmRepository {
     /// `&mut self` call the application already makes on every refresh, right
     /// after listing, so it is where a released handle can actually be
     /// released.
-    fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
+    fn refresh(&mut self) {
         // The `&mut self` call the application already makes on every refresh,
         // right after listing: the place a finished build can be joined, and
         // the place what it started can be taken over.
@@ -1694,26 +1695,15 @@ impl VmRepository for HcsVmRepository {
                  was released; VMLord reports no further HCS events until it is \
                  restarted"
             );
-            self.push_diagnostic(
-                DiagnosticLevel::Warning,
+            vmlord_core::diagnostic!(
+                Warning,
+                Subsystem::Hcs,
                 "The Host Compute Service disconnected, so VMLord has stopped \
                  reporting HCS events; restart VMLord to resume them."
-                    .to_string(),
             );
         }
 
-        let mut diagnostics: Vec<Diagnostic> = self
-            .diagnostics
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .drain(..)
-            .collect();
-        diagnostics.extend(drained.diagnostics);
-        diagnostics.extend(console_failure_diagnostics(
-            &mut self.com1_sessions,
-            &self.storage_root,
-        ));
-        diagnostics
+        report_console_failures(&mut self.com1_sessions, &self.storage_root);
     }
 }
 
@@ -1853,45 +1843,21 @@ fn read_display_secret(
     })
 }
 
-/// Turns every reader that stopped for the wrong reason into a diagnostic, and
-/// forgets every reader that is over.
-fn console_failure_diagnostics(
-    sessions: &mut Com1Sessions,
-    storage_root: &Path,
-) -> Vec<Diagnostic> {
-    sessions
-        .reap()
-        .into_iter()
-        .map(|failure| {
-            let log_path = layout::vm_directory(storage_root, &failure.vm_name)
-                .map(|directory| layout::com1_log_path(&directory).display().to_string())
-                .unwrap_or_else(|_| layout::COM1_LOG_FILE_NAME.to_owned());
-            let message = format!(
-                "COM1 diagnostics for VM \"{}\" stopped unexpectedly; see {log_path}",
-                failure.vm_name
-            );
-            tracing::error!("{message}");
-            Diagnostic {
-                level: DiagnosticLevel::Error,
-                message,
-            }
-        })
-        .collect()
-}
-
-/// Records a diagnostic in a buffer shared with the build threads.
-///
-/// Free rather than a method because a build thread has the buffer and not the
-/// repository: the repository is not `Send`, and does not need to be.
-fn push_shared_diagnostic(
-    diagnostics: &Mutex<Vec<Diagnostic>>,
-    level: DiagnosticLevel,
-    message: String,
-) {
-    diagnostics
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(Diagnostic { level, message });
+/// Reports every reader that stopped for the wrong reason, and forgets every
+/// reader that is over.
+fn report_console_failures(sessions: &mut Com1Sessions, storage_root: &Path) {
+    for failure in sessions.reap() {
+        let log_path = layout::vm_directory(storage_root, &failure.vm_name)
+            .map(|directory| layout::com1_log_path(&directory).display().to_string())
+            .unwrap_or_else(|_| layout::COM1_LOG_FILE_NAME.to_owned());
+        vmlord_core::diagnostic!(
+            Error,
+            Subsystem::Display,
+            vm = failure.vm_name.as_str(),
+            "COM1 diagnostics for VM \"{}\" stopped unexpectedly; see {log_path}",
+            failure.vm_name
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1909,10 +1875,58 @@ mod tests {
     };
 
     use super::{
-        GpuAssignment, HcsSystemState, HcsVmRepository, OS_TYPE, console_failure_diagnostics,
-        guest_ip, launch_running_consoles, merge_with_builds, record_gpu_mode, record_network_mode,
-        refuse_gpu_mode_change,
+        GpuAssignment, HcsSystemState, HcsVmRepository, OS_TYPE, guest_ip, launch_running_consoles,
+        merge_with_builds, record_gpu_mode, record_network_mode, refuse_gpu_mode_change,
+        report_console_failures,
     };
+
+    /// Installs a diagnostics sink for the duration of `body` and hands back
+    /// what was recorded.
+    ///
+    /// Scoped to this thread: two tests running side by side read their own
+    /// records and not each other's, which the one global buffer these
+    /// replaced could not manage.
+    /// Runs `body` with sole use of the global sink and hands back what every
+    /// thread recorded while it ran.
+    ///
+    /// Global rather than scoped because the records these tests are about are
+    /// written on a worker thread, and `with_default` is thread-local: a launch
+    /// reports from a thread of its own. Production installs a global
+    /// subscriber for the same reason, so this is what it actually behaves
+    /// like -- and the lock is what keeps two such tests from draining each
+    /// other's records.
+    fn global_records<T>(body: impl FnOnce() -> T) -> (T, Vec<vmlord_core::Diagnostic>) {
+        static SINK: std::sync::OnceLock<vmlord_core::DiagnosticsSink> = std::sync::OnceLock::new();
+        static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+        let sink = SINK.get_or_init(|| {
+            use tracing_subscriber::layer::SubscriberExt as _;
+
+            let sink = vmlord_core::DiagnosticsSink::new();
+            let subscriber = tracing_subscriber::registry()
+                .with(vmlord_core::DiagnosticsLayer::new(sink.clone()));
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("nothing else installs a global subscriber here");
+            sink
+        });
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Whatever a test that does not use this helper left behind.
+        let _ = sink.take();
+        let value = body();
+        (value, sink.take())
+    }
+
+    fn records<T>(body: impl FnOnce() -> T) -> (T, Vec<vmlord_core::Diagnostic>) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let sink = vmlord_core::DiagnosticsSink::new();
+        let subscriber =
+            tracing_subscriber::registry().with(vmlord_core::DiagnosticsLayer::new(sink.clone()));
+        let value = tracing::subscriber::with_default(subscriber, body);
+        (value, sink.take())
+    }
     use std::sync::atomic::AtomicBool;
 
     use vmlord_core::{GuestGpuDetail, GuestGpuReport};
@@ -2470,10 +2484,9 @@ mod tests {
         );
         let mapping = mapping(NetworkMode::None);
 
-        repository.show_shutdown_console(&mapping);
+        let (_, diagnostics) = records(|| repository.show_shutdown_console(&mapping));
 
         assert!(!repository.com1_sessions.contains(mapping.vm_id));
-        let diagnostics = repository.diagnostics.lock().unwrap().clone();
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].level, DiagnosticLevel::Warning);
         assert!(
@@ -2493,10 +2506,10 @@ mod tests {
             .expect("the request should be dispatched");
 
         repository.shutdowns.wait_until_answered();
-        repository.finish_shutdowns();
+        let (_, diagnostics) = records(|| repository.finish_shutdowns());
 
         assert!(
-            repository.diagnostics.lock().unwrap().is_empty(),
+            diagnostics.is_empty(),
             "a request that went through is not news"
         );
         // The same VM can be asked again once its request is over: a guest that
@@ -2522,9 +2535,8 @@ mod tests {
             .expect("the request should be dispatched");
 
         repository.shutdowns.wait_until_answered();
-        repository.finish_shutdowns();
+        let (_, diagnostics) = records(|| repository.finish_shutdowns());
 
-        let diagnostics = repository.diagnostics.lock().unwrap().clone();
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].level, DiagnosticLevel::Error);
         assert!(
@@ -2637,14 +2649,14 @@ mod tests {
     #[test]
     fn an_opened_session_leaves_its_command_in_the_diagnostics() {
         let recorded = Arc::new(Mutex::new(Vec::new()));
-        let mut repository = repository_with_ssh(recorded);
+        let repository = repository_with_ssh(recorded);
 
-        repository
-            .open_ssh_in_state(&ssh_mapping(), Some(HcsSystemState::Running))
-            .expect("a running guest can be logged into");
-        repository.ssh_launches.wait_until_opened();
-
-        let diagnostics = repository.take_diagnostics();
+        let (_, diagnostics) = global_records(|| {
+            repository
+                .open_ssh_in_state(&ssh_mapping(), Some(HcsSystemState::Running))
+                .expect("a running guest can be logged into");
+            repository.ssh_launches.wait_until_opened();
+        });
         let logged = diagnostics
             .iter()
             .find(|diagnostic| diagnostic.message.contains("ssh.exe"))
@@ -2692,12 +2704,12 @@ mod tests {
             |_| panic!("nor given a terminal"),
         ));
 
-        repository
-            .open_ssh_in_state(&ssh_mapping(), Some(HcsSystemState::Running))
-            .expect("the attempt is made in the background, so it is accepted");
-        repository.ssh_launches.wait_until_opened();
-
-        let diagnostics = repository.take_diagnostics();
+        let (_, diagnostics) = global_records(|| {
+            repository
+                .open_ssh_in_state(&ssh_mapping(), Some(HcsSystemState::Running))
+                .expect("the attempt is made in the background, so it is accepted");
+            repository.ssh_launches.wait_until_opened();
+        });
         let reported = diagnostics
             .iter()
             .find(|diagnostic| diagnostic.level == DiagnosticLevel::Error)
@@ -2727,8 +2739,9 @@ mod tests {
         session.fail_for_test();
         sessions.insert(session);
 
-        let diagnostics =
-            console_failure_diagnostics(&mut sessions, std::path::Path::new(r"C:\vms"));
+        let (_, diagnostics) = records(|| {
+            report_console_failures(&mut sessions, std::path::Path::new(r"C:\vms"));
+        });
 
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].level, DiagnosticLevel::Error);
@@ -2757,8 +2770,9 @@ mod tests {
         session.finish_for_test();
         sessions.insert(session);
 
-        let diagnostics =
-            console_failure_diagnostics(&mut sessions, std::path::Path::new(r"C:\vms"));
+        let (_, diagnostics) = records(|| {
+            report_console_failures(&mut sessions, std::path::Path::new(r"C:\vms"));
+        });
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         assert!(!sessions.contains(mapping.vm_id));
@@ -3324,9 +3338,9 @@ mod tests {
         );
     }
 
-    /// The drain runs inside `take_diagnostics` because that is already called
-    /// on every refresh, right after `list_vms`, so an event reaches the user
-    /// within one refresh interval without any new machinery.
+    /// The drain runs inside `refresh` because that is already called on every
+    /// refresh, right after `list_vms`, so an event reaches the user within one
+    /// refresh interval without any new machinery.
     ///
     /// Releasing the handle is asserted by `watch::drain_events`' own tests and
     /// by the ignored Hyper-V test; it cannot be asserted here, because holding
@@ -3342,7 +3356,7 @@ mod tests {
             details: None,
         });
 
-        let diagnostics = repository.take_diagnostics();
+        let (_, diagnostics) = records(|| repository.refresh());
 
         assert!(
             diagnostics.iter().any(|diagnostic| {
@@ -3369,7 +3383,7 @@ mod tests {
             });
         }
 
-        let diagnostics = repository.take_diagnostics();
+        let (_, diagnostics) = records(|| repository.refresh());
 
         let warnings: Vec<_> = diagnostics
             .iter()
@@ -3404,8 +3418,8 @@ mod tests {
                 kind: HcsEventKind::ServiceDisconnect,
                 details: None,
             });
-            warnings += repository
-                .take_diagnostics()
+            let (_, diagnostics) = records(|| repository.refresh());
+            warnings += diagnostics
                 .iter()
                 .filter(|diagnostic| diagnostic.level == DiagnosticLevel::Warning)
                 .count();
@@ -3428,6 +3442,8 @@ mod tests {
             details: Some("silo job created".into()),
         });
 
-        assert!(repository.take_diagnostics().is_empty());
+        let (_, diagnostics) = records(|| repository.refresh());
+
+        assert!(diagnostics.is_empty());
     }
 }

@@ -1,10 +1,11 @@
 use std::sync::{Arc, Mutex};
 
+use tracing_subscriber::layer::SubscriberExt as _;
 use vmlord_app::{BackendStatus, WorkspaceApp};
 use vmlord_core::{
-    AgentStatus, Diagnostic, GpuMode, NetworkMode, RepositoryError, SshAuthentication,
-    SshAvailability, SshConfig, SshPort, VmGpuFacts, VmRepository, VmState, VmSummary,
-    VmUpdateRequest,
+    AgentStatus, DiagnosticsLayer, DiagnosticsSink, GpuMode, NetworkMode, RepositoryError,
+    SshAuthentication, SshAvailability, SshConfig, SshPort, VmGpuFacts, VmRepository, VmState,
+    VmSummary, VmUpdateRequest,
 };
 
 #[derive(Clone, Default)]
@@ -70,9 +71,7 @@ impl VmRepository for FakeRepository {
         }])
     }
 
-    fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
-        Vec::new()
-    }
+    fn refresh(&mut self) {}
 }
 
 fn update_request() -> VmUpdateRequest {
@@ -85,13 +84,29 @@ fn update_request() -> VmUpdateRequest {
     }
 }
 
+/// Installs a diagnostics sink for the rest of this test.
+///
+/// Thread-local through `set_default`, so tests running side by side read their
+/// own records. The guard has to outlive the application, which is why it comes
+/// back with the sink.
+#[must_use]
+fn records() -> (DiagnosticsSink, tracing::subscriber::DefaultGuard) {
+    let sink = DiagnosticsSink::new();
+    let guard = tracing::subscriber::set_default(
+        tracing_subscriber::registry().with(DiagnosticsLayer::new(sink.clone())),
+    );
+    (sink, guard)
+}
+
 #[test]
 fn update_vm_calls_repository_and_keeps_backend_ready() {
+    let (sink, _guard) = records();
     let shared = SharedState::default();
     let mut app = WorkspaceApp::new(Box::new(FakeRepository {
         vm_state: VmState::Stopped,
         shared: shared.clone(),
-    }));
+    }))
+    .with_diagnostics(sink);
     app.start();
 
     app.update_vm(update_request()).unwrap();
@@ -108,13 +123,15 @@ fn update_vm_calls_repository_and_keeps_backend_ready() {
 
 #[test]
 fn update_vm_accepts_a_running_vm_and_warns_that_it_needs_a_restart() {
+    let (sink, _guard) = records();
     let shared = SharedState::default();
     let mut app = WorkspaceApp::new(Box::new(FakeRepository {
         vm_state: VmState::Running {
             agent_status: AgentStatus::Online,
         },
         shared: shared.clone(),
-    }));
+    }))
+    .with_diagnostics(sink);
     app.start();
 
     app.update_vm(update_request()).unwrap();
@@ -130,11 +147,13 @@ fn update_vm_accepts_a_running_vm_and_warns_that_it_needs_a_restart() {
 
 #[test]
 fn update_vm_does_not_warn_about_a_restart_for_a_stopped_vm() {
+    let (sink, _guard) = records();
     let shared = SharedState::default();
     let mut app = WorkspaceApp::new(Box::new(FakeRepository {
         vm_state: VmState::Stopped,
         shared: shared.clone(),
-    }));
+    }))
+    .with_diagnostics(sink);
     app.start();
 
     app.update_vm(update_request()).unwrap();
@@ -148,11 +167,13 @@ fn update_vm_does_not_warn_about_a_restart_for_a_stopped_vm() {
 
 #[test]
 fn update_vm_rejects_an_unknown_vm_before_repository_call() {
+    let (sink, _guard) = records();
     let shared = SharedState::default();
     let mut app = WorkspaceApp::new(Box::new(FakeRepository {
         vm_state: VmState::Stopped,
         shared: shared.clone(),
-    }));
+    }))
+    .with_diagnostics(sink);
     app.start();
 
     let mut request = update_request();
@@ -165,11 +186,13 @@ fn update_vm_rejects_an_unknown_vm_before_repository_call() {
 
 #[test]
 fn update_vm_rejects_invalid_ram_before_repository_call() {
+    let (sink, _guard) = records();
     let shared = SharedState::default();
     let mut app = WorkspaceApp::new(Box::new(FakeRepository {
         vm_state: VmState::Stopped,
         shared: shared.clone(),
-    }));
+    }))
+    .with_diagnostics(sink);
     app.start();
 
     let mut request = update_request();

@@ -10,3 +10,8 @@ vmlord-core = { path = "../core" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The scoped subscriber the diagnostics tests install: records are read from a
+# sink rather than returned, so a test needs somewhere to read them.
+tracing-subscriber.workspace = true
