@@ -1190,6 +1190,7 @@ impl VmRepository for HcsVmRepository {
     /// before the thread: an obvious mistake belongs in the return value of the
     /// call that made it, not in a diagnostic a second later.
     fn create_vm(&mut self, request: VmCreateRequest) -> Result<(), RepositoryError> {
+        let _span = tracing::info_span!("create_vm", vm = request.name.as_str()).entered();
         self.require_initialized()?;
         request.validate()?;
 
@@ -1260,6 +1261,7 @@ impl VmRepository for HcsVmRepository {
     /// this document, so editing the document is what editing a VM means. A
     /// running VM keeps its current topology until it is restarted.
     fn update_vm(&mut self, request: VmUpdateRequest) -> Result<(), RepositoryError> {
+        let _span = tracing::info_span!("update_vm", vm = request.name.as_str()).entered();
         self.require_initialized()?;
         self.builds.refuse_if_building(&request.name)?;
         self.starts.refuse_if_starting(&request.name)?;
@@ -1320,6 +1322,7 @@ impl VmRepository for HcsVmRepository {
     /// before the thread, so an obvious mistake is the return value of the call
     /// that made it rather than a diagnostic a moment later.
     fn start_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
+        let _span = tracing::info_span!("start_vm", vm = name).entered();
         self.require_initialized()?;
         self.builds.refuse_if_building(name)?;
         self.starts.refuse_if_starting(name)?;
@@ -1365,6 +1368,7 @@ impl VmRepository for HcsVmRepository {
     /// before the thread, so an obvious mistake is the return value of the call
     /// that made it rather than a diagnostic a moment later.
     fn stop_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
+        let _span = tracing::info_span!("stop_vm", vm = name).entered();
         self.require_initialized()?;
         self.builds.refuse_if_building(name)?;
 
@@ -1384,6 +1388,7 @@ impl VmRepository for HcsVmRepository {
     }
 
     fn force_stop_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
+        let _span = tracing::info_span!("force_stop_vm", vm = name).entered();
         self.require_initialized()?;
         self.builds.refuse_if_building(name)?;
 
@@ -1409,6 +1414,7 @@ impl VmRepository for HcsVmRepository {
     /// is irreversible, and stopping is the user's decision to make
     /// deliberately.
     fn delete_vm(&mut self, request: VmDeleteRequest) -> Result<(), RepositoryError> {
+        let _span = tracing::info_span!("delete_vm", vm = request.name.as_str()).entered();
         self.require_initialized()?;
         self.builds.refuse_if_building(&request.name)?;
         // A VM in the middle of starting is not a VM to remove: its thread is
@@ -1450,6 +1456,7 @@ impl VmRepository for HcsVmRepository {
     }
 
     fn cancel_create(&mut self, name: &str) -> Result<(), RepositoryError> {
+        let _span = tracing::info_span!("cancel_create", vm = name).entered();
         self.require_initialized()?;
         self.builds.cancel(name)
     }
@@ -1466,6 +1473,7 @@ impl VmRepository for HcsVmRepository {
     /// one: two readers on one pipe split the guest's output between two
     /// windows and neither shows all of it.
     fn open_console(&mut self, name: &str) -> Result<(), RepositoryError> {
+        let _span = tracing::info_span!("open_console", vm = name).entered();
         self.require_initialized()?;
         self.builds.refuse_if_building(name)?;
 
@@ -1490,6 +1498,7 @@ impl VmRepository for HcsVmRepository {
     /// because once the terminal is up, everything else OpenSSH has to say goes
     /// into that window and not into this process.
     fn open_ssh(&mut self, name: &str) -> Result<(), RepositoryError> {
+        let _span = tracing::info_span!("open_ssh", vm = name).entered();
         self.require_initialized()?;
         self.builds.refuse_if_building(name)?;
 
@@ -1504,6 +1513,7 @@ impl VmRepository for HcsVmRepository {
     /// clicked in, for the reason [`VmRepository::open_ssh`] does it: a click
     /// can be a refresh out of date.
     fn open_display(&mut self, name: &str) -> Result<(), RepositoryError> {
+        let _span = tracing::info_span!("open_display", vm = name).entered();
         self.require_initialized()?;
         self.builds.refuse_if_building(name)?;
 
@@ -1533,6 +1543,7 @@ impl VmRepository for HcsVmRepository {
     /// would publish two versions into the one directory that VM exports and
     /// ask one agent session twice.
     fn update_display_payload(&mut self, name: &str) -> Result<(), RepositoryError> {
+        let _span = tracing::info_span!("update_display_payload", vm = name).entered();
         self.require_initialized()?;
         self.builds.refuse_if_building(name)?;
 
