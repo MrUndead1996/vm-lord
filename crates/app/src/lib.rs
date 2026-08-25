@@ -6,9 +6,9 @@ pub mod gpu;
 use std::{collections::HashMap, fmt, path::PathBuf, time::SystemTime};
 
 use vmlord_core::{
-    AppSettings, Diagnostic, DiagnosticLevel, DisplayStatusCode, GuestDefaults, HostGpuCapabilities,
-    RepositoryError, SettingsError, SettingsStore, VmCreateRequest, VmDeleteRequest,
-    VmDisplayStatus, VmGpuStatus, VmRepository, VmState, VmSummary, VmUpdateRequest,
+    AppSettings, Diagnostic, DiagnosticLevel, GuestDefaults, HostGpuCapabilities, RepositoryError,
+    SettingsError, SettingsStore, VmCreateRequest, VmDeleteRequest, VmDisplayStatus, VmGpuStatus,
+    VmRepository, VmState, VmSummary, VmUpdateRequest,
 };
 
 pub use display::derive_status as derive_display_status;
@@ -545,30 +545,35 @@ impl WorkspaceApp {
         }
     }
 
-    /// Moves a running VM's display payload to the newest version this build
-    /// carries for it.
+    /// Asks for a running VM's display payload to be moved to the newest
+    /// version this build carries for it.
     ///
-    /// Blocking, unlike the connections beside it: what a person wants from an
-    /// update is whether it worked, and the guest builds a kernel module to
-    /// find out. Both outcomes go into the diagnostics, because an update that
-    /// rolled back is a working display and still an answer somebody asked for.
+    /// `Ok` is a request the backend accepted, not a payload that moved: the
+    /// guest builds a kernel module with DKMS to answer, which is minutes, and
+    /// a window that redraws sixty times a second cannot wait on one. The VM
+    /// reports itself as updating while that runs, and how it ended arrives in
+    /// the diagnostics from the backend -- including the guest that could not
+    /// verify the new version and brought the previous one back, which is a
+    /// working display and a failed update.
     ///
     /// # Errors
     ///
-    /// [`RepositoryError`] when there was nothing to update to, nobody to ask,
-    /// or the guest could not carry it out.
+    /// [`RepositoryError`] when there is nobody to ask -- a VM that is not
+    /// running, one with no agent session, one already being updated.
     pub fn update_display_payload(&mut self, name: &str) -> Result<(), RepositoryError> {
         self.require_ready_backend("display payload update")?;
         self.log_vm_action(VmAction::UpdateDisplay);
 
         match self.repository.update_display_payload(name) {
             Ok(()) => {
-                // Refreshed before anything is said, because what the guest
-                // made of the request is not in this `Ok`: the backend records
-                // it, and the status derived from it is where it can be read.
+                self.diagnostics.push(Diagnostic {
+                    level: DiagnosticLevel::Info,
+                    message: format!("Updating the display payload of VM \"{name}\""),
+                });
+                // Refreshed so that the VM shows as updating from this click
+                // rather than from the next tick: what the button does next is
+                // decided by the status this derives.
                 self.refresh();
-                let answer = self.display_update_answer(name);
-                self.diagnostics.push(answer);
                 Ok(())
             }
             Err(error) => {
@@ -581,49 +586,6 @@ impl WorkspaceApp {
                 self.collect_diagnostics();
                 Err(error)
             }
-        }
-    }
-
-    /// What to say about an update the guest answered.
-    ///
-    /// Read from the status the refresh derived rather than from the call that
-    /// returned, because the backend answers `Ok` for every answer it got. A
-    /// guest that could not verify the new version and came back on the
-    /// previous one has a working display and a failed update, and a person who
-    /// pressed the button is owed the second half of that.
-    fn display_update_answer(&self, name: &str) -> Diagnostic {
-        let Some(status) = self.display_status.get(name) else {
-            return Diagnostic {
-                level: DiagnosticLevel::Info,
-                message: format!("Display payload of VM \"{name}\" updated"),
-            };
-        };
-
-        match status.code {
-            DisplayStatusCode::PayloadUpdateRolledBack => Diagnostic {
-                // Not an error: what is running is a display that works.
-                level: DiagnosticLevel::Warning,
-                message: format!(
-                    "Display payload of VM \"{name}\" was not updated: {}",
-                    status.message
-                ),
-            },
-            DisplayStatusCode::PayloadUpdateFailed => Diagnostic {
-                level: DiagnosticLevel::Error,
-                message: format!(
-                    "Display payload of VM \"{name}\" failed to update: {}",
-                    status.message
-                ),
-            },
-            _ => Diagnostic {
-                level: DiagnosticLevel::Info,
-                message: match status.running_version.as_deref() {
-                    Some(version) => {
-                        format!("Display payload of VM \"{name}\" updated to {version}")
-                    }
-                    None => format!("Display payload of VM \"{name}\" updated"),
-                },
-            },
         }
     }
 
@@ -855,9 +817,6 @@ mod tests {
         /// What the backend has observed of this VM's display, which an update
         /// rewrites the way the native backend does.
         display: vmlord_core::VmDisplayFacts,
-        /// Whether the guest refuses the version it is asked for and comes
-        /// back on the one it was running.
-        update_rolls_back: bool,
         /// Whether this backend can answer for the host at all, and how often
         /// it has been asked.
         reports_host_gpu: bool,
@@ -980,21 +939,10 @@ mod tests {
                     "VM \"{name}\" is not running, so its display payload cannot be updated"
                 )));
             }
-            // What the guest made of the request, recorded rather than
-            // returned: the native backend answers `Ok` for every answer it
-            // got, including the one where the guest could not verify the new
-            // version and brought the previous one back.
-            if self.update_rolls_back {
-                self.display.failure = Some(vmlord_core::DisplayFailure::new(
-                    vmlord_core::DisplayStage::Payload,
-                    vmlord_core::DisplayStatusCode::PayloadUpdateRolledBack,
-                    "the new module did not load; the guest is running 0.1.4 again",
-                ));
-            } else {
-                self.display.payload.installed = self.display.payload.available.clone();
-                self.display.payload.loaded = self.display.payload.available.clone();
-                self.display.failure = None;
-            }
+            // Accepted, the way the native backend accepts it: a worker
+            // starts, the VM reports itself as updating, and what the guest
+            // made of it arrives later and from somewhere else.
+            self.display.update_in_flight = true;
             Ok(())
         }
 
@@ -1250,6 +1198,7 @@ mod tests {
                 },
                 failure: None,
                 observed_at: None,
+                update_in_flight: false,
             },
             ..FakeRepository::default()
         }
@@ -1263,46 +1212,32 @@ mod tests {
         app.update_display_payload("dev")
             .expect("a running VM can be asked");
 
-        let last = app
+        let accepted = app
             .diagnostics()
-            .last()
-            .expect("an update that worked is worth one line");
-        assert_eq!(last.level, DiagnosticLevel::Info);
+            .iter()
+            .any(|diagnostic| diagnostic.message == "Updating the display payload of VM \"dev\"");
+        assert!(accepted, "the request is worth one line: {:?}", app.diagnostics());
         assert!(
-            last.message.contains("Display payload of VM \"dev\"") && last.message.contains("0.1.5"),
-            "the line names the version the guest ended up on: {}",
-            last.message
+            !app.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("updated")),
+            "nothing has been updated yet: the guest has not answered"
         );
     }
 
-    /// The answer a person asked for, and the one the `Ok` of the call does not
-    /// carry: the guest could not verify the new version and came back on the
-    /// old one, which is a working display and a failed update.
+    /// What the button reads to stop offering a second update, and what the
+    /// panel reads to say one is under way.
     #[test]
-    fn a_display_payload_update_that_rolled_back_says_so() {
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
-            update_rolls_back: true,
-            ..updatable_repository()
-        }));
+    fn a_vm_being_updated_reports_itself_as_updating() {
+        let mut app = WorkspaceApp::new(Box::new(updatable_repository()));
         app.start();
+        assert!(!app.display_status("dev").expect("a derived status").updating);
 
-        app.update_display_payload("dev")
-            .expect("the guest answered, and rolling back is an answer");
+        app.update_display_payload("dev").expect("accepted");
 
-        let last = app
-            .diagnostics()
-            .last()
-            .expect("a rollback is worth one line");
-        assert_eq!(
-            last.level,
-            DiagnosticLevel::Warning,
-            "not an error -- the display works -- and not an update either: {}",
-            last.message
-        );
         assert!(
-            last.message.contains("0.1.4 again"),
-            "the guest's own account of it: {}",
-            last.message
+            app.display_status("dev").expect("a derived status").updating,
+            "the refresh the click ends with is what shows the update in flight"
         );
     }
 

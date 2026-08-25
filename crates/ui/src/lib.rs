@@ -1647,12 +1647,13 @@ fn connect_offer(status: Option<&VmDisplayStatus>) -> (bool, Option<&str>) {
 
 /// Whether Update display is offered, and what the button says either way.
 ///
-/// Three facts have to line up before the guest can be asked, and the backend
-/// checks all three again before it stages anything: the VM runs, its guest has
-/// reported the payload version it has, and this release carries a different
-/// one. Which of them is missing belongs here rather than in a refusal after
-/// the click, because the click blocks until a guest has finished building a
-/// kernel module against its own kernel.
+/// Four facts have to line up before the guest can be asked, and the backend
+/// checks them again before it stages anything: the VM runs, its guest has
+/// reported the payload version it has, this release carries a different one,
+/// and no update of this VM is already running. Which of them is missing
+/// belongs here rather than in a refusal after the click: an update is minutes
+/// of a guest building a kernel module, and a person deciding whether to start
+/// one is deciding about those minutes.
 ///
 /// The sentence for a display that has nothing to report yet is the application
 /// layer's, for the reason [`connect_offer`] takes it from there: installing,
@@ -1668,6 +1669,16 @@ fn update_display_offer(state: VmState, status: Option<&VmDisplayStatus>) -> (bo
             "The display of this VM has not been reported yet".to_owned(),
         );
     };
+    // Before the versions, because they are the ones the update started from:
+    // what a second press would ask for is a version already being moved to.
+    if status.updating {
+        return (
+            false,
+            "An update of this VM is already under way; how it ended appears in the \
+             diagnostics"
+                .to_owned(),
+        );
+    }
     let Some(running) = status.running_version.as_deref() else {
         return (false, status.message.clone());
     };
@@ -1700,6 +1711,9 @@ fn display_payload_detail(status: Option<&VmDisplayStatus>) -> String {
         status.running_version.as_deref(),
         status.available_version.as_deref(),
     ) {
+        (Some(running), Some(available)) if status.updating => {
+            format!("{running} (updating to {available})")
+        }
         (Some(running), Some(available)) => format!("{running} (this release offers {available})"),
         (Some(running), None) => running.to_owned(),
         (None, Some(available)) => format!("Not reported; this release offers {available}"),
@@ -2322,6 +2336,7 @@ mod tests {
             message: message.to_owned(),
             guest: None,
             can_retry: false,
+            updating: false,
             observed_at: std::time::SystemTime::UNIX_EPOCH,
         }
     }
@@ -2398,6 +2413,31 @@ mod tests {
             "a release with nothing else to offer offers nothing"
         );
         assert!(reason.contains("0.1.5"), "{reason}");
+    }
+
+    /// An update takes minutes of a guest building a kernel module, and a
+    /// second press during them would ask for a version already being moved to.
+    #[test]
+    fn a_vm_already_updating_is_not_offered_a_second_update() {
+        let updating = VmDisplayStatus {
+            updating: true,
+            ..payload_status(Some("0.1.4"), Some("0.1.5"))
+        };
+
+        let (offered, reason) = update_display_offer(
+            VmState::Running {
+                agent_status: AgentStatus::Online,
+            },
+            Some(&updating),
+        );
+
+        assert!(!offered);
+        assert!(reason.contains("already"), "{reason}");
+        assert_eq!(
+            display_payload_detail(Some(&updating)),
+            "0.1.4 (updating to 0.1.5)",
+            "the panel says an update is under way, not that one is available"
+        );
     }
 
     /// A guest that has not reported its payload yet is explained by the

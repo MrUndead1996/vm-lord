@@ -16,8 +16,8 @@ use uuid::Uuid;
 use vmlord_core::{
     AgentStatus, Diagnostic, DiagnosticLevel, DisplayProvisioning, GpuAssignment, GpuMode,
     GuestDisplayReport, GuestReadinessTimeouts, HostGpuCapabilities, NetworkMode, RepositoryError,
-    SshAvailability, VmCreateRequest, VmDeleteRequest, VmRepository, VmState, VmSummary,
-    VmUpdateRequest,
+    SshAvailability, VmCreateRequest, VmDeleteRequest, VmDisplayFacts, VmRepository, VmState,
+    VmSummary, VmUpdateRequest,
 };
 
 use crate::{
@@ -31,7 +31,7 @@ use crate::{
     cycle::{CycleOutcome, VmBuildCycle},
     display_launches::{self, DisplayLaunches, LaunchRequest},
     display_runs::DisplayRuns,
-    display_update,
+    display_update, display_updates,
     gpu_runs::GpuRuns,
     guest_ready::ReadinessTimeouts,
     hcn::HcnNetwork,
@@ -111,6 +111,8 @@ pub struct HcsVmRepository {
     // build thread reports its failure the same way, so the diagnostics buffer
     // is both shared and interior-mutable.
     diagnostics: Arc<Mutex<Vec<Diagnostic>>>,
+    /// The display payload updates in flight, one thread each.
+    display_updates: display_updates::DisplayUpdates,
     initialized: bool,
     /// Whether the user has already been told that HCS event reporting stopped.
     ///
@@ -169,6 +171,7 @@ impl HcsVmRepository {
             force_stop: VmForceStopPipeline::production(),
             delete: VmDeletionPipeline::production(),
             diagnostics: Arc::new(Mutex::new(Vec::new())),
+            display_updates: display_updates::DisplayUpdates::default(),
             events,
             initialized: false,
             service_disconnect_reported: false,
@@ -770,6 +773,10 @@ impl HcsVmRepository {
             self.starts.contains(&mapping.vm_name),
         );
         let ip_address = self.guest_address(&mapping, state);
+        // The host's own fact about this VM's display, and the only one the
+        // guest has no way to report: a worker of ours is asking it to move a
+        // version right now.
+        let update_in_flight = self.display_updates.contains(&mapping.vm_name);
 
         VmSummary {
             name: mapping.vm_name,
@@ -782,7 +789,10 @@ impl HcsVmRepository {
             gpu: self.gpu_runs.snapshot(vm_id),
             desktop_profile,
             display_provisioning,
-            display: self.display_runs.snapshot(vm_id),
+            display: VmDisplayFacts {
+                update_in_flight,
+                ..self.display_runs.snapshot(vm_id)
+            },
             network_mode,
             ip_address,
             ssh,
@@ -1502,14 +1512,26 @@ impl VmRepository for HcsVmRepository {
         self.open_display_in_state(&mapping, state)
     }
 
-    /// Moves a running VM's display payload to the newest version this build
-    /// carries for it.
+    /// Starts moving a running VM's display payload to the newest version this
+    /// build carries for it.
     ///
-    /// Everything that can refuse does so before the guest is asked: a VM that
-    /// is not running, a release with nothing newer, a payload that will not
-    /// stage. What the guest then answers is recorded whichever way it went --
-    /// an update that rolled back is a working display on the previous version
-    /// and is worth saying so.
+    /// What is answered here is only whether the update is worth attempting: a
+    /// VM that is not running, one that records no guest, and one VMLord is not
+    /// listening for have nobody to ask, and saying so is instant. Everything
+    /// the update itself costs happens on a worker, because this is called on
+    /// the UI's thread and the guest builds a kernel module with DKMS to answer
+    /// -- minutes, not the moment a click looks like.
+    ///
+    /// So `Ok` means "an update has been started", not "the payload was
+    /// updated". The difference is not hidden: the VM is listed as updating
+    /// until the worker is done, and how it ended reaches the diagnostics the
+    /// UI already reads -- including the guest that could not verify the new
+    /// version and brought the previous one back, which is a working display
+    /// and a failed update.
+    ///
+    /// A second update of the same VM is refused while the first runs: two
+    /// would publish two versions into the one directory that VM exports and
+    /// ask one agent session twice.
     fn update_display_payload(&mut self, name: &str) -> Result<(), RepositoryError> {
         self.require_initialized()?;
         self.builds.refuse_if_building(name)?;
@@ -1521,44 +1543,76 @@ impl VmRepository for HcsVmRepository {
             )));
         };
         let state = self.reported_state(&mapping)?;
+        refuse_unless_running(
+            &mapping.vm_name,
+            state,
+            "so its display payload cannot be updated; start it first",
+        )?;
+        let vm_id = mapping.vm_id;
+        // Taken here rather than on the worker: a VM VMLord is not listening
+        // for has nobody to ask at all, and that is an answer a person is owed
+        // now rather than in a diagnostic a second later.
+        let Some(channel) = self.agent_sessions.display_update_channel(vm_id) else {
+            return Err(RepositoryError::new(format!(
+                "VMLord is not listening for the agent of VM \"{name}\""
+            )));
+        };
+
+        let vm_name = mapping.vm_name.clone();
         let vm_directory = layout::vm_directory(&self.storage_root, &mapping.vm_name)?;
         let executable_directory = std::env::current_exe()
             .ok()
             .and_then(|path| path.parent().map(Path::to_path_buf))
             .unwrap_or_default();
         let cache_root = display_update::cache_root(&self.storage_root);
-        let installed = self.display_runs.snapshot(mapping.vm_id).payload.installed;
-        let sessions = &self.agent_sessions;
-        let vm_id = mapping.vm_id;
+        let installed = self.display_runs.snapshot(vm_id).payload.installed;
+        let display_runs = self.display_runs.clone();
+        let diagnostics = Arc::clone(&self.diagnostics);
 
-        let outcome = display_update::run(&display_update::UpdateRequest {
-            vm_name: &mapping.vm_name,
-            vm_directory: &vm_directory,
-            executable_directory: &executable_directory,
-            cache_root: &cache_root,
-            guest: target.display_selector(),
-            installed,
-            running: matches!(state, Some(HcsSystemState::Running)),
-            progress: &|_| {},
-            ask: &|version| {
-                sessions
-                    .update_display_payload(vm_id, version)
-                    .unwrap_or_else(|| {
-                        Err(RepositoryError::new(format!(
-                            "VMLord is not listening for the agent of VM \"{name}\""
-                        )))
-                    })
-            },
-        })?;
+        self.display_updates.start(&mapping.vm_name, move || {
+            let outcome = display_update::run(&display_update::UpdateRequest {
+                vm_name: &vm_name,
+                vm_directory: &vm_directory,
+                executable_directory: &executable_directory,
+                cache_root: &cache_root,
+                guest: target.display_selector(),
+                installed,
+                // Checked again by the caller above, and asked for here as the
+                // module's own invariant: what it refuses, it refuses before
+                // anything is staged.
+                running: true,
+                progress: &|_| {},
+                ask: &|version| channel.ask(version),
+            });
 
-        self.display_runs.record_guest_payload(
-            vm_id,
-            outcome.payload.installed,
-            outcome.payload.previous,
-            outcome.payload.loaded,
-            outcome.failure,
-        );
-        Ok(())
+            match outcome {
+                Ok(outcome) => {
+                    // Recorded before it is reported, so that a refresh which
+                    // arrives between the two reads the versions the guest
+                    // ended up on rather than the ones it started from.
+                    display_runs.record_guest_payload(
+                        vm_id,
+                        outcome.payload.installed.clone(),
+                        outcome.payload.previous.clone(),
+                        outcome.payload.loaded.clone(),
+                        outcome.failure.clone(),
+                    );
+                    let (level, message) = display_update::report(&vm_name, &outcome);
+                    log::info!("{message}");
+                    push_shared_diagnostic(&diagnostics, level, message);
+                }
+                // Nothing was moved: an update that was refused is an update
+                // that did not happen, so there are no facts to record and only
+                // the reason to report.
+                Err(error) => {
+                    let message = format!(
+                        "Failed to update the display payload of VM \"{vm_name}\": {error}"
+                    );
+                    log::error!("{message}");
+                    push_shared_diagnostic(&diagnostics, DiagnosticLevel::Error, message);
+                }
+            }
+        })
     }
 
     /// Reads the host afresh on every call: see [`crate::discover_host_gpu`].
@@ -1679,6 +1733,10 @@ impl Drop for HcsVmRepository {
         // A launch still probing holds nothing of the repository's, but its
         // thread must not outlive the process that started it.
         self.ssh_launches.join_all();
+        // Last, and after the sessions above were cancelled: an update waiting
+        // on a guest whose session is gone finds its answer channel closed and
+        // returns, rather than sitting out the twenty minutes it was allowed.
+        self.display_updates.join_all();
     }
 }
 

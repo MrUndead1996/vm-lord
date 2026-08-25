@@ -459,6 +459,14 @@ pub struct VmDisplayFacts {
     pub failure: Option<DisplayFailure>,
     /// When that report was observed. `None` while there is none.
     pub observed_at: Option<SystemTime>,
+    /// Whether an update to a newer payload version is running right now.
+    ///
+    /// Not something the guest reported: it is the host's own fact about the
+    /// thread it started, and it is here because everything a person reads
+    /// about a display arrives through these facts. A guest builds a kernel
+    /// module to answer an update, which is minutes during which the display
+    /// keeps working and a second update must not be asked for.
+    pub update_in_flight: bool,
 }
 
 /// Which versions of the display payload are in play for one VM.
@@ -561,6 +569,12 @@ pub struct VmDisplayStatus {
     pub guest: Option<GuestDisplayDetail>,
     /// Whether installing the desktop can be attempted again from here.
     pub can_retry: bool,
+    /// Whether an update to a newer payload version is running right now.
+    ///
+    /// Beside the state rather than inside it: the display goes on working
+    /// while the guest builds the new module, so an update in flight changes
+    /// what may be asked of it and not what it is doing.
+    pub updating: bool,
     /// When the facts behind this status were observed; the time the status
     /// was derived when there are none yet.
     pub observed_at: SystemTime,
