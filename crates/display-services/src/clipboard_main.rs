@@ -90,7 +90,12 @@ pub fn run(options: Options) -> ExitCode {
         }
     };
 
-    let mut last_generation = None;
+    // The generation a channel was last bound at, and the session it belonged
+    // to. Scoped to the session on purpose: the host counts generations inside
+    // one session and starts a new one from zero, so a bare number carried
+    // across sessions would refuse every channel of every session after the
+    // first.
+    let mut last_bound: Option<(Vec<u8>, u32)> = None;
     loop {
         let Some(broker) = wait_for_broker(&options.broker_socket) else {
             continue;
@@ -98,7 +103,7 @@ pub fn run(options: Options) -> ExitCode {
 
         // One session's clipboard, then back for the next one. A viewer that
         // reconnects is a new session with a new key.
-        match serve_session(&broker, &listener, &mut last_generation) {
+        match serve_session(&broker, &listener, &mut last_bound) {
             Ok(()) => {}
             Err(reason) => eprintln!("vmlord-display-clipboard: {reason}"),
         }
@@ -128,7 +133,7 @@ fn wait_for_broker(path: &std::path::Path) -> Option<Connection> {
 fn serve_session(
     broker: &Connection,
     listener: &vsock::Listener,
-    last_generation: &mut Option<u32>,
+    last_bound: &mut Option<(Vec<u8>, u32)>,
 ) -> Result<(), String> {
     let (session_id, key) = loop {
         let (message, _) = broker
@@ -161,10 +166,10 @@ fn serve_session(
         Channel::Clipboard,
         &key,
         &session_id,
-        *last_generation,
+        guard(last_bound.as_ref(), &session_id),
     )
     .map_err(|error: BindError| format!("the clipboard channel did not bind: {error}"))?;
-    *last_generation = Some(generation);
+    *last_bound = Some((session_id.clone(), generation));
     eprintln!("vmlord-display-clipboard: the clipboard channel bound at generation {generation}");
 
     stream
@@ -172,6 +177,19 @@ fn serve_session(
         .map_err(|error| format!("the clipboard socket refused a timeout: {error}"))?;
 
     pump(&mut stream, generation)
+}
+
+/// The generation a hello has to climb past, for this session.
+///
+/// `None` for a session this daemon has not bound a channel of yet -- which
+/// includes every session after the first. The host counts generations inside
+/// one session and starts the next from zero, so carrying a bare number across
+/// sessions would refuse the first channel of every session but the first, for
+/// as long as the daemon ran.
+fn guard(last_bound: Option<&(Vec<u8>, u32)>, session_id: &[u8]) -> Option<u32> {
+    last_bound
+        .filter(|(bound, _)| bound == session_id)
+        .map(|(_, generation)| *generation)
 }
 
 /// The loop: records in, compositor events in, records out.
@@ -466,6 +484,24 @@ fn record_of(message: &Outgoing, sequence: u32, generation: u32) -> Record {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_generation_is_only_held_against_the_session_it_was_bound_in() {
+        let first = vec![1u8; 16];
+        let second = vec![2u8; 16];
+
+        assert_eq!(guard(None, &first), None, "nothing bound yet holds nothing");
+        assert_eq!(
+            guard(Some(&(first.clone(), 3)), &first),
+            Some(3),
+            "a reconnect inside one session has to climb past what it used"
+        );
+        assert_eq!(
+            guard(Some(&(first, 3)), &second),
+            None,
+            "a new session counts from zero, so the old number cannot refuse it"
+        );
+    }
 
     #[test]
     fn an_op_becomes_the_record_its_type_names() {
