@@ -6,8 +6,16 @@ license.workspace = true
 
 [dependencies]
 eframe = "0.33"
+# The UI's message catalogues, embedded at compile time from `locales/`.
+# It stops here on purpose: no other crate has text a user reads.
+rust-i18n = "3"
 vmlord-app = { path = "../app" }
 vmlord-core = { path = "../core" }
+
+[dev-dependencies]
+# Read back by the catalogue parity test, and by nothing else. The same
+# version `vmlord-core` parses `settings.toml` with.
+toml = "0.8"
 
 [lints]
 workspace = true

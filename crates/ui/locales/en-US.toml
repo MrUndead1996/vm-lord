@@ -1,0 +1,28 @@
+[common]
+cancel = "Cancel"
+save = "Save"
+browse = "Browse..."
+none = "None"
+default = "Default"
+unknown = "Unknown"
+unavailable = "Unavailable"
+disabled = "Disabled"
+
+[settings]
+title = "Application settings"
+description = "Configure where VMLord stores VM data and diagnostic logs."
+vm_storage = "VM storage"
+vm_storage_hint = "Directory for virtual machine data"
+language = "Language"
+log_file = "Log file"
+log_file_hint = "Path to the log file"
+log_level = "Log level"
+vm_storage_required = "VM storage path is required."
+log_file_required = "Log file path is required."
+
+[log_level]
+error = "Error"
+warning = "Warning"
+info = "Info"
+debug = "Debug"
+trace = "Trace"

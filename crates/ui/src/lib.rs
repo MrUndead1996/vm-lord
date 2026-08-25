@@ -6,6 +6,7 @@ use std::{
 };
 
 use eframe::egui;
+use rust_i18n::t;
 use vmlord_app::{BackendStatus, VmAction, WorkspaceApp};
 use vmlord_core::{
     AgentStatus, AppSettings, BuildProgress, BuildStep, CloudImage, DesktopProfile,
@@ -15,6 +16,11 @@ use vmlord_core::{
     VmDeleteRequest, VmDisplayStatus, VmGpuStatus, VmSource, VmState, VmSummary, VmUpdateRequest,
     ubuntu,
 };
+
+// The catalogues in `locales/`, embedded at compile time. English is the
+// fallback, so a key missing from another catalogue shows English rather than
+// its own name -- and the parity test keeps that from happening unnoticed.
+rust_i18n::i18n!("locales", fallback = "en-US");
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -52,6 +58,11 @@ const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
 const FIELD_HEIGHT: f32 = 24.0;
 
 pub fn run(application: WorkspaceApp) -> eframe::Result<()> {
+    // Settings that failed to load leave the locale at the fallback, which is
+    // where a fresh installation starts anyway.
+    if let Some(settings) = application.settings() {
+        rust_i18n::set_locale(settings.language.code());
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([960.0, 640.0]),
         ..Default::default()
@@ -173,11 +184,11 @@ impl SettingsForm {
     fn settings(&self) -> Result<AppSettings, String> {
         let vm_storage_path = self.vm_storage_path.trim();
         if vm_storage_path.is_empty() {
-            return Err("VM storage path is required.".into());
+            return Err(t!("settings.vm_storage_required").to_string());
         }
         let log_file_path = self.log_file_path.trim();
         if log_file_path.is_empty() {
-            return Err("Log file path is required.".into());
+            return Err(t!("settings.log_file_required").to_string());
         }
 
         Ok(AppSettings {
@@ -525,11 +536,15 @@ impl eframe::App for VmlordUi {
             },
             Some(SettingsDialogAction::Cancel) => self.settings_form = None,
             Some(SettingsDialogAction::Submit(settings)) => {
+                let language = settings.language;
                 if let Err(error) = self.application.update_settings(settings) {
                     if let Some(form) = &mut self.settings_form {
                         form.error = Some(error.to_string());
                     }
                 } else {
+                    // egui rebuilds every frame from the catalogue, so this is
+                    // the whole of switching language: no restart, no reload.
+                    rust_i18n::set_locale(language.code());
                     self.settings_form = None;
                 }
             }
@@ -931,63 +946,92 @@ fn render_settings_dialog(
 ) -> Option<SettingsDialogAction> {
     let mut open = true;
     let mut action = None;
-    egui::Window::new("Application settings")
+    egui::Window::new(t!("settings.title").to_string())
         .collapsible(false)
         .resizable(false)
         .default_width(600.0)
         .open(&mut open)
         .show(context, |ui| {
-            ui.label("Configure where VMLord stores VM data and diagnostic logs.");
+            ui.label(t!("settings.description").to_string());
             ui.add_space(8.0);
             egui::Grid::new("application-settings-form")
                 .num_columns(2)
                 .min_col_width(110.0)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    ui.add_sized([110.0, 24.0], egui::Label::new("VM storage"));
+                    ui.add_sized([110.0, 24.0], egui::Label::new(t!("settings.vm_storage").to_string()));
                     ui.horizontal(|ui| {
                         ui.add_sized(
                             [310.0, 24.0],
                             egui::TextEdit::singleline(&mut form.vm_storage_path)
-                                .hint_text("Directory for virtual machine data"),
+                                .hint_text(t!("settings.vm_storage_hint").to_string()),
                         );
-                        if ui.button("Browse...").clicked() {
+                        if ui.button(t!("common.browse").to_string()).clicked() {
                             action = Some(SettingsDialogAction::BrowseVmStorage);
                         }
                     });
                     ui.end_row();
 
-                    ui.add_sized([110.0, 24.0], egui::Label::new("Language"));
+                    ui.add_sized([110.0, 24.0], egui::Label::new(t!("settings.language").to_string()));
                     egui::ComboBox::from_id_salt("settings-language")
                         .width(310.0)
                         .selected_text(language_label(form.language))
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut form.language, Language::EnUs, "English (US)");
+                            ui.selectable_value(
+                                &mut form.language,
+                                Language::EnUs,
+                                language_label(Language::EnUs),
+                            );
+                            ui.selectable_value(
+                                &mut form.language,
+                                Language::RuRu,
+                                language_label(Language::RuRu),
+                            );
                         });
                     ui.end_row();
 
-                    ui.add_sized([110.0, 24.0], egui::Label::new("Log file"));
+                    ui.add_sized([110.0, 24.0], egui::Label::new(t!("settings.log_file").to_string()));
                     ui.horizontal(|ui| {
                         ui.add_sized(
                             [310.0, 24.0],
                             egui::TextEdit::singleline(&mut form.log_file_path)
-                                .hint_text("Path to the log file"),
+                                .hint_text(t!("settings.log_file_hint").to_string()),
                         );
-                        if ui.button("Browse...").clicked() {
+                        if ui.button(t!("common.browse").to_string()).clicked() {
                             action = Some(SettingsDialogAction::BrowseLogFile);
                         }
                     });
                     ui.end_row();
 
-                    ui.add_sized([110.0, 24.0], egui::Label::new("Log level"));
+                    ui.add_sized([110.0, 24.0], egui::Label::new(t!("settings.log_level").to_string()));
                     egui::ComboBox::from_id_salt("settings-log-level")
                         .selected_text(log_level_label(form.log_level))
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut form.log_level, LogLevel::Error, "Error");
-                            ui.selectable_value(&mut form.log_level, LogLevel::Warn, "Warning");
-                            ui.selectable_value(&mut form.log_level, LogLevel::Info, "Info");
-                            ui.selectable_value(&mut form.log_level, LogLevel::Debug, "Debug");
-                            ui.selectable_value(&mut form.log_level, LogLevel::Trace, "Trace");
+                            ui.selectable_value(
+                                &mut form.log_level,
+                                LogLevel::Error,
+                                log_level_label(LogLevel::Error),
+                            );
+                            ui.selectable_value(
+                                &mut form.log_level,
+                                LogLevel::Warn,
+                                log_level_label(LogLevel::Warn),
+                            );
+                            ui.selectable_value(
+                                &mut form.log_level,
+                                LogLevel::Info,
+                                log_level_label(LogLevel::Info),
+                            );
+                            ui.selectable_value(
+                                &mut form.log_level,
+                                LogLevel::Debug,
+                                log_level_label(LogLevel::Debug),
+                            );
+                            ui.selectable_value(
+                                &mut form.log_level,
+                                LogLevel::Trace,
+                                log_level_label(LogLevel::Trace),
+                            );
                         });
                     ui.end_row();
                 });
@@ -1000,8 +1044,11 @@ fn render_settings_dialog(
             ui.separator();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let save = ui.add(
-                    egui::Button::new(egui::RichText::new("Save").color(egui::Color32::WHITE))
-                        .fill(egui::Color32::from_rgb(47, 158, 97))
+                    egui::Button::new(
+                        egui::RichText::new(t!("common.save").to_string())
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(47, 158, 97))
                         .min_size(egui::vec2(88.0, 30.0)),
                 );
                 if save.clicked() {
@@ -1011,9 +1058,12 @@ fn render_settings_dialog(
                     }
                 }
                 let cancel = ui.add(
-                    egui::Button::new(egui::RichText::new("Cancel").color(egui::Color32::WHITE))
-                        .fill(egui::Color32::from_rgb(100, 100, 100))
-                        .min_size(egui::vec2(88.0, 30.0)),
+                    egui::Button::new(
+                        egui::RichText::new(t!("common.cancel").to_string())
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(100, 100, 100))
+                    .min_size(egui::vec2(88.0, 30.0)),
                 );
                 if cancel.clicked() {
                     action = Some(SettingsDialogAction::Cancel);
@@ -1332,19 +1382,23 @@ fn edit_vm_request(form: &EditVmForm) -> Result<VmUpdateRequest, String> {
     })
 }
 
-fn log_level_label(level: LogLevel) -> &'static str {
+fn log_level_label(level: LogLevel) -> String {
     match level {
-        LogLevel::Error => "Error",
-        LogLevel::Warn => "Warning",
-        LogLevel::Info => "Info",
-        LogLevel::Debug => "Debug",
-        LogLevel::Trace => "Trace",
+        LogLevel::Error => t!("log_level.error"),
+        LogLevel::Warn => t!("log_level.warning"),
+        LogLevel::Info => t!("log_level.info"),
+        LogLevel::Debug => t!("log_level.debug"),
+        LogLevel::Trace => t!("log_level.trace"),
     }
+    .to_string()
 }
 
+/// Each language is named in itself, and neither name is translated: a user
+/// who cannot read the language on screen has to find their own in this list.
 fn language_label(language: Language) -> &'static str {
     match language {
         Language::EnUs => "English (US)",
+        Language::RuRu => "Русский",
     }
 }
 
@@ -2413,6 +2467,70 @@ fn vm_state(state: VmState) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use rust_i18n::t;
+
+    /// Every key of one catalogue exists in the other.
+    ///
+    /// A forgotten translation would otherwise fall back to English silently,
+    /// which looks like a rendering bug months later rather than a missing
+    /// line in a pull request.
+    #[test]
+    fn the_catalogues_agree_on_their_keys() {
+        let english = catalogue_keys(include_str!("../locales/en-US.toml"));
+        let russian = catalogue_keys(include_str!("../locales/ru-RU.toml"));
+
+        let missing_in_russian: Vec<_> = english.difference(&russian).collect();
+        let missing_in_english: Vec<_> = russian.difference(&english).collect();
+
+        assert!(
+            missing_in_russian.is_empty(),
+            "not translated: {missing_in_russian:?}"
+        );
+        assert!(
+            missing_in_english.is_empty(),
+            "no English original: {missing_in_english:?}"
+        );
+    }
+
+    /// The dotted paths of every string in a catalogue.
+    fn catalogue_keys(document: &str) -> std::collections::BTreeSet<String> {
+        fn walk(
+            prefix: &str,
+            value: &toml::Value,
+            keys: &mut std::collections::BTreeSet<String>,
+        ) {
+            match value {
+                toml::Value::Table(table) => {
+                    for (key, value) in table {
+                        let path = if prefix.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{prefix}.{key}")
+                        };
+                        walk(&path, value, keys);
+                    }
+                }
+                _ => {
+                    keys.insert(prefix.to_string());
+                }
+            }
+        }
+
+        let document: toml::Value = document.parse().expect("catalogue parses");
+        let mut keys = std::collections::BTreeSet::new();
+        walk("", &document, &mut keys);
+        keys
+    }
+
+    #[test]
+    fn the_settings_dialog_is_translated() {
+        assert_eq!(t!("settings.title", locale = "ru-RU"), "Настройки приложения");
+        assert_ne!(
+            t!("settings.title", locale = "ru-RU"),
+            t!("settings.title", locale = "en-US")
+        );
+    }
+
     #[test]
     fn a_record_is_shown_with_its_moment_its_vm_and_its_code() {
         // The panel exists to be lined up against `vmlord.log`; without the

@@ -1,0 +1,28 @@
+[common]
+cancel = "Отмена"
+save = "Сохранить"
+browse = "Обзор..."
+none = "Нет"
+default = "По умолчанию"
+unknown = "Неизвестно"
+unavailable = "Недоступно"
+disabled = "Отключено"
+
+[settings]
+title = "Настройки приложения"
+description = "Где VMLord хранит данные виртуальных машин и журналы диагностики."
+vm_storage = "Хранилище ВМ"
+vm_storage_hint = "Каталог для данных виртуальных машин"
+language = "Язык"
+log_file = "Файл журнала"
+log_file_hint = "Путь к файлу журнала"
+log_level = "Уровень журнала"
+vm_storage_required = "Укажите путь к хранилищу ВМ."
+log_file_required = "Укажите путь к файлу журнала."
+
+[log_level]
+error = "Ошибки"
+warning = "Предупреждения"
+info = "Информация"
+debug = "Отладка"
+trace = "Трассировка"
