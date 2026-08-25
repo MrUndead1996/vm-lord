@@ -616,7 +616,7 @@ fn render_create_vm_dialog(
 ) -> Option<CreateVmDialogAction> {
     let mut open = true;
     let mut action = None;
-    egui::Window::new("New Linux VM")
+    egui::Window::new(t!("create_vm.title").to_string())
         .collapsible(false)
         .resizable(false)
         .default_width(620.0)
@@ -628,31 +628,29 @@ fn render_create_vm_dialog(
             egui::ScrollArea::vertical()
                 .max_height(420.0)
                 .show(ui, |ui| {
-                    ui.label("Create a persistent Linux workspace.");
+                    ui.label(t!("create_vm.description").to_string());
                     ui.add_space(8.0);
 
                     ui.horizontal(|ui| {
-                        ui.strong("System");
+                        ui.strong(t!("create_vm.system").to_string());
                         ui.radio_value(
                             &mut form.source_kind,
                             SourceKind::CloudImage,
-                            "Cloud image (ready to use)",
+                            t!("create_vm.cloud_image").to_string(),
                         );
                         ui.radio_value(
                             &mut form.source_kind,
                             SourceKind::LocalMedia,
-                            "Own ISO (installed by hand)",
+                            t!("create_vm.own_iso").to_string(),
                         );
                     });
                     match form.source_kind {
-                        SourceKind::CloudImage => ui.small(
-                            "The image is downloaded once and configured on the first boot: \
-                             the user below, their login and the guest settings.",
-                        ),
-                        SourceKind::LocalMedia => ui.small(
-                            "The installer runs in the VM and asks for the user, the password \
-                             and the guest settings itself, so VMLord configures none of them.",
-                        ),
+                        SourceKind::CloudImage => {
+                            ui.small(t!("create_vm.cloud_image_note").to_string())
+                        }
+                        SourceKind::LocalMedia => {
+                            ui.small(t!("create_vm.own_iso_note").to_string())
+                        }
                     };
 
                     ui.add_space(8.0);
@@ -660,7 +658,7 @@ fn render_create_vm_dialog(
                         .num_columns(2)
                         .spacing([12.0, 8.0])
                         .show(ui, |ui| {
-                            ui.label("VM Name");
+                            ui.label(t!("create_vm.vm_name").to_string());
                             ui.add_sized(
                                 [260.0, FIELD_HEIGHT],
                                 egui::TextEdit::singleline(&mut form.name),
@@ -669,7 +667,7 @@ fn render_create_vm_dialog(
 
                             match form.source_kind {
                                 SourceKind::CloudImage => {
-                                    ui.label("Distribution");
+                                    ui.label(t!("create_vm.distribution").to_string());
                                     // One entry until distribution profiles are read
                                     // from a file (#67); the guest's account name and
                                     // its admin group come from the same profile.
@@ -680,7 +678,7 @@ fn render_create_vm_dialog(
                                         });
                                     ui.end_row();
 
-                                    ui.label("Release");
+                                    ui.label(t!("create_vm.release").to_string());
                                     egui::ComboBox::from_id_salt("create-vm-release")
                                         .selected_text(release_label(&form.release))
                                         .show_ui(ui, |ui| {
@@ -695,14 +693,14 @@ fn render_create_vm_dialog(
                                     ui.end_row();
                                 }
                                 SourceKind::LocalMedia => {
-                                    ui.label("OS Image");
+                                    ui.label(t!("create_vm.os_image").to_string());
                                     ui.horizontal(|ui| {
                                         ui.add_sized(
                                             [300.0, FIELD_HEIGHT],
                                             egui::TextEdit::singleline(&mut form.image_path)
-                                                .hint_text("Path to ISO or VHDX..."),
+                                                .hint_text(t!("create_vm.os_image_hint").to_string()),
                                         );
-                                        if ui.button("Browse...").clicked() {
+                                        if ui.button(t!("common.browse").to_string()).clicked() {
                                             action = Some(CreateVmDialogAction::BrowseImage);
                                         }
                                     });
@@ -710,14 +708,14 @@ fn render_create_vm_dialog(
                                 }
                             }
 
-                            ui.label("HDD Size");
+                            ui.label(t!("create_vm.hdd_size").to_string());
                             ui.horizontal(|ui| {
                                 ui.add(egui::DragValue::new(&mut form.disk_gb).range(1..=16_384));
                                 ui.label("GiB");
                             });
                             ui.end_row();
 
-                            ui.label("RAM Size");
+                            ui.label(t!("create_vm.ram_size").to_string());
                             ui.horizontal(|ui| {
                                 ui.add(
                                     egui::DragValue::new(&mut form.ram_mb).range(512..=1_048_576),
@@ -726,7 +724,7 @@ fn render_create_vm_dialog(
                             });
                             ui.end_row();
 
-                            ui.label("CPU Cores");
+                            ui.label(t!("create_vm.cpu_cores").to_string());
                             ui.add(egui::DragValue::new(&mut form.cpu_cores).range(1..=256));
                             ui.end_row();
 
@@ -737,14 +735,18 @@ fn render_create_vm_dialog(
                                     ui.selectable_value(
                                         &mut form.gpu_mode,
                                         GpuMode::Default,
-                                        "Default",
+                                        gpu_mode_label(GpuMode::Default),
                                     );
                                     ui.selectable_value(
                                         &mut form.gpu_mode,
                                         GpuMode::Mirror,
-                                        "Mirror",
+                                        gpu_mode_label(GpuMode::Mirror),
                                     );
-                                    ui.selectable_value(&mut form.gpu_mode, GpuMode::None, "None");
+                                    ui.selectable_value(
+                                        &mut form.gpu_mode,
+                                        GpuMode::None,
+                                        gpu_mode_label(GpuMode::None),
+                                    );
                                 });
                             ui.end_row();
 
@@ -758,7 +760,7 @@ fn render_create_vm_dialog(
                             // hand-installed system gets no seed of VMLord's,
                             // so there would be nothing to install it with.
                             if form.source_kind == SourceKind::CloudImage {
-                                ui.label("Desktop");
+                                ui.label(t!("create_vm.desktop").to_string());
                                 egui::ComboBox::from_id_salt("create-vm-desktop")
                                     .selected_text(desktop_profile_label(form.desktop))
                                     .show_ui(ui, |ui| {
@@ -785,19 +787,19 @@ fn render_create_vm_dialog(
                                 }
                             }
 
-                            ui.label("Network");
+                            ui.label(t!("create_vm.network").to_string());
                             egui::ComboBox::from_id_salt("create-vm-network")
                                 .selected_text(network_mode_label(form.network_mode))
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(
                                         &mut form.network_mode,
                                         NetworkMode::Nat,
-                                        "NAT",
+                                        network_mode_label(NetworkMode::Nat),
                                     );
                                     ui.selectable_value(
                                         &mut form.network_mode,
                                         NetworkMode::None,
-                                        "None",
+                                        network_mode_label(NetworkMode::None),
                                     );
                                 });
                             ui.end_row();
@@ -806,7 +808,7 @@ fn render_create_vm_dialog(
                     if form.source_kind == SourceKind::CloudImage {
                         ui.add_space(10.0);
                         ui.separator();
-                        ui.strong("Guest");
+                        ui.strong(t!("create_vm.guest").to_string());
                         ui.add_space(4.0);
                         render_provisioning_fields(ui, form, ssh_key_path);
                     }
@@ -820,8 +822,11 @@ fn render_create_vm_dialog(
             ui.separator();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let create = ui.add(
-                    egui::Button::new(egui::RichText::new("Create VM").color(egui::Color32::WHITE))
-                        .fill(egui::Color32::from_rgb(47, 158, 97)),
+                    egui::Button::new(
+                        egui::RichText::new(t!("app.create_vm").to_string())
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(47, 158, 97)),
                 );
                 if create.clicked() {
                     match create_vm_request(form, existing_vms) {
@@ -831,7 +836,7 @@ fn render_create_vm_dialog(
                         Err(error) => form.error = Some(error),
                     }
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button(t!("common.cancel").to_string()).clicked() {
                     action = Some(CreateVmDialogAction::Cancel);
                 }
             });
@@ -854,42 +859,34 @@ fn render_provisioning_fields(
         .num_columns(2)
         .spacing([12.0, 8.0])
         .show(ui, |ui| {
-            ui.label("User name");
+            ui.label(t!("create_vm.user_name").to_string());
             ui.add_sized(
                 [260.0, FIELD_HEIGHT],
                 egui::TextEdit::singleline(&mut form.username),
             );
             ui.end_row();
 
-            ui.label("Password");
+            ui.label(t!("create_vm.password").to_string());
             ui.vertical(|ui| {
                 ui.add_sized(
                     [260.0, FIELD_HEIGHT],
                     egui::TextEdit::singleline(&mut form.password)
                         .password(true)
-                        .hint_text("Optional"),
+                        .hint_text(t!("create_vm.password_optional").to_string()),
                 );
                 if form.password.is_empty() {
-                    ui.small(
-                        "No password: the guest is reachable by SSH key only, \
-                         and password logins are turned off. The COM1 console \
-                         cannot log in either, so a guest whose network fails \
-                         is out of reach.",
-                    );
+                    ui.small(t!("create_vm.no_password_note").to_string());
                 }
             });
             ui.end_row();
 
             ui.label("SSH");
             ui.vertical(|ui| {
-                ui.checkbox(&mut form.ssh_enabled, "Run an SSH server in the guest");
+                ui.checkbox(&mut form.ssh_enabled, t!("create_vm.ssh_server").to_string());
                 ui.add_enabled_ui(form.ssh_enabled, |ui| {
-                    ui.checkbox(
-                        &mut form.deploy_key,
-                        "Generate a key pair for this VM and install the public half",
-                    );
+                    ui.checkbox(&mut form.deploy_key, t!("create_vm.ssh_key").to_string());
                     ui.horizontal(|ui| {
-                        ui.label("Port");
+                        ui.label(t!("create_vm.port").to_string());
                         // The range is the domain's own `1..=65535`, and the
                         // widget clamps to it, so the field cannot be dragged
                         // to a port nothing can be reached on. A typed 0 is
@@ -902,47 +899,44 @@ fn render_provisioning_fields(
                         );
                     });
                     if form.ssh_port != SshPort::DEFAULT.get() {
-                        ui.small(
-                            "The port is fixed when the VM is created; \
-                             connections VMLord opens use it automatically.",
-                        );
+                        ui.small(t!("create_vm.port_note").to_string());
                     }
                 });
                 if form.ssh_enabled && form.deploy_key {
                     match ssh_key_path {
                         Some(path) => {
-                            ui.small(format!("Private key: {}", path.display()));
+                            ui.small(t!("create_vm.private_key", path = path.display()).to_string());
                         }
                         None => {
-                            ui.small("The private key is stored in the VM's own folder.");
+                            ui.small(t!("create_vm.private_key_note").to_string());
                         }
                     }
                 }
             });
             ui.end_row();
 
-            ui.label("Locale");
+            ui.label(t!("create_vm.locale").to_string());
             ui.add_sized(
                 [260.0, FIELD_HEIGHT],
                 egui::TextEdit::singleline(&mut form.locale),
             );
             ui.end_row();
 
-            ui.label("Keyboard layout");
+            ui.label(t!("create_vm.keyboard").to_string());
             ui.add_sized(
                 [260.0, FIELD_HEIGHT],
                 egui::TextEdit::singleline(&mut form.keyboard),
             );
             ui.end_row();
 
-            ui.label("Timezone");
+            ui.label(t!("create_vm.timezone").to_string());
             ui.add_sized(
                 [260.0, FIELD_HEIGHT],
                 egui::TextEdit::singleline(&mut form.timezone),
             );
             ui.end_row();
         });
-    ui.small("The three settings above are filled in from this computer and applied to the guest.");
+    ui.small(t!("create_vm.guest_defaults_note").to_string());
 }
 
 fn render_settings_dialog(
@@ -1293,7 +1287,7 @@ fn create_vm_request(
         .iter()
         .any(|vm| vm.name.eq_ignore_ascii_case(name))
     {
-        return Err("A VM with this name already exists.".into());
+        return Err(t!("create_vm.name_taken").to_string());
     }
 
     let request = VmCreateRequest {
@@ -1352,7 +1346,12 @@ fn create_vm_source(form: &CreateVmForm) -> Result<VmSource, String> {
 
 /// Names a release the way the distribution does.
 fn release_label(release: &str) -> String {
-    format!("{} {release} LTS", ubuntu().name)
+    t!(
+        "create_vm.release_label",
+        distribution = ubuntu().name,
+        release = release
+    )
+    .to_string()
 }
 
 fn edit_vm_request(form: &EditVmForm) -> Result<VmUpdateRequest, String> {
@@ -1470,17 +1469,10 @@ fn gpu_capability_warnings(
 
     let mut warnings = Vec::new();
     if !capabilities.assignment.is_available() {
-        warnings.push(
-            "This host presents no GPU partition adapter, so the VM will start without a GPU."
-                .to_owned(),
-        );
+        warnings.push(t!("create_vm.no_gpu_adapter").to_string());
     }
     if !capabilities.linux_payload.is_available() {
-        warnings.push(
-            "The Linux GPU userspace is not installed on this host, so the guest will see the \
-             device but will not render on it."
-                .to_owned(),
-        );
+        warnings.push(t!("create_vm.no_linux_payload").to_string());
     }
     warnings
 }
