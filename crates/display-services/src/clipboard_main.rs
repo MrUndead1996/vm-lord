@@ -81,7 +81,7 @@ impl Options {
 /// that is still booting.
 #[must_use]
 pub fn run(options: Options) -> ExitCode {
-    let listener = match vsock::Listener::bind(CLIPBOARD_PORT) {
+    let listener = match wait_for_port() {
         Ok(listener) => listener,
         Err(error) => {
             eprintln!("vmlord-display-clipboard: this guest has no vsock: {error}");
@@ -106,6 +106,30 @@ pub fn run(options: Options) -> ExitCode {
         match serve_session(&broker, &listener, &mut last_bound) {
             Ok(()) => {}
             Err(reason) => eprintln!("vmlord-display-clipboard: {reason}"),
+        }
+    }
+}
+
+/// Takes the clipboard port, waiting for whoever holds it to let go.
+///
+/// The unit is enabled for every user, so the greeter's own graphical session
+/// runs one of these too, and for a few seconds after a login there are two.
+/// Exiting on that would spend the restart budget on the ordinary shape of
+/// logging in; waiting costs nothing, because a daemon that is not serving the
+/// clipboard has nothing else to do. Anything other than a taken port is a
+/// guest this cannot run on, and that is worth exiting over.
+///
+/// # Errors
+///
+/// The bind error, for every reason except the port already being held.
+fn wait_for_port() -> std::io::Result<vsock::Listener> {
+    loop {
+        match vsock::Listener::bind(CLIPBOARD_PORT) {
+            Ok(listener) => return Ok(listener),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                std::thread::sleep(RETRY);
+            }
+            Err(error) => return Err(error),
         }
     }
 }
