@@ -23,6 +23,7 @@
 //! [`vmlord_display_protocol::clipboard`]; this only speaks to the compositor.
 
 use std::{
+    collections::HashMap,
     error::Error,
     fmt,
     io::{self, Read},
@@ -158,7 +159,9 @@ impl Clipboard {
     ///
     /// [`MutterError::Bus`] if the call is refused.
     pub fn listen(&self) -> Result<(), MutterError> {
-        let options: Vec<(&str, Value<'_>)> = Vec::new();
+        // A map, not a list of pairs: these options are `a{sv}` on the wire,
+        // and a `Vec` of tuples serialises as `a(sv)`, which mutter refuses.
+        let options: HashMap<&str, Value<'_>> = HashMap::new();
 
         self.session
             .call::<_, _, ()>("EnableClipboard", &(options,))?;
@@ -173,7 +176,7 @@ impl Clipboard {
     /// [`MutterError::Bus`] if the call is refused.
     pub fn own(&self, kinds: &[Kind]) -> Result<(), MutterError> {
         let mimes: Vec<&str> = kinds.iter().map(|kind| kind.mime()).collect();
-        let options = vec![("mime-types", Value::from(mimes))];
+        let options = HashMap::from([("mime-types", Value::from(mimes))]);
 
         self.session.call::<_, _, ()>("SetSelection", &(options,))?;
 
@@ -259,8 +262,7 @@ fn pump_signals(signals: MessageIterator, sender: &Sender<Event>) {
 /// this daemon caused comes back as one of these, and forwarding it would put
 /// what the host just sent straight back on the wire.
 fn owner_changed(message: &zbus::Message) -> Option<Event> {
-    let options: std::collections::HashMap<String, zbus::zvariant::OwnedValue> =
-        message.body().deserialize().ok()?;
+    let options: HashMap<String, zbus::zvariant::OwnedValue> = message.body().deserialize().ok()?;
 
     let owned = options
         .get("session-is-owner")
@@ -270,9 +272,9 @@ fn owner_changed(message: &zbus::Message) -> Option<Event> {
         return None;
     }
 
-    let mimes: Vec<String> = options
+    let mimes = options
         .get("mime-types")
-        .and_then(|value| Vec::<String>::try_from(value.clone()).ok())
+        .map(strings_in)
         .unwrap_or_default();
     let kinds = kinds_of(&mimes);
     if kinds.is_empty() {
@@ -287,6 +289,23 @@ fn transfer(message: &zbus::Message) -> Option<Event> {
     let (mime, serial): (String, u32) = message.body().deserialize().ok()?;
 
     Kind::from_mime(&mime).map(|kind| Event::Transfer { kind, serial })
+}
+
+/// The strings inside one `a{sv}` value, whatever it is wrapped in.
+///
+/// The value arrives as a variant holding an array, and a direct conversion to
+/// `Vec<String>` does not see through that wrapping: it answers with nothing,
+/// which would make every offer look like an offer of no formats at all.
+fn strings_in(value: &zbus::zvariant::OwnedValue) -> Vec<String> {
+    let array = match zbus::zvariant::Array::try_from(value.clone()) {
+        Ok(array) => array,
+        Err(_) => return Vec::new(),
+    };
+
+    array
+        .iter()
+        .filter_map(|element| String::try_from(element.try_clone().ok()?).ok())
+        .collect()
 }
 
 /// The kinds these mime types name, in the protocol's canonical order.
