@@ -62,13 +62,26 @@ without the diagnostics layer: neither has a panel to show them in.
 
 ### What this removes
 
-* `VmRepository::take_diagnostics` leaves the trait. Diagnostics were never a
-  property of the repository.
+* `VmRepository::take_diagnostics` becomes `VmRepository::refresh(&mut self)`
+  and returns nothing. Diagnostics were never a property of the repository, but
+  taking them was this method's side occupation rather than its job: it is the
+  one `&mut self` call the application makes on every refresh, and it is where
+  `builds.take_started` and `starts.take_started` adopt finished work,
+  `record_installed_desktops` writes down desktops that appeared,
+  `finish_shutdowns` releases the handles of answered shutdowns, and
+  `watch::drain_events` reaps HCS events and closes the windows of VMs that
+  died. All of that stays exactly where it is; only the return value goes,
+  because the records it used to carry now travel as events. The name matches
+  `app::refresh`, which is its only caller -- one action read at two layers.
+  `platform/tests/hyperv.rs` and `platform/tests/gpu_e2e.rs`, which call it for
+  the list it returns, call `refresh()` and read a test sink instead.
 * `Repository::diagnostics`, `push_diagnostic`, `push_shared_diagnostic`, and
   the `Diagnostics` alias in `display_launches.rs` go entirely. A worker thread
   that needed a clone of the shared buffer now writes `warn!` and is done; the
   plumbing that carried the handle disappears with it.
 * `app::collect_diagnostics`. `app::diagnostics` remains, reading the sink.
+  Every site that called `collect_diagnostics` calls `repository.refresh()`
+  instead, so the housekeeping keeps happening exactly as often as before.
 
 ### Test subscribers
 
