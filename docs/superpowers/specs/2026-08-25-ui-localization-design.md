@@ -38,6 +38,7 @@ use rust_i18n::t;
 rust_i18n::i18n!("locales", fallback = "en-US");
 ```
 
+`rust-i18n = "3"` is a dependency of `vmlord-ui` alone.
 The macro reads both files at compile time and embeds them, so the shipped
 `vmlord.exe` still needs nothing beside it. Nothing outside `vmlord-ui`
 depends on `rust-i18n`: `core`, `app` and `platform` do not know that the
@@ -81,9 +82,9 @@ thing the UI needs to drive `rust-i18n` and the only place the tag is spelled.
 before it opens the window. Settings that failed to load leave the locale at
 `en-US`, which is where the fallback already points.
 
-The settings dialog is where the language changes. `SettingsDialogAction::
-Submit` already hands the rebuilt `AppSettings` to `WorkspaceApp::
-update_settings`; on success it now also calls `set_locale`. egui redraws the
+The settings dialog is where the language changes. The `Submit` arm of
+`SettingsDialogAction` already hands the rebuilt `AppSettings` to
+`WorkspaceApp::update_settings`; on success it now also calls `set_locale`. egui redraws the
 whole frame from the catalogue on every pass, so the interface changes language
 under the Save button with no restart and no reload.
 
