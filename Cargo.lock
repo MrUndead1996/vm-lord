@@ -4780,6 +4780,7 @@ version = "0.1.0"
 dependencies = [
  "serde_yaml_ng",
  "tracing",
+ "tracing-subscriber",
  "vmlord-agent-protocol",
  "vmlord-core",
 ]

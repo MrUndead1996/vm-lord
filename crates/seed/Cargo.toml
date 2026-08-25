@@ -12,6 +12,9 @@ vmlord-core = { path = "../core" }
 vmlord-agent-protocol = { path = "../agent-protocol" }
 
 [dev-dependencies]
+# The scoped subscriber the redaction guard installs: it asserts what a record
+# does not contain, which needs somewhere to read records back from.
+tracing-subscriber.workspace = true
 # Production prints the document by hand; the tests read it back the way
 # cloud-init's PyYAML does, so they assert on meaning rather than on bytes.
 serde_yaml_ng = "0.10"
