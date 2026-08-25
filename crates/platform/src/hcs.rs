@@ -148,7 +148,7 @@ impl HcsStartFailure {
 }
 
 /// Classifies a call HCS refused outright.
-fn call_failure(operation: &str, id: &str, error: windows::core::Error) -> HcsStartFailure {
+fn call_failure(operation: &'static str, id: &str, error: windows::core::Error) -> HcsStartFailure {
     let endpoint_busy = error.code() == HCN_E_ENDPOINT_ALREADY_ATTACHED;
     let error = windows_error(operation, Some(id), error);
     tracing::error!("{error}");
@@ -161,7 +161,7 @@ fn call_failure(operation: &str, id: &str, error: windows::core::Error) -> HcsSt
 
 /// Classifies an operation HCS accepted and then failed.
 fn operation_failure(
-    operation: &str,
+    operation: &'static str,
     id: &str,
     timeout: Duration,
     failure: WaitFailure,

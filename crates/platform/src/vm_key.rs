@@ -256,7 +256,11 @@ fn apply_security_descriptor(path: &Path, sddl: &str) -> Result<(), RepositoryEr
         .map_err(|error| fail("set the file's security descriptor", Some(path), error))
 }
 
-fn fail(operation: &str, path: Option<&Path>, error: windows::core::Error) -> RepositoryError {
+fn fail(
+    operation: &'static str,
+    path: Option<&Path>,
+    error: windows::core::Error,
+) -> RepositoryError {
     let error = match path {
         Some(path) => {
             let described = windows_error(operation, None, error);

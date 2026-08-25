@@ -3,10 +3,12 @@
 mod diagnostics;
 pub mod display;
 pub mod distro;
+mod error;
 pub mod gpu;
 mod logging;
 
 pub use diagnostics::{DiagnosticsLayer, DiagnosticsSink, Subsystem};
+pub use error::RepositoryError;
 pub mod progress;
 pub mod provisioning;
 pub mod settings;
@@ -41,8 +43,6 @@ pub use settings::{
     AppSettings, GuestReadinessTimeouts, Language, LogLevel, SettingsError, SettingsStore,
 };
 pub use ssh::{SshAuthentication, SshAvailability, SshConfig, SshEndpoint, SshPort};
-
-use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -233,28 +233,6 @@ pub enum DiagnosticLevel {
     Warning,
     Error,
 }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RepositoryError {
-    message: String,
-}
-
-impl RepositoryError {
-    #[must_use]
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl fmt::Display for RepositoryError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for RepositoryError {}
 
 pub trait VmRepository {
     fn initialize(&mut self) -> Result<(), RepositoryError>;

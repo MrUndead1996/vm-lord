@@ -4,18 +4,11 @@ use windows::core::Error;
 /// Converts a Windows HRESULT to an error suitable for the repository boundary.
 #[must_use]
 pub fn hresult_to_repository_error(
-    operation: &str,
+    operation: &'static str,
     vm_name: Option<&str>,
     hresult: i32,
 ) -> RepositoryError {
-    let target = vm_name
-        .map(|name| format!(" for VM \"{name}\""))
-        .unwrap_or_default();
-
-    RepositoryError::new(format!(
-        "Windows API operation \"{operation}\"{target} failed (HRESULT 0x{:08X})",
-        hresult as u32
-    ))
+    RepositoryError::windows(operation, vm_name, hresult as u32, "")
 }
 
 /// Converts a `windows-rs` error while retaining the failed operation and VM.
@@ -25,16 +18,11 @@ pub fn hresult_to_repository_error(
 /// takes a table that is not in this repository.
 #[must_use]
 pub(crate) fn windows_error(
-    operation: &str,
+    operation: &'static str,
     vm_name: Option<&str>,
     error: Error,
 ) -> RepositoryError {
-    let described = hresult_to_repository_error(operation, vm_name, error.code().0);
-    let message = error.message();
-    if message.is_empty() {
-        return described;
-    }
-    RepositoryError::new(format!("{described}: {message}"))
+    RepositoryError::windows(operation, vm_name, error.code().0 as u32, error.message())
 }
 
 #[cfg(test)]
