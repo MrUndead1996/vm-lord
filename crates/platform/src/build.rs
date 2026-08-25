@@ -458,8 +458,8 @@ mod tests {
     /// anything else to be called.
     ///
     /// It did not: the entry was removed only by `reap`, which runs from
-    /// `take_diagnostics`. A cancelled build therefore kept its `Building` row
-    /// until something asked for diagnostics, and a build that succeeded was
+    /// `refresh`. A cancelled build therefore kept its `Building` row until
+    /// something asked for a refresh, and a build that succeeded was
     /// listed twice in the meantime -- once from the metadata store it had just
     /// been written to, and once from here.
     #[test]
