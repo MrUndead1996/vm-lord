@@ -1,0 +1,37 @@
+[Unit]
+Description=VMLord display clipboard
+Documentation=https://github.com/mrundead/vmlord
+# A user unit, and it has to be: a selection exists inside a compositor, and
+# only a process in the user's session can reach that user's session bus, which
+# is where mutter answers. The two system units cannot see a clipboard at all.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+# The crash-loop budget. It belongs to the unit and not to the service:
+# systemd reads these two here, and answers them under [Service] with
+# `Unknown key ... ignoring` -- a rate limit that silently is not one.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+ExecStart=/usr/local/lib/vmlord/vmlord-display-clipboard
+# The broker's socket may not exist yet and no session may be open; waiting for
+# both is the daemon's own job, so a restart here means it actually failed.
+Restart=on-failure
+RestartSec=3
+# It holds one channel key and speaks to one bus. A user unit inherits no
+# privilege to give away, and these keep it from acquiring any.
+NoNewPrivileges=yes
+# No `PrivateTmp`, deliberately. It would give this daemon a mount namespace
+# of its own, which on Ubuntu 24.04 and newer puts it under the
+# `unprivileged_userns` AppArmor profile -- and that profile cannot resolve
+# `/run/vmlord/display-clipboard.sock` from inside the namespace, so every
+# connect is denied with a "disconnected path". Hardening that buys nothing
+# here (this process never touches `/tmp`) and costs the whole clipboard.
+RestrictAddressFamilies=AF_VSOCK AF_UNIX
+RestrictNamespaces=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=graphical-session.target

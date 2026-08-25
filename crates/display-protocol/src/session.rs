@@ -10,7 +10,7 @@
 //!
 //! A session need not be run by the process that opened it.
 //! [`Session::established_host`] takes a [`HandedOver`] -- what the handshake
-//! settled on, the session id, two channel keys and the control sequence -- and
+//! settled on, the session id, three channel keys and the control sequence -- and
 //! produces the established host half without a secret. That is how VMLord
 //! keeps the VM's secret while the viewer keeps the sockets, and it is the
 //! host's mirror of what the guest's broker does for its capture process.
@@ -139,8 +139,8 @@ pub struct Session {
     pending: Option<Negotiated>,
     pending_auth: Option<Record>,
     control_sequence: u32,
-    /// Per channel, in `Channel` order: frame then input.
-    channels: [ChannelState; 2],
+    /// Per channel, in `Channel` order: frame, input, then clipboard.
+    channels: [ChannelState; 3],
     /// The channel keys a hand-over carried, which outlive a reconnect.
     ///
     /// A session that handshook derives these from its session key and its
@@ -148,7 +148,7 @@ pub struct Session {
     /// neither, so it keeps what it was given: a channel key depends on the
     /// session and the channel, never on the generation, so replacing a socket
     /// does not replace it.
-    handover_keys: [Option<ChannelKey>; 2],
+    handover_keys: [Option<ChannelKey>; 3],
 }
 
 /// What one bound-or-binding frame or input socket holds.
@@ -166,7 +166,7 @@ struct ChannelState {
 /// Everything the receiving process needs and nothing it does not: no secret,
 /// no session key, no transcript. See [`Session::established_host`].
 pub struct HandedOver {
-    /// The 16 bytes that name the session across its three sockets.
+    /// The 16 bytes that name the session across its four sockets.
     pub session_id: [u8; SESSION_ID_LEN],
     /// What the control handshake settled on.
     pub negotiated: Negotiated,
@@ -174,6 +174,8 @@ pub struct HandedOver {
     pub frame_key: ChannelKey,
     /// The key the input socket proves itself with.
     pub input_key: ChannelKey,
+    /// The key the clipboard socket proves itself with.
+    pub clipboard_key: ChannelKey,
     /// The sequence the control channel carries on from.
     pub control_sequence: u32,
 }
@@ -235,8 +237,12 @@ impl Session {
             pending: None,
             pending_auth: None,
             control_sequence: 0,
-            channels: [ChannelState::default(), ChannelState::default()],
-            handover_keys: [None, None],
+            channels: [
+                ChannelState::default(),
+                ChannelState::default(),
+                ChannelState::default(),
+            ],
+            handover_keys: [None, None, None],
         };
 
         let record = session.control_record(ControlRecord::ClientHello, payload);
@@ -268,8 +274,12 @@ impl Session {
             pending: None,
             pending_auth: None,
             control_sequence: 0,
-            channels: [ChannelState::default(), ChannelState::default()],
-            handover_keys: [None, None],
+            channels: [
+                ChannelState::default(),
+                ChannelState::default(),
+                ChannelState::default(),
+            ],
+            handover_keys: [None, None, None],
         }
     }
 
@@ -277,8 +287,8 @@ impl Session {
     ///
     /// The process that holds the VM's secret runs the four control records and
     /// hands the result here: what the handshake settled on, the session id,
-    /// the two channel keys, and where the control channel's numbering had got
-    /// to. This session derives nothing and holds no secret, which is the whole
+    /// the three channel keys, and where the control channel's numbering had
+    /// got to. This session derives nothing and holds no secret, which is the whole
     /// point -- a viewer that is compromised loses one session's channel keys
     /// and cannot open a second.
     ///
@@ -304,8 +314,16 @@ impl Session {
             pending: None,
             pending_auth: None,
             control_sequence: handed_over.control_sequence,
-            channels: [ChannelState::default(), ChannelState::default()],
-            handover_keys: [Some(handed_over.frame_key), Some(handed_over.input_key)],
+            channels: [
+                ChannelState::default(),
+                ChannelState::default(),
+                ChannelState::default(),
+            ],
+            handover_keys: [
+                Some(handed_over.frame_key),
+                Some(handed_over.input_key),
+                Some(handed_over.clipboard_key),
+            ],
         }
     }
 
@@ -399,18 +417,30 @@ impl Session {
             {
                 self.on_client_auth(payload)
             }
-            (State::Established, Channel::Frame | Channel::Input, message_type)
-                if message_type == FrameRecord::ChannelHello as u16 =>
+            // The clipboard's bind records carry the same three numbers the
+            // frame and input channels' do -- a bind is one exchange on every
+            // bound channel -- so one arm reads the frame enum for all three.
+            (
+                State::Established,
+                Channel::Frame | Channel::Input | Channel::Clipboard,
+                message_type,
+            ) if message_type == FrameRecord::ChannelHello as u16 =>
             {
                 self.on_channel_hello(header.channel, payload)
             }
-            (State::Established, Channel::Frame | Channel::Input, message_type)
-                if message_type == FrameRecord::ChannelAck as u16 =>
+            (
+                State::Established,
+                Channel::Frame | Channel::Input | Channel::Clipboard,
+                message_type,
+            ) if message_type == FrameRecord::ChannelAck as u16 =>
             {
                 self.on_channel_ack(header.channel, payload)
             }
-            (State::Established, Channel::Frame | Channel::Input, message_type)
-                if message_type == FrameRecord::ChannelAuth as u16 =>
+            (
+                State::Established,
+                Channel::Frame | Channel::Input | Channel::Clipboard,
+                message_type,
+            ) if message_type == FrameRecord::ChannelAuth as u16 =>
             {
                 self.on_channel_auth(header.channel, payload)
             }
@@ -851,6 +881,7 @@ impl Session {
         match channel {
             Channel::Frame => Ok(0),
             Channel::Input => Ok(1),
+            Channel::Clipboard => Ok(2),
             Channel::Control => Err(SessionError::Unexpected {
                 channel,
                 message_type: 0,
@@ -1138,6 +1169,46 @@ mod tests {
         let guest = Session::guest(&secret, support());
 
         assert!(guest.derive_channel_key(Channel::Frame).is_none());
+    }
+
+    #[test]
+    fn a_clipboard_channel_binds_like_any_other() {
+        let (mut host, mut guest) = handshake(&Secret::generate(), offer(), support());
+
+        let hello = host
+            .open_channel(Channel::Clipboard)
+            .expect("a clipboard hello");
+        let ack = guest
+            .handle(&hello.header, &hello.payload)
+            .expect("the guest answers a clipboard hello")
+            .reply
+            .expect("an ack");
+        let auth = host
+            .handle(&ack.header, &ack.payload)
+            .expect("the host answers an ack")
+            .reply
+            .expect("an auth");
+        let outcome = guest
+            .handle(&auth.header, &auth.payload)
+            .expect("the guest checks the host's proof");
+
+        assert_eq!(outcome.event, Event::ChannelBound(Channel::Clipboard));
+    }
+
+    #[test]
+    fn a_clipboard_key_is_not_a_frame_key() {
+        let (host, _) = handshake(&Secret::generate(), offer(), support());
+
+        let clipboard = host
+            .derive_channel_key(Channel::Clipboard)
+            .expect("a clipboard key");
+        let frame = host.derive_channel_key(Channel::Frame).expect("a frame key");
+
+        assert_ne!(
+            clipboard.to_bytes().as_slice(),
+            frame.to_bytes().as_slice(),
+            "one channel's key never opens another's socket"
+        );
     }
 
     /// Runs the four-record handshake between a host and a guest that hold the
@@ -1591,6 +1662,9 @@ mod tests {
                 .expect("an established host"),
             input_key: host
                 .derive_channel_key(Channel::Input)
+                .expect("an established host"),
+            clipboard_key: host
+                .derive_channel_key(Channel::Clipboard)
                 .expect("an established host"),
             control_sequence: host.control_sequence(),
         };

@@ -68,16 +68,25 @@ pub(crate) const DISPLAY_FRAME_VSOCK_PORT: u32 = 0x564D_4C46;
 /// The vsock port a guest's display input service listens on -- `VMLI`.
 pub(crate) const DISPLAY_INPUT_VSOCK_PORT: u32 = 0x564D_4C49;
 
-/// The three services one display session runs over, in channel order.
+/// The vsock port a guest's display clipboard service listens on -- `VMLC`.
+///
+/// Bound in the guest by the clipboard daemon of whoever is logged in, rather
+/// than by either system service: a selection exists inside a compositor.
+pub(crate) const DISPLAY_CLIPBOARD_VSOCK_PORT: u32 = 0x564D_4C43;
+
+/// The four services one display session runs over, in channel order.
 ///
 /// Listed in a VM's configuration so that the partition has them; whether
-/// anything inside the guest binds them is the guest's business.
+/// anything inside the guest binds them is the guest's business. The clipboard
+/// is listed like the rest and for the same reason -- a guest where nobody has
+/// logged in simply never binds it.
 #[must_use]
-pub(crate) fn display_service_ids() -> [GUID; 3] {
+pub(crate) fn display_service_ids() -> [GUID; 4] {
     [
         vsock_service_id(DISPLAY_CONTROL_VSOCK_PORT),
         vsock_service_id(DISPLAY_FRAME_VSOCK_PORT),
         vsock_service_id(DISPLAY_INPUT_VSOCK_PORT),
+        vsock_service_id(DISPLAY_CLIPBOARD_VSOCK_PORT),
     ]
 }
 
@@ -450,19 +459,21 @@ mod tests {
     use std::io;
 
     use super::{
-        AGENT_VSOCK_PORT, DISPLAY_CONTROL_VSOCK_PORT, DISPLAY_FRAME_VSOCK_PORT,
-        DISPLAY_INPUT_VSOCK_PORT, agent_service_id, display_service_ids, idle_read,
-        vsock_service_id,
+        AGENT_VSOCK_PORT, DISPLAY_CLIPBOARD_VSOCK_PORT, DISPLAY_CONTROL_VSOCK_PORT,
+        DISPLAY_FRAME_VSOCK_PORT, DISPLAY_INPUT_VSOCK_PORT, agent_service_id, display_service_ids,
+        idle_read, vsock_service_id,
     };
 
     #[test]
     fn the_display_ports_are_the_ones_both_ends_of_that_protocol_spell() {
-        // `VMLD`, `VMLF` and `VMLI` as ASCII. The guest listens on these and
-        // the viewer connects to them, so a change here is a change to two
-        // other crates.
+        // `VMLD`, `VMLF`, `VMLI` and `VMLC` as ASCII. The guest listens on
+        // these and the viewer connects to them, so a change here is a change
+        // to two other crates.
         assert_eq!(DISPLAY_CONTROL_VSOCK_PORT, 0x564D_4C44);
         assert_eq!(DISPLAY_FRAME_VSOCK_PORT, 0x564D_4C46);
         assert_eq!(DISPLAY_INPUT_VSOCK_PORT, 0x564D_4C49);
+        assert_eq!(DISPLAY_CLIPBOARD_VSOCK_PORT, 0x564D_4C43);
+        assert_eq!(display_service_ids().len(), 4);
     }
 
     #[test]
@@ -475,7 +486,7 @@ mod tests {
         ids.sort();
         ids.dedup();
 
-        assert_eq!(ids.len(), 4, "four services, four distinct GUIDs");
+        assert_eq!(ids.len(), 5, "five services, five distinct GUIDs");
     }
 
     #[test]

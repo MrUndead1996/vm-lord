@@ -19,6 +19,11 @@ name = "vmlord-display-session"
 path = "src/bin/session.rs"
 bench = false
 
+[[bin]]
+name = "vmlord-display-clipboard"
+path = "src/bin/clipboard.rs"
+bench = false
+
 [dependencies]
 libc = { version = "0.2", default-features = false }
 prost = "0.14"
@@ -27,6 +32,14 @@ prost = "0.14"
 vmlord-agent-protocol = { path = "../agent-protocol" }
 vmlord-display-codec = { path = "../display-codec" }
 vmlord-display-protocol = { path = "../display-protocol" }
+# GNOME's clipboard lives inside the compositor, and
+# `org.gnome.Mutter.RemoteDesktop` is what reaches it from outside -- the same
+# interface gnome-remote-desktop uses. No default features, so nothing here
+# links a system C library and the musl build stays toolchain-free.
+zbus = { version = "5", default-features = false, features = [
+    "async-io",
+    "blocking-api",
+] }
 
 [build-dependencies]
 prost-build = "0.14"

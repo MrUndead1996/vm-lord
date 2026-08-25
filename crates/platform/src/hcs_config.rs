@@ -165,8 +165,8 @@ fn agent_service_key() -> String {
 
 /// Every HvSocket service a VM is given, keyed by service GUID.
 ///
-/// The agent's, which the guest connects out on, and the display's three,
-/// which the guest listens on. All four are listed for every VM, desktop or
+/// The agent's, which the guest connects out on, and the display's four,
+/// which the guest listens on. All five are listed for every VM, desktop or
 /// not: an entry is the partition's permission for a service to exist, not a
 /// claim that anything inside the guest is using it, and a headless guest
 /// simply never binds the display ports. Making them conditional would mean a
@@ -899,6 +899,7 @@ mod tests {
     const DISPLAY_CONTROL_SERVICE_KEY: &str = "564D4C44-FACB-11E6-BD58-64006A7986D3";
     const DISPLAY_FRAME_SERVICE_KEY: &str = "564D4C46-FACB-11E6-BD58-64006A7986D3";
     const DISPLAY_INPUT_SERVICE_KEY: &str = "564D4C49-FACB-11E6-BD58-64006A7986D3";
+    const DISPLAY_CLIPBOARD_SERVICE_KEY: &str = "564D4C43-FACB-11E6-BD58-64006A7986D3";
 
     /// The service table of a VM built from a cloud image.
     fn service_table_of_a_built_vm() -> serde_json::Map<String, Value> {
@@ -922,7 +923,7 @@ mod tests {
     }
 
     #[test]
-    fn every_vm_is_given_the_three_services_its_display_runs_over() {
+    fn every_vm_is_given_the_four_services_its_display_runs_over() {
         // Listed for every VM, desktop or not: the entry is the partition's
         // permission for the service to exist, and a headless guest never
         // binds the ports. A VM created without them cannot be given them
@@ -934,6 +935,7 @@ mod tests {
             DISPLAY_CONTROL_SERVICE_KEY,
             DISPLAY_FRAME_SERVICE_KEY,
             DISPLAY_INPUT_SERVICE_KEY,
+            DISPLAY_CLIPBOARD_SERVICE_KEY,
         ] {
             assert_eq!(
                 table[key].pointer("/BindSecurityDescriptor"),
@@ -964,7 +966,7 @@ mod tests {
             .pointer("/VirtualMachine/Devices/HvSocket/HvSocketConfig/ServiceTable")
             .and_then(Value::as_object)
             .expect("the VM should have a service table");
-        assert_eq!(table.len(), 4, "the agent's service and the display's three");
+        assert_eq!(table.len(), 5, "the agent's service and the display's four");
         assert_eq!(
             table[AGENT_SERVICE_KEY].pointer("/BindSecurityDescriptor"),
             Some(&json!("D:P(A;;FA;;;SY)(A;;FA;;;BA)")),
@@ -1023,6 +1025,9 @@ mod tests {
                                 "BindSecurityDescriptor": "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
                             },
                             DISPLAY_INPUT_SERVICE_KEY: {
+                                "BindSecurityDescriptor": "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+                            },
+                            DISPLAY_CLIPBOARD_SERVICE_KEY: {
                                 "BindSecurityDescriptor": "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
                             }
                         }}},

@@ -39,6 +39,12 @@ enum Capability {
   CAPABILITY_CURSOR_STREAM = 1;
   // The guest can change its output geometry while a session runs.
   CAPABILITY_DYNAMIC_RESOLUTION = 2;
+  // The session carries selections on a fourth channel. Announced by a guest
+  // whose payload ships the clipboard daemon, whether or not one is attached:
+  // a session commonly opens at the login screen, where no user session and
+  // therefore no daemon exists yet, and a capability cannot be renegotiated
+  // once the handshake has settled it.
+  CAPABILITY_CLIPBOARD = 3;
 }
 
 // How the encoder trades bandwidth against fidelity.
@@ -119,6 +125,37 @@ enum InputRecord {
   INPUT_RECORD_POINTER_SCROLL = 7;
   INPUT_RECORD_RELEASE_ALL = 8;
   INPUT_RECORD_ERROR = 9;
+}
+
+// The `type` field of a record header on the clipboard channel.
+//
+// The first three match the frame and input channels', because a bind is the
+// same three records on every bound channel.
+enum ClipboardRecord {
+  CLIPBOARD_RECORD_UNSPECIFIED = 0;
+  CLIPBOARD_RECORD_CHANNEL_HELLO = 1;
+  CLIPBOARD_RECORD_CHANNEL_ACK = 2;
+  CLIPBOARD_RECORD_CHANNEL_AUTH = 3;
+  CLIPBOARD_RECORD_OFFER = 4;
+  CLIPBOARD_RECORD_REQUEST = 5;
+  CLIPBOARD_RECORD_DATA = 6;
+  CLIPBOARD_RECORD_CANCEL = 7;
+  CLIPBOARD_RECORD_ERROR = 8;
+}
+
+// Why a transfer stopped before its last chunk.
+enum CancelReason {
+  CANCEL_REASON_UNSPECIFIED = 0;
+  // A newer offer replaced the selection this transfer was carrying.
+  CANCEL_REASON_SUPERSEDED = 1;
+  // The transfer passed the cap for its kind.
+  CANCEL_REASON_TOO_LARGE = 2;
+  // The viewer's window lost focus.
+  CANCEL_REASON_FOCUS_LOST = 3;
+  // The side that offered it can no longer produce it.
+  CANCEL_REASON_UNAVAILABLE = 4;
+  // Nothing moved for five seconds.
+  CANCEL_REASON_TIMED_OUT = 5;
 }
 
 // The host's opening record, and the first half of the transcript.
@@ -258,3 +295,35 @@ message PointerScroll {
 
 // Release every key and button the guest believes is held.
 message ReleaseAll {}
+
+// My selection changed; here is what I can produce for it.
+//
+// An announcement and not the selection itself: nothing crosses until the other
+// side asks, so a picture copied in a guest costs nothing until it is pasted.
+message ClipboardOffer {
+  // Names this selection. A request naming an older one is refused rather than
+  // answered with the wrong contents.
+  uint32 serial = 1;
+  // At most sixteen, and only what the allowlist names.
+  repeated string mime_types = 2;
+}
+
+// Send me one of them, as this transfer.
+message ClipboardRequest {
+  uint32 serial = 1;
+  string mime_type = 2;
+  uint32 transfer = 3;
+}
+
+// A chunk of it, in order. `last` ends the transfer.
+message ClipboardData {
+  uint32 transfer = 1;
+  bytes chunk = 2;
+  bool last = 3;
+}
+
+// That transfer is over and its bytes are not coming.
+message ClipboardCancel {
+  uint32 transfer = 1;
+  CancelReason reason = 2;
+}

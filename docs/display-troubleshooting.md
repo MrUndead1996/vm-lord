@@ -67,6 +67,40 @@ dmesg | grep -E 'vmlord_drm|Lockdown|verification'
 - Keyboard or pointer state is released when the input channel drops. Reopen
   the viewer if focus/input does not recover after the channel has rebound.
 
+## Nothing pastes between the host and the guest
+
+The clipboard is a fourth channel, and it needs a graphical session -- not just
+a running VM.
+
+- Sign in through GDM first. Nothing crosses at the login screen, because the
+  clipboard belongs to the compositor and the daemon that reaches it starts
+  with the user's session.
+- Check the daemon inside the guest:
+
+  ```bash
+  systemctl --user status vmlord-display-clipboard.service
+  journalctl --user -u vmlord-display-clipboard -b
+  ```
+
+  Its journal carries mime types, byte counts and outcomes, and never the
+  contents of a selection.
+- Give the display window focus. A selection crosses only while the window has
+  the keyboard, so a paste attempted from a background window has nothing to
+  paste.
+- Check the size. Text and HTML stop at 8 MiB and a picture at 32 MiB; a larger
+  selection is cancelled and the journal says which kind it was.
+- Unlock the guest's screen. While it is locked the compositor refuses to hand
+  out a session at all -- the journal says `Session creation inhibited` -- and
+  the daemon retries until the screen comes back.
+- Copy again. The daemon learns about a selection from the change, not from the
+  selection itself, so one made before it attached (or before a lock) is
+  invisible to it until the next copy.
+- Copied files paste nothing, by design.
+- If the daemon is running and the window is focused but nothing crosses, the
+  broker may have refused it: the clipboard socket is served only to the uid of
+  the active graphical session on `seat0`, so a second user signed in over SSH
+  cannot take it. The broker's journal names the uid it refused.
+
 ## Secure Boot and networking
 
 The MVP module is unsigned. With Secure Boot enabled, the kernel can reject it

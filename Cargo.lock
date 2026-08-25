@@ -4644,6 +4644,7 @@ dependencies = [
  "vmlord-agent-protocol",
  "vmlord-display-codec",
  "vmlord-display-protocol",
+ "zbus",
 ]
 
 [[package]]
@@ -4651,6 +4652,7 @@ name = "vmlord-display-viewer"
 version = "0.1.0"
 dependencies = [
  "log",
+ "png",
  "prost",
  "prost-build",
  "protox",

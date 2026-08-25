@@ -1,4 +1,4 @@
-//! How a record is delimited on any of the three channels.
+//! How a record is delimited on any of the four channels.
 //!
 //! A record is a fixed 24-byte little-endian header followed by `length`
 //! payload bytes. Little-endian because both ends of these sockets are x86-64;
@@ -16,7 +16,7 @@ use std::{error::Error, fmt, io};
 /// The width of the header this build writes and understands.
 pub const HEADER_LEN: usize = 24;
 
-/// Which of a session's three sockets a record belongs to.
+/// Which of a session's four sockets a record belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Channel {
     /// Handshake, session control, liveness and errors.
@@ -25,6 +25,8 @@ pub enum Channel {
     Frame = 2,
     /// Keyboard and pointer, from the host only.
     Input = 3,
+    /// Selections, in both directions.
+    Clipboard = 4,
 }
 
 impl Channel {
@@ -46,6 +48,7 @@ impl Channel {
             1 => Ok(Self::Control),
             2 => Ok(Self::Frame),
             3 => Ok(Self::Input),
+            4 => Ok(Self::Clipboard),
             value => Err(RecordError::UnknownChannel { value }),
         }
     }
@@ -57,6 +60,7 @@ impl fmt::Display for Channel {
             Self::Control => "control",
             Self::Frame => "frame",
             Self::Input => "input",
+            Self::Clipboard => "clipboard",
         })
     }
 }
@@ -78,9 +82,9 @@ pub struct Header {
     pub base: u32,
     /// CRC32C of the payload. A corruption check, not a signature.
     pub checksum: u32,
-    /// Which generation of the session's frame and input channels this belongs
-    /// to. Stale generations are rejected here, before a decoder or an input
-    /// device sees them.
+    /// Which generation of the session's bound channels this belongs to. Stale
+    /// generations are rejected here, before a decoder, an input device or a
+    /// clipboard sees them.
     pub generation: u32,
 }
 
@@ -218,6 +222,13 @@ pub const CONTROL_MAX_PAYLOAD: u32 = 64 * 1024;
 /// The most an input record may carry.
 pub const INPUT_MAX_PAYLOAD: u32 = 4 * 1024;
 
+/// The most a clipboard record may carry.
+///
+/// A selection is chunked to fit rather than sized by the session: this is what
+/// one record may hold, and `clipboard::MAX_TEXT_TRANSFER` and
+/// `clipboard::MAX_IMAGE_TRANSFER` are what a whole transfer may.
+pub const CLIPBOARD_MAX_PAYLOAD: u32 = 64 * 1024;
+
 /// The most a frame record may carry whatever the geometry says.
 ///
 /// A backstop against a geometry that is itself absurd, since the cap below is
@@ -266,6 +277,7 @@ impl Limits {
             Channel::Control => CONTROL_MAX_PAYLOAD,
             Channel::Frame => self.frame,
             Channel::Input => INPUT_MAX_PAYLOAD,
+            Channel::Clipboard => CLIPBOARD_MAX_PAYLOAD,
         }
     }
 }
@@ -506,6 +518,34 @@ mod tests {
             Header::decode(&bytes),
             Err(RecordError::UnknownChannel { value: 9 })
         ));
+    }
+
+    #[test]
+    fn a_clipboard_channel_survives_a_round_trip() {
+        let header = Header {
+            channel: Channel::Clipboard,
+            message_type: 7,
+            length: 3,
+            sequence: 9,
+            base: 0,
+            checksum: 0x1234_5678,
+            generation: 2,
+        };
+
+        let (decoded, extra) = Header::decode(&header.encode()).expect("a header this build wrote");
+
+        assert_eq!(decoded, header);
+        assert_eq!(extra, 0);
+        assert_eq!(Channel::Clipboard.as_wire(), 4);
+        assert_eq!(Channel::Clipboard.to_string(), "clipboard");
+    }
+
+    #[test]
+    fn a_clipboard_record_is_capped_at_sixty_four_kibibytes() {
+        let limits = Limits::new(1920, 1080);
+
+        assert_eq!(limits.for_channel(Channel::Clipboard), CLIPBOARD_MAX_PAYLOAD);
+        assert_eq!(CLIPBOARD_MAX_PAYLOAD, 64 * 1024);
     }
 
     #[test]

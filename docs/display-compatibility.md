@@ -51,8 +51,13 @@ the supported product boundary and the source revision that passed the gate.
 - The first desktop provisioning and DKMS build need guest access to Ubuntu's
   package repositories. After a successful installation, display frames and
   input use HvSocket and do not depend on the VM's IP network.
-- Audio, clipboard, multi-monitor, Motion codec, and zero-copy capture are not
-  part of the MVP display contract.
+- The clipboard carries text, HTML and images in both directions, and needs a
+  logged-in GNOME session: it is driven through the compositor, so nothing
+  crosses at the GDM login screen or on a guest where nobody has signed in.
+- File transfer is not part of the clipboard. Copied files are never offered
+  and an offer of them is ignored.
+- Audio, multi-monitor, Motion codec, and zero-copy capture are not part of the
+  MVP display contract.
 
 See [the display user guide](display-user-guide.md) to start a session and
 [display troubleshooting](display-troubleshooting.md) when Connect is not

@@ -45,6 +45,7 @@ message LaunchParameters {
   // The `ClientHello` record -- header and payload -- to write to the control
   // socket once it connects.
   bytes client_hello = 10;
+  uint32 clipboard_port = 11;
 }
 
 // Handshake bytes, verbatim. The viewer parses none of them.
@@ -68,6 +69,10 @@ message Handover {
   // The next sequence the host's control channel is on, so that the viewer
   // carries on the numbering VMLord left off at.
   uint32 control_sequence = 11;
+  // The key the clipboard socket proves itself with. The viewer's clipboard
+  // thread binds that socket by itself, so it holds this one and the session
+  // id and nothing else of the handshake.
+  bytes clipboard_key = 12;
 }
 
 // The viewer asking for a new session after control was lost. The token is

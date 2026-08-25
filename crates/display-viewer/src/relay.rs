@@ -330,6 +330,11 @@ mod tests {
                             .expect("established")
                             .to_bytes()
                             .to_vec(),
+                        clipboard_key: session
+                            .derive_channel_key(Channel::Clipboard)
+                            .expect("established")
+                            .to_bytes()
+                            .to_vec(),
                         input_key: session
                             .derive_channel_key(Channel::Input)
                             .expect("established")

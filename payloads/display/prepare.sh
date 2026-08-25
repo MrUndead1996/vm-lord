@@ -136,7 +136,7 @@ DOCKER_BUILDKIT=1 docker build \
 # identical for 22.04, 24.04 and 26.04, and the container exists to prove the *module*
 # compiles against a release's headers. A Rust toolchain in there would be a third
 # toolchain for no gain.
-for binary in vmlord-display-broker vmlord-display-session; do
+for binary in vmlord-display-broker vmlord-display-session vmlord-display-clipboard; do
 	[[ -x "$services/$binary" ]] || {
 		echo "$services does not hold $binary; run 'cargo display-services' first" >&2
 		exit 1

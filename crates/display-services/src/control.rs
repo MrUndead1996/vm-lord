@@ -30,9 +30,13 @@ use crate::{
 /// What handling one control record means for the unprivileged process.
 #[derive(Debug)]
 pub enum Outcome {
-    /// A session opened, and here is what the other process needs to bind its
-    /// two sockets.
-    Opened(SessionParameters),
+    /// A session opened: what the capture process needs to bind its two
+    /// sockets, and the clipboard key its daemon needs to bind the fourth.
+    ///
+    /// The two travel together because they are one fact, and they are separate
+    /// values because they go to separate processes: the capture process never
+    /// sees the clipboard key, and the clipboard daemon never sees the others.
+    Opened(SessionParameters, Vec<u8>),
     /// Something to pass straight on.
     Relay(Message),
     /// The host asked the output to change size, and the size is one this
@@ -57,7 +61,16 @@ pub enum Outcome {
 #[must_use]
 pub fn support_from(width: u32, height: u32) -> Support {
     Support {
-        capabilities: vec![Capability::CursorStream, Capability::DynamicResolution],
+        capabilities: vec![
+            Capability::CursorStream,
+            Capability::DynamicResolution,
+            // Announced by the build rather than by an attached daemon: a
+            // session commonly opens at the login screen, where no user session
+            // and therefore no daemon exists yet, and a capability settled in
+            // the handshake cannot be renegotiated when one appears. With no
+            // daemon attached the guest simply offers nothing.
+            Capability::Clipboard,
+        ],
         // Motion is not a mode this build has. Announcing it and then encoding
         // a desktop would be worse than refusing it.
         modes: vec![Mode::Desktop],
@@ -155,15 +168,16 @@ impl Control {
         }
     }
 
-    /// What the unprivileged process is handed once a session exists.
+    /// What the unprivileged processes are handed once a session exists.
     ///
-    /// Two channel keys and a geometry. Not the secret, and not a descriptor:
-    /// what a compromised capture process could take from these bytes is one
+    /// Channel keys and a geometry. Not the secret, and not a descriptor: what
+    /// a compromised capture process could take from these bytes is one
     /// session, and only while that session runs.
     fn opened(&mut self) -> Outcome {
-        let (Some(frame), Some(input), Some(negotiated)) = (
+        let (Some(frame), Some(input), Some(clipboard), Some(negotiated)) = (
             self.session.derive_channel_key(Channel::Frame),
             self.session.derive_channel_key(Channel::Input),
+            self.session.derive_channel_key(Channel::Clipboard),
             self.session.negotiated(),
         ) else {
             return Outcome::Closed("an established session with no keys".to_owned());
@@ -175,15 +189,18 @@ impl Control {
         let cursor_stream = negotiated.capabilities.contains(&Capability::CursorStream);
         self.limits.set_geometry(self.width, self.height);
 
-        Outcome::Opened(SessionParameters {
-            session_id: self.session.session_id().to_vec(),
-            frame_key: frame.to_bytes().to_vec(),
-            input_key: input.to_bytes().to_vec(),
-            width: self.width,
-            height: self.height,
-            tile_size: self.tile_size,
-            cursor_stream,
-        })
+        Outcome::Opened(
+            SessionParameters {
+                session_id: self.session.session_id().to_vec(),
+                frame_key: frame.to_bytes().to_vec(),
+                input_key: input.to_bytes().to_vec(),
+                width: self.width,
+                height: self.height,
+                tile_size: self.tile_size,
+                cursor_stream,
+            },
+            clipboard.to_bytes().to_vec(),
+        )
     }
 
     /// One request on an established session.
@@ -432,7 +449,7 @@ mod tests {
         // writes without being asked for it.
         let mut parameters = None;
         for _ in 0..2 {
-            if let Outcome::Opened(opened) = control.pump(&mut wire) {
+            if let Outcome::Opened(opened, _) = control.pump(&mut wire) {
                 parameters = Some(opened);
             }
             for (message_type, payload) in wire.taken() {
@@ -566,6 +583,10 @@ mod tests {
             support
                 .capabilities
                 .contains(&Capability::DynamicResolution)
+        );
+        assert!(
+            support.capabilities.contains(&Capability::Clipboard),
+            "a build that ships the clipboard daemon says so, whether or not one is attached"
         );
     }
 
