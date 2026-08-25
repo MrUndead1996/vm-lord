@@ -21,10 +21,13 @@ bench = false
 
 [dependencies]
 log.workspace = true
+# The Windows common file dialogs, behind the application layer's picker
+# traits. Wired here because those traits belong to `app`, which `platform`
+# does not depend on.
+rfd = "0.15"
 vmlord-app = { path = "../app" }
 vmlord-core = { path = "../core" }
 vmlord-image = { path = "../image" }
-vmlord-legacy-backend = { path = "../legacy-backend" }
 vmlord-platform = { path = "../platform" }
 vmlord-ui = { path = "../ui" }
 

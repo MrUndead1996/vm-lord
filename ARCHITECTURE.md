@@ -8,9 +8,9 @@ VMLord is a native Windows application for managing Linux virtual machines using
 
 The architecture is intentionally layered to separate user interface, business logic and platform-specific implementation.
 
-During the initial development phase the project reuses the AppSandbox C backend through a thin FFI layer.
-
-The long-term objective is a fully Rust-native implementation.
+The implementation is fully Rust-native: the AppSandbox C backend it started
+from, and the FFI layer that reached it, have been removed from the
+distribution.
 
 ---
 
@@ -21,52 +21,12 @@ The architecture should:
 * isolate platform-specific code
 * isolate unsafe Rust
 * keep the UI independent from virtualization logic
-* allow gradual replacement of the legacy backend
 * remain testable
 * support future CLI and automation APIs
 
 ---
 
 # High-Level Architecture
-
-Current architecture:
-
-```text
-+---------------------------+
-|         UI (Rust)         |
-+---------------------------+
-              |
-              v
-+---------------------------+
-|     Application Layer     |
-+---------------------------+
-              |
-              v
-+---------------------------+
-|      Rust Core API        |
-+---------------------------+
-              |
-              v
-+---------------------------+
-|         FFI Layer         |
-+---------------------------+
-              |
-              v
-+---------------------------+
-| AppSandbox C Backend      |
-+---------------------------+
-              |
-              v
-+---------------------------+
-| Windows HCS / HNS / APIs  |
-+---------------------------+
-```
-
----
-
-# Target Architecture
-
-After migration:
 
 ```text
 +---------------------------+
@@ -93,7 +53,7 @@ After migration:
 +---------------------------+
 ```
 
-No C code should remain.
+No C code remains.
 
 ---
 
@@ -150,7 +110,6 @@ summary and repository types.
 Contains:
 
 * Windows API wrappers
-* FFI
 * unsafe Rust
 
 This is the only layer allowed to interact with operating system APIs.
@@ -160,10 +119,10 @@ This is the only layer allowed to interact with operating system APIs.
 # Current Backend
 
 The native Rust backend owns HCS integration, VM lifecycle, networking, GPU-PV
-and display for supported VMLord VMs. The AppSandbox backend is a transitional
-fallback for legacy VM lifecycle and configuration only. Its display ABI is no
-longer loaded or called: AppSandbox IDD and its guest display/input components
-are outside the VMLord display path.
+and display, and it is the only backend: `vmlord-legacy-backend`,
+`appsandbox_core.dll` and the `VMLORD_BACKEND` switch that reached them are
+gone. VMs created by AppSandbox are not read, migrated or listed -- VMLord
+manages the VMs it created itself.
 
 ## Implemented scaffold
 
@@ -177,8 +136,6 @@ vmlord (composition root)
   -> platform (native HCS backend, default)
   -> seed (the NoCloud documents cloud-init reads)
   -> image (release resolution, download, qcow2)
-  -> legacy-backend (dynamic C FFI, transitional fallback)
-  -> appsandbox_core.dll
 
 agent-protocol (portable wire contract)
   <- vmlord (host side, through platform)
@@ -192,12 +149,10 @@ Linux program that runs inside a guest, so it is excluded from the workspace's
 targets rather than link-failing later.
 `agent-protocol` is in both sets, because both ends of the connection speak it.
 
-`legacy-backend`, `platform`, and `vmlord-agent` are the only crates that
-override the workspace's `unsafe_code = "deny"`: the legacy backend for the
-temporary AppSandbox C ABI, platform for Windows APIs, and the agent's `vsock`
-module for the Linux socket ABI. `legacy-backend` dynamically loads the
-prebuilt `appsandbox_core.dll` placed next to `vmlord.exe`; no C types cross
-into `core`, `app`, or `ui`.
+`platform` and `vmlord-agent` are the only crates that override the workspace's
+`unsafe_code = "deny"`: platform for Windows APIs, and the agent's `vsock`
+module for the Linux socket ABI. Nothing is loaded dynamically and no C types
+exist anywhere in the workspace, so none reach `core`, `app`, or `ui`.
 
 `platform` is the Windows-native foundation for the incremental replacement.
 It depends on `core`, `keys` and `seed` -- all three portable and free of I/O,
@@ -640,11 +595,7 @@ network exists -- with its host adapter, its subnet and its NAT -- from the
 moment VMLord runs rather than from the first start that needs one. Neither can
 fail the initialization: every start ensures the network again, and that is where
 a host whose HNS is broken has to be told about it, rather than losing the VM
-list and its deletions too over a service only the networked VMs need. Setting
-`VMLORD_BACKEND=legacy` selects the AppSandbox backend instead, for as long as
-the migration leaves it something the native backend cannot do; any other value
-(including an unset one) selects the native backend, so a typo cannot silently
-keep VMLord on the backend being retired.
+list and its deletions too over a service only the networked VMs need.
 
 The native backend reports persisted GPU and display configuration together
 with the facts observed from the running guest agent. SSH is the native
@@ -762,16 +713,6 @@ display status rather than the VM's state -- a running VM whose desktop is
 still installing has nothing to open a window on -- and shows that status's own
 sentence while it cannot be pressed. Snapshots remain future application-layer
 work.
-
-Under `VMLORD_BACKEND=legacy`, lifecycle and configuration actions still reach
-AppSandbox's C API: Start invokes `asb_vm_start`; Stop invokes the graceful
-`asb_vm_shutdown`; Force stop invokes `asb_vm_stop`; Edit uses AppSandbox's
-configuration setters. Connect is retired for this backend and directs the
-user to the native backend. The adapter neither resolves nor calls
-`asb_vm_open_display`, so no VMLord path can open the AppSandbox IDD window. It
-calls `asb_detach` on exit so it never stops VMs. `Open SSH` is not among the
-legacy operations either: a connection needs the key, port and `known_hosts`
-file only the native backend has.
 
 ### Image download
 
@@ -1126,8 +1067,9 @@ before there is one.
 `app` reads it through `VmRepository::host_gpu_capabilities`, never by calling
 `vmlord_platform` directly, and the UI only displays what it is handed. The
 method is defaulted on the trait and its default is an error rather than an
-empty report: the legacy backend cannot inspect the host, and "this backend
-cannot tell you" is a different answer from "this host cannot do it".
+empty report: a backend that cannot inspect the host does not thereby know the
+host has nothing, and "this backend cannot tell you" is a different answer from
+"this host cannot do it".
 
 `vmlord_platform::gpu_assignment` is the narrow boundary that proves
 assignment on a running compute system. It maps `Default` and `Mirror` to an
@@ -1743,9 +1685,8 @@ would be a guess: HNS hands out a new one on every start.
 ### The VM's SSH key pair
 
 Every VM gets its own ed25519 pair rather than sharing one. AppSandbox kept a
-single key under `%ProgramData%\AppSandbox\ssh\id_appsandbox`
-(`legacy-backend/src/windows.rs:691`), where the compromise of one sandbox
-reached every other one.
+single key under `%ProgramData%\AppSandbox\ssh\id_appsandbox`, where the
+compromise of one sandbox reached every other one.
 
 `vmlord-keys` generates the pair and serialises it: an OpenSSH PEM document for
 the private half, one `authorized_keys` line commented `vmlord@<vm>` for the
@@ -1920,12 +1861,9 @@ plus unattended answers", and the tool that carried out the answers was
 `iso-patch.exe`: a host-side Ubuntu installer with its own ext4 writer, its own
 squashfs reader, and a partition table written through
 `IOCTL_DISK_SET_DRIVE_LAYOUT_EX`. Importing a cloud image leaves it nothing to
-do, so VMLord stopped shipping it, and `AppSandboxBackend::create_vm` refuses
-rather than letting the DLL fail on a missing executable. Everything the legacy
-backend does with VMs it did not create -- list, start, stop, edit, delete --
-still works, which is what the transitional path is for. What remains of
-`iso-patch` here are citations to its C sources, which recorded Windows
-behaviour worth keeping; only the binary is gone.
+do, so VMLord stopped shipping it. What remains of `iso-patch` here are
+citations to its C sources, which recorded Windows behaviour worth keeping;
+only the binary is gone.
 
 ### Creating a VM from a cloud image
 
@@ -2853,10 +2791,8 @@ has to be recreated rather than migrated. The repository refuses a session
 before it starts one, a sentence per reason: a VM created without a desktop, a
 desktop still installing, a VM that is not running, a guest that has not
 offered its display. What gets past that is one viewer process per Connect.
-The legacy backend exposes no display operation. The retained
-`appsandbox_core.dll` serves only legacy lifecycle and configuration operations;
-VMLord distributes no standalone AppSandbox host IDD or guest display/input
-artifact.
+VMLord distributes no AppSandbox host IDD or guest display/input artifact: the
+display path is the native one described here, end to end.
 
 ### The guest display services
 
@@ -3616,7 +3552,6 @@ platform/
     hns/
     gpu/
     hvsocket/
-    ffi/
 
 app/
 
@@ -3625,38 +3560,12 @@ ui/
 
 ---
 
-# Migration Strategy
+# Migration
 
-Backend replacement happens incrementally.
-
-Recommended order:
-
-1. HCS
-2. HNS
-3. Networking
-4. GPU
-5. Display
-6. SSH
-7. Diagnostics
-
-Each completed Rust module replaces its C equivalent.
-
-No module should exist in both languages permanently.
-
----
-
-# FFI Principles
-
-The FFI layer should remain extremely small.
-
-Responsibilities:
-
-* data conversion
-* handle conversion
-* string conversion
-* error conversion
-
-Business logic must never be implemented in FFI.
+The incremental replacement of the C backend -- HCS, HNS, networking, GPU,
+display, SSH -- is finished, and the backend it replaced has been removed from
+the distribution. Diagnostics are the remaining migration work, and they are
+Rust-native work rather than a port: there is no C module left to stand beside.
 
 ---
 
@@ -3665,7 +3574,6 @@ Business logic must never be implemented in FFI.
 Unsafe code belongs only inside:
 
 * `platform`, for Windows API calls and wrappers
-* `legacy-backend`, for the temporary AppSandbox FFI
 * `vmlord-agent::vsock`, for the Linux socket ABI
 
 Everything above should expose safe Rust interfaces.
