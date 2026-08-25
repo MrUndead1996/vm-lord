@@ -524,7 +524,9 @@ impl<F: Acceptor, I: Acceptor> Loop<F, I> {
         // to be sent; keeping it would cost the peer a frame it cannot decode.
         frame.tail.clear();
         frame.pipeline.reconfigure(geometry);
-        frame.pipeline.write_stream_config(&mut frame.tail, &self.limits)?;
+        frame
+            .pipeline
+            .write_stream_config(&mut frame.tail, &self.limits)?;
         // A decoder that has just been built holds no cursor either.
         self.cursor = None;
 
@@ -738,9 +740,9 @@ impl<F: Acceptor, I: Acceptor> Loop<F, I> {
                 })
             }),
             InputRecord::PointerMotion => PointerMotion::decode(payload).map(|motion| {
-                self.pointer
-                    .as_mut()
-                    .map_or(Ok(()), |pointer| pointer.motion(motion.x, motion.y, width, height))
+                self.pointer.as_mut().map_or(Ok(()), |pointer| {
+                    pointer.motion(motion.x, motion.y, width, height)
+                })
             }),
             InputRecord::PointerButton => PointerButton::decode(payload).map(|event| {
                 self.pointer.as_mut().map_or(Ok(()), |pointer| {

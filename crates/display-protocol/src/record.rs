@@ -544,7 +544,10 @@ mod tests {
     fn a_clipboard_record_is_capped_at_sixty_four_kibibytes() {
         let limits = Limits::new(1920, 1080);
 
-        assert_eq!(limits.for_channel(Channel::Clipboard), CLIPBOARD_MAX_PAYLOAD);
+        assert_eq!(
+            limits.for_channel(Channel::Clipboard),
+            CLIPBOARD_MAX_PAYLOAD
+        );
         assert_eq!(CLIPBOARD_MAX_PAYLOAD, 64 * 1024);
     }
 

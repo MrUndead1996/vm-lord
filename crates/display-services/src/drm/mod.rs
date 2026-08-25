@@ -26,12 +26,11 @@ use crate::ipc::PlaneKind;
 use uapi::{
     DMA_BUF_IOCTL_SYNC, DRM_CLIENT_CAP_UNIVERSAL_PLANES, DRM_FORMAT_ARGB8888,
     DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_XRGB8888, DRM_IOCTL_DROP_MASTER, DRM_IOCTL_GEM_CLOSE,
-    DRM_IOCTL_MODE_GETFB2,
-    DRM_IOCTL_MODE_GETPLANE, DRM_IOCTL_MODE_GETPLANERESOURCES, DRM_IOCTL_MODE_GETPROPERTY,
-    DRM_IOCTL_MODE_OBJ_GETPROPERTIES, DRM_IOCTL_PRIME_HANDLE_TO_FD, DRM_IOCTL_SET_CLIENT_CAP,
-    DRM_IOCTL_WAIT_VBLANK, DRM_MODE_OBJECT_PLANE, DRM_VBLANK_RELATIVE, DmaBufSync, DrmGemClose,
-    DrmModeFbCmd2, DrmModeGetPlane, DrmModeGetPlaneRes, DrmModeGetProperty,
-    DrmModeObjGetProperties, DrmPrimeHandle, DrmSetClientCap, DrmWaitVblank,
+    DRM_IOCTL_MODE_GETFB2, DRM_IOCTL_MODE_GETPLANE, DRM_IOCTL_MODE_GETPLANERESOURCES,
+    DRM_IOCTL_MODE_GETPROPERTY, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, DRM_IOCTL_PRIME_HANDLE_TO_FD,
+    DRM_IOCTL_SET_CLIENT_CAP, DRM_IOCTL_WAIT_VBLANK, DRM_MODE_OBJECT_PLANE, DRM_VBLANK_RELATIVE,
+    DmaBufSync, DrmGemClose, DrmModeFbCmd2, DrmModeGetPlane, DrmModeGetPlaneRes,
+    DrmModeGetProperty, DrmModeObjGetProperties, DrmPrimeHandle, DrmSetClientCap, DrmWaitVblank,
 };
 
 /// Where the kernel lists the DRM devices a machine has.
@@ -541,11 +540,7 @@ type PlaneGenerations = Vec<(u32, u64)>;
 
 /// Repeats a multi-ioctl state read until no driver commit split it.
 fn coherent_snapshot<T>(
-    mut attempt: impl FnMut() -> io::Result<(
-        Option<PlaneGenerations>,
-        T,
-        Option<PlaneGenerations>,
-    )>,
+    mut attempt: impl FnMut() -> io::Result<(Option<PlaneGenerations>, T, Option<PlaneGenerations>)>,
 ) -> io::Result<(T, bool)> {
     loop {
         let (before, state, after) = attempt()?;
@@ -619,12 +614,11 @@ mod tests {
     use super::{
         card_named,
         uapi::{
-            DRM_IOCTL_DROP_MASTER, DRM_IOCTL_GEM_CLOSE, DRM_IOCTL_MODE_GETFB2,
-            DRM_IOCTL_MODE_OBJ_GETPROPERTIES, DRM_IOCTL_PRIME_HANDLE_TO_FD,
+            DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888, DRM_IOCTL_DROP_MASTER, DRM_IOCTL_GEM_CLOSE,
+            DRM_IOCTL_MODE_GETFB2, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, DRM_IOCTL_PRIME_HANDLE_TO_FD,
             DRM_IOCTL_SET_CLIENT_CAP, DRM_IOCTL_WAIT_VBLANK, DmaBufSync, DrmGemClose,
             DrmModeFbCmd2, DrmModeGetPlane, DrmModeObjGetProperties, DrmPrimeHandle,
-            DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888, DrmSetClientCap, DrmWaitVblank, io_none,
-            io_write, io_write_read,
+            DrmSetClientCap, DrmWaitVblank, io_none, io_write, io_write_read,
         },
     };
 

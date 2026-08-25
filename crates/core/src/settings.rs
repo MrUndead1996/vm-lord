@@ -77,6 +77,22 @@ pub enum Language {
     #[serde(rename = "en-US")]
     #[default]
     EnUs,
+    #[serde(rename = "ru-RU")]
+    RuRu,
+}
+
+impl Language {
+    /// The BCP 47 tag the UI's message catalogues are named after.
+    ///
+    /// The tag is spelled here and nowhere else: `serde` writes it into
+    /// `settings.toml`, and the UI hands the same string to its i18n backend,
+    /// so the two cannot drift apart.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::EnUs => "en-US",
+            Self::RuRu => "ru-RU",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,5 +476,38 @@ mod tests {
         assert_eq!(settings.guest_readiness, GuestReadinessTimeouts::default());
 
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    fn language_settings() -> AppSettings {
+        AppSettings {
+            vm_storage_path: std::path::PathBuf::from("vms"),
+            language: Language::RuRu,
+            log_file_path: std::path::PathBuf::from("vmlord.log"),
+            log_level: LogLevel::Info,
+            image_cache_path: std::path::PathBuf::from("images"),
+            guest_readiness: GuestReadinessTimeouts::default(),
+        }
+    }
+
+    #[test]
+    fn a_language_is_stored_under_its_locale_tag() {
+        let document = toml::to_string_pretty(&language_settings()).unwrap();
+
+        assert!(document.contains(r#"language = "ru-RU""#), "{document}");
+    }
+
+    #[test]
+    fn a_stored_locale_tag_loads_back() {
+        let document = toml::to_string_pretty(&language_settings()).unwrap();
+
+        let loaded: AppSettings = toml::from_str(&document).unwrap();
+
+        assert_eq!(loaded.language, Language::RuRu);
+    }
+
+    #[test]
+    fn each_language_names_its_locale() {
+        assert_eq!(Language::EnUs.code(), "en-US");
+        assert_eq!(Language::RuRu.code(), "ru-RU");
     }
 }

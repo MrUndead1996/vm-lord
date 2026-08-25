@@ -10,7 +10,10 @@
 //! them is worth refusing on the socket it arrived on rather than as an
 //! `-ERANGE` from a `write`.
 
-use std::{fs, io, path::{Path, PathBuf}};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+};
 
 /// Where the module publishes the mode it drives.
 pub const MODE_PARAMETER: &str = "/sys/module/vmlord_drm/parameters/mode";

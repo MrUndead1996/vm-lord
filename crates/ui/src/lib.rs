@@ -6,15 +6,21 @@ use std::{
 };
 
 use eframe::egui;
+use rust_i18n::t;
 use vmlord_app::{BackendStatus, VmAction, WorkspaceApp};
 use vmlord_core::{
-    AgentStatus, AppSettings, BuildProgress, BuildStep, CloudImage, DesktopProfile,
+    Advisory, AgentStatus, AppSettings, BuildProgress, BuildStep, CloudImage, DesktopProfile,
     DiagnosticLevel, DisplayState, DownloadPhase, GpuMode, GpuState, GuestDefaults,
     GuestReadinessTimeouts, HostGpuCapabilities, Language, LogLevel, NetworkMode, Password,
     Provisioning, SshAccess, SshAuthentication, SshConfig, SshPort, VmCreateRequest,
     VmDeleteRequest, VmDisplayStatus, VmGpuStatus, VmSource, VmState, VmSummary, VmUpdateRequest,
     ubuntu,
 };
+
+// The catalogues in `locales/`, embedded at compile time. English is the
+// fallback, so a key missing from another catalogue shows English rather than
+// its own name -- and the parity test keeps that from happening unnoticed.
+rust_i18n::i18n!("locales", fallback = "en-US");
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -52,6 +58,11 @@ const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
 const FIELD_HEIGHT: f32 = 24.0;
 
 pub fn run(application: WorkspaceApp) -> eframe::Result<()> {
+    // Settings that failed to load leave the locale at the fallback, which is
+    // where a fresh installation starts anyway.
+    if let Some(settings) = application.settings() {
+        rust_i18n::set_locale(settings.language.code());
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([960.0, 640.0]),
         ..Default::default()
@@ -173,11 +184,11 @@ impl SettingsForm {
     fn settings(&self) -> Result<AppSettings, String> {
         let vm_storage_path = self.vm_storage_path.trim();
         if vm_storage_path.is_empty() {
-            return Err("VM storage path is required.".into());
+            return Err(t!("settings.vm_storage_required").to_string());
         }
         let log_file_path = self.log_file_path.trim();
         if log_file_path.is_empty() {
-            return Err("Log file path is required.".into());
+            return Err(t!("settings.log_file_required").to_string());
         }
 
         Ok(AppSettings {
@@ -316,7 +327,7 @@ impl eframe::App for VmlordUi {
             let mut selected_action = None;
 
             ui.heading("VMLord");
-            ui.label("Linux workspaces on Windows");
+            ui.label(t!("app.subtitle").to_string());
             ui.separator();
 
             ui.horizontal(|ui| {
@@ -324,11 +335,11 @@ impl eframe::App for VmlordUi {
                 let can_refresh = matches!(self.application.status(), BackendStatus::Ready);
                 let refresh = render_refresh_icon(ui, can_refresh);
                 if can_refresh {
-                    refresh.clone().on_hover_text("Refresh");
+                    refresh.clone().on_hover_text(t!("app.refresh").to_string());
                 } else {
                     refresh
                         .clone()
-                        .on_disabled_hover_text("Available when the backend is ready");
+                        .on_disabled_hover_text(t!("app.refresh_hint").to_string());
                 }
                 if refresh.clicked() {
                     self.application.refresh();
@@ -339,23 +350,28 @@ impl eframe::App for VmlordUi {
                     let create = ui.add_enabled(
                         can_refresh,
                         egui::Button::new(
-                            egui::RichText::new("Create VM").color(egui::Color32::WHITE),
+                            egui::RichText::new(t!("app.create_vm").to_string())
+                                .color(egui::Color32::WHITE),
                         )
                         .fill(egui::Color32::from_rgb(47, 158, 97)),
                     );
                     if can_refresh {
-                        create.clone().on_hover_text("Create a virtual machine");
+                        create
+                            .clone()
+                            .on_hover_text(t!("app.create_vm_hint").to_string());
                     } else {
                         create
                             .clone()
-                            .on_disabled_hover_text("Available when the backend is ready");
+                            .on_disabled_hover_text(t!("app.refresh_hint").to_string());
                     }
                     if create.clicked() {
                         selected_action = Some(VmAction::Create);
                     }
 
-                    let settings = ui.button("Settings");
-                    settings.clone().on_hover_text("Open application settings");
+                    let settings = ui.button(t!("app.settings").to_string());
+                    settings
+                        .clone()
+                        .on_hover_text(t!("app.settings_hint").to_string());
                     if settings.clicked()
                         && let Some(current) = self.application.settings()
                     {
@@ -525,11 +541,15 @@ impl eframe::App for VmlordUi {
             },
             Some(SettingsDialogAction::Cancel) => self.settings_form = None,
             Some(SettingsDialogAction::Submit(settings)) => {
+                let language = settings.language;
                 if let Err(error) = self.application.update_settings(settings) {
                     if let Some(form) = &mut self.settings_form {
                         form.error = Some(error.to_string());
                     }
                 } else {
+                    // egui rebuilds every frame from the catalogue, so this is
+                    // the whole of switching language: no restart, no reload.
+                    rust_i18n::set_locale(language.code());
                     self.settings_form = None;
                 }
             }
@@ -596,7 +616,7 @@ fn render_create_vm_dialog(
 ) -> Option<CreateVmDialogAction> {
     let mut open = true;
     let mut action = None;
-    egui::Window::new("New Linux VM")
+    egui::Window::new(t!("create_vm.title").to_string())
         .collapsible(false)
         .resizable(false)
         .default_width(620.0)
@@ -608,31 +628,29 @@ fn render_create_vm_dialog(
             egui::ScrollArea::vertical()
                 .max_height(420.0)
                 .show(ui, |ui| {
-                    ui.label("Create a persistent Linux workspace.");
+                    ui.label(t!("create_vm.description").to_string());
                     ui.add_space(8.0);
 
                     ui.horizontal(|ui| {
-                        ui.strong("System");
+                        ui.strong(t!("create_vm.system").to_string());
                         ui.radio_value(
                             &mut form.source_kind,
                             SourceKind::CloudImage,
-                            "Cloud image (ready to use)",
+                            t!("create_vm.cloud_image").to_string(),
                         );
                         ui.radio_value(
                             &mut form.source_kind,
                             SourceKind::LocalMedia,
-                            "Own ISO (installed by hand)",
+                            t!("create_vm.own_iso").to_string(),
                         );
                     });
                     match form.source_kind {
-                        SourceKind::CloudImage => ui.small(
-                            "The image is downloaded once and configured on the first boot: \
-                             the user below, their login and the guest settings.",
-                        ),
-                        SourceKind::LocalMedia => ui.small(
-                            "The installer runs in the VM and asks for the user, the password \
-                             and the guest settings itself, so VMLord configures none of them.",
-                        ),
+                        SourceKind::CloudImage => {
+                            ui.small(t!("create_vm.cloud_image_note").to_string())
+                        }
+                        SourceKind::LocalMedia => {
+                            ui.small(t!("create_vm.own_iso_note").to_string())
+                        }
                     };
 
                     ui.add_space(8.0);
@@ -640,7 +658,7 @@ fn render_create_vm_dialog(
                         .num_columns(2)
                         .spacing([12.0, 8.0])
                         .show(ui, |ui| {
-                            ui.label("VM Name");
+                            ui.label(t!("create_vm.vm_name").to_string());
                             ui.add_sized(
                                 [260.0, FIELD_HEIGHT],
                                 egui::TextEdit::singleline(&mut form.name),
@@ -649,7 +667,7 @@ fn render_create_vm_dialog(
 
                             match form.source_kind {
                                 SourceKind::CloudImage => {
-                                    ui.label("Distribution");
+                                    ui.label(t!("create_vm.distribution").to_string());
                                     // One entry until distribution profiles are read
                                     // from a file (#67); the guest's account name and
                                     // its admin group come from the same profile.
@@ -660,7 +678,7 @@ fn render_create_vm_dialog(
                                         });
                                     ui.end_row();
 
-                                    ui.label("Release");
+                                    ui.label(t!("create_vm.release").to_string());
                                     egui::ComboBox::from_id_salt("create-vm-release")
                                         .selected_text(release_label(&form.release))
                                         .show_ui(ui, |ui| {
@@ -675,14 +693,16 @@ fn render_create_vm_dialog(
                                     ui.end_row();
                                 }
                                 SourceKind::LocalMedia => {
-                                    ui.label("OS Image");
+                                    ui.label(t!("create_vm.os_image").to_string());
                                     ui.horizontal(|ui| {
                                         ui.add_sized(
                                             [300.0, FIELD_HEIGHT],
                                             egui::TextEdit::singleline(&mut form.image_path)
-                                                .hint_text("Path to ISO or VHDX..."),
+                                                .hint_text(
+                                                    t!("create_vm.os_image_hint").to_string(),
+                                                ),
                                         );
-                                        if ui.button("Browse...").clicked() {
+                                        if ui.button(t!("common.browse").to_string()).clicked() {
                                             action = Some(CreateVmDialogAction::BrowseImage);
                                         }
                                     });
@@ -690,14 +710,14 @@ fn render_create_vm_dialog(
                                 }
                             }
 
-                            ui.label("HDD Size");
+                            ui.label(t!("create_vm.hdd_size").to_string());
                             ui.horizontal(|ui| {
                                 ui.add(egui::DragValue::new(&mut form.disk_gb).range(1..=16_384));
                                 ui.label("GiB");
                             });
                             ui.end_row();
 
-                            ui.label("RAM Size");
+                            ui.label(t!("create_vm.ram_size").to_string());
                             ui.horizontal(|ui| {
                                 ui.add(
                                     egui::DragValue::new(&mut form.ram_mb).range(512..=1_048_576),
@@ -706,7 +726,7 @@ fn render_create_vm_dialog(
                             });
                             ui.end_row();
 
-                            ui.label("CPU Cores");
+                            ui.label(t!("create_vm.cpu_cores").to_string());
                             ui.add(egui::DragValue::new(&mut form.cpu_cores).range(1..=256));
                             ui.end_row();
 
@@ -717,14 +737,18 @@ fn render_create_vm_dialog(
                                     ui.selectable_value(
                                         &mut form.gpu_mode,
                                         GpuMode::Default,
-                                        "Default",
+                                        gpu_mode_label(GpuMode::Default),
                                     );
                                     ui.selectable_value(
                                         &mut form.gpu_mode,
                                         GpuMode::Mirror,
-                                        "Mirror",
+                                        gpu_mode_label(GpuMode::Mirror),
                                     );
-                                    ui.selectable_value(&mut form.gpu_mode, GpuMode::None, "None");
+                                    ui.selectable_value(
+                                        &mut form.gpu_mode,
+                                        GpuMode::None,
+                                        gpu_mode_label(GpuMode::None),
+                                    );
                                 });
                             ui.end_row();
 
@@ -738,7 +762,7 @@ fn render_create_vm_dialog(
                             // hand-installed system gets no seed of VMLord's,
                             // so there would be nothing to install it with.
                             if form.source_kind == SourceKind::CloudImage {
-                                ui.label("Desktop");
+                                ui.label(t!("create_vm.desktop").to_string());
                                 egui::ComboBox::from_id_salt("create-vm-desktop")
                                     .selected_text(desktop_profile_label(form.desktop))
                                     .show_ui(ui, |ui| {
@@ -765,19 +789,19 @@ fn render_create_vm_dialog(
                                 }
                             }
 
-                            ui.label("Network");
+                            ui.label(t!("create_vm.network").to_string());
                             egui::ComboBox::from_id_salt("create-vm-network")
                                 .selected_text(network_mode_label(form.network_mode))
                                 .show_ui(ui, |ui| {
                                     ui.selectable_value(
                                         &mut form.network_mode,
                                         NetworkMode::Nat,
-                                        "NAT",
+                                        network_mode_label(NetworkMode::Nat),
                                     );
                                     ui.selectable_value(
                                         &mut form.network_mode,
                                         NetworkMode::None,
-                                        "None",
+                                        network_mode_label(NetworkMode::None),
                                     );
                                 });
                             ui.end_row();
@@ -786,7 +810,7 @@ fn render_create_vm_dialog(
                     if form.source_kind == SourceKind::CloudImage {
                         ui.add_space(10.0);
                         ui.separator();
-                        ui.strong("Guest");
+                        ui.strong(t!("create_vm.guest").to_string());
                         ui.add_space(4.0);
                         render_provisioning_fields(ui, form, ssh_key_path);
                     }
@@ -800,8 +824,11 @@ fn render_create_vm_dialog(
             ui.separator();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let create = ui.add(
-                    egui::Button::new(egui::RichText::new("Create VM").color(egui::Color32::WHITE))
-                        .fill(egui::Color32::from_rgb(47, 158, 97)),
+                    egui::Button::new(
+                        egui::RichText::new(t!("app.create_vm").to_string())
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(47, 158, 97)),
                 );
                 if create.clicked() {
                     match create_vm_request(form, existing_vms) {
@@ -811,7 +838,7 @@ fn render_create_vm_dialog(
                         Err(error) => form.error = Some(error),
                     }
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button(t!("common.cancel").to_string()).clicked() {
                     action = Some(CreateVmDialogAction::Cancel);
                 }
             });
@@ -834,42 +861,37 @@ fn render_provisioning_fields(
         .num_columns(2)
         .spacing([12.0, 8.0])
         .show(ui, |ui| {
-            ui.label("User name");
+            ui.label(t!("create_vm.user_name").to_string());
             ui.add_sized(
                 [260.0, FIELD_HEIGHT],
                 egui::TextEdit::singleline(&mut form.username),
             );
             ui.end_row();
 
-            ui.label("Password");
+            ui.label(t!("create_vm.password").to_string());
             ui.vertical(|ui| {
                 ui.add_sized(
                     [260.0, FIELD_HEIGHT],
                     egui::TextEdit::singleline(&mut form.password)
                         .password(true)
-                        .hint_text("Optional"),
+                        .hint_text(t!("create_vm.password_optional").to_string()),
                 );
                 if form.password.is_empty() {
-                    ui.small(
-                        "No password: the guest is reachable by SSH key only, \
-                         and password logins are turned off. The COM1 console \
-                         cannot log in either, so a guest whose network fails \
-                         is out of reach.",
-                    );
+                    ui.small(t!("create_vm.no_password_note").to_string());
                 }
             });
             ui.end_row();
 
             ui.label("SSH");
             ui.vertical(|ui| {
-                ui.checkbox(&mut form.ssh_enabled, "Run an SSH server in the guest");
+                ui.checkbox(
+                    &mut form.ssh_enabled,
+                    t!("create_vm.ssh_server").to_string(),
+                );
                 ui.add_enabled_ui(form.ssh_enabled, |ui| {
-                    ui.checkbox(
-                        &mut form.deploy_key,
-                        "Generate a key pair for this VM and install the public half",
-                    );
+                    ui.checkbox(&mut form.deploy_key, t!("create_vm.ssh_key").to_string());
                     ui.horizontal(|ui| {
-                        ui.label("Port");
+                        ui.label(t!("create_vm.port").to_string());
                         // The range is the domain's own `1..=65535`, and the
                         // widget clamps to it, so the field cannot be dragged
                         // to a port nothing can be reached on. A typed 0 is
@@ -882,47 +904,46 @@ fn render_provisioning_fields(
                         );
                     });
                     if form.ssh_port != SshPort::DEFAULT.get() {
-                        ui.small(
-                            "The port is fixed when the VM is created; \
-                             connections VMLord opens use it automatically.",
-                        );
+                        ui.small(t!("create_vm.port_note").to_string());
                     }
                 });
                 if form.ssh_enabled && form.deploy_key {
                     match ssh_key_path {
                         Some(path) => {
-                            ui.small(format!("Private key: {}", path.display()));
+                            ui.small(
+                                t!("create_vm.private_key", path = path.display()).to_string(),
+                            );
                         }
                         None => {
-                            ui.small("The private key is stored in the VM's own folder.");
+                            ui.small(t!("create_vm.private_key_note").to_string());
                         }
                     }
                 }
             });
             ui.end_row();
 
-            ui.label("Locale");
+            ui.label(t!("create_vm.locale").to_string());
             ui.add_sized(
                 [260.0, FIELD_HEIGHT],
                 egui::TextEdit::singleline(&mut form.locale),
             );
             ui.end_row();
 
-            ui.label("Keyboard layout");
+            ui.label(t!("create_vm.keyboard").to_string());
             ui.add_sized(
                 [260.0, FIELD_HEIGHT],
                 egui::TextEdit::singleline(&mut form.keyboard),
             );
             ui.end_row();
 
-            ui.label("Timezone");
+            ui.label(t!("create_vm.timezone").to_string());
             ui.add_sized(
                 [260.0, FIELD_HEIGHT],
                 egui::TextEdit::singleline(&mut form.timezone),
             );
             ui.end_row();
         });
-    ui.small("The three settings above are filled in from this computer and applied to the guest.");
+    ui.small(t!("create_vm.guest_defaults_note").to_string());
 }
 
 fn render_settings_dialog(
@@ -931,63 +952,104 @@ fn render_settings_dialog(
 ) -> Option<SettingsDialogAction> {
     let mut open = true;
     let mut action = None;
-    egui::Window::new("Application settings")
+    egui::Window::new(t!("settings.title").to_string())
         .collapsible(false)
         .resizable(false)
         .default_width(600.0)
         .open(&mut open)
         .show(context, |ui| {
-            ui.label("Configure where VMLord stores VM data and diagnostic logs.");
+            ui.label(t!("settings.description").to_string());
             ui.add_space(8.0);
             egui::Grid::new("application-settings-form")
                 .num_columns(2)
                 .min_col_width(110.0)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    ui.add_sized([110.0, 24.0], egui::Label::new("VM storage"));
+                    ui.add_sized(
+                        [110.0, 24.0],
+                        egui::Label::new(t!("settings.vm_storage").to_string()),
+                    );
                     ui.horizontal(|ui| {
                         ui.add_sized(
                             [310.0, 24.0],
                             egui::TextEdit::singleline(&mut form.vm_storage_path)
-                                .hint_text("Directory for virtual machine data"),
+                                .hint_text(t!("settings.vm_storage_hint").to_string()),
                         );
-                        if ui.button("Browse...").clicked() {
+                        if ui.button(t!("common.browse").to_string()).clicked() {
                             action = Some(SettingsDialogAction::BrowseVmStorage);
                         }
                     });
                     ui.end_row();
 
-                    ui.add_sized([110.0, 24.0], egui::Label::new("Language"));
+                    ui.add_sized(
+                        [110.0, 24.0],
+                        egui::Label::new(t!("settings.language").to_string()),
+                    );
                     egui::ComboBox::from_id_salt("settings-language")
                         .width(310.0)
                         .selected_text(language_label(form.language))
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut form.language, Language::EnUs, "English (US)");
+                            ui.selectable_value(
+                                &mut form.language,
+                                Language::EnUs,
+                                language_label(Language::EnUs),
+                            );
+                            ui.selectable_value(
+                                &mut form.language,
+                                Language::RuRu,
+                                language_label(Language::RuRu),
+                            );
                         });
                     ui.end_row();
 
-                    ui.add_sized([110.0, 24.0], egui::Label::new("Log file"));
+                    ui.add_sized(
+                        [110.0, 24.0],
+                        egui::Label::new(t!("settings.log_file").to_string()),
+                    );
                     ui.horizontal(|ui| {
                         ui.add_sized(
                             [310.0, 24.0],
                             egui::TextEdit::singleline(&mut form.log_file_path)
-                                .hint_text("Path to the log file"),
+                                .hint_text(t!("settings.log_file_hint").to_string()),
                         );
-                        if ui.button("Browse...").clicked() {
+                        if ui.button(t!("common.browse").to_string()).clicked() {
                             action = Some(SettingsDialogAction::BrowseLogFile);
                         }
                     });
                     ui.end_row();
 
-                    ui.add_sized([110.0, 24.0], egui::Label::new("Log level"));
+                    ui.add_sized(
+                        [110.0, 24.0],
+                        egui::Label::new(t!("settings.log_level").to_string()),
+                    );
                     egui::ComboBox::from_id_salt("settings-log-level")
                         .selected_text(log_level_label(form.log_level))
                         .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut form.log_level, LogLevel::Error, "Error");
-                            ui.selectable_value(&mut form.log_level, LogLevel::Warn, "Warning");
-                            ui.selectable_value(&mut form.log_level, LogLevel::Info, "Info");
-                            ui.selectable_value(&mut form.log_level, LogLevel::Debug, "Debug");
-                            ui.selectable_value(&mut form.log_level, LogLevel::Trace, "Trace");
+                            ui.selectable_value(
+                                &mut form.log_level,
+                                LogLevel::Error,
+                                log_level_label(LogLevel::Error),
+                            );
+                            ui.selectable_value(
+                                &mut form.log_level,
+                                LogLevel::Warn,
+                                log_level_label(LogLevel::Warn),
+                            );
+                            ui.selectable_value(
+                                &mut form.log_level,
+                                LogLevel::Info,
+                                log_level_label(LogLevel::Info),
+                            );
+                            ui.selectable_value(
+                                &mut form.log_level,
+                                LogLevel::Debug,
+                                log_level_label(LogLevel::Debug),
+                            );
+                            ui.selectable_value(
+                                &mut form.log_level,
+                                LogLevel::Trace,
+                                log_level_label(LogLevel::Trace),
+                            );
                         });
                     ui.end_row();
                 });
@@ -1000,9 +1062,12 @@ fn render_settings_dialog(
             ui.separator();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let save = ui.add(
-                    egui::Button::new(egui::RichText::new("Save").color(egui::Color32::WHITE))
-                        .fill(egui::Color32::from_rgb(47, 158, 97))
-                        .min_size(egui::vec2(88.0, 30.0)),
+                    egui::Button::new(
+                        egui::RichText::new(t!("common.save").to_string())
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(47, 158, 97))
+                    .min_size(egui::vec2(88.0, 30.0)),
                 );
                 if save.clicked() {
                     match form.settings() {
@@ -1011,9 +1076,12 @@ fn render_settings_dialog(
                     }
                 }
                 let cancel = ui.add(
-                    egui::Button::new(egui::RichText::new("Cancel").color(egui::Color32::WHITE))
-                        .fill(egui::Color32::from_rgb(100, 100, 100))
-                        .min_size(egui::vec2(88.0, 30.0)),
+                    egui::Button::new(
+                        egui::RichText::new(t!("common.cancel").to_string())
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(100, 100, 100))
+                    .min_size(egui::vec2(88.0, 30.0)),
                 );
                 if cancel.clicked() {
                     action = Some(SettingsDialogAction::Cancel);
@@ -1034,38 +1102,36 @@ fn render_edit_vm_dialog(
 ) -> Option<EditVmDialogAction> {
     let mut open = true;
     let mut action = None;
-    egui::Window::new(format!("Edit VM: {}", form.name))
+    egui::Window::new(t!("edit_vm.title", name = form.name).to_string())
         .collapsible(false)
         .resizable(false)
         .default_width(460.0)
         .open(&mut open)
         .show(context, |ui| {
-            ui.label("Changes are saved to the VM configuration and take effect the next time the VM starts.");
-            ui.small(
-                "RAM, CPU and GPU are editable; the GPU mode only while the VM is stopped. \
-                 The SSH port is the exception to the line above: it is changed inside the \
-                 running guest and takes effect at once. Network is not wired to the native \
-                 backend yet. Disk size and VM name stay fixed and currently require \
-                 recreating the VM.",
-            );
+            ui.label(t!("edit_vm.description").to_string());
+            ui.small(t!("edit_vm.scope_note").to_string());
             ui.add_space(8.0);
 
             egui::Grid::new("edit-vm-form")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label("VM Name");
+                    ui.label(t!("create_vm.vm_name").to_string());
                     ui.label(&form.name);
                     ui.end_row();
 
-                    ui.label("RAM Size");
+                    ui.label(t!("create_vm.ram_size").to_string());
                     ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut form.ram_mb).range(512..=1_048_576).speed(2));
+                        ui.add(
+                            egui::DragValue::new(&mut form.ram_mb)
+                                .range(512..=1_048_576)
+                                .speed(2),
+                        );
                         ui.label("MiB");
                     });
                     ui.end_row();
 
-                    ui.label("CPU Cores");
+                    ui.label(t!("create_vm.cpu_cores").to_string());
                     ui.add(egui::DragValue::new(&mut form.cpu_cores).range(1..=256));
                     ui.end_row();
 
@@ -1078,17 +1144,25 @@ fn render_edit_vm_dialog(
                                 ui.selectable_value(
                                     &mut form.gpu_mode,
                                     GpuMode::Default,
-                                    "Default",
+                                    gpu_mode_label(GpuMode::Default),
                                 );
-                                ui.selectable_value(&mut form.gpu_mode, GpuMode::Mirror, "Mirror");
-                                ui.selectable_value(&mut form.gpu_mode, GpuMode::None, "None");
+                                ui.selectable_value(
+                                    &mut form.gpu_mode,
+                                    GpuMode::Mirror,
+                                    gpu_mode_label(GpuMode::Mirror),
+                                );
+                                ui.selectable_value(
+                                    &mut form.gpu_mode,
+                                    GpuMode::None,
+                                    gpu_mode_label(GpuMode::None),
+                                );
                             });
                         // The reason before the click rather than after it: the
                         // backend refuses this change under a live VM, and a
                         // control that looks available and is not is worse than
                         // one that says why.
-                        if let Some(reason) = locked {
-                            combo.response.on_disabled_hover_text(reason);
+                        if let Some(reason) = &locked {
+                            combo.response.on_disabled_hover_text(reason.clone());
                         }
                     });
                     ui.end_row();
@@ -1099,15 +1173,23 @@ fn render_edit_vm_dialog(
                         ui.end_row();
                     }
 
-                    ui.label("Network");
+                    ui.label(t!("create_vm.network").to_string());
                     egui::ComboBox::from_id_salt("edit-vm-network")
                         .selected_text(network_mode_label(form.network_mode))
                         .show_ui(ui, |ui| {
                             // The same two modes the create form offers: the
                             // native backend refuses the rest until #10, and an
                             // option that always fails is a poor way to say so.
-                            ui.selectable_value(&mut form.network_mode, NetworkMode::Nat, "NAT");
-                            ui.selectable_value(&mut form.network_mode, NetworkMode::None, "None");
+                            ui.selectable_value(
+                                &mut form.network_mode,
+                                NetworkMode::Nat,
+                                network_mode_label(NetworkMode::Nat),
+                            );
+                            ui.selectable_value(
+                                &mut form.network_mode,
+                                NetworkMode::None,
+                                network_mode_label(NetworkMode::None),
+                            );
                         });
                     ui.end_row();
 
@@ -1115,7 +1197,7 @@ fn render_edit_vm_dialog(
                     // created without SSH gets no row at all rather than a
                     // disabled one: there is nothing there to enable.
                     if let Some(ssh) = form.ssh.clone() {
-                        ui.label("SSH Port");
+                        ui.label(t!("edit_vm.ssh_port").to_string());
                         let locked = ssh_port_locked(&form.state, ssh.authentication);
                         ui.add_enabled_ui(locked.is_none(), |ui| {
                             let port = ui.add(
@@ -1127,18 +1209,15 @@ fn render_edit_vm_dialog(
                             // mode: this change is made inside the running
                             // guest, and a control that looks available and is
                             // not is worse than one that says why.
-                            if let Some(reason) = locked {
-                                port.on_disabled_hover_text(reason);
+                            if let Some(reason) = &locked {
+                                port.on_disabled_hover_text(reason.clone());
                             }
                         });
                         ui.end_row();
 
                         if locked.is_none() && form.ssh_port != ssh.port.get() {
                             ui.label("");
-                            ui.small(
-                                "The daemon is reconfigured inside the running guest and \
-                                 restarted; the connection VMLord opens next uses the new port.",
-                            );
+                            ui.small(t!("edit_vm.ssh_port_note").to_string());
                             ui.end_row();
                         }
                     }
@@ -1152,8 +1231,11 @@ fn render_edit_vm_dialog(
             ui.separator();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let save = ui.add(
-                    egui::Button::new(egui::RichText::new("Save changes").color(egui::Color32::WHITE))
-                        .fill(egui::Color32::from_rgb(235, 134, 58)),
+                    egui::Button::new(
+                        egui::RichText::new(t!("edit_vm.save").to_string())
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(235, 134, 58)),
                 );
                 if save.clicked() {
                     match edit_vm_request(form) {
@@ -1161,7 +1243,7 @@ fn render_edit_vm_dialog(
                         Err(error) => form.error = Some(error),
                     }
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button(t!("common.cancel").to_string()).clicked() {
                     action = Some(EditVmDialogAction::Cancel);
                 }
             });
@@ -1179,22 +1261,22 @@ fn render_delete_vm_dialog(
 ) -> Option<DeleteVmDialogAction> {
     let mut open = true;
     let mut action = None;
-    egui::Window::new(format!("Delete VM: {}", form.vm_name))
+    egui::Window::new(t!("delete_vm.title", name = form.vm_name).to_string())
         .collapsible(false)
         .resizable(false)
         .default_width(420.0)
         .open(&mut open)
         .show(context, |ui| {
-            ui.label(format!(
-                "VM \"{}\" and its stored configuration will be removed. This cannot be undone.",
-                form.vm_name
-            ));
+            ui.label(t!("delete_vm.description", name = form.vm_name).to_string());
             ui.add_space(8.0);
-            ui.checkbox(&mut form.delete_disks, "Delete virtual disks");
+            ui.checkbox(
+                &mut form.delete_disks,
+                t!("delete_vm.delete_disks").to_string(),
+            );
             if form.delete_disks {
-                ui.small("The VM's virtual disks are deleted with it. The image it was installed from is not touched.");
+                ui.small(t!("delete_vm.disks_deleted").to_string());
             } else {
-                ui.small("The virtual disks are kept, so the VM's directory stays in place and a new VM cannot reuse that name.");
+                ui.small(t!("delete_vm.disks_kept").to_string());
             }
 
             if let Some(error) = &form.error {
@@ -1205,13 +1287,16 @@ fn render_delete_vm_dialog(
             ui.separator();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let delete = ui.add(
-                    egui::Button::new(egui::RichText::new("Delete").color(egui::Color32::WHITE))
-                        .fill(egui::Color32::from_rgb(192, 57, 43)),
+                    egui::Button::new(
+                        egui::RichText::new(t!("actions.delete").to_string())
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(192, 57, 43)),
                 );
                 if delete.clicked() {
                     action = Some(DeleteVmDialogAction::Submit);
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button(t!("common.cancel").to_string()).clicked() {
                     action = Some(DeleteVmDialogAction::Cancel);
                 }
             });
@@ -1238,7 +1323,7 @@ fn create_vm_request(
         .iter()
         .any(|vm| vm.name.eq_ignore_ascii_case(name))
     {
-        return Err("A VM with this name already exists.".into());
+        return Err(t!("create_vm.name_taken").to_string());
     }
 
     let request = VmCreateRequest {
@@ -1297,21 +1382,26 @@ fn create_vm_source(form: &CreateVmForm) -> Result<VmSource, String> {
 
 /// Names a release the way the distribution does.
 fn release_label(release: &str) -> String {
-    format!("{} {release} LTS", ubuntu().name)
+    t!(
+        "create_vm.release_label",
+        distribution = ubuntu().name,
+        release = release
+    )
+    .to_string()
 }
 
 fn edit_vm_request(form: &EditVmForm) -> Result<VmUpdateRequest, String> {
     if form.ram_mb < 512 || !form.ram_mb.is_multiple_of(2) {
-        return Err("RAM must be an even number of MiB and at least 512 MiB.".into());
+        return Err(t!("edit_vm.ram_invalid").to_string());
     }
     if form.cpu_cores == 0 {
-        return Err("CPU cores must be at least 1.".into());
+        return Err(t!("edit_vm.cores_invalid").to_string());
     }
     if matches!(form.gpu_mode, GpuMode::Unknown(_)) {
-        return Err("The current GPU mode is not supported by the Rust UI yet.".into());
+        return Err(t!("edit_vm.gpu_mode_unsupported").to_string());
     }
     if matches!(form.network_mode, NetworkMode::Unknown(_)) {
-        return Err("The current network mode is not supported by the Rust UI yet.".into());
+        return Err(t!("edit_vm.network_mode_unsupported").to_string());
     }
 
     // A VM with no SSH access carries no port: there is no daemon to move, and
@@ -1332,19 +1422,23 @@ fn edit_vm_request(form: &EditVmForm) -> Result<VmUpdateRequest, String> {
     })
 }
 
-fn log_level_label(level: LogLevel) -> &'static str {
+fn log_level_label(level: LogLevel) -> String {
     match level {
-        LogLevel::Error => "Error",
-        LogLevel::Warn => "Warning",
-        LogLevel::Info => "Info",
-        LogLevel::Debug => "Debug",
-        LogLevel::Trace => "Trace",
+        LogLevel::Error => t!("log_level.error"),
+        LogLevel::Warn => t!("log_level.warning"),
+        LogLevel::Info => t!("log_level.info"),
+        LogLevel::Debug => t!("log_level.debug"),
+        LogLevel::Trace => t!("log_level.trace"),
     }
+    .to_string()
 }
 
+/// Each language is named in itself, and neither name is translated: a user
+/// who cannot read the language on screen has to find their own in this list.
 fn language_label(language: Language) -> &'static str {
     match language {
         Language::EnUs => "English (US)",
+        Language::RuRu => "Русский",
     }
 }
 
@@ -1357,23 +1451,28 @@ fn gpu_status_detail(status: Option<&VmGpuStatus>) -> String {
     // Only a VM the last refresh did not list has no status, and that VM is
     // not on screen to be asked about.
     let Some(status) = status else {
-        return "Unknown".into();
+        return t!("common.unknown").to_string();
     };
 
-    let mut detail = format!("{}: {}", gpu_state_label(status.state), status.message);
+    let mut detail = t!(
+        "selected_vm.status_detail",
+        label = gpu_state_label(status.state),
+        message = status.message
+    )
+    .to_string();
     if let Some(adapter) = status
         .native
         .as_ref()
         .and_then(|native| native.adapter.as_ref())
     {
-        detail.push_str(&format!(" Adapter: {adapter}."));
+        detail.push_str(&t!("selected_vm.adapter", adapter = adapter));
     }
     if let Some(node) = status
         .guest
         .as_ref()
         .and_then(|guest| guest.render_node.as_ref())
     {
-        detail.push_str(&format!(" Render node: {node}."));
+        detail.push_str(&t!("selected_vm.render_node", node = node));
     }
     // The stable code, so that what is on screen can be found in the log. Only
     // where something is wrong: a working GPU needs no identifier to match a
@@ -1406,17 +1505,10 @@ fn gpu_capability_warnings(
 
     let mut warnings = Vec::new();
     if !capabilities.assignment.is_available() {
-        warnings.push(
-            "This host presents no GPU partition adapter, so the VM will start without a GPU."
-                .to_owned(),
-        );
+        warnings.push(t!("create_vm.no_gpu_adapter").to_string());
     }
     if !capabilities.linux_payload.is_available() {
-        warnings.push(
-            "The Linux GPU userspace is not installed on this host, so the guest will see the \
-             device but will not render on it."
-                .to_owned(),
-        );
+        warnings.push(t!("create_vm.no_linux_payload").to_string());
     }
     warnings
 }
@@ -1427,10 +1519,10 @@ fn gpu_capability_warnings(
 /// change under a live VM would leave a stored mode that does not describe the
 /// GPU the guest actually has. RAM and CPU are different: they are read from
 /// the configuration on the next start, and nothing claims otherwise.
-fn gpu_mode_locked(state: &VmState) -> Option<&'static str> {
+fn gpu_mode_locked(state: &VmState) -> Option<String> {
     match state {
         VmState::Stopped => None,
-        _ => Some("Stop the VM to change its GPU mode."),
+        _ => Some(t!("actions.gpu_mode_locked").to_string()),
     }
 }
 
@@ -1441,28 +1533,62 @@ fn gpu_mode_locked(state: &VmState) -> Option<&'static str> {
 /// credential VMLord can present on its own. A stopped VM has nothing to reach,
 /// and a password-mode VM has nothing to present -- neither is a refusal worth
 /// discovering after the click.
-fn ssh_port_locked(state: &VmState, authentication: SshAuthentication) -> Option<&'static str> {
+fn ssh_port_locked(state: &VmState, authentication: SshAuthentication) -> Option<String> {
     if authentication == SshAuthentication::Password {
-        return Some(
-            "This VM logs in by password, which nobody can type into a command VMLord runs on \
-             its own. Change the port inside the guest.",
-        );
+        return Some(t!("actions.ssh_port_password_locked").to_string());
     }
     match state {
         VmState::Running { .. } => None,
-        _ => Some("Start the VM to change its SSH port: the change is made inside the guest."),
+        _ => Some(t!("actions.ssh_port_locked").to_string()),
     }
 }
 
-fn gpu_state_label(state: GpuState) -> &'static str {
-    match state {
-        GpuState::Disabled => "Disabled",
-        GpuState::WaitingForGuest => "Waiting for guest",
-        GpuState::Assigned => "Assigned",
-        GpuState::GuestReady => "Ready",
-        GpuState::Degraded => "Degraded",
-        GpuState::Failed => "Failed",
+/// Which of the three forms a counted noun takes.
+///
+/// Russian inflects a counted noun three ways -- 1 ядро, 2 ядра, 5 ядер --
+/// and the catalogue backend carries no plural rules. A rule engine would be a
+/// large answer to one string: the core count is the only place in the UI
+/// where a number stands before a noun that bends. English is served by the
+/// same three keys, because its rule -- one against everything else -- is a
+/// coarsening of this one, and `en-US.toml` repeats itself in the last two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PluralForm {
+    One,
+    Few,
+    Many,
+}
+
+fn plural_form(count: u32) -> PluralForm {
+    let last_two = count % 100;
+    if (11..=14).contains(&last_two) {
+        return PluralForm::Many;
     }
+    match count % 10 {
+        1 => PluralForm::One,
+        2..=4 => PluralForm::Few,
+        _ => PluralForm::Many,
+    }
+}
+
+fn cores_label(count: u32) -> String {
+    match plural_form(count) {
+        PluralForm::One => t!("vm_table.cores_one", count = count),
+        PluralForm::Few => t!("vm_table.cores_few", count = count),
+        PluralForm::Many => t!("vm_table.cores_many", count = count),
+    }
+    .to_string()
+}
+
+fn gpu_state_label(state: GpuState) -> String {
+    match state {
+        GpuState::Disabled => t!("common.disabled"),
+        GpuState::WaitingForGuest => t!("gpu_state.waiting_for_guest"),
+        GpuState::Assigned => t!("gpu_state.assigned"),
+        GpuState::GuestReady => t!("gpu_state.ready"),
+        GpuState::Degraded => t!("gpu_state.degraded"),
+        GpuState::Failed => t!("gpu_state.failed"),
+    }
+    .to_string()
 }
 
 /// What the domain has to say about the VM this form describes, if anything.
@@ -1474,54 +1600,103 @@ fn create_vm_advisories(form: &CreateVmForm) -> Vec<String> {
     create_vm_request(form, &[])
         .map(|request| request.advisories())
         .unwrap_or_default()
+        .into_iter()
+        .map(advisory_text)
+        .collect()
 }
 
-fn desktop_profile_label(profile: DesktopProfile) -> &'static str {
-    match profile {
-        DesktopProfile::Headless => "None (headless)",
-        DesktopProfile::Gnome => "GNOME",
+/// The words for a piece of advice the domain has given.
+///
+/// The domain decides when to advise and carries the numbers; the sentence is
+/// the UI's, because the UI is what has a catalogue and a language.
+fn advisory_text(advisory: Advisory) -> String {
+    match advisory {
+        Advisory::DesktopNeedsCores { required, actual } => t!(
+            "advisory.desktop_needs_cores",
+            required = required,
+            actual = actual
+        ),
+        Advisory::DesktopNeedsRam {
+            required_gib,
+            actual_mb,
+        } => t!(
+            "advisory.desktop_needs_ram",
+            required = required_gib,
+            actual = actual_mb
+        ),
+        Advisory::DesktopNeedsCoresAndRam {
+            required_cores,
+            actual_cores,
+            required_gib,
+            actual_mb,
+        } => t!(
+            "advisory.desktop_needs_cores_and_ram",
+            required_cores = required_cores,
+            actual_cores = actual_cores,
+            required_gib = required_gib,
+            actual_mb = actual_mb
+        ),
+        Advisory::DesktopNeedsPassword => t!("advisory.desktop_needs_password"),
     }
+    .to_string()
+}
+
+fn desktop_profile_label(profile: DesktopProfile) -> String {
+    match profile {
+        DesktopProfile::Headless => t!("desktop_profile.headless"),
+        DesktopProfile::Gnome => t!("desktop_profile.gnome"),
+    }
+    .to_string()
 }
 
 /// What to show beside a VM's desktop, in one line.
 fn display_status_detail(profile: DesktopProfile, status: Option<&VmDisplayStatus>) -> String {
     let Some(status) = status else {
-        return desktop_profile_label(profile).to_owned();
+        return desktop_profile_label(profile);
     };
-    let mut detail = format!("{}: {}", display_state_label(status.state), status.message);
+    let mut detail = t!(
+        "selected_vm.status_detail",
+        label = display_state_label(status.state),
+        message = status.message
+    )
+    .to_string();
     if status.can_retry {
-        detail.push_str(" The desktop can be installed again.");
+        detail.push_str(&t!("selected_vm.desktop_reinstallable"));
     }
     detail
 }
 
-fn display_state_label(state: DisplayState) -> &'static str {
+fn display_state_label(state: DisplayState) -> String {
     match state {
-        DisplayState::Disabled => "Disabled",
-        DisplayState::Provisioning => "Installing",
-        DisplayState::WaitingForGuest => "Waiting for guest",
-        DisplayState::Ready => "Ready",
-        DisplayState::Degraded => "Degraded",
+        DisplayState::Disabled => t!("common.disabled"),
+        DisplayState::Provisioning => t!("display_state.installing"),
+        // The same wait the GPU reports, named the same way.
+        DisplayState::WaitingForGuest => t!("gpu_state.waiting_for_guest"),
+        DisplayState::Ready => t!("display_state.ready"),
+        DisplayState::Degraded => t!("display_state.degraded"),
     }
+    .to_string()
 }
 
-fn gpu_mode_label(mode: GpuMode) -> &'static str {
+fn gpu_mode_label(mode: GpuMode) -> String {
     match mode {
-        GpuMode::None => "None",
-        GpuMode::Default => "Default",
-        GpuMode::Mirror => "Mirror",
-        GpuMode::Unknown(_) => "Unsupported",
+        GpuMode::None => t!("common.none"),
+        GpuMode::Default => t!("common.default"),
+        GpuMode::Mirror => t!("gpu_mode.mirror"),
+        GpuMode::Unknown(_) => t!("gpu_mode.unsupported"),
     }
+    .to_string()
 }
 
-fn network_mode_label(mode: NetworkMode) -> &'static str {
+fn network_mode_label(mode: NetworkMode) -> String {
     match mode {
-        NetworkMode::None => "None",
-        NetworkMode::Nat => "NAT",
-        NetworkMode::External => "External",
-        NetworkMode::Internal => "Internal",
-        NetworkMode::Unknown(_) => "Unsupported",
+        NetworkMode::None => t!("common.none"),
+        NetworkMode::Nat => t!("network_mode.nat"),
+        NetworkMode::External => t!("network_mode.external"),
+        NetworkMode::Internal => t!("network_mode.internal"),
+        NetworkMode::Unknown(_) => t!("network_mode.unsupported"),
     }
+    .to_string()
 }
 
 fn render_refresh_icon(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
@@ -1559,20 +1734,23 @@ fn render_refresh_icon(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
 
 fn render_backend_status(ui: &mut egui::Ui, status: &BackendStatus) {
     match status {
-        BackendStatus::Starting => ui.label("Backend: starting…"),
-        BackendStatus::Ready => ui.colored_label(egui::Color32::LIGHT_GREEN, "Backend: ready"),
+        BackendStatus::Starting => ui.label(t!("app.backend_starting").to_string()),
+        BackendStatus::Ready => ui.colored_label(
+            egui::Color32::LIGHT_GREEN,
+            t!("app.backend_ready").to_string(),
+        ),
         BackendStatus::Unavailable(message) => ui.colored_label(
             egui::Color32::LIGHT_RED,
-            format!("Backend unavailable: {message}"),
+            t!("app.backend_unavailable", message = message).to_string(),
         ),
     };
 }
 
 fn render_vm_list(ui: &mut egui::Ui, vms: &[VmSummary], selected_vm_name: &mut Option<String>) {
-    ui.heading("Workspaces");
+    ui.heading(t!("vm_table.title").to_string());
     if vms.is_empty() {
         *selected_vm_name = None;
-        ui.weak("No virtual machines found.");
+        ui.weak(t!("vm_table.empty").to_string());
         return;
     }
 
@@ -1592,15 +1770,15 @@ fn render_vm_list(ui: &mut egui::Ui, vms: &[VmSummary], selected_vm_name: &mut O
         .num_columns(VM_TABLE_COLUMN_COUNT as usize)
         .min_col_width(min_column_width)
         .show(ui, |ui| {
-            ui.strong("Name");
-            ui.strong("OS");
-            ui.strong("Status");
-            ui.strong("Agent status");
-            ui.strong("CPU");
-            ui.strong("RAM");
-            ui.strong("Disk");
+            ui.strong(t!("vm_table.name").to_string());
+            ui.strong(t!("vm_table.os").to_string());
+            ui.strong(t!("vm_table.status").to_string());
+            ui.strong(t!("vm_table.agent_status").to_string());
+            ui.strong(t!("vm_table.cpu").to_string());
+            ui.strong(t!("vm_table.ram").to_string());
+            ui.strong(t!("vm_table.disk").to_string());
             ui.strong("GPU");
-            ui.strong("Network type");
+            ui.strong(t!("vm_table.network_type").to_string());
             ui.end_row();
             for vm in vms {
                 let is_selected = selected_vm_name.as_deref() == Some(vm.name.as_str());
@@ -1610,9 +1788,9 @@ fn render_vm_list(ui: &mut egui::Ui, vms: &[VmSummary], selected_vm_name: &mut O
                 ui.label(&vm.os_type);
                 ui.label(vm_state_label(vm.state));
                 render_agent_status(ui, agent_status(vm.state));
-                ui.label(format!("{} cores", vm.cpu_cores));
-                ui.label(format!("{} MiB", vm.ram_mb));
-                ui.label(format!("{} GiB", vm.disk_gb));
+                ui.label(cores_label(vm.cpu_cores));
+                ui.label(t!("vm_table.mebibytes", count = vm.ram_mb).to_string());
+                ui.label(t!("vm_table.gibibytes", count = vm.disk_gb).to_string());
                 ui.label(gpu_mode_label(vm.gpu_mode));
                 ui.label(network_mode_label(vm.network_mode));
                 ui.end_row();
@@ -1625,7 +1803,9 @@ fn render_vm_list(ui: &mut egui::Ui, vms: &[VmSummary], selected_vm_name: &mut O
 /// "Open SSH" and not "Open in Windows Terminal": which terminal host the
 /// session lands in is decided when it is launched, and a button that named one
 /// would be wrong on the machine where the other answers.
-const SSH_ACTION_LABEL: &str = "Open SSH";
+fn ssh_action_label() -> String {
+    t!("actions.open_ssh").to_string()
+}
 
 /// What the SSH action can offer for one VM right now.
 ///
@@ -1633,21 +1813,21 @@ const SSH_ACTION_LABEL: &str = "Open SSH";
 /// cannot be pressed yet" are different things to see: the first says this VM
 /// was created without SSH and never will have it, the second says to wait, and
 /// names what for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum SshOffer {
     /// This VM has no SSH access at all, so there is no action to show.
     Absent,
     /// SSH is configured, but the guest cannot be reached yet.
-    Waiting(&'static str),
+    Waiting(String),
     Ready,
 }
 
 impl SshOffer {
     /// The tooltip of a button that cannot be pressed, and nothing for one that
     /// can.
-    const fn waiting_for(self) -> Option<&'static str> {
+    fn waiting_for(&self) -> Option<&str> {
         match self {
-            Self::Waiting(reason) => Some(reason),
+            Self::Waiting(reason) => Some(reason.as_str()),
             Self::Absent | Self::Ready => None,
         }
     }
@@ -1666,14 +1846,12 @@ fn ssh_offer(vm: &VmSummary) -> SshOffer {
     }
 
     match vm.state {
-        VmState::Building { .. } => {
-            SshOffer::Waiting("Available once the VM has been built and started")
-        }
+        VmState::Building { .. } => SshOffer::Waiting(t!("actions.after_start").to_string()),
         VmState::Stopped | VmState::Starting => {
-            SshOffer::Waiting("Available when the VM is running")
+            SshOffer::Waiting(t!("actions.while_running").to_string())
         }
         VmState::Running { .. } if vm.ip_address.is_none() => {
-            SshOffer::Waiting("Available when the guest has an address on the VMLord network")
+            SshOffer::Waiting(t!("actions.needs_address").to_string())
         }
         VmState::Running { .. } => SshOffer::Ready,
     }
@@ -1687,19 +1865,25 @@ fn ssh_offer(vm: &VmSummary) -> SshOffer {
 /// one would be a guess.
 fn ssh_detail(vm: &VmSummary) -> String {
     let Some(ssh) = vm.ssh.config() else {
-        return "Disabled".into();
+        return t!("common.disabled").to_string();
     };
 
     match vm.ip_address {
-        Some(address) => format!(
-            "{}@{}:{} ({} login)",
-            ssh.username, address, ssh.port, ssh.authentication
+        Some(address) => t!(
+            "ssh.endpoint",
+            user = ssh.username,
+            host = address,
+            port = ssh.port,
+            login = ssh.authentication
         ),
-        None => format!(
-            "{} on port {} ({} login); the address appears when the VM is running",
-            ssh.username, ssh.port, ssh.authentication
+        None => t!(
+            "ssh.endpoint_pending",
+            user = ssh.username,
+            port = ssh.port,
+            login = ssh.authentication
         ),
     }
+    .to_string()
 }
 
 /// Whether Connect is offered, and what to say when it is not.
@@ -1709,16 +1893,13 @@ fn ssh_detail(vm: &VmSummary) -> String {
 /// running VM whose guest has not offered its display would leave a viewer
 /// retrying a service nothing binds. The sentence explaining either is the
 /// application layer's, which is why this reads one rather than writing one.
-fn connect_offer(status: Option<&VmDisplayStatus>) -> (bool, Option<&str>) {
+fn connect_offer(status: Option<&VmDisplayStatus>) -> (bool, Option<String>) {
     match status {
         Some(status) if status.is_connectable() => (true, None),
-        Some(status) => (false, Some(status.message.as_str())),
+        Some(status) => (false, Some(status.message.clone())),
         // A VM the application has derived nothing for yet -- one refresh old
         // at most. Offering a window on it would be offering a guess.
-        None => (
-            false,
-            Some("The display of this VM has not been reported yet"),
-        ),
+        None => (false, Some(t!("actions.display_not_reported").to_string())),
     }
 }
 
@@ -1738,23 +1919,15 @@ fn connect_offer(status: Option<&VmDisplayStatus>) -> (bool, Option<&str>) {
 /// and none of them is the UI's to word.
 fn update_display_offer(state: VmState, status: Option<&VmDisplayStatus>) -> (bool, String) {
     if !matches!(state, VmState::Running { .. }) {
-        return (false, "Available only when the VM is running".to_owned());
+        return (false, t!("actions.only_while_running").to_string());
     }
     let Some(status) = status else {
-        return (
-            false,
-            "The display of this VM has not been reported yet".to_owned(),
-        );
+        return (false, t!("actions.display_not_reported").to_string());
     };
     // Before the versions, because they are the ones the update started from:
     // what a second press would ask for is a version already being moved to.
     if status.updating {
-        return (
-            false,
-            "An update of this VM is already under way; how it ended appears in the \
-             diagnostics"
-                .to_owned(),
-        );
+        return (false, t!("actions.display_update_running").to_string());
     }
     let Some(running) = status.running_version.as_deref() else {
         return (false, status.message.clone());
@@ -1763,13 +1936,16 @@ fn update_display_offer(state: VmState, status: Option<&VmDisplayStatus>) -> (bo
     match status.available_version.as_deref() {
         Some(available) => (
             true,
-            format!("Moves the guest from display payload {running} to {available}"),
+            t!(
+                "actions.display_update_offer",
+                running = running,
+                available = available
+            )
+            .to_string(),
         ),
         None => (
             false,
-            format!(
-                "The guest runs display payload {running}, and this release carries nothing else"
-            ),
+            t!("actions.display_up_to_date", running = running).to_string(),
         ),
     }
 }
@@ -1781,20 +1957,30 @@ fn update_display_offer(state: VmState, status: Option<&VmDisplayStatus>) -> (bo
 /// tooltip is only found by someone who already suspects it.
 fn display_payload_detail(status: Option<&VmDisplayStatus>) -> String {
     let Some(status) = status else {
-        return "Not reported".into();
+        return t!("selected_vm.not_reported").to_string();
     };
 
     match (
         status.running_version.as_deref(),
         status.available_version.as_deref(),
     ) {
-        (Some(running), Some(available)) if status.updating => {
-            format!("{running} (updating to {available})")
-        }
-        (Some(running), Some(available)) => format!("{running} (this release offers {available})"),
+        (Some(running), Some(available)) if status.updating => t!(
+            "selected_vm.payload_updating",
+            running = running,
+            available = available
+        )
+        .to_string(),
+        (Some(running), Some(available)) => t!(
+            "selected_vm.payload_offered",
+            running = running,
+            available = available
+        )
+        .to_string(),
         (Some(running), None) => running.to_owned(),
-        (None, Some(available)) => format!("Not reported; this release offers {available}"),
-        (None, None) => "Not reported".into(),
+        (None, Some(available)) => {
+            t!("selected_vm.payload_none_yet", available = available).to_string()
+        }
+        (None, None) => t!("selected_vm.not_reported").to_string(),
     }
 }
 
@@ -1812,11 +1998,13 @@ fn render_selected_vm(
 
     ui.add_space(12.0);
     ui.separator();
-    ui.heading(format!("Selected VM: {}", vm.name));
+    ui.heading(t!("selected_vm.title", name = vm.name).to_string());
 
+    let start = t!("actions.start").to_string();
+    let stop = t!("actions.stop").to_string();
     let primary_action = match vm.state {
-        VmState::Stopped | VmState::Building { .. } => (VmAction::Start, "Start"),
-        VmState::Starting | VmState::Running { .. } => (VmAction::Stop, "Stop"),
+        VmState::Stopped | VmState::Building { .. } => (VmAction::Start, start.as_str()),
+        VmState::Starting | VmState::Running { .. } => (VmAction::Stop, stop.as_str()),
     };
     let is_running = matches!(vm.state, VmState::Running { .. });
     // A VM that is still being created has nothing to start, stop, edit or
@@ -1827,17 +2015,20 @@ fn render_selected_vm(
     ui.horizontal(|ui| {
         action = render_action_group(
             ui,
-            &[primary_action, (VmAction::ForceStop, "Force stop")],
+            &[
+                primary_action,
+                (VmAction::ForceStop, &t!("actions.force_stop")),
+            ],
             !is_building,
-            Some("Available when the VM has finished building"),
+            Some(&t!("actions.after_build")),
         );
         ui.separator();
         let (can_connect, waiting_for) = connect_offer(display_status);
         if let Some(clicked_action) = render_action_group(
             ui,
-            &[(VmAction::Connect, "Connect")],
+            &[(VmAction::Connect, &t!("actions.connect"))],
             can_connect,
-            waiting_for,
+            waiting_for.as_deref(),
         ) {
             action = Some(clicked_action);
         }
@@ -1847,7 +2038,7 @@ fn render_selected_vm(
         let (can_update, update_offer) = update_display_offer(vm.state, display_status);
         if let Some(clicked_action) = render_action_group(
             ui,
-            &[(VmAction::UpdateDisplay, "Update display")],
+            &[(VmAction::UpdateDisplay, &t!("actions.update_display"))],
             can_update,
             Some(update_offer.as_str()),
         ) {
@@ -1860,7 +2051,7 @@ fn render_selected_vm(
         if ssh != SshOffer::Absent
             && let Some(clicked_action) = render_action_group(
                 ui,
-                &[(VmAction::Ssh, SSH_ACTION_LABEL)],
+                &[(VmAction::Ssh, &ssh_action_label())],
                 ssh == SshOffer::Ready,
                 ssh.waiting_for(),
             )
@@ -1871,9 +2062,9 @@ fn render_selected_vm(
         // address and no sshd, only a running compute system to own the pipe.
         if let Some(clicked_action) = render_action_group(
             ui,
-            &[(VmAction::Console, "Open COM port")],
+            &[(VmAction::Console, &t!("actions.open_com_port"))],
             is_running,
-            Some("Available only when the VM is running"),
+            Some(&t!("actions.only_while_running")),
         ) {
             action = Some(clicked_action);
         }
@@ -1883,9 +2074,9 @@ fn render_selected_vm(
         // row disappears on its own.
         if let Some(clicked_action) = render_action_group(
             ui,
-            &[(VmAction::CancelCreate, "Cancel creation")],
+            &[(VmAction::CancelCreate, &t!("actions.cancel_creation"))],
             is_building,
-            Some("Available only while the VM is being created"),
+            Some(&t!("actions.only_while_building")),
         ) {
             action = Some(clicked_action);
         }
@@ -1894,17 +2085,17 @@ fn render_selected_vm(
         // start. Deleting one is not.
         if let Some(clicked_action) = render_action_group(
             ui,
-            &[(VmAction::Edit, "Edit")],
+            &[(VmAction::Edit, &t!("actions.edit"))],
             !is_building,
-            Some("Changes to a running VM apply after a restart"),
+            Some(&t!("actions.restart_needed")),
         ) {
             action = Some(clicked_action);
         }
         if let Some(clicked_action) = render_action_group(
             ui,
-            &[(VmAction::Delete, "Delete")],
+            &[(VmAction::Delete, &t!("actions.delete"))],
             can_delete,
-            Some("Available only when the VM is stopped"),
+            Some(&t!("actions.only_while_stopped")),
         ) {
             action = Some(clicked_action);
         }
@@ -1917,44 +2108,56 @@ fn render_selected_vm(
         .show(ui, |ui| {
             detail_row(
                 ui,
-                "IP address",
+                &t!("selected_vm.ip_address"),
                 vm.ip_address
-                    .map_or_else(|| "Unavailable".into(), |ip| ip.to_string()),
+                    .map_or_else(|| t!("common.unavailable").to_string(), |ip| ip.to_string()),
             );
-            detail_row(ui, "Operating system", vm.os_type.clone());
-            detail_row(ui, "Status", vm_state(vm.state).into());
+            detail_row(ui, &t!("selected_vm.operating_system"), vm.os_type.clone());
+            detail_row(ui, &t!("vm_table.status"), vm_state(vm.state));
             if let VmState::Building { progress } = vm.state {
                 render_build_progress(ui, progress);
             }
             detail_row(
                 ui,
-                "Agent status",
-                agent_status_label(agent_status(vm.state)).into(),
+                &t!("vm_table.agent_status"),
+                agent_status_label(agent_status(vm.state)),
             );
             detail_row(
                 ui,
-                "Network type",
-                network_mode_label(vm.network_mode).into(),
+                &t!("vm_table.network_type"),
+                network_mode_label(vm.network_mode),
             );
-            detail_row(ui, "CPU", format!("{} cores", vm.cpu_cores));
-            detail_row(ui, "RAM", format!("{} MiB", vm.ram_mb));
-            detail_row(ui, "Disk", format!("{} GiB", vm.disk_gb));
-            detail_row(ui, "GPU", gpu_mode_label(vm.gpu_mode).into());
-            detail_row(ui, "GPU status", gpu_status_detail(gpu_status));
+            detail_row(ui, &t!("vm_table.cpu"), cores_label(vm.cpu_cores));
             detail_row(
                 ui,
-                "Desktop",
-                desktop_profile_label(vm.desktop_profile).into(),
+                &t!("vm_table.ram"),
+                t!("vm_table.mebibytes", count = vm.ram_mb).to_string(),
             );
             detail_row(
                 ui,
-                "Desktop status",
+                &t!("vm_table.disk"),
+                t!("vm_table.gibibytes", count = vm.disk_gb).to_string(),
+            );
+            detail_row(ui, "GPU", gpu_mode_label(vm.gpu_mode));
+            detail_row(
+                ui,
+                &t!("selected_vm.gpu_status"),
+                gpu_status_detail(gpu_status),
+            );
+            detail_row(
+                ui,
+                &t!("create_vm.desktop"),
+                desktop_profile_label(vm.desktop_profile),
+            );
+            detail_row(
+                ui,
+                &t!("selected_vm.desktop_status"),
                 display_status_detail(vm.desktop_profile, display_status),
             );
             if vm.desktop_profile.wants_desktop() {
                 detail_row(
                     ui,
-                    "Display payload",
+                    &t!("selected_vm.display_payload"),
                     display_payload_detail(display_status),
                 );
             }
@@ -1975,7 +2178,9 @@ fn render_action_group(
         for (action, label) in actions {
             let response = render_action_icon(ui, *action, enabled);
             let tooltip = disabled_tooltip
-                .map(|reason| format!("{label}: {reason}"))
+                .map(|reason| {
+                    t!("selected_vm.locked_reason", label = label, reason = reason).to_string()
+                })
                 .unwrap_or_else(|| (*label).into());
             if enabled {
                 response.clone().on_hover_text(tooltip);
@@ -2227,13 +2432,13 @@ fn render_build_progress(ui: &mut egui::Ui, progress: BuildProgress) {
         return;
     };
 
-    ui.strong("Progress");
+    ui.strong(t!("selected_vm.progress").to_string());
     ui.vertical(|ui| {
         if let Some(percent) = download_percentage(progress) {
             ui.add(
                 egui::ProgressBar::new(percent as f32 / 100.0)
                     .desired_width(260.0)
-                    .text(format!("{percent}%")),
+                    .text(t!("selected_vm.percent", percent = percent).to_string()),
             );
         }
         ui.label(detail);
@@ -2268,7 +2473,7 @@ fn diagnostic_line(diagnostic: &vmlord_core::Diagnostic) -> String {
 }
 
 fn render_diagnostics(ui: &mut egui::Ui, diagnostics: &[vmlord_core::Diagnostic]) {
-    ui.collapsing("Log", |ui| {
+    ui.collapsing(t!("diagnostics.title").to_string(), |ui| {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(true)
@@ -2286,11 +2491,12 @@ fn render_diagnostics(ui: &mut egui::Ui, diagnostics: &[vmlord_core::Diagnostic]
 }
 
 fn render_agent_status(ui: &mut egui::Ui, status: AgentStatus) {
-    let (color, label) = match status {
-        AgentStatus::Unknown => (egui::Color32::GRAY, "Unknown"),
-        AgentStatus::Offline => (egui::Color32::LIGHT_RED, "Offline"),
-        AgentStatus::Online => (egui::Color32::LIGHT_GREEN, "Online"),
+    let color = match status {
+        AgentStatus::Unknown => egui::Color32::GRAY,
+        AgentStatus::Offline => egui::Color32::LIGHT_RED,
+        AgentStatus::Online => egui::Color32::LIGHT_GREEN,
     };
+    let label = agent_status_label(status);
     let (rect, response) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
     ui.painter().circle_filled(rect.center(), 5.0, color);
     response.on_hover_text(label);
@@ -2303,12 +2509,13 @@ fn agent_status(state: VmState) -> AgentStatus {
     }
 }
 
-fn agent_status_label(status: AgentStatus) -> &'static str {
+fn agent_status_label(status: AgentStatus) -> String {
     match status {
-        AgentStatus::Unknown => "Unknown",
-        AgentStatus::Offline => "Offline",
-        AgentStatus::Online => "Online",
+        AgentStatus::Unknown => t!("common.unknown"),
+        AgentStatus::Offline => t!("agent_status.offline"),
+        AgentStatus::Online => t!("agent_status.online"),
     }
+    .to_string()
 }
 
 /// The status column's text: the step, and how far into it the build is when
@@ -2321,8 +2528,10 @@ fn vm_state_label(state: VmState) -> String {
     let label = vm_state(state);
     match state {
         VmState::Building { progress } => match download_percentage(progress) {
-            Some(percent) => format!("{label} {percent}%"),
-            None => label.to_owned(),
+            Some(percent) => {
+                t!("vm_state.with_percentage", label = label, percent = percent).to_string()
+            }
+            None => label,
         },
         _ => label.to_owned(),
     }
@@ -2356,29 +2565,31 @@ fn download_percentage(progress: BuildProgress) -> Option<u64> {
 /// already says everything, not that progress was lost.
 fn build_detail(progress: BuildProgress) -> Option<String> {
     Some(match progress.download? {
-        DownloadPhase::Connecting => "Connecting to the image server".into(),
+        DownloadPhase::Connecting => t!("build.connecting").to_string(),
         DownloadPhase::Downloading {
             downloaded,
             total: Some(total),
-        } => format!(
-            "Downloaded {} of {} ({}%)",
-            mebibytes(downloaded),
-            mebibytes(total),
-            percentage(downloaded, total)
-        ),
+        } => t!(
+            "build.downloaded_of",
+            done = mebibytes(downloaded),
+            total = mebibytes(total),
+            percent = percentage(downloaded, total)
+        )
+        .to_string(),
         // A server that sent no length leaves nothing to divide by; the count
         // still shows the download is moving.
         DownloadPhase::Downloading {
             downloaded,
             total: None,
-        } => format!("Downloaded {}", mebibytes(downloaded)),
-        DownloadPhase::Verifying { hashed, total } => format!(
-            "Checking the image: {} of {} ({}%)",
-            mebibytes(hashed),
-            mebibytes(total),
-            percentage(hashed, total)
-        ),
-        DownloadPhase::Completed => "Image ready".into(),
+        } => t!("build.downloaded", done = mebibytes(downloaded)).to_string(),
+        DownloadPhase::Verifying { hashed, total } => t!(
+            "build.checking",
+            done = mebibytes(hashed),
+            total = mebibytes(total),
+            percent = percentage(hashed, total)
+        )
+        .to_string(),
+        DownloadPhase::Completed => t!("build.image_ready").to_string(),
     })
 }
 
@@ -2395,24 +2606,150 @@ fn percentage(done: u64, total: u64) -> u64 {
     (done.min(total) * 100 / total).min(if done < total { 99 } else { 100 })
 }
 
-fn vm_state(state: VmState) -> &'static str {
+fn vm_state(state: VmState) -> String {
     match state {
-        VmState::Stopped => "Stopped",
+        VmState::Stopped => t!("vm_state.stopped"),
         VmState::Building { progress } => match progress.step {
-            BuildStep::Downloading => "Building: downloading",
-            BuildStep::WritingDisk => "Building: writing the disk",
-            BuildStep::Provisioning => "Building: provisioning",
-            BuildStep::Registering => "Building: registering",
-            BuildStep::Starting => "Building: starting the VM",
-            BuildStep::AwaitingGuest => "Building: waiting for the guest",
+            BuildStep::Downloading => t!("vm_state.building_downloading"),
+            BuildStep::WritingDisk => t!("vm_state.building_writing_disk"),
+            BuildStep::Provisioning => t!("vm_state.building_provisioning"),
+            BuildStep::Registering => t!("vm_state.building_registering"),
+            BuildStep::Starting => t!("vm_state.building_starting"),
+            BuildStep::AwaitingGuest => t!("vm_state.building_waiting"),
         },
-        VmState::Starting => "Starting",
-        VmState::Running { .. } => "Running",
+        VmState::Starting => t!("vm_state.starting"),
+        VmState::Running { .. } => t!("vm_state.running"),
     }
+    .to_string()
 }
 
 #[cfg(test)]
 mod tests {
+    use rust_i18n::t;
+
+    /// Every key of one catalogue exists in the other.
+    ///
+    /// A forgotten translation would otherwise fall back to English silently,
+    /// which looks like a rendering bug months later rather than a missing
+    /// line in a pull request.
+    #[test]
+    fn the_catalogues_agree_on_their_keys() {
+        let english = catalogue_keys(include_str!("../locales/en-US.toml"));
+        let russian = catalogue_keys(include_str!("../locales/ru-RU.toml"));
+
+        let missing_in_russian: Vec<_> = english.difference(&russian).collect();
+        let missing_in_english: Vec<_> = russian.difference(&english).collect();
+
+        assert!(
+            missing_in_russian.is_empty(),
+            "not translated: {missing_in_russian:?}"
+        );
+        assert!(
+            missing_in_english.is_empty(),
+            "no English original: {missing_in_english:?}"
+        );
+    }
+
+    /// The dotted paths of every string in a catalogue.
+    fn catalogue_keys(document: &str) -> std::collections::BTreeSet<String> {
+        fn walk(prefix: &str, value: &toml::Value, keys: &mut std::collections::BTreeSet<String>) {
+            match value {
+                toml::Value::Table(table) => {
+                    for (key, value) in table {
+                        let path = if prefix.is_empty() {
+                            key.clone()
+                        } else {
+                            format!("{prefix}.{key}")
+                        };
+                        walk(&path, value, keys);
+                    }
+                }
+                _ => {
+                    keys.insert(prefix.to_string());
+                }
+            }
+        }
+
+        let document: toml::Value = document.parse().expect("catalogue parses");
+        let mut keys = std::collections::BTreeSet::new();
+        walk("", &document, &mut keys);
+        keys
+    }
+
+    #[test]
+    fn a_core_count_takes_the_form_russian_asks_for() {
+        assert_eq!(
+            t!("vm_table.cores_one", locale = "ru-RU", count = 1),
+            "1 ядро"
+        );
+        assert_eq!(
+            t!("vm_table.cores_few", locale = "ru-RU", count = 2),
+            "2 ядра"
+        );
+        assert_eq!(
+            t!("vm_table.cores_many", locale = "ru-RU", count = 5),
+            "5 ядер"
+        );
+    }
+
+    #[test]
+    fn the_plural_form_follows_the_count() {
+        use super::{PluralForm, plural_form};
+
+        assert_eq!(plural_form(1), PluralForm::One);
+        assert_eq!(plural_form(2), PluralForm::Few);
+        assert_eq!(plural_form(5), PluralForm::Many);
+        assert_eq!(plural_form(11), PluralForm::Many);
+        assert_eq!(plural_form(21), PluralForm::One);
+        assert_eq!(plural_form(0), PluralForm::Many);
+    }
+
+    /// The advice keeps the domain's numbers and takes the UI's words.
+    #[test]
+    fn an_advisory_is_worded_by_the_catalogue() {
+        use super::{Advisory, advisory_text};
+
+        assert_eq!(
+            advisory_text(Advisory::DesktopNeedsCores {
+                required: 2,
+                actual: 1
+            }),
+            "A GNOME desktop is slow below 2 CPU cores; this VM has 1."
+        );
+        assert_eq!(
+            t!("advisory.desktop_needs_password", locale = "ru-RU"),
+            "У ВМ с рабочим столом без пароля нечего ввести на экране входа; задайте его здесь или позже по SSH."
+        );
+    }
+
+    #[test]
+    fn the_actions_are_translated() {
+        assert_eq!(t!("actions.start", locale = "ru-RU"), "Запустить");
+        assert_eq!(
+            t!(
+                "ssh.endpoint",
+                locale = "ru-RU",
+                user = "dev",
+                host = "172.30.0.5",
+                port = 2222,
+                login = "key"
+            ),
+            "dev@172.30.0.5:2222 (вход: key)"
+        );
+    }
+
+    #[test]
+    fn the_settings_dialog_is_translated() {
+        assert_eq!(
+            t!("settings.title", locale = "ru-RU"),
+            "Настройки приложения"
+        );
+        assert_ne!(
+            t!("settings.title", locale = "ru-RU"),
+            t!("settings.title", locale = "en-US")
+        );
+    }
+
     #[test]
     fn a_record_is_shown_with_its_moment_its_vm_and_its_code() {
         // The panel exists to be lined up against `vmlord.log`; without the
@@ -2493,7 +2830,7 @@ mod tests {
             connect_offer(Some(&waiting)),
             (
                 false,
-                Some("The desktop is installed; waiting for the guest to offer it.")
+                Some("The desktop is installed; waiting for the guest to offer it.".to_owned())
             ),
             "the reason is the application layer's sentence, not one invented here"
         );
@@ -3179,8 +3516,8 @@ mod tests {
     /// window the session lands in is the platform layer's business.
     #[test]
     fn the_action_is_named_after_what_it_opens() {
-        assert_eq!(SSH_ACTION_LABEL, "Open SSH");
-        assert!(!format!("{SSH_ACTION_LABEL:?}").contains("Terminal"));
+        assert_eq!(ssh_action_label(), "Open SSH");
+        assert!(!ssh_action_label().contains("Terminal"));
     }
 
     /// The one check the domain cannot make: it is about the list on screen,

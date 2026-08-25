@@ -25,11 +25,11 @@ pub mod settings;
 pub mod ssh;
 
 pub use display::{
-    DISPLAY_PAYLOAD_SHARE, DesktopProfile, DisplayFailure, DisplayMode, DisplayPayloadFacts,
-    DisplayProvisioning, DisplayShare, DisplayStage, DisplayState, DisplayStatusCode,
-    GuestDisplayDetail, GuestDisplayReport, MAX_DISPLAY_HEIGHT, MAX_DISPLAY_WIDTH,
-    MIN_DESKTOP_CPU_CORES, MIN_DESKTOP_RAM_MB, MIN_DISPLAY_HEIGHT, MIN_DISPLAY_WIDTH,
-    VmDisplayFacts, VmDisplayStatus, desktop_resource_advice,
+    Advisory, DISPLAY_PAYLOAD_SHARE, DesktopProfile, DisplayFailure, DisplayMode,
+    DisplayPayloadFacts, DisplayProvisioning, DisplayShare, DisplayStage, DisplayState,
+    DisplayStatusCode, GuestDisplayDetail, GuestDisplayReport, MAX_DISPLAY_HEIGHT,
+    MAX_DISPLAY_WIDTH, MIN_DESKTOP_CPU_CORES, MIN_DESKTOP_RAM_MB, MIN_DISPLAY_HEIGHT,
+    MIN_DISPLAY_WIDTH, VmDisplayFacts, VmDisplayStatus, desktop_resource_advice,
 };
 pub use distro::{DesktopSetup, DistroProfile, SshDaemon, SshUnits, ubuntu};
 pub use gpu::{
@@ -98,8 +98,8 @@ impl VmCreateRequest {
     /// says what its owner may not have meant. A desktop on one core is
     /// buildable and slow, and only a person can decide whether that matters.
     #[must_use]
-    pub fn advisories(&self) -> Vec<String> {
-        let mut advisories: Vec<String> =
+    pub fn advisories(&self) -> Vec<Advisory> {
+        let mut advisories: Vec<Advisory> =
             desktop_resource_advice(self.desktop_profile(), self.cpu_cores, self.ram_mb)
                 .into_iter()
                 .collect();
@@ -113,10 +113,7 @@ impl VmCreateRequest {
                 VmSource::CloudImage { provisioning, .. } if provisioning.password.is_none()
             )
         {
-            advisories.push(
-                "A desktop VM without a password has nothing to log in with at its login                  screen; set one here, or set one later over SSH."
-                    .into(),
-            );
+            advisories.push(Advisory::DesktopNeedsPassword);
         }
         advisories
     }
@@ -341,8 +338,8 @@ pub trait VmRepository {
 #[cfg(test)]
 mod tests {
     use super::{
-        DesktopProfile, GpuMode, NetworkMode, RepositoryError, VmCreateRequest, VmDeleteRequest,
-        VmRepository, VmSource, VmSummary, VmUpdateRequest,
+        Advisory, DesktopProfile, GpuMode, NetworkMode, RepositoryError, VmCreateRequest,
+        VmDeleteRequest, VmRepository, VmSource, VmSummary, VmUpdateRequest,
     };
 
     fn valid_request() -> VmCreateRequest {
@@ -391,7 +388,7 @@ mod tests {
             ..valid_request()
         };
         assert!(request.validate().is_ok());
-        assert_eq!(request.advisories().len(), 1);
+        assert_eq!(request.advisories(), vec![Advisory::DesktopNeedsPassword]);
     }
 
     #[test]
