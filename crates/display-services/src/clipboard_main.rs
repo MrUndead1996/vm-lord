@@ -246,6 +246,16 @@ fn pump<S: Read + Write>(stream: &mut S, generation: u32) -> Result<(), String> 
                 match events.try_recv() {
                     Ok(mutter::Event::PeerOffer { kinds }) => {
                         // The guest's selection is the local one from here.
+                        // The kinds and never the bytes: this is what tells
+                        // somebody whether a copy in the guest was seen at all.
+                        eprintln!(
+                            "vmlord-display-clipboard: the desktop offers {}",
+                            kinds
+                                .iter()
+                                .map(|kind| kind.mime())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        );
                         ops.extend(exchange.local_offer(&kinds, now));
                     }
                     Ok(mutter::Event::Transfer { kind, serial }) => {

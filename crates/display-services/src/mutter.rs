@@ -274,10 +274,19 @@ fn owner_changed(message: &zbus::Message) -> Option<Event> {
 
     let mimes = options
         .get("mime-types")
-        .map(strings_in)
+        .map(|value| strings_in(value))
         .unwrap_or_default();
     let kinds = kinds_of(&mimes);
     if kinds.is_empty() {
+        // Ordinary -- a guest copying a spreadsheet cell offers a dozen
+        // formats this build carries none of -- and the one thing that
+        // separates it from a selection nobody noticed at all. The count and
+        // never the names: a mime type can carry a file name.
+        eprintln!(
+            "vmlord-display-clipboard: the desktop changed to {} format(s), none carried",
+            mimes.len()
+        );
+
         return None;
     }
 
@@ -291,21 +300,22 @@ fn transfer(message: &zbus::Message) -> Option<Event> {
     Kind::from_mime(&mime).map(|kind| Event::Transfer { kind, serial })
 }
 
-/// The strings inside one `a{sv}` value, whatever it is wrapped in.
+/// Every string anywhere inside one `a{sv}` value.
 ///
-/// The value arrives as a variant holding an array, and a direct conversion to
-/// `Vec<String>` does not see through that wrapping: it answers with nothing,
-/// which would make every offer look like an offer of no formats at all.
-fn strings_in(value: &zbus::zvariant::OwnedValue) -> Vec<String> {
-    let array = match zbus::zvariant::Array::try_from(value.clone()) {
-        Ok(array) => array,
-        Err(_) => return Vec::new(),
-    };
-
-    array
-        .iter()
-        .filter_map(|element| String::try_from(element.try_clone().ok()?).ok())
-        .collect()
+/// Written as a walk rather than a conversion because of what mutter actually
+/// sends: `mime-types` arrives with the signature `(as)` -- a *structure*
+/// wrapping the array, not the array -- so every direct conversion to a list
+/// of strings answers with nothing, and an ownership change looks like an
+/// offer of no formats at all. The walk also sees through the variant a value
+/// in a dictionary is wrapped in, which is the other shape this arrives in.
+fn strings_in(value: &zbus::zvariant::Value<'_>) -> Vec<String> {
+    match value {
+        Value::Str(text) => vec![text.to_string()],
+        Value::Value(inner) => strings_in(inner),
+        Value::Array(array) => array.iter().flat_map(strings_in).collect(),
+        Value::Structure(structure) => structure.fields().iter().flat_map(strings_in).collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// The kinds these mime types name, in the protocol's canonical order.
