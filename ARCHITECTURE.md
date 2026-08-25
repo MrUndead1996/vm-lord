@@ -3754,6 +3754,48 @@ while promising more than it can keep.
 
 ---
 
+# Localization
+
+The UI reads every word it shows from a message catalogue. There are two:
+`crates/ui/locales/en-US.toml` and `crates/ui/locales/ru-RU.toml`, embedded by
+`rust-i18n` at compile time, so the shipped executable still needs nothing
+beside it. A lookup that finds nothing in the active catalogue falls back to
+English, and a test in `vmlord-ui` parses both files and refuses a key that
+exists in one and not the other -- the fallback is a safety net for a running
+program, not a place for a translation to go missing quietly.
+
+`Language::code` in `vmlord-core` is the one place a locale tag is spelled.
+`serde` writes it into `settings.toml` and the UI hands the same string to
+`rust_i18n::set_locale`, so the file and the catalogue cannot drift apart.
+`vmlord_ui::run` sets the locale from the settings before the window opens, and
+the settings dialog sets it again when it saves. That is the whole of switching
+language: egui rebuilds each frame from the catalogue, so the interface changes
+under the Save button with no restart. Settings that failed to load leave the
+locale at English, which is where a fresh installation starts anyway -- the
+language belongs to the installer's choice, not to a guess at the host's
+locale.
+
+Translation stops at the UI boundary. A record raised through `diagnostic!` and
+the `Display` of a `vmlord-core` error stay English: a diagnostic reaches the
+log file in the same breath as it reaches the panel, and a log is more useful
+in one language than in each reader's. Making them translatable would mean an
+error no longer carries its own text -- `core` would return a code with
+parameters and the UI would render it -- which is a larger change than a second
+language needs.
+
+The workspace list counts cores, and Russian inflects a counted noun three ways
+(1 ядро, 2 ядра, 5 ядер). `plural_form` in `crates/ui/src/lib.rs` picks the
+form; the catalogue holds all three. One function rather than a rule engine,
+because that is the only string in the UI where a number stands before a noun
+that bends -- and English is served by the same three keys, its rule being a
+coarsening of the Russian one.
+
+The two language names in the settings combo box, "English (US)" and
+"Русский", are the one thing not translated: a user who cannot read the
+language on screen has to find their own in that list.
+
+---
+
 # Unsafe Rust
 
 Unsafe code belongs only inside:

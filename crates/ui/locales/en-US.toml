@@ -211,3 +211,6 @@ description = "VM \"%{name}\" and its stored configuration will be removed. This
 delete_disks = "Delete virtual disks"
 disks_deleted = "The VM's virtual disks are deleted with it. The image it was installed from is not touched."
 disks_kept = "The virtual disks are kept, so the VM's directory stays in place and a new VM cannot reuse that name."
+
+[diagnostics]
+title = "Log"

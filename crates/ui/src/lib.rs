@@ -1915,7 +1915,7 @@ fn display_payload_detail(status: Option<&VmDisplayStatus>) -> String {
         (None, Some(available)) => {
             t!("selected_vm.payload_none_yet", available = available).to_string()
         }
-        (None, None) => "Not reported".into(),
+        (None, None) => t!("selected_vm.not_reported").to_string(),
     }
 }
 
@@ -2406,7 +2406,7 @@ fn diagnostic_line(diagnostic: &vmlord_core::Diagnostic) -> String {
 }
 
 fn render_diagnostics(ui: &mut egui::Ui, diagnostics: &[vmlord_core::Diagnostic]) {
-    ui.collapsing("Log", |ui| {
+    ui.collapsing(t!("diagnostics.title").to_string(), |ui| {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(true)
@@ -2424,11 +2424,12 @@ fn render_diagnostics(ui: &mut egui::Ui, diagnostics: &[vmlord_core::Diagnostic]
 }
 
 fn render_agent_status(ui: &mut egui::Ui, status: AgentStatus) {
-    let (color, label) = match status {
-        AgentStatus::Unknown => (egui::Color32::GRAY, "Unknown"),
-        AgentStatus::Offline => (egui::Color32::LIGHT_RED, "Offline"),
-        AgentStatus::Online => (egui::Color32::LIGHT_GREEN, "Online"),
+    let color = match status {
+        AgentStatus::Unknown => egui::Color32::GRAY,
+        AgentStatus::Offline => egui::Color32::LIGHT_RED,
+        AgentStatus::Online => egui::Color32::LIGHT_GREEN,
     };
+    let label = agent_status_label(status);
     let (rect, response) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
     ui.painter().circle_filled(rect.center(), 5.0, color);
     response.on_hover_text(label);

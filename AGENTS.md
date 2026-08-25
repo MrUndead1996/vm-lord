@@ -23,6 +23,8 @@ and the `vmlord-legacy-backend` crate have been removed from the distribution.
 * The UI must not contain business logic.
 * The UI must never call Windows APIs directly.
 * The UI communicates only with the application layer.
+* New user-facing text in the UI goes through `t!` and is added to both
+  catalogues under `crates/ui/locales/`.
 
 ## Code Style
 
