@@ -1083,38 +1083,32 @@ fn render_edit_vm_dialog(
 ) -> Option<EditVmDialogAction> {
     let mut open = true;
     let mut action = None;
-    egui::Window::new(format!("Edit VM: {}", form.name))
+    egui::Window::new(t!("edit_vm.title", name = form.name).to_string())
         .collapsible(false)
         .resizable(false)
         .default_width(460.0)
         .open(&mut open)
         .show(context, |ui| {
-            ui.label("Changes are saved to the VM configuration and take effect the next time the VM starts.");
-            ui.small(
-                "RAM, CPU and GPU are editable; the GPU mode only while the VM is stopped. \
-                 The SSH port is the exception to the line above: it is changed inside the \
-                 running guest and takes effect at once. Network is not wired to the native \
-                 backend yet. Disk size and VM name stay fixed and currently require \
-                 recreating the VM.",
-            );
+            ui.label(t!("edit_vm.description").to_string());
+            ui.small(t!("edit_vm.scope_note").to_string());
             ui.add_space(8.0);
 
             egui::Grid::new("edit-vm-form")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label("VM Name");
+                    ui.label(t!("create_vm.vm_name").to_string());
                     ui.label(&form.name);
                     ui.end_row();
 
-                    ui.label("RAM Size");
+                    ui.label(t!("create_vm.ram_size").to_string());
                     ui.horizontal(|ui| {
                         ui.add(egui::DragValue::new(&mut form.ram_mb).range(512..=1_048_576).speed(2));
                         ui.label("MiB");
                     });
                     ui.end_row();
 
-                    ui.label("CPU Cores");
+                    ui.label(t!("create_vm.cpu_cores").to_string());
                     ui.add(egui::DragValue::new(&mut form.cpu_cores).range(1..=256));
                     ui.end_row();
 
@@ -1127,10 +1121,18 @@ fn render_edit_vm_dialog(
                                 ui.selectable_value(
                                     &mut form.gpu_mode,
                                     GpuMode::Default,
-                                    "Default",
+                                    gpu_mode_label(GpuMode::Default),
                                 );
-                                ui.selectable_value(&mut form.gpu_mode, GpuMode::Mirror, "Mirror");
-                                ui.selectable_value(&mut form.gpu_mode, GpuMode::None, "None");
+                                ui.selectable_value(
+                                    &mut form.gpu_mode,
+                                    GpuMode::Mirror,
+                                    gpu_mode_label(GpuMode::Mirror),
+                                );
+                                ui.selectable_value(
+                                    &mut form.gpu_mode,
+                                    GpuMode::None,
+                                    gpu_mode_label(GpuMode::None),
+                                );
                             });
                         // The reason before the click rather than after it: the
                         // backend refuses this change under a live VM, and a
@@ -1148,15 +1150,23 @@ fn render_edit_vm_dialog(
                         ui.end_row();
                     }
 
-                    ui.label("Network");
+                    ui.label(t!("create_vm.network").to_string());
                     egui::ComboBox::from_id_salt("edit-vm-network")
                         .selected_text(network_mode_label(form.network_mode))
                         .show_ui(ui, |ui| {
                             // The same two modes the create form offers: the
                             // native backend refuses the rest until #10, and an
                             // option that always fails is a poor way to say so.
-                            ui.selectable_value(&mut form.network_mode, NetworkMode::Nat, "NAT");
-                            ui.selectable_value(&mut form.network_mode, NetworkMode::None, "None");
+                            ui.selectable_value(
+                                &mut form.network_mode,
+                                NetworkMode::Nat,
+                                network_mode_label(NetworkMode::Nat),
+                            );
+                            ui.selectable_value(
+                                &mut form.network_mode,
+                                NetworkMode::None,
+                                network_mode_label(NetworkMode::None),
+                            );
                         });
                     ui.end_row();
 
@@ -1164,7 +1174,7 @@ fn render_edit_vm_dialog(
                     // created without SSH gets no row at all rather than a
                     // disabled one: there is nothing there to enable.
                     if let Some(ssh) = form.ssh.clone() {
-                        ui.label("SSH Port");
+                        ui.label(t!("edit_vm.ssh_port").to_string());
                         let locked = ssh_port_locked(&form.state, ssh.authentication);
                         ui.add_enabled_ui(locked.is_none(), |ui| {
                             let port = ui.add(
@@ -1184,10 +1194,7 @@ fn render_edit_vm_dialog(
 
                         if locked.is_none() && form.ssh_port != ssh.port.get() {
                             ui.label("");
-                            ui.small(
-                                "The daemon is reconfigured inside the running guest and \
-                                 restarted; the connection VMLord opens next uses the new port.",
-                            );
+                            ui.small(t!("edit_vm.ssh_port_note").to_string());
                             ui.end_row();
                         }
                     }
@@ -1201,8 +1208,11 @@ fn render_edit_vm_dialog(
             ui.separator();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let save = ui.add(
-                    egui::Button::new(egui::RichText::new("Save changes").color(egui::Color32::WHITE))
-                        .fill(egui::Color32::from_rgb(235, 134, 58)),
+                    egui::Button::new(
+                        egui::RichText::new(t!("edit_vm.save").to_string())
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(235, 134, 58)),
                 );
                 if save.clicked() {
                     match edit_vm_request(form) {
@@ -1210,7 +1220,7 @@ fn render_edit_vm_dialog(
                         Err(error) => form.error = Some(error),
                     }
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button(t!("common.cancel").to_string()).clicked() {
                     action = Some(EditVmDialogAction::Cancel);
                 }
             });
@@ -1228,22 +1238,19 @@ fn render_delete_vm_dialog(
 ) -> Option<DeleteVmDialogAction> {
     let mut open = true;
     let mut action = None;
-    egui::Window::new(format!("Delete VM: {}", form.vm_name))
+    egui::Window::new(t!("delete_vm.title", name = form.vm_name).to_string())
         .collapsible(false)
         .resizable(false)
         .default_width(420.0)
         .open(&mut open)
         .show(context, |ui| {
-            ui.label(format!(
-                "VM \"{}\" and its stored configuration will be removed. This cannot be undone.",
-                form.vm_name
-            ));
+            ui.label(t!("delete_vm.description", name = form.vm_name).to_string());
             ui.add_space(8.0);
-            ui.checkbox(&mut form.delete_disks, "Delete virtual disks");
+            ui.checkbox(&mut form.delete_disks, t!("delete_vm.delete_disks").to_string());
             if form.delete_disks {
-                ui.small("The VM's virtual disks are deleted with it. The image it was installed from is not touched.");
+                ui.small(t!("delete_vm.disks_deleted").to_string());
             } else {
-                ui.small("The virtual disks are kept, so the VM's directory stays in place and a new VM cannot reuse that name.");
+                ui.small(t!("delete_vm.disks_kept").to_string());
             }
 
             if let Some(error) = &form.error {
@@ -1254,13 +1261,16 @@ fn render_delete_vm_dialog(
             ui.separator();
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 let delete = ui.add(
-                    egui::Button::new(egui::RichText::new("Delete").color(egui::Color32::WHITE))
-                        .fill(egui::Color32::from_rgb(192, 57, 43)),
+                    egui::Button::new(
+                        egui::RichText::new(t!("actions.delete").to_string())
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(192, 57, 43)),
                 );
                 if delete.clicked() {
                     action = Some(DeleteVmDialogAction::Submit);
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button(t!("common.cancel").to_string()).clicked() {
                     action = Some(DeleteVmDialogAction::Cancel);
                 }
             });
@@ -1356,16 +1366,16 @@ fn release_label(release: &str) -> String {
 
 fn edit_vm_request(form: &EditVmForm) -> Result<VmUpdateRequest, String> {
     if form.ram_mb < 512 || !form.ram_mb.is_multiple_of(2) {
-        return Err("RAM must be an even number of MiB and at least 512 MiB.".into());
+        return Err(t!("edit_vm.ram_invalid").to_string());
     }
     if form.cpu_cores == 0 {
-        return Err("CPU cores must be at least 1.".into());
+        return Err(t!("edit_vm.cores_invalid").to_string());
     }
     if matches!(form.gpu_mode, GpuMode::Unknown(_)) {
-        return Err("The current GPU mode is not supported by the Rust UI yet.".into());
+        return Err(t!("edit_vm.gpu_mode_unsupported").to_string());
     }
     if matches!(form.network_mode, NetworkMode::Unknown(_)) {
-        return Err("The current network mode is not supported by the Rust UI yet.".into());
+        return Err(t!("edit_vm.network_mode_unsupported").to_string());
     }
 
     // A VM with no SSH access carries no port: there is no daemon to move, and

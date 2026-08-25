@@ -192,3 +192,22 @@ guest_defaults_note = "The three settings above are filled in from this computer
 name_taken = "A VM with this name already exists."
 no_gpu_adapter = "This host presents no GPU partition adapter, so the VM will start without a GPU."
 no_linux_payload = "The Linux GPU userspace is not installed on this host, so the guest will see the device but will not render on it."
+
+[edit_vm]
+title = "Edit VM: %{name}"
+description = "Changes are saved to the VM configuration and take effect the next time the VM starts."
+scope_note = "RAM, CPU and GPU are editable; the GPU mode only while the VM is stopped. The SSH port is the exception to the line above: it is changed inside the running guest and takes effect at once. Network is not wired to the native backend yet. Disk size and VM name stay fixed and currently require recreating the VM."
+ssh_port = "SSH Port"
+ssh_port_note = "The daemon is reconfigured inside the running guest and restarted; the connection VMLord opens next uses the new port."
+save = "Save changes"
+ram_invalid = "RAM must be an even number of MiB and at least 512 MiB."
+cores_invalid = "CPU cores must be at least 1."
+gpu_mode_unsupported = "The current GPU mode is not supported by the Rust UI yet."
+network_mode_unsupported = "The current network mode is not supported by the Rust UI yet."
+
+[delete_vm]
+title = "Delete VM: %{name}"
+description = "VM \"%{name}\" and its stored configuration will be removed. This cannot be undone."
+delete_disks = "Delete virtual disks"
+disks_deleted = "The VM's virtual disks are deleted with it. The image it was installed from is not touched."
+disks_kept = "The virtual disks are kept, so the VM's directory stays in place and a new VM cannot reuse that name."
