@@ -732,6 +732,7 @@ mod tests {
             endpoint_id: None,
             network_mode: NetworkMode::Nat,
             ssh,
+            ssh_daemon: None,
             gpu_mode: vmlord_core::GpuMode::None,
             desktop_profile: vmlord_core::DesktopProfile::Headless,
             display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,

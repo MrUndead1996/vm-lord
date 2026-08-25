@@ -280,6 +280,7 @@ mod tests {
             endpoint_id: None,
             network_mode: vmlord_core::NetworkMode::None,
             ssh: None,
+            ssh_daemon: None,
             gpu_mode,
             // No guest target: a VM VMLord cannot pick a payload for is the
             // case every host runs today, because the shipped catalog is empty.

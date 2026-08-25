@@ -11,6 +11,8 @@
 //! are to be read from a JSON file, and a parsed file yields no `&'static str`
 //! short of leaking it.
 
+use serde::{Deserialize, Serialize};
+
 use crate::display::DesktopProfile;
 
 /// The placeholder both templates carry.
@@ -68,7 +70,11 @@ pub struct DesktopSetup {
 /// between distributions here are file paths and unit names, and a generator
 /// that branched on `"Ubuntu"` would have to be edited for every profile added
 /// to a JSON file later.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Serializable because it is recorded per VM at creation: moving the port of
+/// an installed guest later has to write the same files and poke the same
+/// units the seed did, and by then the profile the VM was built from is gone.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshDaemon {
     /// The systemd units that carry the daemon, and how they carry it.
     pub units: SshUnits,
@@ -89,7 +95,10 @@ pub struct SshDaemon {
 /// all and `sshd_config` is the whole story. Spelling that as a choice keeps
 /// the impossible combinations -- a socket drop-in with no socket unit, a
 /// profile naming no units whatsoever -- out of the type.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// The variant and field names are an on-disk format, like [`SshDaemon`]'s:
+/// renaming one changes what a stored VM reads back as.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SshUnits {
     /// The daemon opens its own port. Fedora and SUSE name this unit `sshd`.
     Service { unit: String },

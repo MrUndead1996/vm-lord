@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use vmlord_core::{
     DesktopProfile, DisplayMode, DisplayProvisioning, GpuMode, NetworkMode, RepositoryError,
-    SshConfig, VmSource,
+    SshConfig, SshDaemon, VmSource,
 };
 use vmlord_gpu_payload::GuestSelector;
 
@@ -79,6 +79,19 @@ pub struct VmComputeSystemMapping {
     /// disk is a password leaked.
     #[serde(default)]
     pub ssh: Option<SshConfig>,
+    /// How this guest's distribution runs and configures its SSH daemon.
+    ///
+    /// Recorded at creation because moving the port of a VM that already
+    /// exists has to write the same drop-ins and poke the same units the seed
+    /// did, and by then the image profile the VM was built from is no longer
+    /// in hand -- the seed was consumed on the first boot and nothing on the
+    /// host remembers which distribution answered.
+    ///
+    /// `None` is a VM whose guest VMLord did not configure: one installed by
+    /// hand from local media. Such a guest's SSH daemon is its owner's, and
+    /// VMLord has nothing to say about where its files are.
+    #[serde(default)]
+    pub ssh_daemon: Option<SshDaemon>,
     /// What the VM asks of the host's GPU.
     ///
     /// Recorded because a start has to know what to attach, and the stored HCS
@@ -475,6 +488,7 @@ mod tests {
             disk_gb: 20,
             endpoint_id: None,
             network_mode: NetworkMode::None,
+            ssh_daemon: None,
             gpu_mode: GpuMode::None,
             desktop_profile: vmlord_core::DesktopProfile::Headless,
             display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
@@ -713,6 +727,32 @@ mod tests {
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
+    /// Moving the port of a VM that already exists writes the files named
+    /// here, so what a mapping reads back has to be what the seed was printed
+    /// from -- unit names, drop-in paths and the shape of the two together.
+    #[test]
+    fn the_ssh_daemon_of_a_guest_survives_being_written_and_read_back() {
+        let path = temporary_mapping_file();
+        let store = MetadataStore::new(&path);
+        let vm_id = Uuid::new_v4();
+
+        store
+            .insert(VmComputeSystemMapping {
+                ssh_daemon: Some(distro::ubuntu().ssh),
+                ..mapping(vm_id, "dev-linux", "vmlord-1")
+            })
+            .unwrap();
+
+        let document = fs::read_to_string(&path).unwrap();
+        assert!(document.contains("SocketActivated"), "got {document}");
+        assert!(document.contains("ssh.socket"), "got {document}");
+        assert_eq!(
+            store.find_by_vm_id(vm_id).unwrap().unwrap().ssh_daemon,
+            Some(distro::ubuntu().ssh)
+        );
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
     /// A VM created with SSH switched off. There are no VMs from before the
     /// field existed, so this is the only thing its absence can mean.
     #[test]
@@ -859,6 +899,7 @@ mod tests {
     #[test]
     fn a_recorded_gpu_mode_survives_a_round_trip() {
         let mapping = VmComputeSystemMapping {
+            ssh_daemon: None,
             gpu_mode: GpuMode::Mirror,
             desktop_profile: vmlord_core::DesktopProfile::Headless,
             display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,

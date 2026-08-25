@@ -141,6 +141,17 @@ pub struct VmUpdateRequest {
     pub cpu_cores: u32,
     pub gpu_mode: GpuMode,
     pub network_mode: NetworkMode,
+    /// The port the VM's SSH server is to listen on.
+    ///
+    /// `None` is a VM with no SSH access at all: there is no daemon to move,
+    /// so the field is absent rather than carrying a port for one. A port
+    /// equal to the stored one asks for nothing and changes nothing -- an edit
+    /// form submits every field it shows, including the ones nobody touched.
+    ///
+    /// Unlike RAM and CPU, this one is not a document a later start reads: the
+    /// port lives inside the installed guest, so the change is applied to a
+    /// running one or refused.
+    pub ssh_port: Option<SshPort>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

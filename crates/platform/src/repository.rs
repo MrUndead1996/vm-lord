@@ -16,8 +16,8 @@ use uuid::Uuid;
 use vmlord_core::{
     AgentStatus, DiagnosticLevel, DisplayProvisioning, GpuAssignment, GpuMode, GuestDisplayReport,
     GuestReadinessTimeouts, HostGpuCapabilities, NetworkMode, RepositoryError, SshAvailability,
-    Subsystem, VmCreateRequest, VmDeleteRequest, VmDisplayFacts, VmRepository, VmState, VmSummary,
-    VmUpdateRequest,
+    SshPort, Subsystem, VmCreateRequest, VmDeleteRequest, VmDisplayFacts, VmRepository, VmState,
+    VmSummary, VmUpdateRequest,
 };
 
 use crate::{
@@ -42,6 +42,7 @@ use crate::{
     reconnect::{ReconnectOutcome, reconnect_known_vms},
     shutdown_workers::ShutdownWorkers,
     ssh_launches::SshLaunches,
+    ssh_port::{PortMove, SshPortMover},
     ssh_terminal::SshLauncher,
     start_registry::StartRegistry,
     vhd, watch,
@@ -95,6 +96,10 @@ pub struct HcsVmRepository {
     /// Opens interactive SSH sessions into running guests. Nothing is kept
     /// beside it: a session belongs to whoever asked for it, not to VMLord.
     ssh_launcher: Arc<SshLauncher>,
+    /// Moves the SSH port of a guest an edit asks to move. Beside the launcher
+    /// rather than inside it: one opens a session for a person, the other
+    /// reconfigures a daemon, and they share only the client they run.
+    ssh_port_mover: Arc<SshPortMover>,
     /// The sessions being opened right now, each on a thread of its own.
     ssh_launches: SshLaunches,
     /// The display windows this process has opened, each with a thread on its
@@ -160,6 +165,7 @@ impl HcsVmRepository {
             agent_sessions: AgentSessions::default(),
             gpu_runs,
             ssh_launcher: Arc::new(SshLauncher::production()),
+            ssh_port_mover: Arc::new(SshPortMover::production()),
             ssh_launches: SshLaunches::default(),
             display_launches: DisplayLaunches::default(),
             shutdown: Arc::new(VmShutdownPipeline::production()),
@@ -252,6 +258,84 @@ impl HcsVmRepository {
             Some(HcsSystemState::Paused) => Some("paused".to_string()),
             Some(HcsSystemState::Other(other)) => Some(format!("in state \"{other}\"")),
         })
+    }
+
+    /// Moves the VM's SSH port, when an edit asks for a port it does not
+    /// already have.
+    ///
+    /// Unlike every other field of an update, this one is not a document a
+    /// later start reads: the port lives in files inside the installed guest,
+    /// so it is changed in the running guest or not at all. The stored port is
+    /// rewritten only after the guest's own configuration names the new one,
+    /// so a refused change leaves VMLord connecting where the daemon still
+    /// answers.
+    ///
+    /// What comes back is `Ok` for both outcomes of a change that was made:
+    /// the daemon has moved, or it will when the VM restarts. Which of the two
+    /// it was reaches the user as a diagnostic rather than as an error --
+    /// there is nothing to undo and nothing to retry.
+    fn move_ssh_port(
+        &self,
+        mapping: &VmComputeSystemMapping,
+        requested: Option<SshPort>,
+    ) -> Result<(), RepositoryError> {
+        // An edit form submits every field it shows, so most updates carry the
+        // port the VM already has and ask for nothing.
+        let Some(port) = requested else {
+            return Ok(());
+        };
+        let Some(config) = mapping.ssh.clone() else {
+            let error = RepositoryError::new(format!(
+                "VM \"{}\" was created without SSH access, so it has no SSH port to change",
+                mapping.vm_name
+            ));
+            tracing::warn!("{error}");
+            return Err(error);
+        };
+        if config.port == port {
+            return Ok(());
+        }
+
+        let vm_directory = layout::vm_directory(&self.storage_root, &mapping.vm_name)?;
+        let outcome = self
+            .ssh_port_mover
+            .move_port(mapping, &vm_directory, port)
+            .map_err(|failure| {
+                let error = RepositoryError::new(format!(
+                    "failed to move the SSH port of VM \"{}\" to {port}: {failure}",
+                    mapping.vm_name
+                ));
+                tracing::error!("{error}");
+                error
+            })?;
+
+        // The guest is the authority now, so the record follows it even if the
+        // daemon has not caught up: everything VMLord does next -- a readiness
+        // wait, the SSH button, the endpoint a person reads -- has to name the
+        // port the guest is configured for.
+        self.store.insert(VmComputeSystemMapping {
+            ssh: Some(vmlord_core::SshConfig { port, ..config }),
+            ..mapping.clone()
+        })?;
+
+        match outcome {
+            PortMove::Applied => vmlord_core::diagnostic!(
+                Info,
+                Subsystem::Provisioning,
+                vm = mapping.vm_name.as_str(),
+                "VM \"{}\" now answers SSH on port {port}",
+                mapping.vm_name
+            ),
+            PortMove::RestartNeeded { detail } => vmlord_core::diagnostic!(
+                Warning,
+                Subsystem::Provisioning,
+                vm = mapping.vm_name.as_str(),
+                "VM \"{}\" is configured for SSH port {port} and does not answer there yet \
+                 ({detail}); restart the VM to apply the change",
+                mapping.vm_name
+            ),
+        }
+        Ok(())
     }
 
     /// What HCS says about this VM right now.
@@ -1246,6 +1330,12 @@ impl VmRepository for HcsVmRepository {
     /// compute system as it stops and [`VmStartPipeline`] rebuilds it from
     /// this document, so editing the document is what editing a VM means. A
     /// running VM keeps its current topology until it is restarted.
+    ///
+    /// The SSH port is the one field that is not a document: it is moved
+    /// inside the running guest, last, and after everything else has been
+    /// recorded. A guest that refuses it is therefore an `Err` from an update
+    /// whose other fields did change -- which is why that error names the port
+    /// rather than the VM alone.
     fn update_vm(&mut self, request: VmUpdateRequest) -> Result<(), RepositoryError> {
         let _span = tracing::info_span!("update_vm", vm = request.name.as_str()).entered();
         self.require_initialized()?;
@@ -1283,6 +1373,7 @@ impl VmRepository for HcsVmRepository {
 
         record_network_mode(&self.store, &mapping, request.network_mode)?;
         record_gpu_mode(&self.store, &mapping, request.gpu_mode)?;
+        self.move_ssh_port(&mapping, request.ssh_port)?;
 
         tracing::info!(
             "VM \"{}\" ({}) now requests {} MiB and {} CPU core(s); \
@@ -1937,6 +2028,7 @@ mod tests {
         build::BuildRegistry,
         com1_terminal::{Com1Sessions, TerminalCommand},
         hcn_endpoint::EndpointAddress,
+        ssh_port::SshPortMover,
         ssh_terminal::SshLauncher,
         watch::{HcsEventKind, HcsVmEvent},
     };
@@ -2131,6 +2223,7 @@ mod tests {
             cpu_cores: 2,
             gpu_mode: GpuMode::None,
             network_mode: NetworkMode::None,
+            ssh_port: None,
         }
     }
 
@@ -2238,6 +2331,7 @@ mod tests {
             endpoint_id: None,
             network_mode,
             ssh: None,
+            ssh_daemon: None,
             gpu_mode: GpuMode::None,
             desktop_profile: vmlord_core::DesktopProfile::Headless,
             display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
@@ -2257,6 +2351,7 @@ mod tests {
                 endpoint_id: None,
                 network_mode: NetworkMode::None,
                 ssh: None,
+                ssh_daemon: None,
                 gpu_mode: GpuMode::None,
                 desktop_profile: vmlord_core::DesktopProfile::Headless,
                 display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
@@ -2558,6 +2653,191 @@ mod tests {
             }),
             ..mapping(NetworkMode::Nat)
         }
+    }
+
+    /// A VM whose guest VMLord configured: SSH by key, and a daemon whose
+    /// files VMLord knows the paths of.
+    fn movable_mapping() -> VmComputeSystemMapping {
+        VmComputeSystemMapping {
+            ssh_daemon: Some(vmlord_core::ubuntu().ssh),
+            ..ssh_mapping()
+        }
+    }
+
+    /// A repository over `root` whose port moves end the way `outcome` says,
+    /// without a guest.
+    ///
+    /// The two `Ok` outcomes differ only in whether the guest answers on the
+    /// new port afterwards, which is exactly what the mover decides them by,
+    /// so the fake states them the same way: a guest that runs the commands,
+    /// and a probe that does or does not find a daemon there.
+    fn repository_moving_ports(
+        root: &std::path::Path,
+        outcome: Result<crate::ssh_port::PortMove, crate::ssh_port::PortMoveFailure>,
+    ) -> HcsVmRepository {
+        let mut repository = repository_over(root);
+        let refused = outcome.is_err();
+        let answers = matches!(outcome, Ok(crate::ssh_port::PortMove::Applied));
+        let detail = match &outcome {
+            Ok(crate::ssh_port::PortMove::RestartNeeded { detail }) => detail.clone(),
+            _ => "connection refused".to_owned(),
+        };
+        repository.ssh_port_mover = Arc::new(SshPortMover::for_test(
+            |_| Ok(Some("172.30.0.5".parse().expect("a literal address"))),
+            move |_, _, _| {
+                Ok(crate::ssh_port::RemoteRun {
+                    code: Some(i32::from(refused)),
+                    transcript_tail: if refused {
+                        "sudo: a password is required".to_owned()
+                    } else {
+                        String::new()
+                    },
+                })
+            },
+            move |_, _, _| {
+                if answers { Ok(()) } else { Err(detail.clone()) }
+            },
+        ));
+        repository
+    }
+
+    /// An edit form submits every field it shows, so most updates carry the
+    /// port the VM already has -- and a guest must not be disturbed for one.
+    #[test]
+    fn a_port_that_did_not_change_asks_nothing_of_the_guest() {
+        let (root, store) = temp_store("ssh-port-unchanged");
+        let mut repository = repository_over(&root);
+        repository.ssh_port_mover = Arc::new(SshPortMover::for_test_without_client());
+        let mapping = movable_mapping();
+        store.insert(mapping.clone()).expect("the VM is stored");
+
+        repository
+            .move_ssh_port(&mapping, Some(SshPort::DEFAULT))
+            .expect("nothing was asked for");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The guest is the authority on where its daemon listens, so a move that
+    /// reached it is a move the record has to follow -- everything VMLord does
+    /// next reads the stored port.
+    #[test]
+    fn a_moved_port_is_what_the_store_reads_back() {
+        let (root, store) = temp_store("ssh-port-moved");
+        let repository = repository_moving_ports(&root, Ok(crate::ssh_port::PortMove::Applied));
+        let mapping = movable_mapping();
+        store.insert(mapping.clone()).expect("the VM is stored");
+
+        let (moved, diagnostics) = records(|| {
+            repository.move_ssh_port(&mapping, Some(SshPort::new(2222).expect("a port")))
+        });
+
+        moved.expect("the guest accepted the change");
+        let stored = store
+            .find_by_vm_id(mapping.vm_id)
+            .expect("the store is readable")
+            .expect("the VM is still there");
+        assert_eq!(
+            stored.ssh.expect("the VM still has SSH access").port,
+            SshPort::new(2222).unwrap()
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, DiagnosticLevel::Info);
+        assert!(
+            diagnostics[0].message.contains("port 2222"),
+            "{}",
+            diagnostics[0].message
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A daemon that has not caught up is still a daemon whose configuration
+    /// names the new port: the record follows it, and the user is told what is
+    /// left to do rather than shown an error about a change that was made.
+    #[test]
+    fn a_port_that_needs_a_restart_is_stored_and_said_so() {
+        let (root, store) = temp_store("ssh-port-restart");
+        let repository = repository_moving_ports(
+            &root,
+            Ok(crate::ssh_port::PortMove::RestartNeeded {
+                detail: "connection refused".into(),
+            }),
+        );
+        let mapping = movable_mapping();
+        store.insert(mapping.clone()).expect("the VM is stored");
+
+        let (moved, diagnostics) = records(|| {
+            repository.move_ssh_port(&mapping, Some(SshPort::new(2222).expect("a port")))
+        });
+
+        moved.expect("the change was written into the guest");
+        assert_eq!(
+            store
+                .find_by_vm_id(mapping.vm_id)
+                .unwrap()
+                .unwrap()
+                .ssh
+                .unwrap()
+                .port,
+            SshPort::new(2222).unwrap()
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, DiagnosticLevel::Warning);
+        assert!(
+            diagnostics[0].message.contains("restart the VM"),
+            "{}",
+            diagnostics[0].message
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Nothing changed inside the guest, so the stored port must keep pointing
+    /// at where the daemon still answers.
+    #[test]
+    fn a_guest_that_refused_leaves_the_stored_port_alone() {
+        let (root, store) = temp_store("ssh-port-refused");
+        let repository = repository_moving_ports(
+            &root,
+            Err(crate::ssh_port::PortMoveFailure::Refused {
+                detail: "sudo: a password is required".into(),
+            }),
+        );
+        let mapping = movable_mapping();
+        store.insert(mapping.clone()).expect("the VM is stored");
+
+        let error = repository
+            .move_ssh_port(&mapping, Some(SshPort::new(2222).expect("a port")))
+            .expect_err("a guest that refused is an error the dialog shows");
+
+        assert!(error.to_string().contains("2222"), "{error}");
+        assert_eq!(
+            store
+                .find_by_vm_id(mapping.vm_id)
+                .unwrap()
+                .unwrap()
+                .ssh
+                .unwrap()
+                .port,
+            SshPort::DEFAULT
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_vm_without_ssh_cannot_be_given_a_port() {
+        let (root, _) = temp_store("ssh-port-disabled");
+        let mut repository = repository_over(&root);
+        repository.ssh_port_mover = Arc::new(SshPortMover::for_test_without_client());
+
+        let error = repository
+            .move_ssh_port(
+                &mapping(NetworkMode::Nat),
+                Some(SshPort::new(2222).expect("a port")),
+            )
+            .expect_err("a VM with no daemon has no port to move");
+
+        assert!(error.to_string().contains("without SSH access"), "{error}");
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// A repository whose SSH sessions are recorded instead of opened.
