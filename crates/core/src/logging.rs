@@ -159,7 +159,7 @@ fn compose(stamp: &str, level: Level, target: &str, message: &str, fields: &str)
 ///
 /// Milliseconds, because the thresholds this log has to be able to settle are
 /// stated in them.
-fn timestamp(now: SystemTime) -> String {
+pub(crate) fn timestamp(now: SystemTime) -> String {
     let since = now.duration_since(UNIX_EPOCH).unwrap_or_default();
     let seconds = since.as_secs();
     let (days, time) = (seconds / 86_400, seconds % 86_400);

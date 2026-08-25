@@ -9,6 +9,16 @@ mod logging;
 
 pub use diagnostics::{Diagnostic, DiagnosticLevel, DiagnosticsLayer, DiagnosticsSink, Subsystem};
 pub use error::RepositoryError;
+
+/// A moment as VMLord spells it everywhere: `1970-01-01T00:00:00.000Z`.
+///
+/// Public so the diagnostics panel stamps a record the same way the log file
+/// does: two spellings of one moment would defeat the point of showing it,
+/// which is to line the panel up against `vmlord.log`.
+#[must_use]
+pub fn format_timestamp(at: std::time::SystemTime) -> String {
+    logging::timestamp(at)
+}
 pub mod progress;
 pub mod provisioning;
 pub mod settings;
