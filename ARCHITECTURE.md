@@ -3080,9 +3080,13 @@ are refused outright: they need a model this design does not have, and they are
 task #139.
 
 Two rules keep it honest. A selection crosses only while the viewer's window
-has keyboard focus, so a VM in the background cannot read what its user copies
-elsewhere or replace what is on their clipboard; a change made while the window
-was unfocused is announced when focus returns. And each side suppresses its own
+has keyboard focus -- in *both* directions, so a VM in the background can
+neither read what its user copies elsewhere nor replace what is on their
+clipboard. Neither side loses what happened while the window was away: the host
+announces its own clipboard when focus returns, and an announcement the guest
+made in the meantime is held and handed on then. Holding the announcement holds
+the selection with it, because the model is pull: nothing is asked for and so
+nothing crosses. And each side suppresses its own
 echo with what it already has -- the host with `GetClipboardSequenceNumber`
 taken as it writes, the guest with `session-is-owner` out of mutter's
 `SelectionOwnerChanged` -- because without that, applying the other side's
