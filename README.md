@@ -93,12 +93,16 @@ The long-term goal, however, is different.
 
 While AppSandbox focuses on isolated application environments across multiple platforms, VMLord focuses exclusively on Windows and on providing the best possible Linux desktop experience using the native Windows virtualization APIs.
 
+No AppSandbox code or binary is part of VMLord any more: the C backend VMLord
+booted from was replaced module by module and removed from the distribution.
+AppSandbox is MIT-licensed, © 2026 James Stringer, and is credited here for the
+ideas and the recorded Windows behaviour VMLord kept from it.
+
 ## Status
 
 🚧 Early development. The Windows x64 application runs on the native HCS
-backend and lists persisted VMs in an egui desktop shell. The AppSandbox legacy
-backend remains as a transitional fallback, selected only by setting
-`VMLORD_BACKEND=legacy`.
+backend -- the only backend -- and lists persisted VMs in an egui desktop
+shell.
 
 ## Building
 
@@ -113,7 +117,7 @@ application and a Linux guest agent. The commands are Cargo aliases, defined in
 | `cargo display-services` | the guest display services, `x86_64-unknown-linux-musl` | Windows, Linux |
 | `cargo check-windows` | compile-checks the application and the display viewer through `x86_64-pc-windows-gnu` | WSL |
 | `cargo test-windows` | builds and runs the Windows tests, the display viewer's included | WSL |
-| `cargo dist` | release build of everything -- `vmlord.exe`, `vmlord-com1.exe`, `vmlord-display.exe`, the agent, and the retained legacy backend DLL -- collected into `target/dist/` | Windows |
+| `cargo dist` | release build of everything -- `vmlord.exe`, `vmlord-com1.exe`, `vmlord-display.exe` and the agent -- collected into `target/dist/` | Windows |
 | `cargo gpu-payload pack ...` | release tooling that packs a prepared GPU payload | Windows, Linux |
 
 Prerequisites:
@@ -137,12 +141,8 @@ Start-Process -FilePath .\target\debug\vmlord.exe -Verb RunAs -Wait
 ```
 
 The HCS backend requires elevation, so `cargo run` cannot launch the UAC-marked
-executable directly. The build stages the prebuilt
-`third_party/appsandbox/x64/appsandbox_core.dll` next to the executable for the
-remaining legacy lifecycle and configuration operations. VMLord does not load
-its display export and does not ship separate AppSandbox IDD or guest
-display/input artifacts. See `third_party/appsandbox/NOTICE.md` for the pinned
-artifact and license details.
+executable directly. The build stages nothing beside the executable: VMLord
+ships no third-party runtime.
 
 The shell targets `x86_64-pc-windows-msvc` and creates Linux workspaces either
 from a local ISO, which boots to the distribution's own installer, or from an
@@ -164,5 +164,4 @@ The native display supports GNOME on Wayland for Ubuntu 22.04, 24.04 and 26.04
 amd64. See the **[display compatibility matrix](docs/display-compatibility.md)**,
 **[user guide](docs/display-user-guide.md)** and
 **[troubleshooting guide](docs/display-troubleshooting.md)**. Snapshots remain
-migration work. AppSandbox macOS code, WebView UI, provisioning tools, and
-display resources are not included.
+migration work.

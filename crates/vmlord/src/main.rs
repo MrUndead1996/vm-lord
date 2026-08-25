@@ -5,11 +5,7 @@ use std::path::PathBuf;
 
 use vmlord_core::{AppSettings, BuildMonitor, BuildStep, VmRepository};
 
-/// Selects the backend the composition root wires in.
-///
-/// The native HCS backend is the default; the legacy AppSandbox backend stays
-/// reachable while the migration finishes the features it still owns.
-const BACKEND_VARIABLE: &str = "VMLORD_BACKEND";
+mod pickers;
 
 fn main() {
     let settings = vmlord_core::SettingsStore::for_current_user()
@@ -36,10 +32,8 @@ fn main() {
     };
     let mut application = vmlord_app::WorkspaceApp::new(repository)
         .with_guest_defaults(vmlord_platform::host_guest_defaults())
-        .with_image_picker(Box::new(vmlord_legacy_backend::WindowsImagePicker::new()))
-        .with_settings_path_picker(Box::new(
-            vmlord_legacy_backend::WindowsSettingsPathPicker::new(),
-        ));
+        .with_image_picker(Box::new(pickers::WindowsImagePicker::new()))
+        .with_settings_path_picker(Box::new(pickers::WindowsSettingsPathPicker::new()));
     if let Ok((store, settings)) = settings {
         application = application.with_settings(store, settings);
     }
@@ -50,28 +44,17 @@ fn main() {
 }
 
 fn load_backend(settings: &AppSettings) -> Box<dyn VmRepository> {
-    if !legacy_backend_requested() {
-        log::info!(
-            "using the native HCS backend with VM storage at {}",
-            settings.vm_storage_path.display()
-        );
-        return Box::new(
-            vmlord_platform::HcsVmRepository::new(
-                settings.vm_storage_path.clone(),
-                cloud_disk_importer(settings.image_cache_path.clone()),
-            )
-            .with_readiness_timeouts(settings.guest_readiness),
-        );
-    }
-
-    log::warn!("using the legacy AppSandbox backend because {BACKEND_VARIABLE}=legacy");
-    match vmlord_legacy_backend::AppSandboxBackend::load_from_executable_dir() {
-        Ok(backend) => Box::new(backend),
-        Err(error) => {
-            log::error!("failed to load the legacy backend: {error}");
-            vmlord_app::unavailable_repository(error.to_string())
-        }
-    }
+    log::info!(
+        "using the native HCS backend with VM storage at {}",
+        settings.vm_storage_path.display()
+    );
+    Box::new(
+        vmlord_platform::HcsVmRepository::new(
+            settings.vm_storage_path.clone(),
+            cloud_disk_importer(settings.image_cache_path.clone()),
+        )
+        .with_readiness_timeouts(settings.guest_readiness),
+    )
 }
 
 /// Joins the two halves of getting a cloud image onto a VM's disk: fetching it,
@@ -105,24 +88,4 @@ fn cloud_disk_importer(cache_directory: PathBuf) -> vmlord_platform::CloudDiskIm
             .map(|_summary| ())
         },
     )
-}
-
-/// Reports whether the transitional legacy backend was asked for.
-///
-/// Anything other than `legacy` -- including an unset or misspelled value --
-/// selects the native backend, so a typo cannot silently keep VMLord on the
-/// backend being retired.
-fn legacy_backend_requested() -> bool {
-    match std::env::var(BACKEND_VARIABLE) {
-        Ok(value) if value.eq_ignore_ascii_case("legacy") => true,
-        Ok(value) if value.is_empty() || value.eq_ignore_ascii_case("hcs") => false,
-        Ok(value) => {
-            log::warn!(
-                "ignoring unknown {BACKEND_VARIABLE} value \"{value}\"; \
-                 expected \"hcs\" or \"legacy\""
-            );
-            false
-        }
-        Err(_) => false,
-    }
 }

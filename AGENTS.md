@@ -8,19 +8,13 @@ For architecture details, see **ARCHITECTURE.md**.
 
 ## Project Status
 
-VMLord is currently migrating from the AppSandbox C backend to a Rust-native architecture.
-
-The current implementation intentionally reuses the AppSandbox backend through a small FFI layer.
-
-The backend is temporary and will be replaced incrementally.
+VMLord is Rust-native. The AppSandbox C backend it started from, its FFI layer
+and the `vmlord-legacy-backend` crate have been removed from the distribution.
 
 ## Development Principles
 
-* Implement all new application code in Rust.
-* Keep the FFI layer as small as possible.
-* Do not expose C types outside the FFI layer.
-* Avoid modifying the AppSandbox backend unless necessary.
-* Replace backend components one module at a time.
+* Implement all application code in Rust.
+* Do not reintroduce C code or an FFI layer for backend work.
 * Prefer native Windows APIs over PowerShell, WMI or external processes.
 * Isolate all `unsafe` code inside platform-specific modules.
 
@@ -46,14 +40,12 @@ Avoid:
 * traits with a single implementation
 * large architectural rewrites unless explicitly requested
 
-## Migration
+## AppSandbox references
 
-When porting functionality from AppSandbox:
-
-* preserve behavior before improving it;
-* do not translate C code line-by-line;
-* design clean Rust APIs;
-* treat the C backend as an implementation detail.
+AppSandbox's sources are no longer part of this repository, but the code and
+**ARCHITECTURE.md** still cite them where they recorded Windows behaviour worth
+keeping. Treat those citations as history: they explain a decision, they do not
+describe anything VMLord ships.
 
 ## Documentation
 
