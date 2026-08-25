@@ -26,3 +26,74 @@ warning = "Предупреждения"
 info = "Информация"
 debug = "Отладка"
 trace = "Трассировка"
+
+[app]
+subtitle = "Linux-окружения в Windows"
+refresh = "Обновить"
+refresh_hint = "Доступно, когда бэкенд готов"
+create_vm = "Создать ВМ"
+create_vm_hint = "Создать виртуальную машину"
+settings = "Настройки"
+settings_hint = "Открыть настройки приложения"
+backend_starting = "Бэкенд: запускается…"
+backend_ready = "Бэкенд: готов"
+backend_unavailable = "Бэкенд недоступен: %{message}"
+
+[vm_table]
+title = "Окружения"
+empty = "Виртуальных машин нет."
+name = "Имя"
+os = "ОС"
+status = "Состояние"
+agent_status = "Состояние агента"
+cpu = "CPU"
+ram = "RAM"
+disk = "Диск"
+network_type = "Тип сети"
+cores_one = "%{count} ядро"
+cores_few = "%{count} ядра"
+cores_many = "%{count} ядер"
+mebibytes = "%{count} МиБ"
+gibibytes = "%{count} ГиБ"
+
+[agent_status]
+offline = "Не в сети"
+online = "В сети"
+
+[vm_state]
+stopped = "Остановлена"
+starting = "Запускается"
+running = "Работает"
+building_downloading = "Сборка: загрузка"
+building_writing_disk = "Сборка: запись диска"
+building_provisioning = "Сборка: подготовка"
+building_registering = "Сборка: регистрация"
+building_starting = "Сборка: запуск ВМ"
+building_waiting = "Сборка: ожидание гостя"
+with_percentage = "%{label} %{percent}%"
+
+[gpu_state]
+waiting_for_guest = "Ожидание гостя"
+assigned = "Назначен"
+ready = "Готов"
+degraded = "Ограничен"
+failed = "Ошибка"
+
+[display_state]
+installing = "Устанавливается"
+ready = "Готов"
+degraded = "Ограничен"
+
+[desktop_profile]
+headless = "Нет (без графики)"
+gnome = "GNOME"
+
+[gpu_mode]
+mirror = "Зеркало"
+unsupported = "Не поддерживается"
+
+[network_mode]
+nat = "NAT"
+external = "Внешняя"
+internal = "Внутренняя"
+unsupported = "Не поддерживается"

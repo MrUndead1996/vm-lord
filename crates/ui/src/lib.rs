@@ -327,7 +327,7 @@ impl eframe::App for VmlordUi {
             let mut selected_action = None;
 
             ui.heading("VMLord");
-            ui.label("Linux workspaces on Windows");
+            ui.label(t!("app.subtitle").to_string());
             ui.separator();
 
             ui.horizontal(|ui| {
@@ -335,11 +335,11 @@ impl eframe::App for VmlordUi {
                 let can_refresh = matches!(self.application.status(), BackendStatus::Ready);
                 let refresh = render_refresh_icon(ui, can_refresh);
                 if can_refresh {
-                    refresh.clone().on_hover_text("Refresh");
+                    refresh.clone().on_hover_text(t!("app.refresh").to_string());
                 } else {
                     refresh
                         .clone()
-                        .on_disabled_hover_text("Available when the backend is ready");
+                        .on_disabled_hover_text(t!("app.refresh_hint").to_string());
                 }
                 if refresh.clicked() {
                     self.application.refresh();
@@ -350,23 +350,28 @@ impl eframe::App for VmlordUi {
                     let create = ui.add_enabled(
                         can_refresh,
                         egui::Button::new(
-                            egui::RichText::new("Create VM").color(egui::Color32::WHITE),
+                            egui::RichText::new(t!("app.create_vm").to_string())
+                                .color(egui::Color32::WHITE),
                         )
                         .fill(egui::Color32::from_rgb(47, 158, 97)),
                     );
                     if can_refresh {
-                        create.clone().on_hover_text("Create a virtual machine");
+                        create
+                            .clone()
+                            .on_hover_text(t!("app.create_vm_hint").to_string());
                     } else {
                         create
                             .clone()
-                            .on_disabled_hover_text("Available when the backend is ready");
+                            .on_disabled_hover_text(t!("app.refresh_hint").to_string());
                     }
                     if create.clicked() {
                         selected_action = Some(VmAction::Create);
                     }
 
-                    let settings = ui.button("Settings");
-                    settings.clone().on_hover_text("Open application settings");
+                    let settings = ui.button(t!("app.settings").to_string());
+                    settings
+                        .clone()
+                        .on_hover_text(t!("app.settings_hint").to_string());
                     if settings.clicked()
                         && let Some(current) = self.application.settings()
                     {
@@ -1508,15 +1513,52 @@ fn ssh_port_locked(state: &VmState, authentication: SshAuthentication) -> Option
     }
 }
 
-fn gpu_state_label(state: GpuState) -> &'static str {
-    match state {
-        GpuState::Disabled => "Disabled",
-        GpuState::WaitingForGuest => "Waiting for guest",
-        GpuState::Assigned => "Assigned",
-        GpuState::GuestReady => "Ready",
-        GpuState::Degraded => "Degraded",
-        GpuState::Failed => "Failed",
+/// Which of the three forms a counted noun takes.
+///
+/// Russian inflects a counted noun three ways -- 1 ядро, 2 ядра, 5 ядер --
+/// and the catalogue backend carries no plural rules. A rule engine would be a
+/// large answer to one string: the core count is the only place in the UI
+/// where a number stands before a noun that bends. English is served by the
+/// same three keys, because its rule -- one against everything else -- is a
+/// coarsening of this one, and `en-US.toml` repeats itself in the last two.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PluralForm {
+    One,
+    Few,
+    Many,
+}
+
+fn plural_form(count: u32) -> PluralForm {
+    let last_two = count % 100;
+    if (11..=14).contains(&last_two) {
+        return PluralForm::Many;
     }
+    match count % 10 {
+        1 => PluralForm::One,
+        2..=4 => PluralForm::Few,
+        _ => PluralForm::Many,
+    }
+}
+
+fn cores_label(count: u32) -> String {
+    match plural_form(count) {
+        PluralForm::One => t!("vm_table.cores_one", count = count),
+        PluralForm::Few => t!("vm_table.cores_few", count = count),
+        PluralForm::Many => t!("vm_table.cores_many", count = count),
+    }
+    .to_string()
+}
+
+fn gpu_state_label(state: GpuState) -> String {
+    match state {
+        GpuState::Disabled => t!("common.disabled"),
+        GpuState::WaitingForGuest => t!("gpu_state.waiting_for_guest"),
+        GpuState::Assigned => t!("gpu_state.assigned"),
+        GpuState::GuestReady => t!("gpu_state.ready"),
+        GpuState::Degraded => t!("gpu_state.degraded"),
+        GpuState::Failed => t!("gpu_state.failed"),
+    }
+    .to_string()
 }
 
 /// What the domain has to say about the VM this form describes, if anything.
@@ -1530,17 +1572,18 @@ fn create_vm_advisories(form: &CreateVmForm) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn desktop_profile_label(profile: DesktopProfile) -> &'static str {
+fn desktop_profile_label(profile: DesktopProfile) -> String {
     match profile {
-        DesktopProfile::Headless => "None (headless)",
-        DesktopProfile::Gnome => "GNOME",
+        DesktopProfile::Headless => t!("desktop_profile.headless"),
+        DesktopProfile::Gnome => t!("desktop_profile.gnome"),
     }
+    .to_string()
 }
 
 /// What to show beside a VM's desktop, in one line.
 fn display_status_detail(profile: DesktopProfile, status: Option<&VmDisplayStatus>) -> String {
     let Some(status) = status else {
-        return desktop_profile_label(profile).to_owned();
+        return desktop_profile_label(profile);
     };
     let mut detail = format!("{}: {}", display_state_label(status.state), status.message);
     if status.can_retry {
@@ -1549,33 +1592,37 @@ fn display_status_detail(profile: DesktopProfile, status: Option<&VmDisplayStatu
     detail
 }
 
-fn display_state_label(state: DisplayState) -> &'static str {
+fn display_state_label(state: DisplayState) -> String {
     match state {
-        DisplayState::Disabled => "Disabled",
-        DisplayState::Provisioning => "Installing",
-        DisplayState::WaitingForGuest => "Waiting for guest",
-        DisplayState::Ready => "Ready",
-        DisplayState::Degraded => "Degraded",
+        DisplayState::Disabled => t!("common.disabled"),
+        DisplayState::Provisioning => t!("display_state.installing"),
+        // The same wait the GPU reports, named the same way.
+        DisplayState::WaitingForGuest => t!("gpu_state.waiting_for_guest"),
+        DisplayState::Ready => t!("display_state.ready"),
+        DisplayState::Degraded => t!("display_state.degraded"),
     }
+    .to_string()
 }
 
-fn gpu_mode_label(mode: GpuMode) -> &'static str {
+fn gpu_mode_label(mode: GpuMode) -> String {
     match mode {
-        GpuMode::None => "None",
-        GpuMode::Default => "Default",
-        GpuMode::Mirror => "Mirror",
-        GpuMode::Unknown(_) => "Unsupported",
+        GpuMode::None => t!("common.none"),
+        GpuMode::Default => t!("common.default"),
+        GpuMode::Mirror => t!("gpu_mode.mirror"),
+        GpuMode::Unknown(_) => t!("gpu_mode.unsupported"),
     }
+    .to_string()
 }
 
-fn network_mode_label(mode: NetworkMode) -> &'static str {
+fn network_mode_label(mode: NetworkMode) -> String {
     match mode {
-        NetworkMode::None => "None",
-        NetworkMode::Nat => "NAT",
-        NetworkMode::External => "External",
-        NetworkMode::Internal => "Internal",
-        NetworkMode::Unknown(_) => "Unsupported",
+        NetworkMode::None => t!("common.none"),
+        NetworkMode::Nat => t!("network_mode.nat"),
+        NetworkMode::External => t!("network_mode.external"),
+        NetworkMode::Internal => t!("network_mode.internal"),
+        NetworkMode::Unknown(_) => t!("network_mode.unsupported"),
     }
+    .to_string()
 }
 
 fn render_refresh_icon(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
@@ -1613,20 +1660,23 @@ fn render_refresh_icon(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
 
 fn render_backend_status(ui: &mut egui::Ui, status: &BackendStatus) {
     match status {
-        BackendStatus::Starting => ui.label("Backend: starting…"),
-        BackendStatus::Ready => ui.colored_label(egui::Color32::LIGHT_GREEN, "Backend: ready"),
+        BackendStatus::Starting => ui.label(t!("app.backend_starting").to_string()),
+        BackendStatus::Ready => ui.colored_label(
+            egui::Color32::LIGHT_GREEN,
+            t!("app.backend_ready").to_string(),
+        ),
         BackendStatus::Unavailable(message) => ui.colored_label(
             egui::Color32::LIGHT_RED,
-            format!("Backend unavailable: {message}"),
+            t!("app.backend_unavailable", message = message).to_string(),
         ),
     };
 }
 
 fn render_vm_list(ui: &mut egui::Ui, vms: &[VmSummary], selected_vm_name: &mut Option<String>) {
-    ui.heading("Workspaces");
+    ui.heading(t!("vm_table.title").to_string());
     if vms.is_empty() {
         *selected_vm_name = None;
-        ui.weak("No virtual machines found.");
+        ui.weak(t!("vm_table.empty").to_string());
         return;
     }
 
@@ -1646,15 +1696,15 @@ fn render_vm_list(ui: &mut egui::Ui, vms: &[VmSummary], selected_vm_name: &mut O
         .num_columns(VM_TABLE_COLUMN_COUNT as usize)
         .min_col_width(min_column_width)
         .show(ui, |ui| {
-            ui.strong("Name");
-            ui.strong("OS");
-            ui.strong("Status");
-            ui.strong("Agent status");
-            ui.strong("CPU");
-            ui.strong("RAM");
-            ui.strong("Disk");
+            ui.strong(t!("vm_table.name").to_string());
+            ui.strong(t!("vm_table.os").to_string());
+            ui.strong(t!("vm_table.status").to_string());
+            ui.strong(t!("vm_table.agent_status").to_string());
+            ui.strong(t!("vm_table.cpu").to_string());
+            ui.strong(t!("vm_table.ram").to_string());
+            ui.strong(t!("vm_table.disk").to_string());
             ui.strong("GPU");
-            ui.strong("Network type");
+            ui.strong(t!("vm_table.network_type").to_string());
             ui.end_row();
             for vm in vms {
                 let is_selected = selected_vm_name.as_deref() == Some(vm.name.as_str());
@@ -1664,9 +1714,9 @@ fn render_vm_list(ui: &mut egui::Ui, vms: &[VmSummary], selected_vm_name: &mut O
                 ui.label(&vm.os_type);
                 ui.label(vm_state_label(vm.state));
                 render_agent_status(ui, agent_status(vm.state));
-                ui.label(format!("{} cores", vm.cpu_cores));
-                ui.label(format!("{} MiB", vm.ram_mb));
-                ui.label(format!("{} GiB", vm.disk_gb));
+                ui.label(cores_label(vm.cpu_cores));
+                ui.label(t!("vm_table.mebibytes", count = vm.ram_mb).to_string());
+                ui.label(t!("vm_table.gibibytes", count = vm.disk_gb).to_string());
                 ui.label(gpu_mode_label(vm.gpu_mode));
                 ui.label(network_mode_label(vm.network_mode));
                 ui.end_row();
@@ -2357,12 +2407,13 @@ fn agent_status(state: VmState) -> AgentStatus {
     }
 }
 
-fn agent_status_label(status: AgentStatus) -> &'static str {
+fn agent_status_label(status: AgentStatus) -> String {
     match status {
-        AgentStatus::Unknown => "Unknown",
-        AgentStatus::Offline => "Offline",
-        AgentStatus::Online => "Online",
+        AgentStatus::Unknown => t!("common.unknown"),
+        AgentStatus::Offline => t!("agent_status.offline"),
+        AgentStatus::Online => t!("agent_status.online"),
     }
+    .to_string()
 }
 
 /// The status column's text: the step, and how far into it the build is when
@@ -2375,8 +2426,10 @@ fn vm_state_label(state: VmState) -> String {
     let label = vm_state(state);
     match state {
         VmState::Building { progress } => match download_percentage(progress) {
-            Some(percent) => format!("{label} {percent}%"),
-            None => label.to_owned(),
+            Some(percent) => {
+                t!("vm_state.with_percentage", label = label, percent = percent).to_string()
+            }
+            None => label,
         },
         _ => label.to_owned(),
     }
@@ -2449,20 +2502,21 @@ fn percentage(done: u64, total: u64) -> u64 {
     (done.min(total) * 100 / total).min(if done < total { 99 } else { 100 })
 }
 
-fn vm_state(state: VmState) -> &'static str {
+fn vm_state(state: VmState) -> String {
     match state {
-        VmState::Stopped => "Stopped",
+        VmState::Stopped => t!("vm_state.stopped"),
         VmState::Building { progress } => match progress.step {
-            BuildStep::Downloading => "Building: downloading",
-            BuildStep::WritingDisk => "Building: writing the disk",
-            BuildStep::Provisioning => "Building: provisioning",
-            BuildStep::Registering => "Building: registering",
-            BuildStep::Starting => "Building: starting the VM",
-            BuildStep::AwaitingGuest => "Building: waiting for the guest",
+            BuildStep::Downloading => t!("vm_state.building_downloading"),
+            BuildStep::WritingDisk => t!("vm_state.building_writing_disk"),
+            BuildStep::Provisioning => t!("vm_state.building_provisioning"),
+            BuildStep::Registering => t!("vm_state.building_registering"),
+            BuildStep::Starting => t!("vm_state.building_starting"),
+            BuildStep::AwaitingGuest => t!("vm_state.building_waiting"),
         },
-        VmState::Starting => "Starting",
-        VmState::Running { .. } => "Running",
+        VmState::Starting => t!("vm_state.starting"),
+        VmState::Running { .. } => t!("vm_state.running"),
     }
+    .to_string()
 }
 
 #[cfg(test)]
@@ -2520,6 +2574,28 @@ mod tests {
         let mut keys = std::collections::BTreeSet::new();
         walk("", &document, &mut keys);
         keys
+    }
+
+    #[test]
+    fn a_core_count_takes_the_form_russian_asks_for() {
+        assert_eq!(t!("vm_table.cores_one", locale = "ru-RU", count = 1), "1 ядро");
+        assert_eq!(t!("vm_table.cores_few", locale = "ru-RU", count = 2), "2 ядра");
+        assert_eq!(
+            t!("vm_table.cores_many", locale = "ru-RU", count = 5),
+            "5 ядер"
+        );
+    }
+
+    #[test]
+    fn the_plural_form_follows_the_count() {
+        use super::{PluralForm, plural_form};
+
+        assert_eq!(plural_form(1), PluralForm::One);
+        assert_eq!(plural_form(2), PluralForm::Few);
+        assert_eq!(plural_form(5), PluralForm::Many);
+        assert_eq!(plural_form(11), PluralForm::Many);
+        assert_eq!(plural_form(21), PluralForm::One);
+        assert_eq!(plural_form(0), PluralForm::Many);
     }
 
     #[test]

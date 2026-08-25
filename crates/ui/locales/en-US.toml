@@ -26,3 +26,74 @@ warning = "Warning"
 info = "Info"
 debug = "Debug"
 trace = "Trace"
+
+[app]
+subtitle = "Linux workspaces on Windows"
+refresh = "Refresh"
+refresh_hint = "Available when the backend is ready"
+create_vm = "Create VM"
+create_vm_hint = "Create a virtual machine"
+settings = "Settings"
+settings_hint = "Open application settings"
+backend_starting = "Backend: starting…"
+backend_ready = "Backend: ready"
+backend_unavailable = "Backend unavailable: %{message}"
+
+[vm_table]
+title = "Workspaces"
+empty = "No virtual machines found."
+name = "Name"
+os = "OS"
+status = "Status"
+agent_status = "Agent status"
+cpu = "CPU"
+ram = "RAM"
+disk = "Disk"
+network_type = "Network type"
+cores_one = "%{count} core"
+cores_few = "%{count} cores"
+cores_many = "%{count} cores"
+mebibytes = "%{count} MiB"
+gibibytes = "%{count} GiB"
+
+[agent_status]
+offline = "Offline"
+online = "Online"
+
+[vm_state]
+stopped = "Stopped"
+starting = "Starting"
+running = "Running"
+building_downloading = "Building: downloading"
+building_writing_disk = "Building: writing the disk"
+building_provisioning = "Building: provisioning"
+building_registering = "Building: registering"
+building_starting = "Building: starting the VM"
+building_waiting = "Building: waiting for the guest"
+with_percentage = "%{label} %{percent}%"
+
+[gpu_state]
+waiting_for_guest = "Waiting for guest"
+assigned = "Assigned"
+ready = "Ready"
+degraded = "Degraded"
+failed = "Failed"
+
+[display_state]
+installing = "Installing"
+ready = "Ready"
+degraded = "Degraded"
+
+[desktop_profile]
+headless = "None (headless)"
+gnome = "GNOME"
+
+[gpu_mode]
+mirror = "Mirror"
+unsupported = "Unsupported"
+
+[network_mode]
+nat = "NAT"
+external = "External"
+internal = "Internal"
+unsupported = "Unsupported"
