@@ -34,6 +34,15 @@ Prefer:
 * descriptive names
 * idiomatic Rust
 
+Log through `tracing`, not `log`. The `log` crate remains a dependency only so
+that records from `eframe` and other dependencies still reach the file.
+
+An event meant for the user goes through `vmlord_core::diagnostic!`, which marks
+it for the diagnostics panel and names its subsystem. Ordinary `info!` and
+`warn!` reach the log file alone. A secret must have neither a `Display` nor a
+`Debug` that shows its value -- see **ARCHITECTURE.md**, "What never reaches a
+record".
+
 Avoid:
 
 * unnecessary abstractions
