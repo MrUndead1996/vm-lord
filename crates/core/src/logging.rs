@@ -1,5 +1,5 @@
 use std::{
-    fmt,
+    fmt::{self, Write as _},
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::PathBuf,
@@ -7,7 +7,17 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use log::{Level, LevelFilter, Log, Metadata, Record, SetLoggerError};
+use tracing::{
+    Event, Level, Metadata, Subscriber,
+    field::{Field, Visit},
+    level_filters::LevelFilter,
+    span::{Attributes, Id},
+    subscriber::SetGlobalDefaultError,
+};
+use tracing_log::log_tracer::SetLoggerError;
+use tracing_subscriber::{
+    Layer, layer::Context, layer::SubscriberExt as _, registry::LookupSpan,
+};
 
 use crate::{AppSettings, LogLevel};
 
@@ -32,12 +42,24 @@ pub fn initialize_without_console(settings: &AppSettings) -> Result<(), LoggingE
 
 /// Whether records are echoed to standard output as well as written to file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Console {
+pub(crate) enum Console {
     Echo,
     Silent,
 }
 
 fn install(settings: &AppSettings, console: Console) -> Result<(), LoggingError> {
+    let layer = record_layer(settings, console)?;
+    install_bridge(settings)?;
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
+        .map_err(LoggingError::AlreadyInitialized)?;
+    Ok(())
+}
+
+/// Opens the log file and builds the layer that writes to it.
+///
+/// Separate from installation so that a process which also wants diagnostics
+/// can compose the two layers rather than repeat the file handling.
+fn record_layer(settings: &AppSettings, console: Console) -> Result<RecordLayer, LoggingError> {
     let log_directory =
         settings
             .log_file_path
@@ -60,15 +82,22 @@ fn install(settings: &AppSettings, console: Console) -> Result<(), LoggingError>
             path: settings.log_file_path.clone(),
             source,
         })?;
-    let level = level_filter(settings.log_level);
-    let logger = Box::leak(Box::new(ApplicationLogger {
-        level,
+
+    Ok(RecordLayer {
+        level: level_filter(settings.log_level),
         console,
         file: Mutex::new(file),
-    }));
+    })
+}
 
-    log::set_logger(logger).map_err(LoggingError::AlreadyInitialized)?;
-    log::set_max_level(level);
+/// Points the `log` crate at the subscriber.
+///
+/// Dependencies -- `eframe` among them -- write through `log`, and without this
+/// their records stop reaching the file. `LogTracer` decides what to forward
+/// from `log`'s own maximum level, so the two have to be told the same thing.
+fn install_bridge(settings: &AppSettings) -> Result<(), LoggingError> {
+    tracing_log::LogTracer::init().map_err(LoggingError::LogBridge)?;
+    log::set_max_level(log_level_filter(settings.log_level));
     Ok(())
 }
 
@@ -83,12 +112,16 @@ fn emit(line: &str, console: Console, out: &mut impl Write, file: &mut impl Writ
     let _ = writeln!(file, "{line}");
 }
 
-/// One record's line, stamp first.
+/// One record's line, stamp first, fields last.
 ///
 /// Its own function for the same reason `emit` is: what a line looks like is
-/// worth a test, and installing a logger to read one back is not.
-fn compose(stamp: &str, level: Level, target: &str, message: &fmt::Arguments<'_>) -> String {
-    format!("[{stamp}] [{level:<5}] {target}: {message}")
+/// worth a test, and installing a subscriber to read one back is not. `fields`
+/// arrives already rendered and already carrying its leading space, or empty.
+fn compose(stamp: &str, level: Level, target: &str, message: &str, fields: &str) -> String {
+    format!(
+        "[{stamp}] [{:<5}] {target}: {message}{fields}",
+        level.as_str()
+    )
 }
 
 /// The instant a record was written, as `1970-01-01T00:00:00.000Z`.
@@ -150,35 +183,77 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
 
 fn level_filter(level: LogLevel) -> LevelFilter {
     match level {
-        LogLevel::Error => LevelFilter::Error,
-        LogLevel::Warn => LevelFilter::Warn,
-        LogLevel::Info => LevelFilter::Info,
-        LogLevel::Debug => LevelFilter::Debug,
-        LogLevel::Trace => LevelFilter::Trace,
+        LogLevel::Error => LevelFilter::ERROR,
+        LogLevel::Warn => LevelFilter::WARN,
+        LogLevel::Info => LevelFilter::INFO,
+        LogLevel::Debug => LevelFilter::DEBUG,
+        LogLevel::Trace => LevelFilter::TRACE,
     }
 }
 
-struct ApplicationLogger {
+/// The same setting, in the units the `log` bridge is configured in.
+fn log_level_filter(level: LogLevel) -> log::LevelFilter {
+    match level {
+        LogLevel::Error => log::LevelFilter::Error,
+        LogLevel::Warn => log::LevelFilter::Warn,
+        LogLevel::Info => log::LevelFilter::Info,
+        LogLevel::Debug => log::LevelFilter::Debug,
+        LogLevel::Trace => log::LevelFilter::Trace,
+    }
+}
+
+/// The layer that writes records to the log file, and to a console when there
+/// is one to write to.
+pub(crate) struct RecordLayer {
     level: LevelFilter,
     console: Console,
     file: Mutex<File>,
 }
 
-impl Log for ApplicationLogger {
-    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        metadata.level() <= self.level
+impl<S> Layer<S> for RecordLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn enabled(&self, metadata: &Metadata<'_>, _: Context<'_, S>) -> bool {
+        *metadata.level() <= self.level
     }
 
-    fn log(&self, record: &Record<'_>) {
-        if !self.enabled(record.metadata()) {
+    fn on_new_span(&self, attributes: &Attributes<'_>, id: &Id, context: Context<'_, S>) {
+        // Rendered once, when the span opens, rather than on every event
+        // inside it: an operation's fields do not change while it runs.
+        let mut visitor = RecordVisitor::default();
+        attributes.record(&mut visitor);
+        if let Some(span) = context.span(id) {
+            span.extensions_mut().insert(SpanFields(visitor.fields));
+        }
+    }
+
+    fn on_event(&self, event: &Event<'_>, context: Context<'_, S>) {
+        if *event.metadata().level() > self.level {
             return;
         }
 
+        let mut visitor = RecordVisitor::default();
+        event.record(&mut visitor);
+
+        // The operation's own fields come before the event's: a reader who
+        // scans down a column wants the VM in the same place on every line.
+        let mut fields = String::new();
+        if let Some(scope) = context.event_scope(event) {
+            for span in scope.from_root() {
+                if let Some(rendered) = span.extensions().get::<SpanFields>() {
+                    fields.push_str(&rendered.0);
+                }
+            }
+        }
+        fields.push_str(&visitor.fields);
+
         let line = compose(
             &timestamp(SystemTime::now()),
-            record.level(),
-            record.target(),
-            record.args(),
+            *event.metadata().level(),
+            event.metadata().target(),
+            &visitor.message,
+            &fields,
         );
         if let Ok(mut file) = self.file.lock() {
             emit(&line, self.console, &mut io::stdout().lock(), &mut *file);
@@ -186,13 +261,53 @@ impl Log for ApplicationLogger {
             let _ = writeln!(io::stdout().lock(), "{line}");
         }
     }
+}
 
-    fn flush(&self) {
-        if self.console == Console::Echo {
-            let _ = io::stdout().lock().flush();
+/// A span's fields, rendered when it opened.
+struct SpanFields(String);
+
+/// Pulls a record's message and its remaining fields apart.
+///
+/// `tracing` carries the message as a field named `message`, so the two have to
+/// be separated here rather than in a format string. Everything else is
+/// rendered `name=value` with a leading space, so `compose` can append the lot
+/// without knowing whether there were any.
+#[derive(Default)]
+struct RecordVisitor {
+    message: String,
+    fields: String,
+}
+
+impl Visit for RecordVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_string();
+        } else {
+            let _ = write!(self.fields, " {}={value}", field.name());
         }
-        if let Ok(mut file) = self.file.lock() {
-            let _ = file.flush();
+    }
+
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        // A code reads as hex or it reads as nothing: `0x803B0014` is
+        // searchable and `2151546900` is not.
+        if field.name() == "code" {
+            let _ = write!(self.fields, " code=0x{value:08X}");
+        } else {
+            let _ = write!(self.fields, " {}={value}", field.name());
+        }
+    }
+
+    fn record_bool(&mut self, field: &Field, value: bool) {
+        let _ = write!(self.fields, " {}={value}", field.name());
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        // A field written `%value` arrives here too, wrapped so that its
+        // `Debug` prints the `Display` text unquoted.
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        } else {
+            let _ = write!(self.fields, " {}={value:?}", field.name());
         }
     }
 }
@@ -207,7 +322,8 @@ pub enum LoggingError {
         path: PathBuf,
         source: io::Error,
     },
-    AlreadyInitialized(SetLoggerError),
+    AlreadyInitialized(SetGlobalDefaultError),
+    LogBridge(SetLoggerError),
 }
 
 impl fmt::Display for LoggingError {
@@ -235,6 +351,12 @@ impl fmt::Display for LoggingError {
                     "application logger is already initialized: {source}"
                 )
             }
+            Self::LogBridge(source) => {
+                write!(
+                    formatter,
+                    "the log-to-tracing bridge is already installed: {source}"
+                )
+            }
         }
     }
 }
@@ -243,7 +365,7 @@ impl std::error::Error for LoggingError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::AlreadyInitialized(_) => None,
+            Self::AlreadyInitialized(_) | Self::LogBridge(_) => None,
             Self::MissingParent { .. } => None,
         }
     }
@@ -253,7 +375,7 @@ impl std::error::Error for LoggingError {
 mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
-    use log::{Level, LevelFilter};
+    use tracing::{Level, level_filters::LevelFilter};
 
     use super::{Console, compose, emit, level_filter, timestamp};
     use crate::LogLevel;
@@ -286,9 +408,10 @@ mod tests {
     fn a_record_carries_its_stamp_before_anything_else() {
         let line = compose(
             "2024-02-29T01:01:01.123Z",
-            Level::Info,
+            Level::INFO,
             "vmlord_display_viewer::status",
-            &format_args!("the display session is Running"),
+            "the display session is Running",
+            "",
         );
 
         assert_eq!(
@@ -300,11 +423,31 @@ mod tests {
 
     #[test]
     fn maps_configured_levels_to_log_filters() {
-        assert_eq!(level_filter(LogLevel::Error), LevelFilter::Error);
-        assert_eq!(level_filter(LogLevel::Warn), LevelFilter::Warn);
-        assert_eq!(level_filter(LogLevel::Info), LevelFilter::Info);
-        assert_eq!(level_filter(LogLevel::Debug), LevelFilter::Debug);
-        assert_eq!(level_filter(LogLevel::Trace), LevelFilter::Trace);
+        assert_eq!(level_filter(LogLevel::Error), LevelFilter::ERROR);
+        assert_eq!(level_filter(LogLevel::Warn), LevelFilter::WARN);
+        assert_eq!(level_filter(LogLevel::Info), LevelFilter::INFO);
+        assert_eq!(level_filter(LogLevel::Debug), LevelFilter::DEBUG);
+        assert_eq!(level_filter(LogLevel::Trace), LevelFilter::TRACE);
+    }
+
+    #[test]
+    fn a_records_fields_follow_its_message() {
+        // Fields are what makes a record selectable. They go after the message
+        // so that a line still reads as a sentence first.
+        let line = compose(
+            "2024-02-29T01:01:01.123Z",
+            Level::WARN,
+            "vmlord_platform::repository",
+            "the endpoint could not be attached",
+            " vm=dev-linux code=0x803B0014",
+        );
+
+        assert_eq!(
+            line,
+            "[2024-02-29T01:01:01.123Z] [WARN ] \
+             vmlord_platform::repository: the endpoint could not be attached \
+             vm=dev-linux code=0x803B0014"
+        );
     }
 
     #[test]

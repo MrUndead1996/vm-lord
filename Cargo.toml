@@ -56,7 +56,19 @@ license = "MIT"
 authors = ["VMLord contributors"]
 
 [workspace.dependencies]
+# The logging facade. `log` stays alongside it, not as a leftover: `eframe` and
+# other dependencies write through `log`, and `tracing-log` is what keeps their
+# records reaching the file.
 log = "0.4"
+tracing = "0.1"
+# `registry` is what stores span data, which is how an event inherits the VM
+# name from the operation it happened inside. No `fmt`: its UTC timestamp needs
+# the `time` crate, and `core::logging` already spells the stamp itself.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "registry",
+    "std",
+] }
+tracing-log = "0.2"
 windows = { version = "0.61", default-features = false }
 
 [workspace.lints.rust]

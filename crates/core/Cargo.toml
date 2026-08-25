@@ -5,7 +5,12 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# Kept for the bridge alone: `LogTracer` forwards what dependencies write
+# through `log` into the subscriber below.
 log.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-log.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 # A VM's stable identity, which the SSH contract remembers a guest's host key
