@@ -3050,6 +3050,12 @@ selection, so the daemon listens until the host actually sends something; and
 the descriptor `SelectionRead` returns is non-blocking, so reading a selection
 is a poll loop -- which is where the size cap and the deadline live.
 
+Two more properties shape what a user sees rather than the code. Mutter
+inhibits session creation entirely while the screen is locked, so the daemon
+comes and goes with the lock and retries rather than failing; and it announces a
+selection only when ownership *changes*, so a daemon that attaches after a copy
+has already happened learns nothing about it until the next one.
+
 The daemon holds no secret and binds `VMLC` itself, with a key the broker sends
 it over a second socket, `/run/vmlord/display-clipboard.sock`. That socket
 cannot be owned by a group the way the capture process's is: the daemon runs as

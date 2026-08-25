@@ -89,6 +89,12 @@ a running VM.
   paste.
 - Check the size. Text and HTML stop at 8 MiB and a picture at 32 MiB; a larger
   selection is cancelled and the journal says which kind it was.
+- Unlock the guest's screen. While it is locked the compositor refuses to hand
+  out a session at all -- the journal says `Session creation inhibited` -- and
+  the daemon retries until the screen comes back.
+- Copy again. The daemon learns about a selection from the change, not from the
+  selection itself, so one made before it attached (or before a lock) is
+  invisible to it until the next copy.
 - Copied files paste nothing, by design.
 - If the daemon is running and the window is focused but nothing crosses, the
   broker may have refused it: the clipboard socket is served only to the uid of
