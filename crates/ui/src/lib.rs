@@ -1645,6 +1645,68 @@ fn connect_offer(status: Option<&VmDisplayStatus>) -> (bool, Option<&str>) {
     }
 }
 
+/// Whether Update display is offered, and what the button says either way.
+///
+/// Three facts have to line up before the guest can be asked, and the backend
+/// checks all three again before it stages anything: the VM runs, its guest has
+/// reported the payload version it has, and this release carries a different
+/// one. Which of them is missing belongs here rather than in a refusal after
+/// the click, because the click blocks until a guest has finished building a
+/// kernel module against its own kernel.
+///
+/// The sentence for a display that has nothing to report yet is the application
+/// layer's, for the reason [`connect_offer`] takes it from there: installing,
+/// waiting for the guest and a desktop that failed are three different answers
+/// and none of them is the UI's to word.
+fn update_display_offer(state: VmState, status: Option<&VmDisplayStatus>) -> (bool, String) {
+    if !matches!(state, VmState::Running { .. }) {
+        return (false, "Available only when the VM is running".to_owned());
+    }
+    let Some(status) = status else {
+        return (
+            false,
+            "The display of this VM has not been reported yet".to_owned(),
+        );
+    };
+    let Some(running) = status.running_version.as_deref() else {
+        return (false, status.message.clone());
+    };
+
+    match status.available_version.as_deref() {
+        Some(available) => (
+            true,
+            format!("Moves the guest from display payload {running} to {available}"),
+        ),
+        None => (
+            false,
+            format!(
+                "The guest runs display payload {running}, and this release carries nothing else"
+            ),
+        ),
+    }
+}
+
+/// What the details panel says about the display payload versions.
+///
+/// Beside the status rather than inside it: whether there is an update to make
+/// is a fact about the VM a person reads before reaching for the button, and a
+/// tooltip is only found by someone who already suspects it.
+fn display_payload_detail(status: Option<&VmDisplayStatus>) -> String {
+    let Some(status) = status else {
+        return "Not reported".into();
+    };
+
+    match (
+        status.running_version.as_deref(),
+        status.available_version.as_deref(),
+    ) {
+        (Some(running), Some(available)) => format!("{running} (this release offers {available})"),
+        (Some(running), None) => running.to_owned(),
+        (None, Some(available)) => format!("Not reported; this release offers {available}"),
+        (None, None) => "Not reported".into(),
+    }
+}
+
 fn render_selected_vm(
     ui: &mut egui::Ui,
     vms: &[VmSummary],
@@ -1685,6 +1747,18 @@ fn render_selected_vm(
             &[(VmAction::Connect, "Connect")],
             can_connect,
             waiting_for,
+        ) {
+            action = Some(clicked_action);
+        }
+        // Beside Connect because it is about the same window: the payload is
+        // what draws it, and moving it to a newer version is the one thing
+        // about the display a start does not do by itself.
+        let (can_update, update_offer) = update_display_offer(vm.state, display_status);
+        if let Some(clicked_action) = render_action_group(
+            ui,
+            &[(VmAction::UpdateDisplay, "Update display")],
+            can_update,
+            Some(update_offer.as_str()),
         ) {
             action = Some(clicked_action);
         }
@@ -1786,6 +1860,13 @@ fn render_selected_vm(
                 "Desktop status",
                 display_status_detail(vm.desktop_profile, display_status),
             );
+            if vm.desktop_profile.wants_desktop() {
+                detail_row(
+                    ui,
+                    "Display payload",
+                    display_payload_detail(display_status),
+                );
+            }
             detail_row(ui, "SSH", ssh_detail(vm));
         });
 
@@ -2275,6 +2356,103 @@ mod tests {
 
         assert!(!offered);
         assert!(reason.is_some());
+    }
+
+    /// One derived display status with versions in it, which is what an
+    /// update is decided from.
+    fn payload_status(running: Option<&str>, available: Option<&str>) -> VmDisplayStatus {
+        VmDisplayStatus {
+            running_version: running.map(str::to_owned),
+            available_version: available.map(str::to_owned),
+            ..display_status(DisplayState::Ready, "The guest offers its desktop.")
+        }
+    }
+
+    /// The three facts the backend checks before it touches anything, checked
+    /// here so that a person reads them instead of a refusal after the click.
+    #[test]
+    fn a_display_payload_update_is_offered_only_when_there_is_one_to_make() {
+        let running = VmState::Running {
+            agent_status: AgentStatus::Online,
+        };
+
+        let (offered, reason) =
+            update_display_offer(running, Some(&payload_status(Some("0.1.4"), Some("0.1.5"))));
+        assert!(offered);
+        assert!(
+            reason.contains("0.1.4") && reason.contains("0.1.5"),
+            "the offer names both versions: {reason}"
+        );
+
+        let (offered, reason) = update_display_offer(
+            VmState::Stopped,
+            Some(&payload_status(Some("0.1.4"), Some("0.1.5"))),
+        );
+        assert!(!offered, "a stopped VM has nobody to ask");
+        assert!(reason.contains("running"), "{reason}");
+
+        let (offered, reason) =
+            update_display_offer(running, Some(&payload_status(Some("0.1.5"), None)));
+        assert!(
+            !offered,
+            "a release with nothing else to offer offers nothing"
+        );
+        assert!(reason.contains("0.1.5"), "{reason}");
+    }
+
+    /// A guest that has not reported its payload yet is explained by the
+    /// application layer's own sentence rather than by one invented here.
+    #[test]
+    fn an_unreported_payload_says_what_the_display_is_waiting_for() {
+        let waiting = VmDisplayStatus {
+            running_version: None,
+            available_version: Some("0.1.5".into()),
+            ..display_status(
+                DisplayState::WaitingForGuest,
+                "The desktop is installed; waiting for the guest to offer it.",
+            )
+        };
+
+        assert_eq!(
+            update_display_offer(
+                VmState::Running {
+                    agent_status: AgentStatus::Online
+                },
+                Some(&waiting)
+            ),
+            (
+                false,
+                "The desktop is installed; waiting for the guest to offer it.".to_owned()
+            )
+        );
+
+        let (offered, reason) = update_display_offer(
+            VmState::Running {
+                agent_status: AgentStatus::Online,
+            },
+            None,
+        );
+        assert!(!offered);
+        assert!(!reason.is_empty());
+    }
+
+    /// The versions are in the panel as well as in the tooltip: whether an
+    /// update is there to be made is a fact about the VM, not a hover.
+    #[test]
+    fn the_details_state_both_payload_versions() {
+        assert_eq!(
+            display_payload_detail(Some(&payload_status(Some("0.1.4"), Some("0.1.5")))),
+            "0.1.4 (this release offers 0.1.5)"
+        );
+        assert_eq!(
+            display_payload_detail(Some(&payload_status(Some("0.1.5"), None))),
+            "0.1.5"
+        );
+        assert_eq!(
+            display_payload_detail(Some(&payload_status(None, None))),
+            "Not reported"
+        );
+        assert_eq!(display_payload_detail(None), "Not reported");
     }
 
     /// Creating a VM no longer ends at a registered compute system, so the two

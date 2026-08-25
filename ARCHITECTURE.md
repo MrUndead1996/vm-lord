@@ -711,8 +711,9 @@ console" -- the UI calls `WorkspaceApp::open_console` and nothing else, since a
 named pipe is the platform layer's business. `Connect` follows the derived
 display status rather than the VM's state -- a running VM whose desktop is
 still installing has nothing to open a window on -- and shows that status's own
-sentence while it cannot be pressed. Snapshots remain future application-layer
-work.
+sentence while it cannot be pressed. `Update display` stands beside it and
+reads the same status, described under "Display: updating and rolling back".
+Snapshots remain future application-layer work.
 
 ### Image download
 
@@ -3417,6 +3418,27 @@ A successful rollback is **not** a degraded display. The desktop works, on the
 version that was working before, and `display-payload-update-rolled-back` says
 exactly that. `display-payload-update-failed` is the other case: neither
 version is running.
+
+The offer reaches a person as `Update display`, a button beside Connect in the
+selected VM's actions. The three facts the host will check are read off the
+derived status *before* the click rather than out of a refusal after it: the VM
+is running, its guest has reported the payload version it has, and this release
+carries a different one. Which of them is missing is what the disabled button
+says, and for a guest that has reported nothing yet the sentence is the
+application layer's own -- installing, waiting for the guest, and a desktop
+that failed are three different answers. The details panel states both versions
+on a `Display payload` row beside the desktop status, because whether there is
+an update to make is a fact about the VM and not something to be found by
+hovering. The press blocks: what a person wants from an update is whether it
+worked, and finding out means a DKMS build inside the guest.
+
+What the update came to is one line in the diagnostics, and it is taken from
+the status the refresh derived rather than from the call that returned. The
+backend answers `Ok` for every answer it got from the guest, so an update that
+rolled back would otherwise read as one that worked: it is reported as a
+warning naming the version the guest came back on -- not an error, because the
+display works -- and `display-payload-update-failed` as an error, because
+nothing displays.
 
 ## The desktop codec
 
