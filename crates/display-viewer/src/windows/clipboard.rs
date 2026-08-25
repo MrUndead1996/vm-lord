@@ -130,6 +130,10 @@ fn serve(parameters: &Parameters, focus: &Receiver<Focus>) -> Result<(), String>
     // when it comes back: the guest is told what is on the clipboard now, not
     // what was on it while somebody was working elsewhere.
     let mut owed = false;
+    // The guest's last announcement while the window was unfocused, held until
+    // it comes back. The model is pull, so holding the announcement holds the
+    // selection with it: nothing is asked for and nothing crosses.
+    let mut awaited: Option<ClipboardOffer> = None;
     // What this thread last put on the clipboard, so that the update Windows
     // sends back is not offered to the guest as something new.
     let mut written = 0;
@@ -147,6 +151,9 @@ fn serve(parameters: &Parameters, focus: &Receiver<Focus>) -> Result<(), String>
                 if owed {
                     owed = false;
                     ops.extend(offer_local(&mut exchange, html, now));
+                }
+                if let Some(offer) = awaited.take() {
+                    ops.extend(exchange.peer_offer(offer.serial, &offer.mime_types, now));
                 }
             }
             Ok(Focus::Lost) => {
@@ -190,7 +197,15 @@ fn serve(parameters: &Parameters, focus: &Receiver<Focus>) -> Result<(), String>
         if let Some(open) = socket.as_mut() {
             match record::read(open, &limits, &mut payload) {
                 Ok(header) => {
-                    if header.generation == session.generation(Channel::Clipboard) {
+                    if header.generation != session.generation(Channel::Clipboard) {
+                        // A record from a connection that has been replaced.
+                    } else if let Some(offer) = unfocused_offer(focused, &header, &payload) {
+                        // The rule is the same in both directions: nothing
+                        // crosses into a window that does not have the
+                        // keyboard. Kept, not dropped, so that what the guest
+                        // copied is there when somebody comes back to it.
+                        awaited = Some(offer);
+                    } else {
                         ops.extend(handle(&mut exchange, &header, &payload, now));
                     }
                 }
@@ -369,6 +384,18 @@ fn bind(
     }
 
     Ok(socket)
+}
+
+/// The offer in this record, if it is one and the window cannot take it.
+///
+/// A background VM must not be able to put anything on the clipboard of the
+/// desktop it is running on, any more than it can read what is copied there.
+fn unfocused_offer(focused: bool, header: &Header, payload: &[u8]) -> Option<ClipboardOffer> {
+    if focused || header.message_type != ClipboardRecord::Offer as u16 {
+        return None;
+    }
+
+    ClipboardOffer::decode(payload).ok()
 }
 
 /// What one record off the channel means to the exchange.
@@ -755,6 +782,43 @@ mod tests {
         assert_eq!(record.header.message_type, ClipboardRecord::Offer as u16);
         assert_eq!(record.header.sequence, 3);
         assert_eq!(record.header.generation, 2);
+    }
+
+    #[test]
+    fn an_offer_is_held_back_from_a_window_without_the_keyboard() {
+        let offer = ClipboardOffer {
+            serial: 4,
+            mime_types: vec![Kind::Text.mime().to_owned()],
+        };
+        let header = Header {
+            channel: Channel::Clipboard,
+            message_type: ClipboardRecord::Offer as u16,
+            length: 0,
+            sequence: 0,
+            base: 0,
+            checksum: 0,
+            generation: 0,
+        };
+        let payload = offer.encode_to_vec();
+
+        assert_eq!(
+            unfocused_offer(false, &header, &payload).map(|held| held.serial),
+            Some(4),
+            "a background window takes nothing the guest copies"
+        );
+        assert!(
+            unfocused_offer(true, &header, &payload).is_none(),
+            "a focused window handles it the ordinary way"
+        );
+
+        let data = Header {
+            message_type: ClipboardRecord::Data as u16,
+            ..header
+        };
+        assert!(
+            unfocused_offer(false, &data, &payload).is_none(),
+            "only an announcement waits; everything else is the exchange's"
+        );
     }
 
     #[test]
