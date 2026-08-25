@@ -340,6 +340,7 @@ mod tests {
             endpoint_id: None,
             network_mode: NetworkMode::None,
             ssh: None,
+            ssh_daemon: None,
             gpu_mode: GpuMode::None,
             desktop_profile: vmlord_core::DesktopProfile::Headless,
             display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,

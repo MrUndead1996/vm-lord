@@ -11,8 +11,9 @@ use vmlord_core::{
     AgentStatus, AppSettings, BuildProgress, BuildStep, CloudImage, DesktopProfile,
     DiagnosticLevel, DisplayState, DownloadPhase, GpuMode, GpuState, GuestDefaults,
     GuestReadinessTimeouts, HostGpuCapabilities, Language, LogLevel, NetworkMode, Password,
-    Provisioning, SshAccess, SshPort, VmCreateRequest, VmDeleteRequest, VmDisplayStatus,
-    VmGpuStatus, VmSource, VmState, VmSummary, VmUpdateRequest, ubuntu,
+    Provisioning, SshAccess, SshAuthentication, SshConfig, SshPort, VmCreateRequest,
+    VmDeleteRequest, VmDisplayStatus, VmGpuStatus, VmSource, VmState, VmSummary, VmUpdateRequest,
+    ubuntu,
 };
 
 const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
@@ -196,6 +197,16 @@ struct EditVmForm {
     cpu_cores: u32,
     gpu_mode: GpuMode,
     network_mode: NetworkMode,
+    /// The SSH access the VM was created with, or none at all.
+    ///
+    /// Kept whole rather than as a port alone: whether the port may be edited
+    /// depends on how the VM logs in, and a form holding only a number would
+    /// have to ask the list again to find out.
+    ssh: Option<SshConfig>,
+    /// The port being edited, as a plain `u16` for the same reason the create
+    /// form holds one: a field on its way from 22 to 2222 passes through
+    /// values nobody means, 0 among them.
+    ssh_port: u16,
     /// What the VM was doing when the form was opened, which decides whether
     /// its GPU mode may be touched at all.
     state: VmState,
@@ -204,12 +215,15 @@ struct EditVmForm {
 
 impl EditVmForm {
     fn from_vm(vm: &VmSummary) -> Self {
+        let ssh = vm.ssh.config().cloned();
         Self {
             name: vm.name.clone(),
             ram_mb: vm.ram_mb,
             cpu_cores: vm.cpu_cores,
             gpu_mode: vm.gpu_mode,
             network_mode: vm.network_mode,
+            ssh_port: ssh.as_ref().map_or(SshPort::DEFAULT, |ssh| ssh.port).get(),
+            ssh,
             state: vm.state.clone(),
             error: None,
         }
@@ -1029,8 +1043,10 @@ fn render_edit_vm_dialog(
             ui.label("Changes are saved to the VM configuration and take effect the next time the VM starts.");
             ui.small(
                 "RAM, CPU and GPU are editable; the GPU mode only while the VM is stopped. \
-                 Network is not wired to the native backend yet. Disk size and VM name stay \
-                 fixed and currently require recreating the VM.",
+                 The SSH port is the exception to the line above: it is changed inside the \
+                 running guest and takes effect at once. Network is not wired to the native \
+                 backend yet. Disk size and VM name stay fixed and currently require \
+                 recreating the VM.",
             );
             ui.add_space(8.0);
 
@@ -1094,6 +1110,38 @@ fn render_edit_vm_dialog(
                             ui.selectable_value(&mut form.network_mode, NetworkMode::None, "None");
                         });
                     ui.end_row();
+
+                    // Only a VM that has an SSH daemon has a port to move. One
+                    // created without SSH gets no row at all rather than a
+                    // disabled one: there is nothing there to enable.
+                    if let Some(ssh) = form.ssh.clone() {
+                        ui.label("SSH Port");
+                        let locked = ssh_port_locked(&form.state, ssh.authentication);
+                        ui.add_enabled_ui(locked.is_none(), |ui| {
+                            let port = ui.add(
+                                egui::DragValue::new(&mut form.ssh_port)
+                                    .range(1..=65_535)
+                                    .speed(1),
+                            );
+                            // The reason before the click, as with the GPU
+                            // mode: this change is made inside the running
+                            // guest, and a control that looks available and is
+                            // not is worse than one that says why.
+                            if let Some(reason) = locked {
+                                port.on_disabled_hover_text(reason);
+                            }
+                        });
+                        ui.end_row();
+
+                        if locked.is_none() && form.ssh_port != ssh.port.get() {
+                            ui.label("");
+                            ui.small(
+                                "The daemon is reconfigured inside the running guest and \
+                                 restarted; the connection VMLord opens next uses the new port.",
+                            );
+                            ui.end_row();
+                        }
+                    }
                 });
 
             if let Some(error) = &form.error {
@@ -1266,12 +1314,21 @@ fn edit_vm_request(form: &EditVmForm) -> Result<VmUpdateRequest, String> {
         return Err("The current network mode is not supported by the Rust UI yet.".into());
     }
 
+    // A VM with no SSH access carries no port: there is no daemon to move, and
+    // a number sent for one would be a request the backend has to refuse.
+    let ssh_port = form
+        .ssh
+        .as_ref()
+        .map(|_| SshPort::new(form.ssh_port).map_err(|error| error.to_string()))
+        .transpose()?;
+
     Ok(VmUpdateRequest {
         name: form.name.clone(),
         ram_mb: form.ram_mb,
         cpu_cores: form.cpu_cores,
         gpu_mode: form.gpu_mode,
         network_mode: form.network_mode,
+        ssh_port,
     })
 }
 
@@ -1374,6 +1431,26 @@ fn gpu_mode_locked(state: &VmState) -> Option<&'static str> {
     match state {
         VmState::Stopped => None,
         _ => Some("Stop the VM to change its GPU mode."),
+    }
+}
+
+/// Why this VM's SSH port may not be edited right now, if it may not.
+///
+/// The port is not a stored setting a later start reads: it lives in files
+/// inside the guest, so changing it means reaching a running guest with a
+/// credential VMLord can present on its own. A stopped VM has nothing to reach,
+/// and a password-mode VM has nothing to present -- neither is a refusal worth
+/// discovering after the click.
+fn ssh_port_locked(state: &VmState, authentication: SshAuthentication) -> Option<&'static str> {
+    if authentication == SshAuthentication::Password {
+        return Some(
+            "This VM logs in by password, which nobody can type into a command VMLord runs on \
+             its own. Change the port inside the guest.",
+        );
+    }
+    match state {
+        VmState::Running { .. } => None,
+        _ => Some("Start the VM to change its SSH port: the change is made inside the guest."),
     }
 }
 
@@ -2951,6 +3028,24 @@ mod tests {
         }
     }
 
+    /// An edit form of a VM whose SSH access is `ssh`, with everything else
+    /// left as it was opened.
+    fn edit_form(ssh: Option<SshConfig>) -> EditVmForm {
+        EditVmForm {
+            name: "dev".into(),
+            ram_mb: 2048,
+            cpu_cores: 2,
+            gpu_mode: GpuMode::Default,
+            network_mode: NetworkMode::Nat,
+            ssh_port: ssh.as_ref().map_or(SshPort::DEFAULT, |ssh| ssh.port).get(),
+            ssh,
+            state: VmState::Running {
+                agent_status: AgentStatus::Online,
+            },
+            error: None,
+        }
+    }
+
     fn ssh_config() -> SshConfig {
         SshConfig {
             username: "dev".into(),
@@ -3193,6 +3288,8 @@ mod tests {
             cpu_cores: 8,
             gpu_mode: GpuMode::Mirror,
             network_mode: NetworkMode::Nat,
+            ssh: None,
+            ssh_port: SshPort::DEFAULT.get(),
             error: None,
             state: VmState::Stopped,
         })
@@ -3203,6 +3300,89 @@ mod tests {
         assert_eq!(request.network_mode, NetworkMode::Nat);
     }
 
+    /// A VM that has an SSH daemon carries its port in every update, so that
+    /// the backend can tell "still 22" from "moved to 22".
+    #[test]
+    fn the_edited_ssh_port_reaches_the_request() {
+        let request = edit_vm_request(&EditVmForm {
+            ssh_port: 2222,
+            ..edit_form(Some(ssh_config()))
+        })
+        .unwrap();
+
+        assert_eq!(request.ssh_port, Some(SshPort::new(2222).unwrap()));
+    }
+
+    /// A VM created without SSH has no daemon to move, and a port sent for one
+    /// would be a request the backend has to refuse.
+    #[test]
+    fn a_vm_without_ssh_sends_no_port() {
+        let request = edit_vm_request(&edit_form(None)).unwrap();
+
+        assert_eq!(request.ssh_port, None);
+    }
+
+    /// The widget clamps to `1..=65535`, and a form is still a form: what the
+    /// domain refuses must be refused here rather than sent.
+    #[test]
+    fn edit_vm_request_rejects_a_port_nothing_can_connect_to() {
+        let error = edit_vm_request(&EditVmForm {
+            ssh_port: 0,
+            ..edit_form(Some(ssh_config()))
+        })
+        .unwrap_err();
+
+        assert!(error.contains("SSH port"), "got {error}");
+    }
+
+    #[test]
+    fn a_form_opens_on_the_port_the_vm_listens_on() {
+        let form = EditVmForm::from_vm(&VmSummary {
+            ssh: SshAvailability::Enabled(SshConfig {
+                port: SshPort::new(2222).unwrap(),
+                ..ssh_config()
+            }),
+            ..vm_summary()
+        });
+
+        assert_eq!(form.ssh_port, 2222);
+    }
+
+    /// The port is changed inside the running guest, so a VM that is not
+    /// running has nothing to change -- said before the click rather than
+    /// after it.
+    #[test]
+    fn a_stopped_vm_says_why_its_ssh_port_cannot_be_edited() {
+        let reason = ssh_port_locked(&VmState::Stopped, SshAuthentication::VmlordKey)
+            .expect("a stopped VM cannot be reconfigured");
+
+        assert!(reason.contains("Start the VM"), "got {reason}");
+        assert_eq!(
+            ssh_port_locked(
+                &VmState::Running {
+                    agent_status: AgentStatus::Online,
+                },
+                SshAuthentication::VmlordKey
+            ),
+            None
+        );
+    }
+
+    /// Nobody is at a prompt when VMLord runs the reconfiguration, and key
+    /// mode is the only credential it can present on its own.
+    #[test]
+    fn a_password_vm_says_why_its_ssh_port_cannot_be_edited() {
+        let reason = ssh_port_locked(
+            &VmState::Running {
+                agent_status: AgentStatus::Online,
+            },
+            SshAuthentication::Password,
+        )
+        .expect("a password cannot be typed into a command VMLord runs");
+
+        assert!(reason.contains("password"), "got {reason}");
+    }
+
     #[test]
     fn edit_vm_request_rejects_odd_ram() {
         let error = edit_vm_request(&EditVmForm {
@@ -3211,6 +3391,8 @@ mod tests {
             cpu_cores: 4,
             gpu_mode: GpuMode::Default,
             network_mode: NetworkMode::Nat,
+            ssh: None,
+            ssh_port: SshPort::DEFAULT.get(),
             error: None,
             state: VmState::Stopped,
         })

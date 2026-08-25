@@ -101,6 +101,17 @@ pub(crate) fn cloud_init_status_log_path(vm_directory: &Path) -> PathBuf {
     vm_directory.join("cloud-init-status.log")
 }
 
+/// Returns the path of the transcript a port move leaves behind.
+///
+/// Beside the readiness transcript, and for the same reason: it records what
+/// was asked of the guest and what the guest answered, which is the only
+/// account of a reconfiguration that happens inside a VM nobody is watching.
+/// One file per VM rather than one per attempt -- the last move is the one
+/// anybody asks about.
+pub(crate) fn ssh_port_log_path(vm_directory: &Path) -> PathBuf {
+    vm_directory.join("ssh-port.log")
+}
+
 /// Returns the path of the VM's system disk.
 pub(crate) fn system_disk_path(vm_directory: &Path) -> PathBuf {
     vm_directory.join("disks").join("system.vhdx")

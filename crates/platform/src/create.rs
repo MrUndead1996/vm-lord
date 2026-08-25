@@ -244,6 +244,14 @@ impl VmCreationPipeline {
                 VmSource::LocalMedia { .. } => None,
                 VmSource::CloudImage { provisioning, .. } => provisioning.ssh_config(),
             },
+            // How that daemon is carried, taken from the same profile the seed
+            // is printed from. Moving the port later writes the drop-ins named
+            // here, so recording them is what keeps a reconfiguration from
+            // guessing which distribution answered.
+            ssh_daemon: match &request.source {
+                VmSource::LocalMedia { .. } => None,
+                VmSource::CloudImage { image, .. } => Some(image.profile.ssh.clone()),
+            },
             gpu_mode: request.gpu_mode,
             // The desktop the seed below is asked to install, and the fact
             // that nothing has installed it yet. A build that never reaches
@@ -1338,6 +1346,51 @@ mod tests {
         assert_eq!(target.distribution, "ubuntu");
         assert_eq!(target.release, "24.04");
         assert_eq!(target.architecture, "amd64");
+    }
+
+    /// The seed's drop-ins are written from the image's profile, and moving
+    /// the port later has to write the same files -- by which time the profile
+    /// is gone. So it is recorded with the VM.
+    #[test]
+    fn a_created_vm_records_how_its_ssh_daemon_is_carried() {
+        let fixture = fixture("cloud-daemon");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+
+        let mapping = pipeline
+            .create(
+                &fixture.store,
+                &cloud_request("cloud-daemon-vm"),
+                &fixture.vm_directory,
+                &monitor(),
+            )
+            .expect("creation must succeed");
+
+        assert_eq!(
+            mapping.ssh_daemon,
+            Some(vmlord_core::ubuntu().ssh),
+            "the drop-ins a later reconfiguration writes are this profile's"
+        );
+    }
+
+    /// A guest VMLord did not provision has an SSH daemon of somebody else's,
+    /// and a profile recorded for it would be a guess.
+    #[test]
+    fn a_vm_built_from_installation_media_records_no_ssh_daemon() {
+        let fixture = fixture("media-daemon");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+
+        let mapping = pipeline
+            .create(
+                &fixture.store,
+                &fixture.request.clone(),
+                &fixture.vm_directory,
+                &monitor(),
+            )
+            .expect("creation must succeed");
+
+        assert_eq!(mapping.ssh_daemon, None);
     }
 
     #[test]

@@ -531,6 +531,7 @@ fn a_mode_changes_only_under_a_stopped_vm_and_applies_at_the_next_start() {
         cpu_cores: 2,
         gpu_mode: GpuMode::Default,
         network_mode: NetworkMode::None,
+        ssh_port: None,
     });
 
     let stopped = repository
@@ -543,6 +544,7 @@ fn a_mode_changes_only_under_a_stopped_vm_and_applies_at_the_next_start() {
         cpu_cores: 2,
         gpu_mode: GpuMode::Default,
         network_mode: NetworkMode::None,
+        ssh_port: None,
     });
     let stored_mode = summary(&mut repository, name).map(|vm| vm.gpu_mode);
 

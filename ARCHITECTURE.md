@@ -1516,8 +1516,10 @@ values nobody means, 0 among them, on the way from 22 to 2222 -- and turns it
 into an `SshPort` on submit, so a zero typed past the widget's `1..=65535` clamp
 is refused by the domain rather than by the dialog. There is no list of
 forbidden ports: a port some other service on the host happens to use is still
-one a guest can listen on. Changing the port of a VM that already exists means
-reconfiguring an installed guest, which is #72 rather than part of creation.
+one a guest can listen on. Changing the port of a VM that already exists is a
+different act from choosing one -- it reconfigures an installed guest rather
+than describing a guest to be built -- and it is described under "Moving the
+SSH port of an installed guest" below.
 
 `Provisioning::ssh_config` is the one place a configuration is derived from what
 cloud-init was asked to do, and `VmComputeSystemMapping::ssh` is where it is
@@ -1568,6 +1570,69 @@ and those are quoted and `%`-doubled -- for OpenSSH's own configuration parser,
 which splits on white space and expands `%d`-style tokens, not for a shell. A VM
 under `C:\Virtual Machines\` therefore keeps its known-hosts file, and one whose
 directory contains a `%` points where it says.
+
+### Moving the SSH port of an installed guest
+
+The edit form can change the port of a VM that already exists, and that change
+is unlike every other field it carries. RAM, CPU, the GPU mode and the network
+mode are documents a later start reads; the SSH port is a file inside the guest.
+Nothing on the host can write it -- Hyper-V holds the VHDX open while the VM
+runs, and a guest whose file system was written behind its back would not read
+the change anyway. So `platform::ssh_port` makes it where the file lives: over
+the same OpenSSH client everything else uses, on the port the daemon answers on
+*now*.
+
+Four things are therefore refused before anything is attempted, each with its
+own reason: a host with no `ssh.exe`, a VM created without SSH, a VM whose guest
+VMLord did not provision, and a VM that logs in by password -- nobody is at a
+prompt when VMLord runs a command of its own, and key mode is the only
+credential it can present unattended. A VM with no address is refused as "start
+it first". The UI shows the same four as a disabled field with the reason on
+hover, so the refusal arrives before the click rather than after it.
+
+`VmComputeSystemMapping::ssh_daemon` is what makes the change possible at all.
+The drop-ins the seed writes come from the image's `DistroProfile`, and by the
+time anyone edits a VM that profile is gone: the seed was consumed on the first
+boot and nothing else on the host remembers which distribution answered. So the
+`SshDaemon` is recorded with the VM at creation, and a move writes the same
+files, at the same paths, with the same contents the seed wrote -- a guest
+created on a port and a guest moved to one must not be two different
+configurations.
+
+It takes two commands rather than one, because the second cuts the branch it
+sits on. Writing the drop-ins and running `daemon-reload` is safe and its exit
+status means what it says; `set -e` is what makes it mean anything, since
+without it the status would be `daemon-reload`'s alone and a drop-in that could
+not be written would be reported as a change that was made. Restarting the
+daemon is the opposite: on a socket-activated guest the session giving the order
+*is* `ssh.service`, so stopping it kills the connection that asked, and
+`ssh.exe` then reports a broken session rather than the command's status --
+whether or not the guest did as it was told. That half is handed to
+`systemd-run --collect --no-block`, which runs it in a transient unit outside
+the session's cgroup: a shell backgrounded inside the session would be killed
+along with the session and leave a guest with a stopped socket and no daemon at
+all. Its exit code is deliberately not read. The question is settled by the only
+thing that can settle it -- whether the guest answers on the new port
+afterwards, probed for ten seconds.
+
+Which is what the two successful outcomes are. `Applied` means the guest answers
+there now; `RestartNeeded` means the drop-ins are in place and the running
+daemon has not caught up. Both write the new port into the mapping, because the
+guest's own configuration is the authority and everything VMLord does next --
+the readiness wait, the `VmSummary` row, the endpoint the SSH button connects to
+-- has to name the port the guest is configured for. Only a refused *write* is
+an error, and it leaves the stored port exactly where the daemon still answers.
+The difference between the two reaches the user as a diagnostic rather than as
+an error: there is nothing to undo and nothing to retry, only a VM to restart.
+
+Everything the remote command carries -- drop-in paths, unit names -- comes from
+a document on disk and is single-quoted for the guest's shell, and the script as
+a whole is quoted again as `sudo -n /bin/sh -c`'s single argument. `-n` rather
+than a prompt: a guest whose passwordless `sudo` has been taken away refuses the
+change instead of sitting there waiting to be typed at. The host-key file is
+untouched by any of this, and deliberately so: `HostKeyAlias` is the VM's id, so
+a guest that moved its port is still the same guest, and the key learned on 22
+is the key expected on 2222.
 
 ### Opening an interactive session
 

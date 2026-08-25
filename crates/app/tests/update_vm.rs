@@ -81,6 +81,9 @@ fn update_request() -> VmUpdateRequest {
         cpu_cores: 8,
         gpu_mode: GpuMode::Mirror,
         network_mode: NetworkMode::Nat,
+        // Carried like every other field: the application layer decides
+        // nothing about a port, it hands the request to the repository.
+        ssh_port: Some(SshPort::new(2222).expect("2222 is a port")),
     }
 }
 
