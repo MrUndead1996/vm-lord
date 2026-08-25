@@ -67,17 +67,14 @@ impl AgentSessions {
         self.0.clear();
     }
 
-    /// Asks the agent of `vm_id` to move its display payload to a version.
+    /// Hands out the way to ask the agent of `vm_id` for a payload update.
     ///
-    /// The request goes to the thread that owns that VM's session, because a
-    /// session is one conversation on one socket and a second writer would be
-    /// two. `None` is a VM VMLord is not listening for at all.
-    pub(crate) fn update_display_payload(
-        &self,
-        vm_id: Uuid,
-        target_version: &str,
-    ) -> Option<Result<DisplayUpdateAnswer, RepositoryError>> {
-        Some(self.0.get(&vm_id)?.update_display_payload(target_version))
+    /// A channel rather than the answer itself, because the asking happens on a
+    /// thread of its own: an update takes as long as a DKMS build inside the
+    /// guest, and the registry lives behind the repository's `&mut self`, which
+    /// is the UI's thread. `None` is a VM VMLord is not listening for at all.
+    pub(crate) fn display_update_channel(&self, vm_id: Uuid) -> Option<DisplayUpdateChannel> {
+        Some(self.0.get(&vm_id)?.display_update_channel())
     }
 
     /// Whether the agent of `vm_id` has a session open right now.
@@ -132,14 +129,41 @@ pub(crate) struct DisplayUpdateAnswer {
 /// that asked.
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 
+/// The way to ask one VM's guest for a display payload update, off the thread
+/// that owns the session registry.
+///
+/// Carries only what the asking needs -- where to send the request, whether
+/// there is a session to send it to, and the VM's name for what it has to say
+/// -- so that an update can be handed to a worker without handing it the
+/// registry. The sender is the connection's own: a session is one conversation
+/// on one socket, and every request for this VM goes to the one thread serving
+/// it, whichever thread asked.
+pub(crate) struct DisplayUpdateChannel {
+    vm_name: String,
+    online: Arc<AtomicBool>,
+    updates: Sender<DisplayUpdate>,
+}
+
 impl AgentConnection {
+    /// Hands out this connection's update channel.
+    fn display_update_channel(&self) -> DisplayUpdateChannel {
+        DisplayUpdateChannel {
+            vm_name: self.vm_name.clone(),
+            online: Arc::clone(&self.online),
+            updates: self.updates.clone(),
+        }
+    }
+}
+
+impl DisplayUpdateChannel {
     /// Asks this VM's guest to move its display payload to `target_version`.
     ///
     /// Blocks until the guest answers or the budget runs out, because what a
-    /// caller wants from an update is whether it worked. A VM whose session is
-    /// not open right now answers immediately: there is nobody to ask, and
-    /// queueing the request would move a version at a moment nobody chose.
-    fn update_display_payload(
+    /// caller wants from an update is whether it worked -- which is why the
+    /// caller is a worker thread. A VM whose session is not open right now
+    /// answers immediately: there is nobody to ask, and queueing the request
+    /// would move a version at a moment nobody chose.
+    pub(crate) fn ask(
         &self,
         target_version: &str,
     ) -> Result<DisplayUpdateAnswer, RepositoryError> {
@@ -174,7 +198,9 @@ impl AgentConnection {
             ))
         })
     }
+}
 
+impl AgentConnection {
     /// Binds the agent service of a running VM and starts serving it.
     ///
     /// `runtime_id` is the partition the VM is running as, which is what an

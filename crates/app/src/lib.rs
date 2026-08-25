@@ -545,18 +545,21 @@ impl WorkspaceApp {
         }
     }
 
-    /// Moves a running VM's display payload to the newest version this build
-    /// carries for it.
+    /// Asks for a running VM's display payload to be moved to the newest
+    /// version this build carries for it.
     ///
-    /// Blocking, unlike the connections beside it: what a person wants from an
-    /// update is whether it worked, and the guest builds a kernel module to
-    /// find out. Both outcomes go into the diagnostics, because an update that
-    /// rolled back is a working display and still an answer somebody asked for.
+    /// `Ok` is a request the backend accepted, not a payload that moved: the
+    /// guest builds a kernel module with DKMS to answer, which is minutes, and
+    /// a window that redraws sixty times a second cannot wait on one. The VM
+    /// reports itself as updating while that runs, and how it ended arrives in
+    /// the diagnostics from the backend -- including the guest that could not
+    /// verify the new version and brought the previous one back, which is a
+    /// working display and a failed update.
     ///
     /// # Errors
     ///
-    /// [`RepositoryError`] when there was nothing to update to, nobody to ask,
-    /// or the guest could not carry it out.
+    /// [`RepositoryError`] when there is nobody to ask -- a VM that is not
+    /// running, one with no agent session, one already being updated.
     pub fn update_display_payload(&mut self, name: &str) -> Result<(), RepositoryError> {
         self.require_ready_backend("display payload update")?;
         self.log_vm_action(VmAction::UpdateDisplay);
@@ -565,8 +568,11 @@ impl WorkspaceApp {
             Ok(()) => {
                 self.diagnostics.push(Diagnostic {
                     level: DiagnosticLevel::Info,
-                    message: format!("Display payload of VM \"{name}\" updated"),
+                    message: format!("Updating the display payload of VM \"{name}\""),
                 });
+                // Refreshed so that the VM shows as updating from this click
+                // rather than from the next tick: what the button does next is
+                // decided by the status this derives.
                 self.refresh();
                 Ok(())
             }
@@ -808,6 +814,9 @@ mod tests {
         /// The desktop the VM was created with, and how far installing it got.
         desktop_profile: vmlord_core::DesktopProfile,
         display_provisioning: vmlord_core::DisplayProvisioning,
+        /// What the backend has observed of this VM's display, which an update
+        /// rewrites the way the native backend does.
+        display: vmlord_core::VmDisplayFacts,
         /// Whether this backend can answer for the host at all, and how often
         /// it has been asked.
         reports_host_gpu: bool,
@@ -860,7 +869,7 @@ mod tests {
                 gpu: self.gpu.clone(),
                 desktop_profile: self.desktop_profile,
                 display_provisioning: self.display_provisioning.clone(),
-                display: vmlord_core::VmDisplayFacts::default(),
+                display: self.display.clone(),
                 network_mode: vmlord_core::NetworkMode::Nat,
                 ip_address: None,
                 ssh: vmlord_core::SshAvailability::Enabled(vmlord_core::SshConfig {
@@ -930,6 +939,10 @@ mod tests {
                     "VM \"{name}\" is not running, so its display payload cannot be updated"
                 )));
             }
+            // Accepted, the way the native backend accepts it: a worker
+            // starts, the VM reports itself as updating, and what the guest
+            // made of it arrives later and from somewhere else.
+            self.display.update_in_flight = true;
             Ok(())
         }
 
@@ -1167,22 +1180,64 @@ mod tests {
         );
     }
 
+    /// A VM whose desktop is installed and whose guest reports one version
+    /// while the release carries another: the only VM an update is offered for.
+    fn updatable_repository() -> FakeRepository {
+        FakeRepository {
+            vm_is_running: true,
+            display_provisioning: vmlord_core::DisplayProvisioning::Ready,
+            display: vmlord_core::VmDisplayFacts {
+                guest: Some(vmlord_core::GuestDisplayReport::Ready(
+                    vmlord_core::GuestDisplayDetail::default(),
+                )),
+                payload: vmlord_core::DisplayPayloadFacts {
+                    installed: Some("0.1.4".into()),
+                    previous: None,
+                    loaded: Some("0.1.4".into()),
+                    available: Some("0.1.5".into()),
+                },
+                failure: None,
+                observed_at: None,
+                update_in_flight: false,
+            },
+            ..FakeRepository::default()
+        }
+    }
+
     #[test]
     fn updates_a_display_payload_through_the_repository() {
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
-            vm_is_running: true,
-            ..FakeRepository::default()
-        }));
+        let mut app = WorkspaceApp::new(Box::new(updatable_repository()));
         app.start();
 
         app.update_display_payload("dev")
             .expect("a running VM can be asked");
 
+        let accepted = app
+            .diagnostics()
+            .iter()
+            .any(|diagnostic| diagnostic.message == "Updating the display payload of VM \"dev\"");
+        assert!(accepted, "the request is worth one line: {:?}", app.diagnostics());
         assert!(
-            app.diagnostics()
+            !app.diagnostics()
                 .iter()
-                .any(|diagnostic| diagnostic.message.contains("Display payload of VM \"dev\"")),
-            "an update that worked is worth one line"
+                .any(|diagnostic| diagnostic.message.contains("updated")),
+            "nothing has been updated yet: the guest has not answered"
+        );
+    }
+
+    /// What the button reads to stop offering a second update, and what the
+    /// panel reads to say one is under way.
+    #[test]
+    fn a_vm_being_updated_reports_itself_as_updating() {
+        let mut app = WorkspaceApp::new(Box::new(updatable_repository()));
+        app.start();
+        assert!(!app.display_status("dev").expect("a derived status").updating);
+
+        app.update_display_payload("dev").expect("accepted");
+
+        assert!(
+            app.display_status("dev").expect("a derived status").updating,
+            "the refresh the click ends with is what shows the update in flight"
         );
     }
 

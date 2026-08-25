@@ -50,6 +50,7 @@ pub fn derive_status(
             .flatten(),
         guest: guest_detail(facts),
         can_retry,
+        updating: facts.update_in_flight,
         observed_at,
     };
 
@@ -331,6 +332,7 @@ mod tests {
     #[test]
     fn a_payload_that_would_not_build_is_degraded_and_says_so() {
         let facts = VmDisplayFacts {
+            update_in_flight: false,
             payload: DisplayPayloadFacts {
                 available: Some("0.1.0".into()),
                 ..DisplayPayloadFacts::default()
@@ -432,6 +434,7 @@ mod tests {
                 "0.2.0 did not verify; 0.1.0 is running",
             )),
             observed_at: Some(now()),
+            update_in_flight: false,
         };
 
         let status = derive_status(

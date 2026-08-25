@@ -711,8 +711,10 @@ console" -- the UI calls `WorkspaceApp::open_console` and nothing else, since a
 named pipe is the platform layer's business. `Connect` follows the derived
 display status rather than the VM's state -- a running VM whose desktop is
 still installing has nothing to open a window on -- and shows that status's own
-sentence while it cannot be pressed. Snapshots remain future application-layer
-work.
+sentence while it cannot be pressed. `Update display` stands beside it, reads
+the same status and starts a background update, described under "Display:
+updating and rolling back".
+Snapshots remain future application-layer work.
 
 ### Image download
 
@@ -3417,6 +3419,53 @@ A successful rollback is **not** a degraded display. The desktop works, on the
 version that was working before, and `display-payload-update-rolled-back` says
 exactly that. `display-payload-update-failed` is the other case: neither
 version is running.
+
+The offer reaches a person as `Update display`, a button beside Connect in the
+selected VM's actions. The four facts the host will check are read off the
+derived status *before* the click rather than out of a refusal after it: the VM
+is running, its guest has reported the payload version it has, this release
+carries a different one, and no update of that VM is already running. Which of
+them is missing is what the disabled button says, and for a guest that has
+reported nothing yet the sentence is the application layer's own -- installing,
+waiting for the guest, and a desktop that failed are three different answers.
+The details panel states both versions on a `Display payload` row beside the
+desktop status, because whether there is an update to make is a fact about the
+VM and not something to be found by hovering.
+
+The press does not wait. An update is the longest thing a person can ask VMLord
+for -- the guest builds a kernel module against its own running kernel, and the
+recipe's budget for one is fifteen minutes -- so it runs on a worker, the way an
+SSH launch and a start do, and for the same reason: the caller is the thread
+that draws the window. What the click answers is only whether the update is
+worth attempting, which is instant: a VM that is not running, one that records
+no guest, one VMLord holds no agent session for, and one already being updated
+all have nobody to ask and say so on the spot.
+
+`display_updates::DisplayUpdates` is that worker registry, keyed by VM name.
+Keyed, unlike `ssh_launches`, because two shells into one guest is an ordinary
+thing to want while two updates of one VM would publish two versions into the
+one directory that VM exports and ask one agent session twice. The key is also
+what the list of VMs reads: a VM being updated carries `update_in_flight` in its
+display facts, which becomes `updating` on the derived status, and that is what
+disables the button and puts `updating to <version>` in the panel. It is beside
+the display's state rather than inside it, because the desktop goes on working
+while the guest builds -- Connect stays available throughout.
+
+Asking the guest from a worker means not holding the session registry, which
+lives behind the repository's `&mut self`. The connection hands out a
+`DisplayUpdateChannel` instead -- the VM's name, whether a session is open, and
+the sender the serving thread reads -- so every request still reaches the one
+thread that owns that socket, whichever thread asked.
+
+How the update ended is one line the worker pushes into the diagnostics the UI
+already reads, decided by `display_update::report`, and the display's facts are
+recorded before that line so a refresh arriving between the two reads the
+versions the guest ended up on. An update that took is an ordinary line naming
+the version; `display-payload-update-rolled-back` is a warning naming the
+version the guest came back on -- not an error, because the display works -- and
+`display-payload-update-failed` is an error, because nothing displays. A refusal
+raised before anything was staged records no facts at all: an update that was
+refused is an update that did not happen.
 
 ## The desktop codec
 

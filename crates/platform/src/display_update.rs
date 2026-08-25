@@ -17,7 +17,8 @@ use std::{
 
 use vmlord_agent_protocol::v1::DisplayUpdateOutcome;
 use vmlord_core::{
-    DisplayFailure, DisplayPayloadFacts, DisplayStage, DisplayStatusCode, RepositoryError,
+    DiagnosticLevel, DisplayFailure, DisplayPayloadFacts, DisplayStage, DisplayStatusCode,
+    RepositoryError,
 };
 use vmlord_display_payload::GuestSelector;
 use vmlord_payload::PayloadProgress;
@@ -121,6 +122,46 @@ fn outcome_of(answer: &DisplayUpdateAnswer, available: String) -> UpdateOutcome 
     UpdateOutcome { payload, failure }
 }
 
+/// What one finished update is worth saying about it, as a level and a line.
+///
+/// Here rather than at the caller because this module is what knows the
+/// difference: the guest answers every request, and three different things can
+/// be true of an answer. An update that took is an ordinary line; one the guest
+/// could not verify and rolled back is a warning, because the display works and
+/// the version a person asked for is not the one running; one that left neither
+/// version loaded is an error, because nothing displays.
+pub(crate) fn report(vm_name: &str, outcome: &UpdateOutcome) -> (DiagnosticLevel, String) {
+    let Some(failure) = outcome.failure.as_ref() else {
+        return (
+            DiagnosticLevel::Info,
+            match outcome.payload.installed.as_deref() {
+                Some(version) => {
+                    format!("Display payload of VM \"{vm_name}\" updated to {version}")
+                }
+                None => format!("Display payload of VM \"{vm_name}\" updated"),
+            },
+        );
+    };
+
+    if failure.code == DisplayStatusCode::PayloadUpdateRolledBack {
+        return (
+            DiagnosticLevel::Warning,
+            format!(
+                "Display payload of VM \"{vm_name}\" was not updated: {}",
+                failure.message
+            ),
+        );
+    }
+
+    (
+        DiagnosticLevel::Error,
+        format!(
+            "Failed to update the display payload of VM \"{vm_name}\": {}",
+            failure.message
+        ),
+    )
+}
+
 /// Where a VM's staged payloads live, for the caller that owns the roots.
 pub(crate) fn cache_root(storage_root: &Path) -> PathBuf {
     crate::layout::payload_cache_root(storage_root)
@@ -138,7 +179,7 @@ mod tests {
     use vmlord_core::{DisplayFailure, DisplayStage, DisplayStatusCode};
     use vmlord_display_payload::GuestSelector;
 
-    use super::{UpdateRequest, outcome_of, run};
+    use super::{UpdateOutcome, UpdateRequest, outcome_of, report, run};
     use crate::agent::DisplayUpdateAnswer;
     use crate::agent_session::GuestDisplayPayloadReport;
 
@@ -177,6 +218,69 @@ mod tests {
             progress: &|_| {},
             ask,
         }
+    }
+
+    /// One finished update, as the guest's answer left it.
+    fn outcome(installed: Option<&str>, failure: Option<DisplayFailure>) -> UpdateOutcome {
+        UpdateOutcome {
+            payload: vmlord_core::DisplayPayloadFacts {
+                installed: installed.map(str::to_owned),
+                previous: None,
+                loaded: installed.map(str::to_owned),
+                available: Some("0.2.0".into()),
+            },
+            failure,
+        }
+    }
+
+    #[test]
+    fn an_update_that_took_is_one_ordinary_line_naming_the_version() {
+        let (level, message) = report("dev-linux", &outcome(Some("0.2.0"), None));
+
+        assert_eq!(level, vmlord_core::DiagnosticLevel::Info);
+        assert!(message.contains("dev-linux") && message.contains("0.2.0"), "{message}");
+    }
+
+    /// The answer the `Ok` of an update does not carry: the guest could not
+    /// verify the new version and came back on the old one.
+    #[test]
+    fn an_update_that_rolled_back_is_a_warning_and_not_an_update() {
+        let (level, message) = report(
+            "dev-linux",
+            &outcome(
+                Some("0.1.0"),
+                Some(DisplayFailure::new(
+                    DisplayStage::Payload,
+                    DisplayStatusCode::PayloadUpdateRolledBack,
+                    "0.2.0 did not verify; 0.1.0 is running",
+                )),
+            ),
+        );
+
+        assert_eq!(
+            level,
+            vmlord_core::DiagnosticLevel::Warning,
+            "the display works, so this is not an error: {message}"
+        );
+        assert!(message.contains("not updated"), "{message}");
+        assert!(message.contains("0.1.0 is running"), "{message}");
+    }
+
+    #[test]
+    fn an_update_that_left_nothing_running_is_an_error() {
+        let (level, _) = report(
+            "dev-linux",
+            &outcome(
+                None,
+                Some(DisplayFailure::new(
+                    DisplayStage::Payload,
+                    DisplayStatusCode::PayloadUpdateFailed,
+                    "the module did not load and the previous version did not come back",
+                )),
+            ),
+        );
+
+        assert_eq!(level, vmlord_core::DiagnosticLevel::Error);
     }
 
     #[test]
