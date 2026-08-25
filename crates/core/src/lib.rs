@@ -31,7 +31,11 @@ pub use display::{
     MAX_DISPLAY_WIDTH, MIN_DESKTOP_CPU_CORES, MIN_DESKTOP_RAM_MB, MIN_DISPLAY_HEIGHT,
     MIN_DISPLAY_WIDTH, VmDisplayFacts, VmDisplayStatus, desktop_resource_advice,
 };
-pub use distro::{DesktopSetup, DistroProfile, SshDaemon, SshUnits, ubuntu};
+#[cfg(any(test, feature = "test-profile"))]
+pub use distro::ubuntu;
+pub use distro::{
+    DesktopSetup, DistroCatalog, DistroCatalogError, DistroProfile, SshDaemon, SshUnits,
+};
 pub use gpu::{
     GPU_PAYLOAD_SHARE, GpuAssignment, GpuAvailability, GpuFailure, GpuMode, GpuShare,
     GpuShareManifest, GpuShareRole, GpuStage, GpuState, GpuStatusCode, GuestGpuDetail,

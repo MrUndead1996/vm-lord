@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+test-profile = []
+
 [dependencies]
 # Kept for the bridge alone: `LogTracer` forwards what dependencies write
 # through `log` into the subscriber below.
@@ -12,15 +15,11 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-log.workspace = true
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 toml = "0.8"
 # A VM's stable identity, which the SSH contract remembers a guest's host key
 # under. No random generation here: ids are minted where VMs are created.
 uuid = { version = "1", default-features = false }
-
-[dev-dependencies]
-# Only the SSH round-trip tests use it, to read stored documents back the way
-# the metadata store will.
-serde_json = "1.0"
 
 [lints]
 workspace = true

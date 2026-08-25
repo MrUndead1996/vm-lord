@@ -11,6 +11,7 @@ const DEFAULT_VM_DIRECTORY: &str = "vms";
 const DEFAULT_LOG_DIRECTORY: &str = "logs";
 const DEFAULT_LOG_FILE_NAME: &str = "vmlord.log";
 const DEFAULT_IMAGE_DIRECTORY: &str = "images";
+const DEFAULT_DISTRO: &str = "ubuntu";
 
 /// Persistent settings that configure application-wide behavior.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +31,9 @@ pub struct AppSettings {
     /// and `network_mode` are handled in `VmComputeSystemMapping`.
     #[serde(default)]
     pub image_cache_path: PathBuf,
+    /// Distribution profile selected for new cloud-image VMs.
+    #[serde(default = "default_distro")]
+    pub default_distro: String,
     /// Timeouts for the readiness wait that ends a VM's creation.
     ///
     /// Last in the struct on purpose: TOML demands that every value precede
@@ -218,6 +222,7 @@ impl SettingsStore {
                 .join(DEFAULT_LOG_FILE_NAME),
             log_level: LogLevel::Info,
             image_cache_path: config_directory.join(DEFAULT_IMAGE_DIRECTORY),
+            default_distro: default_distro(),
             guest_readiness: GuestReadinessTimeouts::default(),
         })
     }
@@ -229,6 +234,10 @@ impl SettingsStore {
                 path: self.config_path.clone(),
             })
     }
+}
+
+fn default_distro() -> String {
+    DEFAULT_DISTRO.into()
 }
 
 #[derive(Debug)]
@@ -393,6 +402,7 @@ mod tests {
             log_file_path: directory.join("logs").join("vmlord.log"),
             log_level: LogLevel::Info,
             image_cache_path: directory.join("elsewhere").join("images"),
+            default_distro: "fedora".into(),
             guest_readiness: GuestReadinessTimeouts::default(),
         };
 
@@ -414,6 +424,7 @@ mod tests {
             log_file_path: directory.join("diagnostics").join("application.log"),
             log_level: LogLevel::Debug,
             image_cache_path: directory.join("images"),
+            default_distro: "ubuntu".into(),
             guest_readiness: GuestReadinessTimeouts::default(),
         };
 
@@ -478,6 +489,31 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[test]
+    fn settings_written_before_the_default_distribution_existed_select_ubuntu() {
+        let directory = temporary_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("settings.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "vm_storage_path = {vms:?}\n\
+                 language = \"en-US\"\n\
+                 log_file_path = {log:?}\n\
+                 log_level = \"info\"\n",
+                vms = directory.join("vms").display().to_string(),
+                log = directory.join("vmlord.log").display().to_string(),
+            ),
+        )
+        .unwrap();
+
+        let settings = SettingsStore::new(&config_path).load_or_create().unwrap();
+
+        assert_eq!(settings.default_distro, "ubuntu");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
     fn language_settings() -> AppSettings {
         AppSettings {
             vm_storage_path: std::path::PathBuf::from("vms"),
@@ -485,6 +521,7 @@ mod tests {
             log_file_path: std::path::PathBuf::from("vmlord.log"),
             log_level: LogLevel::Info,
             image_cache_path: std::path::PathBuf::from("images"),
+            default_distro: "ubuntu".into(),
             guest_readiness: GuestReadinessTimeouts::default(),
         }
     }

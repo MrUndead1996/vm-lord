@@ -3,7 +3,8 @@
 mod support;
 
 use support::{Behaviour, TestServer};
-use vmlord_image::{DistroProfile, ResolveError, resolve_image, ubuntu};
+use vmlord_core::ubuntu;
+use vmlord_image::{DistroProfile, ResolveError, resolve_image};
 
 const FIXTURE: &str = include_str!("fixtures/ubuntu-24.04-SHA256SUMS");
 

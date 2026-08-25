@@ -6,9 +6,9 @@ pub mod gpu;
 use std::{collections::HashMap, fmt, path::PathBuf, time::SystemTime};
 
 use vmlord_core::{
-    AppSettings, Diagnostic, DiagnosticsSink, GuestDefaults, HostGpuCapabilities, RepositoryError,
-    SettingsError, SettingsStore, Subsystem, VmCreateRequest, VmDeleteRequest, VmDisplayStatus,
-    VmGpuStatus, VmRepository, VmState, VmSummary, VmUpdateRequest,
+    AppSettings, Diagnostic, DiagnosticsSink, DistroProfile, GuestDefaults, HostGpuCapabilities,
+    RepositoryError, SettingsError, SettingsStore, Subsystem, VmCreateRequest, VmDeleteRequest,
+    VmDisplayStatus, VmGpuStatus, VmRepository, VmState, VmSummary, VmUpdateRequest,
 };
 
 pub use display::derive_status as derive_display_status;
@@ -97,6 +97,7 @@ pub struct WorkspaceApp {
     image_picker: Option<Box<dyn ImagePicker>>,
     settings_path_picker: Option<Box<dyn SettingsPathPicker>>,
     settings: Option<SettingsContext>,
+    distro_profile: Option<DistroProfile>,
     guest_defaults: GuestDefaults,
     status: BackendStatus,
     vms: Vec<VmSummary>,
@@ -145,6 +146,7 @@ impl WorkspaceApp {
             image_picker: None,
             settings_path_picker: None,
             settings: None,
+            distro_profile: None,
             guest_defaults: GuestDefaults::default(),
             status: BackendStatus::Starting,
             vms: Vec::new(),
@@ -185,6 +187,17 @@ impl WorkspaceApp {
             current: settings,
         });
         self
+    }
+
+    #[must_use]
+    pub fn with_distro_profile(mut self, profile: DistroProfile) -> Self {
+        self.distro_profile = Some(profile);
+        self
+    }
+
+    #[must_use]
+    pub fn distro_profile(&self) -> Option<&DistroProfile> {
+        self.distro_profile.as_ref()
     }
 
     /// Sets what a new VM's locale, keyboard layout and timezone start out as.
@@ -855,6 +868,16 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn application_exposes_the_distribution_profile_supplied_by_composition_root() {
+        let profile = vmlord_core::ubuntu();
+
+        let app = WorkspaceApp::new(Box::new(FakeRepository::default()))
+            .with_distro_profile(profile.clone());
+
+        assert_eq!(app.distro_profile(), Some(&profile));
+    }
     use vmlord_core::{DiagnosticLevel, HostGpuCapabilities, Language, LogLevel, VmState};
 
     /// A backend that works: every test names only what it changes about it.
@@ -1487,6 +1510,7 @@ mod tests {
             log_file_path: directory.join("logs").join("vmlord.log"),
             log_level: LogLevel::Info,
             image_cache_path: directory.join("images"),
+            default_distro: "ubuntu".into(),
             guest_readiness: vmlord_core::GuestReadinessTimeouts::default(),
         };
         let updated_settings = AppSettings {
@@ -1495,6 +1519,7 @@ mod tests {
             log_file_path: directory.join("diagnostics").join("application.log"),
             log_level: LogLevel::Debug,
             image_cache_path: directory.join("cached-images"),
+            default_distro: "ubuntu".into(),
             guest_readiness: vmlord_core::GuestReadinessTimeouts::default(),
         };
         let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()))

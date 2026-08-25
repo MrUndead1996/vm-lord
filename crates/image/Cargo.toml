@@ -21,6 +21,7 @@ vmlord-core = { path = "../core" }
 
 [dev-dependencies]
 sha2 = "0.11"
+vmlord-core = { path = "../core", features = ["test-profile"] }
 
 [lints]
 workspace = true

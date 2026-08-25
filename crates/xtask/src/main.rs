@@ -114,6 +114,7 @@ fn dist(payloads: Vec<dist_arguments::DistPayload>) -> Result<(), String> {
         })?;
         println!("dist: {file}");
     }
+    stage_distros(&workspace, &destination)?;
 
     if payloads.is_empty() {
         println!(
@@ -136,6 +137,29 @@ fn dist(payloads: Vec<dist_arguments::DistPayload>) -> Result<(), String> {
     }
 
     println!("dist: written to {}", destination.display());
+    Ok(())
+}
+
+fn stage_distros(workspace: &Path, destination: &Path) -> Result<(), String> {
+    let source = workspace.join("distros");
+    let target = destination.join("distros");
+    fs::create_dir_all(&target)
+        .map_err(|error| format!("cannot create {}: {error}", target.display()))?;
+    let entries = fs::read_dir(&source)
+        .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| format!("distribution profile has no file name: {}", path.display()))?;
+        fs::copy(&path, target.join(file_name))
+            .map_err(|error| format!("cannot copy {}: {error}", path.display()))?;
+        println!("dist: distros/{}", file_name.to_string_lossy());
+    }
     Ok(())
 }
 
@@ -179,9 +203,13 @@ fn workspace_root() -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
-    use super::distribution_directory;
+    use super::{distribution_directory, stage_distros};
 
     #[test]
     fn the_distribution_lives_under_target_so_cargo_clean_removes_it() {
@@ -191,5 +219,32 @@ mod tests {
             distribution_directory(workspace),
             PathBuf::from("workspace").join("target").join("dist")
         );
+    }
+
+    #[test]
+    fn every_distribution_profile_is_staged_with_the_release() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("vmlord-dist-profile-test-{unique}"));
+        let source = root.join("workspace").join("distros");
+        let destination = root.join("target").join("dist");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("ubuntu.json"), "ubuntu").unwrap();
+        fs::write(source.join("fedora.json"), "fedora").unwrap();
+
+        stage_distros(&root.join("workspace"), &destination).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(destination.join("distros/ubuntu.json")).unwrap(),
+            "ubuntu"
+        );
+        assert_eq!(
+            fs::read_to_string(destination.join("distros/fedora.json")).unwrap(),
+            "fedora"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }
