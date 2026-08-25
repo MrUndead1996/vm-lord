@@ -117,11 +117,24 @@ which happens constantly.
 diagnostic!(Warning, Subsystem::Gpu, vm = %name, "GPU-PV assignment was refused");
 ```
 
-expanding to `tracing::warn!(diagnostic = true, subsystem = ?…, vm = %name, …)`.
+expanding to `tracing::warn!(diagnostic = true, subsystem = "Gpu", vm = %name, …)`.
 AGENTS.md discourages unnecessary abstraction, and this one earns its place
 narrowly: a typo in the field name would silently fail to show in the UI and
 would break no test. Ordinary `info!` / `warn!` stay plain `tracing`. The macro
 is only for what is addressed to a person.
+
+The macro's first argument is a `DiagnosticLevel` spelled as a literal, and it
+selects the `tracing` macro at compile time: `Info` to `info!`, `Warning` to
+`warn!`, `Error` to `error!`. The layer maps back the same way, so the level a
+record shows is the level the event was emitted at and there is no second
+source of truth to disagree.
+
+Fields are read back through `Visit` by name and by type, which fixes how each
+is recorded. `subsystem` is a string: `Subsystem` gains `as_str` and a
+`FromStr`, the macro records `as_str`, and the layer parses it -- rather than
+`?subsystem`, whose `Debug` output the layer would be parsing by luck. `vm` is a
+string, `diagnostic` a bool, and `code` a `u64` narrowed to `u32`, matching
+`record_u64`, which is what `tracing` calls for an integer field.
 
 ### Spans
 
