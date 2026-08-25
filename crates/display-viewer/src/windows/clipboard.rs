@@ -576,13 +576,21 @@ fn apply(pieces: &[Piece], html: u32) -> Result<u32, String> {
         return Err("nothing in the selection could be converted".to_owned());
     }
 
-    let _open = Clipboard::open().ok_or_else(|| "the clipboard is held elsewhere".to_owned())?;
+    let open = Clipboard::open().ok_or_else(|| "the clipboard is held elsewhere".to_owned())?;
     // SAFETY: the clipboard is open on this thread.
     unsafe { EmptyClipboard() }.map_err(|error| error.to_string())?;
 
     for (format, bytes) in formats {
         put(format, &bytes)?;
     }
+
+    // Closed before the number is read, and that order is the whole of the
+    // echo suppression: Windows advances the sequence number when the
+    // clipboard is closed, so a number taken while it is still open is the one
+    // from *before* this write. Taking it there made every applied selection
+    // look like somebody else's copy, and the host offered the guest its own
+    // selection straight back.
+    drop(open);
 
     Ok(sequence_number())
 }
