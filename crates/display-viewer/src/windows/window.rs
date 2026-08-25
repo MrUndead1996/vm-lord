@@ -142,7 +142,7 @@ impl Shared {
     /// and its keys belong in the same queue as that window's mouse.
     pub(crate) fn report(&self, event: UiEvent) {
         if self.events.send(event).is_err() {
-            log::debug!("a {event:?} had nowhere to go: the session is already over");
+            tracing::debug!("a {event:?} had nowhere to go: the session is already over");
         }
     }
 }
@@ -369,7 +369,7 @@ impl Window {
     /// Covers the monitor this window is on, keeping what it takes off.
     fn enter_fullscreen(&mut self) {
         let Some(monitor) = self.monitor_rectangle() else {
-            log::warn!("the window is on no monitor; full screen is not available");
+            tracing::warn!("the window is on no monitor; full screen is not available");
 
             return;
         };
@@ -378,7 +378,9 @@ impl Window {
         // maximised is maximised again on the way out: `showCmd` is what
         // remembers that, and `rcNormalPosition` is where it came from.
         let Some(placement) = self.placement() else {
-            log::warn!("the window's placement could not be read; full screen is not available");
+            tracing::warn!(
+                "the window's placement could not be read; full screen is not available"
+            );
 
             return;
         };
@@ -673,7 +675,7 @@ pub fn become_dpi_aware() {
     if let Err(error) =
         unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
     {
-        log::debug!("this process is already DPI aware, or cannot be told to be: {error}");
+        tracing::debug!("this process is already DPI aware, or cannot be told to be: {error}");
     }
 }
 
@@ -1036,7 +1038,7 @@ fn mark_fullscreen(hwnd: HWND, on: bool) {
     };
     // SAFETY: an interface this thread created and a window this process owns.
     if let Err(error) = unsafe { taskbar.MarkFullscreenWindow(hwnd, on) } {
-        log::warn!("the shell would not be told about the full-screen window: {error}");
+        tracing::warn!("the shell would not be told about the full-screen window: {error}");
     }
 }
 
@@ -1070,7 +1072,7 @@ fn create_taskbar() -> Option<ITaskbarList2> {
         ) {
             Ok(taskbar) => taskbar,
             Err(error) => {
-                log::warn!(
+                tracing::warn!(
                     "the shell's taskbar list is not available, so the taskbar may stay over a full-screen window: {error}"
                 );
 
@@ -1079,7 +1081,7 @@ fn create_taskbar() -> Option<ITaskbarList2> {
         };
         // Documented as the first call on the interface, before any other.
         if let Err(error) = taskbar.HrInit() {
-            log::warn!("the shell's taskbar list would not start: {error}");
+            tracing::warn!("the shell's taskbar list would not start: {error}");
 
             return None;
         }

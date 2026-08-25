@@ -70,7 +70,7 @@ impl DisplayUpdates {
             let error = RepositoryError::new(format!(
                 "the display payload of VM \"{vm_name}\" is already being updated"
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             return Err(error);
         }
 
@@ -89,11 +89,11 @@ impl DisplayUpdates {
                     "the thread updating the display payload of VM \"{vm_name}\" could not be \
                      started: {error}"
                 ));
-                log::error!("{error}");
+                tracing::error!("{error}");
                 error
             })?;
 
-        log::info!("updating the display payload of VM \"{vm_name}\" in the background");
+        tracing::info!("updating the display payload of VM \"{vm_name}\" in the background");
         updates.insert(
             vm_name.to_owned(),
             Update {
@@ -116,7 +116,7 @@ impl DisplayUpdates {
             if let Some(worker) = update.worker.take()
                 && worker.join().is_err()
             {
-                log::error!(
+                tracing::error!(
                     "the thread updating the display payload of VM \"{vm_name}\" panicked"
                 );
             }
@@ -141,7 +141,7 @@ impl DisplayUpdates {
             if let Some(worker) = update.worker.take()
                 && worker.join().is_err()
             {
-                log::error!(
+                tracing::error!(
                     "the thread updating the display payload of VM \"{vm_name}\" panicked"
                 );
             }

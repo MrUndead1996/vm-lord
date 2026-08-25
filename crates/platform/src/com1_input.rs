@@ -173,7 +173,7 @@ impl ConsoleModes {
         ] {
             match set_console_mode(which, mode_of) {
                 Some(previous) => changed.push(previous),
-                None => log::debug!(
+                None => tracing::debug!(
                     "COM1 console standard handle {} is not a console; leaving its mode alone",
                     which.0
                 ),
@@ -189,7 +189,7 @@ impl Drop for ConsoleModes {
             // SAFETY: `handle` is a standard handle this process owns for its
             // lifetime, and `original` is the mode read from it.
             if let Err(error) = unsafe { SetConsoleMode(handle, original) } {
-                log::warn!("could not restore the COM1 console mode: {error}");
+                tracing::warn!("could not restore the COM1 console mode: {error}");
             }
         }
     }
@@ -224,7 +224,7 @@ fn set_console_mode(
 /// thread might still write to it. The `Arc` is what pays it.
 pub(crate) fn start_input(pipe: Arc<Com1Pipe>, vm_name: String) -> Result<(), RepositoryError> {
     let event = WindowsEvent::new(true, false)?;
-    log::debug!("COM1 input for VM \"{vm_name}\" is being forwarded to the guest");
+    tracing::debug!("COM1 input for VM \"{vm_name}\" is being forwarded to the guest");
     std::thread::Builder::new()
         .name("vmlord-com1-input".to_owned())
         .spawn(move || {
@@ -232,20 +232,22 @@ pub(crate) fn start_input(pipe: Arc<Com1Pipe>, vm_name: String) -> Result<(), Re
             let stdin = io::stdin();
             match pump_input(&mut stdin.lock(), &mut writer) {
                 Ok(()) => {
-                    log::debug!("COM1 input for VM \"{vm_name}\" ended with its standard input");
+                    tracing::debug!(
+                        "COM1 input for VM \"{vm_name}\" ended with its standard input"
+                    );
                 }
                 Err(error) if is_end_of_stream_io(&error) => {
-                    log::debug!("COM1 input for VM \"{vm_name}\" ended with the pipe");
+                    tracing::debug!("COM1 input for VM \"{vm_name}\" ended with the pipe");
                 }
                 Err(error) => {
-                    log::warn!("COM1 input for VM \"{vm_name}\" stopped: {error}");
+                    tracing::warn!("COM1 input for VM \"{vm_name}\" stopped: {error}");
                 }
             }
         })
         .map_err(|error| {
             let error =
                 RepositoryError::new(format!("cannot start the COM1 input thread: {error}"));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
     Ok(())

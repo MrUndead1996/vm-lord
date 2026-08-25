@@ -70,11 +70,11 @@ impl SshLaunches {
                     "the thread opening an SSH session to VM \"{vm_name}\" could not be \
                      started: {error}"
                 ));
-                log::error!("{error}");
+                tracing::error!("{error}");
                 error
             })?;
 
-        log::debug!("opening an SSH session to VM \"{vm_name}\" in the background");
+        tracing::debug!("opening an SSH session to VM \"{vm_name}\" in the background");
         workers.push(Worker {
             vm_name: vm_name.to_owned(),
             finished,
@@ -136,7 +136,7 @@ fn join(mut worker: Worker) {
     if let Some(handle) = worker.handle.take()
         && handle.join().is_err()
     {
-        log::error!(
+        tracing::error!(
             "the thread opening an SSH session to VM \"{}\" panicked",
             worker.vm_name
         );

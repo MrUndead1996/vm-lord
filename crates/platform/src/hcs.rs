@@ -148,10 +148,10 @@ impl HcsStartFailure {
 }
 
 /// Classifies a call HCS refused outright.
-fn call_failure(operation: &str, id: &str, error: windows::core::Error) -> HcsStartFailure {
+fn call_failure(operation: &'static str, id: &str, error: windows::core::Error) -> HcsStartFailure {
     let endpoint_busy = error.code() == HCN_E_ENDPOINT_ALREADY_ATTACHED;
     let error = windows_error(operation, Some(id), error);
-    log::error!("{error}");
+    tracing::error!("{error}");
     if endpoint_busy {
         HcsStartFailure::EndpointBusy(error)
     } else {
@@ -161,7 +161,7 @@ fn call_failure(operation: &str, id: &str, error: windows::core::Error) -> HcsSt
 
 /// Classifies an operation HCS accepted and then failed.
 fn operation_failure(
-    operation: &str,
+    operation: &'static str,
     id: &str,
     timeout: Duration,
     failure: WaitFailure,
@@ -169,12 +169,12 @@ fn operation_failure(
     match failure {
         WaitFailure::Windows(error) if error.code() == HCN_E_ENDPOINT_ALREADY_ATTACHED => {
             let error = windows_error(operation, Some(id), error);
-            log::error!("{error}");
+            tracing::error!("{error}");
             HcsStartFailure::EndpointBusy(error)
         }
         failure => {
             let error = wait_failure(timeout, failure);
-            log::error!("the {operation} of \"{id}\" failed: {error}");
+            tracing::error!("the {operation} of \"{id}\" failed: {error}");
             HcsStartFailure::Failed(error)
         }
     }
@@ -225,7 +225,7 @@ impl HcsSystem {
         match Self::try_open(vm_name, requested_access) {
             Ok(system) => Ok(Some(system)),
             Err(error) if error.code() == HCS_E_SYSTEM_NOT_FOUND => {
-                log::debug!("HCS does not know compute system \"{vm_name}\"");
+                tracing::debug!("HCS does not know compute system \"{vm_name}\"");
                 Ok(None)
             }
             Err(error) => Err(windows_error("open compute system", Some(vm_name), error)),
@@ -250,7 +250,7 @@ impl HcsSystem {
     /// configuration attaches (see [`HcsClient::grant_vm_access`]); otherwise
     /// the start fails with `ERROR_ACCESS_DENIED`.
     pub fn start(&self) -> Result<HcsOperation, RepositoryError> {
-        log::debug!("starting HCS compute system \"{}\"", self.id);
+        tracing::debug!("starting HCS compute system \"{}\"", self.id);
         let operation = HcsOperation::new();
         // SAFETY: `self.handle` and `operation.0` are valid owned handles for
         // the duration of this call. Null options are accepted here: a start
@@ -260,7 +260,7 @@ impl HcsSystem {
         unsafe { HcsStartComputeSystem(self.handle, operation.0, PCWSTR::null()) }.map_err(
             |error| {
                 let error = windows_error("start compute system", Some(&self.id), error);
-                log::error!("{error}");
+                tracing::error!("{error}");
                 error
             },
         )?;
@@ -274,7 +274,7 @@ impl HcsSystem {
     /// the one failure it can recover from, and it can only recognise it here,
     /// where the raw HRESULT is still available.
     pub fn start_and_wait(&self, timeout: Duration) -> Result<(), HcsStartFailure> {
-        log::debug!("starting HCS compute system \"{}\"", self.id);
+        tracing::debug!("starting HCS compute system \"{}\"", self.id);
         let operation = HcsOperation::new();
         // SAFETY: `self.handle` and `operation.0` are valid owned handles for
         // the duration of this call. Null options are accepted here: a start
@@ -301,7 +301,7 @@ impl HcsSystem {
     /// never powers off, so this is not a substitute for
     /// [`HcsSystem::terminate`].
     pub fn shutdown(&self) -> Result<HcsOperation, RepositoryError> {
-        log::debug!("shutting down HCS compute system \"{}\"", self.id);
+        tracing::debug!("shutting down HCS compute system \"{}\"", self.id);
         let operation = HcsOperation::new();
         let options = HSTRING::from(shutdown_options());
         // SAFETY: `self.handle` and `operation.0` are valid owned handles for
@@ -309,7 +309,7 @@ impl HcsSystem {
         unsafe { HcsShutDownComputeSystem(self.handle, operation.0, &options) }.map_err(
             |error| {
                 let error = windows_error("shut down compute system", Some(&self.id), error);
-                log::error!("{error}");
+                tracing::error!("{error}");
                 error
             },
         )?;
@@ -329,12 +329,12 @@ impl HcsSystem {
                 if error.code() == ERROR_NOT_SUPPORTED.to_hresult() =>
             {
                 let error = unsupported_shutdown_error(&self.id, error.code().0 as u32);
-                log::error!("{error}");
+                tracing::error!("{error}");
                 Err(error)
             }
             Err(failure) => {
                 let error = wait_failure(timeout, failure);
-                log::error!(
+                tracing::error!(
                     "the shutdown of HCS compute system \"{}\" failed: {error}",
                     self.id
                 );
@@ -352,7 +352,7 @@ impl HcsSystem {
     /// configuration and started again -- which is what
     /// [`crate::VmStartPipeline`] does.
     pub fn terminate(&self) -> Result<HcsOperation, RepositoryError> {
-        log::debug!("terminating HCS compute system \"{}\"", self.id);
+        tracing::debug!("terminating HCS compute system \"{}\"", self.id);
         let operation = HcsOperation::new();
         // SAFETY: `self.handle` and `operation.0` are valid owned handles for
         // the duration of this call. Null options match
@@ -361,7 +361,7 @@ impl HcsSystem {
         unsafe { HcsTerminateComputeSystem(self.handle, operation.0, PCWSTR::null()) }.map_err(
             |error| {
                 let error = windows_error("terminate compute system", Some(&self.id), error);
-                log::error!("{error}");
+                tracing::error!("{error}");
                 error
             },
         )?;
@@ -378,7 +378,7 @@ impl HcsSystem {
             .wait_for_completion(timeout)
             .map(|_document| ())
             .inspect_err(|error| {
-                log::error!(
+                tracing::error!(
                     "the termination of HCS compute system \"{}\" failed: {error}",
                     self.id
                 );
@@ -394,7 +394,7 @@ impl HcsSystem {
     /// `HCN_E_ENDPOINT_ALREADY_ATTACHED`. Detaching before the VM stops is what
     /// keeps the endpoint -- and therefore the guest's address -- reusable.
     pub fn remove_network_adapter(&self, endpoint_id: Uuid) -> Result<(), RepositoryError> {
-        log::debug!(
+        tracing::debug!(
             "detaching the adapter of endpoint {endpoint_id} from HCS compute system \"{}\"",
             self.id
         );
@@ -412,7 +412,7 @@ impl HcsSystem {
                 ))
             })
             .inspect_err(|error| {
-                log::error!(
+                tracing::error!(
                     "detaching the adapter of HCS compute system \"{}\" failed: {error}",
                     self.id
                 );
@@ -797,21 +797,21 @@ impl HcsClient {
     /// Subsequent calls after a successful probe are no-ops.
     pub fn initialize(&mut self) -> Result<(), RepositoryError> {
         if self.initialized {
-            log::debug!("HCS client already initialized; skipping availability probe");
+            tracing::debug!("HCS client already initialized; skipping availability probe");
             return Ok(());
         }
 
-        log::debug!("probing Host Compute Service availability");
+        tracing::debug!("probing Host Compute Service availability");
         let document = self.probe_service_properties().inspect_err(|error| {
-            log::error!("Host Compute Service is unavailable: {error}");
+            tracing::error!("Host Compute Service is unavailable: {error}");
         })?;
 
         parse_service_result(&document).inspect_err(|error| {
-            log::error!("Host Compute Service returned an invalid result: {error}");
+            tracing::error!("Host Compute Service returned an invalid result: {error}");
         })?;
 
         self.initialized = true;
-        log::info!("Host Compute Service is available");
+        tracing::info!("Host Compute Service is available");
         Ok(())
     }
 
@@ -833,7 +833,7 @@ impl HcsClient {
         id: &str,
         configuration: &str,
     ) -> Result<(HcsSystem, HcsOperation), RepositoryError> {
-        log::debug!("creating HCS compute system \"{id}\"");
+        tracing::debug!("creating HCS compute system \"{id}\"");
         let operation = HcsOperation::new();
         let hcs_id = HSTRING::from(id);
         let hcs_configuration = HSTRING::from(configuration);
@@ -844,7 +844,7 @@ impl HcsClient {
             unsafe { HcsCreateComputeSystem(&hcs_id, &hcs_configuration, operation.0, None) }
                 .map_err(|error| {
                     let error = windows_error("create compute system", Some(id), error);
-                    log::error!("{error}");
+                    tracing::error!("{error}");
                     error
                 })?;
 
@@ -870,7 +870,7 @@ impl HcsClient {
         configuration: &str,
         timeout: Duration,
     ) -> Result<HcsSystem, HcsStartFailure> {
-        log::debug!("creating HCS compute system \"{id}\"");
+        tracing::debug!("creating HCS compute system \"{id}\"");
         let operation = HcsOperation::new();
         let hcs_id = HSTRING::from(id);
         let hcs_configuration = HSTRING::from(configuration);
@@ -901,7 +901,7 @@ impl HcsClient {
     /// `ERROR_ACCESS_DENIED` even though the file was just created
     /// successfully by an elevated process.
     pub fn grant_vm_access(&self, id: &str, path: &Path) -> Result<(), RepositoryError> {
-        log::debug!(
+        tracing::debug!(
             "granting HCS compute system \"{id}\" access to {}",
             path.display()
         );
@@ -917,7 +917,7 @@ impl HcsClient {
             // expected for the GPU shares under `System32`, which no grant can
             // cover and none of which needs one.
             let error = windows_error("grant VM access", Some(id), error);
-            log::debug!("{error}");
+            tracing::debug!("{error}");
             error
         })
     }
@@ -954,13 +954,13 @@ impl HcsClient {
     /// that has been created but never started refuses a property query
     /// outright, and that is precisely the state worth distinguishing.
     pub fn enumerate_systems(&self) -> Result<Vec<HcsSystemSummary>, RepositoryError> {
-        log::debug!("enumerating HCS compute systems");
+        tracing::debug!("enumerating HCS compute systems");
         let document = self.enumerate_document().inspect_err(|error| {
-            log::error!("failed to enumerate HCS compute systems: {error}");
+            tracing::error!("failed to enumerate HCS compute systems: {error}");
         })?;
-        log::debug!("HCS enumeration returned: {document}");
+        tracing::debug!("HCS enumeration returned: {document}");
         let systems = parse_enumerate_result(&document)?;
-        log::debug!("enumerated {} HCS compute system(s)", systems.len());
+        tracing::debug!("enumerated {} HCS compute system(s)", systems.len());
         Ok(systems)
     }
 
@@ -1026,10 +1026,10 @@ fn create_state_file(path: &Path, kind: StateFile) -> Result<(), RepositoryError
             "failed to remove the stale state file {}: {error}",
             path.display()
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         return Err(error);
     }
-    log::debug!("creating the state file {}", path.display());
+    tracing::debug!("creating the state file {}", path.display());
     // `HSTRING` has no `From<&OsStr>`; the lossy conversion matches
     // `grant_vm_access` above.
     let wide_path = HSTRING::from(path.as_os_str().to_string_lossy().as_ref());
@@ -1040,7 +1040,7 @@ fn create_state_file(path: &Path, kind: StateFile) -> Result<(), RepositoryError
     };
     result.map_err(|error| {
         let error = windows_error(kind.description(), None, error);
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })
 }

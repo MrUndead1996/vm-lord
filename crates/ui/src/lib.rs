@@ -2170,6 +2170,26 @@ fn detail_row(ui: &mut egui::Ui, label: &str, value: String) {
     ui.end_row();
 }
 
+/// One record as the panel shows it.
+///
+/// The moment comes first because the panel's whole use is lining an event up
+/// with the same event in `vmlord.log`, and the code comes last because it is
+/// what a reader copies into a search.
+fn diagnostic_line(diagnostic: &vmlord_core::Diagnostic) -> String {
+    let mut line = format!(
+        "[{}] {}",
+        vmlord_core::format_timestamp(diagnostic.at),
+        diagnostic.message
+    );
+    if let Some(vm) = &diagnostic.vm {
+        line.push_str(&format!(" ({vm})"));
+    }
+    if let Some(code) = diagnostic.code {
+        line.push_str(&format!(" [0x{code:08X}]"));
+    }
+    line
+}
+
 fn render_diagnostics(ui: &mut egui::Ui, diagnostics: &[vmlord_core::Diagnostic]) {
     ui.collapsing("Log", |ui| {
         egui::ScrollArea::vertical()
@@ -2182,7 +2202,7 @@ fn render_diagnostics(ui: &mut egui::Ui, diagnostics: &[vmlord_core::Diagnostic]
                         DiagnosticLevel::Warning => egui::Color32::YELLOW,
                         DiagnosticLevel::Error => egui::Color32::LIGHT_RED,
                     };
-                    ui.colored_label(color, &diagnostic.message);
+                    ui.colored_label(color, diagnostic_line(diagnostic));
                 }
             });
     });
@@ -2316,6 +2336,43 @@ fn vm_state(state: VmState) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_record_is_shown_with_its_moment_its_vm_and_its_code() {
+        // The panel exists to be lined up against `vmlord.log`; without the
+        // stamp there is nothing to line up.
+        let line = super::diagnostic_line(&vmlord_core::Diagnostic {
+            level: vmlord_core::DiagnosticLevel::Error,
+            subsystem: vmlord_core::Subsystem::Hcs,
+            vm: Some("dev-linux".into()),
+            code: Some(0x803B_0014),
+            at: std::time::UNIX_EPOCH,
+            message: "the endpoint was already attached".into(),
+        });
+
+        assert_eq!(
+            line,
+            "[1970-01-01T00:00:00.000Z] the endpoint was already attached \
+             (dev-linux) [0x803B0014]"
+        );
+    }
+
+    #[test]
+    fn a_record_about_no_vm_in_particular_shows_neither_a_name_nor_a_code() {
+        let line = super::diagnostic_line(&vmlord_core::Diagnostic {
+            level: vmlord_core::DiagnosticLevel::Info,
+            subsystem: vmlord_core::Subsystem::App,
+            vm: None,
+            code: None,
+            at: std::time::UNIX_EPOCH,
+            message: "Application settings saved".into(),
+        });
+
+        assert_eq!(
+            line,
+            "[1970-01-01T00:00:00.000Z] Application settings saved"
+        );
+    }
+
     use std::net::{IpAddr, Ipv4Addr};
 
     use vmlord_core::{

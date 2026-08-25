@@ -263,12 +263,12 @@ impl MetadataStore {
                 "HCS compute system id \"{}\" is already mapped to VM \"{}\" ({})",
                 mapping.hcs_compute_system_id, conflict.vm_name, conflict.vm_id
             );
-            log::error!("{message}");
+            tracing::error!("{message}");
             return Err(RepositoryError::new(message));
         }
 
         mappings.retain(|existing| existing.vm_id != mapping.vm_id);
-        log::debug!(
+        tracing::debug!(
             "mapping VM \"{}\" ({}) to HCS compute system \"{}\"",
             mapping.vm_name,
             mapping.vm_id,
@@ -287,11 +287,11 @@ impl MetadataStore {
         let original_len = mappings.len();
         mappings.retain(|existing| existing.vm_id != vm_id);
         if mappings.len() == original_len {
-            log::warn!("no HCS compute system mapping found for VM {vm_id} to remove");
+            tracing::warn!("no HCS compute system mapping found for VM {vm_id} to remove");
             return Ok(());
         }
 
-        log::debug!("removed HCS compute system mapping for VM {vm_id}");
+        tracing::debug!("removed HCS compute system mapping for VM {vm_id}");
         self.save(&mappings)
     }
 
@@ -337,7 +337,7 @@ impl MetadataStore {
         let contents = match fs::read_to_string(&self.mapping_file_path) {
             Ok(contents) => contents,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                log::debug!(
+                tracing::debug!(
                     "no HCS metadata mapping file at {}; starting empty",
                     self.mapping_file_path.display()
                 );
@@ -346,7 +346,7 @@ impl MetadataStore {
             Err(source) => {
                 let error =
                     filesystem_error("read metadata mapping", &self.mapping_file_path, source);
-                log::error!("{error}");
+                tracing::error!("{error}");
                 return Err(error);
             }
         };
@@ -357,7 +357,7 @@ impl MetadataStore {
                     "failed to parse metadata mapping at {}: {source}",
                     self.mapping_file_path.display()
                 ));
-                log::error!("{error}");
+                tracing::error!("{error}");
                 error
             })?;
 
@@ -367,7 +367,7 @@ impl MetadataStore {
                     "invalid metadata mapping at {}: {source}",
                     self.mapping_file_path.display()
                 ));
-                log::error!("{error}");
+                tracing::error!("{error}");
                 error
             })?;
         }
@@ -380,7 +380,7 @@ impl MetadataStore {
             fs::create_dir_all(directory).map_err(|source| {
                 let error =
                     filesystem_error("create metadata mapping directory", directory, source);
-                log::error!("{error}");
+                tracing::error!("{error}");
                 error
             })?;
         }
@@ -390,7 +390,7 @@ impl MetadataStore {
         })?;
         fs::write(&self.mapping_file_path, document).map_err(|source| {
             let error = filesystem_error("write metadata mapping", &self.mapping_file_path, source);
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })
     }

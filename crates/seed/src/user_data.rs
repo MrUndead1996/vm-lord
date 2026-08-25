@@ -182,7 +182,7 @@ fn agent_install_commands() -> Vec<Vec<String>> {
 fn disable_ssh(request: &SeedRequest<'_>) -> Vec<Vec<String>> {
     let units = request.ssh_daemon.units.all();
 
-    log::debug!("the seed disables the SSH daemon: {}", units.join(", "));
+    tracing::debug!("the seed disables the SSH daemon: {}", units.join(", "));
     let mut command = vec![
         "systemctl".to_owned(),
         "disable".to_owned(),
@@ -340,6 +340,85 @@ mod tests {
     const AGENT_SECRET: &str = "Zm9ydHktdHdvIGJ5dGVzIG9mIHNlY3JldCBoZXJlIQ==";
     const SSHD_DROP_IN: &str = "/etc/ssh/sshd_config.d/10-vmlord.conf";
     const SOCKET_DROP_IN: &str = "/etc/systemd/system/ssh.socket.d/10-vmlord.conf";
+
+    /// A subscriber that keeps every record, for the test below.
+    mod capture {
+        use std::{
+            fmt,
+            sync::{Arc, Mutex},
+        };
+
+        use tracing::{
+            Event, Subscriber,
+            field::{Field, Visit},
+        };
+        use tracing_subscriber::{Layer, layer::Context, layer::SubscriberExt as _};
+
+        /// Runs `body` with every record it writes captured, and hands back the
+        /// records, joined.
+        pub(super) fn capture(body: impl FnOnce()) -> String {
+            let records = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&records)));
+            tracing::subscriber::with_default(subscriber, body);
+            records
+                .lock()
+                .expect("no test panics while holding the records")
+                .join("\n")
+        }
+
+        struct Capture(Arc<Mutex<Vec<String>>>);
+
+        impl<S: Subscriber> Layer<S> for Capture {
+            fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+                let mut rendered = String::new();
+                event.record(&mut Everything(&mut rendered));
+                self.0
+                    .lock()
+                    .expect("no test panics while holding the records")
+                    .push(rendered);
+            }
+        }
+
+        /// Every field, not only the message: a secret that leaked as a field
+        /// would be just as leaked.
+        struct Everything<'a>(&'a mut String);
+
+        impl Visit for Everything<'_> {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                self.0.push_str(&format!(" {}={value}", field.name()));
+            }
+
+            fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+                self.0.push_str(&format!(" {}={value:?}", field.name()));
+            }
+        }
+    }
+
+    /// The rule this guards: a secret has neither a `Display` nor a `Debug`
+    /// that shows its value, so it cannot reach a record at all.
+    ///
+    /// It passes on the first run, because `SeedRequest`, `Seed` and
+    /// `auth::Secret` are already built that way. It is here to stop passing
+    /// the moment one of them grows a `Debug` and something records it -- which
+    /// would otherwise break nothing and be noticed by nobody.
+    #[test]
+    fn building_the_documents_records_no_secret() {
+        let mut request = request();
+        request.agent_secret = Some(AGENT_SECRET);
+
+        let text = capture::capture(|| {
+            let _seed = crate::build(&request);
+        });
+
+        assert!(
+            !text.contains(HASH),
+            "no crypt entry may be recorded: {text}"
+        );
+        assert!(
+            !text.contains(AGENT_SECRET),
+            "no agent secret may be recorded: {text}"
+        );
+    }
 
     fn request() -> SeedRequest<'static> {
         SeedRequest {

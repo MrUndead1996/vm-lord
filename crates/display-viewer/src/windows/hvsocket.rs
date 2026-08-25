@@ -147,7 +147,7 @@ impl HvSocket {
 
         stream.wait_writable(timeout)?;
 
-        log::debug!(
+        tracing::debug!(
             "connected to vsock port {port:#x} of partition {partition:?}",
             partition = address.vm_id
         );

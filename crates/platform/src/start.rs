@@ -275,11 +275,11 @@ impl VmStartPipeline {
     ) -> Result<Com1Session, RepositoryError> {
         let mapping = store.find_by_vm_name(vm_name)?.ok_or_else(|| {
             let error = RepositoryError::new(format!("no HCS mapping found for VM \"{vm_name}\""));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
 
-        log::info!(
+        tracing::info!(
             "starting VM \"{}\" ({}) as HCS compute system \"{}\"",
             mapping.vm_name,
             mapping.vm_id,
@@ -315,7 +315,7 @@ impl VmStartPipeline {
 
         let failure = match self.open_console_and_start(&mapping, vm_directory, &configuration) {
             Ok(session) => {
-                log::info!("started VM \"{}\" ({})", mapping.vm_name, mapping.vm_id);
+                tracing::info!("started VM \"{}\" ({})", mapping.vm_name, mapping.vm_id);
                 self.attach_gpu(&mapping, prepared.as_ref());
                 return Ok(session);
             }
@@ -327,16 +327,16 @@ impl VmStartPipeline {
         let busy = match failure {
             HcsStartFailure::EndpointBusy(error) => error,
             HcsStartFailure::Failed(error) => {
-                log::error!("failed to start VM \"{}\": {error}", mapping.vm_name);
+                tracing::error!("failed to start VM \"{}\": {error}", mapping.vm_name);
                 return Err(error);
             }
         };
         let Some(endpoint) = endpoint else {
-            log::error!("failed to start VM \"{}\": {busy}", mapping.vm_name);
+            tracing::error!("failed to start VM \"{}\": {busy}", mapping.vm_name);
             return Err(busy);
         };
 
-        log::warn!(
+        tracing::warn!(
             "VM \"{}\" could not start because HNS still has endpoint {endpoint} attached to a \
              compute system that no longer exists: {busy}; replacing the endpoint and retrying \
              the start once",
@@ -362,11 +362,11 @@ impl VmStartPipeline {
             .open_console_and_start(&mapping, vm_directory, &configuration)
             .map_err(|failure| {
                 let error = failure.into_error();
-                log::error!("failed to start VM \"{}\": {error}", mapping.vm_name);
+                tracing::error!("failed to start VM \"{}\": {error}", mapping.vm_name);
                 error
             })?;
 
-        log::info!("started VM \"{}\" ({})", mapping.vm_name, mapping.vm_id);
+        tracing::info!("started VM \"{}\" ({})", mapping.vm_name, mapping.vm_id);
         self.attach_gpu(&mapping, prepared.as_ref());
         Ok(session)
     }
@@ -430,7 +430,7 @@ impl VmStartPipeline {
         // recorded. Attaching adapters whose drivers the guest cannot reach
         // would not make that less true.
         if matches!(prepared.assignment, GpuAssignment::Failed(_)) {
-            log::info!(
+            tracing::info!(
                 "VM \"{}\" is not asked to attach any GPU adapter, because none could be \
                  handed to it",
                 mapping.vm_name
@@ -439,13 +439,13 @@ impl VmStartPipeline {
         }
 
         match (self.gpu_assigner)(&mapping.hcs_compute_system_id, mapping.gpu_mode) {
-            Ok(()) => log::info!(
+            Ok(()) => tracing::info!(
                 "VM \"{}\" has its GPU attached in mode {:?}",
                 mapping.vm_name,
                 mapping.gpu_mode
             ),
             Err(failure) => {
-                log::warn!(
+                tracing::warn!(
                     "VM \"{}\" is running without the GPU it asked for: {}",
                     mapping.vm_name,
                     failure.message
@@ -511,7 +511,7 @@ impl VmStartPipeline {
         policy: EndpointPolicy,
     ) -> Result<(String, Option<Uuid>), RepositoryError> {
         if mapping.network_mode != NetworkMode::Nat {
-            log::debug!(
+            tracing::debug!(
                 "VM \"{}\" asks for {:?} networking; starting it without an endpoint",
                 mapping.vm_name,
                 mapping.network_mode
@@ -523,7 +523,7 @@ impl VmStartPipeline {
             let updated = hcs_config::remove_network_adapter(&configuration)?;
             if updated != configuration {
                 self.write_configuration(mapping, vm_directory, &updated)?;
-                log::info!(
+                tracing::info!(
                     "VM \"{}\" ({}) no longer asks for a network; its adapter was removed \
                      from the stored configuration",
                     mapping.vm_name,
@@ -560,12 +560,12 @@ impl VmStartPipeline {
                  told one over DHCP",
                 adapter.endpoint_id, mapping.vm_name
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             return Err(error);
         };
         (self.dhcp_registrar)(store, &adapter.mac_address, address)?;
 
-        log::info!(
+        tracing::info!(
             "VM \"{}\" ({}) starts on endpoint {}",
             mapping.vm_name,
             mapping.vm_id,
@@ -586,7 +586,7 @@ impl VmStartPipeline {
                 mapping.vm_name,
                 configuration_path.display()
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })
     }
@@ -609,7 +609,7 @@ impl VmStartPipeline {
                 mapping.vm_name,
                 configuration_path.display()
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })
     }
@@ -621,7 +621,7 @@ impl VmStartPipeline {
     ) -> Result<(), RepositoryError> {
         let paths = attachment_paths(document)?;
         if paths.is_empty() {
-            log::warn!(
+            tracing::warn!(
                 "the HCS configuration of VM \"{}\" attaches no files; \
                  starting without granting any VM access",
                 mapping.vm_name
@@ -632,7 +632,7 @@ impl VmStartPipeline {
             // the VM itself, so a file it was not granted is a start that fails
             // with `ERROR_ACCESS_DENIED` deep inside HCS instead of here.
             (self.access_granter)(&mapping.hcs_compute_system_id, path).inspect_err(|error| {
-                log::error!(
+                tracing::error!(
                     "VM \"{}\" cannot be started: it could not be granted access to \"{}\": \
                      {error}",
                     mapping.vm_name,
@@ -655,7 +655,7 @@ fn attachment_paths(document: &str) -> Result<Vec<PathBuf>, RepositoryError> {
         let error = RepositoryError::new(format!(
             "the stored HCS configuration is not valid JSON: {error}"
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })?;
 
@@ -716,7 +716,7 @@ fn with_plan9_shares(
     match hcs_config::apply_plan9_shares(&configuration, &exports) {
         Ok(updated) => updated,
         Err(error) => {
-            log::warn!(
+            tracing::warn!(
                 "VM \"{}\" starts without its Plan9 shares: {error}",
                 mapping.vm_name
             );
@@ -778,7 +778,7 @@ fn ensure_endpoint(
         (EndpointPolicy::Reuse, Some(existing)) => existing,
         (EndpointPolicy::Reuse, None) => {
             if let Some(id) = recorded {
-                log::warn!(
+                tracing::warn!(
                     "HNS no longer knows endpoint {id} of VM \"{vm_name}\"; \
                      creating a new one, which changes the address the guest is offered"
                 );
@@ -796,11 +796,13 @@ fn ensure_endpoint(
             }
             let id = Uuid::new_v4();
             match &address {
-                Some(address) => log::info!(
+                Some(address) => tracing::info!(
                     "replacing the occupied endpoint of VM \"{vm_name}\" with {id} on {}",
                     address.ip_address
                 ),
-                None => log::info!("replacing the occupied endpoint of VM \"{vm_name}\" with {id}"),
+                None => {
+                    tracing::info!("replacing the occupied endpoint of VM \"{vm_name}\" with {id}")
+                }
             }
             (
                 id,
@@ -826,7 +828,7 @@ fn replaced_address(
     existing: Option<&(Uuid, HcnEndpoint)>,
 ) -> Result<Option<EndpointAddress>, RepositoryError> {
     let Some((id, endpoint)) = existing else {
-        log::warn!(
+        tracing::warn!(
             "HNS no longer knows the occupied endpoint of VM \"{vm_name}\"; \
              its replacement is created without an address of its own"
         );
@@ -835,7 +837,7 @@ fn replaced_address(
 
     let address = endpoint.address()?;
     if address.is_none() {
-        log::warn!(
+        tracing::warn!(
             "HNS reports no address for endpoint {id} of VM \"{vm_name}\"; \
              its replacement cannot ask for the old one, so the guest is offered a new address"
         );
@@ -860,7 +862,7 @@ fn prepare_hcs_system(id: &str, configuration: &str) -> Result<(), HcsStartFailu
             match plan_for_existing(&state) {
                 ExistingSystemPlan::StartAsIs => Some(system),
                 ExistingSystemPlan::Rebuild => {
-                    log::info!(
+                    tracing::info!(
                         "compute system \"{id}\" has never run, so it is rebuilt from the \
                          configuration this start prepared -- the one that carries the VM's \
                          network adapter"
@@ -869,7 +871,9 @@ fn prepare_hcs_system(id: &str, configuration: &str) -> Result<(), HcsStartFailu
                     // process still holds open.
                     drop(system);
                     if let Err(error) = cleanup::teardown_compute_system(id) {
-                        log::error!("the compute system \"{id}\" could not be rebuilt: {error}");
+                        tracing::error!(
+                            "the compute system \"{id}\" could not be rebuilt: {error}"
+                        );
                         return Err(HcsStartFailure::Failed(error));
                     }
                     None
@@ -877,7 +881,7 @@ fn prepare_hcs_system(id: &str, configuration: &str) -> Result<(), HcsStartFailu
             }
         }
         None => {
-            log::info!(
+            tracing::info!(
                 "HCS no longer knows compute system \"{id}\"; \
                  re-creating it from the stored configuration before starting it"
             );
@@ -958,7 +962,7 @@ fn reported_state(id: &str) -> Result<HcsSystemState, RepositoryError> {
 /// failed, it does not decide it.
 fn tear_down_after_a_failed_creation(id: &str, failure: HcsStartFailure) -> HcsStartFailure {
     if let Err(error) = cleanup::teardown_compute_system(id) {
-        log::warn!(
+        tracing::warn!(
             "cleanup of the ambiguously-created compute system \"{id}\" also failed: {error}"
         );
     }

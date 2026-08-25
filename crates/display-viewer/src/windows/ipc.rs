@@ -223,7 +223,7 @@ fn serve(pipe: HANDLE, sink: &Sender<Command>, running: &Arc<AtomicBool>) {
             // read rather than a failure.
             let code = unsafe { GetLastError() };
             if code != ERROR_PIPE_CONNECTED && code != ERROR_NO_DATA {
-                log::debug!("the command pipe stopped listening: {code:?}");
+                tracing::debug!("the command pipe stopped listening: {code:?}");
                 break;
             }
         }
@@ -235,15 +235,15 @@ fn serve(pipe: HANDLE, sink: &Sender<Command>, running: &Arc<AtomicBool>) {
             let mut link = Link::new(&mut handle, io::sink());
             match link.read() {
                 Ok(Message::Command(command)) => {
-                    log::info!("the viewer was asked to {command:?}");
+                    tracing::info!("the viewer was asked to {command:?}");
                     if sink.send(command).is_err() {
                         break;
                     }
                 }
-                Ok(other) => log::warn!(
+                Ok(other) => tracing::warn!(
                     "a {other:?} arrived on the command pipe, which answers commands only"
                 ),
-                Err(error) => log::debug!("a command could not be read: {error}"),
+                Err(error) => tracing::debug!("a command could not be read: {error}"),
             }
         }
 

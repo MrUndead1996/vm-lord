@@ -56,7 +56,7 @@ pub fn write_key_pair(vm_directory: &Path, pair: &VmKeyPair) -> Result<(), Repos
                 "VM directory {} already has an SSH key",
                 vm_directory.display()
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             return Err(error);
         }
         Err(error) => return Err(io_failure("create the private key", &private_path, &error)),
@@ -78,7 +78,7 @@ pub fn write_key_pair(vm_directory: &Path, pair: &VmKeyPair) -> Result<(), Repos
     fs::write(&public_path, pair.public_openssh())
         .map_err(|error| io_failure("write the public key", &public_path, &error))?;
 
-    log::debug!("wrote an SSH key pair into {}", keys_directory.display());
+    tracing::debug!("wrote an SSH key pair into {}", keys_directory.display());
     Ok(())
 }
 
@@ -91,7 +91,7 @@ pub fn read_public_key(vm_directory: &Path) -> Result<Option<String>, Repository
     match fs::read_to_string(&path) {
         Ok(key) => Ok(Some(key.trim_end().to_string())),
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            log::debug!("VM directory {} holds no SSH key", vm_directory.display());
+            tracing::debug!("VM directory {} holds no SSH key", vm_directory.display());
             Ok(None)
         }
         Err(error) => Err(io_failure("read the public key", &path, &error)),
@@ -103,7 +103,7 @@ fn io_failure(operation: &str, path: &Path, error: &io::Error) -> RepositoryErro
         "failed to {operation} at {}: {error}",
         path.display()
     ));
-    log::error!("{error}");
+    tracing::error!("{error}");
     error
 }
 
@@ -159,7 +159,7 @@ pub(crate) fn restrict_to_owner(path: &Path) -> Result<(), RepositoryError> {
     // directory would otherwise hand down.
     let sddl = format!("O:{sid}D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{sid})");
     apply_security_descriptor(path, &sddl)?;
-    log::debug!(
+    tracing::debug!(
         "restricted {} to SYSTEM, Administrators and {sid}",
         path.display()
     );
@@ -256,7 +256,11 @@ fn apply_security_descriptor(path: &Path, sddl: &str) -> Result<(), RepositoryEr
         .map_err(|error| fail("set the file's security descriptor", Some(path), error))
 }
 
-fn fail(operation: &str, path: Option<&Path>, error: windows::core::Error) -> RepositoryError {
+fn fail(
+    operation: &'static str,
+    path: Option<&Path>,
+    error: windows::core::Error,
+) -> RepositoryError {
     let error = match path {
         Some(path) => {
             let described = windows_error(operation, None, error);
@@ -264,7 +268,7 @@ fn fail(operation: &str, path: Option<&Path>, error: windows::core::Error) -> Re
         }
         None => windows_error(operation, None, error),
     };
-    log::error!("{error}");
+    tracing::error!("{error}");
     error
 }
 

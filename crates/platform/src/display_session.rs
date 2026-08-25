@@ -15,7 +15,7 @@
 //! session and no longer.
 
 use uuid::Uuid;
-use vmlord_core::{Diagnostic, DiagnosticLevel, DisplayMode};
+use vmlord_core::{DiagnosticLevel, DisplayMode};
 use vmlord_display_protocol::{
     keys::{self, Secret},
     record::{self, Channel, Limits, Record},
@@ -57,8 +57,13 @@ fn control_limits() -> Limits {
 pub(crate) struct Answer {
     /// What to write back down the pipe, in order.
     pub(crate) to_viewer: Vec<Message>,
-    /// What the rest of VMLord is to be told, if anything.
-    pub(crate) diagnostics: Vec<Diagnostic>,
+    /// What the rest of VMLord is to be told, if anything: a level and a
+    /// sentence.
+    ///
+    /// Not a whole record: which subsystem this is and which VM it is about
+    /// are known by the launcher that reports it, and a driver that had to
+    /// name them would be repeating what its caller already knows.
+    pub(crate) diagnostics: Vec<(DiagnosticLevel, String)>,
 }
 
 impl Answer {
@@ -74,7 +79,7 @@ impl Answer {
     fn reported(level: DiagnosticLevel, message: String) -> Self {
         Self {
             to_viewer: Vec::new(),
-            diagnostics: vec![Diagnostic { level, message }],
+            diagnostics: vec![(level, message)],
         }
     }
 }
@@ -155,7 +160,7 @@ impl Driver {
                 // A viewer that sends what only VMLord sends is a build that
                 // disagrees with this one, and the launch contract's revision
                 // check catches the ordinary form of that.
-                log::warn!(
+                tracing::warn!(
                     "the display window of VM \"{}\" sent a {} VMLord does not answer",
                     self.vm_name,
                     name_of(&other)
@@ -170,7 +175,7 @@ impl Driver {
         if self.session.is_none() {
             // The session is the viewer's from the hand-over on, so a record
             // arriving here is one the far side no longer needs answered.
-            log::debug!(
+            tracing::debug!(
                 "a record arrived for VM \"{}\" after its session was handed over",
                 self.vm_name
             );
@@ -213,24 +218,23 @@ impl Driver {
 
         let mut answer = Answer::nothing();
         if let Some(reply) = outcome.reply {
-            answer.to_viewer.push(Message::RelayToViewer(framed(&reply)));
+            answer
+                .to_viewer
+                .push(Message::RelayToViewer(framed(&reply)));
         }
         if outcome.event == Event::ControlEstablished {
             match self.hand_over() {
                 Ok(handover) => {
-                    answer.diagnostics.push(Diagnostic {
-                        level: DiagnosticLevel::Info,
-                        message: format!(
+                    answer.diagnostics.push((
+                        DiagnosticLevel::Info,
+                        format!(
                             "Display of VM \"{}\" opened at {}x{}",
                             self.vm_name, handover.width, handover.height
                         ),
-                    });
+                    ));
                     answer.to_viewer.push(Message::Handover(handover));
                 }
-                Err(reason) => answer.diagnostics.push(Diagnostic {
-                    level: DiagnosticLevel::Error,
-                    message: reason,
-                }),
+                Err(reason) => answer.diagnostics.push((DiagnosticLevel::Error, reason)),
             }
             self.session = None;
         }
@@ -296,7 +300,7 @@ impl Driver {
 
         let (session, hello) = Session::host(&self.secret, self.offer.clone());
         self.session = Some(session);
-        log::info!(
+        tracing::info!(
             "the display window of VM \"{}\" lost control and asked for another session",
             self.vm_name
         );
@@ -324,7 +328,9 @@ fn same_bytes(left: &[u8], right: &[u8]) -> bool {
         && left
             .iter()
             .zip(right)
-            .fold(0_u8, |difference, (left, right)| difference | (left ^ right))
+            .fold(0_u8, |difference, (left, right)| {
+                difference | (left ^ right)
+            })
             == 0
 }
 
@@ -445,12 +451,8 @@ mod tests {
 
     #[test]
     fn the_launch_parameters_name_the_partition_and_the_three_ports() {
-        let (_driver, parameters) = Driver::open(
-            "dev",
-            Secret::generate(),
-            Uuid::from_u128(7),
-            None,
-        );
+        let (_driver, parameters) =
+            Driver::open("dev", Secret::generate(), Uuid::from_u128(7), None);
 
         assert_eq!(parameters.vm_name, "dev");
         assert_eq!(parameters.runtime_id, *Uuid::from_u128(7).as_bytes());
@@ -501,9 +503,7 @@ mod tests {
     fn a_request_carrying_the_wrong_token_is_refused_and_reported() {
         let (mut driver, _guest_secret, _hello, _token) = driver(None);
 
-        let answer = driver.handle(Message::RequestRelay {
-            token: vec![0; 32],
-        });
+        let answer = driver.handle(Message::RequestRelay { token: vec![0; 32] });
 
         assert!(answer.to_viewer.is_empty());
         assert_eq!(answer.diagnostics.len(), 1);

@@ -133,7 +133,7 @@ impl SettingsStore {
                 if settings.image_cache_path.as_os_str().is_empty() {
                     settings.image_cache_path =
                         self.config_directory()?.join(DEFAULT_IMAGE_DIRECTORY);
-                    log::debug!(
+                    tracing::debug!(
                         "settings carried no image cache path; defaulting to {}",
                         settings.image_cache_path.display()
                     );

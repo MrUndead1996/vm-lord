@@ -108,7 +108,7 @@ impl GpuExports {
                 // Debug, not warn: this is the ordinary answer for a path
                 // under `System32`, and a warning per share per start would be
                 // a log that reports the expected as a fault.
-                log::debug!(
+                tracing::debug!(
                     "share \"{}\" is offered without an explicit grant: the VM could not be \
                      given access to \"{}\": {error}",
                     export.name(),
@@ -166,7 +166,7 @@ fn system_directory() -> Option<PathBuf> {
     // call did not fill it.
     let length = unsafe { GetSystemDirectoryW(Some(&mut buffer)) } as usize;
     if length == 0 || length > buffer.len() {
-        log::warn!("the system directory could not be read; nothing may be exported");
+        tracing::warn!("the system directory could not be read; nothing may be exported");
         return None;
     }
 
@@ -182,11 +182,11 @@ pub(crate) fn program_files_directory() -> Option<PathBuf> {
     // SAFETY: the call takes no borrowed memory, and the buffer it returns is
     // the caller's to free.
     let path = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, None) }
-        .inspect_err(|error| log::debug!("Program Files could not be read: {error}"))
+        .inspect_err(|error| tracing::debug!("Program Files could not be read: {error}"))
         .ok()?;
     // SAFETY: a successful call returns a NUL-terminated wide string.
     let directory = unsafe { path.to_string() }
-        .inspect_err(|error| log::debug!("Program Files is not valid UTF-16: {error}"))
+        .inspect_err(|error| tracing::debug!("Program Files is not valid UTF-16: {error}"))
         .ok()
         .map(PathBuf::from);
     // SAFETY: `path` came from the call above and is freed exactly once.
@@ -317,7 +317,7 @@ impl ExportRoots {
     ) -> Self {
         let wsl_d3d12 = program_files.and_then(|program_files| {
             let Ok(program_files) = canonicalize(program_files) else {
-                log::debug!("Program Files could not be resolved; no D3D12 share");
+                tracing::debug!("Program Files could not be resolved; no D3D12 share");
                 return None;
             };
             resolve_root(
@@ -328,7 +328,7 @@ impl ExportRoots {
         });
 
         let Ok(system32) = canonicalize(system32) else {
-            log::warn!("the system directory could not be resolved; nothing may be exported");
+            tracing::warn!("the system directory could not be resolved; nothing may be exported");
             return Self {
                 driver_packages: None,
                 wsl_lib: None,
@@ -352,7 +352,7 @@ fn resolve_root(root: &Path, candidate: &Path, canonicalize: Canonicalize<'_>) -
     match canonicalize(candidate) {
         Ok(resolved) if is_within(root, &resolved) => Some(resolved),
         Ok(resolved) => {
-            log::warn!(
+            tracing::warn!(
                 "refusing to export from \"{}\": it resolves to \"{}\", outside \"{}\"",
                 candidate.display(),
                 resolved.display(),
@@ -361,7 +361,7 @@ fn resolve_root(root: &Path, candidate: &Path, canonicalize: Canonicalize<'_>) -
             None
         }
         Err(error) => {
-            log::debug!(
+            tracing::debug!(
                 "nothing to export from \"{}\": {error}",
                 candidate.display()
             );
@@ -408,7 +408,7 @@ pub(crate) fn build_with(
         let resolved = match canonicalize(driver_store) {
             Ok(resolved) => resolved,
             Err(error) => {
-                log::warn!(
+                tracing::warn!(
                     "not exporting the driver package of \"{}\": {error}",
                     adapter.name
                 );
@@ -416,7 +416,7 @@ pub(crate) fn build_with(
             }
         };
         if !is_within(root, &resolved) {
-            log::warn!(
+            tracing::warn!(
                 "not exporting \"{}\" for \"{}\": it resolves to \"{}\", outside \"{}\"",
                 driver_store.display(),
                 adapter.name,
@@ -439,7 +439,7 @@ pub(crate) fn build_with(
             continue;
         };
         let Some(share) = GpuShare::driver_package(&folder) else {
-            log::warn!(
+            tracing::warn!(
                 "not exporting \"{}\": \"{folder}\" cannot become a share name",
                 resolved.display()
             );

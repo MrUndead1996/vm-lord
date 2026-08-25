@@ -38,7 +38,7 @@ pub fn open_cloud_image(
     progress: &ProgressPublisher<DownloadPhase>,
     cancel: &AtomicBool,
 ) -> Result<Qcow2Image, RepositoryError> {
-    log::debug!(
+    tracing::debug!(
         "preparing {} {release} for a {capacity}-byte disk, cached in {}",
         profile.name,
         cache_directory.display()
@@ -57,7 +57,7 @@ pub fn open_cloud_image(
     .map_err(at_the_boundary)?;
 
     let image = Qcow2Image::open(&path, capacity).map_err(at_the_boundary)?;
-    log::debug!(
+    tracing::debug!(
         "opened {} as a {}-byte disk",
         path.display(),
         image.virtual_size()

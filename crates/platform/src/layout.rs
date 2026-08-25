@@ -33,7 +33,7 @@ pub(crate) fn vm_directory(storage_root: &Path, vm_name: &str) -> Result<PathBuf
             let error = RepositoryError::new(format!(
                 "VM name \"{vm_name}\" cannot be used as a directory name"
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             Err(error)
         }
     }

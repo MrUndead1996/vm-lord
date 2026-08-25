@@ -86,7 +86,7 @@ impl AttachedDisk {
         };
         result.ok().map_err(|error| {
             let error = windows_error("open virtual disk for attach", None, error);
-            log::error!("{} for {}", error, path.display());
+            tracing::error!("{} for {}", error, path.display());
             error
         })?;
 
@@ -109,7 +109,7 @@ impl AttachedDisk {
         };
         if let Err(error) = result.ok() {
             let error = windows_error("attach virtual disk", None, error);
-            log::error!("{} for {}", error, path.display());
+            tracing::error!("{} for {}", error, path.display());
             // SAFETY: the disk was opened above and never attached, so closing
             // the handle is all the undoing there is.
             let _ = unsafe { CloseHandle(handle) };
@@ -122,7 +122,7 @@ impl AttachedDisk {
             detached: false,
         };
         attached.physical_path = attached.read_physical_path(path)?;
-        log::info!("attached {} as {}", path.display(), attached.physical_path);
+        tracing::info!("attached {} as {}", path.display(), attached.physical_path);
         Ok(attached)
     }
 
@@ -146,15 +146,15 @@ impl AttachedDisk {
 
         detached.ok().map_err(|error| {
             let error = windows_error("detach virtual disk", None, error);
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
         closed.map_err(|error| {
             let error = windows_error("close virtual disk handle", None, error);
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
-        log::debug!("detached {}", self.physical_path);
+        tracing::debug!("detached {}", self.physical_path);
         Ok(())
     }
 
@@ -170,7 +170,7 @@ impl AttachedDisk {
         };
         result.ok().map_err(|error| {
             let error = windows_error("get virtual disk physical path", None, error);
-            log::error!("{} for {}", error, path.display());
+            tracing::error!("{} for {}", error, path.display());
             error
         })?;
 
@@ -184,7 +184,7 @@ impl Drop for AttachedDisk {
         if self.detached {
             return;
         }
-        log::warn!(
+        tracing::warn!(
             "detaching {} during unwind; the import did not finish",
             self.physical_path
         );
@@ -233,11 +233,11 @@ impl PhysicalDrive {
         }
         .map_err(|error| {
             let error = windows_error("open physical drive", None, error);
-            log::error!("{error} for {physical_path}");
+            tracing::error!("{error} for {physical_path}");
             error
         })?;
 
-        log::debug!("opened {physical_path} unbuffered, {chunk_bytes} bytes at a time");
+        tracing::debug!("opened {physical_path} unbuffered, {chunk_bytes} bytes at a time");
         Ok(Self {
             handle,
             path: physical_path.to_owned(),
@@ -256,7 +256,7 @@ impl PhysicalDrive {
         // asked for.
         unsafe { SetFilePointerEx(self.handle, distance, None, FILE_BEGIN) }.map_err(|error| {
             let error = windows_error("seek on physical drive", None, error);
-            log::error!("{error} to {offset} on {}", self.path);
+            tracing::error!("{error} to {offset} on {}", self.path);
             error
         })
     }
@@ -286,7 +286,7 @@ impl DiskBlocks for PhysicalDrive {
         }
         .map_err(|error| {
             let error = windows_error("write to physical drive", None, error);
-            log::error!("{error} at {offset} on {}", self.path);
+            tracing::error!("{error} at {offset} on {}", self.path);
             error
         })?;
 
@@ -295,10 +295,10 @@ impl DiskBlocks for PhysicalDrive {
                 "a {length}-byte write at {offset} on {} moved {written} bytes",
                 self.path
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             return Err(error);
         }
-        log::debug!("wrote {length} bytes at {offset} on {}", self.path);
+        tracing::debug!("wrote {length} bytes at {offset} on {}", self.path);
         Ok(())
     }
 
@@ -314,7 +314,7 @@ impl DiskBlocks for PhysicalDrive {
         unsafe { ReadFile(self.handle, Some(scratch), Some(&mut read), None) }.map_err(
             |error| {
                 let error = windows_error("read from physical drive", None, error);
-                log::error!("{error} at {offset} on {}", self.path);
+                tracing::error!("{error} at {offset} on {}", self.path);
                 error
             },
         )?;
@@ -325,7 +325,7 @@ impl DiskBlocks for PhysicalDrive {
                 bytes.len(),
                 self.path
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             return Err(error);
         }
         let wanted = bytes.len();
@@ -337,10 +337,10 @@ impl DiskBlocks for PhysicalDrive {
         // SAFETY: `handle` is the drive opened above and still open.
         unsafe { FlushFileBuffers(self.handle) }.map_err(|error| {
             let error = windows_error("flush physical drive", None, error);
-            log::error!("{error} on {}", self.path);
+            tracing::error!("{error} on {}", self.path);
             error
         })?;
-        log::debug!("flushed {}", self.path);
+        tracing::debug!("flushed {}", self.path);
         Ok(())
     }
 }

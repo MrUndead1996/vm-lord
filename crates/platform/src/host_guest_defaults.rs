@@ -186,7 +186,9 @@ fn xkb_layout(klid: &str) -> String {
     const DEFAULT_LAYOUT: &str = "us";
 
     let Ok(identifier) = u32::from_str_radix(klid.trim(), 16) else {
-        log::warn!("the host keyboard identifier \"{klid}\" is not a KLID; using {DEFAULT_LAYOUT}");
+        tracing::warn!(
+            "the host keyboard identifier \"{klid}\" is not a KLID; using {DEFAULT_LAYOUT}"
+        );
         return DEFAULT_LAYOUT.to_owned();
     };
 
@@ -208,7 +210,9 @@ fn xkb_layout(klid: &str) -> String {
     match found {
         Some(layout) => layout.to_owned(),
         None => {
-            log::warn!("no XKB layout is known for the host KLID {klid}; using {DEFAULT_LAYOUT}");
+            tracing::warn!(
+                "no XKB layout is known for the host KLID {klid}; using {DEFAULT_LAYOUT}"
+            );
             DEFAULT_LAYOUT.to_owned()
         }
     }
@@ -233,11 +237,11 @@ fn host_locale() -> Option<String> {
     let mut buffer = [0u16; 85];
     let written = unsafe { GetUserDefaultLocaleName(&mut buffer) };
     if written <= 0 {
-        log::warn!("the host locale could not be read");
+        tracing::warn!("the host locale could not be read");
         return None;
     }
     let tag = terminated(&buffer);
-    log::debug!("the host locale is {tag}");
+    tracing::debug!("the host locale is {tag}");
     Some(tag)
 }
 
@@ -248,11 +252,11 @@ fn host_locale() -> Option<String> {
 fn host_klid() -> Option<String> {
     let mut buffer = [0u16; 9];
     if let Err(error) = unsafe { GetKeyboardLayoutNameW(&mut buffer) } {
-        log::warn!("the host keyboard layout could not be read: {error}");
+        tracing::warn!("the host keyboard layout could not be read: {error}");
         return None;
     }
     let klid = terminated(&buffer);
-    log::debug!("the host keyboard identifier is {klid}");
+    tracing::debug!("the host keyboard identifier is {klid}");
     Some(klid)
 }
 
@@ -264,11 +268,11 @@ fn host_time_zone_key() -> Option<String> {
 
     let mut information = DYNAMIC_TIME_ZONE_INFORMATION::default();
     if unsafe { GetDynamicTimeZoneInformation(&mut information) } == TIME_ZONE_ID_INVALID {
-        log::warn!("the host time zone could not be read");
+        tracing::warn!("the host time zone could not be read");
         return None;
     }
     let key = terminated(&information.TimeZoneKeyName);
-    log::debug!("the host time zone key is {key}");
+    tracing::debug!("the host time zone key is {key}");
     Some(key)
 }
 
@@ -298,7 +302,7 @@ fn guest_defaults(
     let locale = match locale.and_then(posix_locale) {
         Some(mapped) => mapped,
         None => {
-            log::warn!(
+            tracing::warn!(
                 "the host locale {} has no POSIX name; the guest starts out with {}",
                 locale.unwrap_or("<unreadable>"),
                 fallback.locale
@@ -310,7 +314,7 @@ fn guest_defaults(
     let timezone = match timezone.and_then(iana_timezone) {
         Some(mapped) => mapped,
         None => {
-            log::warn!(
+            tracing::warn!(
                 "the host time zone {} has no IANA name; the guest starts out with {}",
                 timezone.unwrap_or("<unreadable>"),
                 fallback.timezone
@@ -319,7 +323,7 @@ fn guest_defaults(
         }
     };
 
-    log::info!(
+    tracing::info!(
         "a new VM starts out with locale {locale}, keyboard {keyboard}, timezone {timezone}"
     );
     GuestDefaults {

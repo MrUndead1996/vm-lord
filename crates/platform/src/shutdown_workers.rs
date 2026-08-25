@@ -70,7 +70,7 @@ impl ShutdownWorkers {
         if workers.iter().any(|worker| worker.vm_id == vm_id) {
             let error =
                 RepositoryError::new(format!("VM \"{vm_name}\" is already being shut down"));
-            log::error!("{error}");
+            tracing::error!("{error}");
             return Err(error);
         }
 
@@ -97,11 +97,11 @@ impl ShutdownWorkers {
                 let error = RepositoryError::new(format!(
                     "the thread shutting down VM \"{vm_name}\" could not be started: {error}"
                 ));
-                log::error!("{error}");
+                tracing::error!("{error}");
                 error
             })?;
 
-        log::info!("asking VM \"{vm_name}\" to shut down in the background");
+        tracing::info!("asking VM \"{vm_name}\" to shut down in the background");
         workers.push(Worker {
             vm_id,
             vm_name: vm_name.to_owned(),
@@ -158,7 +158,7 @@ impl ShutdownWorkers {
         for worker in self.lock().drain(..) {
             let vm_name = worker.vm_name.clone();
             if let Err(error) = collect(worker).result {
-                log::warn!("VM \"{vm_name}\" was not asked to shut down: {error}");
+                tracing::warn!("VM \"{vm_name}\" was not asked to shut down: {error}");
             }
         }
     }
@@ -177,7 +177,7 @@ fn collect(mut worker: Worker) -> FinishedShutdown {
     if let Some(handle) = worker.handle.take()
         && handle.join().is_err()
     {
-        log::error!(
+        tracing::error!(
             "the thread asking VM \"{}\" to shut down panicked",
             worker.vm_name
         );

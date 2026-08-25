@@ -148,7 +148,7 @@ impl VmEventSink {
     }
 }
 
-use vmlord_core::{Diagnostic, DiagnosticLevel};
+use vmlord_core::Subsystem;
 
 /// The longest `EventData` excerpt a diagnostic carries.
 const DETAILS_LIMIT: usize = 200;
@@ -165,8 +165,6 @@ impl HcsEventKind {
 
 /// What a drain leaves the caller to act on.
 pub(crate) struct DrainedEvents {
-    /// The diagnostics to surface, in arrival order.
-    pub diagnostics: Vec<Diagnostic>,
     /// The VMs whose held handle the events proved dead.
     pub released: Vec<Uuid>,
     /// The VMs whose compute system stopped executing.
@@ -201,18 +199,19 @@ pub(crate) fn drain_events(
 ) -> DrainedEvents {
     let (events, dropped) = sink.drain();
     if dropped > 0 {
-        log::warn!("{dropped} HCS event(s) were discarded because VMLord's event queue was full");
+        tracing::warn!(
+            "{dropped} HCS event(s) were discarded because VMLord's event queue was full"
+        );
     }
 
     let mut drained = DrainedEvents {
-        diagnostics: Vec::new(),
         released: Vec::new(),
         stopped: Vec::new(),
         service_disconnected: false,
     };
     for event in events {
         if superseded(event.vm_id, event.generation) {
-            log::debug!(
+            tracing::debug!(
                 "dropping a stale HCS event for VM \"{}\" ({}): it was queued by \
                  watch generation {}, which VMLord has since replaced",
                 event.vm_name,
@@ -231,70 +230,66 @@ pub(crate) fn drain_events(
         // the handle too, but what makes it worth reporting is the service being
         // gone, which is true whether or not the handle went with it.
         drained.service_disconnected |= matches!(event.kind, HcsEventKind::ServiceDisconnect);
-        if let Some(diagnostic) = report(&event) {
-            drained.diagnostics.push(diagnostic);
-        }
+        report(&event);
     }
     drained
 }
 
-/// Logs `event` and returns the diagnostic the user should see, if any.
+/// Records `event`, marking the ones the user should see.
 ///
-/// Noise HCS reports but VMLord has nothing to do about stays in the log only:
-/// the diagnostics buffer holds 100 entries, and filling it with silo-job
-/// notifications would push out the crash report that matters.
-fn report(event: &HcsVmEvent) -> Option<Diagnostic> {
+/// One event rather than a log line and a diagnostic side by side: the record
+/// layer writes the fields too, so the file keeps the compute system's id and
+/// what HCS said, while the panel shows the sentence. Noise HCS reports but
+/// VMLord has nothing to do about goes unmarked -- the panel holds 100
+/// records, and filling it with silo-job notifications would push out the
+/// crash report that matters.
+///
+/// The VM is named on every record because these arrive on the event thread,
+/// which is inside no operation's span.
+fn report(event: &HcsVmEvent) {
     let name = &event.vm_name;
     let vm_id = event.vm_id;
     let details = event.details.as_deref().unwrap_or("");
 
     match &event.kind {
-        HcsEventKind::Exited => {
-            log::info!("VM \"{name}\" ({vm_id}) exited; HCS reported: {details}");
-            Some(diagnostic(
-                DiagnosticLevel::Info,
-                format!("VM \"{name}\" stopped"),
-            ))
-        }
-        HcsEventKind::CrashInitiated => {
-            log::warn!("the guest of VM \"{name}\" ({vm_id}) is crashing; HCS reported: {details}");
-            Some(diagnostic(
-                DiagnosticLevel::Warning,
-                format!("The guest of VM \"{name}\" is crashing"),
-            ))
-        }
-        HcsEventKind::CrashReport => {
-            log::error!("the guest of VM \"{name}\" ({vm_id}) crashed; HCS reported: {details}");
-            Some(diagnostic(
-                DiagnosticLevel::Error,
-                format!(
-                    "The guest of VM \"{name}\" crashed; HCS reported: {}",
-                    excerpt(details)
-                ),
-            ))
-        }
-        HcsEventKind::ServiceDisconnect => {
-            log::error!(
-                "the Host Compute Service disconnected from VM \"{name}\" ({vm_id}); \
-                 HCS reported: {details}"
-            );
-            Some(diagnostic(
-                DiagnosticLevel::Error,
-                format!("The Host Compute Service disconnected from VM \"{name}\""),
-            ))
-        }
-        HcsEventKind::Ignored(event_type) => {
-            log::debug!(
-                "VM \"{name}\" ({vm_id}) reported HCS event type {event_type}, \
-                 which VMLord does not act on; HCS reported: {details}"
-            );
-            None
-        }
+        HcsEventKind::Exited => vmlord_core::diagnostic!(
+            Info,
+            Subsystem::Hcs,
+            vm = name.as_str(),
+            vm_id = %vm_id,
+            details,
+            "VM \"{name}\" stopped"
+        ),
+        HcsEventKind::CrashInitiated => vmlord_core::diagnostic!(
+            Warning,
+            Subsystem::Hcs,
+            vm = name.as_str(),
+            vm_id = %vm_id,
+            details,
+            "The guest of VM \"{name}\" is crashing"
+        ),
+        HcsEventKind::CrashReport => vmlord_core::diagnostic!(
+            Error,
+            Subsystem::Hcs,
+            vm = name.as_str(),
+            vm_id = %vm_id,
+            details,
+            "The guest of VM \"{name}\" crashed; HCS reported: {}",
+            excerpt(details)
+        ),
+        HcsEventKind::ServiceDisconnect => vmlord_core::diagnostic!(
+            Error,
+            Subsystem::Hcs,
+            vm = name.as_str(),
+            vm_id = %vm_id,
+            details,
+            "The Host Compute Service disconnected from VM \"{name}\""
+        ),
+        HcsEventKind::Ignored(event_type) => tracing::debug!(
+            "VM \"{name}\" ({vm_id}) reported HCS event type {event_type}, \
+             which VMLord does not act on; HCS reported: {details}"
+        ),
     }
-}
-
-fn diagnostic(level: DiagnosticLevel, message: String) -> Diagnostic {
-    Diagnostic { level, message }
 }
 
 /// Shortens `details` to something a diagnostics line can hold.
@@ -401,7 +396,7 @@ impl SystemWatch {
             ));
         }
 
-        log::debug!(
+        tracing::debug!(
             "watching the HCS events of VM \"{vm_name}\" ({vm_id}) as generation {generation}"
         );
         Ok(Self { system, context })
@@ -434,7 +429,7 @@ impl Drop for SystemWatch {
                 // calling `Arc::from_raw` is what leaks it, and leaking one
                 // small allocation is not comparable to a thread inside HCS
                 // dereferencing freed memory.
-                log::error!(
+                tracing::error!(
                     "could not remove the HCS event callback of VM {:?}: {error}; \
                      its context is leaked deliberately rather than freed while \
                      HCS may still call into it",
@@ -628,7 +623,8 @@ mod tests {
     }
 
     use super::{DETAILS_LIMIT, DrainedEvents, drain_events};
-    use vmlord_core::DiagnosticLevel;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use vmlord_core::{DiagnosticLevel, DiagnosticsLayer, DiagnosticsSink};
 
     fn event_of(kind: HcsEventKind, details: Option<&str>) -> HcsVmEvent {
         HcsVmEvent {
@@ -646,6 +642,27 @@ mod tests {
         false
     }
 
+    /// Drains `sink` with the records it produced.
+    ///
+    /// The subscriber is scoped to this call: two tests running side by side
+    /// read their own records and not each other's.
+    fn drain_with_records(sink: &VmEventSink) -> (DrainedEvents, Vec<vmlord_core::Diagnostic>) {
+        drain_superseded_with_records(sink, nothing_superseded)
+    }
+
+    /// The same, for the tests that decide what a newer watch has replaced.
+    fn drain_superseded_with_records(
+        sink: &VmEventSink,
+        superseded: impl FnMut(Uuid, u64) -> bool,
+    ) -> (DrainedEvents, Vec<vmlord_core::Diagnostic>) {
+        let records = DiagnosticsSink::new();
+        let subscriber =
+            tracing_subscriber::registry().with(DiagnosticsLayer::new(records.clone()));
+        let drained =
+            tracing::subscriber::with_default(subscriber, || drain_events(sink, superseded));
+        (drained, records.take())
+    }
+
     #[test]
     fn an_exit_is_reported_and_releases_the_handle() {
         let sink = VmEventSink::default();
@@ -653,12 +670,12 @@ mod tests {
         let vm_id = exited.vm_id;
         sink.push(exited);
 
-        let DrainedEvents {
+        let (
+            DrainedEvents {
+                released, stopped, ..
+            },
             diagnostics,
-            released,
-            stopped,
-            ..
-        } = drain_events(&sink, nothing_superseded);
+        ) = drain_with_records(&sink);
 
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].level, DiagnosticLevel::Info);
@@ -677,11 +694,7 @@ mod tests {
         let sink = VmEventSink::default();
         sink.push(event_of(HcsEventKind::CrashInitiated, None));
 
-        let DrainedEvents {
-            diagnostics,
-            released,
-            ..
-        } = drain_events(&sink, nothing_superseded);
+        let (DrainedEvents { released, .. }, diagnostics) = drain_with_records(&sink);
 
         assert_eq!(diagnostics[0].level, DiagnosticLevel::Warning);
         assert!(released.is_empty());
@@ -695,11 +708,7 @@ mod tests {
             Some("{\"DumpFile\":\"C:\\\\dumps\\\\dev.dmp\"}"),
         ));
 
-        let DrainedEvents {
-            diagnostics,
-            released,
-            ..
-        } = drain_events(&sink, nothing_superseded);
+        let (DrainedEvents { released, .. }, diagnostics) = drain_with_records(&sink);
 
         assert_eq!(diagnostics[0].level, DiagnosticLevel::Error);
         assert!(diagnostics[0].message.contains("dev.dmp"));
@@ -720,12 +729,12 @@ mod tests {
         let vm_id = disconnected.vm_id;
         sink.push(disconnected);
 
-        let DrainedEvents {
+        let (
+            DrainedEvents {
+                released, stopped, ..
+            },
             diagnostics,
-            released,
-            stopped,
-            ..
-        } = drain_events(&sink, nothing_superseded);
+        ) = drain_with_records(&sink);
 
         assert_eq!(diagnostics[0].level, DiagnosticLevel::Error);
         assert_eq!(released, vec![vm_id]);
@@ -741,11 +750,7 @@ mod tests {
         let sink = VmEventSink::default();
         sink.push(event_of(HcsEventKind::Ignored(4), Some("noise")));
 
-        let DrainedEvents {
-            diagnostics,
-            released,
-            ..
-        } = drain_events(&sink, nothing_superseded);
+        let (DrainedEvents { released, .. }, diagnostics) = drain_with_records(&sink);
 
         assert!(diagnostics.is_empty());
         assert!(released.is_empty());
@@ -762,7 +767,7 @@ mod tests {
             Some(&"д".repeat(DETAILS_LIMIT * 2)),
         ));
 
-        let DrainedEvents { diagnostics, .. } = drain_events(&sink, nothing_superseded);
+        let (_, diagnostics) = drain_with_records(&sink);
 
         assert!(diagnostics[0].message.ends_with("..."));
         assert!(diagnostics[0].message.chars().count() < DETAILS_LIMIT * 2);
@@ -774,11 +779,7 @@ mod tests {
         sink.push(event_of(HcsEventKind::CrashInitiated, None));
         sink.push(event_of(HcsEventKind::Exited, None));
 
-        let DrainedEvents {
-            diagnostics,
-            released,
-            ..
-        } = drain_events(&sink, nothing_superseded);
+        let (DrainedEvents { released, .. }, diagnostics) = drain_with_records(&sink);
 
         assert_eq!(
             diagnostics
@@ -902,15 +903,14 @@ mod tests {
         let vm_id = stale.vm_id;
         sink.push(stale);
 
-        let drained = drain_events(&sink, |asked, generation| {
+        let (drained, diagnostics) = drain_superseded_with_records(&sink, |asked, generation| {
             assert_eq!(asked, vm_id);
             generation != 5
         });
 
         assert!(
-            drained.diagnostics.is_empty(),
-            "a superseded event must not tell the user a running VM stopped: {:?}",
-            drained.diagnostics
+            diagnostics.is_empty(),
+            "a superseded event must not tell the user a running VM stopped: {diagnostics:?}"
         );
         assert!(
             drained.released.is_empty(),
@@ -930,9 +930,10 @@ mod tests {
         let vm_id = current.vm_id;
         sink.push(current);
 
-        let drained = drain_events(&sink, |_vm_id, generation| generation != 5);
+        let (drained, diagnostics) =
+            drain_superseded_with_records(&sink, |_vm_id, generation| generation != 5);
 
-        assert_eq!(drained.diagnostics.len(), 1);
+        assert_eq!(diagnostics.len(), 1);
         assert_eq!(drained.released, vec![vm_id]);
     }
 
@@ -944,9 +945,9 @@ mod tests {
         let sink = VmEventSink::default();
         sink.push(event_of(HcsEventKind::CrashReport, Some("old dump")));
 
-        let drained = drain_events(&sink, |_vm_id, _generation| true);
+        let (_, diagnostics) = drain_superseded_with_records(&sink, |_vm_id, _generation| true);
 
-        assert!(drained.diagnostics.is_empty());
+        assert!(diagnostics.is_empty());
     }
 
     /// Finding 2: the disconnect releases every handle and nothing
@@ -981,11 +982,12 @@ mod tests {
         let sink = VmEventSink::default();
         sink.push(event_of(HcsEventKind::ServiceDisconnect, None));
 
-        let drained = drain_events(&sink, |_vm_id, _generation| true);
+        let (drained, diagnostics) =
+            drain_superseded_with_records(&sink, |_vm_id, _generation| true);
 
         assert!(!drained.service_disconnected);
         assert!(drained.released.is_empty());
-        assert!(drained.diagnostics.is_empty());
+        assert!(diagnostics.is_empty());
     }
 
     /// The generation is what makes the staleness check possible at all, so the

@@ -73,7 +73,7 @@ impl SshPort {
         NonZeroU16::new(port).map(Self).ok_or_else(|| {
             let error =
                 RepositoryError::new("the SSH port must be between 1 and 65535, and 0 is not one");
-            log::warn!("rejected SSH port: {error}");
+            tracing::warn!("rejected SSH port: {error}");
             error
         })
     }

@@ -210,7 +210,7 @@ impl BuildMonitor {
 
     /// Records the step the build has reached.
     pub fn report(&self, step: BuildStep) {
-        log::debug!("a VM build reached {step:?}");
+        tracing::debug!("a VM build reached {step:?}");
         self.step.publish(step);
     }
 

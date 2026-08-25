@@ -214,7 +214,7 @@ pub fn run_com1_helper(options: Com1HelperOptions) -> Result<(), RepositoryError
 
     match capture(&options, &cancel, &ready) {
         Ok(()) => {
-            log::debug!(
+            tracing::debug!(
                 "COM1 capture for VM \"{}\" finished; output is in {}",
                 options.vm_name,
                 options.log_path.display()
@@ -223,7 +223,7 @@ pub fn run_com1_helper(options: Com1HelperOptions) -> Result<(), RepositoryError
         }
         Err(error) => {
             let _ = failed.signal();
-            log::error!(
+            tracing::error!(
                 "COM1 capture for VM \"{}\" failed: {error}",
                 options.vm_name
             );
@@ -247,7 +247,7 @@ fn capture(
     // Before the pipe, not after: the point of the replay is that the window
     // has something in it while the connection is still being made.
     replay_tail(options);
-    log::debug!(
+    tracing::debug!(
         "COM1 reader for VM \"{}\" is waiting for {}",
         options.vm_name,
         options.pipe_path.display()
@@ -256,7 +256,7 @@ fn capture(
     let Some(pipe) = connect(options, cancel, &parent)? else {
         return Ok(());
     };
-    log::debug!("COM1 reader for VM \"{}\" is connected", options.vm_name);
+    tracing::debug!("COM1 reader for VM \"{}\" is connected", options.vm_name);
 
     // The pipe is shared, not handed over: the input thread outlives this call
     // by design, and its `Arc` keeps the handle open until the process exits.
@@ -576,7 +576,7 @@ fn replay_tail(options: &Com1HelperOptions) {
     let history = match read_tail(&options.log_path, REPLAY_TAIL_BYTES) {
         Ok(history) => history,
         Err(error) => {
-            log::warn!(
+            tracing::warn!(
                 "the COM1 console of VM \"{}\" opens without history: {} could not be read: \
                  {error}",
                 options.vm_name,
@@ -606,13 +606,13 @@ fn replay_tail(options: &Com1HelperOptions) {
         .and_then(|()| stdout.write_all(&tail))
         .and_then(|()| stdout.flush())
     {
-        log::warn!(
+        tracing::warn!(
             "could not replay the COM1 history of VM \"{}\": {error}",
             options.vm_name
         );
         return;
     }
-    log::debug!(
+    tracing::debug!(
         "the COM1 console of VM \"{}\" opened with {} byte(s) of history",
         options.vm_name,
         tail.len()
@@ -758,7 +758,7 @@ fn open_log(options: &Com1HelperOptions) -> Result<File, RepositoryError> {
             options.log_path.display(),
             options.vm_name
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })
 }

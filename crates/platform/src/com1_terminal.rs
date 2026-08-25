@@ -77,7 +77,7 @@ impl Com1Session {
     /// is not an error, and neither is one whose terminal a person closed.
     fn cancel(&self) {
         if let Err(error) = self.cancel.signal() {
-            log::warn!(
+            tracing::warn!(
                 "could not cancel the COM1 reader for VM \"{}\": {error}",
                 self.vm_name
             );
@@ -114,7 +114,7 @@ impl Com1Session {
                 // Unprovable rather than proven: a reader that may still be
                 // reading is left alone, as it was before this could be asked.
                 Err(error) => {
-                    log::warn!(
+                    tracing::warn!(
                         "could not tell whether the COM1 reader for VM \"{}\" is still \
                          running: {error}",
                         self.vm_name
@@ -202,7 +202,7 @@ impl Com1Sessions {
                     vm_name: session.vm_name.clone(),
                 });
             } else {
-                log::debug!(
+                tracing::debug!(
                     "the COM1 reader for VM \"{}\" finished with its pipe",
                     session.vm_name
                 );
@@ -325,7 +325,7 @@ impl Com1Launcher {
         // that the start it was opened for is not happening.
         self.await_readiness(&ready, &session)?;
 
-        log::info!(
+        tracing::info!(
             "COM1 diagnostics for VM \"{}\" are being captured to {}",
             mapping.vm_name,
             com1_log_path(vm_directory).display()
@@ -364,7 +364,7 @@ impl Com1Launcher {
             match (self.spawn)(&command) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    log::warn!(
+                    tracing::warn!(
                         "could not open the COM1 console of VM \"{vm_name}\" with {}: {error}",
                         command.program.display()
                     );
@@ -377,7 +377,7 @@ impl Com1Launcher {
             "cannot open a terminal for the COM1 console of VM \"{vm_name}\" ({})",
             refusals.join("; ")
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         Err(error)
     }
 
@@ -409,7 +409,7 @@ impl Com1Launcher {
             "the COM1 console of VM \"{}\" did not start capturing",
             session.vm_name
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         Err(error)
     }
 
@@ -636,7 +636,7 @@ fn helper_path(vm_name: &str) -> Result<PathBuf, RepositoryError> {
             "the COM1 console of VM \"{vm_name}\" cannot be opened: {} is missing",
             helper.display()
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         return Err(error);
     }
     Ok(helper)

@@ -68,17 +68,17 @@ impl HcnNetwork {
     /// remembers.
     pub fn ensure() -> Result<Self, RepositoryError> {
         if let Some(network) = Self::open_if_present(VMLORD_NETWORK_ID)? {
-            log::debug!("the VMLord NAT network already exists");
+            tracing::debug!("the VMLord NAT network already exists");
             return Ok(network);
         }
 
         let subnet = choose_subnet(&host_subnets()?);
         let settings = nat_network_settings(subnet)?;
-        log::info!("creating the VMLord NAT network on {subnet}");
+        tracing::info!("creating the VMLord NAT network on {subnet}");
 
         match Self::create(VMLORD_NETWORK_ID, &settings) {
             Ok(network) => {
-                log::info!("created the VMLord NAT network on {subnet}");
+                tracing::info!("created the VMLord NAT network on {subnet}");
                 Ok(network)
             }
             // Another VMLord process may have created the network between the
@@ -86,7 +86,7 @@ impl HcnNetwork {
             // subnet -- is the one to use.
             Err(error) => match Self::open_if_present(VMLORD_NETWORK_ID)? {
                 Some(network) => {
-                    log::debug!(
+                    tracing::debug!(
                         "the VMLord NAT network was created concurrently; using the existing one \
                          instead of reporting: {error}"
                     );
@@ -101,7 +101,7 @@ impl HcnNetwork {
     pub fn open(id: u128) -> Result<Self, RepositoryError> {
         Self::try_open(id).map_err(|error| {
             let error = windows_error("open HCN network", None, error);
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })
     }
@@ -111,12 +111,12 @@ impl HcnNetwork {
         match Self::try_open(id) {
             Ok(network) => Ok(Some(network)),
             Err(error) if is_network_absent(&error) => {
-                log::debug!("HNS does not know network {:?}", GUID::from_u128(id));
+                tracing::debug!("HNS does not know network {:?}", GUID::from_u128(id));
                 Ok(None)
             }
             Err(error) => {
                 let error = windows_error("open HCN network", None, error);
-                log::error!("{error}");
+                tracing::error!("{error}");
                 Err(error)
             }
         }
@@ -141,7 +141,7 @@ impl HcnNetwork {
         // handle to this wrapper.
         unsafe { HcnCreateNetwork(&id, &settings, &mut network, None) }.map_err(|error| {
             let error = windows_error("create HCN network", None, error);
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
         Ok(Self(network))
@@ -159,20 +159,20 @@ impl HcnNetwork {
     /// requested outcome, not a failure.
     pub fn delete(id: u128) -> Result<(), RepositoryError> {
         let guid = GUID::from_u128(id);
-        log::debug!("deleting HCN network {guid:?}");
+        tracing::debug!("deleting HCN network {guid:?}");
         // SAFETY: `guid` is valid for the duration of the call.
         match unsafe { HcnDeleteNetwork(&guid, None) } {
             Ok(()) => {
-                log::info!("deleted HCN network {guid:?}");
+                tracing::info!("deleted HCN network {guid:?}");
                 Ok(())
             }
             Err(error) if is_network_absent(&error) => {
-                log::debug!("HCN network {guid:?} was already gone");
+                tracing::debug!("HCN network {guid:?} was already gone");
                 Ok(())
             }
             Err(error) => {
                 let error = windows_error("delete HCN network", None, error);
-                log::error!("{error}");
+                tracing::error!("{error}");
                 Err(error)
             }
         }

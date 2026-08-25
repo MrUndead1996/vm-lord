@@ -59,14 +59,14 @@ pub fn import_image(
     cancel: &AtomicBool,
 ) -> Result<ImportSummary, RepositoryError> {
     create_dynamic_vhdx(target, disk_size_bytes)?;
-    log::info!(
+    tracing::info!(
         "importing an image into {} ({disk_size_bytes} bytes)",
         target.display()
     );
 
     match write_into(source, target, disk_size_bytes, cancel) {
         Ok(summary) => {
-            log::info!(
+            tracing::info!(
                 "imported {} bytes into {}, skipping {} bytes of holes",
                 summary.written_bytes,
                 target.display(),
@@ -112,7 +112,7 @@ fn write_into(
 fn discard(target: &Path, error: RepositoryError) -> RepositoryError {
     match fs::remove_file(target) {
         Ok(()) => {
-            log::debug!("removed the unfinished {}", target.display());
+            tracing::debug!("removed the unfinished {}", target.display());
             error
         }
         Err(remove_error) if remove_error.kind() == std::io::ErrorKind::NotFound => error,
@@ -121,7 +121,7 @@ fn discard(target: &Path, error: RepositoryError) -> RepositoryError {
                 "{error}; the unfinished {} could not be removed either: {remove_error}",
                 target.display()
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         }
     }

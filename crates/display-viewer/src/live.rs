@@ -143,7 +143,7 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
         };
         let limits = Limits::new(negotiated.width, negotiated.height);
 
-        log::info!(
+        tracing::info!(
             "the display session is {}x{} at {}-pixel tiles, mode {:?}",
             negotiated.width,
             negotiated.height,
@@ -205,7 +205,7 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
     /// line rather than a state -- the picture that is on screen is still the
     /// one the guest has.
     pub fn set_resolution(&mut self, width: u32, height: u32) {
-        log::info!("asking the guest for {width}x{height}");
+        tracing::info!("asking the guest for {width}x{height}");
         self.write_control(
             ControlRecord::SetResolution,
             SetResolution { width, height }.encode_to_vec(),
@@ -214,7 +214,7 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
 
     /// Asks the guest for an encoding mode.
     pub fn set_mode(&mut self, mode: Mode) {
-        log::info!("asking the guest for {mode:?}");
+        tracing::info!("asking the guest for {mode:?}");
         self.write_control(
             ControlRecord::SetMode,
             SetMode { mode: mode as i32 }.encode_to_vec(),
@@ -236,7 +236,7 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
         let sequence = match self.session.take_channel_sequence(Channel::Input) {
             Ok(sequence) => sequence,
             Err(error) => {
-                log::debug!("an input record could not be numbered: {error}");
+                tracing::debug!("an input record could not be numbered: {error}");
                 self.input = None;
 
                 return;
@@ -256,7 +256,7 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
             return;
         };
         if let Err(error) = record::write(socket, &record, &limits) {
-            log::debug!("the input channel could not be written to: {error}");
+            tracing::debug!("the input channel could not be written to: {error}");
             self.input = None;
         }
     }
@@ -282,7 +282,7 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
 
             match self.bind(channel) {
                 Ok(()) => {
-                    log::info!(
+                    tracing::info!(
                         "the {channel} channel bound at generation {}",
                         self.session.generation(channel)
                     );
@@ -292,7 +292,7 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
                     }
                 }
                 Err(reason) => {
-                    log::debug!("the {channel} channel could not bind: {reason}");
+                    tracing::debug!("the {channel} channel could not bind: {reason}");
                     self.next_bind = now + BIND_BACKOFF;
                     return;
                 }
@@ -395,7 +395,7 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
                 }
                 Ok(ControlRecord::DisplayState) => {
                     if let Ok(state) = DisplayState::decode(payload.as_slice()) {
-                        log::info!(
+                        tracing::info!(
                             "the guest reports {}x{} at {}-pixel tiles",
                             state.width,
                             state.height,
@@ -405,7 +405,7 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
                 }
                 Ok(ControlRecord::Error) => {
                     if let Ok(error) = ErrorRecord::decode(payload.as_slice()) {
-                        log::warn!(
+                        tracing::warn!(
                             "the guest reported display error {}: {}",
                             error.code,
                             error.detail
@@ -417,7 +417,7 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
                     self.payload = payload;
                     return;
                 }
-                _ => log::debug!(
+                _ => tracing::debug!(
                     "a control record of type {} is one this build does not read",
                     header.message_type
                 ),
@@ -432,7 +432,7 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
         if let Some((token, sent)) = self.outstanding
             && now.duration_since(sent) >= PONG_TIMEOUT
         {
-            log::warn!(
+            tracing::warn!(
                 "ping {token} went unanswered for {}s",
                 PONG_TIMEOUT.as_secs()
             );
@@ -513,7 +513,7 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
     /// What the reconnected channel owes -- a `StreamConfig` and a keyframe --
     /// is the guest's obligation, which is why nothing is requested here.
     fn rebind(&mut self, now: Instant, signals: &mut Vec<Signal>, reason: &str) {
-        log::warn!("the frame channel is being replaced: {reason}");
+        tracing::warn!("the frame channel is being replaced: {reason}");
         self.frame = None;
         self.video = Video::new();
         self.next_bind = now;
@@ -554,7 +554,7 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
         );
 
         if let Err(error) = record::write(&mut self.control, &record, &self.control_limits) {
-            log::debug!("a {message_type:?} record could not be written: {error}");
+            tracing::debug!("a {message_type:?} record could not be written: {error}");
         }
     }
 }
@@ -883,8 +883,8 @@ mod tests {
 
         let header = wait_for_record(&mut harness.input, &limits, &mut payload);
         assert_eq!(header.message_type, InputRecord::KeyEvent as u16);
-        let key = vmlord_display_protocol::v1::KeyEvent::decode(payload.as_slice())
-            .expect("a key event");
+        let key =
+            vmlord_display_protocol::v1::KeyEvent::decode(payload.as_slice()).expect("a key event");
         assert_eq!((key.keycode, key.pressed), (30, true));
 
         let header = wait_for_record(&mut harness.input, &limits, &mut payload);
@@ -1168,38 +1168,39 @@ mod tests {
 
     #[test]
     fn an_error_record_is_logged_and_the_session_carries_on() {
-        crate::log::capture::install();
-        let now = Instant::now();
-        let (mut live, mut harness) = start(now);
-        let mut signals = Vec::new();
-        let limits = Limits::new(0, 0);
+        let (_, text) = crate::log::capture::capture(|| {
+            let now = Instant::now();
+            let (mut live, mut harness) = start(now);
+            let mut signals = Vec::new();
+            let limits = Limits::new(0, 0);
 
-        record::write(
-            &mut harness.control,
-            &Record::new(
-                Channel::Control,
-                ControlRecord::Error as u16,
-                0,
-                0,
-                0,
-                vmlord_display_protocol::v1::Error {
-                    code: vmlord_display_protocol::v1::ErrorCode::CaptureFailed as i32,
-                    detail: "the compositor stopped".to_owned(),
-                }
-                .encode_to_vec(),
-            ),
-            &limits,
-        )
-        .expect("an in-memory socket");
+            record::write(
+                &mut harness.control,
+                &Record::new(
+                    Channel::Control,
+                    ControlRecord::Error as u16,
+                    0,
+                    0,
+                    0,
+                    vmlord_display_protocol::v1::Error {
+                        code: vmlord_display_protocol::v1::ErrorCode::CaptureFailed as i32,
+                        detail: "the compositor stopped".to_owned(),
+                    }
+                    .encode_to_vec(),
+                ),
+                &limits,
+            )
+            .expect("an in-memory socket");
 
-        live.pump(Instant::now(), &mut signals);
+            live.pump(Instant::now(), &mut signals);
 
-        assert!(
-            !signals
-                .iter()
-                .any(|signal| matches!(signal, Signal::Ended(_)))
-        );
-        assert!(crate::log::capture::text().contains("the compositor stopped"));
+            assert!(
+                !signals
+                    .iter()
+                    .any(|signal| matches!(signal, Signal::Ended(_)))
+            );
+        });
+        assert!(text.contains("the compositor stopped"));
     }
 
     #[test]

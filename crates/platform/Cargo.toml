@@ -26,7 +26,7 @@ vmlord-display-viewer = { path = "../display-viewer" }
 vmlord-gpu-payload = { path = "../gpu-payload" }
 vmlord-payload = { path = "../payload" }
 arcbox-dhcp = "0.6"
-log.workspace = true
+tracing.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 # `getrandom` is off deliberately: the salt comes from `BCryptGenRandom`, the
@@ -74,6 +74,9 @@ windows = { workspace = true, features = [
 ] }
 
 [dev-dependencies]
+# The scoped subscriber the diagnostics tests install: records are read back
+# from a sink rather than returned, so a test needs somewhere to read them.
+tracing-subscriber.workspace = true
 # Only the `#[ignore]`d import test uses it, to read a real cloud image the way
 # production will. The dependency runs one way: `image` knows nothing of
 # Windows, and `platform` does not depend on it to build.

@@ -163,10 +163,7 @@ impl DisplayUpdateChannel {
     /// caller is a worker thread. A VM whose session is not open right now
     /// answers immediately: there is nobody to ask, and queueing the request
     /// would move a version at a moment nobody chose.
-    pub(crate) fn ask(
-        &self,
-        target_version: &str,
-    ) -> Result<DisplayUpdateAnswer, RepositoryError> {
+    pub(crate) fn ask(&self, target_version: &str) -> Result<DisplayUpdateAnswer, RepositoryError> {
         let (answer, answered) = mpsc::channel();
         if !self.online.load(Ordering::Relaxed) {
             return Err(RepositoryError::new(format!(
@@ -282,7 +279,7 @@ impl AgentConnection {
                 let error = RepositoryError::new(format!(
                     "the agent thread of VM \"{vm_name}\" could not be started: {error}"
                 ));
-                log::error!("{error}");
+                tracing::error!("{error}");
                 error
             })?;
 
@@ -325,7 +322,7 @@ impl Drop for AgentConnection {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        log::debug!(
+        tracing::debug!(
             "VMLord stopped listening for the agent of VM \"{}\"",
             self.vm_name
         );
@@ -441,10 +438,10 @@ fn report(vm_name: &str, error: &SessionError) {
         && let vmlord_agent_protocol::frame::FrameError::Io(io) = frame
         && io.kind() == std::io::ErrorKind::ConnectionAborted
     {
-        log::debug!("the agent session of VM \"{vm_name}\" ended with the VM");
+        tracing::debug!("the agent session of VM \"{vm_name}\" ended with the VM");
         return;
     }
-    log::warn!("the agent session of VM \"{vm_name}\" ended: {error}");
+    tracing::warn!("the agent session of VM \"{vm_name}\" ended: {error}");
 }
 
 /// Reads the host's copy of a VM's agent secret.
@@ -458,7 +455,7 @@ fn read_secret(path: &Path, vm_name: &str) -> Result<Secret, RepositoryError> {
             "the agent secret of VM \"{vm_name}\" could not be read from {}: {error}",
             path.display()
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })?);
 
@@ -469,7 +466,7 @@ fn read_secret(path: &Path, vm_name: &str) -> Result<Secret, RepositoryError> {
             "the agent secret of VM \"{vm_name}\" at {} is unusable: {error}",
             path.display()
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })
 }

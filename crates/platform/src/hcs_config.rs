@@ -216,7 +216,7 @@ pub(crate) fn ensure_supported_network_mode(mode: NetworkMode) -> Result<(), Rep
                 "the HCS backend does not support network mode {other:?} yet; \
                  External and Internal networking arrive with #10"
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             Err(error)
         }
     }
@@ -295,7 +295,7 @@ pub(crate) fn apply_network_adapter(
                 "the stored HCS configuration has no \"{DEVICES_POINTER}\" object to attach a \
                  network adapter to"
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
 
@@ -366,7 +366,7 @@ pub(crate) fn apply_plan9_shares(
                 "the stored HCS configuration has no \"{DEVICES_POINTER}\" object to attach \
                  Plan9 shares to"
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
 
@@ -461,7 +461,7 @@ fn parse(document: &str) -> Result<serde_json::Value, RepositoryError> {
         let error = RepositoryError::new(format!(
             "the stored HCS configuration is not valid JSON: {error}"
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })
 }
@@ -475,7 +475,7 @@ fn read_u32(configuration: &serde_json::Value, pointer: &str) -> Result<u32, Rep
             let error = RepositoryError::new(format!(
                 "the stored HCS configuration has no numeric \"{pointer}\""
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })
 }
@@ -488,7 +488,7 @@ fn write_target<'a>(
         let error = RepositoryError::new(format!(
             "the stored HCS configuration has no \"{pointer}\" to update"
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })
 }

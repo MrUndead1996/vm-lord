@@ -70,7 +70,7 @@ pub struct Seed {
 /// in #59, where the documents meet a filesystem.
 #[must_use]
 pub fn build(request: &SeedRequest<'_>) -> Seed {
-    log::debug!(
+    tracing::debug!(
         "building a seed for VM \"{}\" ({}): user \"{}\", password {}, key {}, {}",
         request.vm_name,
         request.instance_id,

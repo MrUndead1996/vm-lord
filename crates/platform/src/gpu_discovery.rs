@@ -24,7 +24,7 @@ pub fn discover_host_gpu() -> HostGpuCapabilities {
     let adapters = match partition_adapters() {
         Ok(adapters) => adapters,
         Err(error) => {
-            log::warn!("enumerating GPU partition adapters failed: {error}");
+            tracing::warn!("enumerating GPU partition adapters failed: {error}");
             Vec::new()
         }
     };

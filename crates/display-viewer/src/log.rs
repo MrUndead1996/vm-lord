@@ -32,53 +32,67 @@ pub fn initialize() {
     }
 }
 
-/// A logger that keeps every record, for the tests that assert what is not in
-/// them.
+/// A subscriber that keeps every record, for the tests that assert what is not
+/// in them.
+///
+/// Scoped rather than global: `capture` installs it for the duration of one
+/// closure, so two tests running side by side cannot read each other's
+/// records. The old global logger could only be installed once per process,
+/// which meant every test shared one buffer.
 #[cfg(test)]
 pub mod capture {
-    use std::sync::{Mutex, OnceLock};
+    use std::{
+        fmt,
+        sync::{Arc, Mutex},
+    };
 
-    use log::{Level, LevelFilter, Log, Metadata, Record};
+    use tracing::{
+        Event, Subscriber,
+        field::{Field, Visit},
+    };
+    use tracing_subscriber::{Layer, layer::Context, layer::SubscriberExt as _};
 
-    static RECORDS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    /// Runs `body` with every record it writes captured, and hands back what
+    /// it returned along with the records, joined.
+    pub fn capture<T>(body: impl FnOnce() -> T) -> (T, String) {
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Capture(Arc::clone(&records)));
+        let value = tracing::subscriber::with_default(subscriber, body);
+        let text = records
+            .lock()
+            .expect("no test panics while holding the records")
+            .join("\n");
+        (value, text)
+    }
 
-    struct Capture;
+    struct Capture(Arc<Mutex<Vec<String>>>);
 
-    impl Log for Capture {
-        fn enabled(&self, _: &Metadata<'_>) -> bool {
-            true
+    impl<S: Subscriber> Layer<S> for Capture {
+        fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+            let mut message = String::new();
+            event.record(&mut MessageVisitor(&mut message));
+            self.0
+                .lock()
+                .expect("no test panics while holding the records")
+                .push(message);
         }
+    }
 
-        fn log(&self, record: &Record<'_>) {
-            if record.level() <= Level::Trace {
-                records()
-                    .lock()
-                    .expect("no test panics while holding the log")
-                    .push(record.args().to_string());
+    /// Keeps the record's text and discards its fields: these tests assert
+    /// what a message does not contain.
+    struct MessageVisitor<'a>(&'a mut String);
+
+    impl Visit for MessageVisitor<'_> {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "message" {
+                *self.0 = value.to_string();
             }
         }
 
-        fn flush(&self) {}
-    }
-
-    fn records() -> &'static Mutex<Vec<String>> {
-        RECORDS.get_or_init(|| Mutex::new(Vec::new()))
-    }
-
-    /// Installs the capturing logger. Safe to call from every test.
-    pub fn install() {
-        static INSTALLED: OnceLock<()> = OnceLock::new();
-        INSTALLED.get_or_init(|| {
-            let _ = log::set_logger(&Capture);
-            log::set_max_level(LevelFilter::Trace);
-        });
-    }
-
-    /// Everything logged so far, joined.
-    pub fn text() -> String {
-        records()
-            .lock()
-            .expect("no test panics while holding the log")
-            .join("\n")
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            if field.name() == "message" {
+                *self.0 = format!("{value:?}");
+            }
+        }
     }
 }

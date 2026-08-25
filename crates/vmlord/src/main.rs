@@ -10,10 +10,12 @@ mod pickers;
 fn main() {
     let settings = vmlord_core::SettingsStore::for_current_user()
         .and_then(|store| store.load_or_create().map(|settings| (store, settings)));
+    let mut diagnostics = None;
     let repository = match &settings {
-        Ok((_, settings)) => match vmlord_core::initialize_logging(settings) {
-            Ok(()) => {
-                log::info!(
+        Ok((_, settings)) => match vmlord_core::initialize_with_diagnostics(settings) {
+            Ok(sink) => {
+                diagnostics = Some(sink);
+                tracing::info!(
                     "logging initialized at {} with {:?} level",
                     settings.log_file_path.display(),
                     settings.log_level
@@ -34,6 +36,10 @@ fn main() {
         .with_guest_defaults(vmlord_platform::host_guest_defaults())
         .with_image_picker(Box::new(pickers::WindowsImagePicker::new()))
         .with_settings_path_picker(Box::new(pickers::WindowsSettingsPathPicker::new()));
+    // Without this the panel stays empty: the layer records, and nobody reads.
+    if let Some(sink) = diagnostics {
+        application = application.with_diagnostics(sink);
+    }
     if let Ok((store, settings)) = settings {
         application = application.with_settings(store, settings);
     }
@@ -44,7 +50,7 @@ fn main() {
 }
 
 fn load_backend(settings: &AppSettings) -> Box<dyn VmRepository> {
-    log::info!(
+    tracing::info!(
         "using the native HCS backend with VM storage at {}",
         settings.vm_storage_path.display()
     );

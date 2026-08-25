@@ -57,7 +57,7 @@ fn endpoint_subnet(address: &EndpointAddress) -> Result<Ipv4Subnet, RepositoryEr
             "HNS reported \"{}\" as an endpoint address, which is not an IPv4 address",
             address.ip_address
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })?;
 
@@ -125,7 +125,7 @@ impl State {
                  the guest cannot be offered its address",
                 config.pool_start, config.pool_end
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             return Err(error);
         }
 
@@ -135,7 +135,7 @@ impl State {
 
         if let Some(previous) = self.reserved.remove(&mac) {
             self.server.remove_reservation(&mac);
-            log::debug!("the guest at {mac:02x?} moved from {previous} to {ip}");
+            tracing::debug!("the guest at {mac:02x?} moved from {previous} to {ip}");
         }
 
         let holder = self
@@ -146,12 +146,14 @@ impl State {
         if let Some(holder) = holder {
             self.reserved.remove(&holder);
             self.server.remove_reservation(&holder);
-            log::info!("HNS moved {ip} from the guest at {holder:02x?} to the one at {mac:02x?}");
+            tracing::info!(
+                "HNS moved {ip} from the guest at {holder:02x?} to the one at {mac:02x?}"
+            );
         }
 
         self.server.reserve_ip(mac, ip);
         self.reserved.insert(mac, ip);
-        log::debug!("the guest at {mac:02x?} is served {ip}");
+        tracing::debug!("the guest at {mac:02x?} is served {ip}");
         Ok(())
     }
 
@@ -168,20 +170,20 @@ impl State {
         let packet = match DhcpPacket::parse(datagram) {
             Ok(packet) => packet,
             Err(error) => {
-                log::debug!("a datagram on the DHCP port was not a DHCP packet: {error}");
+                tracing::debug!("a datagram on the DHCP port was not a DHCP packet: {error}");
                 return None;
             }
         };
 
         let mac = packet.client_mac();
-        log::debug!(
+        tracing::debug!(
             "a DHCP {:?} arrived from {mac:02x?} ({} bytes)",
             packet.message_type,
             datagram.len()
         );
 
         if !self.reserved.contains_key(&mac) {
-            log::debug!(
+            tracing::debug!(
                 "the DHCP request from {mac:02x?} is not from a guest of the VMLord network; \
                  it is left unanswered"
             );
@@ -191,7 +193,7 @@ impl State {
         match self.server.handle_packet(datagram) {
             Ok(Some(reply)) => {
                 let target = reply_target(&packet);
-                log::info!(
+                tracing::info!(
                     "answering the guest at {mac:02x?} with a DHCP {:?} to {target}",
                     DhcpPacket::parse(&reply)
                         .ok()
@@ -200,14 +202,14 @@ impl State {
                 Some((reply, target))
             }
             Ok(None) => {
-                log::debug!(
+                tracing::debug!(
                     "the DHCP {:?} from {mac:02x?} needs no reply",
                     packet.message_type
                 );
                 None
             }
             Err(error) => {
-                log::warn!("the DHCP request from {mac:02x?} could not be answered: {error}");
+                tracing::warn!("the DHCP request from {mac:02x?} could not be answered: {error}");
                 None
             }
         }
@@ -267,11 +269,11 @@ impl DhcpService {
                 let error = RepositoryError::new(format!(
                     "the DHCP server thread could not be started: {error}"
                 ));
-                log::error!("{error}");
+                tracing::error!("{error}");
                 error
             })?;
 
-        log::info!(
+        tracing::info!(
             "the VMLord DHCP server is serving {subnet} from {}",
             subnet.gateway()
         );
@@ -288,7 +290,7 @@ impl DhcpService {
             let error = RepositoryError::new(format!(
                 "HNS reported \"{mac}\" as an endpoint's MAC address, which cannot be parsed"
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
         let address: Ipv4Addr = ip.ip_address.parse().map_err(|_| {
@@ -296,7 +298,7 @@ impl DhcpService {
                 "HNS reported \"{}\" as an endpoint address, which is not an IPv4 address",
                 ip.ip_address
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
 
@@ -313,7 +315,7 @@ impl Drop for DhcpService {
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
-        log::info!("the VMLord DHCP server stopped");
+        tracing::info!("the VMLord DHCP server stopped");
     }
 }
 
@@ -378,7 +380,7 @@ fn seed(service: &DhcpService, store: &MetadataStore) {
     let mappings = match store.list() {
         Ok(mappings) => mappings,
         Err(error) => {
-            log::warn!(
+            tracing::warn!(
                 "the recorded VMs could not be read, so only the VM being started is served \
                  by DHCP: {error}"
             );
@@ -391,7 +393,7 @@ fn seed(service: &DhcpService, store: &MetadataStore) {
             continue;
         };
         if let Err(error) = seed_one(service, endpoint_id) {
-            log::warn!(
+            tracing::warn!(
                 "the endpoint of VM \"{}\" could not be served by DHCP: {error}",
                 mapping.vm_name
             );
@@ -417,7 +419,7 @@ fn seed_one(service: &DhcpService, endpoint_id: Uuid) -> Result<(), RepositoryEr
 fn bind(gateway: Ipv4Addr) -> Result<UdpSocket, RepositoryError> {
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, DHCP_SERVER_PORT)).map_err(|error| {
         let error = bind_error(&error);
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })?;
     send_through(&socket, subnet::interface_index(gateway)?)?;
@@ -425,7 +427,7 @@ fn bind(gateway: Ipv4Addr) -> Result<UdpSocket, RepositoryError> {
         let error = RepositoryError::new(format!(
             "the DHCP socket could not be made broadcast: {error}"
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })?;
     socket
@@ -434,7 +436,7 @@ fn bind(gateway: Ipv4Addr) -> Result<UdpSocket, RepositoryError> {
             let error = RepositoryError::new(format!(
                 "the DHCP socket could not be given a read timeout: {error}"
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
     Ok(socket)
@@ -471,7 +473,7 @@ fn send_through(socket: &UdpSocket, index: u32) -> Result<(), RepositoryError> {
             None,
             code.0,
         );
-        log::error!("{error}");
+        tracing::error!("{error}");
         return Err(error);
     }
 
@@ -514,7 +516,7 @@ fn serve(socket: &UdpSocket, state: &Mutex<State>, running: &AtomicBool) {
                 continue;
             }
             Err(error) => {
-                log::warn!("the DHCP server could not read from its socket: {error}");
+                tracing::warn!("the DHCP server could not read from its socket: {error}");
                 continue;
             }
         };
@@ -526,8 +528,8 @@ fn serve(socket: &UdpSocket, state: &Mutex<State>, running: &AtomicBool) {
 
         if let Some((reply, target)) = reply {
             match socket.send_to(&reply, target) {
-                Ok(sent) => log::debug!("sent {sent} bytes of DHCP reply to {target}"),
-                Err(error) => log::warn!("a DHCP reply to {target} could not be sent: {error}"),
+                Ok(sent) => tracing::debug!("sent {sent} bytes of DHCP reply to {target}"),
+                Err(error) => tracing::warn!("a DHCP reply to {target} could not be sent: {error}"),
             }
         }
     }

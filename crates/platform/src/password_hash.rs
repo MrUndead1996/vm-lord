@@ -39,11 +39,11 @@ pub fn hash_password(password: &Password) -> Result<String, RepositoryError> {
         .hash_password_with_salt(password.as_str().as_bytes(), &salt)
         .map_err(|error| {
             let error = RepositoryError::new(format!("failed to hash the password: {error}"));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
 
-    log::debug!("hashed the password into a SHA-512-crypt entry");
+    tracing::debug!("hashed the password into a SHA-512-crypt entry");
     Ok(hash.as_str().to_string())
 }
 
@@ -60,7 +60,7 @@ fn random_salt() -> Result<[u8; SALT_BYTES], RepositoryError> {
         .ok()
         .map_err(|error| {
             let error = windows_error("generate the password salt", None, error);
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })?;
     Ok(salt)

@@ -422,8 +422,8 @@ cheaply -- an unknown VM, one still being built, one already being shut down --
 so an obvious mistake is the return value of the click that made it rather than
 a diagnostic a moment later.
 
-What comes back is collected in `take_diagnostics`, the `&mut self` call the
-refresh already makes. A delivered request means the guest is on its way down,
+What comes back is recorded as a marked event, and reaped in `refresh`, the
+`&mut self` call the refresh already makes. A delivered request means the guest is on its way down,
 so its agent connection and its HCS event watch are given up there; a failed one
 means the opposite -- the guest never heard the request and keeps running -- so
 both stay where they are and only the reason becomes an `Error` diagnostic. A
@@ -623,9 +623,9 @@ absence is the only signal separating the two.
 VMLord holds, which is the only source for what the enumeration cannot say: why
 a VM stopped, that its guest crashed, and that the Host Compute Service
 disconnected. The callback runs on a thread HCS owns, so it only classifies the
-event and queues it; the repository drains that queue in `take_diagnostics` on
-every refresh, logs each event, surfaces the significant ones as diagnostics,
-and releases the handle of a VM that is gone. The enumeration remains the sole
+event and queues it; the repository drains that queue in `refresh` on every
+refresh, records each event, marks the significant ones for the panel, and
+releases the handle of a VM that is gone. The enumeration remains the sole
 authority on VM state.
 
 Each registration carries a generation, counted by the event sink the watches
@@ -1630,7 +1630,7 @@ again when the repository is dropped.
 So `open_ssh` answers "a session is being opened", not "a session opened", and
 the preflight failure that used to be its return value is now a diagnostic. The
 person sees no difference: the UI ignored that return value and read the
-diagnostics buffer, which is where both outcomes have always gone.
+diagnostics panel, which is where both outcomes have always gone.
 
 ### Offering a session
 
@@ -2104,7 +2104,7 @@ only account there is of a stop that stalls, and the pipe closing is what ends
 the capture. A force
 stop, a delete, an HCS exit event, and VMLord's own shutdown all cancel it,
 because in each of those cases nothing will ever close the pipe from the other
-end. `take_diagnostics` reaps sessions that are over: one that finished with its
+end. `refresh` reaps sessions that are over: one that finished with its
 pipe, and one whose window was closed, are `DEBUG` lines, and one that signaled
 `failed` becomes an `Error` diagnostic naming the VM and the `com1.log` to look
 in. A killed helper cannot signal `failed`, so a window closed by hand and a
@@ -2138,8 +2138,8 @@ certainly -- validation, a name the store or the build registry already knows, a
 directory that already exists -- and then hands the request to
 `build::BuildRegistry::start`, which spawns one `std::thread` per VM and returns.
 The thread runs `cycle::VmBuildCycle::run`, which is creation, start and the
-readiness wait as one operation; a failure is reported to the user through the
-shared diagnostics buffer rather than through a return value nobody is waiting on.
+readiness wait as one operation; a failure is reported to the user as a marked
+event rather than through a return value nobody is waiting on.
 
 ### Waiting for the guest
 
@@ -2244,8 +2244,8 @@ it is accepted, with its sizes taken from the request because nothing of the VM
 is on disk yet to read them from; and it stops appearing the moment its thread is
 over, because a failed build rolled itself back and never reached the store. The
 UI needs no new plumbing for any of this: the existing one-second refresh already
-calls `list_vms`, and `take_diagnostics` -- the `&mut self` call that follows it
--- is where finished threads are joined by `BuildRegistry::reap`.
+calls `list_vms`, and `refresh` -- the `&mut self` call that follows it -- is
+where finished threads are joined by `BuildRegistry::reap`.
 
 Progress is a level in two slots joined at the moment of reading, not a stream:
 `BuildMonitor` holds a `ProgressPublisher<BuildStep>` written by the pipeline and
@@ -3612,9 +3612,80 @@ ui/
 # Migration
 
 The incremental replacement of the C backend -- HCS, HNS, networking, GPU,
-display, SSH -- is finished, and the backend it replaced has been removed from
-the distribution. Diagnostics are the remaining migration work, and they are
-Rust-native work rather than a port: there is no C module left to stand beside.
+display, SSH -- is finished, the backend it replaced has been removed from the
+distribution, and diagnostics, the last piece, are done. They were Rust-native
+work rather than a port: there was no C module left to stand beside.
+
+---
+
+# Diagnostics
+
+Records go through `tracing`. The subscriber is a `Registry` with two layers,
+both built in `core::logging`.
+
+The **record layer** writes the log file, and standard output when there is a
+console to write to. It is a `tracing` layer rather than
+`tracing_subscriber::fmt` because the line format here is fixed and older than
+the facade: `[1970-01-01T00:00:00.000Z] [INFO ] target: message`, with the
+stamp spelled by `core::logging::timestamp` -- Howard Hinnant's civil-date
+algorithm, written out because the leap rule is the whole difficulty. `fmt`
+would need the `time` crate to say the same thing. An event's fields are
+appended after its message, and a span's fields are appended before them, so a
+reader scanning a column finds the VM in the same place on every line.
+
+The **diagnostics layer** collects what is addressed to a person. An event
+reaches the panel when it carries a `diagnostic` field, which
+`vmlord_core::diagnostic!` writes and nothing else does. Not by level: a
+warning that an image cache did not warm belongs in the file and not in the
+user's face. Not by target: targets move when code moves between modules. The
+macro exists so the marker cannot be misspelled -- `diagnostc = true` would
+silently fail to show and would break no test -- and it picks the `tracing`
+macro from the level literal, so a record's level and its event's level are one
+decision.
+
+A `Diagnostic` is a level, a `Subsystem`, an optional VM, an optional Windows
+code, the moment it was observed, and a sentence. The subsystem is the list the
+migration named -- HCS, HNS, networking, GPU, display, provisioning -- plus
+`Image` and `App`; being a field rather than a guess from the wording is what
+makes those six one stream instead of six conventions. The moment is stamped by
+the layer, because when a thing was observed is a property of the observation.
+
+Records wait in a `DiagnosticsSink`, a shared queue capped at a hundred, and
+`WorkspaceApp::diagnostics` drains it. It drains on read rather than on refresh
+so the answer to a click appears in the panel while the click is still being
+drawn.
+
+`VmRepository::refresh` is what the application calls after `list_vms` on every
+refresh. It used to be `take_diagnostics`, which was never what it was for:
+finished builds and starts are adopted there, answered shutdowns give up their
+handles, desktops that appeared are written down, and HCS events are drained.
+Only the return value went.
+
+Two things follow from spans being thread-local. An event inside `start_vm`
+inherits the VM from the operation's span and cannot lose it -- but an event on
+a worker thread inherits nothing, so every report from a build, a start, a
+display session or an SSH launch names its VM itself.
+
+`log` remains a dependency, and not as a leftover: `eframe` and other
+dependencies write through it, and `tracing_log::LogTracer` is what keeps their
+records reaching the file.
+
+### What never reaches a record
+
+A secret has neither a `Display` nor a `Debug` that shows its value. `tracing`
+records a field only through one of those two traits, so a secret does not
+compile into a field at all: the guarantee comes from the compiler rather than
+from anybody's vigilance.
+
+This covers `Password`, `VmKeyPair`, `Seed`, `SeedRequest` and
+`agent_protocol::auth::Secret` -- the last three because the user-data document
+carries the password's crypt entry and the agent's secret. A guard test in
+`seed::user_data` builds the real documents under a capturing subscriber and
+asserts that neither the crypt entry nor the secret appears.
+
+There is no pattern-matching scrubber and there should not be one: a leak can
+only come from our own code, and a filter would cost something on every record
+while promising more than it can keep.
 
 ---
 

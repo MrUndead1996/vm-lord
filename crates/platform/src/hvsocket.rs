@@ -190,7 +190,7 @@ impl AgentListener {
                 let error = RepositoryError::new(format!(
                     "the agent listener of VM \"{vm_name}\" could not be created: {error}"
                 ));
-                log::error!("{error}");
+                tracing::error!("{error}");
                 error
             })?;
         let listener = Self {
@@ -223,7 +223,7 @@ impl AgentListener {
             return Err(listener.failure("put into listening", last_error()));
         }
 
-        log::debug!(
+        tracing::debug!(
             "listening for the agent of VM \"{vm_name}\" on partition {runtime_id}, \
              vsock port {AGENT_VSOCK_PORT}"
         );
@@ -272,7 +272,7 @@ impl AgentListener {
         };
         stream.set_timeout(SO_SNDTIMEO, WRITE_TIMEOUT)?;
 
-        log::info!("the agent of VM \"{}\" connected", self.vm_name);
+        tracing::info!("the agent of VM \"{}\" connected", self.vm_name);
         Ok(Some(stream))
     }
 
@@ -281,7 +281,7 @@ impl AgentListener {
             "the agent listener of VM \"{}\" could not be {what}: {detail}",
             self.vm_name
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     }
 }
@@ -323,7 +323,7 @@ impl AgentStream {
                 self.vm_name,
                 last_error()
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             return Err(error);
         }
         Ok(())
@@ -403,7 +403,7 @@ impl Drop for AgentStream {
     fn drop(&mut self) {
         // SAFETY: This stream exclusively owns the socket and closes it once.
         unsafe { closesocket(self.socket) };
-        log::debug!("the agent connection of VM \"{}\" was closed", self.vm_name);
+        tracing::debug!("the agent connection of VM \"{}\" was closed", self.vm_name);
     }
 }
 
@@ -430,7 +430,7 @@ fn initialize_winsock() -> Result<(), RepositoryError> {
         .clone()
         .map_err(|detail| {
             let error = RepositoryError::new(format!("Winsock is not available: {detail}"));
-            log::error!("{error}");
+            tracing::error!("{error}");
             error
         })
 }

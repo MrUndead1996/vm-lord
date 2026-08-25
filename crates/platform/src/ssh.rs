@@ -67,7 +67,7 @@ pub(crate) fn guest_address(
     match address.ip_address.parse() {
         Ok(ip) => Ok(Some(ip)),
         Err(error) => {
-            log::debug!(
+            tracing::debug!(
                 "HNS reported \"{}\" as the address of VM \"{}\", which is not an IP address: \
                  {error}",
                 address.ip_address,

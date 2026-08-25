@@ -40,9 +40,9 @@ pub(crate) fn parse_sha256sums(
         });
     }
     if unreadable > 0 {
-        log::warn!("{unreadable} lines of {url} are not checksum entries and were skipped");
+        tracing::warn!("{unreadable} lines of {url} are not checksum entries and were skipped");
     }
-    log::debug!("{url} lists {parsed} checksums");
+    tracing::debug!("{url} lists {parsed} checksums");
 
     found.ok_or_else(|| ResolveError::ImageNotListed {
         file_name: file_name.to_owned(),

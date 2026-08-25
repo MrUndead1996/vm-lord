@@ -47,7 +47,7 @@ pub(crate) fn create_dynamic_vhdx(path: &Path, size_bytes: u64) -> Result<(), Re
         }
     }
 
-    log::debug!(
+    tracing::debug!(
         "creating VHDX disk at {} ({size_bytes} bytes)",
         path.display()
     );
@@ -91,7 +91,7 @@ pub(crate) fn create_dynamic_vhdx(path: &Path, size_bytes: u64) -> Result<(), Re
     };
     result.ok().map_err(|error| {
         let error = windows_error("create virtual disk", None, error);
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })?;
 
@@ -99,11 +99,11 @@ pub(crate) fn create_dynamic_vhdx(path: &Path, size_bytes: u64) -> Result<(), Re
     // call above and is closed exactly once here.
     unsafe { CloseHandle(handle) }.map_err(|error| {
         let error = windows_error("close virtual disk handle", None, error);
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })?;
 
-    log::info!("created VHDX disk at {}", path.display());
+    tracing::info!("created VHDX disk at {}", path.display());
     Ok(())
 }
 
@@ -133,7 +133,7 @@ pub(crate) fn virtual_size_bytes(path: &Path) -> Result<u64, RepositoryError> {
     };
     result.ok().map_err(|error| {
         let error = windows_error("open virtual disk", None, error);
-        log::error!("{} for {}", error, path.display());
+        tracing::error!("{} for {}", error, path.display());
         error
     })?;
 
@@ -153,19 +153,19 @@ pub(crate) fn virtual_size_bytes(path: &Path) -> Result<u64, RepositoryError> {
 
     result.ok().map_err(|error| {
         let error = windows_error("get virtual disk information", None, error);
-        log::error!("{} for {}", error, path.display());
+        tracing::error!("{} for {}", error, path.display());
         error
     })?;
     closed.map_err(|error| {
         let error = windows_error("close virtual disk handle", None, error);
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })?;
 
     // SAFETY: `GET_VIRTUAL_DISK_INFO_SIZE` is the version requested above, so
     // HCS filled in the `Size` arm of the union.
     let virtual_size = unsafe { information.Anonymous.Size.VirtualSize };
-    log::debug!("{} presents {virtual_size} bytes", path.display());
+    tracing::debug!("{} presents {virtual_size} bytes", path.display());
     Ok(virtual_size)
 }
 

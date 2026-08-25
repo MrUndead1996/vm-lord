@@ -90,7 +90,7 @@ impl Qcow2Image {
         let qcow = load(&mut file, path)?;
         check_agreement(&qcow, &facts)?;
 
-        log::info!(
+        tracing::info!(
             "{} holds a {}-byte disk within a {capacity}-byte capacity",
             path.display(),
             facts.virtual_size
@@ -197,7 +197,7 @@ impl Qcow2Image {
                 Qcow2Error::Malformed(format!("the L2 table at {l2_offset} could not be read"))
             })?;
         self.l1_index = Some(l1_index);
-        log::debug!("read the L2 table at {l2_offset} for L1 entry {l1_index}");
+        tracing::debug!("read the L2 table at {l2_offset} for L1 entry {l1_index}");
         Ok(())
     }
 

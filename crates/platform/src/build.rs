@@ -89,7 +89,7 @@ impl BuildRegistry {
         if builds.contains_key(&request.name) {
             let error =
                 RepositoryError::new(format!("VM \"{}\" is already being created", request.name));
-            log::error!("{error}");
+            tracing::error!("{error}");
             return Err(error);
         }
 
@@ -120,11 +120,11 @@ impl BuildRegistry {
                     "the thread creating VM \"{}\" could not be started: {error}",
                     request.name
                 ));
-                log::error!("{error}");
+                tracing::error!("{error}");
                 error
             })?;
 
-        log::info!("started creating VM \"{}\" in the background", request.name);
+        tracing::info!("started creating VM \"{}\" in the background", request.name);
         builds.insert(
             request.name.clone(),
             Build {
@@ -191,10 +191,10 @@ impl BuildRegistry {
         let builds = self.lock();
         let Some(build) = builds.get(name) else {
             let error = RepositoryError::new(format!("VM \"{name}\" is not being created"));
-            log::error!("{error}");
+            tracing::error!("{error}");
             return Err(error);
         };
-        log::warn!("cancelling the creation of VM \"{name}\"");
+        tracing::warn!("cancelling the creation of VM \"{name}\"");
         build.monitor.cancel();
         Ok(())
     }
@@ -208,7 +208,7 @@ impl BuildRegistry {
             return Ok(());
         }
         let error = RepositoryError::new(format!("VM \"{name}\" is still being created"));
-        log::error!("{error}");
+        tracing::error!("{error}");
         Err(error)
     }
 
@@ -236,7 +236,7 @@ impl BuildRegistry {
             if let Some(worker) = build.worker.take()
                 && worker.join().is_err()
             {
-                log::error!("the thread creating VM \"{name}\" panicked");
+                tracing::error!("the thread creating VM \"{name}\" panicked");
             }
         }
     }
@@ -282,7 +282,7 @@ impl BuildRegistry {
             if let Some(worker) = build.worker.take()
                 && worker.join().is_err()
             {
-                log::error!("the thread creating VM \"{name}\" panicked");
+                tracing::error!("the thread creating VM \"{name}\" panicked");
             }
         }
     }
@@ -458,8 +458,8 @@ mod tests {
     /// anything else to be called.
     ///
     /// It did not: the entry was removed only by `reap`, which runs from
-    /// `take_diagnostics`. A cancelled build therefore kept its `Building` row
-    /// until something asked for diagnostics, and a build that succeeded was
+    /// `refresh`. A cancelled build therefore kept its `Building` row until
+    /// something asked for a refresh, and a build that succeeded was
     /// listed twice in the meantime -- once from the metadata store it had just
     /// been written to, and once from here.
     #[test]

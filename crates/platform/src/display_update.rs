@@ -238,7 +238,10 @@ mod tests {
         let (level, message) = report("dev-linux", &outcome(Some("0.2.0"), None));
 
         assert_eq!(level, vmlord_core::DiagnosticLevel::Info);
-        assert!(message.contains("dev-linux") && message.contains("0.2.0"), "{message}");
+        assert!(
+            message.contains("dev-linux") && message.contains("0.2.0"),
+            "{message}"
+        );
     }
 
     /// The answer the `Ok` of an update does not carry: the guest could not

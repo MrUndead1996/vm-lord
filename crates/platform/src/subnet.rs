@@ -111,17 +111,17 @@ pub(crate) fn choose_subnet(occupied: &[Ipv4Subnet]) -> Ipv4Subnet {
     for candidate in CANDIDATE_SUBNETS {
         match occupied.iter().find(|used| candidate.overlaps(**used)) {
             None => {
-                log::debug!("candidate subnet {candidate} does not overlap any host adapter");
+                tracing::debug!("candidate subnet {candidate} does not overlap any host adapter");
                 return candidate;
             }
             Some(used) => {
-                log::debug!("candidate subnet {candidate} overlaps host subnet {used}");
+                tracing::debug!("candidate subnet {candidate} overlaps host subnet {used}");
             }
         }
     }
 
     let fallback = CANDIDATE_SUBNETS[0];
-    log::warn!(
+    tracing::warn!(
         "every candidate subnet for the VMLord NAT network overlaps a host adapter; \
          using {fallback} anyway. A host route -- a corporate VPN's, typically -- \
          shares this range, and traffic to it may reach the VMs instead of its \
@@ -134,7 +134,7 @@ pub(crate) fn choose_subnet(occupied: &[Ipv4Subnet]) -> Ipv4Subnet {
 pub(crate) fn host_subnets() -> Result<Vec<Ipv4Subnet>, RepositoryError> {
     let table = UnicastAddressTable::query()?;
     let subnets: Vec<Ipv4Subnet> = table.ipv4_subnets();
-    log::debug!(
+    tracing::debug!(
         "the host occupies {} IPv4 subnet(s): {}",
         subnets.len(),
         subnets
@@ -159,7 +159,7 @@ pub(crate) fn interface_index(address: Ipv4Addr) -> Result<u32, RepositoryError>
             "no host adapter carries {address}, so the interface serving the VMLord network \
              could not be identified"
         ));
-        log::error!("{error}");
+        tracing::error!("{error}");
         error
     })
 }
@@ -180,7 +180,7 @@ impl UnicastAddressTable {
         let status = unsafe { GetUnicastIpAddressTable(AF_INET, &mut table) };
         if status != ERROR_SUCCESS {
             let error = unicast_table_error(status);
-            log::error!("{error}");
+            tracing::error!("{error}");
             return Err(error);
         }
         Ok(Self(table))

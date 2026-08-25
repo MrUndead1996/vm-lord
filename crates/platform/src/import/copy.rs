@@ -113,7 +113,7 @@ pub(crate) fn copy_image(
             first_length = used;
         } else if is_zero(&chunk[..used]) {
             summary.skipped_bytes += used as u64;
-            log::debug!("skipped the hole at {offset} ({used} bytes)");
+            tracing::debug!("skipped the hole at {offset} ({used} bytes)");
         } else {
             disk.write_at(offset, &chunk[..used])?;
             written.push(Written {
@@ -141,7 +141,7 @@ pub(crate) fn copy_image(
         }
     }
 
-    log::info!(
+    tracing::info!(
         "wrote {} of {} image bytes, skipping {} as holes",
         summary.written_bytes,
         summary.image_bytes,
@@ -169,17 +169,17 @@ fn verify(
                 "the {} bytes written at {} did not read back: the disk took the write and did not keep it",
                 record.length, record.offset
             ));
-            log::error!("{error}");
+            tracing::error!("{error}");
             return Err(error);
         }
         verified += record.length as u64;
     }
-    log::info!("read back and matched {verified} bytes");
+    tracing::info!("read back and matched {verified} bytes");
     Ok(verified)
 }
 
 fn repository_error(message: String) -> RepositoryError {
-    log::error!("{message}");
+    tracing::error!("{message}");
     RepositoryError::new(message)
 }
 

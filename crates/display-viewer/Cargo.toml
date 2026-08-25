@@ -18,7 +18,7 @@ name = "vmlord_display_viewer"
 path = "src/lib.rs"
 
 [dependencies]
-log.workspace = true
+tracing.workspace = true
 prost = "0.14"
 # Settings and the application log, the same two `vmlord-com1` takes.
 vmlord-core = { path = "../core" }
@@ -63,3 +63,8 @@ protox = "0.9"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The scoped subscriber the capture tests install: they assert what a record
+# does not contain, which needs somewhere to read records back from.
+tracing-subscriber.workspace = true

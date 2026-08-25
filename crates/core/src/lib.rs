@@ -1,9 +1,24 @@
 //! UI-independent domain types and repository boundary for VMLord.
 
+mod diagnostics;
 pub mod display;
 pub mod distro;
+mod error;
 pub mod gpu;
-pub mod logging;
+mod logging;
+
+pub use diagnostics::{Diagnostic, DiagnosticLevel, DiagnosticsLayer, DiagnosticsSink, Subsystem};
+pub use error::RepositoryError;
+
+/// A moment as VMLord spells it everywhere: `1970-01-01T00:00:00.000Z`.
+///
+/// Public so the diagnostics panel stamps a record the same way the log file
+/// does: two spellings of one moment would defeat the point of showing it,
+/// which is to line the panel up against `vmlord.log`.
+#[must_use]
+pub fn format_timestamp(at: std::time::SystemTime) -> String {
+    logging::timestamp(at)
+}
 pub mod progress;
 pub mod provisioning;
 pub mod settings;
@@ -24,7 +39,7 @@ pub use gpu::{
     WSL_LIB_SHARE,
 };
 pub use logging::{
-    LoggingError, initialize as initialize_logging,
+    LoggingError, initialize as initialize_logging, initialize_with_diagnostics,
     initialize_without_console as initialize_logging_without_console,
 };
 pub use progress::{
@@ -38,8 +53,6 @@ pub use settings::{
     AppSettings, GuestReadinessTimeouts, Language, LogLevel, SettingsError, SettingsStore,
 };
 pub use ssh::{SshAuthentication, SshAvailability, SshConfig, SshEndpoint, SshPort};
-
-use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -218,41 +231,6 @@ pub enum NetworkMode {
     Unknown(i32),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Diagnostic {
-    pub level: DiagnosticLevel,
-    pub message: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DiagnosticLevel {
-    Info,
-    Warning,
-    Error,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RepositoryError {
-    message: String,
-}
-
-impl RepositoryError {
-    #[must_use]
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl fmt::Display for RepositoryError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for RepositoryError {}
-
 pub trait VmRepository {
     fn initialize(&mut self) -> Result<(), RepositoryError>;
     fn create_vm(&mut self, request: VmCreateRequest) -> Result<(), RepositoryError>;
@@ -338,14 +316,22 @@ pub trait VmRepository {
         ))
     }
     fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError>;
-    fn take_diagnostics(&mut self) -> Vec<Diagnostic>;
+    /// Reaps what background work has finished, on the one `&mut self` call
+    /// the application makes on every refresh.
+    ///
+    /// Named for what it does rather than for what it used to return: finished
+    /// builds and starts are adopted here, answered shutdowns give up their
+    /// handles, desktops that appeared are written down, and HCS events are
+    /// drained. Diagnostics no longer come back from it -- they are recorded as
+    /// events on the way through, and read from the sink instead.
+    fn refresh(&mut self);
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DesktopProfile, Diagnostic, GpuMode, NetworkMode, RepositoryError, VmCreateRequest,
-        VmDeleteRequest, VmRepository, VmSource, VmSummary, VmUpdateRequest,
+        DesktopProfile, GpuMode, NetworkMode, RepositoryError, VmCreateRequest, VmDeleteRequest,
+        VmRepository, VmSource, VmSummary, VmUpdateRequest,
     };
 
     fn valid_request() -> VmCreateRequest {
@@ -560,9 +546,7 @@ mod tests {
             fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError> {
                 Ok(Vec::new())
             }
-            fn take_diagnostics(&mut self) -> Vec<Diagnostic> {
-                Vec::new()
-            }
+            fn refresh(&mut self) {}
         }
 
         let error = SilentBackend

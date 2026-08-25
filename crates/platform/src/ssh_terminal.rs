@@ -173,7 +173,7 @@ impl SshLauncher {
             Ok(Some(address)) => address,
             Ok(None) => return Err(SshLaunchFailure::NoAddress),
             Err(error) => {
-                log::error!(
+                tracing::error!(
                     "the address of VM \"{}\" could not be read: {error}",
                     mapping.vm_name
                 );
@@ -215,7 +215,7 @@ impl SshLauncher {
         let invocation = ssh::invocation(&client, &endpoint, vm_directory, None, None);
         self.spawn_somewhere(&invocation, &mapping.vm_name)?;
 
-        log::info!(
+        tracing::info!(
             "an SSH session to VM \"{}\" was opened at {endpoint}",
             mapping.vm_name
         );
@@ -241,7 +241,7 @@ impl SshLauncher {
             match (self.spawn)(&command) {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    log::warn!(
+                    tracing::warn!(
                         "could not open an SSH session to VM \"{vm_name}\" with {}: {error}",
                         command.program.display()
                     );

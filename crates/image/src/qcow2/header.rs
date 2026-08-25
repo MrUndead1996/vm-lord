@@ -160,7 +160,7 @@ pub(crate) fn inspect(
 
     check_extensions(reader, extensions_offset, file_length)?;
 
-    log::debug!(
+    tracing::debug!(
         "the image is qcow v{version}: a {virtual_size}-byte disk in {cluster_size}-byte \
          {compression:?} clusters, {l1_size} L1 entries at {l1_table_offset}"
     );
@@ -206,7 +206,7 @@ fn check_l1_table(
         )));
     }
     if l1_size > needed {
-        log::warn!("the L1 table has {l1_size} entries where {needed} would do");
+        tracing::warn!("the L1 table has {l1_size} entries where {needed} would do");
     }
 
     let table_bytes = l1_size * 8;
@@ -243,7 +243,7 @@ fn check_version3(reader: &mut (impl Read + Seek)) -> Result<(Compression, u64),
     let compatible = be_u64(&tail, 8);
     let autoclear = be_u64(&tail, 16);
     if compatible != 0 || autoclear != 0 {
-        log::debug!(
+        tracing::debug!(
             "the image sets compatible features {compatible:#018x} and auto-clear features \
              {autoclear:#018x}, none of which affect reading it"
         );
@@ -339,7 +339,7 @@ fn check_extensions(
                     "a header extension of type {kind:#010x} runs past the end of the file"
                 ))
             })?;
-        log::debug!("skipping the {length}-byte header extension of type {kind:#010x}");
+        tracing::debug!("skipping the {length}-byte header extension of type {kind:#010x}");
     }
 
     Err(Qcow2Error::Malformed(format!(
