@@ -87,10 +87,7 @@ pub const DMA_BUF_IOCTL_SYNC: libc::c_ulong =
 /// that works perfectly shows up as a black window.
 #[must_use]
 pub const fn fourcc(code: &[u8; 4]) -> u32 {
-    (code[0] as u32)
-        | ((code[1] as u32) << 8)
-        | ((code[2] as u32) << 16)
-        | ((code[3] as u32) << 24)
+    (code[0] as u32) | ((code[1] as u32) << 8) | ((code[2] as u32) << 16) | ((code[3] as u32) << 24)
 }
 
 /// Blue, green, red, one ignored byte. What a desktop's primary plane is.

@@ -579,7 +579,10 @@ mod tests {
 
     #[test]
     fn the_allowlist_names_four_kinds_and_nothing_else() {
-        assert_eq!(Kind::from_mime("text/plain;charset=utf-8"), Some(Kind::Text));
+        assert_eq!(
+            Kind::from_mime("text/plain;charset=utf-8"),
+            Some(Kind::Text)
+        );
         assert_eq!(Kind::from_mime("text/html"), Some(Kind::Html));
         assert_eq!(Kind::from_mime("image/bmp"), Some(Kind::Bmp));
         assert_eq!(Kind::from_mime("image/png"), Some(Kind::Png));

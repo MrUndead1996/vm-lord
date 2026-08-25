@@ -424,24 +424,21 @@ impl Session {
                 State::Established,
                 Channel::Frame | Channel::Input | Channel::Clipboard,
                 message_type,
-            ) if message_type == FrameRecord::ChannelHello as u16 =>
-            {
+            ) if message_type == FrameRecord::ChannelHello as u16 => {
                 self.on_channel_hello(header.channel, payload)
             }
             (
                 State::Established,
                 Channel::Frame | Channel::Input | Channel::Clipboard,
                 message_type,
-            ) if message_type == FrameRecord::ChannelAck as u16 =>
-            {
+            ) if message_type == FrameRecord::ChannelAck as u16 => {
                 self.on_channel_ack(header.channel, payload)
             }
             (
                 State::Established,
                 Channel::Frame | Channel::Input | Channel::Clipboard,
                 message_type,
-            ) if message_type == FrameRecord::ChannelAuth as u16 =>
-            {
+            ) if message_type == FrameRecord::ChannelAuth as u16 => {
                 self.on_channel_auth(header.channel, payload)
             }
             (_, channel, message_type) => Err(SessionError::Unexpected {
@@ -1202,7 +1199,9 @@ mod tests {
         let clipboard = host
             .derive_channel_key(Channel::Clipboard)
             .expect("a clipboard key");
-        let frame = host.derive_channel_key(Channel::Frame).expect("a frame key");
+        let frame = host
+            .derive_channel_key(Channel::Frame)
+            .expect("a frame key");
 
         assert_ne!(
             clipboard.to_bytes().as_slice(),

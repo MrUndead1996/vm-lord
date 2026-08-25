@@ -865,8 +865,7 @@ fn start_services(report: &mut Report) -> Result<(), String> {
     // halves have met. What proves they have is the socket between them.
     let deadline = std::time::Instant::now() + SHORT_BUDGET;
     loop {
-        if SYSTEM_UNITS.iter().all(|unit| unit_is_active(unit))
-            && Path::new(BROKER_SOCKET).exists()
+        if SYSTEM_UNITS.iter().all(|unit| unit_is_active(unit)) && Path::new(BROKER_SOCKET).exists()
         {
             report.ok(
                 DisplayRecipeStep::ServicesStart,

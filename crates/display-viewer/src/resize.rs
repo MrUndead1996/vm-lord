@@ -104,7 +104,10 @@ mod tests {
 
         resize.observe(1280, 720, start);
 
-        assert_eq!(resize.due(start + DEBOUNCE - Duration::from_millis(1)), None);
+        assert_eq!(
+            resize.due(start + DEBOUNCE - Duration::from_millis(1)),
+            None
+        );
     }
 
     #[test]

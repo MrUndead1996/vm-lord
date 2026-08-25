@@ -134,6 +134,30 @@ pub const MIN_DESKTOP_CPU_CORES: u32 = 2;
 /// The least memory a desktop guest is comfortable on, in MiB.
 pub const MIN_DESKTOP_RAM_MB: u32 = 4096;
 
+/// What a request may not have meant, as a fact rather than a sentence.
+///
+/// The domain decides when there is something to say and what it is about; the
+/// wording belongs to the UI, which is the half of the application that has a
+/// message catalogue and a language. No `Display` for the same reason: an
+/// advisory that could format itself would be a second wording to keep in step
+/// with the catalogue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Advisory {
+    /// A desktop VM with fewer cores than GNOME is comfortable on.
+    DesktopNeedsCores { required: u32, actual: u32 },
+    /// A desktop VM with less memory than GNOME is comfortable on.
+    DesktopNeedsRam { required_gib: u32, actual_mb: u32 },
+    /// A desktop VM short of both.
+    DesktopNeedsCoresAndRam {
+        required_cores: u32,
+        actual_cores: u32,
+        required_gib: u32,
+        actual_mb: u32,
+    },
+    /// A desktop VM whose guest has no password to type at its login screen.
+    DesktopNeedsPassword,
+}
+
 /// What to tell someone creating a desktop VM smaller than GNOME wants, or
 /// `None` when there is nothing to say.
 ///
@@ -147,7 +171,7 @@ pub fn desktop_resource_advice(
     profile: DesktopProfile,
     cpu_cores: u32,
     ram_mb: u32,
-) -> Option<String> {
+) -> Option<Advisory> {
     if !profile.wants_desktop() {
         return None;
     }
@@ -156,17 +180,20 @@ pub fn desktop_resource_advice(
     let ram_gib = MIN_DESKTOP_RAM_MB / 1024;
     match (short_cpu, short_ram) {
         (false, false) => None,
-        (true, false) => Some(format!(
-            "A GNOME desktop is slow below {MIN_DESKTOP_CPU_CORES} CPU cores; this VM has \
-             {cpu_cores}."
-        )),
-        (false, true) => Some(format!(
-            "A GNOME desktop is slow below {ram_gib} GiB of RAM; this VM has {ram_mb} MiB."
-        )),
-        (true, true) => Some(format!(
-            "A GNOME desktop is slow below {MIN_DESKTOP_CPU_CORES} CPU cores and {ram_gib} GiB of \
-             RAM; this VM has {cpu_cores} cores and {ram_mb} MiB."
-        )),
+        (true, false) => Some(Advisory::DesktopNeedsCores {
+            required: MIN_DESKTOP_CPU_CORES,
+            actual: cpu_cores,
+        }),
+        (false, true) => Some(Advisory::DesktopNeedsRam {
+            required_gib: ram_gib,
+            actual_mb: ram_mb,
+        }),
+        (true, true) => Some(Advisory::DesktopNeedsCoresAndRam {
+            required_cores: MIN_DESKTOP_CPU_CORES,
+            actual_cores: cpu_cores,
+            required_gib: ram_gib,
+            actual_mb: ram_mb,
+        }),
     }
 }
 
@@ -697,10 +724,31 @@ mod tests {
 
     #[test]
     fn small_resources_are_advised_against_and_not_refused() {
-        assert!(desktop_resource_advice(DesktopProfile::Gnome, 1, 8192).is_some());
-        assert!(desktop_resource_advice(DesktopProfile::Gnome, 4, 2048).is_some());
-        let both = desktop_resource_advice(DesktopProfile::Gnome, 1, 1024).expect("advice");
-        assert!(both.contains('1') && both.contains("1024"));
+        assert_eq!(
+            desktop_resource_advice(DesktopProfile::Gnome, 1, 8192),
+            Some(Advisory::DesktopNeedsCores {
+                required: MIN_DESKTOP_CPU_CORES,
+                actual: 1
+            })
+        );
+        assert_eq!(
+            desktop_resource_advice(DesktopProfile::Gnome, 4, 2048),
+            Some(Advisory::DesktopNeedsRam {
+                required_gib: MIN_DESKTOP_RAM_MB / 1024,
+                actual_mb: 2048
+            })
+        );
+        // The advice carries the numbers and not a sentence: the words are the
+        // UI's, which is the half of this that has a language.
+        assert_eq!(
+            desktop_resource_advice(DesktopProfile::Gnome, 1, 1024),
+            Some(Advisory::DesktopNeedsCoresAndRam {
+                required_cores: MIN_DESKTOP_CPU_CORES,
+                actual_cores: 1,
+                required_gib: MIN_DESKTOP_RAM_MB / 1024,
+                actual_mb: 1024
+            })
+        );
         assert_eq!(
             desktop_resource_advice(
                 DesktopProfile::Gnome,

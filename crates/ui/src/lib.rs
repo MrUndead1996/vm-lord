@@ -9,7 +9,7 @@ use eframe::egui;
 use rust_i18n::t;
 use vmlord_app::{BackendStatus, VmAction, WorkspaceApp};
 use vmlord_core::{
-    AgentStatus, AppSettings, BuildProgress, BuildStep, CloudImage, DesktopProfile,
+    Advisory, AgentStatus, AppSettings, BuildProgress, BuildStep, CloudImage, DesktopProfile,
     DiagnosticLevel, DisplayState, DownloadPhase, GpuMode, GpuState, GuestDefaults,
     GuestReadinessTimeouts, HostGpuCapabilities, Language, LogLevel, NetworkMode, Password,
     Provisioning, SshAccess, SshAuthentication, SshConfig, SshPort, VmCreateRequest,
@@ -698,7 +698,9 @@ fn render_create_vm_dialog(
                                         ui.add_sized(
                                             [300.0, FIELD_HEIGHT],
                                             egui::TextEdit::singleline(&mut form.image_path)
-                                                .hint_text(t!("create_vm.os_image_hint").to_string()),
+                                                .hint_text(
+                                                    t!("create_vm.os_image_hint").to_string(),
+                                                ),
                                         );
                                         if ui.button(t!("common.browse").to_string()).clicked() {
                                             action = Some(CreateVmDialogAction::BrowseImage);
@@ -882,7 +884,10 @@ fn render_provisioning_fields(
 
             ui.label("SSH");
             ui.vertical(|ui| {
-                ui.checkbox(&mut form.ssh_enabled, t!("create_vm.ssh_server").to_string());
+                ui.checkbox(
+                    &mut form.ssh_enabled,
+                    t!("create_vm.ssh_server").to_string(),
+                );
                 ui.add_enabled_ui(form.ssh_enabled, |ui| {
                     ui.checkbox(&mut form.deploy_key, t!("create_vm.ssh_key").to_string());
                     ui.horizontal(|ui| {
@@ -905,7 +910,9 @@ fn render_provisioning_fields(
                 if form.ssh_enabled && form.deploy_key {
                     match ssh_key_path {
                         Some(path) => {
-                            ui.small(t!("create_vm.private_key", path = path.display()).to_string());
+                            ui.small(
+                                t!("create_vm.private_key", path = path.display()).to_string(),
+                            );
                         }
                         None => {
                             ui.small(t!("create_vm.private_key_note").to_string());
@@ -958,7 +965,10 @@ fn render_settings_dialog(
                 .min_col_width(110.0)
                 .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    ui.add_sized([110.0, 24.0], egui::Label::new(t!("settings.vm_storage").to_string()));
+                    ui.add_sized(
+                        [110.0, 24.0],
+                        egui::Label::new(t!("settings.vm_storage").to_string()),
+                    );
                     ui.horizontal(|ui| {
                         ui.add_sized(
                             [310.0, 24.0],
@@ -971,7 +981,10 @@ fn render_settings_dialog(
                     });
                     ui.end_row();
 
-                    ui.add_sized([110.0, 24.0], egui::Label::new(t!("settings.language").to_string()));
+                    ui.add_sized(
+                        [110.0, 24.0],
+                        egui::Label::new(t!("settings.language").to_string()),
+                    );
                     egui::ComboBox::from_id_salt("settings-language")
                         .width(310.0)
                         .selected_text(language_label(form.language))
@@ -989,7 +1002,10 @@ fn render_settings_dialog(
                         });
                     ui.end_row();
 
-                    ui.add_sized([110.0, 24.0], egui::Label::new(t!("settings.log_file").to_string()));
+                    ui.add_sized(
+                        [110.0, 24.0],
+                        egui::Label::new(t!("settings.log_file").to_string()),
+                    );
                     ui.horizontal(|ui| {
                         ui.add_sized(
                             [310.0, 24.0],
@@ -1002,7 +1018,10 @@ fn render_settings_dialog(
                     });
                     ui.end_row();
 
-                    ui.add_sized([110.0, 24.0], egui::Label::new(t!("settings.log_level").to_string()));
+                    ui.add_sized(
+                        [110.0, 24.0],
+                        egui::Label::new(t!("settings.log_level").to_string()),
+                    );
                     egui::ComboBox::from_id_salt("settings-log-level")
                         .selected_text(log_level_label(form.log_level))
                         .show_ui(ui, |ui| {
@@ -1048,7 +1067,7 @@ fn render_settings_dialog(
                             .color(egui::Color32::WHITE),
                     )
                     .fill(egui::Color32::from_rgb(47, 158, 97))
-                        .min_size(egui::vec2(88.0, 30.0)),
+                    .min_size(egui::vec2(88.0, 30.0)),
                 );
                 if save.clicked() {
                     match form.settings() {
@@ -1103,7 +1122,11 @@ fn render_edit_vm_dialog(
 
                     ui.label(t!("create_vm.ram_size").to_string());
                     ui.horizontal(|ui| {
-                        ui.add(egui::DragValue::new(&mut form.ram_mb).range(512..=1_048_576).speed(2));
+                        ui.add(
+                            egui::DragValue::new(&mut form.ram_mb)
+                                .range(512..=1_048_576)
+                                .speed(2),
+                        );
                         ui.label("MiB");
                     });
                     ui.end_row();
@@ -1246,7 +1269,10 @@ fn render_delete_vm_dialog(
         .show(context, |ui| {
             ui.label(t!("delete_vm.description", name = form.vm_name).to_string());
             ui.add_space(8.0);
-            ui.checkbox(&mut form.delete_disks, t!("delete_vm.delete_disks").to_string());
+            ui.checkbox(
+                &mut form.delete_disks,
+                t!("delete_vm.delete_disks").to_string(),
+            );
             if form.delete_disks {
                 ui.small(t!("delete_vm.disks_deleted").to_string());
             } else {
@@ -1574,6 +1600,45 @@ fn create_vm_advisories(form: &CreateVmForm) -> Vec<String> {
     create_vm_request(form, &[])
         .map(|request| request.advisories())
         .unwrap_or_default()
+        .into_iter()
+        .map(advisory_text)
+        .collect()
+}
+
+/// The words for a piece of advice the domain has given.
+///
+/// The domain decides when to advise and carries the numbers; the sentence is
+/// the UI's, because the UI is what has a catalogue and a language.
+fn advisory_text(advisory: Advisory) -> String {
+    match advisory {
+        Advisory::DesktopNeedsCores { required, actual } => t!(
+            "advisory.desktop_needs_cores",
+            required = required,
+            actual = actual
+        ),
+        Advisory::DesktopNeedsRam {
+            required_gib,
+            actual_mb,
+        } => t!(
+            "advisory.desktop_needs_ram",
+            required = required_gib,
+            actual = actual_mb
+        ),
+        Advisory::DesktopNeedsCoresAndRam {
+            required_cores,
+            actual_cores,
+            required_gib,
+            actual_mb,
+        } => t!(
+            "advisory.desktop_needs_cores_and_ram",
+            required_cores = required_cores,
+            actual_cores = actual_cores,
+            required_gib = required_gib,
+            actual_mb = actual_mb
+        ),
+        Advisory::DesktopNeedsPassword => t!("advisory.desktop_needs_password"),
+    }
+    .to_string()
 }
 
 fn desktop_profile_label(profile: DesktopProfile) -> String {
@@ -2047,11 +2112,7 @@ fn render_selected_vm(
                 vm.ip_address
                     .map_or_else(|| t!("common.unavailable").to_string(), |ip| ip.to_string()),
             );
-            detail_row(
-                ui,
-                &t!("selected_vm.operating_system"),
-                vm.os_type.clone(),
-            );
+            detail_row(ui, &t!("selected_vm.operating_system"), vm.os_type.clone());
             detail_row(ui, &t!("vm_table.status"), vm_state(vm.state));
             if let VmState::Building { progress } = vm.state {
                 render_build_progress(ui, progress);
@@ -2078,7 +2139,11 @@ fn render_selected_vm(
                 t!("vm_table.gibibytes", count = vm.disk_gb).to_string(),
             );
             detail_row(ui, "GPU", gpu_mode_label(vm.gpu_mode));
-            detail_row(ui, &t!("selected_vm.gpu_status"), gpu_status_detail(gpu_status));
+            detail_row(
+                ui,
+                &t!("selected_vm.gpu_status"),
+                gpu_status_detail(gpu_status),
+            );
             detail_row(
                 ui,
                 &t!("create_vm.desktop"),
@@ -2113,7 +2178,9 @@ fn render_action_group(
         for (action, label) in actions {
             let response = render_action_icon(ui, *action, enabled);
             let tooltip = disabled_tooltip
-                .map(|reason| t!("selected_vm.locked_reason", label = label, reason = reason).to_string())
+                .map(|reason| {
+                    t!("selected_vm.locked_reason", label = label, reason = reason).to_string()
+                })
                 .unwrap_or_else(|| (*label).into());
             if enabled {
                 response.clone().on_hover_text(tooltip);
@@ -2585,11 +2652,7 @@ mod tests {
 
     /// The dotted paths of every string in a catalogue.
     fn catalogue_keys(document: &str) -> std::collections::BTreeSet<String> {
-        fn walk(
-            prefix: &str,
-            value: &toml::Value,
-            keys: &mut std::collections::BTreeSet<String>,
-        ) {
+        fn walk(prefix: &str, value: &toml::Value, keys: &mut std::collections::BTreeSet<String>) {
             match value {
                 toml::Value::Table(table) => {
                     for (key, value) in table {
@@ -2615,8 +2678,14 @@ mod tests {
 
     #[test]
     fn a_core_count_takes_the_form_russian_asks_for() {
-        assert_eq!(t!("vm_table.cores_one", locale = "ru-RU", count = 1), "1 ядро");
-        assert_eq!(t!("vm_table.cores_few", locale = "ru-RU", count = 2), "2 ядра");
+        assert_eq!(
+            t!("vm_table.cores_one", locale = "ru-RU", count = 1),
+            "1 ядро"
+        );
+        assert_eq!(
+            t!("vm_table.cores_few", locale = "ru-RU", count = 2),
+            "2 ядра"
+        );
         assert_eq!(
             t!("vm_table.cores_many", locale = "ru-RU", count = 5),
             "5 ядер"
@@ -2633,6 +2702,24 @@ mod tests {
         assert_eq!(plural_form(11), PluralForm::Many);
         assert_eq!(plural_form(21), PluralForm::One);
         assert_eq!(plural_form(0), PluralForm::Many);
+    }
+
+    /// The advice keeps the domain's numbers and takes the UI's words.
+    #[test]
+    fn an_advisory_is_worded_by_the_catalogue() {
+        use super::{Advisory, advisory_text};
+
+        assert_eq!(
+            advisory_text(Advisory::DesktopNeedsCores {
+                required: 2,
+                actual: 1
+            }),
+            "A GNOME desktop is slow below 2 CPU cores; this VM has 1."
+        );
+        assert_eq!(
+            t!("advisory.desktop_needs_password", locale = "ru-RU"),
+            "У ВМ с рабочим столом без пароля нечего ввести на экране входа; задайте его здесь или позже по SSH."
+        );
     }
 
     #[test]
@@ -2653,7 +2740,10 @@ mod tests {
 
     #[test]
     fn the_settings_dialog_is_translated() {
-        assert_eq!(t!("settings.title", locale = "ru-RU"), "Настройки приложения");
+        assert_eq!(
+            t!("settings.title", locale = "ru-RU"),
+            "Настройки приложения"
+        );
         assert_ne!(
             t!("settings.title", locale = "ru-RU"),
             t!("settings.title", locale = "en-US")

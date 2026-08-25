@@ -68,7 +68,10 @@ pub fn utf16_of(text: &[u8]) -> Vec<u16> {
 /// over one character would be worse than replacing it.
 #[must_use]
 pub fn utf8_of(units: &[u16]) -> Vec<u8> {
-    let end = units.iter().position(|unit| *unit == 0).unwrap_or(units.len());
+    let end = units
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(units.len());
 
     String::from_utf16_lossy(&units[..end]).into_bytes()
 }
@@ -96,7 +99,11 @@ pub fn cf_html_of(html: &[u8]) -> Vec<u8> {
     let end_html = end_fragment + HTML_EPILOGUE.len();
 
     let header = HTML_HEADER
-        .replacen("StartHTML:0000000000", &format!("StartHTML:{start_html:010}"), 1)
+        .replacen(
+            "StartHTML:0000000000",
+            &format!("StartHTML:{start_html:010}"),
+            1,
+        )
         .replacen("EndHTML:0000000000", &format!("EndHTML:{end_html:010}"), 1)
         .replacen(
             "StartFragment:0000000000",
@@ -303,7 +310,9 @@ fn decode_bmp(bmp: &[u8]) -> Result<Picture, ImageError> {
         .checked_add(stride * height_pixels as usize)
         .ok_or_else(|| ImageError("a picture larger than this address space".to_owned()))?;
     if bmp.len() < needed {
-        return Err(ImageError("the picture is shorter than its header".to_owned()));
+        return Err(ImageError(
+            "the picture is shorter than its header".to_owned(),
+        ));
     }
 
     // A positive height is bottom-up, which is the ordinary BMP; a negative one

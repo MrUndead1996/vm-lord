@@ -214,3 +214,9 @@ disks_kept = "The virtual disks are kept, so the VM's directory stays in place a
 
 [diagnostics]
 title = "Log"
+
+[advisory]
+desktop_needs_cores = "A GNOME desktop is slow below %{required} CPU cores; this VM has %{actual}."
+desktop_needs_ram = "A GNOME desktop is slow below %{required} GiB of RAM; this VM has %{actual} MiB."
+desktop_needs_cores_and_ram = "A GNOME desktop is slow below %{required_cores} CPU cores and %{required_gib} GiB of RAM; this VM has %{actual_cores} cores and %{actual_mb} MiB."
+desktop_needs_password = "A desktop VM without a password has nothing to log in with at its login screen; set one here, or set one later over SSH."

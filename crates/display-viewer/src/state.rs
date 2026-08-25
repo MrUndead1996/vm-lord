@@ -291,7 +291,10 @@ mod tests {
 
     #[test]
     fn a_name_cannot_escape_the_directory_it_is_written_in() {
-        assert_eq!(file_name("../../windows/system32"), ".._.._windows_system32");
+        assert_eq!(
+            file_name("../../windows/system32"),
+            ".._.._windows_system32"
+        );
         assert_eq!(file_name(r"C:\evil"), "C__evil");
         assert_eq!(file_name(".."), "vm");
         assert_eq!(file_name(""), "vm");
