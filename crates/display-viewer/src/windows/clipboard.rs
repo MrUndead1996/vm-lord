@@ -28,8 +28,8 @@ use vmlord_display_protocol::{
     record::{self, Channel, Header, Limits, Record},
     session::{HandedOver, Negotiated, Session},
     v1::{
-        CancelReason, ClipboardCancel, ClipboardData, ClipboardOffer, ClipboardRecord,
-        ClipboardRequest, Capability, Mode, ProtocolVersion,
+        CancelReason, Capability, ClipboardCancel, ClipboardData, ClipboardOffer, ClipboardRecord,
+        ClipboardRequest, Mode, ProtocolVersion,
     },
 };
 use windows::{
@@ -37,9 +37,9 @@ use windows::{
         Foundation::{HANDLE, HGLOBAL, HWND, LPARAM, LRESULT, WPARAM},
         System::{
             DataExchange::{
-                AddClipboardFormatListener, CloseClipboard, EmptyClipboard,
-                GetClipboardSequenceNumber, GetClipboardData, IsClipboardFormatAvailable,
-                OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
+                AddClipboardFormatListener, CloseClipboard, EmptyClipboard, GetClipboardData,
+                GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
+                RegisterClipboardFormatW, SetClipboardData,
             },
             Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
         },
@@ -121,6 +121,10 @@ fn serve(parameters: &Parameters, focus: &Receiver<Focus>) -> Result<(), String>
     let mut exchange = Exchange::new();
     let mut socket: Option<HvSocket> = None;
     let mut next_bind = Instant::now();
+    // Whether a hello has ever gone down this channel. The guest burns a
+    // generation the moment it reads one, so every attempt after the first has
+    // to carry a higher one -- whether or not the attempt it belonged to bound.
+    let mut greeted = false;
     let mut focused = false;
     // A host selection that changed while the window was unfocused, to announce
     // when it comes back: the guest is told what is on the clipboard now, not
@@ -166,7 +170,7 @@ fn serve(parameters: &Parameters, focus: &Receiver<Focus>) -> Result<(), String>
         }
 
         if socket.is_none() && now >= next_bind {
-            match bind(&mut session, parameters) {
+            match bind(&mut session, parameters, &mut greeted) {
                 Ok(bound) => {
                     log::info!(
                         "the clipboard channel bound at generation {}",
@@ -192,18 +196,15 @@ fn serve(parameters: &Parameters, focus: &Receiver<Focus>) -> Result<(), String>
                 }
                 Err(record::RecordError::Idle) => {}
                 Err(error) => {
-                    log::debug!("the clipboard channel ended: {error}");
+                    log::info!("the clipboard channel ended: {error}");
                     socket = None;
                     next_bind = Instant::now() + BIND_BACKOFF;
-                    if let Err(error) = session.reconnect_channel(Channel::Clipboard) {
-                        return Err(error.to_string());
-                    }
                 }
             }
         }
 
         ops.extend(exchange.tick(now));
-        carry_out(
+        let lost = carry_out(
             ops,
             &mut exchange,
             &mut session,
@@ -213,11 +214,21 @@ fn serve(parameters: &Parameters, focus: &Receiver<Focus>) -> Result<(), String>
             &mut held,
             &mut written,
         );
+        if lost {
+            log::info!("the clipboard channel could not be written to");
+            socket = None;
+            next_bind = Instant::now() + BIND_BACKOFF;
+        }
     }
 }
 
 /// Does everything the exchange asked for, in order.
+///
+/// Answers whether the socket was lost on the way. It is the caller that owns
+/// it, so saying so is the only way this can put it down: a write that failed
+/// into a socket the loop went on using would fail silently for ever.
 #[allow(clippy::too_many_arguments)]
+#[must_use]
 fn carry_out<S: Read + Write>(
     ops: Vec<Op>,
     exchange: &mut Exchange,
@@ -227,10 +238,11 @@ fn carry_out<S: Read + Write>(
     html: u32,
     held: &mut Vec<Piece>,
     written: &mut u32,
-) {
+) -> bool {
     // A queue rather than a list: producing a selection appends the chunks that
     // carry it, and those follow whatever is already waiting.
     let mut queue: std::collections::VecDeque<Op> = ops.into();
+    let mut lost = false;
 
     while let Some(op) = queue.pop_front() {
         match op {
@@ -241,14 +253,11 @@ fn carry_out<S: Read + Write>(
                 let Ok(sequence) = session.take_channel_sequence(Channel::Clipboard) else {
                     continue;
                 };
-                let record = record_of(
-                    &message,
-                    sequence,
-                    session.generation(Channel::Clipboard),
-                );
+                let record = record_of(&message, sequence, session.generation(Channel::Clipboard));
                 if let Err(error) = record::write(open, &record, limits) {
                     log::debug!("a clipboard record could not be written: {error}");
                     socket = None;
+                    lost = true;
                 }
             }
             Op::Produce { kind, transfer } => match read_kind(kind, html) {
@@ -270,6 +279,8 @@ fn carry_out<S: Read + Write>(
             }
         }
     }
+
+    lost
 }
 
 /// What the host's clipboard has, as an offer.
@@ -323,14 +334,26 @@ fn session_of(handover: &Handover) -> Result<Session, String> {
 }
 
 /// Opens the clipboard socket and runs the three-record bind on it.
-fn bind(session: &mut Session, parameters: &Parameters) -> Result<HvSocket, String> {
+///
+/// `greeted` is what makes a second attempt possible at all. The guest records
+/// the generation of every hello it reads and refuses anything that does not
+/// climb, so an attempt that failed has still spent one: after the first, the
+/// generation is advanced whether the last attempt bound or not.
+fn bind(
+    session: &mut Session,
+    parameters: &Parameters,
+    greeted: &mut bool,
+) -> Result<HvSocket, String> {
     let mut socket = HvSocket::connect(&parameters.runtime_id, parameters.port, CONNECT_TIMEOUT)
         .map_err(|error| error.to_string())?;
     let limits = Limits::new(0, 0);
 
-    let hello = session
-        .open_channel(Channel::Clipboard)
-        .map_err(|error| error.to_string())?;
+    let hello = if std::mem::replace(greeted, true) {
+        session.reconnect_channel(Channel::Clipboard)
+    } else {
+        session.open_channel(Channel::Clipboard)
+    }
+    .map_err(|error| error.to_string())?;
     record::write(&mut socket, &hello, &limits).map_err(|error| error.to_string())?;
 
     let mut payload = Vec::new();
@@ -540,8 +563,12 @@ fn apply(pieces: &[Piece], html: u32) -> Result<u32, String> {
 /// Copies one format's bytes into global memory the clipboard takes over.
 fn put(format: u32, bytes: &[u8]) -> Result<(), String> {
     // SAFETY: a moveable allocation of a known size.
-    let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) }
-        .map_err(|error| format!("the clipboard could not be given {} bytes: {error}", bytes.len()))?;
+    let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes.len()) }.map_err(|error| {
+        format!(
+            "the clipboard could not be given {} bytes: {error}",
+            bytes.len()
+        )
+    })?;
 
     // SAFETY: `memory` was just allocated and is not locked.
     let pointer = unsafe { GlobalLock(memory) };
@@ -728,6 +755,72 @@ mod tests {
         assert_eq!(record.header.message_type, ClipboardRecord::Offer as u16);
         assert_eq!(record.header.sequence, 3);
         assert_eq!(record.header.generation, 2);
+    }
+
+    #[test]
+    fn a_write_that_failed_says_the_socket_is_gone() {
+        // A socket the loop keeps using after a failed write is a clipboard
+        // that is silently dead for the rest of the session.
+        struct Closed;
+        impl Read for Closed {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+        impl Write for Closed {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut session = session_of(&handover()).expect("a clipboard session");
+        let mut exchange = Exchange::new();
+        let mut held = Vec::new();
+        let mut written = 0;
+        let mut socket = Closed;
+
+        let lost = carry_out(
+            vec![Op::Send(Outgoing::Offer {
+                serial: 1,
+                mime_types: vec![Kind::Text.mime()],
+            })],
+            &mut exchange,
+            &mut session,
+            Some(&mut socket),
+            &Limits::new(0, 0),
+            0,
+            &mut held,
+            &mut written,
+        );
+
+        assert!(
+            lost,
+            "a failed write has to reach the loop that owns the socket"
+        );
+    }
+
+    #[test]
+    fn every_attempt_after_the_first_climbs_a_generation() {
+        // What the guest enforces: it remembers the generation of every hello
+        // it reads, so a second attempt at the one it already refused can
+        // never bind. `bind` needs a socket, so this is the half of it that
+        // decides the generation.
+        let mut session = session_of(&handover()).expect("a clipboard session");
+        let mut greeted = false;
+
+        for expected in 0..3 {
+            let hello = if std::mem::replace(&mut greeted, true) {
+                session.reconnect_channel(Channel::Clipboard)
+            } else {
+                session.open_channel(Channel::Clipboard)
+            }
+            .expect("a hello");
+
+            assert_eq!(hello.header.generation, expected);
+        }
     }
 
     fn handover() -> Handover {
