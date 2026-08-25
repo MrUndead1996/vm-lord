@@ -53,6 +53,32 @@ fn install(settings: &AppSettings, console: Console) -> Result<(), LoggingError>
     Ok(())
 }
 
+/// Brings up logging and the diagnostics panel together.
+///
+/// The panel is the reason a sink comes back: the caller hands it to the
+/// application, which reads it on every refresh. `vmlord-com1` and
+/// `vmlord-display` call `initialize` instead -- neither has a panel to show a
+/// record in.
+///
+/// # Errors
+///
+/// [`LoggingError`] when the log directory or file cannot be opened, or when a
+/// subscriber is already installed.
+pub fn initialize_with_diagnostics(
+    settings: &AppSettings,
+) -> Result<crate::diagnostics::DiagnosticsSink, LoggingError> {
+    let sink = crate::diagnostics::DiagnosticsSink::new();
+    let layer = record_layer(settings, Console::Echo)?;
+    install_bridge(settings)?;
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry()
+            .with(layer)
+            .with(crate::diagnostics::DiagnosticsLayer::new(sink.clone())),
+    )
+    .map_err(LoggingError::AlreadyInitialized)?;
+    Ok(sink)
+}
+
 /// Opens the log file and builds the layer that writes to it.
 ///
 /// Separate from installation so that a process which also wants diagnostics

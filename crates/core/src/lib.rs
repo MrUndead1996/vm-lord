@@ -1,9 +1,12 @@
 //! UI-independent domain types and repository boundary for VMLord.
 
+mod diagnostics;
 pub mod display;
 pub mod distro;
 pub mod gpu;
-pub mod logging;
+mod logging;
+
+pub use diagnostics::{DiagnosticsLayer, DiagnosticsSink, Subsystem};
 pub mod progress;
 pub mod provisioning;
 pub mod settings;
@@ -24,7 +27,7 @@ pub use gpu::{
     WSL_LIB_SHARE,
 };
 pub use logging::{
-    LoggingError, initialize as initialize_logging,
+    LoggingError, initialize as initialize_logging, initialize_with_diagnostics,
     initialize_without_console as initialize_logging_without_console,
 };
 pub use progress::{
