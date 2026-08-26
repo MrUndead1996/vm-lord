@@ -738,7 +738,7 @@ fn executable_directory_for_display() -> PathBuf {
 }
 
 /// Canonicalizes a path the way an export must have it.
-fn canonicalize_for_export(path: &Path) -> Result<PathBuf, RepositoryError> {
+pub(crate) fn canonicalize_for_export(path: &Path) -> Result<PathBuf, RepositoryError> {
     std::fs::canonicalize(path)
         .map_err(|error| RepositoryError::new(format!("{}: {error}", path.display())))
 }

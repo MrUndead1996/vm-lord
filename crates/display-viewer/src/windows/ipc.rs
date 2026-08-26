@@ -13,8 +13,8 @@
 //! viewer can be the one to run a handshake for it.
 //!
 //! The pipe server belongs to the viewer, so it outlives the VMLord that
-//! started it and is found by a later one. That is the repeated-Connect case
-//! that matters.
+//! started it and is found by a later one. The later viewer closes that orphan
+//! and takes its mutex: only a fresh process can receive fresh launch pipes.
 
 use std::{
     error::Error,
@@ -68,6 +68,9 @@ const BUSY_WAIT: Duration = Duration::from_secs(2);
 /// How long a busy client sleeps between attempts.
 const BUSY_POLL: Duration = Duration::from_millis(10);
 
+/// How long a replacement waits for the old viewer to release its claim.
+const REPLACE_WAIT: Duration = Duration::from_secs(5);
+
 /// The mutex one viewer holds for the life of its process.
 #[must_use]
 pub fn mutex_name(runtime_id: &[u8; 16]) -> String {
@@ -105,8 +108,9 @@ pub struct SingleInstance {
 impl SingleInstance {
     /// Takes the claim, or reports that another viewer has it.
     ///
-    /// `Ok(None)` is the repeated-Connect case: a viewer for this VM is already
-    /// running, and what the caller should do is focus it through the pipe.
+    /// `Ok(None)` means a viewer for this VM is already running. A caller from
+    /// a new VMLord replaces it; repeated Connect inside one VMLord is handled
+    /// before another viewer is launched.
     ///
     /// # Errors
     ///
@@ -130,6 +134,27 @@ impl SingleInstance {
         }
 
         Ok(Some(Self { handle }))
+    }
+}
+
+/// Closes the viewer left by an earlier VMLord and takes its claim.
+///
+/// The old viewer cannot reuse launch pipes whose owning process has exited.
+/// Replacing it is what binds the surviving window request to the new
+/// process's pipes and session driver.
+pub fn replace_instance(runtime_id: &[u8; 16]) -> Result<SingleInstance, IpcError> {
+    send_command(runtime_id, Command::Close)?;
+    let deadline = Instant::now() + REPLACE_WAIT;
+    loop {
+        if let Some(claim) = SingleInstance::take(runtime_id)? {
+            return Ok(claim);
+        }
+        if Instant::now() >= deadline {
+            return Err(IpcError::Unreachable(
+                "the old display viewer did not close".to_owned(),
+            ));
+        }
+        thread::sleep(BUSY_POLL);
     }
 }
 
@@ -456,7 +481,9 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{CommandServer, SingleInstance, mutex_name, pipe_name, send_command};
+    use super::{
+        CommandServer, SingleInstance, mutex_name, pipe_name, replace_instance, send_command,
+    };
     use crate::launch::{Command, Message};
 
     /// A runtime id nothing else in the test process uses.
@@ -498,6 +525,32 @@ mod tests {
                 .is_some(),
             "the mutex is released when the viewer exits"
         );
+    }
+
+    #[test]
+    fn a_new_parent_closes_the_old_viewer_and_takes_its_claim() {
+        let id = runtime_id(9);
+        let first = SingleInstance::take(&id)
+            .expect("the mutex can be created")
+            .expect("nothing else holds it");
+        let (sink, commands) = mpsc::channel();
+        let server = CommandServer::start(&id, sink).expect("the pipe can be created");
+        let (replacement, replaced) = mpsc::channel();
+        let replacing = std::thread::spawn(move || {
+            let claim = replace_instance(&id).expect("the old viewer gives way");
+            replacement.send(()).unwrap();
+            drop(claim);
+        });
+
+        assert_eq!(
+            commands.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Command::Close
+        );
+        drop(server);
+        drop(first);
+        replaced.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        replacing.join().unwrap();
     }
 
     #[test]
