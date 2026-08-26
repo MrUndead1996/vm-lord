@@ -357,15 +357,40 @@ fn name_of(message: &Message) -> &'static str {
 mod tests {
     use uuid::Uuid;
     use vmlord_core::FileClipboardSettings;
+    use vmlord_display_payload::ProtocolRange;
     use vmlord_display_protocol::{
         keys::Secret,
         record::{self, Record},
         session::{Session, Support},
-        v1::{Capability, Mode},
+        v1::{Capability, Mode, ProtocolVersion},
     };
     use vmlord_display_viewer::launch::Message;
 
     use super::{Driver, control_limits, framed};
+
+    #[test]
+    fn the_payload_this_build_ships_speaks_what_the_host_negotiates() {
+        // The one place that has both: `vmlord-display-payload` deliberately
+        // does not depend on the protocol, so a release whose services were
+        // built before a revision would otherwise be offered to a host that
+        // negotiates it.
+        #[derive(serde::Deserialize)]
+        struct Spec {
+            protocol: ProtocolRange,
+        }
+
+        let document =
+            include_str!("../../../payloads/display/ubuntu-24.04-amd64/payload.spec.json");
+        let spec: Spec = serde_json::from_str(document).expect("a checked-in payload spec");
+        let current = ProtocolVersion::current();
+
+        assert!(
+            spec.protocol.covers(current.major, current.minor),
+            "the shipped payload does not cover {}.{}",
+            current.major,
+            current.minor
+        );
+    }
 
     /// What the MVP guest announces.
     fn support() -> Support {

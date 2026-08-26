@@ -42,9 +42,75 @@ impl ProtocolRange {
     }
 }
 
+/// The releases this repository builds, as their specs are checked in.
+///
+/// Held here so that a protocol revision cannot be added without the payloads
+/// that have to speak it being looked at in the same change.
+#[cfg(test)]
+const SPECS: [(&str, &str); 3] = [
+    (
+        "ubuntu-22.04-amd64",
+        include_str!("../../../payloads/display/ubuntu-22.04-amd64/payload.spec.json"),
+    ),
+    (
+        "ubuntu-24.04-amd64",
+        include_str!("../../../payloads/display/ubuntu-24.04-amd64/payload.spec.json"),
+    ),
+    (
+        "ubuntu-26.04-amd64",
+        include_str!("../../../payloads/display/ubuntu-26.04-amd64/payload.spec.json"),
+    ),
+];
+
 #[cfg(test)]
 mod tests {
-    use super::ProtocolRange;
+    use serde::Deserialize;
+
+    use super::{ProtocolRange, ProtocolVersionParts, SPECS};
+
+    /// The revision the guest services in these payloads implement.
+    ///
+    /// Written out rather than depended on, which is what keeps this crate
+    /// free of `vmlord-display-protocol`; `vmlord-platform`, which has both,
+    /// holds this against what the protocol actually negotiates.
+    const CURRENT: ProtocolVersionParts = ProtocolVersionParts { major: 1, minor: 3 };
+
+    #[derive(Deserialize)]
+    struct Spec {
+        version: String,
+        protocol: ProtocolRange,
+    }
+
+    #[test]
+    fn every_release_speaks_the_revision_this_build_negotiates() {
+        for (name, document) in SPECS {
+            let spec: Spec =
+                serde_json::from_str(document).unwrap_or_else(|error| panic!("{name}: {error}"));
+
+            assert!(spec.protocol.is_valid(), "{name} has no protocol range");
+            assert!(
+                spec.protocol.covers(CURRENT.major, CURRENT.minor),
+                "{name} at {} does not cover {}.{}",
+                spec.version,
+                CURRENT.major,
+                CURRENT.minor
+            );
+        }
+    }
+
+    #[test]
+    fn a_payload_from_before_a_revision_is_not_promoted_into_covering_it() {
+        // What 0.1.5 declared, which is every release before the file
+        // clipboard: it may not be read as covering what it never spoke.
+        let historical = ProtocolRange {
+            major: 1,
+            min_minor: 0,
+            max_minor: 0,
+        };
+
+        assert!(historical.covers(1, 0));
+        assert!(!historical.covers(CURRENT.major, CURRENT.minor));
+    }
 
     #[test]
     fn a_range_covers_only_its_own_major() {
