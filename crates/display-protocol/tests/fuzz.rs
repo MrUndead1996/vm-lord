@@ -8,11 +8,16 @@
 //! Two invariants: nothing panics, and no session hands out a channel key
 //! unless a real handshake put one there.
 
+use prost::Message;
 use vmlord_display_protocol::{
     keys::Secret,
-    record::{self, Channel, Limits},
+    record::{self, Channel, Limits, Record},
     session::{Offer, Session, Support},
-    v1::{Capability, Mode},
+    v1::{
+        Capability, ClipboardFileCancel, ClipboardFileChunk, ClipboardFileComplete,
+        ClipboardFileEntry, ClipboardFileOffer, ClipboardFilePolicy, ClipboardFileRequest,
+        ClipboardRecord, FileCancelReason, FileEntryKind, Mode,
+    },
 };
 
 /// xorshift64*, so the corpus is the same on every machine and every run.
@@ -116,6 +121,108 @@ fn a_session_never_yields_a_channel_key_to_input_that_did_not_authenticate() {
                 host.channel_key(channel).is_none(),
                 "a host bound a channel to mutated input"
             );
+        }
+    }
+}
+
+/// One of every file clipboard record, written as a peer would send them.
+fn file_clipboard_wire() -> Vec<u8> {
+    let limits = Limits::new(1920, 1080);
+    let mut wire = Vec::new();
+
+    let records = [
+        (
+            ClipboardRecord::FilePolicy,
+            ClipboardFilePolicy {
+                max_file_bytes: 1 << 30,
+                max_transfer_bytes: 4 << 30,
+                retention_seconds: 86_400,
+            }
+            .encode_to_vec(),
+        ),
+        (
+            ClipboardRecord::FileOffer,
+            ClipboardFileOffer { serial: 7 }.encode_to_vec(),
+        ),
+        (
+            ClipboardRecord::FileRequest,
+            ClipboardFileRequest {
+                serial: 7,
+                transfer: 3,
+            }
+            .encode_to_vec(),
+        ),
+        (
+            ClipboardRecord::FileEntry,
+            ClipboardFileEntry {
+                transfer: 3,
+                path: "notes/todo.txt".into(),
+                kind: FileEntryKind::File as i32,
+                size: 4096,
+            }
+            .encode_to_vec(),
+        ),
+        (
+            ClipboardRecord::FileChunk,
+            ClipboardFileChunk {
+                transfer: 3,
+                chunk: vec![0x5A; 1024],
+            }
+            .encode_to_vec(),
+        ),
+        (
+            ClipboardRecord::FileComplete,
+            ClipboardFileComplete { transfer: 3 }.encode_to_vec(),
+        ),
+        (
+            ClipboardRecord::FileCancel,
+            ClipboardFileCancel {
+                transfer: 3,
+                reason: FileCancelReason::TooLarge as i32,
+            }
+            .encode_to_vec(),
+        ),
+    ];
+
+    for (sequence, (message_type, payload)) in records.into_iter().enumerate() {
+        let record = Record::new(
+            Channel::Clipboard,
+            message_type as u16,
+            sequence as u32,
+            0,
+            0,
+            payload,
+        );
+        record::write(&mut wire, &record, &limits).expect("a file clipboard record");
+    }
+
+    wire
+}
+
+#[test]
+fn the_file_clipboard_records_survive_mutated_input() {
+    let mut rng = Rng(0x0F11_E5EE_D123_4567);
+    let limits = Limits::new(1920, 1080);
+    let corpus = vec![file_clipboard_wire()];
+
+    for _ in 0..20_000 {
+        let mut bytes = mutated(&mut rng, &corpus);
+        let keep = rng.below(bytes.len() + 1);
+        bytes.truncate(keep);
+
+        let mut payload = Vec::new();
+        let mut cursor = bytes.as_slice();
+        while let Ok(header) = record::read(&mut cursor, &limits, &mut payload) {
+            // Whatever the header claims to be, every decoder it could reach
+            // has to answer rather than panic.
+            let _ = ClipboardRecord::try_from(i32::from(header.message_type));
+            let _ = ClipboardFilePolicy::decode(payload.as_slice());
+            let _ = ClipboardFileOffer::decode(payload.as_slice());
+            let _ = ClipboardFileRequest::decode(payload.as_slice());
+            let _ = ClipboardFileEntry::decode(payload.as_slice());
+            let _ = ClipboardFileChunk::decode(payload.as_slice());
+            let _ = ClipboardFileComplete::decode(payload.as_slice());
+            let _ = ClipboardFileCancel::decode(payload.as_slice());
         }
     }
 }

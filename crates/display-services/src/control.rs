@@ -70,6 +70,7 @@ pub fn support_from(width: u32, height: u32) -> Support {
             // the handshake cannot be renegotiated when one appears. With no
             // daemon attached the guest simply offers nothing.
             Capability::Clipboard,
+            Capability::FileClipboard,
         ],
         // Motion is not a mode this build has. Announcing it and then encoding
         // a desktop would be worse than refusing it.

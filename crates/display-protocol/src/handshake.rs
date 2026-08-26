@@ -14,7 +14,7 @@ use std::{error::Error, fmt};
 use crate::v1::{Capability, ProtocolVersion};
 
 /// The revision of the schema this build implements.
-pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 0 };
+pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 3 };
 
 impl ProtocolVersion {
     /// The revision this build implements.
@@ -76,12 +76,28 @@ pub fn confirm_version(
 /// "absent", not a capability.
 #[must_use]
 pub fn agreed_capabilities(local: &[Capability], remote: &[i32]) -> Vec<Capability> {
-    local
+    let mut agreed: Vec<_> = local
         .iter()
         .copied()
         .filter(|capability| *capability != Capability::Unspecified)
         .filter(|capability| remote.contains(&i32::from(*capability)))
-        .collect()
+        .collect();
+    if !agreed.contains(&Capability::Clipboard) {
+        agreed.retain(|capability| *capability != Capability::FileClipboard);
+    }
+    agreed
+}
+
+/// Removes capabilities introduced after the negotiated protocol revision.
+#[must_use]
+pub fn capabilities_at(
+    version: ProtocolVersion,
+    mut capabilities: Vec<Capability>,
+) -> Vec<Capability> {
+    if version.major != 1 || version.minor < 3 {
+        capabilities.retain(|capability| *capability != Capability::FileClipboard);
+    }
+    capabilities
 }
 
 /// Checks the capabilities a peer answered a hello with.
@@ -197,6 +213,47 @@ mod tests {
         let agreed = agreed_capabilities(&[Capability::CursorStream], &[9999]);
 
         assert!(agreed.is_empty());
+    }
+
+    #[test]
+    fn file_clipboard_is_agreed_only_beside_the_clipboard() {
+        let local = [Capability::Clipboard, Capability::FileClipboard];
+
+        assert_eq!(
+            agreed_capabilities(
+                &local,
+                &[
+                    i32::from(Capability::Clipboard),
+                    i32::from(Capability::FileClipboard),
+                ],
+            ),
+            local
+        );
+        assert!(
+            agreed_capabilities(
+                &[Capability::FileClipboard],
+                &[i32::from(Capability::FileClipboard)],
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn file_clipboard_does_not_exist_at_protocol_one_two() {
+        assert_eq!(
+            capabilities_at(
+                version(1, 2),
+                vec![Capability::Clipboard, Capability::FileClipboard],
+            ),
+            vec![Capability::Clipboard]
+        );
+        assert_eq!(
+            capabilities_at(
+                version(1, 3),
+                vec![Capability::Clipboard, Capability::FileClipboard],
+            ),
+            vec![Capability::Clipboard, Capability::FileClipboard]
+        );
     }
 
     #[test]

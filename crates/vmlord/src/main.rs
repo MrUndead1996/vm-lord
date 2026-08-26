@@ -87,7 +87,8 @@ fn load_backend(settings: &AppSettings) -> Box<dyn VmRepository> {
             settings.vm_storage_path.clone(),
             cloud_disk_importer(settings.image_cache_path.clone()),
         )
-        .with_readiness_timeouts(settings.guest_readiness),
+        .with_readiness_timeouts(settings.guest_readiness)
+        .with_file_clipboard_settings(settings.clipboard_files),
     )
 }
 

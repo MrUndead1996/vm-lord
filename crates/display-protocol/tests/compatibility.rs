@@ -43,6 +43,86 @@ fn hello_from(version: ProtocolVersion, capabilities: Vec<i32>) -> Record {
     )
 }
 
+/// A build that has the file clipboard, to be answered by peers that may not.
+fn file_clipboard_support() -> Support {
+    Support {
+        capabilities: vec![Capability::Clipboard, Capability::FileClipboard],
+        modes: vec![Mode::Desktop],
+        tile_sizes: vec![32],
+        width: 1920,
+        height: 1080,
+    }
+}
+
+/// What a guest answers a hello with.
+fn answer(support: Support, hello: &Record) -> ServerHello {
+    let mut guest = Session::guest(&Secret::generate(), support);
+    let reply = guest
+        .handle(&hello.header, &hello.payload)
+        .expect("a well-formed client hello")
+        .reply
+        .expect("a server hello");
+
+    ServerHello::decode(reply.payload.as_slice()).expect("a server hello")
+}
+
+#[test]
+fn a_host_from_before_the_file_clipboard_never_settles_one() {
+    let hello = hello_from(
+        ProtocolVersion { major: 1, minor: 2 },
+        vec![
+            i32::from(Capability::Clipboard),
+            i32::from(Capability::FileClipboard),
+        ],
+    );
+
+    let answered = answer(file_clipboard_support(), &hello);
+
+    assert_eq!(
+        answered.version,
+        Some(ProtocolVersion { major: 1, minor: 2 })
+    );
+    // The old host would not know record types 9 to 15, so nothing may send
+    // them: the capability they hang from is gone from what was settled.
+    assert_eq!(
+        answered.capabilities,
+        vec![i32::from(Capability::Clipboard)]
+    );
+}
+
+#[test]
+fn a_host_at_this_revision_settles_the_file_clipboard_beside_the_clipboard() {
+    let hello = hello_from(
+        ProtocolVersion::current(),
+        vec![
+            i32::from(Capability::Clipboard),
+            i32::from(Capability::FileClipboard),
+        ],
+    );
+
+    let answered = answer(file_clipboard_support(), &hello);
+
+    assert_eq!(
+        answered.capabilities,
+        vec![
+            i32::from(Capability::Clipboard),
+            i32::from(Capability::FileClipboard),
+        ]
+    );
+}
+
+#[test]
+fn a_file_clipboard_offered_without_the_clipboard_is_dropped_not_promoted() {
+    let hello = hello_from(
+        ProtocolVersion::current(),
+        vec![i32::from(Capability::FileClipboard)],
+    );
+
+    let answered = answer(file_clipboard_support(), &hello);
+
+    assert!(answered.capabilities.is_empty());
+}
+
 #[test]
 fn a_newer_host_and_this_guest_settle_on_this_builds_minor() {
     let mut guest = Session::guest(&Secret::generate(), support());

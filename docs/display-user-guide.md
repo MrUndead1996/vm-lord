@@ -42,7 +42,29 @@ text, HTML and images.
   the contents only when the other asks for them.
 - Text and HTML are limited to 8 MiB and a picture to 32 MiB. A larger
   selection is refused without disturbing the session.
-- Files are not carried. Copying files in either direction pastes nothing.
+- Files and folders are carried too, in both directions, with the same focus
+  rule: copy in one, paste in the other. A folder brings everything inside it.
+- Only ordinary files and folders cross. Shortcuts, symbolic links, junctions,
+  pipes and devices are refused, and refusing one cancels that copy rather than
+  pasting part of a tree.
+- A file may be up to 1 GB and one copy up to 4 GB by default. Change either in
+  `settings.toml`:
+
+  ```toml
+  [clipboard_files]
+  max_file_size = "1GB"
+  max_transfer_size = "4GB"
+  retention = "24h"
+  ```
+
+  Sizes take `B`, `KB`, `MB` or `GB` and are binary multiples; `retention`
+  takes `s`, `m` or `h`.
+- Pasted files are copies. They are written into a private folder of your own
+  before they appear on the clipboard, and on Windows they are kept for
+  `retention` -- a day by default -- so a paste still works after the window is
+  closed. Move what you want to keep somewhere of your own.
+- A copy that is cancelled, times out, or is interrupted by the window losing
+  focus leaves nothing half-written behind.
 
 Display traffic does not traverse the VM's IP network. Removing network access
 after provisioning does not disconnect an existing display, but future package

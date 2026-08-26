@@ -1,4 +1,4 @@
-//! The six modules that touch Win32, and the only `unsafe` in this crate.
+//! The seven modules that touch Win32, and the only `unsafe` in this crate.
 //!
 //! The workspace denies `unsafe_code`; each declaration below re-allows it for
 //! one module and says what crosses that door. Everything else in the crate is
@@ -30,3 +30,8 @@ pub mod hook;
 /// that carries selections to and from the guest.
 #[allow(unsafe_code)]
 pub mod clipboard;
+
+/// Opening, creating and enumerating filesystem objects for the file
+/// clipboard, without ever following what stands for something else.
+#[allow(unsafe_code)]
+pub mod files;

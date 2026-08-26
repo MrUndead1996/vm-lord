@@ -30,7 +30,9 @@ use std::{
 };
 
 use uuid::Uuid;
-use vmlord_core::{DiagnosticLevel, DisplayMode, RepositoryError, Subsystem};
+use vmlord_core::{
+    DiagnosticLevel, DisplayMode, FileClipboardSettings, RepositoryError, Subsystem,
+};
 use vmlord_display_protocol::keys::Secret;
 use vmlord_display_viewer::{
     launch::{self, Link, Message},
@@ -55,6 +57,7 @@ pub(crate) struct LaunchRequest<'a> {
     /// The mode stored for this VM, if one has been.
     pub(crate) mode: Option<DisplayMode>,
     pub(crate) viewer: PathBuf,
+    pub(crate) file_policy: FileClipboardSettings,
 }
 
 /// Where the viewer is, given where the application is.
@@ -146,6 +149,7 @@ impl DisplayLaunches {
             request.secret,
             request.runtime_id,
             request.mode,
+            request.file_policy,
         );
         let mut child = spawn(&request.viewer, request.vm_name)?;
         let (reader, writer) = pipes(&mut child, request.vm_name)?;
@@ -377,6 +381,7 @@ mod tests {
 
     use tracing_subscriber::layer::SubscriberExt as _;
     use uuid::Uuid;
+    use vmlord_core::FileClipboardSettings;
     use vmlord_display_protocol::keys::Secret;
 
     use super::{DisplayLaunches, LaunchRequest, Worker};
@@ -430,6 +435,7 @@ mod tests {
                     runtime_id: Uuid::from_u128(7),
                     mode: None,
                     viewer: PathBuf::from(r"C:\nowhere\vmlord-display.exe"),
+                    file_policy: FileClipboardSettings::default(),
                 })
                 .expect_err("there is no viewer at that path")
         });

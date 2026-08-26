@@ -45,6 +45,8 @@ enum Capability {
   // therefore no daemon exists yet, and a capability cannot be renegotiated
   // once the handshake has settled it.
   CAPABILITY_CLIPBOARD = 3;
+  // The clipboard channel can stream filesystem trees with negotiated policy.
+  CAPABILITY_FILE_CLIPBOARD = 4;
 }
 
 // How the encoder trades bandwidth against fidelity.
@@ -141,6 +143,32 @@ enum ClipboardRecord {
   CLIPBOARD_RECORD_DATA = 6;
   CLIPBOARD_RECORD_CANCEL = 7;
   CLIPBOARD_RECORD_ERROR = 8;
+  CLIPBOARD_RECORD_FILE_POLICY = 9;
+  CLIPBOARD_RECORD_FILE_OFFER = 10;
+  CLIPBOARD_RECORD_FILE_REQUEST = 11;
+  CLIPBOARD_RECORD_FILE_ENTRY = 12;
+  CLIPBOARD_RECORD_FILE_CHUNK = 13;
+  CLIPBOARD_RECORD_FILE_COMPLETE = 14;
+  CLIPBOARD_RECORD_FILE_CANCEL = 15;
+}
+
+enum FileEntryKind {
+  FILE_ENTRY_KIND_UNSPECIFIED = 0;
+  FILE_ENTRY_KIND_FILE = 1;
+  FILE_ENTRY_KIND_DIRECTORY = 2;
+}
+
+enum FileCancelReason {
+  FILE_CANCEL_REASON_UNSPECIFIED = 0;
+  FILE_CANCEL_REASON_SUPERSEDED = 1;
+  FILE_CANCEL_REASON_TOO_LARGE = 2;
+  FILE_CANCEL_REASON_FOCUS_LOST = 3;
+  FILE_CANCEL_REASON_UNAVAILABLE = 4;
+  FILE_CANCEL_REASON_TIMED_OUT = 5;
+  FILE_CANCEL_REASON_UNSAFE_ENTRY = 6;
+  FILE_CANCEL_REASON_INVALID_PATH = 7;
+  FILE_CANCEL_REASON_IO_FAILED = 8;
+  FILE_CANCEL_REASON_POLICY_REJECTED = 9;
 }
 
 // Why a transfer stopped before its last chunk.
@@ -326,4 +354,36 @@ message ClipboardData {
 message ClipboardCancel {
   uint32 transfer = 1;
   CancelReason reason = 2;
+}
+
+message ClipboardFilePolicy {
+  uint64 max_file_bytes = 1;
+  uint64 max_transfer_bytes = 2;
+  uint64 retention_seconds = 3;
+}
+
+message ClipboardFileOffer { uint32 serial = 1; }
+
+message ClipboardFileRequest {
+  uint32 serial = 1;
+  uint32 transfer = 2;
+}
+
+message ClipboardFileEntry {
+  uint32 transfer = 1;
+  string path = 2;
+  FileEntryKind kind = 3;
+  uint64 size = 4;
+}
+
+message ClipboardFileChunk {
+  uint32 transfer = 1;
+  bytes chunk = 2;
+}
+
+message ClipboardFileComplete { uint32 transfer = 1; }
+
+message ClipboardFileCancel {
+  uint32 transfer = 1;
+  FileCancelReason reason = 2;
 }

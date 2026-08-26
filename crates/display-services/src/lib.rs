@@ -9,6 +9,7 @@
 pub mod broker_main;
 pub mod capture;
 pub mod channel;
+pub mod clipboard_files;
 pub mod clipboard_main;
 pub mod control;
 pub mod cursor;

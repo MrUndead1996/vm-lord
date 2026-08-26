@@ -13,23 +13,30 @@
 //! byte count and an outcome are what a clipboard problem is diagnosed from.
 
 use std::{
+    collections::VecDeque,
     io::{Read, Write},
+    path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{Receiver, Sender, TryRecvError, channel},
     },
     thread::{self, JoinHandle},
-    time::Instant,
+    time::{Duration, Instant, SystemTime},
 };
 
 use prost::Message as _;
 use vmlord_display_protocol::{
-    clipboard::{Exchange, Kind, Message as Outgoing, Op, Piece},
+    clipboard::{
+        Exchange, Kind, Message as Outgoing, Op, Piece,
+        files::{self, EntryKind, Message as FileOutgoing, Op as FileOp, Policy},
+    },
     record::{self, Channel, Header, Limits, Record},
     session::{HandedOver, Negotiated, Session},
     v1::{
-        CancelReason, Capability, ClipboardCancel, ClipboardData, ClipboardOffer, ClipboardRecord,
-        ClipboardRequest, Mode, ProtocolVersion,
+        CancelReason, Capability, ClipboardCancel, ClipboardData, ClipboardFileCancel,
+        ClipboardFileChunk, ClipboardFileComplete, ClipboardFileEntry, ClipboardFileOffer,
+        ClipboardFilePolicy, ClipboardFileRequest, ClipboardOffer, ClipboardRecord,
+        ClipboardRequest, FileCancelReason, Mode, ProtocolVersion,
     },
 };
 use windows::{
@@ -43,6 +50,7 @@ use windows::{
             },
             Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
         },
+        UI::Shell::HDROP,
         UI::WindowsAndMessaging::{
             CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, HWND_MESSAGE, MSG,
             PM_REMOVE, PeekMessageW, RegisterClassW, WINDOW_EX_STYLE, WINDOW_STYLE,
@@ -53,8 +61,11 @@ use windows::{
 };
 
 use crate::{
-    clipboard::win32,
-    launch::Handover,
+    clipboard::{
+        files::{FileError, Produced, SourceTree, Staging, cleanup, dropfiles_of, staging_root},
+        win32,
+    },
+    launch::{FilePolicy, Handover},
     live::{BIND_BACKOFF, channel_key, read_awaited},
     windows::hvsocket::{CONNECT_TIMEOUT, HvSocket},
 };
@@ -64,6 +75,9 @@ const CF_UNICODETEXT: u32 = 13;
 
 /// `CF_DIB`, which is what a picture is on this clipboard.
 const CF_DIB: u32 = 8;
+
+/// `CF_HDROP`, which is what a selection of files is on this clipboard.
+const CF_HDROP: u32 = 15;
 
 /// Whether the desktop's clipboard has changed since the loop last looked.
 ///
@@ -88,6 +102,8 @@ pub struct Parameters {
     pub port: u32,
     /// The session VMLord handed over, which carries every channel key.
     pub handover: Handover,
+    /// The limits and completed-file lifetime this host was configured with.
+    pub file_policy: FilePolicy,
 }
 
 /// Starts the clipboard thread, and returns what tells it about focus.
@@ -119,6 +135,8 @@ fn serve(parameters: &Parameters, focus: &Receiver<Focus>) -> Result<(), String>
 
     let limits = Limits::new(0, 0);
     let mut exchange = Exchange::new();
+    let mut files = Files::new(parameters);
+    files.sweep();
     let mut socket: Option<HvSocket> = None;
     let mut next_bind = Instant::now();
     // Whether a hello has ever gone down this channel. The guest burns a
@@ -145,20 +163,25 @@ fn serve(parameters: &Parameters, focus: &Receiver<Focus>) -> Result<(), String>
         let now = Instant::now();
         let mut ops = Vec::new();
 
+        let mut file_ops = Vec::new();
+
         match focus.try_recv() {
             Ok(Focus::Gained) => {
                 focused = true;
                 if owed {
                     owed = false;
                     ops.extend(offer_local(&mut exchange, html, now));
+                    file_ops.extend(files.offer_local(now));
                 }
                 if let Some(offer) = awaited.take() {
                     ops.extend(exchange.peer_offer(offer.serial, &offer.mime_types, now));
                 }
+                file_ops.extend(files.focus_gained(now));
             }
             Ok(Focus::Lost) => {
                 focused = false;
                 ops.extend(exchange.focus_lost(now));
+                file_ops.extend(files.focus_lost(now));
             }
             Err(TryRecvError::Disconnected) => return Ok(()),
             Err(TryRecvError::Empty) => {}
@@ -171,6 +194,7 @@ fn serve(parameters: &Parameters, focus: &Receiver<Focus>) -> Result<(), String>
                 // is the echo that would bounce a selection forever.
             } else if focused {
                 ops.extend(offer_local(&mut exchange, html, now));
+                file_ops.extend(files.offer_local(now));
             } else {
                 owed = true;
             }
@@ -185,7 +209,11 @@ fn serve(parameters: &Parameters, focus: &Receiver<Focus>) -> Result<(), String>
                     );
                     socket = Some(bound);
                     exchange = Exchange::new();
+                    files.rebind(parameters);
                     held.clear();
+                    // The guest offers nothing until it has been told what the
+                    // limits are, so this is what opens the file clipboard.
+                    file_ops.extend(files.announce());
                 }
                 Err(reason) => {
                     tracing::debug!("the clipboard channel could not bind: {reason}");
@@ -207,6 +235,7 @@ fn serve(parameters: &Parameters, focus: &Receiver<Focus>) -> Result<(), String>
                         awaited = Some(offer);
                     } else {
                         ops.extend(handle(&mut exchange, &header, &payload, now));
+                        file_ops.extend(files.handle(focused, &header, &payload, now));
                     }
                 }
                 Err(record::RecordError::Idle) => {}
@@ -219,6 +248,12 @@ fn serve(parameters: &Parameters, focus: &Receiver<Focus>) -> Result<(), String>
         }
 
         ops.extend(exchange.tick(now));
+        file_ops.extend(files.tick(now));
+        // One entry or one chunk per turn round the loop, so that a directory
+        // of a thousand files cannot hold focus, the socket or an ordinary
+        // selection behind it.
+        file_ops.extend(files.step(now));
+
         let lost = carry_out(
             ops,
             &mut exchange,
@@ -229,10 +264,23 @@ fn serve(parameters: &Parameters, focus: &Receiver<Focus>) -> Result<(), String>
             &mut held,
             &mut written,
         );
-        if lost {
+        let file_lost = files.carry_out(
+            file_ops,
+            &mut session,
+            socket.as_mut(),
+            &limits,
+            html,
+            &held,
+            &mut written,
+        );
+
+        if lost || file_lost {
             tracing::info!("the clipboard channel could not be written to");
             socket = None;
             next_bind = Instant::now() + BIND_BACKOFF;
+            // Whatever was half-written goes with the connection it belonged
+            // to; the tree is removed rather than left in the profile.
+            files.forget();
         }
     }
 }
@@ -296,6 +344,506 @@ fn carry_out<S: Read + Write>(
     }
 
     lost
+}
+
+/// The file clipboard of one viewer window.
+///
+/// Everything a file transfer needs that an ordinary selection does not: the
+/// portable state machine, the tree being read out of this desktop, the tree
+/// arriving from the guest, and the paths of the last tree that arrived whole.
+struct Files {
+    exchange: files::Exchange,
+    /// Whether the session settled the capability at all. Without it, not one
+    /// file record goes down the channel: a guest from before it has no name
+    /// for them and would end the session over one.
+    enabled: bool,
+    /// The name this session's staging directories are made under.
+    session: String,
+    /// Where those directories are made. A field rather than a call, so that
+    /// nothing but a session with a profile behind it writes into one.
+    base: Option<PathBuf>,
+    /// How long a committed tree outlives the transfer that made it.
+    retention: Duration,
+    /// The tree being read out of this desktop, and the transfer it answers.
+    source: Option<(u32, SourceTree)>,
+    /// The tree arriving from the guest. Dropping it removes what it staged.
+    staging: Option<Staging>,
+    /// The top-level paths of the last tree that arrived whole, which is what
+    /// `CF_HDROP` names. Never logged.
+    staged: Vec<PathBuf>,
+    /// The guest's last file offer while the window was away, held until it
+    /// comes back. The model is pull, so holding the announcement holds the
+    /// files with it: nothing is asked for and nothing crosses.
+    awaited: Option<u32>,
+}
+
+impl Files {
+    /// The file clipboard this session's capabilities and settings allow.
+    fn new(parameters: &Parameters) -> Self {
+        let policy = policy_of(parameters.file_policy);
+
+        Self {
+            exchange: files::Exchange::new(policy, Instant::now()),
+            enabled: parameters
+                .handover
+                .capabilities
+                .contains(&i32::from(Capability::FileClipboard)),
+            session: session_token(&parameters.handover.session_id),
+            base: staging_root(),
+            retention: Duration::from_secs(policy.retention_seconds()),
+            source: None,
+            staging: None,
+            staged: Vec::new(),
+            awaited: None,
+        }
+    }
+
+    /// Removes what earlier sessions left in this user's profile.
+    ///
+    /// Clipboard data outlives the process that put it there, so this is the
+    /// only place a committed tree is ever deleted for being old.
+    fn sweep(&self) {
+        if !self.enabled {
+            return;
+        }
+        let Some(root) = staging_root() else {
+            return;
+        };
+
+        cleanup(&root, SystemTime::now(), self.retention);
+    }
+
+    /// A new connection means a new exchange, and nothing carried over.
+    fn rebind(&mut self, parameters: &Parameters) {
+        let staged = std::mem::take(&mut self.staged);
+        *self = Self::new(parameters);
+        // What is on the desktop's clipboard stays on it: the paths are still
+        // there, and a paste after a reconnect still finds them.
+        self.staged = staged;
+    }
+
+    /// Says what this host's limits are, once a channel is up to say it on.
+    fn announce(&mut self) -> Vec<FileOp> {
+        if !self.enabled {
+            return Vec::new();
+        }
+
+        self.exchange.announce()
+    }
+
+    /// The desktop's selection has files in it.
+    fn offer_local(&mut self, now: Instant) -> Vec<FileOp> {
+        if !self.enabled || !files_available() {
+            return Vec::new();
+        }
+
+        self.exchange.local_offer(now)
+    }
+
+    /// One file record off the channel.
+    ///
+    /// Nothing crosses into a window without the keyboard, so while unfocused
+    /// only the guest's limits and its cancellations are taken.
+    fn handle(
+        &mut self,
+        focused: bool,
+        header: &Header,
+        payload: &[u8],
+        now: Instant,
+    ) -> Vec<FileOp> {
+        if !self.enabled {
+            return Vec::new();
+        }
+
+        match parse_file(header, payload) {
+            Some(FileOutgoing::Policy(policy)) => {
+                self.exchange.peer_policy(policy);
+
+                Vec::new()
+            }
+            Some(FileOutgoing::Cancel { transfer, reason }) => {
+                self.exchange.peer_cancel(transfer, reason)
+            }
+            // Kept, not dropped: what the guest copied is there when somebody
+            // comes back to the window, which is what an ordinary selection
+            // already does.
+            Some(FileOutgoing::Offer { serial }) if !focused => {
+                self.awaited = Some(serial);
+
+                Vec::new()
+            }
+            _ if !focused => Vec::new(),
+            Some(FileOutgoing::Offer { serial }) => self.exchange.peer_offer(serial, now),
+            Some(FileOutgoing::Request { serial, transfer }) => {
+                self.exchange.peer_request(serial, transfer, now)
+            }
+            Some(FileOutgoing::Entry {
+                transfer,
+                path,
+                kind,
+                size,
+            }) => self.exchange.peer_entry(transfer, &path, kind, size, now),
+            Some(FileOutgoing::Chunk { transfer, chunk }) => {
+                self.exchange.peer_chunk(transfer, &chunk, now)
+            }
+            Some(FileOutgoing::Complete { transfer }) => self.exchange.peer_complete(transfer, now),
+            None => Vec::new(),
+        }
+    }
+
+    /// Asks for the offer that arrived while the window was away.
+    fn focus_gained(&mut self, now: Instant) -> Vec<FileOp> {
+        match self.awaited.take() {
+            Some(serial) => self.exchange.peer_offer(serial, now),
+            None => Vec::new(),
+        }
+    }
+
+    /// Cancels both directions and removes what was being staged.
+    fn focus_lost(&mut self, now: Instant) -> Vec<FileOp> {
+        self.source = None;
+
+        self.exchange.focus_lost(now)
+    }
+
+    /// Cancels whichever transfer has stopped moving.
+    fn tick(&mut self, now: Instant) -> Vec<FileOp> {
+        self.exchange.tick(now)
+    }
+
+    /// One entry, or one chunk, of the tree being read out of this desktop.
+    fn step(&mut self, now: Instant) -> Vec<FileOp> {
+        let Some((transfer, tree)) = self.source.as_mut() else {
+            return Vec::new();
+        };
+        let transfer = *transfer;
+
+        match tree.next() {
+            Ok(Some(Produced::Entry { path, kind, size })) => self
+                .exchange
+                .produced_entry(transfer, &path, kind, size, now),
+            Ok(Some(Produced::Chunk(bytes))) => self.exchange.produced_chunk(transfer, bytes, now),
+            Ok(None) => {
+                self.source = None;
+
+                self.exchange.produced_complete(transfer, now)
+            }
+            Err(error) => {
+                // What failed, never what it was called.
+                tracing::debug!("a copied tree could not be read: {error}");
+                self.source = None;
+
+                self.exchange.produced_failed(transfer, reason_of(&error))
+            }
+        }
+    }
+
+    /// Drops a transfer that a lost connection took with it.
+    fn forget(&mut self) {
+        self.source = None;
+        self.staging = None;
+    }
+
+    /// Does everything the file exchange asked for, in order.
+    ///
+    /// Answers whether the socket was lost on the way, as [`carry_out`] does.
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    fn carry_out<S: Read + Write>(
+        &mut self,
+        ops: Vec<FileOp>,
+        session: &mut Session,
+        mut socket: Option<&mut S>,
+        limits: &Limits,
+        html: u32,
+        held: &[Piece],
+        written: &mut u32,
+    ) -> bool {
+        let mut queue: VecDeque<FileOp> = ops.into();
+        let mut lost = false;
+
+        while let Some(op) = queue.pop_front() {
+            match op {
+                FileOp::Send(message) => {
+                    let Some(open) = socket.as_deref_mut() else {
+                        continue;
+                    };
+                    let Ok(sequence) = session.take_channel_sequence(Channel::Clipboard) else {
+                        continue;
+                    };
+                    let record =
+                        record_of_file(&message, sequence, session.generation(Channel::Clipboard));
+                    if let Err(error) = record::write(open, &record, limits) {
+                        tracing::debug!("a clipboard record could not be written: {error}");
+                        socket = None;
+                        lost = true;
+                    }
+                }
+                FileOp::Enumerate { transfer } => {
+                    match hdrop_selection()
+                        .ok_or(FileError::NoName)
+                        .and_then(|paths| SourceTree::open(&paths, self.exchange.policy()))
+                    {
+                        Ok(tree) => self.source = Some((transfer, tree)),
+                        Err(error) => {
+                            tracing::debug!("the desktop's files could not be read: {error}");
+                            queue.extend(
+                                self.exchange
+                                    .produced_failed(transfer, FileCancelReason::Unavailable),
+                            );
+                        }
+                    }
+                }
+                FileOp::CreateEntry {
+                    transfer,
+                    path,
+                    kind,
+                    size,
+                } => {
+                    let staged = match self.staging.as_mut() {
+                        Some(staging) => staging.create_entry(&path, kind, size),
+                        None => self
+                            .base
+                            .clone()
+                            .ok_or(FileError::NoProfile)
+                            .and_then(|base| Staging::create_at(&base, &self.session, transfer))
+                            .and_then(|mut fresh| {
+                                let created = fresh.create_entry(&path, kind, size);
+                                self.staging = Some(fresh);
+                                created
+                            }),
+                    };
+
+                    if let Err(error) = staged {
+                        tracing::debug!("a tree could not be staged: {error}");
+                        self.staging = None;
+                        queue.extend(self.exchange.staging_failed(transfer, reason_of(&error)));
+                    }
+                }
+                FileOp::WriteChunk { transfer, bytes } => {
+                    let written = self
+                        .staging
+                        .as_mut()
+                        .ok_or(FileError::Changed)
+                        .and_then(|staging| staging.write_chunk(&bytes));
+
+                    if let Err(error) = written {
+                        tracing::debug!("a tree could not be staged: {error}");
+                        self.staging = None;
+                        queue.extend(self.exchange.staging_failed(transfer, reason_of(&error)));
+                    }
+                }
+                FileOp::Commit { transfer } => match self.staging.take().map(Staging::commit) {
+                    Some(Ok(paths)) => {
+                        tracing::debug!("taking a guest selection of {} file(s)", paths.len());
+                        self.staged = paths;
+                        // The files and whatever formats the ordinary
+                        // selection had, under one `EmptyClipboard`.
+                        match apply_with(held, html, &self.staged) {
+                            Ok(sequence) => *written = sequence,
+                            Err(reason) => {
+                                tracing::warn!("the files could not be applied: {reason}");
+                                self.staged.clear();
+                            }
+                        }
+                    }
+                    Some(Err(error)) => {
+                        tracing::debug!("a tree could not be staged: {error}");
+                        queue.extend(self.exchange.staging_failed(transfer, reason_of(&error)));
+                    }
+                    None => {}
+                },
+                FileOp::Abort { .. } => {
+                    // Dropping it removes the whole partial tree.
+                    self.staging = None;
+                }
+            }
+        }
+
+        lost
+    }
+}
+
+/// The limits the state machine holds, from what the launch carried.
+fn policy_of(policy: FilePolicy) -> Policy {
+    Policy::new(
+        policy.max_file_bytes,
+        policy.max_transfer_bytes,
+        policy.retention_seconds,
+    )
+}
+
+/// Why a transfer ended, from what the filesystem said.
+fn reason_of(error: &FileError) -> FileCancelReason {
+    match error {
+        FileError::Unsupported => FileCancelReason::UnsafeEntry,
+        FileError::TooLarge | FileError::TooMany => FileCancelReason::TooLarge,
+        FileError::Path(_) | FileError::NoName => FileCancelReason::InvalidPath,
+        _ => FileCancelReason::IoFailed,
+    }
+}
+
+/// The name this session's staging directories are made under.
+fn session_token(session_id: &[u8]) -> String {
+    session_id
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Whether the desktop's clipboard is holding a selection of files.
+fn files_available() -> bool {
+    // SAFETY: a plain query about a format number.
+    unsafe { IsClipboardFormatAvailable(CF_HDROP) }.is_ok()
+}
+
+/// The paths the desktop's `CF_HDROP` names.
+fn hdrop_selection() -> Option<Vec<PathBuf>> {
+    let _open = Clipboard::open()?;
+
+    // SAFETY: the clipboard is open on this thread; the handle belongs to the
+    // clipboard and is only read here.
+    let handle = unsafe { GetClipboardData(CF_HDROP) }.ok()?;
+
+    crate::windows::files::hdrop_paths(HDROP(handle.0)).ok()
+}
+
+/// Reads a file record, or nothing at all for one this build has no name for.
+fn parse_file(header: &Header, payload: &[u8]) -> Option<FileOutgoing> {
+    match ClipboardRecord::try_from(i32::from(header.message_type)).ok()? {
+        ClipboardRecord::FilePolicy => {
+            let policy = ClipboardFilePolicy::decode(payload).ok()?;
+
+            Some(FileOutgoing::Policy(Policy::new(
+                policy.max_file_bytes,
+                policy.max_transfer_bytes,
+                policy.retention_seconds,
+            )))
+        }
+        ClipboardRecord::FileOffer => {
+            let offer = ClipboardFileOffer::decode(payload).ok()?;
+
+            Some(FileOutgoing::Offer {
+                serial: offer.serial,
+            })
+        }
+        ClipboardRecord::FileRequest => {
+            let request = ClipboardFileRequest::decode(payload).ok()?;
+
+            Some(FileOutgoing::Request {
+                serial: request.serial,
+                transfer: request.transfer,
+            })
+        }
+        ClipboardRecord::FileEntry => {
+            let entry = ClipboardFileEntry::decode(payload).ok()?;
+
+            Some(FileOutgoing::Entry {
+                transfer: entry.transfer,
+                path: entry.path,
+                kind: EntryKind::from_wire(entry.kind)?,
+                size: entry.size,
+            })
+        }
+        ClipboardRecord::FileChunk => {
+            let chunk = ClipboardFileChunk::decode(payload).ok()?;
+
+            Some(FileOutgoing::Chunk {
+                transfer: chunk.transfer,
+                chunk: chunk.chunk,
+            })
+        }
+        ClipboardRecord::FileComplete => {
+            let complete = ClipboardFileComplete::decode(payload).ok()?;
+
+            Some(FileOutgoing::Complete {
+                transfer: complete.transfer,
+            })
+        }
+        ClipboardRecord::FileCancel => {
+            let cancel = ClipboardFileCancel::decode(payload).ok()?;
+
+            Some(FileOutgoing::Cancel {
+                transfer: cancel.transfer,
+                reason: FileCancelReason::try_from(cancel.reason).unwrap_or_default(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Wraps one file message as the record that carries it.
+fn record_of_file(message: &FileOutgoing, sequence: u32, generation: u32) -> Record {
+    let (message_type, payload) = match message {
+        FileOutgoing::Policy(policy) => (
+            ClipboardRecord::FilePolicy,
+            ClipboardFilePolicy {
+                max_file_bytes: policy.max_file_bytes(),
+                max_transfer_bytes: policy.max_transfer_bytes(),
+                retention_seconds: policy.retention_seconds(),
+            }
+            .encode_to_vec(),
+        ),
+        FileOutgoing::Offer { serial } => (
+            ClipboardRecord::FileOffer,
+            ClipboardFileOffer { serial: *serial }.encode_to_vec(),
+        ),
+        FileOutgoing::Request { serial, transfer } => (
+            ClipboardRecord::FileRequest,
+            ClipboardFileRequest {
+                serial: *serial,
+                transfer: *transfer,
+            }
+            .encode_to_vec(),
+        ),
+        FileOutgoing::Entry {
+            transfer,
+            path,
+            kind,
+            size,
+        } => (
+            ClipboardRecord::FileEntry,
+            ClipboardFileEntry {
+                transfer: *transfer,
+                path: path.clone(),
+                kind: kind.as_wire(),
+                size: *size,
+            }
+            .encode_to_vec(),
+        ),
+        FileOutgoing::Chunk { transfer, chunk } => (
+            ClipboardRecord::FileChunk,
+            ClipboardFileChunk {
+                transfer: *transfer,
+                chunk: chunk.clone(),
+            }
+            .encode_to_vec(),
+        ),
+        FileOutgoing::Complete { transfer } => (
+            ClipboardRecord::FileComplete,
+            ClipboardFileComplete {
+                transfer: *transfer,
+            }
+            .encode_to_vec(),
+        ),
+        FileOutgoing::Cancel { transfer, reason } => (
+            ClipboardRecord::FileCancel,
+            ClipboardFileCancel {
+                transfer: *transfer,
+                reason: i32::from(*reason),
+            }
+            .encode_to_vec(),
+        ),
+    };
+
+    Record::new(
+        Channel::Clipboard,
+        message_type as u16,
+        sequence,
+        0,
+        generation,
+        payload,
+    )
 }
 
 /// What the host's clipboard has, as an offer.
@@ -542,7 +1090,18 @@ fn read_kind(kind: Kind, html: u32) -> Option<Vec<u8>> {
 /// Every format at once, under one `EmptyClipboard`: a paste that found the
 /// text but not the picture would be a selection this side took apart.
 fn apply(pieces: &[Piece], html: u32) -> Result<u32, String> {
+    apply_with(pieces, html, &[])
+}
+
+/// Puts a guest selection, and the files staged for it, on the clipboard.
+///
+/// The paths are the staged tree's top level and nothing below it: what a
+/// paste creates is what was copied, not the directory it was staged in.
+fn apply_with(pieces: &[Piece], html: u32, paths: &[PathBuf]) -> Result<u32, String> {
     let mut formats: Vec<(u32, Vec<u8>)> = Vec::new();
+    if !paths.is_empty() {
+        formats.push((CF_HDROP, dropfiles_of(paths)));
+    }
     for piece in pieces {
         match piece.kind {
             Kind::Text => {
@@ -759,6 +1318,243 @@ extern "system" fn procedure(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A file-capable session, with limits small enough to reach in a test.
+    fn file_parameters(capable: bool) -> Parameters {
+        let mut handover = handover();
+        if capable {
+            handover
+                .capabilities
+                .push(i32::from(Capability::FileClipboard));
+        }
+
+        Parameters {
+            runtime_id: [0; 16],
+            port: 5000,
+            handover,
+            file_policy: FilePolicy {
+                max_file_bytes: 1024,
+                max_transfer_bytes: 4096,
+                retention_seconds: 3600,
+            },
+        }
+    }
+
+    /// The record a guest's file offer arrives as.
+    fn file_offer(serial: u32) -> Record {
+        record_of_file(&FileOutgoing::Offer { serial }, 0, 0)
+    }
+
+    #[test]
+    fn every_file_message_survives_the_wire() {
+        let messages = [
+            FileOutgoing::Policy(Policy::new(1024, 4096, 3600)),
+            FileOutgoing::Offer { serial: 7 },
+            FileOutgoing::Request {
+                serial: 7,
+                transfer: 1,
+            },
+            FileOutgoing::Entry {
+                transfer: 1,
+                path: "tree/a.txt".to_owned(),
+                kind: EntryKind::File,
+                size: 3,
+            },
+            FileOutgoing::Chunk {
+                transfer: 1,
+                chunk: b"abc".to_vec(),
+            },
+            FileOutgoing::Complete { transfer: 1 },
+            FileOutgoing::Cancel {
+                transfer: 1,
+                reason: FileCancelReason::FocusLost,
+            },
+        ];
+
+        for message in messages {
+            let record = record_of_file(&message, 0, 5);
+
+            assert_eq!(record.header.channel, Channel::Clipboard);
+            assert_eq!(record.header.generation, 5);
+            assert_eq!(
+                parse_file(&record.header, &record.payload).as_ref(),
+                Some(&message),
+                "{message:?} did not come back as itself"
+            );
+        }
+    }
+
+    #[test]
+    fn a_session_without_the_capability_puts_no_file_record_on_the_wire() {
+        let parameters = file_parameters(false);
+        let mut files = Files::new(&parameters);
+        let offer = file_offer(7);
+
+        assert_eq!(files.announce(), Vec::new());
+        assert_eq!(files.offer_local(Instant::now()), Vec::new());
+        assert_eq!(
+            files.handle(true, &offer.header, &offer.payload, Instant::now()),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn a_file_capable_session_states_its_limits_when_the_channel_binds() {
+        let parameters = file_parameters(true);
+        let mut files = Files::new(&parameters);
+
+        assert_eq!(
+            files.announce(),
+            vec![FileOp::Send(FileOutgoing::Policy(Policy::new(
+                1024, 4096, 3600
+            )))]
+        );
+        assert_eq!(files.announce(), Vec::new());
+    }
+
+    #[test]
+    fn a_window_without_the_keyboard_asks_the_guest_for_nothing() {
+        let parameters = file_parameters(true);
+        let mut files = Files::new(&parameters);
+        let policy = record_of_file(&FileOutgoing::Policy(Policy::new(1024, 4096, 3600)), 0, 0);
+        let offer = file_offer(7);
+        let now = Instant::now();
+
+        files.handle(false, &policy.header, &policy.payload, now);
+
+        assert_eq!(
+            files.handle(false, &offer.header, &offer.payload, now),
+            Vec::new(),
+            "an unfocused window asked for a tree"
+        );
+        assert_eq!(
+            files.handle(true, &offer.header, &offer.payload, now),
+            vec![FileOp::Send(FileOutgoing::Request {
+                serial: 7,
+                transfer: 1,
+            })]
+        );
+    }
+
+    #[test]
+    fn an_offer_made_while_the_window_was_away_is_asked_for_when_it_comes_back() {
+        let parameters = file_parameters(true);
+        let mut files = Files::new(&parameters);
+        let policy = record_of_file(&FileOutgoing::Policy(Policy::new(1024, 4096, 3600)), 0, 0);
+        let now = Instant::now();
+
+        files.handle(true, &policy.header, &policy.payload, now);
+
+        // Two offers while away: the last one is what the guest's clipboard
+        // holds, so it is the one that gets asked for.
+        for serial in [7, 8] {
+            let offer = file_offer(serial);
+            assert_eq!(
+                files.handle(false, &offer.header, &offer.payload, now),
+                Vec::new()
+            );
+        }
+
+        assert_eq!(
+            files.focus_gained(now),
+            vec![FileOp::Send(FileOutgoing::Request {
+                serial: 8,
+                transfer: 1,
+            })]
+        );
+        assert_eq!(
+            files.focus_gained(now),
+            Vec::new(),
+            "an offer is asked for once"
+        );
+    }
+
+    #[test]
+    fn a_window_that_lost_the_keyboard_ends_the_tree_it_was_taking() {
+        let parameters = file_parameters(true);
+        let mut files = Files::new(&parameters);
+        let policy = record_of_file(&FileOutgoing::Policy(Policy::new(1024, 4096, 3600)), 0, 0);
+        let offer = file_offer(7);
+        let now = Instant::now();
+
+        files.handle(true, &policy.header, &policy.payload, now);
+        files.handle(true, &offer.header, &offer.payload, now);
+
+        assert_eq!(
+            files.focus_lost(now),
+            vec![
+                FileOp::Send(FileOutgoing::Cancel {
+                    transfer: 1,
+                    reason: FileCancelReason::FocusLost,
+                }),
+                FileOp::Abort { transfer: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn no_line_about_a_tree_carries_a_name_from_it() {
+        let parameters = file_parameters(true);
+        let mut files = Files::new(&parameters);
+        let policy = record_of_file(&FileOutgoing::Policy(Policy::new(1024, 4096, 3600)), 0, 0);
+        let offer = file_offer(7);
+        let now = Instant::now();
+        let sentinel = "vmlord-sentinel-name.txt";
+        // Never the real profile: a test that staged there would leave a
+        // directory in the user's clipboard staging root.
+        let base =
+            std::env::temp_dir().join(format!("vmlord-clipboard-log-test-{}", std::process::id()));
+        files.base = Some(base.clone());
+
+        files.handle(true, &policy.header, &policy.payload, now);
+        let ops = files.handle(true, &offer.header, &offer.payload, now);
+        assert!(!ops.is_empty(), "the offer was not asked for");
+
+        let entry = record_of_file(
+            &FileOutgoing::Entry {
+                transfer: 1,
+                path: sentinel.to_owned(),
+                kind: EntryKind::File,
+                size: 3,
+            },
+            0,
+            0,
+        );
+        let create = files.handle(true, &entry.header, &entry.payload, now);
+        // The same entry twice: the second cannot be created new, which is the
+        // failure whose line this test is about.
+        let again = files.handle(true, &entry.header, &entry.payload, now);
+
+        let ((), records) = crate::log::capture::capture(|| {
+            let mut session = session_of(&parameters.handover).expect("a session");
+            let mut nothing: Option<&mut std::io::Cursor<Vec<u8>>> = None;
+            let _ = files.carry_out(
+                create,
+                &mut session,
+                nothing.take(),
+                &Limits::new(0, 0),
+                0,
+                &[],
+                &mut 0,
+            );
+            let _ = files.carry_out(
+                again,
+                &mut session,
+                nothing,
+                &Limits::new(0, 0),
+                0,
+                &[],
+                &mut 0,
+            );
+        });
+
+        assert!(
+            !records.contains(sentinel),
+            "a name from the tree reached the log: {records}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn a_session_without_the_capability_is_refused() {

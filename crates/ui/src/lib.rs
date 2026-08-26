@@ -10,10 +10,11 @@ use rust_i18n::t;
 use vmlord_app::{BackendStatus, VmAction, WorkspaceApp};
 use vmlord_core::{
     Advisory, AgentStatus, AppSettings, BuildProgress, BuildStep, CloudImage, DesktopProfile,
-    DiagnosticLevel, DisplayState, DistroProfile, DownloadPhase, GpuMode, GpuState, GuestDefaults,
-    GuestReadinessTimeouts, HostGpuCapabilities, Language, LogLevel, NetworkMode, Password,
-    Provisioning, SshAccess, SshAuthentication, SshConfig, SshPort, VmCreateRequest,
-    VmDeleteRequest, VmDisplayStatus, VmGpuStatus, VmSource, VmState, VmSummary, VmUpdateRequest,
+    DiagnosticLevel, DisplayState, DistroProfile, DownloadPhase, FileClipboardSettings, GpuMode,
+    GpuState, GuestDefaults, GuestReadinessTimeouts, HostGpuCapabilities, Language, LogLevel,
+    NetworkMode, Password, Provisioning, SshAccess, SshAuthentication, SshConfig, SshPort,
+    VmCreateRequest, VmDeleteRequest, VmDisplayStatus, VmGpuStatus, VmSource, VmState, VmSummary,
+    VmUpdateRequest,
 };
 
 // The catalogues in `locales/`, embedded at compile time. English is the
@@ -151,6 +152,8 @@ struct SettingsForm {
     /// and with no widget of its own on purpose: the readiness timeouts are
     /// edited in `settings.toml` on the rare occasion anyone needs to.
     guest_readiness: GuestReadinessTimeouts,
+    /// TOML-only in task 139; the settings dialog must preserve it unchanged.
+    clipboard_files: FileClipboardSettings,
     error: Option<String>,
 }
 
@@ -164,6 +167,7 @@ impl SettingsForm {
             image_cache_path: settings.image_cache_path.clone(),
             default_distro: settings.default_distro.clone(),
             guest_readiness: settings.guest_readiness,
+            clipboard_files: settings.clipboard_files,
             error: None,
         }
     }
@@ -186,6 +190,7 @@ impl SettingsForm {
             image_cache_path: self.image_cache_path.clone(),
             default_distro: self.default_distro.clone(),
             guest_readiness: self.guest_readiness,
+            clipboard_files: self.clipboard_files,
         })
     }
 }
