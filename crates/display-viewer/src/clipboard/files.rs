@@ -383,11 +383,27 @@ impl Staging {
     /// [`FileError::NoProfile`] without `LOCALAPPDATA`, and [`FileError::Io`]
     /// if the directories cannot be made.
     pub fn create(session: &str, transfer: u32) -> Result<Self, FileError> {
-        let mut base = staging_root().ok_or(FileError::NoProfile)?;
-        base.push(session);
-        fs::create_dir_all(&base)?;
+        Self::create_at(
+            &staging_root().ok_or(FileError::NoProfile)?,
+            session,
+            transfer,
+        )
+    }
 
-        Self::create_under(&base, transfer)
+    /// A staging root under a base the caller chose, for one session.
+    ///
+    /// The base is a parameter so that nothing but a real session ever writes
+    /// into a real profile: a test names a directory of its own.
+    ///
+    /// # Errors
+    ///
+    /// [`FileError::Io`] if the directories cannot be made.
+    pub fn create_at(base: &Path, session: &str, transfer: u32) -> Result<Self, FileError> {
+        let mut root = base.to_owned();
+        root.push(session);
+        fs::create_dir_all(&root)?;
+
+        Self::create_under(&root, transfer)
     }
 
     /// A staging root under a directory the caller chose.

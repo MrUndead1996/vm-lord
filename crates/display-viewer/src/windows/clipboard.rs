@@ -358,6 +358,9 @@ struct Files {
     enabled: bool,
     /// The name this session's staging directories are made under.
     session: String,
+    /// Where those directories are made. A field rather than a call, so that
+    /// nothing but a session with a profile behind it writes into one.
+    base: Option<PathBuf>,
     /// How long a committed tree outlives the transfer that made it.
     retention: Duration,
     /// The tree being read out of this desktop, and the transfer it answers.
@@ -381,6 +384,7 @@ impl Files {
                 .capabilities
                 .contains(&i32::from(Capability::FileClipboard)),
             session: session_token(&parameters.handover.session_id),
+            base: staging_root(),
             retention: Duration::from_secs(policy.retention_seconds()),
             source: None,
             staging: None,
@@ -576,11 +580,16 @@ impl Files {
                 } => {
                     let staged = match self.staging.as_mut() {
                         Some(staging) => staging.create_entry(&path, kind, size),
-                        None => Staging::create(&self.session, transfer).and_then(|mut fresh| {
-                            let created = fresh.create_entry(&path, kind, size);
-                            self.staging = Some(fresh);
-                            created
-                        }),
+                        None => self
+                            .base
+                            .clone()
+                            .ok_or(FileError::NoProfile)
+                            .and_then(|base| Staging::create_at(&base, &self.session, transfer))
+                            .and_then(|mut fresh| {
+                                let created = fresh.create_entry(&path, kind, size);
+                                self.staging = Some(fresh);
+                                created
+                            }),
                     };
 
                     if let Err(error) = staged {
@@ -1436,6 +1445,11 @@ mod tests {
         let offer = file_offer(7);
         let now = Instant::now();
         let sentinel = "vmlord-sentinel-name.txt";
+        // Never the real profile: a test that staged there would leave a
+        // directory in the user's clipboard staging root.
+        let base =
+            std::env::temp_dir().join(format!("vmlord-clipboard-log-test-{}", std::process::id()));
+        files.base = Some(base.clone());
 
         files.handle(true, &policy.header, &policy.payload, now);
         let ops = files.handle(true, &offer.header, &offer.payload, now);
@@ -1483,6 +1497,8 @@ mod tests {
             !records.contains(sentinel),
             "a name from the tree reached the log: {records}"
         );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
