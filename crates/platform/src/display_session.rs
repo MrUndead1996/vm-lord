@@ -113,6 +113,7 @@ impl Driver {
                 Capability::CursorStream,
                 Capability::DynamicResolution,
                 Capability::Clipboard,
+                Capability::FileClipboard,
             ],
             // A host-side policy that resolves to `Desktop` until a motion
             // codec exists. The guest is what resolves it.
@@ -373,6 +374,7 @@ mod tests {
                 Capability::CursorStream,
                 Capability::DynamicResolution,
                 Capability::Clipboard,
+                Capability::FileClipboard,
             ],
             modes: vec![Mode::Desktop],
             tile_sizes: vec![16, 32, 64],

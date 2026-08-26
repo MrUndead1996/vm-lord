@@ -7,11 +7,12 @@
 use prost::Message;
 use vmlord_display_protocol::{
     keys::{SESSION_ID_LEN, Secret, TAG_LEN},
-    record::{self, Channel, Limits, Record, RecordError},
+    record::{self, CLIPBOARD_MAX_PAYLOAD, Channel, Limits, Record, RecordError},
     session::{Event, Offer, Session, SessionError, Support},
     v1::{
-        Capability, ChannelHello, ClientHello, ControlRecord, ErrorCode, FrameRecord, Mode,
-        ProtocolVersion, ServerAuth,
+        Capability, ChannelHello, ClientHello, ClipboardFileCancel, ClipboardFileEntry,
+        ClipboardRecord, ControlRecord, ErrorCode, FileCancelReason, FileEntryKind, FrameRecord,
+        Mode, ProtocolVersion, ServerAuth,
     },
 };
 
@@ -300,4 +301,75 @@ fn a_header_that_is_all_ones_allocates_nothing() {
     // The channel byte is checked before the length is trusted.
     assert!(matches!(error, RecordError::UnknownChannel { value: 0xFF }));
     assert!(payload.is_empty());
+}
+
+#[test]
+fn a_file_chunk_over_the_clipboard_cap_is_refused_before_it_is_allocated() {
+    let mut header = Record::new(
+        Channel::Clipboard,
+        ClipboardRecord::FileChunk as u16,
+        0,
+        0,
+        0,
+        Vec::new(),
+    )
+    .header;
+    header.length = CLIPBOARD_MAX_PAYLOAD + 1;
+
+    let mut payload = Vec::new();
+    let error = record::read(&mut header.encode().as_slice(), &limits(), &mut payload)
+        .expect_err("a file chunk over the clipboard cap");
+
+    assert!(matches!(
+        error,
+        RecordError::TooLarge {
+            channel: Channel::Clipboard,
+            cap: CLIPBOARD_MAX_PAYLOAD,
+            ..
+        }
+    ));
+    assert!(payload.is_empty());
+}
+
+#[test]
+fn an_entry_kind_from_a_newer_peer_is_not_mistaken_for_a_file() {
+    let entry = ClipboardFileEntry {
+        transfer: 1,
+        path: "notes/todo.txt".into(),
+        kind: 4242,
+        size: 12,
+    };
+
+    let decoded =
+        ClipboardFileEntry::decode(entry.encode_to_vec().as_slice()).expect("a well-formed entry");
+
+    // The unknown value survives decoding rather than collapsing onto a
+    // variant, so the reader refuses it instead of creating the wrong thing.
+    assert_eq!(decoded.kind, 4242);
+    assert!(FileEntryKind::try_from(decoded.kind).is_err());
+}
+
+#[test]
+fn a_cancel_reason_from_a_newer_peer_is_not_mapped_onto_a_known_one() {
+    let cancel = ClipboardFileCancel {
+        transfer: 1,
+        reason: 4242,
+    };
+
+    let decoded = ClipboardFileCancel::decode(cancel.encode_to_vec().as_slice())
+        .expect("a well-formed cancel");
+
+    assert_eq!(decoded.reason, 4242);
+    assert!(FileCancelReason::try_from(decoded.reason).is_err());
+}
+
+#[test]
+fn a_clipboard_record_type_past_the_file_ones_is_not_guessed_at() {
+    assert!(ClipboardRecord::try_from(16).is_err());
+    for value in 9..=15 {
+        assert!(
+            ClipboardRecord::try_from(value).is_ok(),
+            "the file records are 9 through 15"
+        );
+    }
 }

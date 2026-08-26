@@ -458,8 +458,10 @@ impl Session {
             hello.version.unwrap_or_default(),
         )
         .map_err(SessionError::Version)?;
-        let capabilities =
-            handshake::agreed_capabilities(&support.capabilities, &hello.capabilities);
+        let capabilities = handshake::capabilities_at(
+            version,
+            handshake::agreed_capabilities(&support.capabilities, &hello.capabilities),
+        );
 
         let wanted = Mode::try_from(hello.mode).unwrap_or_default();
         let mode = resolve_mode(wanted, &support.modes)?;
@@ -527,6 +529,7 @@ impl Session {
         let capabilities =
             handshake::confirm_capabilities(&offer.capabilities, &answer.capabilities)
                 .map_err(SessionError::Capability)?;
+        let capabilities = handshake::capabilities_at(version, capabilities);
 
         let modes: Vec<Mode> = answer
             .modes
