@@ -16,6 +16,9 @@
 //! can produce and sends nothing until the other asks, so a picture copied in a
 //! guest costs nothing until somebody pastes it on the host.
 
+pub mod files;
+pub mod path;
+
 use std::time::{Duration, Instant};
 
 use crate::v1::CancelReason;
