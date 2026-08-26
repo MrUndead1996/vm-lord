@@ -10,11 +10,10 @@ use rust_i18n::t;
 use vmlord_app::{BackendStatus, VmAction, WorkspaceApp};
 use vmlord_core::{
     Advisory, AgentStatus, AppSettings, BuildProgress, BuildStep, CloudImage, DesktopProfile,
-    DiagnosticLevel, DisplayState, DownloadPhase, GpuMode, GpuState, GuestDefaults,
+    DiagnosticLevel, DisplayState, DistroProfile, DownloadPhase, GpuMode, GpuState, GuestDefaults,
     GuestReadinessTimeouts, HostGpuCapabilities, Language, LogLevel, NetworkMode, Password,
     Provisioning, SshAccess, SshAuthentication, SshConfig, SshPort, VmCreateRequest,
     VmDeleteRequest, VmDisplayStatus, VmGpuStatus, VmSource, VmState, VmSummary, VmUpdateRequest,
-    ubuntu,
 };
 
 // The catalogues in `locales/`, embedded at compile time. English is the
@@ -30,22 +29,6 @@ const AUTO_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 /// will accept and carry out with less than was asked for.
 const WARNING_COLOR: egui::Color32 = egui::Color32::from_rgb(0xE0, 0xA0, 0x30);
 const VM_TABLE_COLUMN_COUNT: f32 = 9.0;
-
-/// The releases the create form offers, newest first.
-///
-/// LTS only, which is the epic's boundary: an interim release is supported for
-/// nine months, and a workspace outliving its own security updates is not what
-/// a default should build. The list is written out rather than fetched --
-/// Canonical publishes no machine-readable index of current releases -- and it
-/// moves to the distribution profile when profiles come from JSON (#67).
-///
-/// All three are current: 26.04 is the newest LTS and the one a new VM gets by
-/// default, 24.04 and 22.04 are still under standard support. Each was checked
-/// against the file name the profile builds -- the server answers
-/// `/releases/26.04/` with a redirect to its codename, and
-/// `ubuntu-26.04-server-cloudimg-amd64.img` is listed in the `SHA256SUMS`
-/// behind it, which is what the release resolver reads.
-const UBUNTU_RELEASES: [&str; 3] = ["26.04", "24.04", "22.04"];
 
 const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
 
@@ -115,11 +98,12 @@ enum SourceKind {
 /// behaviours. What is not submitted is decided by `create_vm_request`, which
 /// reads only the fields the chosen source has.
 struct CreateVmForm {
+    profile: DistroProfile,
     name: String,
     source_kind: SourceKind,
     /// Installation media: the path to the ISO the guest is installed from.
     image_path: String,
-    /// Cloud image: the release, from [`UBUNTU_RELEASES`].
+    /// Cloud image: one of the releases named by `profile`.
     release: String,
     username: String,
     /// Empty means no password at all: the guest is reachable by key only.
@@ -161,6 +145,8 @@ struct SettingsForm {
     /// whole `AppSettings`, so a field it does not know about would be lost on
     /// every save. The widget for it arrives with the image download UI.
     image_cache_path: PathBuf,
+    /// Identifier of the distribution profile used for new cloud-image VMs.
+    default_distro: String,
     /// Carried through unchanged for the same reason as `image_cache_path`,
     /// and with no widget of its own on purpose: the readiness timeouts are
     /// edited in `settings.toml` on the rare occasion anyone needs to.
@@ -176,6 +162,7 @@ impl SettingsForm {
             log_file_path: settings.log_file_path.display().to_string(),
             log_level: settings.log_level,
             image_cache_path: settings.image_cache_path.clone(),
+            default_distro: settings.default_distro.clone(),
             guest_readiness: settings.guest_readiness,
             error: None,
         }
@@ -197,6 +184,7 @@ impl SettingsForm {
             log_file_path: PathBuf::from(log_file_path),
             log_level: self.log_level,
             image_cache_path: self.image_cache_path.clone(),
+            default_distro: self.default_distro.clone(),
             guest_readiness: self.guest_readiness,
         })
     }
@@ -263,13 +251,14 @@ impl CreateVmForm {
     /// A form filled with what VMLord would do if nobody changed anything:
     /// the newest supported release, the distribution's own account name, and
     /// the host's locale, keyboard layout and timezone.
-    fn new(guest_defaults: &GuestDefaults) -> Self {
+    fn new(profile: &DistroProfile, guest_defaults: &GuestDefaults) -> Self {
         Self {
+            profile: profile.clone(),
             name: "ubuntu".into(),
             source_kind: SourceKind::CloudImage,
             image_path: String::new(),
-            release: UBUNTU_RELEASES[0].into(),
-            username: ubuntu().default_user,
+            release: profile.releases.first().cloned().unwrap_or_default(),
+            username: profile.default_user.clone(),
             password: String::new(),
             ssh_enabled: true,
             deploy_key: true,
@@ -409,8 +398,9 @@ impl eframe::App for VmlordUi {
         if let Some(action) = action.inner {
             match action {
                 VmAction::Create => {
-                    self.create_vm_form =
-                        Some(CreateVmForm::new(self.application.guest_defaults()));
+                    self.create_vm_form = self.application.distro_profile().map(|profile| {
+                        CreateVmForm::new(profile, self.application.guest_defaults())
+                    });
                     self.edit_vm_form = None;
                 }
                 VmAction::Edit => {
@@ -504,10 +494,11 @@ impl eframe::App for VmlordUi {
             None => {}
         }
 
+        let distro_options = self.application.distro_options().collect::<Vec<_>>();
         let settings_dialog_action = self
             .settings_form
             .as_mut()
-            .and_then(|form| render_settings_dialog(context, form));
+            .and_then(|form| render_settings_dialog(context, form, &distro_options));
         match settings_dialog_action {
             Some(SettingsDialogAction::BrowseVmStorage) => {
                 match self.application.pick_vm_storage_directory() {
@@ -668,25 +659,22 @@ fn render_create_vm_dialog(
                             match form.source_kind {
                                 SourceKind::CloudImage => {
                                     ui.label(t!("create_vm.distribution").to_string());
-                                    // One entry until distribution profiles are read
-                                    // from a file (#67); the guest's account name and
-                                    // its admin group come from the same profile.
                                     egui::ComboBox::from_id_salt("create-vm-distribution")
-                                        .selected_text(ubuntu().name)
+                                        .selected_text(&form.profile.name)
                                         .show_ui(ui, |ui| {
-                                            ui.label(ubuntu().name);
+                                            ui.label(&form.profile.name);
                                         });
                                     ui.end_row();
 
                                     ui.label(t!("create_vm.release").to_string());
                                     egui::ComboBox::from_id_salt("create-vm-release")
-                                        .selected_text(release_label(&form.release))
+                                        .selected_text(release_label(&form.profile, &form.release))
                                         .show_ui(ui, |ui| {
-                                            for release in UBUNTU_RELEASES {
+                                            for release in &form.profile.releases {
                                                 ui.selectable_value(
                                                     &mut form.release,
                                                     release.to_owned(),
-                                                    release_label(release),
+                                                    release_label(&form.profile, release),
                                                 );
                                             }
                                         });
@@ -949,6 +937,7 @@ fn render_provisioning_fields(
 fn render_settings_dialog(
     context: &egui::Context,
     form: &mut SettingsForm,
+    distro_options: &[(&str, &str)],
 ) -> Option<SettingsDialogAction> {
     let mut open = true;
     let mut action = None;
@@ -979,6 +968,20 @@ fn render_settings_dialog(
                             action = Some(SettingsDialogAction::BrowseVmStorage);
                         }
                     });
+                    ui.end_row();
+
+                    ui.add_sized(
+                        [110.0, 24.0],
+                        egui::Label::new(t!("settings.default_distro").to_string()),
+                    );
+                    egui::ComboBox::from_id_salt("settings-default-distro")
+                        .width(310.0)
+                        .selected_text(distro_label(distro_options, &form.default_distro))
+                        .show_ui(ui, |ui| {
+                            for &(id, name) in distro_options {
+                                ui.selectable_value(&mut form.default_distro, id.to_owned(), name);
+                            }
+                        });
                     ui.end_row();
 
                     ui.add_sized(
@@ -1093,6 +1096,13 @@ fn render_settings_dialog(
         action = Some(SettingsDialogAction::Cancel);
     }
     action
+}
+
+fn distro_label<'a>(options: &'a [(&str, &str)], selected: &'a str) -> &'a str {
+    options
+        .iter()
+        .find_map(|&(id, name)| (id == selected).then_some(name))
+        .unwrap_or(selected)
 }
 
 fn render_edit_vm_dialog(
@@ -1352,7 +1362,7 @@ fn create_vm_source(form: &CreateVmForm) -> Result<VmSource, String> {
         },
         SourceKind::CloudImage => VmSource::CloudImage {
             image: CloudImage {
-                profile: ubuntu(),
+                profile: form.profile.clone(),
                 release: form.release.clone(),
             },
             provisioning: Provisioning {
@@ -1381,10 +1391,10 @@ fn create_vm_source(form: &CreateVmForm) -> Result<VmSource, String> {
 }
 
 /// Names a release the way the distribution does.
-fn release_label(release: &str) -> String {
+fn release_label(profile: &DistroProfile, release: &str) -> String {
     t!(
         "create_vm.release_label",
-        distribution = ubuntu().name,
+        distribution = &profile.name,
         release = release
     )
     .to_string()
@@ -2791,7 +2801,7 @@ mod tests {
 
     use vmlord_core::{
         DisplayStage, DisplayState, DisplayStatusCode, GpuAvailability, GpuFailure, GpuStatusCode,
-        SshAuthentication, SshAvailability, SshConfig, VmGpuFacts,
+        SshAuthentication, SshAvailability, SshConfig, VmGpuFacts, ubuntu,
     };
 
     use super::*;
@@ -3018,11 +3028,14 @@ mod tests {
     }
 
     fn cloud_form() -> CreateVmForm {
-        CreateVmForm::new(&GuestDefaults {
-            locale: "ru_RU.UTF-8".into(),
-            keyboard: "ru".into(),
-            timezone: "Europe/Moscow".into(),
-        })
+        CreateVmForm::new(
+            &ubuntu(),
+            &GuestDefaults {
+                locale: "ru_RU.UTF-8".into(),
+                keyboard: "ru".into(),
+                timezone: "Europe/Moscow".into(),
+            },
+        )
     }
 
     fn provisioning_of(request: &VmCreateRequest) -> &Provisioning {
@@ -3048,15 +3061,36 @@ mod tests {
             form.release, "26.04",
             "a new VM starts from the newest LTS, which is the first of the offered releases"
         );
-        assert_eq!(form.release, UBUNTU_RELEASES[0]);
-        for release in UBUNTU_RELEASES {
+        assert_eq!(form.release, form.profile.releases[0]);
+        for release in &form.profile.releases {
             assert!(
-                vmlord_core::ubuntu()
+                form.profile
                     .image_url(release)
                     .ends_with(&format!("ubuntu-{release}-server-cloudimg-amd64.img")),
                 "the resolver has to be able to build a URL for {release}"
             );
         }
+    }
+
+    #[test]
+    fn a_new_form_uses_the_profile_selected_by_application_settings() {
+        let mut profile = ubuntu();
+        profile.name = "Fedora".into();
+        profile.releases = vec!["42".into(), "41".into()];
+        profile.default_user = "fedora".into();
+
+        let form = CreateVmForm::new(&profile, &GuestDefaults::default());
+
+        assert_eq!(form.release, "42");
+        assert_eq!(form.username, "fedora");
+    }
+
+    #[test]
+    fn distro_setting_shows_the_profile_name_for_its_stored_identifier() {
+        let options = [("fedora", "Fedora Linux"), ("ubuntu", "Ubuntu")];
+
+        assert_eq!(distro_label(&options, "fedora"), "Fedora Linux");
+        assert_eq!(distro_label(&options, "missing"), "missing");
     }
 
     #[test]

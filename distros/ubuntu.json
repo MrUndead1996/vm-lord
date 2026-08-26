@@ -1,0 +1,23 @@
+{
+  "name": "Ubuntu",
+  "releases": ["26.04", "24.04", "22.04"],
+  "directory_template": "https://cloud-images.ubuntu.com/releases/{release}/release/",
+  "file_name_template": "ubuntu-{release}-server-cloudimg-amd64.img",
+  "checksum_file": "SHA256SUMS",
+  "default_user": "ubuntu",
+  "admin_group": "sudo",
+  "ssh": {
+    "units": {
+      "SocketActivated": {
+        "socket": "ssh.socket",
+        "socket_drop_in": "/etc/systemd/system/ssh.socket.d/10-vmlord.conf",
+        "service": "ssh.service"
+      }
+    },
+    "config_drop_in": "/etc/ssh/sshd_config.d/10-vmlord.conf"
+  },
+  "desktop": {
+    "packages": ["ubuntu-desktop-minimal"],
+    "display_manager": "gdm3.service"
+  }
+}

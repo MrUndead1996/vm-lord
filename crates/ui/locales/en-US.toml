@@ -17,6 +17,7 @@ language = "Language"
 log_file = "Log file"
 log_file_hint = "Path to the log file"
 log_level = "Log level"
+default_distro = "Default distribution"
 vm_storage_required = "VM storage path is required."
 log_file_required = "Log file path is required."
 

@@ -11,9 +11,11 @@
 //! are to be read from a JSON file, and a parsed file yields no `&'static str`
 //! short of leaking it.
 
+use std::{collections::BTreeMap, fmt, fs, io, path::PathBuf};
+
 use serde::{Deserialize, Serialize};
 
-use crate::display::DesktopProfile;
+use crate::{SettingsStore, display::DesktopProfile};
 
 /// The placeholder both templates carry.
 const RELEASE_PLACEHOLDER: &str = "{release}";
@@ -24,9 +26,10 @@ const RELEASE_PLACEHOLDER: &str = "{release}";
 /// The URL is kept as two templates rather than one: the checksum file sits in
 /// the same directory as the image, and a single template would have to have its
 /// tail cut off to get at that directory.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct DistroProfile {
     pub name: String,
+    pub releases: Vec<String>,
     pub directory_template: String,
     pub file_name_template: String,
     pub checksum_file: String,
@@ -55,13 +58,137 @@ pub struct DistroProfile {
 /// adds no repository, downloads no binary of its own and signs nothing: the
 /// desktop a guest ends up with is the one its vendor ships, updated by the
 /// guest's own updates.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct DesktopSetup {
     /// The packages that bring in GNOME, GDM and their Wayland session.
     pub packages: Vec<String>,
     /// The display manager unit that has to run for a login screen to appear.
     pub display_manager: String,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DistroCatalog {
+    profiles: BTreeMap<String, DistroProfile>,
+}
+
+impl DistroCatalog {
+    pub fn load(settings: &SettingsStore) -> Result<Self, DistroCatalogError> {
+        let directory = settings
+            .config_path()
+            .parent()
+            .ok_or_else(|| DistroCatalogError::MissingSettingsParent {
+                path: settings.config_path().to_path_buf(),
+            })?
+            .join("distros");
+        let entries = fs::read_dir(&directory).map_err(|source| DistroCatalogError::Io {
+            operation: "read distribution profile directory",
+            path: directory.clone(),
+            source,
+        })?;
+        let mut profiles = BTreeMap::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| DistroCatalogError::Io {
+                operation: "read distribution profile directory entry",
+                path: directory.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            let id = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .expect("a JSON path returned by read_dir has a file stem")
+                .to_owned();
+            let document = fs::read_to_string(&path).map_err(|source| DistroCatalogError::Io {
+                operation: "read distribution profile",
+                path: path.clone(),
+                source,
+            })?;
+            let profile =
+                serde_json::from_str(&document).map_err(|source| DistroCatalogError::Parse {
+                    path: path.clone(),
+                    source,
+                })?;
+            profiles.insert(id, profile);
+        }
+        Ok(Self { profiles })
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.profiles.len()
+    }
+
+    pub fn select(&self, id: &str) -> Result<&DistroProfile, DistroCatalogError> {
+        self.profiles
+            .get(id)
+            .ok_or_else(|| DistroCatalogError::ProfileNotFound { id: id.to_owned() })
+    }
+
+    pub fn options(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.profiles
+            .iter()
+            .map(|(id, profile)| (id.as_str(), profile.name.as_str()))
+    }
+}
+
+#[derive(Debug)]
+pub enum DistroCatalogError {
+    MissingSettingsParent {
+        path: PathBuf,
+    },
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        source: io::Error,
+    },
+    Parse {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    ProfileNotFound {
+        id: String,
+    },
+}
+
+impl fmt::Display for DistroCatalogError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingSettingsParent { path } => {
+                write!(
+                    formatter,
+                    "settings path has no parent directory: {}",
+                    path.display()
+                )
+            }
+            Self::Io {
+                operation,
+                path,
+                source,
+            } => {
+                write!(
+                    formatter,
+                    "failed to {operation} at {}: {source}",
+                    path.display()
+                )
+            }
+            Self::Parse { path, source } => {
+                write!(
+                    formatter,
+                    "failed to parse distribution profile at {}: {source}",
+                    path.display()
+                )
+            }
+            Self::ProfileNotFound { id } => {
+                write!(formatter, "distribution profile {id:?} was not found")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DistroCatalogError {}
 
 /// How a distribution starts its SSH daemon, and where a setting of VMLord's
 /// has to be written for the daemon to read it.
@@ -130,49 +257,15 @@ impl SshUnits {
     }
 }
 
-/// Ubuntu's official cloud images.
+/// Ubuntu fixture shared by tests in workspace crates.
 ///
-/// The directory is addressed by version number even though the server stores
-/// it under the codename: `/releases/24.04/` answers 302 to `/releases/noble/`,
-/// so a table of codenames would buy nothing and would need a line added for
-/// every future release. The file name, in contrast, does carry the version
-/// number rather than the codename -- verified on 24.04 and 22.04.
-///
-/// The architecture is baked into the template. Hyper-V here is x86_64, and a
-/// field with one possible value is no better than an enum with one variant.
+/// The feature is dev-only: release binaries must load this document from the
+/// installed `distros` directory rather than embed a second copy.
+#[cfg(any(test, feature = "test-profile"))]
 #[must_use]
 pub fn ubuntu() -> DistroProfile {
-    DistroProfile {
-        name: "Ubuntu".into(),
-        directory_template: "https://cloud-images.ubuntu.com/releases/{release}/release/".into(),
-        file_name_template: "ubuntu-{release}-server-cloudimg-amd64.img".into(),
-        checksum_file: "SHA256SUMS".into(),
-        default_user: "ubuntu".into(),
-        admin_group: "sudo".into(),
-        ssh: SshDaemon {
-            units: SshUnits::SocketActivated {
-                socket: "ssh.socket".into(),
-                // Ubuntu socket-activates the daemon since 22.10, and the unit
-                // lives under `/lib`, so the override goes under `/etc` where
-                // systemd looks for it second.
-                socket_drop_in: "/etc/systemd/system/ssh.socket.d/10-vmlord.conf".into(),
-                service: "ssh.service".into(),
-            },
-            // `sshd_config` ends with `Include /etc/ssh/sshd_config.d/*.conf`
-            // read in name order, and the *first* value of a keyword wins --
-            // so the number decides who wins, and `10-` puts VMLord ahead of
-            // cloud-init's own `50-cloud-init.conf`.
-            config_drop_in: "/etc/ssh/sshd_config.d/10-vmlord.conf".into(),
-        },
-        desktop: Some(DesktopSetup {
-            // The minimal desktop task rather than `ubuntu-desktop`: it pulls
-            // GNOME Shell, GDM and the Wayland session and leaves out the
-            // office suite, the games and the printer stack a VM opened for a
-            // desktop does not need.
-            packages: vec!["ubuntu-desktop-minimal".into()],
-            display_manager: "gdm3.service".into(),
-        }),
-    }
+    serde_json::from_str(include_str!("../../../distros/ubuntu.json"))
+        .expect("the workspace Ubuntu test profile must be valid")
 }
 
 impl DistroProfile {
@@ -220,7 +313,157 @@ impl DistroProfile {
 
 #[cfg(test)]
 mod tests {
-    use super::{DesktopProfile, DistroProfile, SshUnits, ubuntu};
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::{DesktopProfile, DistroCatalog, DistroProfile, SshUnits, ubuntu};
+    use crate::SettingsStore;
+
+    fn temporary_directory() -> std::path::PathBuf {
+        let unique_id = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("vmlord-distro-test-{unique_id}"))
+    }
+
+    fn profile_document(name: &str, user: &str) -> String {
+        format!(
+            r#"{{
+                "name": "{name}",
+                "releases": ["26.04", "24.04"],
+                "directory_template": "https://images.example/{name}/{{release}}/",
+                "file_name_template": "{name}-{{release}}.img",
+                "checksum_file": "SHA256SUMS",
+                "default_user": "{user}",
+                "admin_group": "wheel",
+                "ssh": {{
+                    "units": {{ "Service": {{ "unit": "sshd.service" }} }},
+                    "config_drop_in": "/etc/ssh/sshd_config.d/10-vmlord.conf"
+                }},
+                "desktop": null
+            }}"#
+        )
+    }
+
+    #[test]
+    fn a_catalog_loads_every_json_profile_and_selects_the_configured_one() {
+        let directory = temporary_directory();
+        let distros = directory.join("distros");
+        fs::create_dir_all(&distros).unwrap();
+        fs::write(
+            distros.join("ubuntu.json"),
+            profile_document("Ubuntu", "ubuntu"),
+        )
+        .unwrap();
+        fs::write(
+            distros.join("fedora.json"),
+            profile_document("Fedora", "fedora"),
+        )
+        .unwrap();
+        fs::write(distros.join("README.txt"), "not a profile").unwrap();
+        let store = SettingsStore::new(directory.join("settings.toml"));
+
+        let catalog = DistroCatalog::load(&store).unwrap();
+
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog.select("fedora").unwrap().default_user, "fedora");
+        assert_eq!(
+            catalog.options().collect::<Vec<_>>(),
+            [("fedora", "Fedora"), ("ubuntu", "Ubuntu")]
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_missing_profile_directory_reports_the_path_that_was_read() {
+        let directory = temporary_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let store = SettingsStore::new(directory.join("settings.toml"));
+
+        let error = DistroCatalog::load(&store).unwrap_err().to_string();
+
+        assert!(
+            error.contains("read distribution profile directory"),
+            "{error}"
+        );
+        assert!(
+            error.contains(&directory.join("distros").display().to_string()),
+            "{error}"
+        );
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn invalid_json_reports_the_profile_file_and_parse_failure() {
+        let directory = temporary_directory();
+        let distros = directory.join("distros");
+        fs::create_dir_all(&distros).unwrap();
+        let profile_path = distros.join("broken.json");
+        fs::write(&profile_path, "{ definitely not JSON }").unwrap();
+        let store = SettingsStore::new(directory.join("settings.toml"));
+
+        let error = DistroCatalog::load(&store).unwrap_err().to_string();
+
+        assert!(error.contains("parse distribution profile"), "{error}");
+        assert!(
+            error.contains(&profile_path.display().to_string()),
+            "{error}"
+        );
+        assert!(error.contains("line 1 column"), "{error}");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn selecting_an_unknown_configured_profile_names_its_identifier() {
+        let directory = temporary_directory();
+        let distros = directory.join("distros");
+        fs::create_dir_all(&distros).unwrap();
+        fs::write(
+            distros.join("ubuntu.json"),
+            profile_document("Ubuntu", "ubuntu"),
+        )
+        .unwrap();
+        let store = SettingsStore::new(directory.join("settings.toml"));
+        let catalog = DistroCatalog::load(&store).unwrap();
+
+        let error = catalog.select("arch").unwrap_err().to_string();
+
+        assert!(error.contains("arch"), "{error}");
+        assert!(error.contains("not found"), "{error}");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn the_shipped_ubuntu_profile_preserves_the_existing_resolver_contract() {
+        let profile: DistroProfile =
+            serde_json::from_str(include_str!("../../../distros/ubuntu.json")).unwrap();
+
+        assert_eq!(profile.name, "Ubuntu");
+        assert_eq!(profile.releases, ["26.04", "24.04", "22.04"]);
+        assert_eq!(profile.default_user, "ubuntu");
+        assert_eq!(profile.admin_group, "sudo");
+        assert_eq!(
+            profile.image_url("24.04"),
+            "https://cloud-images.ubuntu.com/releases/24.04/release/\
+             ubuntu-24.04-server-cloudimg-amd64.img"
+        );
+        assert_eq!(
+            profile.checksums_url("24.04"),
+            "https://cloud-images.ubuntu.com/releases/24.04/release/SHA256SUMS"
+        );
+        assert_eq!(profile.ssh.units.all(), ["ssh.socket", "ssh.service"]);
+        assert_eq!(
+            profile.desktop.unwrap().packages,
+            ["ubuntu-desktop-minimal"]
+        );
+    }
 
     #[test]
     fn a_profile_builds_the_image_url_and_the_checksums_url_in_one_directory() {

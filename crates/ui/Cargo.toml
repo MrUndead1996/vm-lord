@@ -13,6 +13,7 @@ vmlord-app = { path = "../app" }
 vmlord-core = { path = "../core" }
 
 [dev-dependencies]
+vmlord-core = { path = "../core", features = ["test-profile"] }
 # Read back by the catalogue parity test, and by nothing else. The same
 # version `vmlord-core` parses `settings.toml` with.
 toml = "0.8"

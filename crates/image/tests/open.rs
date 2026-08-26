@@ -6,8 +6,8 @@ use std::{fs, path::PathBuf, sync::atomic::AtomicBool};
 
 use sha2::{Digest, Sha256};
 use support::TestServer;
-use vmlord_core::ProgressPublisher;
-use vmlord_image::{DistroProfile, open_cloud_image, ubuntu};
+use vmlord_core::{ProgressPublisher, ubuntu};
+use vmlord_image::{DistroProfile, open_cloud_image};
 
 /// Bigger than the fixture's disk, so capacity is not what is under test.
 const CAPACITY: u64 = 1024 * 1024;
