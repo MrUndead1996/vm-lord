@@ -40,6 +40,7 @@ use crate::{
     hcs_config::{self, VmTopology},
     layout, list_known_vms,
     reconnect::{ReconnectOutcome, reconnect_known_vms},
+    run_recovery,
     shutdown_workers::ShutdownWorkers,
     ssh_launches::SshLaunches,
     ssh_port::{PortMove, SshPortMover},
@@ -1244,6 +1245,18 @@ impl VmRepository for HcsVmRepository {
         // up here rather than waiting for the VM to be started again.
         for known in &known {
             if known.state == Some(HcsSystemState::Running) {
+                match layout::vm_directory(&self.storage_root, &known.mapping.vm_name) {
+                    Ok(vm_directory) => run_recovery::restore(
+                        &known.mapping,
+                        &vm_directory,
+                        &self.gpu_runs,
+                        &self.display_runs,
+                    ),
+                    Err(error) => tracing::warn!(
+                        "cannot recover the payload shares of VM \"{}\": {error}",
+                        known.mapping.vm_name
+                    ),
+                }
                 self.listen_for_agent(&known.mapping, known.runtime_id);
             }
         }

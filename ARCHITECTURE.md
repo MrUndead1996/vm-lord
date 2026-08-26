@@ -202,6 +202,14 @@ known at all. A VM HCS does not report is `Absent` and keeps its mapping: a
 stopped VM looks exactly like one deleted outside VMLord, and dropping the
 mapping would turn every stop into a delete.
 
+Before a reconnected VM's agent listener is restored, `platform::run_recovery`
+rebuilds the payload offers that died with the previous process. It only reads
+the already staged GPU generation and the display's published `active`
+directory, validates them through the same export builders a start uses, and
+records their manifests in `GpuRuns` and `DisplayRuns`. It never stages a new
+generation or changes the running compute system: the Plan9 device is immutable
+for that boot, and the recovery only restores the names the guest must mount.
+
 `platform::HcnNetwork::ensure` opens the one NAT network VMLord shares across
 the whole installation, creating it when the Host Network Service does not have
 it. The network has no owner among the VMs -- the per-VM object is the endpoint
@@ -1013,8 +1021,11 @@ force stop, delete, the HCS release event, and process shutdown.
 
 Nothing is persisted. A `VmGpuStatus` describes a moment, and facts recorded by
 a process that is gone are confirmed by nothing -- the VM may have crashed, the
-guest may have lost the device. Re-observing is cheap: a reconnecting agent
-runs the same attach, recipe and probe exchange within seconds.
+guest may have lost the device. The staged directories do survive, so a process
+that reopens a still-running compute system reconstructs its mount manifest
+from those directories before accepting the first agent session. Re-observing
+the facts is cheap: a reconnecting agent runs the same attach, recipe and probe
+exchange within seconds.
 
 What cannot be re-observed is the assignment, which happens once, right after
 the system starts. A VM reclaimed from a previous process therefore reports
@@ -3373,6 +3384,12 @@ them on top of that desktop. The first time one reports, the stored
 provisioning is written as `Ready`, which is also what keeps a stopped VM
 reading as a VM whose desktop is not running rather than one whose desktop
 never arrived.
+
+The display payload offer is runtime state too, but its published directory
+survives a VMLord restart. Reconnect validates `display-payload/active` through
+the normal display export boundary and restores its fixed share name in
+`DisplayRuns` before the agent listener starts. The first agent session can
+therefore mount and report the desktop without waiting for a later reconnect.
 
 The desktop itself comes from the distribution's own archives. `DistroProfile`
 carries a `DesktopSetup` -- the packages and the display manager unit -- and

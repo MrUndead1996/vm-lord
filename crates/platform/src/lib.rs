@@ -54,6 +54,7 @@ mod password_hash;
 mod paths;
 mod reconnect;
 mod repository;
+mod run_recovery;
 mod shutdown;
 mod shutdown_workers;
 mod ssh;
