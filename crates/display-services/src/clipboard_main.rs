@@ -268,7 +268,7 @@ fn pump<S: Read + Write>(stream: &mut S, generation: u32) -> Result<(), String> 
         if let Some((mutter_clipboard, events)) = clipboard.as_ref() {
             loop {
                 match events.try_recv() {
-                    Ok(mutter::Event::PeerOffer { kinds }) => {
+                    Ok(mutter::Event::PeerOffer { kinds, .. }) => {
                         // The guest's selection is the local one from here.
                         // The kinds and never the bytes: this is what tells
                         // somebody whether a copy in the guest was seen at all.
@@ -284,6 +284,11 @@ fn pump<S: Read + Write>(stream: &mut S, generation: u32) -> Result<(), String> 
                     }
                     Ok(mutter::Event::Transfer { kind, serial }) => {
                         answer_transfer(mutter_clipboard, &held, kind, serial);
+                    }
+                    Ok(mutter::Event::TransferFiles { serial, .. }) => {
+                        // Nothing owns files here yet; the transfer is
+                        // refused rather than left for the desktop to wait on.
+                        let _ = mutter_clipboard.refuse(serial);
                     }
                     Ok(mutter::Event::Closed) | Err(TryRecvError::Disconnected) => {
                         eprintln!("vmlord-display-clipboard: the desktop's clipboard went away");
@@ -344,7 +349,7 @@ fn pump<S: Read + Write>(stream: &mut S, generation: u32) -> Result<(), String> 
                     );
                     held = pieces;
                     if let Some((clipboard, _)) = clipboard.as_ref()
-                        && let Err(error) = clipboard.own(&kinds)
+                        && let Err(error) = clipboard.own(&kinds, false)
                     {
                         eprintln!(
                             "vmlord-display-clipboard: the desktop refused the selection: {error}"

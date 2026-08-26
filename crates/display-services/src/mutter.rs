@@ -48,6 +48,13 @@ const ROOT: &str = "/org/gnome/Mutter/RemoteDesktop";
 /// The interface a session speaks.
 const SESSION: &str = "org.gnome.Mutter.RemoteDesktop.Session";
 
+/// How a file selection is named in a uri-list, which is what most of the
+/// desktop reads.
+pub const URI_LIST_MIME: &str = "text/uri-list";
+
+/// How GNOME's file manager names one, with the operation on the first line.
+pub const GNOME_COPIED_MIME: &str = "x-special/gnome-copied-files";
+
 /// How long one transfer may take before it is abandoned.
 ///
 /// The same five seconds the protocol's own inactivity limit uses: a guest
@@ -62,11 +69,20 @@ pub enum Event {
     PeerOffer {
         /// What it can produce, of what may be carried.
         kinds: Vec<Kind>,
+        /// Whether it also names files.
+        files: bool,
     },
     /// Something in the guest wants the selection this side owns.
     Transfer {
         /// Which format it asked for.
         kind: Kind,
+        /// The serial to answer with.
+        serial: u32,
+    },
+    /// Something in the guest wants the files of the selection this side owns.
+    TransferFiles {
+        /// Which of the two file formats it asked for.
+        mime: String,
         /// The serial to answer with.
         serial: u32,
     },
@@ -171,11 +187,18 @@ impl Clipboard {
 
     /// Takes the guest's selection, offering these formats.
     ///
+    /// `files` adds the two names a file selection is offered under, which is
+    /// what a file manager in the guest looks for and what nothing else does.
+    ///
     /// # Errors
     ///
     /// [`MutterError::Bus`] if the call is refused.
-    pub fn own(&self, kinds: &[Kind]) -> Result<(), MutterError> {
-        let mimes: Vec<&str> = kinds.iter().map(|kind| kind.mime()).collect();
+    pub fn own(&self, kinds: &[Kind], files: bool) -> Result<(), MutterError> {
+        let mut mimes: Vec<&str> = kinds.iter().map(|kind| kind.mime()).collect();
+        if files {
+            mimes.push(URI_LIST_MIME);
+            mimes.push(GNOME_COPIED_MIME);
+        }
         let options = HashMap::from([("mime-types", Value::from(mimes))]);
 
         self.session.call::<_, _, ()>("SetSelection", &(options,))?;
@@ -192,8 +215,20 @@ impl Clipboard {
     /// `cap`, [`MutterError::Idle`] if nothing arrives in time, and
     /// [`MutterError::Transfer`] if the descriptor fails.
     pub fn read(&self, kind: Kind, cap: usize) -> Result<Vec<u8>, MutterError> {
-        let descriptor: zbus::zvariant::OwnedFd =
-            self.session.call("SelectionRead", &(kind.mime(),))?;
+        self.read_mime(kind.mime(), cap)
+    }
+
+    /// Reads one format of the guest's selection by name, up to `cap` bytes.
+    ///
+    /// The untyped edge, for the two file formats: their bodies are lists of
+    /// paths, not clipboard payloads, and no file's contents ever pass through
+    /// here.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Clipboard::read`].
+    pub fn read_mime(&self, mime: &str, cap: usize) -> Result<Vec<u8>, MutterError> {
+        let descriptor: zbus::zvariant::OwnedFd = self.session.call("SelectionRead", &(mime,))?;
 
         drain(&OwnedFd::from(descriptor), cap, DEADLINE)
     }
@@ -277,7 +312,8 @@ fn owner_changed(message: &zbus::Message) -> Option<Event> {
         .map(|value| strings_in(value))
         .unwrap_or_default();
     let kinds = kinds_of(&mimes);
-    if kinds.is_empty() {
+    let files = offers_files(&mimes);
+    if kinds.is_empty() && !files {
         // Ordinary -- a guest copying a spreadsheet cell offers a dozen
         // formats this build carries none of -- and the one thing that
         // separates it from a selection nobody noticed at all. The count and
@@ -290,14 +326,28 @@ fn owner_changed(message: &zbus::Message) -> Option<Event> {
         return None;
     }
 
-    Some(Event::PeerOffer { kinds })
+    Some(Event::PeerOffer { kinds, files })
 }
 
 /// Something in the guest is asking for the selection this side owns.
 fn transfer(message: &zbus::Message) -> Option<Event> {
     let (mime, serial): (String, u32) = message.body().deserialize().ok()?;
 
-    Kind::from_mime(&mime).map(|kind| Event::Transfer { kind, serial })
+    if let Some(kind) = Kind::from_mime(&mime) {
+        return Some(Event::Transfer { kind, serial });
+    }
+    if mime == URI_LIST_MIME || mime == GNOME_COPIED_MIME {
+        return Some(Event::TransferFiles { mime, serial });
+    }
+
+    None
+}
+
+/// Whether a selection names files, whichever of the two formats it uses.
+fn offers_files(mimes: &[String]) -> bool {
+    mimes
+        .iter()
+        .any(|mime| mime == URI_LIST_MIME || mime == GNOME_COPIED_MIME)
 }
 
 /// Every string anywhere inside one `a{sv}` value.
@@ -431,6 +481,13 @@ mod tests {
     #[test]
     fn an_offer_of_files_alone_names_no_kind() {
         assert!(kinds_of(&["text/uri-list".to_owned()]).is_empty());
+    }
+
+    #[test]
+    fn an_offer_of_files_is_seen_under_either_of_its_names() {
+        assert!(offers_files(&[URI_LIST_MIME.to_owned()]));
+        assert!(offers_files(&[GNOME_COPIED_MIME.to_owned()]));
+        assert!(!offers_files(&["text/plain;charset=utf-8".to_owned()]));
     }
 
     #[test]
