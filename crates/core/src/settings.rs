@@ -188,7 +188,7 @@ fn parse_scaled(text: &str, units: &[(&str, u64)]) -> Result<u64, &'static str> 
 
 fn format_scaled(value: u64, units: &[(&str, u64)]) -> String {
     for (suffix, multiplier) in units {
-        if value % multiplier == 0 {
+        if value.is_multiple_of(*multiplier) {
             return format!("{}{suffix}", value / multiplier);
         }
     }
