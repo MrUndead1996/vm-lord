@@ -48,8 +48,10 @@ use vmlord_display_protocol::{
     v1::{Capability, Mode},
 };
 use vmlord_display_viewer::{
+    display_modes::{self, DisplayMode, select_mode},
+    fps_gap::{self, FpsGap},
     input::{self, Report},
-    launch::{self, Command, Handover, LaunchParameters, Link, Message},
+    launch::{self, Command, DiagnosticLevel, Handover, LaunchParameters, Link, Message},
     live::{Live, Signal},
     log as viewer_log,
     placement::place,
@@ -60,6 +62,7 @@ use vmlord_display_viewer::{
     windows::{
         clipboard::{self, Focus},
         d3d::Renderer,
+        display_modes::{MonitorWatch, snapshot_for_window},
         hook::Hook,
         hvsocket::{CONNECT_TIMEOUT, ConnectError, HvSocket},
         ipc::{self, CommandServer, SingleInstance},
@@ -177,6 +180,9 @@ fn run(parameters: LaunchParameters, claim: SingleInstance) -> ExitCode {
     let frame = Arc::new(Mutex::new(SharedFrame::default()));
     let (to_session, from_pipe) = mpsc::channel();
     let (to_parent, outgoing) = mpsc::channel();
+    // The main thread reports too: what it measures about the picture is a
+    // diagnostic, and the session thread has no part in it.
+    let to_parent_from_window = to_parent.clone();
     let (signals_out, signals) = mpsc::channel();
     let (orders_out, orders) = mpsc::channel();
 
@@ -206,8 +212,10 @@ fn run(parameters: LaunchParameters, claim: SingleInstance) -> ExitCode {
             ui: &ui,
             commands: &commands_in,
             clipboard: &clipboard,
+            outbox: &to_parent_from_window,
         },
         &mut state,
+        parameters.fps_gap_threshold_percent,
     );
 
     // Best effort, and last: a window position is not worth delaying a
@@ -302,6 +310,15 @@ enum Order {
     },
     /// The user picked an encoding mode.
     Mode(Mode),
+    /// The monitor the window is on, and the mode to prefer on it.
+    AvailableModes {
+        /// Every mode the host monitor drives, normalized.
+        modes: Vec<DisplayMode>,
+        /// The one the viewer chose, by policy or by the user.
+        preferred: Option<DisplayMode>,
+    },
+    /// The user picked a resolution from the system menu.
+    DisplayMode(DisplayMode),
 }
 
 /// Everything the session thread owns.
@@ -334,6 +351,8 @@ struct Loop<'a> {
     ui: &'a Receiver<UiEvent>,
     commands: &'a Receiver<Command>,
     clipboard: &'a Arc<Mutex<Option<Sender<Focus>>>>,
+    /// Straight to VMLord, for what the window itself finds.
+    outbox: &'a Sender<Message>,
 }
 
 /// Reads standard input until VMLord closes it.
@@ -546,6 +565,19 @@ where
                 Ok(Order::Input(event)) => live.send_input(event),
                 Ok(Order::Resolution { width, height }) => live.set_resolution(width, height),
                 Ok(Order::Mode(mode)) => live.set_mode(mode),
+                // Dropped rather than queued for a guest that never asked for
+                // them: an older payload resizes its output from the window
+                // and has nothing to do with a monitor's mode list.
+                Ok(Order::AvailableModes { modes, preferred }) => {
+                    if live.host_modes() {
+                        live.set_available_modes(&modes, preferred);
+                    }
+                }
+                Ok(Order::DisplayMode(mode)) => {
+                    if live.host_modes() {
+                        live.set_display_mode(mode);
+                    }
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Attempt::Stop,
             }
@@ -657,12 +689,22 @@ fn refresh(session: &Session) -> Option<Vec<u8>> {
 /// `state` is this VM's window as it will be remembered: the loop keeps it up
 /// to date rather than reading the window back at the end, because a window
 /// that is closing has already stopped being where it was.
-fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
+fn pump(mut context: Loop<'_>, state: &mut WindowState, fps_gap_threshold_percent: u8) -> ExitCode {
     let mut progress = Progress::new(Instant::now());
     let mut closing = false;
     let mut policy = input::Policy::new();
     let mut stream: Option<Geometry> = None;
     let mut resize = Resize::new();
+    // The monitor the window is on, enumerated once a rearrangement settles,
+    // and what its last enumeration said.
+    let mut monitors = MonitorWatch::new();
+    let mut offered: Vec<DisplayMode> = Vec::new();
+    let mut native: Option<DisplayMode> = None;
+    // What the guest confirmed it came up on, which is what a delivered rate
+    // is measured against -- not what the viewer asked for.
+    let mut committed: Option<DisplayMode> = None;
+    let mut fps_gap = FpsGap::new(fps_gap_threshold_percent);
+    let mut presented = 0u64;
     // While this lives the keyboard is the guest's. It is taken on focus and
     // given back the moment the window loses it -- or the user asks.
     let mut hook: Option<Hook> = None;
@@ -680,6 +722,12 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
                     stream = Some(*geometry);
                     reposition(&mut policy, stream, context.window);
                 }
+                Signal::Committed(mode) => {
+                    committed = *mode;
+                    // A new mode is a new rate to measure: the frames that
+                    // arrived at the mode before are not this one's.
+                    fps_gap.reset();
+                }
                 Signal::Ended(_) => {
                     policy.report(Report::ChannelLost);
                     // The guest that was told the window's size is not the
@@ -691,6 +739,13 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
                     let (width, height) = context.window.client_size();
                     resize.observe(width.max(0) as u32, height.max(0) as u32, Instant::now());
                     mode_owed = true;
+                    // And the same for the monitor: the list and the selection
+                    // are sent to the guest that is listening now, in that
+                    // order, rather than assumed to have survived the socket.
+                    monitors.forget();
+                    monitors.observe(Instant::now());
+                    committed = None;
+                    fps_gap.reset();
                 }
                 _ => {}
             }
@@ -742,6 +797,15 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
                         state.size = (width, height);
                     }
                 }
+                UiEvent::MonitorChanged => monitors.observe(Instant::now()),
+                UiEvent::DisplayMode(mode) => {
+                    // Remembered because the user said so: a mode chosen by
+                    // policy is one the next monitor may not have, and a mode
+                    // chosen from the menu is what this VM opens at.
+                    state.display_mode = Some(mode);
+                    context.window.set_modes(&offered, Some(mode));
+                    let _ = context.orders.send(Order::DisplayMode(mode));
+                }
                 UiEvent::Moved(x, y) => {
                     // Only a restored window reports this, so what is kept is
                     // the place the user left the window rather than the
@@ -752,6 +816,12 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
                     let wanted = !context.window.is_fullscreen();
                     context.window.set_fullscreen(wanted);
                     state.fullscreen = context.window.is_fullscreen();
+                    // A window filling a monitor wants that monitor's own
+                    // timing, which is not always the one the desktop is on.
+                    if wanted && let Some(mode) = native.filter(|mode| offered.contains(mode)) {
+                        context.window.set_modes(&offered, Some(mode));
+                        let _ = context.orders.send(Order::DisplayMode(mode));
+                    }
                 }
                 UiEvent::Quality(quality) => {
                     state.quality = quality;
@@ -772,6 +842,31 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
             if let Some((width, height)) = resize.due(Instant::now()) {
                 worked = true;
                 let _ = context.orders.send(Order::Resolution { width, height });
+            }
+        }
+        if monitors.due(Instant::now()) {
+            worked = true;
+            if let Some(snapshot) = snapshot_for_window(context.window.handle())
+                && monitors.accept(snapshot.clone())
+            {
+                tracing::debug!(
+                    "the window is on {} with {} modes",
+                    snapshot.identity,
+                    snapshot.modes.len()
+                );
+                // The selection survives a monitor that still offers it and
+                // falls back by policy when it does not, which is what a
+                // laptop coming back without its dock looks like.
+                let chosen = select_mode(state.display_mode, &snapshot.modes);
+                // Cut to what the guest's connector holds before anything is
+                // published: a longer list is one the module refuses whole.
+                offered = display_modes::offered(&snapshot.modes, Some(chosen));
+                native = snapshot.preferred;
+                context.window.set_modes(&offered, Some(chosen));
+                let _ = context.orders.send(Order::AvailableModes {
+                    modes: offered.clone(),
+                    preferred: Some(chosen),
+                });
             }
         }
 
@@ -806,8 +901,23 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
             return ExitCode::SUCCESS;
         }
 
-        upload(&mut context);
-        draw(&mut context, &progress);
+        let uploaded = upload(&mut context);
+        if draw(&mut context, &progress) && uploaded {
+            presented += 1;
+        }
+
+        // Paused rather than counted while there is no picture to deliver: a
+        // minimised window and a session that is still coming up are both a
+        // second of nothing, and neither is the guest failing to keep up.
+        let measuring = progress.is_running() && !context.window.is_minimised();
+        if !measuring {
+            fps_gap.reset();
+        } else if let Some(warning) = fps_gap.sample(Instant::now(), presented, committed) {
+            let _ = context.outbox.send(Message::Diagnostic {
+                level: DiagnosticLevel::Warning,
+                detail: fps_gap::detail(context.vm_name, warning),
+            });
+        }
 
         if !worked {
             thread::sleep(IDLE);
@@ -859,31 +969,43 @@ fn apply(context: &mut Loop<'_>, progress: &mut Progress, signal: Signal) {
         }
         // Where the guest thinks its pointer is. The host's own cursor is what
         // the user sees until #119 wires input up.
-        Signal::Moved(_) | Signal::Damage(_) => {}
+        // Both are the main loop's own business rather than the renderer's:
+        // where the guest thinks its pointer is, and what mode it came up on.
+        Signal::Moved(_) | Signal::Damage(_) | Signal::Committed(_) => {}
         Signal::Status(event) => progress.on(event, Instant::now()),
         Signal::Ended(reason) => tracing::info!("the session is over: {reason}"),
     }
 }
 
 /// Uploads whatever the session thread has copied in since the last frame.
-fn upload(context: &mut Loop<'_>) {
+///
+/// Whether there was one, which is what an FPS is counted from: a loop that
+/// spins with nothing new to draw is not a frame that was delivered.
+fn upload(context: &mut Loop<'_>) -> bool {
     let Ok(mut frame) = context.frame.lock() else {
-        return;
+        return false;
     };
     if frame.damage.is_empty() {
-        return;
+        return false;
     }
 
     let damage = std::mem::take(&mut frame.damage);
     if let Err(error) = context.renderer.upload(&frame.pixels, &damage) {
         tracing::warn!("the frame could not be uploaded: {error}");
+
+        return false;
     }
+
+    true
 }
 
 /// Presents, and rebuilds the device if it was lost.
-fn draw(context: &mut Loop<'_>, progress: &Progress) {
+///
+/// `true` when what was on screen is what the guest sent, which is the other
+/// half of a frame having been delivered.
+fn draw(context: &mut Loop<'_>, progress: &Progress) -> bool {
     let Err(error) = context.renderer.present(progress, context.vm_name) else {
-        return;
+        return true;
     };
 
     tracing::warn!("the frame could not be presented: {error}");
@@ -895,4 +1017,6 @@ fn draw(context: &mut Loop<'_>, progress: &Progress) {
         Ok(false) => tracing::error!("the graphics device cannot be recovered again"),
         Err(error) => tracing::error!("the graphics device could not be rebuilt: {error}"),
     }
+
+    false
 }

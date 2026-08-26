@@ -437,7 +437,14 @@ impl<F: Acceptor, I: Acceptor> Loop<F, I> {
 
                 Ok(None)
             }
-            Message::Geometry { width, height } => {
+            // The refresh is the control thread's to report to the host: an
+            // encoder is built on a geometry and paces itself on the frames it
+            // is handed, so a timing means nothing here.
+            Message::Geometry {
+                width,
+                height,
+                refresh_hz: _,
+            } => {
                 self.resize(width, height)?;
 
                 Ok(None)
@@ -1633,7 +1640,14 @@ mod tests {
         /// The broker reports the size the output came up at.
         fn broker_sends_geometry(&mut self, width: u32, height: u32) {
             self.broker
-                .send(&Message::Geometry { width, height }, &[])
+                .send(
+                    &Message::Geometry {
+                        width,
+                        height,
+                        refresh_hz: 60,
+                    },
+                    &[],
+                )
                 .expect("a geometry");
         }
 

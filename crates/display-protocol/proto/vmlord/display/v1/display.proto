@@ -47,6 +47,9 @@ enum Capability {
   CAPABILITY_CLIPBOARD = 3;
   // The clipboard channel can stream filesystem trees with negotiated policy.
   CAPABILITY_FILE_CLIPBOARD = 4;
+  // The host can replace the guest connector's normalized resolution and
+  // integer-refresh mode list while a session is running.
+  CAPABILITY_HOST_DISPLAY_MODES = 5;
 }
 
 // How the encoder trades bandwidth against fidelity.
@@ -98,6 +101,8 @@ enum ControlRecord {
   CONTROL_RECORD_END_SESSION = 10;
   CONTROL_RECORD_DISPLAY_STATE = 11;
   CONTROL_RECORD_ERROR = 12;
+  CONTROL_RECORD_SET_AVAILABLE_MODES = 13;
+  CONTROL_RECORD_SET_DISPLAY_MODE = 14;
 }
 
 // The `type` field of a record header on the frame channel.
@@ -267,6 +272,21 @@ message SetResolution {
   uint32 height = 2;
 }
 
+message DisplayTiming {
+  uint32 width = 1;
+  uint32 height = 2;
+  uint32 refresh_hz = 3;
+}
+
+message SetAvailableModes {
+  repeated DisplayTiming modes = 1;
+  DisplayTiming preferred = 2;
+}
+
+message SetDisplayMode {
+  DisplayTiming mode = 1;
+}
+
 // The viewer's decoder has nothing to apply a delta to and needs a fresh
 // keyframe. Recovery, not flow control.
 message RequestKeyframe {}
@@ -289,6 +309,7 @@ message DisplayState {
   uint32 height = 2;
   uint32 tile_size = 3;
   Mode mode = 4;
+  uint32 refresh_hz = 5;
 }
 
 message Error {

@@ -20,7 +20,7 @@ use prost::Message as _;
 use crate::viewer::v1::{self as wire, envelope};
 
 /// The revision of the launch contract this build speaks.
-pub const REVISION: u32 = 2;
+pub const REVISION: u32 = 3;
 
 /// The largest message a launch pipe may carry.
 ///
@@ -47,6 +47,27 @@ pub enum Message {
     },
     /// Something for the window rather than for the session.
     Command(Command),
+    /// Something the viewer found that a person should be told about.
+    Diagnostic {
+        /// How loud it is.
+        level: DiagnosticLevel,
+        /// The prose to show, formatted by the viewer.
+        detail: String,
+    },
+}
+
+/// How loud a diagnostic from the viewer is.
+///
+/// The application's own levels, restated here because this contract may not
+/// depend on the application: the viewer is a process of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagnosticLevel {
+    /// Worth knowing.
+    Info,
+    /// Worth acting on.
+    Warning,
+    /// Something did not work.
+    Error,
 }
 
 /// What VMLord asks the window to do.
@@ -85,6 +106,8 @@ pub struct LaunchParameters {
     pub client_hello: Vec<u8>,
     /// Limits and completed-file lifetime for clipboard file transfers.
     pub file_policy: FilePolicy,
+    /// Delivered FPS below this share of DRM refresh is diagnostic-worthy.
+    pub fps_gap_threshold_percent: u8,
 }
 
 /// Parsed file clipboard settings handed to the viewer.
@@ -159,6 +182,7 @@ pub fn encode(message: &Message) -> Vec<u8> {
             clipboard_max_file_bytes: parameters.file_policy.max_file_bytes,
             clipboard_max_transfer_bytes: parameters.file_policy.max_transfer_bytes,
             clipboard_retention_seconds: parameters.file_policy.retention_seconds,
+            fps_gap_threshold_percent: u32::from(parameters.fps_gap_threshold_percent),
         }),
         Message::RelayToViewer(bytes) => envelope::Kind::RelayToViewer(wire::Relay {
             bytes: bytes.clone(),
@@ -182,6 +206,14 @@ pub fn encode(message: &Message) -> Vec<u8> {
         }),
         Message::RequestRelay { token } => envelope::Kind::RequestRelay(wire::RequestRelay {
             token: token.clone(),
+        }),
+        Message::Diagnostic { level, detail } => envelope::Kind::Diagnostic(wire::Diagnostic {
+            level: match level {
+                DiagnosticLevel::Info => wire::diagnostic::Level::Info as i32,
+                DiagnosticLevel::Warning => wire::diagnostic::Level::Warning as i32,
+                DiagnosticLevel::Error => wire::diagnostic::Level::Error as i32,
+            },
+            detail: detail.clone(),
         }),
         Message::Command(command) => envelope::Kind::Command(wire::Command {
             kind: match command {
@@ -240,6 +272,12 @@ pub fn decode(bytes: &[u8]) -> Result<Message, LaunchError> {
                 retention_seconds: parameters.clipboard_retention_seconds,
             }
             .validate()?,
+            fps_gap_threshold_percent: parameters
+                .fps_gap_threshold_percent
+                .try_into()
+                .ok()
+                .filter(|percent| (1..=100).contains(percent))
+                .ok_or(LaunchError::Policy)?,
         }),
         envelope::Kind::RelayToViewer(relay) => Message::RelayToViewer(relay.bytes),
         envelope::Kind::RelayFromViewer(relay) => Message::RelayFromViewer(relay.bytes),
@@ -267,6 +305,15 @@ pub fn decode(bytes: &[u8]) -> Result<Message, LaunchError> {
                 _ => return Err(LaunchError::Empty),
             })
         }
+        envelope::Kind::Diagnostic(diagnostic) => Message::Diagnostic {
+            level: match wire::diagnostic::Level::try_from(diagnostic.level) {
+                Ok(wire::diagnostic::Level::Info) => DiagnosticLevel::Info,
+                Ok(wire::diagnostic::Level::Warning) => DiagnosticLevel::Warning,
+                Ok(wire::diagnostic::Level::Error) => DiagnosticLevel::Error,
+                _ => return Err(LaunchError::Empty),
+            },
+            detail: diagnostic.detail,
+        },
     };
 
     Ok(message)
@@ -462,7 +509,8 @@ mod tests {
     use std::io;
 
     use super::{
-        Command, FilePolicy, Handover, LaunchError, LaunchParameters, Link, Message, decode, encode,
+        Command, DiagnosticLevel, FilePolicy, Handover, LaunchError, LaunchParameters, Link,
+        Message, decode, encode,
     };
 
     fn parameters() -> LaunchParameters {
@@ -483,6 +531,7 @@ mod tests {
                 max_transfer_bytes: 4 << 30,
                 retention_seconds: 86_400,
             },
+            fps_gap_threshold_percent: 50,
         }
     }
 
@@ -513,6 +562,10 @@ mod tests {
             Message::RequestRelay { token: vec![9; 32] },
             Message::Command(Command::Focus),
             Message::Command(Command::Close),
+            Message::Diagnostic {
+                level: DiagnosticLevel::Warning,
+                detail: "the picture is arriving at a fraction of the refresh".to_owned(),
+            },
         ];
 
         for message in messages {
@@ -533,6 +586,19 @@ mod tests {
         assert_eq!(parameters.file_policy.max_file_bytes, 1 << 30);
         assert_eq!(parameters.file_policy.max_transfer_bytes, 4 << 30);
         assert_eq!(parameters.file_policy.retention_seconds, 86_400);
+    }
+
+    #[test]
+    fn fps_gap_threshold_survives_the_launch_pipe() {
+        let mut parameters = parameters();
+        parameters.fps_gap_threshold_percent = 73;
+
+        let decoded = decode(&encode(&Message::Launch(parameters))).unwrap();
+
+        let Message::Launch(parameters) = decoded else {
+            panic!("the launch message changed kind");
+        };
+        assert_eq!(parameters.fps_gap_threshold_percent, 73);
     }
 
     #[test]
@@ -574,7 +640,7 @@ mod tests {
     #[test]
     fn an_envelope_naming_no_message_is_refused() {
         // Current revision and nothing else.
-        assert!(matches!(decode(&[0x08, 0x02]), Err(LaunchError::Empty)));
+        assert!(matches!(decode(&[0x08, 0x03]), Err(LaunchError::Empty)));
     }
 
     #[test]

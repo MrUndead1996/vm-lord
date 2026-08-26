@@ -23,6 +23,7 @@ message Envelope {
     Handover handover = 5;
     RequestRelay request_relay = 6;
     Command command = 7;
+    Diagnostic diagnostic = 8;
   }
 }
 
@@ -49,6 +50,9 @@ message LaunchParameters {
   uint64 clipboard_max_file_bytes = 12;
   uint64 clipboard_max_transfer_bytes = 13;
   uint64 clipboard_retention_seconds = 14;
+  // Percentage of committed DRM refresh below which sustained delivered FPS
+  // is reported as a user-visible warning.
+  uint32 fps_gap_threshold_percent = 15;
 }
 
 // Handshake bytes, verbatim. The viewer parses none of them.
@@ -91,5 +95,20 @@ message Command {
     KIND_UNSPECIFIED = 0;
     KIND_FOCUS = 1;
     KIND_CLOSE = 2;
+  }
+}
+
+// Something the viewer found that a person should be told about, on its way to
+// the application's diagnostics. Prose, already formatted: the viewer is what
+// knows the numbers, and VMLord is only where they are shown.
+message Diagnostic {
+  Level level = 1;
+  string detail = 2;
+
+  enum Level {
+    LEVEL_UNSPECIFIED = 0;
+    LEVEL_INFO = 1;
+    LEVEL_WARNING = 2;
+    LEVEL_ERROR = 3;
   }
 }

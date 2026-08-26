@@ -7,8 +7,10 @@
 //! modules that touch Win32.
 
 pub mod clipboard;
+pub mod display_modes;
 #[cfg(test)]
 pub(crate) mod duplex;
+pub mod fps_gap;
 pub mod fullscreen;
 pub mod input;
 pub mod launch;

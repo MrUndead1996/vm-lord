@@ -14,10 +14,10 @@ use std::{
 
 use uuid::Uuid;
 use vmlord_core::{
-    AgentStatus, DiagnosticLevel, DisplayProvisioning, FileClipboardSettings, GpuAssignment,
-    GpuMode, GuestDisplayReport, GuestReadinessTimeouts, HostGpuCapabilities, NetworkMode,
-    RepositoryError, SshAvailability, SshPort, Subsystem, VmCreateRequest, VmDeleteRequest,
-    VmDisplayFacts, VmRepository, VmState, VmSummary, VmUpdateRequest,
+    AgentStatus, DiagnosticLevel, DisplayProvisioning, DisplaySettings, FileClipboardSettings,
+    GpuAssignment, GpuMode, GuestDisplayReport, GuestReadinessTimeouts, HostGpuCapabilities,
+    NetworkMode, RepositoryError, SshAvailability, SshPort, Subsystem, VmCreateRequest,
+    VmDeleteRequest, VmDisplayFacts, VmRepository, VmState, VmSummary, VmUpdateRequest,
 };
 
 use crate::{
@@ -73,6 +73,7 @@ pub struct HcsVmRepository {
     /// told apart from the defaults the cycle was built with.
     readiness_timeouts: ReadinessTimeouts,
     file_clipboard: FileClipboardSettings,
+    display_settings: DisplaySettings,
     /// The VMs being created right now.
     builds: Arc<BuildRegistry>,
     /// Starts VMs. Shared rather than owned because a start now runs on a
@@ -154,6 +155,7 @@ impl HcsVmRepository {
             )),
             readiness_timeouts: ReadinessTimeouts::default(),
             file_clipboard: FileClipboardSettings::default(),
+            display_settings: DisplaySettings::default(),
             builds: Arc::new(BuildRegistry::default()),
             start: Arc::new(
                 VmStartPipeline::production(com1_launcher.clone()).for_vms_under(
@@ -207,6 +209,13 @@ impl HcsVmRepository {
     #[must_use]
     pub fn with_file_clipboard_settings(mut self, settings: FileClipboardSettings) -> Self {
         self.file_clipboard = settings;
+        self
+    }
+
+    /// Replaces the defaults used by display stream diagnostics.
+    #[must_use]
+    pub fn with_display_settings(mut self, settings: DisplaySettings) -> Self {
+        self.display_settings = settings;
         self
     }
 
@@ -746,6 +755,7 @@ impl HcsVmRepository {
             mode: mapping.display_mode,
             viewer: display_launches::viewer_path()?,
             file_policy: self.file_clipboard,
+            fps_gap_threshold_percent: self.display_settings.fps_gap_threshold_percent,
         })
     }
 

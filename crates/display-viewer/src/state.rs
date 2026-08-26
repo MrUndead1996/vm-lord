@@ -21,6 +21,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::display_modes::DisplayMode;
+
 /// The size a VM with nothing remembered opens at.
 pub const DEFAULT_SIZE: (u32, u32) = (1920, 1080);
 
@@ -72,6 +74,8 @@ pub struct WindowState {
     pub fullscreen: bool,
     /// The encoding mode the user picked.
     pub quality: Quality,
+    /// Explicit resolution and refresh chosen from the host monitor.
+    pub display_mode: Option<DisplayMode>,
 }
 
 impl Default for WindowState {
@@ -81,6 +85,7 @@ impl Default for WindowState {
             size: DEFAULT_SIZE,
             fullscreen: false,
             quality: Quality::default(),
+            display_mode: None,
         }
     }
 }
@@ -92,6 +97,9 @@ impl WindowState {
         let mut state = Self::default();
         let mut x = None;
         let mut y = None;
+        let mut display_width = None;
+        let mut display_height = None;
+        let mut display_refresh_hz = None;
 
         for line in contents.lines() {
             let Some((key, value)) = line.split_once('=') else {
@@ -112,6 +120,9 @@ impl WindowState {
                     }
                 }
                 "fullscreen" => state.fullscreen = value == "true",
+                "display_width" => display_width = value.parse().ok(),
+                "display_height" => display_height = value.parse().ok(),
+                "display_refresh_hz" => display_refresh_hz = value.parse().ok(),
                 "quality" => {
                     if let Some(quality) = Quality::parse(value) {
                         state.quality = quality;
@@ -124,6 +135,10 @@ impl WindowState {
         // A position is both halves or neither: half of one would put the
         // window somewhere nobody left it.
         state.position = x.zip(y);
+        state.display_mode = display_width
+            .zip(display_height)
+            .zip(display_refresh_hz)
+            .and_then(|((width, height), refresh_hz)| DisplayMode::new(width, height, refresh_hz));
         // A size with no pixels in it is one no window can open at.
         if state.size.0 == 0 || state.size.1 == 0 {
             state.size = DEFAULT_SIZE;
@@ -144,6 +159,11 @@ impl WindowState {
         let _ = writeln!(text, "height = {}", self.size.1);
         let _ = writeln!(text, "fullscreen = {}", self.fullscreen);
         let _ = writeln!(text, "quality = {}", self.quality.as_str());
+        if let Some(mode) = self.display_mode {
+            let _ = writeln!(text, "display_width = {}", mode.width);
+            let _ = writeln!(text, "display_height = {}", mode.height);
+            let _ = writeln!(text, "display_refresh_hz = {}", mode.refresh_hz);
+        }
 
         text
     }
@@ -235,6 +255,8 @@ fn file_name(vm_name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::display_modes::DisplayMode;
+
     use super::{DEFAULT_SIZE, Quality, Store, WindowState, file_name};
 
     #[test]
@@ -244,6 +266,7 @@ mod tests {
             size: (2560, 1440),
             fullscreen: true,
             quality: Quality::Desktop,
+            display_mode: DisplayMode::new(2560, 1440, 144),
         };
 
         assert_eq!(WindowState::parse(&state.render()), state);
@@ -311,6 +334,7 @@ mod tests {
             size: (1280, 720),
             fullscreen: false,
             quality: Quality::Desktop,
+            display_mode: None,
         };
 
         store.save(&state).expect("a written state");
@@ -323,5 +347,29 @@ mod tests {
         let store = Store::new("/nonexistent/vmlord/one.conf");
 
         assert_eq!(store.load(), WindowState::default());
+    }
+
+    #[test]
+    fn a_selected_display_mode_survives_a_round_trip() {
+        let state = WindowState {
+            display_mode: DisplayMode::new(2560, 1440, 144),
+            ..WindowState::default()
+        };
+
+        assert_eq!(
+            WindowState::parse(&state.render()).display_mode,
+            state.display_mode
+        );
+    }
+
+    #[test]
+    fn a_partial_or_invalid_selected_mode_is_forgotten() {
+        for contents in [
+            "display_width = 1920\ndisplay_height = 1080\n",
+            "display_width = 1920\ndisplay_height = 1080\ndisplay_refresh_hz = 0\n",
+            "display_width = 3840\ndisplay_height = 2160\ndisplay_refresh_hz = 60\n",
+        ] {
+            assert_eq!(WindowState::parse(contents).display_mode, None);
+        }
     }
 }

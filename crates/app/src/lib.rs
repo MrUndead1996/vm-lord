@@ -933,6 +933,7 @@ mod tests {
             default_distro: "removed-profile".into(),
             guest_readiness: vmlord_core::GuestReadinessTimeouts::default(),
             clipboard_files: vmlord_core::FileClipboardSettings::default(),
+            display: vmlord_core::DisplaySettings::default(),
         };
         store.save(&stale).unwrap();
         let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()))
@@ -967,6 +968,7 @@ mod tests {
             default_distro: "ubuntu".into(),
             guest_readiness: vmlord_core::GuestReadinessTimeouts::default(),
             clipboard_files: vmlord_core::FileClipboardSettings::default(),
+            display: vmlord_core::DisplaySettings::default(),
         };
         store.save(&initial).unwrap();
         let mut updated = initial.clone();
@@ -997,6 +999,7 @@ mod tests {
             default_distro: "ubuntu".into(),
             guest_readiness: vmlord_core::GuestReadinessTimeouts::default(),
             clipboard_files: vmlord_core::FileClipboardSettings::default(),
+            display: vmlord_core::DisplaySettings::default(),
         };
         store.save(&initial).unwrap();
         let mut updated = initial.clone();
@@ -1648,6 +1651,7 @@ mod tests {
             default_distro: "ubuntu".into(),
             guest_readiness: vmlord_core::GuestReadinessTimeouts::default(),
             clipboard_files: vmlord_core::FileClipboardSettings::default(),
+            display: vmlord_core::DisplaySettings::default(),
         };
         let updated_settings = AppSettings {
             vm_storage_path: directory.join("virtual-machines"),
@@ -1658,6 +1662,7 @@ mod tests {
             default_distro: "fedora".into(),
             guest_readiness: vmlord_core::GuestReadinessTimeouts::default(),
             clipboard_files: vmlord_core::FileClipboardSettings::default(),
+            display: vmlord_core::DisplaySettings::default(),
         };
         let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()))
             .with_diagnostics(sink)

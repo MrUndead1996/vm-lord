@@ -17,8 +17,8 @@ use vmlord_display_protocol::{
     record::{self, Channel, Limits, Record, RecordError},
     session::{Event, Session, Support},
     v1::{
-        Capability, ControlRecord, DisplayState, ErrorCode, Mode, Ping, Pong, SetMode,
-        SetResolution,
+        Capability, ControlRecord, DisplayState, DisplayTiming, ErrorCode, Mode, Ping, Pong,
+        SetAvailableModes, SetDisplayMode, SetMode, SetResolution,
     },
 };
 
@@ -47,6 +47,21 @@ pub enum Outcome {
         /// The height.
         height: u32,
     },
+    /// The host published the modes its own monitor drives, and every one of
+    /// them is a mode this output builds.
+    ///
+    /// The list and the selection travel together because the module has to be
+    /// told them in that order: a mode marked preferred while the connector is
+    /// still offering the old list is a hotplug onto a mode about to be
+    /// withdrawn.
+    AvailableModes {
+        /// The whole list to offer, never empty.
+        modes: Vec<DisplayTiming>,
+        /// The one to mark preferred, when the host named one.
+        preferred: Option<DisplayTiming>,
+    },
+    /// The host chose one of the modes it published.
+    DisplayMode(DisplayTiming),
     /// The session is over, for the reason given. Fit for a journal, not for a
     /// decision.
     Closed(String),
@@ -71,6 +86,10 @@ pub fn support_from(width: u32, height: u32) -> Support {
             // daemon attached the guest simply offers nothing.
             Capability::Clipboard,
             Capability::FileClipboard,
+            // The connector's mode list is the host monitor's, and this build
+            // is the one that replaces it. Announced here so that a host on an
+            // older protocol revision never sends a record this cannot apply.
+            Capability::HostDisplayModes,
         ],
         // Motion is not a mode this build has. Announcing it and then encoding
         // a desktop would be worse than refusing it.
@@ -87,7 +106,14 @@ pub struct Control {
     /// The geometry the output is on, which is what a `DisplayState` reports.
     width: u32,
     height: u32,
+    /// The refresh the compositor committed, zero until one has been seen.
+    refresh_hz: u32,
     tile_size: u32,
+    /// Whether the host negotiated the mode-list capability.
+    ///
+    /// A record it did not negotiate is one this build must not act on, however
+    /// well formed: the two sides agreed on what this session speaks.
+    host_modes: bool,
     /// Whether the four handshake records are behind us. After them the session
     /// takes no more records, and what arrives is a request.
     established: bool,
@@ -107,9 +133,11 @@ impl Control {
             session: Session::guest(secret, support),
             width,
             height,
+            refresh_hz: 0,
             // Until the handshake settles one, this is what the codec defaults
             // to and what a `DisplayState` before then would report.
             tile_size: 32,
+            host_modes: false,
             established: false,
             sequence: 0,
             limits,
@@ -188,6 +216,9 @@ impl Control {
         self.height = negotiated.height;
         self.tile_size = negotiated.tile_size;
         let cursor_stream = negotiated.capabilities.contains(&Capability::CursorStream);
+        self.host_modes = negotiated
+            .capabilities
+            .contains(&Capability::HostDisplayModes);
         self.limits.set_geometry(self.width, self.height);
 
         Outcome::Opened(
@@ -263,6 +294,72 @@ impl Control {
                     }
                 }
             }
+            Ok(ControlRecord::SetAvailableModes) if self.host_modes => {
+                let Ok(set) = SetAvailableModes::decode(payload) else {
+                    self.report(
+                        stream,
+                        ErrorCode::MalformedRecord,
+                        "an unreadable mode list",
+                    );
+
+                    return Outcome::Nothing;
+                };
+                // Counted before anything is validated: a host that named more
+                // modes than the module holds is refused on the record rather
+                // than after a list has been built out of it.
+                if set.modes.len() > output::MAX_MODES {
+                    self.report(
+                        stream,
+                        ErrorCode::ResolutionRejected,
+                        "more modes than this output offers",
+                    );
+
+                    return Outcome::Nothing;
+                }
+                // The whole update or none of it. A list with one mode this
+                // output cannot build is a host that disagrees about the
+                // contract, and applying the rest would hide that.
+                if !set.modes.iter().all(output::drivable) {
+                    self.report(
+                        stream,
+                        ErrorCode::ResolutionRejected,
+                        "a mode outside what this output drives",
+                    );
+
+                    return Outcome::Nothing;
+                }
+
+                let modes = if set.modes.is_empty() {
+                    // A host whose enumeration found nothing still has a
+                    // window, and a connector with no modes is one no
+                    // compositor lights.
+                    vec![output::FALLBACK]
+                } else {
+                    set.modes
+                };
+                let preferred = set.preferred.filter(output::drivable);
+
+                Outcome::AvailableModes { modes, preferred }
+            }
+            Ok(ControlRecord::SetDisplayMode) if self.host_modes => {
+                let wanted = SetDisplayMode::decode(payload)
+                    .ok()
+                    .and_then(|set| set.mode)
+                    .filter(output::drivable);
+
+                match wanted {
+                    Some(mode) => Outcome::DisplayMode(mode),
+                    None => {
+                        self.report(
+                            stream,
+                            ErrorCode::ResolutionRejected,
+                            "a mode outside what this output drives",
+                        );
+
+                        Outcome::Nothing
+                    }
+                }
+            }
             Ok(ControlRecord::EndSession) => {
                 Outcome::Closed("the host ended the session".to_owned())
             }
@@ -282,16 +379,23 @@ impl Control {
     ///
     /// The record caps move with it: a taller output is a bigger keyframe, and
     /// the caps are what say how big a record may be.
-    pub fn set_geometry(&mut self, width: u32, height: u32) {
+    pub fn set_geometry(&mut self, width: u32, height: u32, refresh_hz: u32) {
         self.width = width;
         self.height = height;
+        self.refresh_hz = refresh_hz;
         self.limits.set_geometry(width, height);
     }
 
-    /// The geometry this session is on.
+    /// The geometry this session is on, and the refresh that came up with it.
     #[must_use]
-    pub fn geometry(&self) -> (u32, u32) {
-        (self.width, self.height)
+    pub fn geometry(&self) -> (u32, u32, u32) {
+        (self.width, self.height, self.refresh_hz)
+    }
+
+    /// Whether this session negotiated the host's mode list.
+    #[must_use]
+    pub fn host_modes(&self) -> bool {
+        self.host_modes
     }
 
     /// Reports the geometry that is actually on.
@@ -301,6 +405,9 @@ impl Control {
             height: self.height,
             tile_size: self.tile_size,
             mode: Mode::Desktop as i32,
+            // Zero while nothing has been committed: a refresh is only known
+            // once the compositor has settled on one of the offered modes.
+            refresh_hz: self.refresh_hz,
         };
         self.write(stream, ControlRecord::DisplayState, state.encode_to_vec());
     }
@@ -363,8 +470,8 @@ mod tests {
         record::{self, Channel, Limits, Record},
         session::{Offer, Session},
         v1::{
-            Capability, ControlRecord, DisplayState, EndSession, ErrorCode, Mode, Ping,
-            RequestKeyframe, SetMode, SetResolution,
+            Capability, ControlRecord, DisplayState, DisplayTiming, EndSession, ErrorCode, Mode,
+            Ping, RequestKeyframe, SetAvailableModes, SetDisplayMode, SetMode, SetResolution,
         },
     };
 
@@ -535,6 +642,31 @@ mod tests {
         )
     }
 
+    fn timing(width: u32, height: u32, refresh_hz: u32) -> DisplayTiming {
+        DisplayTiming {
+            width,
+            height,
+            refresh_hz,
+        }
+    }
+
+    fn control_record_available_modes(
+        modes: Vec<DisplayTiming>,
+        preferred: Option<DisplayTiming>,
+    ) -> Record {
+        control_record(
+            ControlRecord::SetAvailableModes,
+            SetAvailableModes { modes, preferred }.encode_to_vec(),
+        )
+    }
+
+    fn control_record_display_mode(mode: DisplayTiming) -> Record {
+        control_record(
+            ControlRecord::SetDisplayMode,
+            SetDisplayMode { mode: Some(mode) }.encode_to_vec(),
+        )
+    }
+
     fn control_record_ping(token: u64) -> Record {
         control_record(ControlRecord::Ping, Ping { token }.encode_to_vec())
     }
@@ -548,6 +680,131 @@ mod tests {
 
     fn control_record_end_session() -> Record {
         control_record(ControlRecord::EndSession, EndSession {}.encode_to_vec())
+    }
+
+    /// One record on a session whose host asked for the mode-list capability.
+    fn drive_with_host_modes(record: Record) -> (Outcome, Option<ErrorCode>) {
+        let secret = Secret::generate();
+        let (mut host, client_hello) = Session::host(
+            &secret,
+            Offer {
+                capabilities: vec![Capability::CursorStream, Capability::HostDisplayModes],
+                ..offer()
+            },
+        );
+        let mut control = Control::new(&secret, support_from(1920, 1080));
+        let mut wire = Duplex::default();
+
+        wire.offer(&client_hello);
+        for _ in 0..2 {
+            let _ = control.pump(&mut wire);
+            for (message_type, payload) in wire.taken() {
+                let header = Record::new(Channel::Control, message_type, 0, 0, 0, payload);
+                if let Ok(outcome) = host.handle(&header.header, &header.payload)
+                    && let Some(reply) = outcome.reply
+                {
+                    wire.offer(&reply);
+                }
+            }
+        }
+        assert!(control.host_modes(), "the capability was negotiated");
+
+        wire.offer(&record);
+        let outcome = control.pump(&mut wire);
+        let error = wire
+            .taken()
+            .into_iter()
+            .find_map(|(message_type, payload)| {
+                (message_type == ControlRecord::Error as u16).then(|| {
+                    ErrorCode::try_from(
+                        vmlord_display_protocol::v1::Error::decode(payload.as_slice())
+                            .expect("an error record")
+                            .code,
+                    )
+                    .expect("a known code")
+                })
+            });
+
+        (outcome, error)
+    }
+
+    #[test]
+    fn a_mode_list_from_a_host_that_did_not_ask_for_the_capability_is_not_answered() {
+        // The two sides agreed what this session speaks. A record outside that
+        // is one this build must not act on, however well formed it is.
+        let error = drive_control(control_record_available_modes(
+            vec![timing(1920, 1080, 60)],
+            None,
+        ));
+
+        assert_eq!(error, Some(ErrorCode::MalformedRecord));
+    }
+
+    #[test]
+    fn a_published_list_arrives_with_its_selection() {
+        let (outcome, error) = drive_with_host_modes(control_record_available_modes(
+            vec![timing(1280, 720, 60), timing(1920, 1080, 144)],
+            Some(timing(1920, 1080, 144)),
+        ));
+
+        assert_eq!(error, None);
+        assert!(matches!(
+            outcome,
+            Outcome::AvailableModes { ref modes, preferred: Some(preferred) }
+                if modes.len() == 2 && preferred == timing(1920, 1080, 144)
+        ));
+    }
+
+    #[test]
+    fn one_mode_this_output_cannot_drive_refuses_the_whole_list() {
+        // Applying the rest would be a guest quietly offering something other
+        // than what the host published, which is a disagreement about the
+        // contract rather than a mode to drop.
+        let (outcome, error) = drive_with_host_modes(control_record_available_modes(
+            vec![timing(1920, 1080, 60), timing(3840, 2160, 60)],
+            None,
+        ));
+
+        assert_eq!(error, Some(ErrorCode::ResolutionRejected));
+        assert!(matches!(outcome, Outcome::Nothing));
+    }
+
+    #[test]
+    fn more_modes_than_the_module_holds_are_refused_before_a_list_is_built() {
+        let modes = (0..=super::output::MAX_MODES)
+            .map(|step| timing(640 + step as u32 * 8, 480, 60))
+            .collect();
+        let (outcome, error) = drive_with_host_modes(control_record_available_modes(modes, None));
+
+        assert_eq!(error, Some(ErrorCode::ResolutionRejected));
+        assert!(matches!(outcome, Outcome::Nothing));
+    }
+
+    #[test]
+    fn a_host_that_enumerated_nothing_still_leaves_the_connector_a_mode() {
+        // A connector with no modes is an output no compositor lights, and a
+        // host whose monitor would not answer still has a window.
+        let (outcome, error) = drive_with_host_modes(control_record_available_modes(vec![], None));
+
+        assert_eq!(error, None);
+        assert!(matches!(
+            outcome,
+            Outcome::AvailableModes { ref modes, preferred: None }
+                if modes == &vec![super::output::FALLBACK]
+        ));
+    }
+
+    #[test]
+    fn a_selected_mode_is_taken_and_an_impossible_one_is_refused() {
+        let (outcome, error) =
+            drive_with_host_modes(control_record_display_mode(timing(1280, 720, 120)));
+        assert_eq!(error, None);
+        assert!(matches!(outcome, Outcome::DisplayMode(mode) if mode == timing(1280, 720, 120)));
+
+        let (refused, error) =
+            drive_with_host_modes(control_record_display_mode(timing(1280, 720, 240)));
+        assert_eq!(error, Some(ErrorCode::ResolutionRejected));
+        assert!(matches!(refused, Outcome::Nothing));
     }
 
     /// A host that hung up at a record boundary.
@@ -641,12 +898,16 @@ mod tests {
     #[test]
     fn the_geometry_a_display_state_reports_follows_the_output() {
         let (_, _, mut control, mut wire) = opened();
-        control.set_geometry(1280, 720);
+        control.set_geometry(1280, 720, 75);
         control.state(&mut wire);
 
         let state = state_from(&mut wire);
         assert_eq!((state.width, state.height), (1280, 720));
-        assert_eq!(control.geometry(), (1280, 720));
+        assert_eq!(
+            state.refresh_hz, 75,
+            "what the compositor committed, not what was asked for"
+        );
+        assert_eq!(control.geometry(), (1280, 720, 75));
     }
 
     #[test]

@@ -74,6 +74,9 @@ message InputDevices {}
 message Geometry {
   uint32 width = 1;
   uint32 height = 2;
+  // The refresh the compositor committed, read off the CRTC's timing. Zero
+  // for an output whose mode could not be read.
+  uint32 refresh_hz = 3;
 }
 
 // What the planes hold at one vblank.

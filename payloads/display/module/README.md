@@ -11,23 +11,33 @@ framebuffer a compositor commits *is* the product, and VMLord's capture service
 reads it as an ordinary DRM client -- `drmModeGetFB2`, `drmPrimeHandleToFD`,
 `mmap` -- without taking DRM master.
 
-The connector offers **one** mode, between 640x480 and 2560x1440, marked
-preferred. Its size at load comes from the `width` and `height` parameters,
+The connector offers the host monitor's modes, between 640x480 and 2560x1440
+at 1 to 144 Hz, with the host's selection marked preferred. What it offers at
+load is the single mode the `width`, `height` and `refresh` parameters name,
 which `vmlord-agent` writes into `/etc/modprobe.d/vmlord-display.conf` from the
-mode the host has stored for one VM; a size outside the bounds is refused with
-a warning and falls back to 1920x1080. There is no vblank hardware to be in
+mode the host has stored for one VM; a mode outside the bounds is refused with
+a warning and falls back to 1920x1080@60. There is no vblank hardware to be in
 phase with, so the timer is the output's only clock -- and without one a
 compositor is never paced.
 
-While the module runs, that size is `/sys/module/vmlord_drm/parameters/mode`,
-written as `WxH` by the display broker when the host's window is resized. A
-write validates the bounds, moves the preferred mode and hotplugs the
-connector; the compositor, which is the DRM master, is what actually commits
-the mode. Offering exactly one mode is what makes that commit certain: a
-connector that kept the standard list would leave a compositor free to stay on
-the mode it was already on, which is a window that was resized and a desktop
-that was not. What it costs is a guest-side resolution picker -- and a picture
-that disagreed with the window is what there would be if there were one.
+While the module runs, two parameters carry that:
+
+* `/sys/module/vmlord_drm/parameters/modes`, comma-separated `WxH@HZ`, is the
+  whole list the connector offers. The display broker writes the normalized
+  modes of the monitor the viewer's window is on -- at most 32 of them and at
+  most 512 bytes, which are limits the host agrees to rather than discovers.
+  The write is parsed into a fixed array and validated in full before the list
+  is swapped, so a write this module refuses leaves the guest offering the
+  modes it already had rather than half a list.
+* `/sys/module/vmlord_drm/parameters/mode`, one `WxH@HZ`, is the mode marked
+  preferred. It need not be one of the list: a window being dragged asks for a
+  geometry nobody enumerated, and the host's window stays the authority on this
+  output's size.
+
+Either write validates the bounds and hotplugs the connector; the compositor,
+which is the DRM master, is what actually commits a mode. The preferred mode is
+offered first and marked, which is what a compositor follows when a hotplug
+takes the mode it was on away.
 
 The smallest *framebuffer* the device accepts is 64x64, which is deliberately
 not the smallest mode it offers. `mode_config`'s minimum bounds every buffer
@@ -68,8 +78,10 @@ Two files that are configuration rather than code, both copied into a guest by
 
 ## What it is not
 
-* **No guest-side mode list.** The host's window is the authority on this
-  output's size; see above.
+* **No mode list of its own.** Every mode this connector offers came from the
+  host: the monitor the viewer's window sits on, normalized, plus whatever the
+  window is currently asking for. The connector never invents the standard VESA
+  list, because a mode the host cannot present is one a guest must not pick.
 * **No synthesized EDID.** The connector reports a physical size at 96 DPI and
   no monitor name, so GNOME Settings calls it an unknown display. A hand-built
   128-byte block would fix the name and would cost a fifth version guard across
