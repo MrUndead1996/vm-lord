@@ -6,6 +6,15 @@ repository -- these files are what produces one.
 
 ## Building
 
+Rebuild every supported release from the repository root:
+
+```sh
+./rebuild_payload.sh
+```
+
+The script writes separate results under `target/display-payload/ubuntu-22.04`,
+`ubuntu-24.04` and `ubuntu-26.04`. The equivalent commands for one release are:
+
 ```sh
 cargo display-services
 payloads/display/prepare.sh \
