@@ -60,6 +60,7 @@ use vmlord_display_viewer::{
     windows::{
         clipboard::{self, Focus},
         d3d::Renderer,
+        display_modes::{MonitorWatch, snapshot_for_window},
         hook::Hook,
         hvsocket::{CONNECT_TIMEOUT, ConnectError, HvSocket},
         ipc::{self, CommandServer, SingleInstance},
@@ -663,6 +664,8 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
     let mut policy = input::Policy::new();
     let mut stream: Option<Geometry> = None;
     let mut resize = Resize::new();
+    // The monitor the window is on, enumerated once a rearrangement settles.
+    let mut monitors = MonitorWatch::new();
     // While this lives the keyboard is the guest's. It is taken on focus and
     // given back the moment the window loses it -- or the user asks.
     let mut hook: Option<Hook> = None;
@@ -742,6 +745,7 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
                         state.size = (width, height);
                     }
                 }
+                UiEvent::MonitorChanged => monitors.observe(Instant::now()),
                 UiEvent::Moved(x, y) => {
                     // Only a restored window reports this, so what is kept is
                     // the place the user left the window rather than the
@@ -772,6 +776,18 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
             if let Some((width, height)) = resize.due(Instant::now()) {
                 worked = true;
                 let _ = context.orders.send(Order::Resolution { width, height });
+            }
+        }
+        if monitors.due(Instant::now()) {
+            worked = true;
+            if let Some(snapshot) = snapshot_for_window(context.window.handle())
+                && monitors.accept(snapshot.clone())
+            {
+                tracing::debug!(
+                    "the window is on {} with {} modes",
+                    snapshot.identity,
+                    snapshot.modes.len()
+                );
             }
         }
 

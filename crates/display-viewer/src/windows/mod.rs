@@ -35,3 +35,7 @@ pub mod clipboard;
 /// clipboard, without ever following what stands for something else.
 #[allow(unsafe_code)]
 pub mod files;
+
+/// The monitor the window is on, and the modes it drives.
+#[allow(unsafe_code)]
+pub mod display_modes;

@@ -30,8 +30,8 @@ impl DisplayMode {
             || width > MAX_WIDTH
             || height < MIN_HEIGHT
             || height > MAX_HEIGHT
-            || width % 8 != 0
-            || height % 2 != 0
+            || !width.is_multiple_of(8)
+            || !height.is_multiple_of(2)
             || refresh_hz == 0
             || refresh_hz > MAX_REFRESH_HZ
         {

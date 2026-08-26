@@ -53,11 +53,11 @@ use windows::{
                 SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
                 SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPlacement,
                 SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
-                WINDOWPLACEMENT, WM_APP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_KILLFOCUS,
-                WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL,
-                WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
-                WM_SETFOCUS, WM_SIZE, WM_SYSCOMMAND, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
-                WS_OVERLAPPEDWINDOW, WS_POPUP,
+                WINDOWPLACEMENT, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
+                WM_ERASEBKGND, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+                WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_QUIT,
+                WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_SYSCOMMAND, WM_XBUTTONDOWN,
+                WM_XBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_POPUP,
             },
         },
     },
@@ -164,6 +164,11 @@ pub enum UiEvent {
     ToggleFullscreen,
     /// The user picked an encoding mode from the system menu.
     Quality(Quality),
+    /// The monitor the window is on may not be the one it was on.
+    ///
+    /// A signal rather than a snapshot: what the monitor now is takes a
+    /// dozen Win32 calls, and nothing that slow runs on the message pump.
+    MonitorChanged,
     /// The user closed the window.
     Closing,
     /// Something the user did with the keyboard or the mouse.
@@ -942,7 +947,19 @@ extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
             if let Some((x, y)) = restored_origin(hwnd) {
                 shared.report(UiEvent::Moved(x, y));
             }
+            // A window dragged across an edge is on another monitor without
+            // anything having changed about the desktop.
+            shared.report(UiEvent::MonitorChanged);
             LRESULT(0)
+        }
+        // The desktop was rearranged, or the window crossed onto a monitor
+        // that scales differently. Either way the modes may not be the same.
+        WM_DISPLAYCHANGE | WM_DPICHANGED => {
+            shared.report(UiEvent::MonitorChanged);
+
+            // SAFETY: the default handler, which moves the window to the
+            // rectangle a DPI change suggests.
+            unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
         }
         WM_SIZE => {
             let width = (lparam.0 & 0xffff) as i32;
@@ -1111,9 +1128,9 @@ mod tests {
     use windows::Win32::{
         Foundation::{LPARAM, WPARAM},
         UI::WindowsAndMessaging::{
-            IsZoomed, SC_MAXIMIZE, SendMessageW, WM_CLOSE, WM_KILLFOCUS, WM_LBUTTONDOWN,
-            WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
-            WM_SETFOCUS, WM_SYSCOMMAND,
+            IsZoomed, SC_MAXIMIZE, SendMessageW, WM_CLOSE, WM_DISPLAYCHANGE, WM_KILLFOCUS,
+            WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_RBUTTONDOWN,
+            WM_RBUTTONUP, WM_SETFOCUS, WM_SYSCOMMAND,
         },
     };
 
@@ -1406,6 +1423,37 @@ mod tests {
             reported.contains(&UiEvent::Moved(position.0, position.1)),
             "a moved window reports its place: {reported:?}"
         );
+    }
+
+    #[test]
+    fn a_desktop_that_changed_marks_the_monitor_stale() {
+        // Only stale: what the monitor now is gets enumerated off the message
+        // pump, because a mode list is a dozen Win32 calls and this thread is
+        // the one that must never stop.
+        let (shared, events) = shared();
+        let window = opened(&events, &shared);
+
+        // SAFETY: a message sent to this process's own window.
+        unsafe {
+            SendMessageW(window.handle(), WM_DISPLAYCHANGE, None, None);
+        }
+
+        assert!(drain(&events).contains(&UiEvent::MonitorChanged));
+    }
+
+    #[test]
+    fn a_window_dragged_onto_another_monitor_marks_it_stale_too() {
+        // A move is how a window changes screens without the desktop changing
+        // at all, and the screen it is on now is the one to publish.
+        let (shared, events) = shared();
+        let window = opened(&events, &shared);
+
+        // SAFETY: a message sent to this process's own window.
+        unsafe {
+            SendMessageW(window.handle(), WM_MOVE, None, None);
+        }
+
+        assert!(drain(&events).contains(&UiEvent::MonitorChanged));
     }
 
     #[test]
