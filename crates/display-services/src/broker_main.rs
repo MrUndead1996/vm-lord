@@ -186,7 +186,7 @@ struct BrokerState {
     /// The size of the framebuffer capture last saw, once it has seen one.
     /// The one answer to "what is the output actually on", because it is the
     /// buffer that gets encoded rather than the mode that was asked for.
-    geometry: Option<(u32, u32)>,
+    geometry: Option<(u32, u32, u32)>,
     /// Whether that size has moved since the control thread last read it.
     geometry_changed: bool,
     /// Whether the broker is on its way out.
@@ -195,6 +195,65 @@ struct BrokerState {
 
 /// The shared state and the signal that it changed.
 type Shared = Arc<(Mutex<BrokerState>, Condvar)>;
+
+/// One write to the module's mode parameters.
+#[derive(Clone, Debug, PartialEq)]
+enum ModeWrite {
+    /// The whole list the connector is to offer.
+    List(Vec<DisplayTiming>),
+    /// The one of them to mark preferred.
+    Preferred(DisplayTiming),
+}
+
+/// The mode list and the selection the host has published.
+///
+/// Kept outside the session that published them: a viewer that reconnects --
+/// a network blip, a host that restarted its process -- is the same monitor in
+/// front of the same guest, and a connector that fell back to its boot mode in
+/// between would be a desktop that resized itself for no reason.
+#[derive(Default)]
+struct HostModes {
+    /// What the connector offers. Empty until a host has published a list.
+    modes: Vec<DisplayTiming>,
+    /// The one marked preferred, when a host has chosen one.
+    selected: Option<DisplayTiming>,
+}
+
+impl HostModes {
+    /// Records a published list, and the selection that came with it.
+    ///
+    /// A selection that is no longer in the list is dropped: what the module
+    /// would be told to prefer is a mode the host stopped offering.
+    fn publish(&mut self, modes: Vec<DisplayTiming>, preferred: Option<DisplayTiming>) {
+        self.selected = preferred.or_else(|| self.selected.take());
+        self.selected = self
+            .selected
+            .take()
+            .filter(|selected| modes.contains(selected));
+        self.modes = modes;
+    }
+
+    /// Records a mode the host chose.
+    fn select(&mut self, mode: DisplayTiming) {
+        self.selected = Some(mode);
+    }
+
+    /// The writes that put the module where the host asked, in order.
+    ///
+    /// The list before the selection, always: a mode marked preferred while
+    /// the connector is still offering the old list is a hotplug onto a mode
+    /// that is about to be withdrawn.
+    fn writes(&self) -> Vec<ModeWrite> {
+        if self.modes.is_empty() {
+            return Vec::new();
+        }
+
+        let mut writes = vec![ModeWrite::List(self.modes.clone())];
+        writes.extend(self.selected.map(ModeWrite::Preferred));
+
+        writes
+    }
+}
 
 /// Runs the broker until it cannot.
 ///
@@ -452,6 +511,9 @@ fn send_devices(connection: &Connection, devices: Option<&(OwnedFd, OwnedFd)>) {
 
 /// Accepts one control connection at a time and runs its session.
 fn serve_sessions(listener: &vsock::Listener, secret: &Secret, output: &Output, shared: &Shared) {
+    // Outlives the sessions that publish it: see `HostModes`.
+    let mut host_modes = HostModes::default();
+
     loop {
         if stopping(shared) {
             return;
@@ -472,7 +534,7 @@ fn serve_sessions(listener: &vsock::Listener, secret: &Secret, output: &Output, 
         // session opened after a resize starts where the last one left off.
         let (width, height) = geometry(output, shared);
         let mut control = Control::new(secret, support_from(width, height));
-        let reason = run_session(&mut control, &mut stream, output, shared);
+        let reason = run_session(&mut control, &mut stream, output, shared, &mut host_modes);
 
         close_session(shared, &reason);
     }
@@ -484,6 +546,7 @@ fn run_session(
     stream: &mut vsock::Stream,
     output: &Output,
     shared: &Shared,
+    host_modes: &mut HostModes,
 ) -> String {
     loop {
         if stopping(shared) {
@@ -494,11 +557,12 @@ fn run_session(
         // of a new size. The capture process has already been told by the
         // thread that saw it; what is owed here is the host's own record, so
         // that a viewer knows the size it asked for is the size it has.
-        if let Some((width, height)) = take_geometry_change(shared)
-            && (width, height) != control.geometry()
+        if let Some(committed) = take_geometry_change(shared)
+            && committed != control.geometry()
         {
-            eprintln!("vmlord-display-broker: the output came up at {width}x{height}");
-            control.set_geometry(width, height);
+            let (width, height, refresh_hz) = committed;
+            eprintln!("vmlord-display-broker: the output came up at {width}x{height}@{refresh_hz}");
+            control.set_geometry(width, height, refresh_hz);
             control.state(stream);
         }
 
@@ -514,10 +578,24 @@ fn run_session(
         match control.pump(stream) {
             Outcome::Opened(parameters, clipboard_key) => {
                 open_session(shared, parameters, clipboard_key);
+                // Before the host asks for anything: a reconnecting viewer is
+                // the same monitor, and the connector is put back where the
+                // last session left it rather than left on its boot mode.
+                if control.host_modes() {
+                    apply_modes(output, control, stream, &host_modes.writes());
+                }
+            }
+            Outcome::AvailableModes { modes, preferred } => {
+                host_modes.publish(modes, preferred);
+                apply_modes(output, control, stream, &host_modes.writes());
+            }
+            Outcome::DisplayMode(mode) => {
+                host_modes.select(mode);
+                apply_modes(output, control, stream, &[ModeWrite::Preferred(mode)]);
             }
             Outcome::Relay(message) => send_to_peer(shared, &message),
             Outcome::Resize { width, height } => {
-                request_mode(output, control, stream, width, height)
+                request_mode(output, control, stream, host_modes, width, height)
             }
             Outcome::Closed(reason) => return reason,
             Outcome::Nothing => {}
@@ -768,15 +846,21 @@ fn capture_frames(mut device: Device, shared: &Shared) {
             .planes
             .iter()
             .find(|plane| plane.kind == PlaneKind::Primary)
-            && observe_geometry(shared, primary.width, primary.height)
         {
-            let _ = peer.send(
-                &Message::Geometry {
-                    width: primary.width,
-                    height: primary.height,
-                },
-                &[],
-            );
+            // Asked rather than remembered: a compositor may recommit the same
+            // size at another refresh, and the refresh is the CRTC's answer
+            // to what the mode request became.
+            let refresh_hz = committed_refresh(&device);
+            if observe_geometry(shared, primary.width, primary.height, refresh_hz) {
+                let _ = peer.send(
+                    &Message::Geometry {
+                        width: primary.width,
+                        height: primary.height,
+                        refresh_hz,
+                    },
+                    &[],
+                );
+            }
         }
 
         if send_snapshot(&device, request, shared, &snapshot.planes) {
@@ -1009,11 +1093,12 @@ fn geometry(output: &Output, shared: &Shared) -> (u32, u32) {
         .expect("the broker's lock is not poisoned")
         .geometry;
 
-    seen.unwrap_or_else(|| {
-        let mode = output.current();
+    seen.map(|(width, height, _)| (width, height))
+        .unwrap_or_else(|| {
+            let mode = output.current();
 
-        (mode.width, mode.height)
-    })
+            (mode.width, mode.height)
+        })
 }
 
 /// Asks the module for a mode, and says so on the socket if it will not take it.
@@ -1025,15 +1110,21 @@ fn request_mode(
     output: &Output,
     control: &mut Control,
     stream: &mut vsock::Stream,
+    host_modes: &HostModes,
     width: u32,
     height: u32,
 ) {
-    // The refresh the output is already on: a window being dragged asks for a
-    // geometry, and the mode it is asked for keeps the timing it was chosen at.
+    // A window being dragged asks for a geometry and says nothing about
+    // timing, so the mode it becomes keeps the refresh the host selected --
+    // or, before it has selected anything, the one the output is already on.
+    // The module offers a preferred mode whether or not it is in the list,
+    // which is what keeps a dragged window an authority on this output's size.
     let mode = DisplayTiming {
         width,
         height,
-        refresh_hz: output.current().refresh_hz,
+        refresh_hz: host_modes
+            .selected
+            .map_or_else(|| output.current().refresh_hz, |mode| mode.refresh_hz),
     };
     if let Err(error) = output.request(&mode) {
         eprintln!(
@@ -1048,15 +1139,57 @@ fn request_mode(
     }
 }
 
+/// Puts the module where the host asked, and says so if it will not go.
+///
+/// Nonfatal: a parameter that refused a write is a request the host is owed an
+/// answer to, not a session to end. The guest carries on offering the modes it
+/// already had, which is what the module's whole-or-nothing parse guarantees.
+fn apply_modes(
+    output: &Output,
+    control: &mut Control,
+    stream: &mut vsock::Stream,
+    writes: &[ModeWrite],
+) {
+    for write in writes {
+        let result = match write {
+            ModeWrite::List(modes) => output.replace_modes(modes),
+            ModeWrite::Preferred(mode) => output.request(mode),
+        };
+        if let Err(error) = result {
+            eprintln!("vmlord-display-broker: {write:?} was refused: {error}");
+            control.report(
+                stream,
+                ErrorCode::ResolutionRejected,
+                "the output refused the mode list",
+            );
+
+            return;
+        }
+    }
+}
+
+/// The refresh the CRTC is scanning out, or zero when it will not say.
+///
+/// Zero rather than an error, and silent rather than logged: this is read on
+/// every commit capture sees, and a device that cannot answer would otherwise
+/// be a line of stderr per vblank. The host reads zero as "not known", which
+/// is what it is.
+fn committed_refresh(device: &Device) -> u32 {
+    match device.committed_mode() {
+        Ok(Some((_, _, refresh_hz))) => refresh_hz,
+        Ok(None) | Err(_) => 0,
+    }
+}
+
 /// Records the size capture last saw, and says whether it moved.
-fn observe_geometry(shared: &Shared, width: u32, height: u32) -> bool {
+fn observe_geometry(shared: &Shared, width: u32, height: u32, refresh_hz: u32) -> bool {
     let (lock, signal) = &**shared;
     let mut state = lock.lock().expect("the broker's lock is not poisoned");
 
-    if state.geometry == Some((width, height)) {
+    if state.geometry == Some((width, height, refresh_hz)) {
         return false;
     }
-    state.geometry = Some((width, height));
+    state.geometry = Some((width, height, refresh_hz));
     // For the control thread, which owes the host a `DisplayState` for it.
     state.geometry_changed = true;
     signal.notify_all();
@@ -1065,7 +1198,7 @@ fn observe_geometry(shared: &Shared, width: u32, height: u32) -> bool {
 }
 
 /// The size capture saw, if it has moved since this was last called.
-fn take_geometry_change(shared: &Shared) -> Option<(u32, u32)> {
+fn take_geometry_change(shared: &Shared) -> Option<(u32, u32, u32)> {
     let (lock, _) = &**shared;
     let mut state = lock.lock().expect("the broker's lock is not poisoned");
 
@@ -1153,6 +1286,75 @@ mod tests {
             generation,
             ..plane(7, false)
         }
+    }
+
+    fn timing(
+        width: u32,
+        height: u32,
+        refresh_hz: u32,
+    ) -> vmlord_display_protocol::v1::DisplayTiming {
+        vmlord_display_protocol::v1::DisplayTiming {
+            width,
+            height,
+            refresh_hz,
+        }
+    }
+
+    #[test]
+    fn the_list_is_written_before_the_selection() {
+        // A mode marked preferred while the connector is still offering the
+        // old list is a hotplug onto a mode about to be withdrawn.
+        let mut modes = super::HostModes::default();
+        modes.publish(
+            vec![timing(1280, 720, 60), timing(1920, 1080, 144)],
+            Some(timing(1920, 1080, 144)),
+        );
+
+        assert_eq!(
+            modes.writes(),
+            vec![
+                super::ModeWrite::List(vec![timing(1280, 720, 60), timing(1920, 1080, 144)]),
+                super::ModeWrite::Preferred(timing(1920, 1080, 144)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_guest_told_nothing_yet_is_left_on_the_mode_it_booted_at() {
+        assert!(super::HostModes::default().writes().is_empty());
+    }
+
+    #[test]
+    fn a_reconnecting_viewer_gets_the_connector_put_back_where_it_was() {
+        // The same monitor in front of the same guest: a connector that fell
+        // back to its boot mode in between would be a desktop that resized
+        // itself for no reason.
+        let mut modes = super::HostModes::default();
+        modes.publish(vec![timing(1920, 1080, 60)], None);
+        modes.select(timing(1920, 1080, 60));
+        let replayed = modes.writes();
+
+        assert_eq!(
+            replayed,
+            vec![
+                super::ModeWrite::List(vec![timing(1920, 1080, 60)]),
+                super::ModeWrite::Preferred(timing(1920, 1080, 60)),
+            ]
+        );
+        assert_eq!(modes.writes(), replayed, "and again for the session after");
+    }
+
+    #[test]
+    fn a_selection_the_new_list_no_longer_offers_is_forgotten() {
+        let mut modes = super::HostModes::default();
+        modes.publish(vec![timing(2560, 1440, 144)], Some(timing(2560, 1440, 144)));
+        modes.publish(vec![timing(1920, 1080, 60)], None);
+
+        assert_eq!(
+            modes.writes(),
+            vec![super::ModeWrite::List(vec![timing(1920, 1080, 60)])],
+            "the module is not told to prefer a mode nobody offers"
+        );
     }
 
     #[test]

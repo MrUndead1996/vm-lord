@@ -53,6 +53,14 @@ pub const DRM_IOCTL_DROP_MASTER: libc::c_ulong = io_none(DRM, 0x1f);
 pub const DRM_IOCTL_WAIT_VBLANK: libc::c_ulong =
     io_write_read(DRM, 0x3a, size_of::<DrmWaitVblank>() as u32);
 
+/// Lists the device's CRTCs, connectors and encoders.
+pub const DRM_IOCTL_MODE_GETRESOURCES: libc::c_ulong =
+    io_write_read(DRM, 0xa0, size_of::<DrmModeCardRes>() as u32);
+
+/// One CRTC's framebuffer and the mode it is scanning out.
+pub const DRM_IOCTL_MODE_GETCRTC: libc::c_ulong =
+    io_write_read(DRM, 0xa1, size_of::<DrmModeCrtc>() as u32);
+
 /// Lists the device's planes, once universal planes are asked for.
 pub const DRM_IOCTL_MODE_GETPLANERESOURCES: libc::c_ulong =
     io_write_read(DRM, 0xb5, size_of::<DrmModeGetPlaneRes>() as u32);
@@ -153,6 +161,81 @@ pub struct DrmWaitVblank {
     pub sequence: u32,
     pub tval_sec: i64,
     pub tval_usec: i64,
+}
+
+/// How long a mode's name is in `struct drm_mode_modeinfo`.
+pub const DRM_DISPLAY_MODE_LEN: usize = 32;
+
+/// `DRM_MODE_FLAG_INTERLACE`: two fields to a frame.
+pub const DRM_MODE_FLAG_INTERLACE: u32 = 1 << 4;
+
+/// `DRM_MODE_FLAG_DBLSCAN`: every line scanned twice.
+pub const DRM_MODE_FLAG_DBLSCAN: u32 = 1 << 5;
+
+/// `struct drm_mode_card_res`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DrmModeCardRes {
+    pub fb_id_ptr: u64,
+    pub crtc_id_ptr: u64,
+    pub connector_id_ptr: u64,
+    pub encoder_id_ptr: u64,
+    pub count_fbs: u32,
+    pub count_crtcs: u32,
+    pub count_connectors: u32,
+    pub count_encoders: u32,
+    pub min_width: u32,
+    pub max_width: u32,
+    pub min_height: u32,
+    pub max_height: u32,
+}
+
+/// `struct drm_mode_modeinfo`.
+///
+/// The timing itself rather than a refresh rate: the kernel's own `vrefresh`
+/// field stopped being filled in, and the clock and the totals are what a
+/// refresh has always been derived from.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct DrmModeModeInfo {
+    /// The pixel clock in kHz.
+    pub clock: u32,
+    pub hdisplay: u16,
+    pub hsync_start: u16,
+    pub hsync_end: u16,
+    pub htotal: u16,
+    pub hskew: u16,
+    pub vdisplay: u16,
+    pub vsync_start: u16,
+    pub vsync_end: u16,
+    pub vtotal: u16,
+    pub vscan: u16,
+    pub vrefresh: u32,
+    pub flags: u32,
+    pub kind: u32,
+    pub name: [libc::c_char; DRM_DISPLAY_MODE_LEN],
+}
+
+impl Default for DrmModeModeInfo {
+    fn default() -> Self {
+        // SAFETY: every field is a plain integer or an array of them.
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+/// `struct drm_mode_crtc`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DrmModeCrtc {
+    pub set_connectors_ptr: u64,
+    pub count_connectors: u32,
+    pub crtc_id: u32,
+    pub fb_id: u32,
+    pub x: u32,
+    pub y: u32,
+    pub gamma_size: u32,
+    pub mode_valid: u32,
+    pub mode: DrmModeModeInfo,
 }
 
 /// `struct drm_mode_get_plane_res`.

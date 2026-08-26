@@ -26,11 +26,13 @@ use crate::ipc::PlaneKind;
 use uapi::{
     DMA_BUF_IOCTL_SYNC, DRM_CLIENT_CAP_UNIVERSAL_PLANES, DRM_FORMAT_ARGB8888,
     DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_XRGB8888, DRM_IOCTL_DROP_MASTER, DRM_IOCTL_GEM_CLOSE,
-    DRM_IOCTL_MODE_GETFB2, DRM_IOCTL_MODE_GETPLANE, DRM_IOCTL_MODE_GETPLANERESOURCES,
-    DRM_IOCTL_MODE_GETPROPERTY, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, DRM_IOCTL_PRIME_HANDLE_TO_FD,
-    DRM_IOCTL_SET_CLIENT_CAP, DRM_IOCTL_WAIT_VBLANK, DRM_MODE_OBJECT_PLANE, DRM_VBLANK_RELATIVE,
-    DmaBufSync, DrmGemClose, DrmModeFbCmd2, DrmModeGetPlane, DrmModeGetPlaneRes,
-    DrmModeGetProperty, DrmModeObjGetProperties, DrmPrimeHandle, DrmSetClientCap, DrmWaitVblank,
+    DRM_IOCTL_MODE_GETCRTC, DRM_IOCTL_MODE_GETFB2, DRM_IOCTL_MODE_GETPLANE,
+    DRM_IOCTL_MODE_GETPLANERESOURCES, DRM_IOCTL_MODE_GETPROPERTY, DRM_IOCTL_MODE_GETRESOURCES,
+    DRM_IOCTL_MODE_OBJ_GETPROPERTIES, DRM_IOCTL_PRIME_HANDLE_TO_FD, DRM_IOCTL_SET_CLIENT_CAP,
+    DRM_IOCTL_WAIT_VBLANK, DRM_MODE_FLAG_DBLSCAN, DRM_MODE_FLAG_INTERLACE, DRM_MODE_OBJECT_PLANE,
+    DRM_VBLANK_RELATIVE, DmaBufSync, DrmGemClose, DrmModeCardRes, DrmModeCrtc, DrmModeFbCmd2,
+    DrmModeGetPlane, DrmModeGetPlaneRes, DrmModeGetProperty, DrmModeModeInfo,
+    DrmModeObjGetProperties, DrmPrimeHandle, DrmSetClientCap, DrmWaitVblank,
 };
 
 /// Where the kernel lists the DRM devices a machine has.
@@ -251,6 +253,73 @@ impl Device {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    /// The mode the compositor has actually committed, if it has committed one.
+    ///
+    /// The answer to what a request became: a mode was asked for on the
+    /// module's parameter and the compositor was free to commit something
+    /// else, so the timing that is on is read off the CRTC rather than
+    /// remembered from the write.
+    ///
+    /// `None` for a device with no CRTC lit, which is a guest whose desktop
+    /// has not come up yet.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] for a failed ioctl.
+    pub fn committed_mode(&self) -> io::Result<Option<(u32, u32, u32)>> {
+        for crtc_id in self.crtc_ids()? {
+            let mut request = DrmModeCrtc {
+                crtc_id,
+                ..DrmModeCrtc::default()
+            };
+            ioctl(
+                self.descriptor.as_raw_fd(),
+                DRM_IOCTL_MODE_GETCRTC,
+                &mut request,
+            )?;
+            if request.mode_valid == 0 {
+                continue;
+            }
+
+            return Ok(Some((
+                u32::from(request.mode.hdisplay),
+                u32::from(request.mode.vdisplay),
+                refresh_hz(&request.mode),
+            )));
+        }
+
+        Ok(None)
+    }
+
+    /// The device's CRTC ids.
+    fn crtc_ids(&self) -> io::Result<Vec<u32>> {
+        let mut resources = DrmModeCardRes::default();
+        ioctl(
+            self.descriptor.as_raw_fd(),
+            DRM_IOCTL_MODE_GETRESOURCES,
+            &mut resources,
+        )?;
+
+        let mut ids = vec![0u32; resources.count_crtcs as usize];
+        if ids.is_empty() {
+            return Ok(ids);
+        }
+        resources.crtc_id_ptr = ids.as_mut_ptr() as u64;
+        // Only the CRTCs: the other three counts stay zero, so the kernel
+        // fills nothing for them and no other buffer has to exist.
+        resources.count_fbs = 0;
+        resources.count_connectors = 0;
+        resources.count_encoders = 0;
+        ioctl(
+            self.descriptor.as_raw_fd(),
+            DRM_IOCTL_MODE_GETRESOURCES,
+            &mut resources,
+        )?;
+        ids.truncate(resources.count_crtcs as usize);
+
+        Ok(ids)
     }
 
     /// What the planes hold right now.
@@ -585,6 +654,37 @@ pub fn sync_buffer(descriptor: libc::c_int, flags: u64) -> io::Result<()> {
 }
 
 /// One ioctl, retried through signals.
+/// A mode's refresh rate in whole hertz, from its clock and its totals.
+///
+/// What `drm_mode_vrefresh` does, and for the same reason it exists: the
+/// `vrefresh` field of `drm_mode_modeinfo` is not filled in by the kernels
+/// this runs on, and a refresh has always been the pixel clock divided by the
+/// pixels a frame spends. Rounded rather than truncated, because a 59.94 Hz
+/// mode is a 60 Hz mode everywhere else in this protocol.
+#[must_use]
+pub fn refresh_hz(mode: &DrmModeModeInfo) -> u32 {
+    let pixels = u64::from(mode.htotal) * u64::from(mode.vtotal);
+    if pixels == 0 {
+        return 0;
+    }
+
+    let mut clock = u64::from(mode.clock) * 1000;
+    // An interlaced frame is two fields, and each field is a refresh.
+    if mode.flags & DRM_MODE_FLAG_INTERLACE != 0 {
+        clock *= 2;
+    }
+    // A doubled scan draws every line twice, so a frame costs two of them.
+    if mode.flags & DRM_MODE_FLAG_DBLSCAN != 0 {
+        clock /= 2;
+    }
+    // And a vertical scan repeats the whole frame that many times.
+    if mode.vscan > 1 {
+        clock /= u64::from(mode.vscan);
+    }
+
+    u32::try_from((clock + pixels / 2) / pixels).unwrap_or(u32::MAX)
+}
+
 fn ioctl<T>(descriptor: libc::c_int, request: libc::c_ulong, argument: &mut T) -> io::Result<()> {
     loop {
         // SAFETY: `argument` is a live, correctly shaped value for `request`,
@@ -611,14 +711,62 @@ fn signed(value: u64) -> i32 {
 mod tests {
     use std::{collections::VecDeque, fs, io, path::PathBuf};
 
+    /// The timing of a mode, with the fields a refresh is derived from set.
+    fn timing(clock: u32, htotal: u16, vtotal: u16) -> DrmModeModeInfo {
+        DrmModeModeInfo {
+            clock,
+            htotal,
+            vtotal,
+            ..DrmModeModeInfo::default()
+        }
+    }
+
+    #[test]
+    fn a_refresh_is_the_clock_over_the_pixels_a_frame_spends() {
+        // 1920x1080 at 60 Hz, as drm_cvt_mode builds it: 148.5 MHz over
+        // 2200x1125, which is 60 exactly.
+        assert_eq!(super::refresh_hz(&timing(148_500, 2200, 1125)), 60);
+        // And the same mode at the 59.94 Hz a real panel runs, which is a 60
+        // Hz mode everywhere else in this protocol.
+        assert_eq!(super::refresh_hz(&timing(148_352, 2200, 1125)), 60);
+    }
+
+    #[test]
+    fn a_mode_with_no_timing_at_all_has_no_refresh() {
+        // A CRTC whose mode is not valid, read anyway: a division rather than
+        // a panic is what a broker can carry on from.
+        assert_eq!(super::refresh_hz(&timing(148_500, 0, 0)), 0);
+    }
+
+    #[test]
+    fn the_flags_that_change_what_a_frame_costs_are_followed() {
+        let interlaced = DrmModeModeInfo {
+            flags: super::DRM_MODE_FLAG_INTERLACE,
+            ..timing(148_500, 2200, 1125)
+        };
+        let doubled = DrmModeModeInfo {
+            flags: super::DRM_MODE_FLAG_DBLSCAN,
+            ..timing(148_500, 2200, 1125)
+        };
+        let scanned = DrmModeModeInfo {
+            vscan: 2,
+            ..timing(148_500, 2200, 1125)
+        };
+
+        assert_eq!(super::refresh_hz(&interlaced), 120, "a field is a refresh");
+        assert_eq!(super::refresh_hz(&doubled), 30);
+        assert_eq!(super::refresh_hz(&scanned), 30);
+    }
+
     use super::{
         card_named,
         uapi::{
             DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888, DRM_IOCTL_DROP_MASTER, DRM_IOCTL_GEM_CLOSE,
             DRM_IOCTL_MODE_GETFB2, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, DRM_IOCTL_PRIME_HANDLE_TO_FD,
             DRM_IOCTL_SET_CLIENT_CAP, DRM_IOCTL_WAIT_VBLANK, DmaBufSync, DrmGemClose,
-            DrmModeFbCmd2, DrmModeGetPlane, DrmModeObjGetProperties, DrmPrimeHandle,
-            DrmSetClientCap, DrmWaitVblank, io_none, io_write, io_write_read,
+            DrmModeCardRes, DrmModeCrtc, DrmModeFbCmd2, DrmModeGetPlane, DrmModeModeInfo,
+            DrmModeObjGetProperties, DrmPrimeHandle, DrmSetClientCap, DrmWaitVblank, io_none,
+            io_write, io_write_read,
         },
     };
 
@@ -694,6 +842,9 @@ mod tests {
         assert_eq!(size_of::<DrmModeGetPlane>(), 32);
         assert_eq!(size_of::<DrmModeObjGetProperties>(), 32);
         assert_eq!(size_of::<DrmModeFbCmd2>(), 104);
+        assert_eq!(size_of::<DrmModeCardRes>(), 64);
+        assert_eq!(size_of::<DrmModeModeInfo>(), 68);
+        assert_eq!(size_of::<DrmModeCrtc>(), 104);
         assert_eq!(size_of::<DmaBufSync>(), 8);
     }
 

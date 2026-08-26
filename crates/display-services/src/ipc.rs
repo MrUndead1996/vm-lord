@@ -44,6 +44,9 @@ pub enum Message {
         width: u32,
         /// Its height.
         height: u32,
+        /// The refresh the compositor committed, or zero when the CRTC would
+        /// not say what it is scanning out.
+        refresh_hz: u32,
     },
     /// What the planes hold at one vblank.
     Snapshot {
@@ -182,9 +185,14 @@ fn into_wire(message: &Message) -> envelope::Message {
             envelope::Message::KeyframeRequested(broker::KeyframeRequested {})
         }
         Message::InputDevices => envelope::Message::InputDevices(broker::InputDevices {}),
-        Message::Geometry { width, height } => envelope::Message::Geometry(broker::Geometry {
+        Message::Geometry {
+            width,
+            height,
+            refresh_hz,
+        } => envelope::Message::Geometry(broker::Geometry {
             width: *width,
             height: *height,
+            refresh_hz: *refresh_hz,
         }),
         Message::Snapshot {
             sequence,
@@ -226,6 +234,7 @@ fn from_wire(message: envelope::Message) -> Result<Message, IpcError> {
         envelope::Message::Geometry(geometry) => Message::Geometry {
             width: geometry.width,
             height: geometry.height,
+            refresh_hz: geometry.refresh_hz,
         },
         envelope::Message::Snapshot(snapshot) => Message::Snapshot {
             sequence: snapshot.sequence,
@@ -317,6 +326,7 @@ mod tests {
             Message::Geometry {
                 width: 2560,
                 height: 1440,
+                refresh_hz: 144,
             },
             Message::Snapshot {
                 sequence: 42,
