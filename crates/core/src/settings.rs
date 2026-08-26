@@ -40,6 +40,159 @@ pub struct AppSettings {
     /// every table, and this field is written as a table.
     #[serde(default)]
     pub guest_readiness: GuestReadinessTimeouts,
+    /// Limits and retention for file transfers over the display clipboard.
+    #[serde(default)]
+    pub clipboard_files: FileClipboardSettings,
+}
+
+/// A byte count stored in settings with a human-readable binary unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DataSize(u64);
+
+impl DataSize {
+    #[must_use]
+    pub const fn from_bytes(bytes: u64) -> Self {
+        Self(bytes)
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> u64 {
+        self.0
+    }
+}
+
+/// A duration stored in settings with a seconds, minutes or hours suffix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retention(u64);
+
+impl Retention {
+    #[must_use]
+    pub const fn from_seconds(seconds: u64) -> Self {
+        Self(seconds)
+    }
+
+    #[must_use]
+    pub const fn seconds(self) -> u64 {
+        self.0
+    }
+}
+
+/// File-transfer policy shared by the host viewer and guest clipboard daemon.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FileClipboardSettings {
+    pub max_file_size: DataSize,
+    pub max_transfer_size: DataSize,
+    pub retention: Retention,
+}
+
+impl Default for FileClipboardSettings {
+    fn default() -> Self {
+        Self {
+            max_file_size: DataSize(1 << 30),
+            max_transfer_size: DataSize(4 << 30),
+            retention: Retention(24 * 60 * 60),
+        }
+    }
+}
+
+impl FileClipboardSettings {
+    /// Refuses a policy whose per-file allowance exceeds the whole transfer.
+    pub fn validate(self) -> Result<(), FileClipboardSettingsError> {
+        if self.max_file_size.0 > self.max_transfer_size.0 {
+            return Err(FileClipboardSettingsError::FileExceedsTransfer);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FileClipboardSettingsError {
+    FileExceedsTransfer,
+}
+
+impl fmt::Display for FileClipboardSettingsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FileExceedsTransfer => formatter.write_str(
+                "clipboard.files.max_file_size exceeds clipboard.files.max_transfer_size",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for FileClipboardSettingsError {}
+
+impl Serialize for DataSize {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format_scaled(
+            self.0,
+            &[("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10), ("B", 1)],
+        ))
+    }
+}
+
+impl<'de> Deserialize<'de> for DataSize {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        parse_scaled(
+            &text,
+            &[("GB", 1 << 30), ("MB", 1 << 20), ("KB", 1 << 10), ("B", 1)],
+        )
+        .map(Self)
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for Retention {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&format_scaled(self.0, &[("h", 3600), ("m", 60), ("s", 1)]))
+    }
+}
+
+impl<'de> Deserialize<'de> for Retention {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        parse_scaled(&text, &[("h", 3600), ("m", 60), ("s", 1)])
+            .map(Self)
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+fn parse_scaled(text: &str, units: &[(&str, u64)]) -> Result<u64, &'static str> {
+    for (suffix, multiplier) in units {
+        let Some(number) = text.get(..text.len().saturating_sub(suffix.len())) else {
+            continue;
+        };
+        let Some(found) = text.get(number.len()..) else {
+            continue;
+        };
+        if !found.eq_ignore_ascii_case(suffix) {
+            continue;
+        }
+        if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+            return Err("a setting value must be a positive integer followed by a unit");
+        }
+        let value = number
+            .parse::<u64>()
+            .map_err(|_| "a setting value is too large")?;
+        if value == 0 {
+            return Err("a setting value must be greater than zero");
+        }
+        return value
+            .checked_mul(*multiplier)
+            .ok_or("a setting value is too large");
+    }
+    Err("a setting value has an unsupported unit")
+}
+
+fn format_scaled(value: u64, units: &[(&str, u64)]) -> String {
+    for (suffix, multiplier) in units {
+        if value % multiplier == 0 {
+            return format!("{}{suffix}", value / multiplier);
+        }
+    }
+    unreachable!("the final unit always has multiplier one")
 }
 
 /// How long each phase of waiting for a freshly created guest may take.
@@ -150,6 +303,10 @@ impl SettingsStore {
                         path: self.config_path.clone(),
                         source: Box::new(source),
                     })?;
+                settings
+                    .clipboard_files
+                    .validate()
+                    .map_err(SettingsError::Validation)?;
                 if settings.image_cache_path.as_os_str().is_empty() {
                     settings.image_cache_path =
                         self.config_directory()?.join(DEFAULT_IMAGE_DIRECTORY);
@@ -175,6 +332,10 @@ impl SettingsStore {
 
     /// Persists settings as TOML and creates their parent directories when needed.
     pub fn save(&self, settings: &AppSettings) -> Result<(), SettingsError> {
+        settings
+            .clipboard_files
+            .validate()
+            .map_err(SettingsError::Validation)?;
         let config_directory = self.config_directory()?;
         fs::create_dir_all(config_directory).map_err(|source| SettingsError::Io {
             operation: "create configuration directory",
@@ -224,6 +385,7 @@ impl SettingsStore {
             image_cache_path: config_directory.join(DEFAULT_IMAGE_DIRECTORY),
             default_distro: default_distro(),
             guest_readiness: GuestReadinessTimeouts::default(),
+            clipboard_files: FileClipboardSettings::default(),
         })
     }
 
@@ -256,6 +418,7 @@ pub enum SettingsError {
         source: Box<toml::de::Error>,
     },
     Serialize(toml::ser::Error),
+    Validation(FileClipboardSettingsError),
 }
 
 impl fmt::Display for SettingsError {
@@ -288,6 +451,7 @@ impl fmt::Display for SettingsError {
                 )
             }
             Self::Serialize(source) => write!(formatter, "failed to serialize settings: {source}"),
+            Self::Validation(source) => write!(formatter, "invalid settings: {source}"),
         }
     }
 }
@@ -298,6 +462,7 @@ impl std::error::Error for SettingsError {
             Self::Io { source, .. } => Some(source),
             Self::Parse { source, .. } => Some(source),
             Self::Serialize(source) => Some(source),
+            Self::Validation(source) => Some(source),
             Self::LocalAppDataUnavailable | Self::MissingParent { .. } => None,
         }
     }
@@ -311,7 +476,8 @@ mod tests {
     };
 
     use super::{
-        AppSettings, GuestReadinessTimeouts, Language, LogLevel, SettingsError, SettingsStore,
+        AppSettings, DataSize, FileClipboardSettings, GuestReadinessTimeouts, Language, LogLevel,
+        Retention, SettingsError, SettingsStore,
     };
 
     fn temporary_directory() -> std::path::PathBuf {
@@ -404,6 +570,7 @@ mod tests {
             image_cache_path: directory.join("elsewhere").join("images"),
             default_distro: "fedora".into(),
             guest_readiness: GuestReadinessTimeouts::default(),
+            clipboard_files: FileClipboardSettings::default(),
         };
 
         store.save(&settings).unwrap();
@@ -426,6 +593,7 @@ mod tests {
             image_cache_path: directory.join("images"),
             default_distro: "ubuntu".into(),
             guest_readiness: GuestReadinessTimeouts::default(),
+            clipboard_files: FileClipboardSettings::default(),
         };
 
         store.save(&settings).unwrap();
@@ -490,6 +658,67 @@ mod tests {
     }
 
     #[test]
+    fn file_clipboard_settings_use_human_units_and_binary_multipliers() {
+        let settings: FileClipboardSettings = toml::from_str(
+            "max_file_size = \"1GB\"\nmax_transfer_size = \"4096MB\"\nretention = \"24h\"",
+        )
+        .unwrap();
+
+        assert_eq!(settings.max_file_size.bytes(), 1 << 30);
+        assert_eq!(settings.max_transfer_size.bytes(), 4 << 30);
+        assert_eq!(settings.retention.seconds(), 86_400);
+        assert!(settings.validate().is_ok());
+
+        let document = toml::to_string(&settings).unwrap();
+        assert!(document.contains("max_file_size = \"1GB\""), "{document}");
+        assert!(
+            document.contains("max_transfer_size = \"4GB\""),
+            "{document}"
+        );
+        assert!(document.contains("retention = \"24h\""), "{document}");
+    }
+
+    #[test]
+    fn invalid_file_clipboard_units_and_values_are_refused() {
+        for value in [
+            "0GB",
+            "1GiB",
+            "1.5GB",
+            "1 GB",
+            "1d",
+            "18446744073709551615GB",
+        ] {
+            let document = format!(
+                "max_file_size = \"{value}\"\nmax_transfer_size = \"4GB\"\nretention = \"24h\""
+            );
+            assert!(
+                toml::from_str::<FileClipboardSettings>(&document).is_err(),
+                "accepted {value}"
+            );
+        }
+
+        let invalid = FileClipboardSettings {
+            max_file_size: DataSize::from_bytes(5 << 30),
+            max_transfer_size: DataSize::from_bytes(4 << 30),
+            retention: Retention::from_seconds(86_400),
+        };
+        assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn an_old_settings_file_gets_file_clipboard_defaults() {
+        let settings: AppSettings = toml::from_str(
+            "vm_storage_path = \"vms\"\nlanguage = \"en-US\"\nlog_file_path = \"vmlord.log\"\nlog_level = \"info\"",
+        )
+        .unwrap();
+
+        assert_eq!(settings.clipboard_files, FileClipboardSettings::default());
+        assert_eq!(settings.clipboard_files.max_file_size.bytes(), 1 << 30);
+        assert_eq!(settings.clipboard_files.max_transfer_size.bytes(), 4 << 30);
+        assert_eq!(settings.clipboard_files.retention.seconds(), 86_400);
+    }
+
+    #[test]
     fn settings_written_before_the_default_distribution_existed_select_ubuntu() {
         let directory = temporary_directory();
         fs::create_dir_all(&directory).unwrap();
@@ -523,6 +752,7 @@ mod tests {
             image_cache_path: std::path::PathBuf::from("images"),
             default_distro: "ubuntu".into(),
             guest_readiness: GuestReadinessTimeouts::default(),
+            clipboard_files: FileClipboardSettings::default(),
         }
     }
 
