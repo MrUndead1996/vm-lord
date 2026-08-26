@@ -34,6 +34,14 @@ const STAGING: [&str; 2] = ["VMLord", "Clipboard"];
 /// name inside a tree can ever be mistaken for one.
 const COMMITTED: &str = "committed";
 
+/// How many names one transfer may try before it gives up.
+///
+/// A transfer id restarts at one whenever a channel rebinds, while a committed
+/// tree outlives the connection that brought it: without this, the first
+/// transfer after a reconnect would land on a directory that is still there
+/// and fail, and go on failing until the old tree aged out.
+const STAGING_NAMES: u32 = 64;
+
 /// Why a tree could not be read or could not be written.
 #[derive(Debug)]
 pub enum FileError {
@@ -144,40 +152,52 @@ pub fn staging_root() -> Option<PathBuf> {
 ///
 /// Clipboard data outlives the process that put it there, so a committed tree
 /// is kept for `retention` rather than deleted when the viewer exits; a tree
-/// with no marker beside it never became a selection at all and goes now. A
-/// directory whose name is all digits is one transfer; anything else is a
-/// session, and is descended into once.
+/// with no marker beside it never became a selection at all and goes now.
+/// `root` is the staging root, whose children are sessions and whose
+/// grandchildren are transfers.
 pub fn cleanup(root: &Path, now: SystemTime, retention: Duration) {
-    let Ok(entries) = fs::read_dir(root) else {
-        return;
+    for session in directories_in(root) {
+        for transfer in directories_in(&session) {
+            let marker = marker_of(&transfer);
+            let kept = fs::metadata(&marker)
+                .and_then(|marker| marker.modified())
+                .map(|at| now.duration_since(at).is_ok_and(|age| age <= retention))
+                .unwrap_or(false);
+            if !kept {
+                remove_tree(&transfer);
+                let _ = fs::remove_file(&marker);
+            }
+        }
+    }
+}
+
+/// The plain directories directly inside one directory.
+///
+/// A reparse point is not one of them: cleanup deletes, and deleting through
+/// something that stands for another place is how a cleanup becomes a loss.
+fn directories_in(directory: &Path) -> Vec<PathBuf> {
+    let Ok(listing) = fs::read_dir(directory) else {
+        return Vec::new();
     };
 
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(metadata) = fs::symlink_metadata(&path) else {
-            continue;
-        };
-        if !metadata.is_dir() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
-            continue;
-        }
+    listing
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            fs::symlink_metadata(path).is_ok_and(|metadata| {
+                metadata.is_dir()
+                    && metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 == 0
+            })
+        })
+        .collect()
+}
 
-        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
-            continue;
-        };
-        if !name.chars().all(|character| character.is_ascii_digit()) {
-            cleanup(&path, now, retention);
-            continue;
-        }
-
-        let marker = marker_of(&path);
-        let kept = fs::metadata(&marker)
-            .and_then(|marker| marker.modified())
-            .map(|at| now.duration_since(at).is_ok_and(|age| age <= retention))
-            .unwrap_or(false);
-        if !kept {
-            remove_tree(&path);
-            let _ = fs::remove_file(&marker);
-        }
+/// What one transfer's directory is called on its nth attempt.
+fn staging_name(transfer: u32, attempt: u32) -> String {
+    if attempt == 0 {
+        transfer.to_string()
+    } else {
+        format!("{transfer}-{attempt}")
     }
 }
 
@@ -412,15 +432,26 @@ impl Staging {
     ///
     /// [`FileError::Io`] if the root cannot be created fresh.
     pub fn create_under(base: &Path, transfer: u32) -> Result<Self, FileError> {
-        let root = base.join(transfer.to_string());
-        make_directory(&root)?;
+        for attempt in 0..STAGING_NAMES {
+            let root = base.join(staging_name(transfer, attempt));
+            match make_directory(&root) {
+                Ok(()) => {
+                    return Ok(Self {
+                        root,
+                        open: None,
+                        top_level: Vec::new(),
+                        committed: false,
+                    });
+                }
+                // Something of that name is already there -- a tree from
+                // before a reconnect, most likely -- so this one goes beside
+                // it rather than failing.
+                Err(FileError::Exists) => {}
+                Err(error) => return Err(error),
+            }
+        }
 
-        Ok(Self {
-            root,
-            open: None,
-            top_level: Vec::new(),
-            committed: false,
-        })
+        Err(FileError::Exists)
     }
 
     /// Creates one entry of the arriving tree.
@@ -788,37 +819,65 @@ mod tests {
 
     #[test]
     fn cleanup_keeps_a_committed_tree_until_its_retention_runs_out() {
-        let base = temporary_directory();
-        fs::create_dir_all(&base).expect("a base directory");
+        let root = temporary_directory();
+        let base = root.join("session");
+        fs::create_dir_all(&base).expect("a session directory");
 
         let mut staging = Staging::create_under(&base, 1).expect("a staging root");
         stage(&mut staging, "a.txt", EntryKind::File, 0);
         staging.commit().expect("a whole tree");
 
-        cleanup(&base, SystemTime::now(), Duration::from_secs(3600));
+        cleanup(&root, SystemTime::now(), Duration::from_secs(3600));
         assert!(base.join("1").exists());
 
         // A day later, by asking as if it were.
         cleanup(
-            &base,
+            &root,
             SystemTime::now() + Duration::from_secs(7200),
             Duration::from_secs(3600),
         );
         assert!(!base.join("1").exists());
+        assert!(!base.join("1.committed").exists());
 
-        fs::remove_dir_all(&base).expect("the tree");
+        fs::remove_dir_all(&root).expect("the tree");
     }
 
     #[test]
     fn cleanup_removes_a_tree_that_was_never_committed() {
-        let base = temporary_directory();
-        fs::create_dir_all(&base).expect("a base directory");
+        let root = temporary_directory();
+        let base = root.join("session");
         fs::create_dir_all(base.join("2")).expect("a stale staging root");
         fs::write(base.join("2/half.bin"), b"ab").expect("a half-written file");
 
-        cleanup(&base, SystemTime::now(), Duration::from_secs(3600));
+        cleanup(&root, SystemTime::now(), Duration::from_secs(3600));
 
         assert!(!base.join("2").exists());
+
+        fs::remove_dir_all(&root).expect("the tree");
+    }
+
+    #[test]
+    fn a_transfer_whose_name_is_taken_is_staged_beside_what_is_there() {
+        let base = temporary_directory();
+        fs::create_dir_all(&base).expect("a base directory");
+
+        // What a reconnect looks like: the ids start again at one, and the
+        // tree the last connection committed is still there.
+        let first = Staging::create_under(&base, 1).expect("a staging root");
+        first.commit().expect("a whole tree");
+        let second = Staging::create_under(&base, 1).expect("a second staging root");
+        let mut third = Staging::create_under(&base, 1).expect("a third staging root");
+        stage(&mut third, "a.txt", EntryKind::File, 0);
+
+        assert!(base.join("1").is_dir());
+        assert!(base.join("1-1").is_dir());
+        assert_eq!(
+            third.commit().expect("a whole tree"),
+            vec![base.join("1-2").join("a.txt")]
+        );
+
+        second.abort();
+        assert!(!base.join("1-1").exists(), "an aborted tree stayed behind");
 
         fs::remove_dir_all(&base).expect("the tree");
     }

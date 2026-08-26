@@ -26,6 +26,14 @@ use vmlord_display_protocol::clipboard::{
     path::{PathError, ValidatedPath},
 };
 
+/// How many names one transfer may try before it gives up.
+///
+/// A transfer id restarts at one whenever this daemon reconnects, while a
+/// staged tree outlives the connection that brought it: without this, the
+/// first transfer after a reconnect would land on a directory that is still
+/// there and fail.
+const STAGING_NAMES: u32 = 64;
+
 /// What a `text/uri-list` payload is not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UriError {
@@ -482,17 +490,27 @@ impl Staging {
     ///
     /// [`FileError::Io`] if the root cannot be created fresh.
     pub fn create_under(base: &Path, transfer: u32) -> Result<Self, FileError> {
-        let root = base.join(transfer.to_string());
-        make_private(&root)?;
-        let directory = open_directory(None, root.as_os_str())?;
+        for attempt in 0..STAGING_NAMES {
+            let root = base.join(staging_name(transfer, attempt));
+            match make_private(&root) {
+                // Something of that name is already there -- a tree from
+                // before a reconnect, most likely -- so this one goes beside
+                // it rather than failing.
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                other => other?,
+            }
+            let directory = open_directory(None, root.as_os_str())?;
 
-        Ok(Self {
-            root,
-            directory,
-            open: None,
-            top_level: Vec::new(),
-            committed: false,
-        })
+            return Ok(Self {
+                root,
+                directory,
+                open: None,
+                top_level: Vec::new(),
+                committed: false,
+            });
+        }
+
+        Err(FileError::Exists)
     }
 
     /// Creates one entry of the arriving tree.
@@ -578,6 +596,15 @@ impl Drop for Staging {
             self.open = None;
             remove_tree(&self.root);
         }
+    }
+}
+
+/// What one transfer's directory is called on its nth attempt.
+fn staging_name(transfer: u32, attempt: u32) -> String {
+    if attempt == 0 {
+        transfer.to_string()
+    } else {
+        format!("{transfer}-{attempt}")
     }
 }
 
@@ -1035,6 +1062,29 @@ mod tests {
         assert_eq!(
             fs::read(root.join("1/tree/a.txt")).expect("a staged file"),
             b"abc"
+        );
+
+        fs::remove_dir_all(&root).expect("the tree");
+    }
+
+    #[test]
+    fn a_transfer_whose_name_is_taken_is_staged_beside_what_is_there() {
+        let root = temporary_directory();
+        fs::create_dir_all(&root).expect("a runtime directory");
+
+        // What a reconnect looks like: the ids start again at one, and the
+        // tree the last connection staged is still there.
+        let first = Staging::create_under(&root, 1).expect("a staging root");
+        let committed = first.commit().expect("a whole tree");
+        assert!(committed.is_empty(), "an empty tree names nothing");
+
+        let mut second = Staging::create_under(&root, 1).expect("a second staging root");
+        stage(&mut second, "a.txt", EntryKind::File, 0);
+
+        assert!(root.join("1").is_dir());
+        assert_eq!(
+            second.commit().expect("a whole tree"),
+            vec![root.join("1-1").join("a.txt")]
         );
 
         fs::remove_dir_all(&root).expect("the tree");
