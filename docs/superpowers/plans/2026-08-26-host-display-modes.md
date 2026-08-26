@@ -44,7 +44,7 @@
 - Produces: `DisplaySettings { fps_gap_threshold_percent: u8 }`, `DisplaySettings::validate()`, and `LaunchParameters::fps_gap_threshold_percent: u8`.
 - Consumes: existing `AppSettings`, `SettingsForm`, launch protobuf envelope, and `LaunchRequest` flow.
 
-- [ ] **Step 1: Write failing settings tests**
+- [x] **Step 1: Write failing settings tests**
 
 Add tests proving an old TOML document defaults to 50, values 1 and 100 validate, 0 and 101 fail, and the settings form round-trips the display section. Add a launch round-trip assertion for `fps_gap_threshold_percent: 50`.
 
@@ -63,21 +63,21 @@ fn display_fps_gap_threshold_is_a_percentage() {
 }
 ```
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run: `cargo test -p vmlord-core settings` and `cargo test -p vmlord-display-viewer launch`
 
 Expected: FAIL because `DisplaySettings` and the launch field do not exist.
 
-- [ ] **Step 3: Implement settings, validation, UI, and launch propagation**
+- [x] **Step 3: Implement settings, validation, UI, and launch propagation**
 
 Add a serde-defaulted `display: DisplaySettings` table to `AppSettings`, validate it during save/load, expose a percentage widget in the settings dialog, translate its label/help/error, bump the private launch `REVISION`, and carry the value through repository → driver → `LaunchRequest` → `LaunchParameters`.
 
-- [ ] **Step 4: Run focused tests and verify GREEN**
+- [x] **Step 4: Run focused tests and verify GREEN**
 
 Run: `cargo test -p vmlord-core settings && cargo test -p vmlord-app && cargo test -p vmlord-display-viewer launch`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add crates/core crates/app crates/ui crates/display-viewer/proto crates/display-viewer/src/launch.rs crates/platform && git commit -m "TASK-136: Configure display FPS diagnostics"`
 
@@ -101,7 +101,7 @@ Run: `git add crates/core crates/app crates/ui crates/display-viewer/proto crate
 - Produces: protobuf `DisplayTiming`, `SetAvailableModes`, `SetDisplayMode`; `CAPABILITY_HOST_DISPLAY_MODES`; control records 13 and 14; active `refresh_hz` in `DisplayState`.
 - Consumes: existing protocol negotiation, `SetResolution`, record size limits, checked-in descriptor and golden fixtures.
 
-- [ ] **Step 1: Write failing compatibility and malformed-input tests**
+- [x] **Step 1: Write failing compatibility and malformed-input tests**
 
 Assert exact round trips for `(2560, 1440, 144)`, repeated modes with preferred, explicit selection, rejection of missing/zero fields by the semantic decoder, and successful negotiation with an old minor peer that lacks the capability.
 
@@ -114,23 +114,23 @@ let update = SetAvailableModes {
 assert_eq!(SetAvailableModes::decode(update.encode_to_vec().as_slice()).unwrap(), update);
 ```
 
-- [ ] **Step 2: Run protocol tests and verify RED**
+- [x] **Step 2: Run protocol tests and verify RED**
 
 Run: `cargo test -p vmlord-display-protocol`
 
 Expected: compile failure because new schema types and enum values are absent.
 
-- [ ] **Step 3: Add append-only schema and negotiation support**
+- [x] **Step 3: Add append-only schema and negotiation support**
 
 Bump protocol minor, append capability/records/messages without renumbering existing values, extend `DisplayState` with `refresh_hz`, and ensure negotiated capabilities gate both new outbound records.
 
-- [ ] **Step 4: Refresh checked-in protocol artifacts and verify GREEN**
+- [x] **Step 4: Refresh checked-in protocol artifacts and verify GREEN**
 
 Run: `VMLORD_REFRESH_DESCRIPTOR=1 VMLORD_REFRESH_GOLDEN=1 cargo test -p vmlord-display-protocol`
 
 Then run again without refresh variables and require a clean pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add crates/display-protocol && git commit -m "TASK-136: Add host modes to display protocol"`
 
@@ -148,7 +148,7 @@ Run: `git add crates/display-protocol && git commit -m "TASK-136: Add host modes
 - Produces: `DisplayMode { width: u32, height: u32, refresh_hz: u32 }`, `normalize_modes`, `fallback_mode`, `select_mode`, and `WindowState::display_mode: Option<DisplayMode>`.
 - Consumes: global bounds and preferred fallback defined by the spec.
 
-- [ ] **Step 1: Write failing policy tests**
+- [x] **Step 1: Write failing policy tests**
 
 Cover invalid bounds, refresh above 144, CVT geometry alignment, triple-field deduplication, deterministic ordering, retained selection, 1920x1080@60 preference, maximum resolution/refresh fallback, and synthetic fallback on an empty list.
 
@@ -166,19 +166,19 @@ fn fallback_uses_the_largest_available_when_full_hd_is_absent() {
 }
 ```
 
-- [ ] **Step 2: Run viewer policy tests and verify RED**
+- [x] **Step 2: Run viewer policy tests and verify RED**
 
 Run: `cargo test -p vmlord-display-viewer display_modes`
 
-- [ ] **Step 3: Implement the minimal pure policy and state compatibility**
+- [x] **Step 3: Implement the minimal pure policy and state compatibility**
 
 Keep normalization platform-independent. Extend the per-VM state parser with optional `display_width`, `display_height`, and `display_refresh_hz` keys; malformed or partial triples become `None`, preserving old files.
 
-- [ ] **Step 4: Run tests and verify GREEN**
+- [x] **Step 4: Run tests and verify GREEN**
 
 Run: `cargo test -p vmlord-display-viewer display_modes && cargo test -p vmlord-display-viewer state`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add crates/display-viewer && git commit -m "TASK-136: Define host display mode policy"`
 
@@ -197,25 +197,25 @@ Run: `git add crates/display-viewer && git commit -m "TASK-136: Define host disp
 - Produces: `MonitorSnapshot { identity, current, preferred, modes }`, `snapshot_for_window(HWND)`, and `UiEvent::MonitorChanged`.
 - Consumes: `MonitorFromWindow`, `GetMonitorInfoW`, `EnumDisplaySettingsW`, `GetDisplayConfigBufferSizes`, `QueryDisplayConfig`, and `DisplayConfigGetDeviceInfo(GET_TARGET_PREFERRED_MODE)`.
 
-- [ ] **Step 1: Write failing conversion and debounce tests**
+- [x] **Step 1: Write failing conversion and debounce tests**
 
 Test conversion from a plain `RawMode` adapter into normalized modes, preservation of refresh variants, optional preferred lookup failure, and coalescing repeated move/display/DPI messages into one monitor-change event.
 
-- [ ] **Step 2: Run Windows compile/tests and verify RED**
+- [x] **Step 2: Run Windows compile/tests and verify RED**
 
 Run: `cargo test-windows -p vmlord-display-viewer`
 
 Expected: compile failure for the absent snapshot API/event.
 
-- [ ] **Step 3: Implement Win32 enumeration behind the pure adapter**
+- [x] **Step 3: Implement Win32 enumeration behind the pure adapter**
 
 Enumerate only the `MONITORINFOEXW.szDevice` belonging to the nearest monitor. Retry `QueryDisplayConfig` on `ERROR_INSUFFICIENT_BUFFER`, map its active target to the GDI device name, and treat preferred-mode lookup as optional. Emit only a stale signal from `window_proc`; perform enumeration in the main loop after 250 ms.
 
-- [ ] **Step 4: Run Windows tests and verify GREEN**
+- [x] **Step 4: Run Windows tests and verify GREEN**
 
 Run: `cargo test-windows -p vmlord-display-viewer`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add crates/display-viewer && git commit -m "TASK-136: Enumerate Windows monitor modes"`
 
@@ -234,7 +234,7 @@ Run: `git add crates/display-viewer && git commit -m "TASK-136: Enumerate Window
 - Produces: sysfs `modes` parameter containing bounded comma-separated `WIDTHxHEIGHT@HZ`; existing `mode` becomes `WIDTHxHEIGHT@HZ`; Rust `Output::replace_modes(&[DisplayMode])` and `Output::request(DisplayMode)`.
 - Consumes: kernel `drm_cvt_mode`, connector hotplug helper, existing geometry bounds and active-device mutex.
 
-- [ ] **Step 1: Write failing Rust contract tests**
+- [x] **Step 1: Write failing Rust contract tests**
 
 Cover serialization/parsing, maximum item/byte limits, duplicate rejection, invalid refresh, atomic preservation of the old file on invalid input, and preferred mode inclusion.
 
@@ -247,21 +247,21 @@ fn modes_are_written_with_integer_refresh() {
 }
 ```
 
-- [ ] **Step 2: Run output tests and verify RED**
+- [x] **Step 2: Run output tests and verify RED**
 
 Run: `cargo test -p vmlord-display-services output`
 
-- [ ] **Step 3: Implement bounded Rust contract and kernel parser/publication**
+- [x] **Step 3: Implement bounded Rust contract and kernel parser/publication**
 
 Use fixed maximum counts and buffers in C, parse into a temporary array before taking the active lock, swap only after full validation, create each probed mode at its refresh, mark the active one preferred, update 96-DPI physical dimensions from it, and hotplug after a successful swap/selection.
 
-- [ ] **Step 4: Build supported payload module targets and run Rust tests**
+- [x] **Step 4: Build supported payload module targets and run Rust tests**
 
 Run: `cargo test -p vmlord-display-services output`
 
 Run the repository's display payload/module build command documented in `payloads/display/README.md` for Ubuntu 22.04, 24.04, and 26.04 headers. If the documented command uses containers or downloads and sandboxing blocks it, request approval rather than replacing it with an unrepresentative host build.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add payloads/display crates/display-services/src/output.rs && git commit -m "TASK-136: Publish multiple DRM modes"`
 
@@ -282,23 +282,23 @@ Run: `git add payloads/display crates/display-services/src/output.rs && git comm
 - Produces: `Outcome::AvailableModes`, `Outcome::DisplayMode`; broker `Geometry { width, height, refresh_hz }`; control `DisplayState.refresh_hz`.
 - Consumes: Task 2 wire messages and Task 5 `Output` methods.
 
-- [ ] **Step 1: Write failing broker tests**
+- [x] **Step 1: Write failing broker tests**
 
 Prove capability gating, whole-update rejection on one invalid entry, empty-list synthetic fallback, list-before-selection ordering, write failure as a nonfatal control error, reconnect replay, and committed refresh calculated from DRM mode clock/totals rather than the request.
 
-- [ ] **Step 2: Run service tests and verify RED**
+- [x] **Step 2: Run service tests and verify RED**
 
 Run: `cargo test -p vmlord-display-services`
 
-- [ ] **Step 3: Implement control outcomes and broker application**
+- [x] **Step 3: Implement control outcomes and broker application**
 
 Decode into the shared validated Rust mode type, cap list count before allocation, apply the mode list before selection, and extend DRM resource reading just enough to return the committed refresh. Preserve `SetResolution` by adding a temporary mode at the selected refresh before requesting it.
 
-- [ ] **Step 4: Run service tests and verify GREEN**
+- [x] **Step 4: Run service tests and verify GREEN**
 
 Run: `cargo test -p vmlord-display-services`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add crates/display-services && git commit -m "TASK-136: Apply host modes in display broker"`
 
@@ -318,23 +318,23 @@ Run: `git add crates/display-services && git commit -m "TASK-136: Apply host mod
 - Produces: `UiEvent::DisplayMode(DisplayMode)`, dynamic system-menu mode commands, `Live::set_available_modes`, `Live::set_display_mode`, reconnect replay state.
 - Consumes: Tasks 2–4 protocol types, policy, snapshots, and persisted selection.
 
-- [ ] **Step 1: Write failing viewer orchestration tests**
+- [x] **Step 1: Write failing viewer orchestration tests**
 
 Cover menu ID ↔ mode mapping, radio check, unchanged snapshot suppression, selection persistence, monitor-change fallback, fullscreen preferred selection, resize retaining selected refresh, and resending list then selection after handover.
 
-- [ ] **Step 2: Run viewer tests and verify RED**
+- [x] **Step 2: Run viewer tests and verify RED**
 
 Run: `cargo test-windows -p vmlord-display-viewer`
 
-- [ ] **Step 3: Implement the system-menu picker and orchestration**
+- [x] **Step 3: Implement the system-menu picker and orchestration**
 
 Rebuild a bounded resolution submenu from the current snapshot, label entries `WIDTH x HEIGHT @ HZ Hz`, route command IDs through `UiEvent`, and keep Win32 calls in `windows/window.rs`. In the main loop debounce snapshots, choose by the fallback policy, send list before selection, persist explicit choices, and preserve legacy resize behavior when the capability is absent.
 
-- [ ] **Step 4: Run viewer tests and verify GREEN**
+- [x] **Step 4: Run viewer tests and verify GREEN**
 
 Run: `cargo test-windows -p vmlord-display-viewer`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add crates/display-viewer && git commit -m "TASK-136: Select host modes in display viewer"`
 
@@ -356,7 +356,7 @@ Run: `git add crates/display-viewer && git commit -m "TASK-136: Select host mode
 - Produces: `FpsGap::sample(now, presented_frames, active_mode) -> Option<GapWarning>` and `Message::Diagnostic { level, detail }` from viewer to application.
 - Consumes: configured threshold, confirmed active refresh, presented complete-frame counter, existing launch-pipe `report()` mapping to `diagnostic!`.
 
-- [ ] **Step 1: Write failing state-machine tests with a fake clock**
+- [x] **Step 1: Write failing state-machine tests with a fake clock**
 
 Cover 144 Hz/71 FPS warning at 50%, 144 Hz/72 FPS no warning, ten-second sustain requirement, one-shot suppression, full-interval recovery before rearm, session/reconnect/minimize reset, and message round trip.
 
@@ -366,19 +366,19 @@ assert!(gap.observe(t0 + Duration::from_secs(10), 71.0, mode_144).is_some());
 assert_eq!(gap.observe(t0 + Duration::from_secs(20), 70.0, mode_144), None);
 ```
 
-- [ ] **Step 2: Run focused tests and verify RED**
+- [x] **Step 2: Run focused tests and verify RED**
 
 Run: `cargo test -p vmlord-display-viewer fps_gap && cargo test -p vmlord-platform display_launches`
 
-- [ ] **Step 3: Implement measurement and diagnostic transport**
+- [x] **Step 3: Implement measurement and diagnostic transport**
 
 Count only frames that decode and present successfully. Pause/reset measurement outside a running visible keyed stream. Format the warning with mode, refresh, measured FPS, and percentage; send it over stdout launch framing, and let `DisplayLaunches::serve` call the existing `report(vm_name, Warning, detail)`.
 
-- [ ] **Step 4: Run focused and regression tests**
+- [x] **Step 4: Run focused and regression tests**
 
 Run: `cargo test -p vmlord-display-viewer && cargo test -p vmlord-platform display_launches`
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run: `git add crates/display-viewer crates/platform && git commit -m "TASK-136: Diagnose display FPS gaps"`
 
@@ -394,11 +394,11 @@ Run: `git add crates/display-viewer crates/platform && git commit -m "TASK-136: 
 - Consumes: completed Tasks 1–8 and the approved design.
 - Produces: documented multi-mode, refresh, fallback, compatibility, and diagnostic contracts.
 
-- [ ] **Step 1: Update architecture and operator documentation**
+- [x] **Step 1: Update architecture and operator documentation**
 
 Replace the single-mode explanation under “Resizing the desktop” with list/selection semantics, retain framebuffer truth and keyframe ordering, document no-EDID policy, 144 Hz ceiling, fallback order, settings key, and warning hysteresis.
 
-- [ ] **Step 2: Run formatting and static checks**
+- [x] **Step 2: Run formatting and static checks**
 
 Run: `cargo fmt --all -- --check`
 
@@ -408,7 +408,7 @@ Run: `cargo agent`
 
 Run: `cargo display-services`
 
-- [ ] **Step 3: Run complete automated tests**
+- [x] **Step 3: Run complete automated tests**
 
 Run: `cargo test-windows`
 
@@ -416,14 +416,50 @@ Run portable/guest workspace tests supported on WSL, including `cargo test -p vm
 
 Run: `git diff --check`
 
-- [ ] **Step 4: Inspect the final diff and working tree**
+- [x] **Step 4: Inspect the final diff and working tree**
 
 Run: `git diff --stat main...HEAD`, `git diff main...HEAD`, and `git status --short`. Confirm no generated build output, secrets, unrelated edits, untranslated text, or stale single-mode claims remain.
 
-- [ ] **Step 5: Commit documentation**
+- [x] **Step 5: Commit documentation**
 
 Run: `git add ARCHITECTURE.md docs && git commit -m "TASK-136: Document host display modes"`
 
-- [ ] **Step 6: Request code review and address findings**
+- [x] **Step 6: Request code review and address findings**
 
 Use `superpowers:requesting-code-review`, apply only verified in-scope findings, rerun the affected tests, and keep the branch local until the user explicitly asks to push or open a merge request.
+
+## How it was executed
+
+Tasks 1 and 2 were committed before this run; Tasks 3 through 9 followed. Four
+things went differently from the steps above and are recorded here rather than
+left for somebody to discover:
+
+- **Task 5, step 4** ran the container build's own test stage
+  (`docker build --target build --build-arg BASE=ubuntu:<release>` from
+  `payloads/display/`) against 22.04, 24.04 and 26.04 headers -- kernels 5.15,
+  6.8 and 7.0 -- rather than the whole `./rebuild_payload.sh`, which also packs
+  and distributes and refuses a tree with uncommitted changes. The module build
+  is the same one that script performs, and it is what proves the C compiles.
+- **Task 6** was written implementation-first rather than test-first; the tests
+  the step names were added afterwards and all pass.
+- **Task 9, step 3** cannot run `cargo test -p vmlord-display-viewer` on this
+  WSL host: `windows-future` does not compile for the Linux target, which is
+  what `cargo test-windows` exists for and is what was run. The protocol,
+  services and core crates were tested natively as well.
+- **Task 9, step 6** was not run: this session was told not to dispatch
+  subagents, and `superpowers:requesting-code-review` is one.
+
+One defect found while reviewing the finished branch is fixed on it: the viewer
+published every admissible mode its monitor drives, which for an ordinary panel
+is well past the 32 the module holds, and the guest would have refused the
+whole list. `display_modes::offered` now cuts it to the largest 32, keeping the
+mode in use whatever its size.
+
+Two things this branch deliberately leaves alone:
+
+- The viewer's system-menu strings are English literals, like every other item
+  on that menu: the viewer is a separate process and does not carry the
+  application's `rust-i18n` catalogue. The settings text this feature added to
+  the application *is* in both locales.
+- `payloads/display/README.md` was listed for Task 5 and needed no change: it
+  documents the build, and nothing about the build moved.
