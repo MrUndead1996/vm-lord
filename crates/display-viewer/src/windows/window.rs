@@ -48,17 +48,18 @@ use windows::{
                 CreateWindowExW, DefWindowProcW, DeleteMenu, DestroyMenu, DestroyWindow,
                 DispatchMessageW, GWL_EXSTYLE, GWL_STYLE, GWLP_USERDATA, GetClientRect,
                 GetSystemMenu, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, HMENU,
-                HWND_TOP, IDC_ARROW, LoadCursorW, MB_ICONERROR, MB_OK, MF_BYCOMMAND, MF_BYPOSITION,
-                MF_POPUP, MF_SEPARATOR, MF_STRING, MONITORINFOF_PRIMARY, MSG, MessageBoxW,
-                PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SW_RESTORE,
-                SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOOWNERZORDER,
-                SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW,
-                SetWindowPlacement, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
-                WINDOW_STYLE, WINDOWPLACEMENT, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE,
-                WM_DPICHANGED, WM_ERASEBKGND, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
-                WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE,
-                WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_SYSCOMMAND,
-                WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_POPUP,
+                HWND_TOP, IDC_ARROW, IsIconic, LoadCursorW, MB_ICONERROR, MB_OK, MF_BYCOMMAND,
+                MF_BYPOSITION, MF_POPUP, MF_SEPARATOR, MF_STRING, MONITORINFOF_PRIMARY, MSG,
+                MessageBoxW, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage,
+                RegisterClassW, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOMOVE,
+                SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
+                SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, ShowWindow, TranslateMessage,
+                WINDOW_EX_STYLE, WINDOW_STYLE, WINDOWPLACEMENT, WM_APP, WM_CLOSE, WM_DESTROY,
+                WM_DISPLAYCHANGE, WM_DPICHANGED, WM_ERASEBKGND, WM_KILLFOCUS, WM_LBUTTONDOWN,
+                WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE,
+                WM_MOUSEWHEEL, WM_MOVE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS,
+                WM_SIZE, WM_SYSCOMMAND, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
+                WS_OVERLAPPEDWINDOW, WS_POPUP,
             },
         },
     },
@@ -403,6 +404,13 @@ impl Window {
                 );
             }
         }
+    }
+
+    /// Whether the window is minimised, and so has no picture to deliver.
+    #[must_use]
+    pub fn is_minimised(&self) -> bool {
+        // SAFETY: `hwnd` names a window of this process.
+        unsafe { IsIconic(self.hwnd) }.as_bool()
     }
 
     /// Marks which encoding mode is in force.

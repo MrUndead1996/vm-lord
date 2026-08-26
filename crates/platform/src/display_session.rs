@@ -22,7 +22,9 @@ use vmlord_display_protocol::{
     session::{Event, Offer, Session},
     v1::{Capability, Mode},
 };
-use vmlord_display_viewer::launch::{FilePolicy, Handover, LaunchParameters, Message};
+use vmlord_display_viewer::launch::{
+    DiagnosticLevel as ViewerLevel, FilePolicy, Handover, LaunchParameters, Message,
+};
 
 use crate::hvsocket::{
     DISPLAY_CLIPBOARD_VSOCK_PORT, DISPLAY_CONTROL_VSOCK_PORT, DISPLAY_FRAME_VSOCK_PORT,
@@ -165,6 +167,9 @@ impl Driver {
         match message {
             Message::RelayFromViewer(bytes) => self.relay(&bytes),
             Message::RequestRelay { token } => self.open_another_session(&token),
+            // Prose the viewer already formatted: it is the process that knows
+            // the numbers, and this side only knows which VM they are about.
+            Message::Diagnostic { level, detail } => Answer::reported(level_of(level), detail),
             other => {
                 // A viewer that sends what only VMLord sends is a build that
                 // disagrees with this one, and the launch contract's revision
@@ -352,6 +357,16 @@ fn name_of(message: &Message) -> &'static str {
         Message::Handover(_) => "hand-over",
         Message::RequestRelay { .. } => "session request",
         Message::Command(_) => "window command",
+        Message::Diagnostic { .. } => "diagnostic",
+    }
+}
+
+/// The application's level for one the viewer named.
+fn level_of(level: ViewerLevel) -> DiagnosticLevel {
+    match level {
+        ViewerLevel::Info => DiagnosticLevel::Info,
+        ViewerLevel::Warning => DiagnosticLevel::Warning,
+        ViewerLevel::Error => DiagnosticLevel::Error,
     }
 }
 
@@ -366,7 +381,7 @@ mod tests {
         session::{Session, Support},
         v1::{Capability, Mode, ProtocolVersion},
     };
-    use vmlord_display_viewer::launch::Message;
+    use vmlord_display_viewer::launch::{DiagnosticLevel as ViewerLevel, Message};
 
     use super::{Driver, control_limits, framed};
 
@@ -432,6 +447,27 @@ mod tests {
     }
 
     /// Runs a whole handshake between a driver and a guest that answers it.
+    #[test]
+    fn a_diagnostic_from_the_viewer_becomes_one_of_the_applications() {
+        // The viewer is the process that knows the numbers; this side only
+        // knows which VM they are about, and hands the prose straight on.
+        let (mut driver, _, _, _) = driver(None);
+
+        let answer = driver.handle(Message::Diagnostic {
+            level: ViewerLevel::Warning,
+            detail: "the picture is arriving at a fraction of the refresh".to_owned(),
+        });
+
+        assert_eq!(
+            answer.diagnostics,
+            vec![(
+                vmlord_core::DiagnosticLevel::Warning,
+                "the picture is arriving at a fraction of the refresh".to_owned()
+            )]
+        );
+        assert!(answer.to_viewer.is_empty());
+    }
+
     fn handshake(driver: &mut Driver, hello: Vec<u8>, secret: &Secret) -> Message {
         let mut guest = Session::guest(secret, support());
         let mut to_guest = vec![hello];

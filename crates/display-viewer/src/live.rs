@@ -75,6 +75,12 @@ pub enum Signal {
     Cursor(OwnedCursorImage),
     /// Where the cursor is now.
     Moved(CursorPosition),
+    /// The mode the guest says its output actually came up on.
+    ///
+    /// `None` when the guest reported no refresh, which is an older payload or
+    /// a compositor that has committed nothing yet: there is then no rate to
+    /// measure a delivered one against.
+    Committed(Option<DisplayMode>),
     /// Something the status machine has to know.
     Status(Event),
     /// The session is over, for the reason given. Fit for a log.
@@ -445,11 +451,17 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
                 Ok(ControlRecord::DisplayState) => {
                     if let Ok(state) = DisplayState::decode(payload.as_slice()) {
                         tracing::info!(
-                            "the guest reports {}x{} at {}-pixel tiles",
+                            "the guest reports {}x{}@{} at {}-pixel tiles",
                             state.width,
                             state.height,
+                            state.refresh_hz,
                             state.tile_size
                         );
+                        signals.push(Signal::Committed(DisplayMode::new(
+                            state.width,
+                            state.height,
+                            state.refresh_hz,
+                        )));
                     }
                 }
                 Ok(ControlRecord::Error) => {

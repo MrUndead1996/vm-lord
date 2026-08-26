@@ -47,6 +47,27 @@ pub enum Message {
     },
     /// Something for the window rather than for the session.
     Command(Command),
+    /// Something the viewer found that a person should be told about.
+    Diagnostic {
+        /// How loud it is.
+        level: DiagnosticLevel,
+        /// The prose to show, formatted by the viewer.
+        detail: String,
+    },
+}
+
+/// How loud a diagnostic from the viewer is.
+///
+/// The application's own levels, restated here because this contract may not
+/// depend on the application: the viewer is a process of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagnosticLevel {
+    /// Worth knowing.
+    Info,
+    /// Worth acting on.
+    Warning,
+    /// Something did not work.
+    Error,
 }
 
 /// What VMLord asks the window to do.
@@ -186,6 +207,14 @@ pub fn encode(message: &Message) -> Vec<u8> {
         Message::RequestRelay { token } => envelope::Kind::RequestRelay(wire::RequestRelay {
             token: token.clone(),
         }),
+        Message::Diagnostic { level, detail } => envelope::Kind::Diagnostic(wire::Diagnostic {
+            level: match level {
+                DiagnosticLevel::Info => wire::diagnostic::Level::Info as i32,
+                DiagnosticLevel::Warning => wire::diagnostic::Level::Warning as i32,
+                DiagnosticLevel::Error => wire::diagnostic::Level::Error as i32,
+            },
+            detail: detail.clone(),
+        }),
         Message::Command(command) => envelope::Kind::Command(wire::Command {
             kind: match command {
                 Command::Focus => wire::command::Kind::Focus as i32,
@@ -276,6 +305,15 @@ pub fn decode(bytes: &[u8]) -> Result<Message, LaunchError> {
                 _ => return Err(LaunchError::Empty),
             })
         }
+        envelope::Kind::Diagnostic(diagnostic) => Message::Diagnostic {
+            level: match wire::diagnostic::Level::try_from(diagnostic.level) {
+                Ok(wire::diagnostic::Level::Info) => DiagnosticLevel::Info,
+                Ok(wire::diagnostic::Level::Warning) => DiagnosticLevel::Warning,
+                Ok(wire::diagnostic::Level::Error) => DiagnosticLevel::Error,
+                _ => return Err(LaunchError::Empty),
+            },
+            detail: diagnostic.detail,
+        },
     };
 
     Ok(message)
@@ -471,7 +509,8 @@ mod tests {
     use std::io;
 
     use super::{
-        Command, FilePolicy, Handover, LaunchError, LaunchParameters, Link, Message, decode, encode,
+        Command, DiagnosticLevel, FilePolicy, Handover, LaunchError, LaunchParameters, Link,
+        Message, decode, encode,
     };
 
     fn parameters() -> LaunchParameters {
@@ -523,6 +562,10 @@ mod tests {
             Message::RequestRelay { token: vec![9; 32] },
             Message::Command(Command::Focus),
             Message::Command(Command::Close),
+            Message::Diagnostic {
+                level: DiagnosticLevel::Warning,
+                detail: "the picture is arriving at a fraction of the refresh".to_owned(),
+            },
         ];
 
         for message in messages {

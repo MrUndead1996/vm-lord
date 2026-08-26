@@ -23,6 +23,7 @@ message Envelope {
     Handover handover = 5;
     RequestRelay request_relay = 6;
     Command command = 7;
+    Diagnostic diagnostic = 8;
   }
 }
 
@@ -94,5 +95,20 @@ message Command {
     KIND_UNSPECIFIED = 0;
     KIND_FOCUS = 1;
     KIND_CLOSE = 2;
+  }
+}
+
+// Something the viewer found that a person should be told about, on its way to
+// the application's diagnostics. Prose, already formatted: the viewer is what
+// knows the numbers, and VMLord is only where they are shown.
+message Diagnostic {
+  Level level = 1;
+  string detail = 2;
+
+  enum Level {
+    LEVEL_UNSPECIFIED = 0;
+    LEVEL_INFO = 1;
+    LEVEL_WARNING = 2;
+    LEVEL_ERROR = 3;
   }
 }
