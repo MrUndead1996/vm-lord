@@ -176,6 +176,7 @@ fn serve(parameters: &Parameters, focus: &Receiver<Focus>) -> Result<(), String>
                 if let Some(offer) = awaited.take() {
                     ops.extend(exchange.peer_offer(offer.serial, &offer.mime_types, now));
                 }
+                file_ops.extend(files.focus_gained(now));
             }
             Ok(Focus::Lost) => {
                 focused = false;
@@ -370,6 +371,10 @@ struct Files {
     /// The top-level paths of the last tree that arrived whole, which is what
     /// `CF_HDROP` names. Never logged.
     staged: Vec<PathBuf>,
+    /// The guest's last file offer while the window was away, held until it
+    /// comes back. The model is pull, so holding the announcement holds the
+    /// files with it: nothing is asked for and nothing crosses.
+    awaited: Option<u32>,
 }
 
 impl Files {
@@ -389,6 +394,7 @@ impl Files {
             source: None,
             staging: None,
             staged: Vec::new(),
+            awaited: None,
         }
     }
 
@@ -458,6 +464,14 @@ impl Files {
             Some(FileOutgoing::Cancel { transfer, reason }) => {
                 self.exchange.peer_cancel(transfer, reason)
             }
+            // Kept, not dropped: what the guest copied is there when somebody
+            // comes back to the window, which is what an ordinary selection
+            // already does.
+            Some(FileOutgoing::Offer { serial }) if !focused => {
+                self.awaited = Some(serial);
+
+                Vec::new()
+            }
             _ if !focused => Vec::new(),
             Some(FileOutgoing::Offer { serial }) => self.exchange.peer_offer(serial, now),
             Some(FileOutgoing::Request { serial, transfer }) => {
@@ -473,6 +487,14 @@ impl Files {
                 self.exchange.peer_chunk(transfer, &chunk, now)
             }
             Some(FileOutgoing::Complete { transfer }) => self.exchange.peer_complete(transfer, now),
+            None => Vec::new(),
+        }
+    }
+
+    /// Asks for the offer that arrived while the window was away.
+    fn focus_gained(&mut self, now: Instant) -> Vec<FileOp> {
+        match self.awaited.take() {
+            Some(serial) => self.exchange.peer_offer(serial, now),
             None => Vec::new(),
         }
     }
@@ -1411,6 +1433,39 @@ mod tests {
                 serial: 7,
                 transfer: 1,
             })]
+        );
+    }
+
+    #[test]
+    fn an_offer_made_while_the_window_was_away_is_asked_for_when_it_comes_back() {
+        let parameters = file_parameters(true);
+        let mut files = Files::new(&parameters);
+        let policy = record_of_file(&FileOutgoing::Policy(Policy::new(1024, 4096, 3600)), 0, 0);
+        let now = Instant::now();
+
+        files.handle(true, &policy.header, &policy.payload, now);
+
+        // Two offers while away: the last one is what the guest's clipboard
+        // holds, so it is the one that gets asked for.
+        for serial in [7, 8] {
+            let offer = file_offer(serial);
+            assert_eq!(
+                files.handle(false, &offer.header, &offer.payload, now),
+                Vec::new()
+            );
+        }
+
+        assert_eq!(
+            files.focus_gained(now),
+            vec![FileOp::Send(FileOutgoing::Request {
+                serial: 8,
+                transfer: 1,
+            })]
+        );
+        assert_eq!(
+            files.focus_gained(now),
+            Vec::new(),
+            "an offer is asked for once"
         );
     }
 
