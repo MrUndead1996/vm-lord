@@ -14,7 +14,7 @@ use std::{error::Error, fmt};
 use crate::v1::{Capability, ProtocolVersion};
 
 /// The revision of the schema this build implements.
-pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 3 };
+pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 4 };
 
 impl ProtocolVersion {
     /// The revision this build implements.
@@ -96,6 +96,9 @@ pub fn capabilities_at(
 ) -> Vec<Capability> {
     if version.major != 1 || version.minor < 3 {
         capabilities.retain(|capability| *capability != Capability::FileClipboard);
+    }
+    if version.major != 1 || version.minor < 4 {
+        capabilities.retain(|capability| *capability != Capability::HostDisplayModes);
     }
     capabilities
 }

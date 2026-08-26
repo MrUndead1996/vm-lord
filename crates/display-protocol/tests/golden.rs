@@ -23,8 +23,8 @@ use vmlord_display_protocol::{
     record::{self, Channel, Limits, Record},
     session::{Offer, Session, Support},
     v1::{
-        Capability, FrameRecord, InputRecord, KeyEvent, Mode, PixelFormat, PointerMotion,
-        StreamConfig,
+        Capability, ControlRecord, DisplayTiming, FrameRecord, InputRecord, KeyEvent, Mode,
+        PixelFormat, PointerMotion, SetAvailableModes, SetDisplayMode, StreamConfig,
     },
 };
 
@@ -116,6 +116,35 @@ fn the_handshake_is_the_bytes_it_has_always_been() {
 fn one_record_of_each_carrying_type_is_the_bytes_it_has_always_been() {
     let limits = Limits::new(1920, 1080);
     let mut wire = Vec::new();
+
+    let timing = DisplayTiming {
+        width: 2560,
+        height: 1440,
+        refresh_hz: 144,
+    };
+    let available = Record::new(
+        Channel::Control,
+        ControlRecord::SetAvailableModes as u16,
+        0,
+        0,
+        0,
+        SetAvailableModes {
+            modes: vec![timing.clone()],
+            preferred: Some(timing.clone()),
+        }
+        .encode_to_vec(),
+    );
+    record::write(&mut wire, &available, &limits).expect("available display modes");
+
+    let selected = Record::new(
+        Channel::Control,
+        ControlRecord::SetDisplayMode as u16,
+        1,
+        0,
+        0,
+        SetDisplayMode { mode: Some(timing) }.encode_to_vec(),
+    );
+    record::write(&mut wire, &selected, &limits).expect("a selected display mode");
 
     let stream_config = Record::new(
         Channel::Frame,
