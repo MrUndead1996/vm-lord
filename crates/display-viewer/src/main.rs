@@ -48,7 +48,7 @@ use vmlord_display_protocol::{
     v1::{Capability, Mode},
 };
 use vmlord_display_viewer::{
-    display_modes::{DisplayMode, select_mode},
+    display_modes::{self, DisplayMode, select_mode},
     fps_gap::{self, FpsGap},
     input::{self, Report},
     launch::{self, Command, DiagnosticLevel, Handover, LaunchParameters, Link, Message},
@@ -858,7 +858,9 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState, fps_gap_threshold_percen
                 // falls back by policy when it does not, which is what a
                 // laptop coming back without its dock looks like.
                 let chosen = select_mode(state.display_mode, &snapshot.modes);
-                offered = snapshot.modes;
+                // Cut to what the guest's connector holds before anything is
+                // published: a longer list is one the module refuses whole.
+                offered = display_modes::offered(&snapshot.modes, Some(chosen));
                 native = snapshot.preferred;
                 context.window.set_modes(&offered, Some(chosen));
                 let _ = context.orders.send(Order::AvailableModes {

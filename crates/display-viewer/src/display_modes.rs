@@ -44,7 +44,7 @@ impl DisplayMode {
         })
     }
 
-    fn key(self) -> (u64, u32, u32, u32) {
+    pub(crate) fn key(self) -> (u64, u32, u32, u32) {
         (
             u64::from(self.width) * u64::from(self.height),
             self.width,
@@ -97,7 +97,12 @@ pub const SC_MODE_FIRST: usize = 0x9100;
 /// The distance between two of them.
 pub const SC_MODE_STEP: usize = 0x10;
 
-/// How many modes the menu offers, which is what the guest's list holds.
+/// How many modes are offered at once.
+///
+/// The guest's limit as much as the menu's: the module parses a write into a
+/// fixed array of this many before it takes its lock, and a longer list is one
+/// it refuses whole. A monitor with sixty admissible modes is ordinary, so the
+/// cut is made here rather than discovered on the socket.
 pub const MAX_MENU_MODES: usize = 32;
 
 /// The command id the mode at `index` is offered under.
@@ -116,6 +121,30 @@ pub fn menu_index(command: usize) -> Option<usize> {
     let index = offset / SC_MODE_STEP;
 
     (index < MAX_MENU_MODES).then_some(index)
+}
+
+/// The modes to offer, out of everything the monitor drives.
+///
+/// The largest [`MAX_MENU_MODES`], because a list that has to be cut is cut
+/// from the bottom: nobody picks 640x480 on a 1440p panel, and the mode that
+/// is already selected is kept whatever its size.
+#[must_use]
+pub fn offered(modes: &[DisplayMode], keep: Option<DisplayMode>) -> Vec<DisplayMode> {
+    if modes.len() <= MAX_MENU_MODES {
+        return modes.to_vec();
+    }
+
+    let mut offered: Vec<_> = modes[modes.len() - MAX_MENU_MODES..].to_vec();
+    if let Some(keep) = keep.filter(|keep| modes.contains(keep))
+        && !offered.contains(&keep)
+    {
+        // The smallest of the kept ones makes room: what the user is on now
+        // is not a mode to drop for being small.
+        offered[0] = keep;
+        offered.sort_unstable_by_key(|mode| mode.key());
+    }
+
+    offered
 }
 
 /// How a mode reads in the menu.
@@ -207,5 +236,39 @@ mod tests {
     #[test]
     fn a_mode_reads_as_its_three_numbers() {
         assert_eq!(super::label(mode(1920, 1080, 60)), "1920 x 1080 @ 60 Hz");
+    }
+
+    #[test]
+    fn a_monitor_with_more_modes_than_the_guest_holds_is_cut_from_the_bottom() {
+        let modes = normalize_modes((0..50).map(|step| (640 + step * 8, 480, 60)));
+        assert!(modes.len() > super::MAX_MENU_MODES);
+
+        let offered = super::offered(&modes, None);
+
+        assert_eq!(offered.len(), super::MAX_MENU_MODES);
+        assert_eq!(
+            offered.last(),
+            modes.last(),
+            "the largest mode is never the one dropped"
+        );
+    }
+
+    #[test]
+    fn the_mode_in_use_survives_the_cut_however_small_it_is() {
+        let modes = normalize_modes((0..50).map(|step| (640 + step * 8, 480, 60)));
+        let smallest = modes[0];
+
+        let offered = super::offered(&modes, Some(smallest));
+
+        assert_eq!(offered.len(), super::MAX_MENU_MODES);
+        assert!(offered.contains(&smallest));
+        assert_eq!(offered.last(), modes.last());
+    }
+
+    #[test]
+    fn a_list_the_guest_already_holds_is_left_alone() {
+        let modes = normalize_modes([(1280, 720, 60), (1920, 1080, 60)]);
+
+        assert_eq!(super::offered(&modes, None), modes);
     }
 }
