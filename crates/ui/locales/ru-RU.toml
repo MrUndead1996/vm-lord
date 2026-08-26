@@ -17,6 +17,7 @@ language = "Язык"
 log_file = "Файл журнала"
 log_file_hint = "Путь к файлу журнала"
 log_level = "Уровень журнала"
+default_distro = "Дистрибутив по умолчанию"
 vm_storage_required = "Укажите путь к хранилищу ВМ."
 log_file_required = "Укажите путь к файлу журнала."
 

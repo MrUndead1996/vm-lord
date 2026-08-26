@@ -103,7 +103,7 @@ struct CreateVmForm {
     source_kind: SourceKind,
     /// Installation media: the path to the ISO the guest is installed from.
     image_path: String,
-    /// Cloud image: the release, from [`UBUNTU_RELEASES`].
+    /// Cloud image: one of the releases named by `profile`.
     release: String,
     username: String,
     /// Empty means no password at all: the guest is reachable by key only.
@@ -145,7 +145,7 @@ struct SettingsForm {
     /// whole `AppSettings`, so a field it does not know about would be lost on
     /// every save. The widget for it arrives with the image download UI.
     image_cache_path: PathBuf,
-    /// Carried through unchanged; profile selection is configured in TOML.
+    /// Identifier of the distribution profile used for new cloud-image VMs.
     default_distro: String,
     /// Carried through unchanged for the same reason as `image_cache_path`,
     /// and with no widget of its own on purpose: the readiness timeouts are
@@ -494,10 +494,11 @@ impl eframe::App for VmlordUi {
             None => {}
         }
 
+        let distro_options = self.application.distro_options().collect::<Vec<_>>();
         let settings_dialog_action = self
             .settings_form
             .as_mut()
-            .and_then(|form| render_settings_dialog(context, form));
+            .and_then(|form| render_settings_dialog(context, form, &distro_options));
         match settings_dialog_action {
             Some(SettingsDialogAction::BrowseVmStorage) => {
                 match self.application.pick_vm_storage_directory() {
@@ -936,6 +937,7 @@ fn render_provisioning_fields(
 fn render_settings_dialog(
     context: &egui::Context,
     form: &mut SettingsForm,
+    distro_options: &[(&str, &str)],
 ) -> Option<SettingsDialogAction> {
     let mut open = true;
     let mut action = None;
@@ -966,6 +968,20 @@ fn render_settings_dialog(
                             action = Some(SettingsDialogAction::BrowseVmStorage);
                         }
                     });
+                    ui.end_row();
+
+                    ui.add_sized(
+                        [110.0, 24.0],
+                        egui::Label::new(t!("settings.default_distro").to_string()),
+                    );
+                    egui::ComboBox::from_id_salt("settings-default-distro")
+                        .width(310.0)
+                        .selected_text(distro_label(distro_options, &form.default_distro))
+                        .show_ui(ui, |ui| {
+                            for &(id, name) in distro_options {
+                                ui.selectable_value(&mut form.default_distro, id.to_owned(), name);
+                            }
+                        });
                     ui.end_row();
 
                     ui.add_sized(
@@ -1080,6 +1096,13 @@ fn render_settings_dialog(
         action = Some(SettingsDialogAction::Cancel);
     }
     action
+}
+
+fn distro_label<'a>(options: &'a [(&str, &str)], selected: &'a str) -> &'a str {
+    options
+        .iter()
+        .find_map(|&(id, name)| (id == selected).then_some(name))
+        .unwrap_or(selected)
 }
 
 fn render_edit_vm_dialog(
@@ -3060,6 +3083,14 @@ mod tests {
 
         assert_eq!(form.release, "42");
         assert_eq!(form.username, "fedora");
+    }
+
+    #[test]
+    fn distro_setting_shows_the_profile_name_for_its_stored_identifier() {
+        let options = [("fedora", "Fedora Linux"), ("ubuntu", "Ubuntu")];
+
+        assert_eq!(distro_label(&options, "fedora"), "Fedora Linux");
+        assert_eq!(distro_label(&options, "missing"), "missing");
     }
 
     #[test]

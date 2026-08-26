@@ -6,9 +6,10 @@ pub mod gpu;
 use std::{collections::HashMap, fmt, path::PathBuf, time::SystemTime};
 
 use vmlord_core::{
-    AppSettings, Diagnostic, DiagnosticsSink, DistroProfile, GuestDefaults, HostGpuCapabilities,
-    RepositoryError, SettingsError, SettingsStore, Subsystem, VmCreateRequest, VmDeleteRequest,
-    VmDisplayStatus, VmGpuStatus, VmRepository, VmState, VmSummary, VmUpdateRequest,
+    AppSettings, Diagnostic, DiagnosticsSink, DistroCatalog, DistroCatalogError, DistroProfile,
+    GuestDefaults, HostGpuCapabilities, RepositoryError, SettingsError, SettingsStore, Subsystem,
+    VmCreateRequest, VmDeleteRequest, VmDisplayStatus, VmGpuStatus, VmRepository, VmState,
+    VmSummary, VmUpdateRequest,
 };
 
 pub use display::derive_status as derive_display_status;
@@ -24,6 +25,8 @@ pub enum BackendStatus {
 #[derive(Debug)]
 pub enum SettingsUpdateError {
     NotInitialized,
+    DistroCatalogUnavailable,
+    Distro(DistroCatalogError),
     Save(SettingsError),
 }
 
@@ -31,6 +34,10 @@ impl fmt::Display for SettingsUpdateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::NotInitialized => formatter.write_str("application settings are not initialized"),
+            Self::DistroCatalogUnavailable => {
+                formatter.write_str("distribution profile catalog is not loaded")
+            }
+            Self::Distro(error) => error.fmt(formatter),
             Self::Save(error) => error.fmt(formatter),
         }
     }
@@ -39,7 +46,8 @@ impl fmt::Display for SettingsUpdateError {
 impl std::error::Error for SettingsUpdateError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::NotInitialized => None,
+            Self::NotInitialized | Self::DistroCatalogUnavailable => None,
+            Self::Distro(error) => Some(error),
             Self::Save(error) => Some(error),
         }
     }
@@ -97,7 +105,7 @@ pub struct WorkspaceApp {
     image_picker: Option<Box<dyn ImagePicker>>,
     settings_path_picker: Option<Box<dyn SettingsPathPicker>>,
     settings: Option<SettingsContext>,
-    distro_profile: Option<DistroProfile>,
+    distro_catalog: Option<DistroCatalog>,
     guest_defaults: GuestDefaults,
     status: BackendStatus,
     vms: Vec<VmSummary>,
@@ -146,7 +154,7 @@ impl WorkspaceApp {
             image_picker: None,
             settings_path_picker: None,
             settings: None,
-            distro_profile: None,
+            distro_catalog: None,
             guest_defaults: GuestDefaults::default(),
             status: BackendStatus::Starting,
             vms: Vec::new(),
@@ -190,14 +198,19 @@ impl WorkspaceApp {
     }
 
     #[must_use]
-    pub fn with_distro_profile(mut self, profile: DistroProfile) -> Self {
-        self.distro_profile = Some(profile);
+    pub fn with_distro_catalog(mut self, catalog: DistroCatalog) -> Self {
+        self.distro_catalog = Some(catalog);
         self
     }
 
     #[must_use]
     pub fn distro_profile(&self) -> Option<&DistroProfile> {
-        self.distro_profile.as_ref()
+        let id = &self.settings.as_ref()?.current.default_distro;
+        self.distro_catalog.as_ref()?.select(id).ok()
+    }
+
+    pub fn distro_options(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.distro_catalog.iter().flat_map(DistroCatalog::options)
     }
 
     /// Sets what a new VM's locale, keyboard layout and timezone start out as.
@@ -235,9 +248,20 @@ impl WorkspaceApp {
     }
 
     pub fn update_settings(&mut self, settings: AppSettings) -> Result<(), SettingsUpdateError> {
-        let Some(context) = &mut self.settings else {
+        if self.settings.is_none() {
             return Err(SettingsUpdateError::NotInitialized);
-        };
+        }
+        let catalog = self
+            .distro_catalog
+            .as_ref()
+            .ok_or(SettingsUpdateError::DistroCatalogUnavailable)?;
+        catalog
+            .select(&settings.default_distro)
+            .map_err(SettingsUpdateError::Distro)?;
+        let context = self
+            .settings
+            .as_mut()
+            .expect("settings were checked before validating their distribution");
         context
             .store
             .save(&settings)
@@ -869,14 +893,121 @@ mod tests {
 
     use super::*;
 
+    fn temporary_directory() -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("vmlord-app-distro-test-{unique}"))
+    }
+
+    fn distro_catalog(directory: &std::path::Path) -> vmlord_core::DistroCatalog {
+        let distros = directory.join("distros");
+        fs::create_dir_all(&distros).unwrap();
+        fs::write(
+            distros.join("ubuntu.json"),
+            include_str!("../../../distros/ubuntu.json"),
+        )
+        .unwrap();
+        fs::write(
+            distros.join("fedora.json"),
+            include_str!("../../../distros/ubuntu.json")
+                .replace("Ubuntu", "Fedora")
+                .replace("ubuntu", "fedora"),
+        )
+        .unwrap();
+        vmlord_core::DistroCatalog::load(&SettingsStore::new(directory.join("settings.toml")))
+            .unwrap()
+    }
+
     #[test]
-    fn application_exposes_the_distribution_profile_supplied_by_composition_root() {
-        let profile = vmlord_core::ubuntu();
+    fn stale_distribution_setting_can_be_repaired_from_exposed_options() {
+        let directory = temporary_directory();
+        let store = SettingsStore::new(directory.join("settings.toml"));
+        let stale = AppSettings {
+            vm_storage_path: directory.join("vms"),
+            language: Language::EnUs,
+            log_file_path: directory.join("logs/vmlord.log"),
+            log_level: LogLevel::Info,
+            image_cache_path: directory.join("images"),
+            default_distro: "removed-profile".into(),
+            guest_readiness: vmlord_core::GuestReadinessTimeouts::default(),
+        };
+        store.save(&stale).unwrap();
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()))
+            .with_distro_catalog(distro_catalog(&directory))
+            .with_settings(store, stale.clone());
 
-        let app = WorkspaceApp::new(Box::new(FakeRepository::default()))
-            .with_distro_profile(profile.clone());
+        assert_eq!(
+            app.distro_options().collect::<Vec<_>>(),
+            [("fedora", "Fedora"), ("ubuntu", "Ubuntu")]
+        );
+        assert_eq!(app.distro_profile(), None);
 
-        assert_eq!(app.distro_profile(), Some(&profile));
+        let mut repaired = stale;
+        repaired.default_distro = "fedora".into();
+        app.update_settings(repaired).unwrap();
+
+        assert_eq!(app.distro_profile().unwrap().name, "Fedora");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn settings_refuse_a_distribution_that_is_not_in_the_loaded_catalog() {
+        let directory = temporary_directory();
+        let store = SettingsStore::new(directory.join("settings.toml"));
+        let initial = AppSettings {
+            vm_storage_path: directory.join("vms"),
+            language: Language::EnUs,
+            log_file_path: directory.join("logs/vmlord.log"),
+            log_level: LogLevel::Info,
+            image_cache_path: directory.join("images"),
+            default_distro: "ubuntu".into(),
+            guest_readiness: vmlord_core::GuestReadinessTimeouts::default(),
+        };
+        store.save(&initial).unwrap();
+        let mut updated = initial.clone();
+        updated.default_distro = "arch".into();
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()))
+            .with_distro_catalog(distro_catalog(&directory))
+            .with_settings(store.clone(), initial.clone());
+
+        let error = app.update_settings(updated).unwrap_err().to_string();
+
+        assert!(error.contains("arch"), "{error}");
+        assert_eq!(app.settings(), Some(&initial));
+        assert_eq!(store.load_or_create().unwrap(), initial);
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn settings_do_not_persist_a_distribution_when_the_catalog_is_unavailable() {
+        let directory = temporary_directory();
+        let store = SettingsStore::new(directory.join("settings.toml"));
+        let initial = AppSettings {
+            vm_storage_path: directory.join("vms"),
+            language: Language::EnUs,
+            log_file_path: directory.join("logs/vmlord.log"),
+            log_level: LogLevel::Info,
+            image_cache_path: directory.join("images"),
+            default_distro: "ubuntu".into(),
+            guest_readiness: vmlord_core::GuestReadinessTimeouts::default(),
+        };
+        store.save(&initial).unwrap();
+        let mut updated = initial.clone();
+        updated.default_distro = "fedora".into();
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()))
+            .with_settings(store.clone(), initial.clone());
+
+        let error = app.update_settings(updated).unwrap_err().to_string();
+
+        assert!(error.contains("catalog"), "{error}");
+        assert_eq!(app.settings(), Some(&initial));
+        assert_eq!(store.load_or_create().unwrap(), initial);
+
+        fs::remove_dir_all(directory).unwrap();
     }
     use vmlord_core::{DiagnosticLevel, HostGpuCapabilities, Language, LogLevel, VmState};
 
@@ -1504,6 +1635,7 @@ mod tests {
                 .as_nanos()
         ));
         let store = SettingsStore::new(directory.join("settings.toml"));
+        let catalog = distro_catalog(&directory);
         let initial_settings = AppSettings {
             vm_storage_path: directory.join("vms"),
             language: Language::EnUs,
@@ -1519,16 +1651,18 @@ mod tests {
             log_file_path: directory.join("diagnostics").join("application.log"),
             log_level: LogLevel::Debug,
             image_cache_path: directory.join("cached-images"),
-            default_distro: "ubuntu".into(),
+            default_distro: "fedora".into(),
             guest_readiness: vmlord_core::GuestReadinessTimeouts::default(),
         };
         let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()))
             .with_diagnostics(sink)
+            .with_distro_catalog(catalog)
             .with_settings(store.clone(), initial_settings);
 
         app.update_settings(updated_settings.clone()).unwrap();
 
         assert_eq!(app.settings(), Some(&updated_settings));
+        assert_eq!(app.distro_profile().unwrap().name, "Fedora");
         assert_eq!(store.load_or_create().unwrap(), updated_settings);
         assert!(
             app.diagnostics()

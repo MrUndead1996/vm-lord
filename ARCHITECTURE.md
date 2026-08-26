@@ -701,9 +701,11 @@ placing that directory beside `settings.toml`. `core::distro::DistroCatalog`
 enumerates the directory once at startup, derives each profile identifier from
 its file name and deserializes the complete catalog. `default_distro` in
 `settings.toml` selects the profile used for new cloud-image VMs and defaults
-to `ubuntu` when an older settings file has no such field. Directory, file and
-JSON errors retain the failing path; an unknown configured identifier names
-the missing profile rather than silently falling back.
+to `ubuntu` when an older settings file has no such field. The settings dialog
+lists every loaded profile and applies a new default immediately to subsequent
+VM creation. Directory, file and JSON errors retain the failing path; an
+unknown configured identifier names the missing profile rather than silently
+falling back.
 
 `core::logging` installs the shared `log` backend after settings are loaded and
 before the backend starts. It writes records at the configured `log_level` to

@@ -32,12 +32,20 @@ fn main() {
             vmlord_app::unavailable_repository(format!("failed to initialize settings: {error}"))
         }
     };
-    let distro_profile =
+    let distro_catalog =
         settings.as_ref().ok().and_then(
-            |(store, settings)| match vmlord_core::DistroCatalog::load(store)
-                .and_then(|catalog| catalog.select(&settings.default_distro).cloned())
-            {
-                Ok(profile) => Some(profile),
+            |(store, settings)| match vmlord_core::DistroCatalog::load(store) {
+                Ok(catalog) => {
+                    if let Err(error) = catalog.select(&settings.default_distro) {
+                        eprintln!("failed to load distribution profiles: {error}");
+                        vmlord_core::diagnostic!(
+                            Error,
+                            vmlord_core::Subsystem::App,
+                            "Failed to load distribution profiles: {error}"
+                        );
+                    }
+                    Some(catalog)
+                }
                 Err(error) => {
                     eprintln!("failed to load distribution profiles: {error}");
                     vmlord_core::diagnostic!(
@@ -53,8 +61,8 @@ fn main() {
         .with_guest_defaults(vmlord_platform::host_guest_defaults())
         .with_image_picker(Box::new(pickers::WindowsImagePicker::new()))
         .with_settings_path_picker(Box::new(pickers::WindowsSettingsPathPicker::new()));
-    if let Some(profile) = distro_profile {
-        application = application.with_distro_profile(profile);
+    if let Some(catalog) = distro_catalog {
+        application = application.with_distro_catalog(catalog);
     }
     // Without this the panel stays empty: the layer records, and nobody reads.
     if let Some(sink) = diagnostics {

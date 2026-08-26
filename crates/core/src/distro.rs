@@ -126,6 +126,12 @@ impl DistroCatalog {
             .get(id)
             .ok_or_else(|| DistroCatalogError::ProfileNotFound { id: id.to_owned() })
     }
+
+    pub fn options(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.profiles
+            .iter()
+            .map(|(id, profile)| (id.as_str(), profile.name.as_str()))
+    }
 }
 
 #[derive(Debug)]
@@ -364,6 +370,10 @@ mod tests {
 
         assert_eq!(catalog.len(), 2);
         assert_eq!(catalog.select("fedora").unwrap().default_user, "fedora");
+        assert_eq!(
+            catalog.options().collect::<Vec<_>>(),
+            [("fedora", "Fedora"), ("ubuntu", "Ubuntu")]
+        );
 
         fs::remove_dir_all(directory).unwrap();
     }
