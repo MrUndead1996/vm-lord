@@ -14,10 +14,10 @@ use std::{
 
 use uuid::Uuid;
 use vmlord_core::{
-    AgentStatus, DiagnosticLevel, DisplayProvisioning, GpuAssignment, GpuMode, GuestDisplayReport,
-    GuestReadinessTimeouts, HostGpuCapabilities, NetworkMode, RepositoryError, SshAvailability,
-    SshPort, Subsystem, VmCreateRequest, VmDeleteRequest, VmDisplayFacts, VmRepository, VmState,
-    VmSummary, VmUpdateRequest,
+    AgentStatus, DiagnosticLevel, DisplayProvisioning, FileClipboardSettings, GpuAssignment,
+    GpuMode, GuestDisplayReport, GuestReadinessTimeouts, HostGpuCapabilities, NetworkMode,
+    RepositoryError, SshAvailability, SshPort, Subsystem, VmCreateRequest, VmDeleteRequest,
+    VmDisplayFacts, VmRepository, VmState, VmSummary, VmUpdateRequest,
 };
 
 use crate::{
@@ -71,6 +71,7 @@ pub struct HcsVmRepository {
     /// Kept beside the cycle so that a later `with_readiness_timeouts` can be
     /// told apart from the defaults the cycle was built with.
     readiness_timeouts: ReadinessTimeouts,
+    file_clipboard: FileClipboardSettings,
     /// The VMs being created right now.
     builds: Arc<BuildRegistry>,
     /// Starts VMs. Shared rather than owned because a start now runs on a
@@ -151,6 +152,7 @@ impl HcsVmRepository {
                 &storage_root,
             )),
             readiness_timeouts: ReadinessTimeouts::default(),
+            file_clipboard: FileClipboardSettings::default(),
             builds: Arc::new(BuildRegistry::default()),
             start: Arc::new(
                 VmStartPipeline::production(com1_launcher.clone()).for_vms_under(
@@ -197,6 +199,13 @@ impl HcsVmRepository {
                  with the cycle they would have changed"
             ),
         }
+        self
+    }
+
+    /// Replaces the defaults used by every subsequently launched viewer.
+    #[must_use]
+    pub fn with_file_clipboard_settings(mut self, settings: FileClipboardSettings) -> Self {
+        self.file_clipboard = settings;
         self
     }
 
@@ -735,6 +744,7 @@ impl HcsVmRepository {
             runtime_id,
             mode: mapping.display_mode,
             viewer: display_launches::viewer_path()?,
+            file_policy: self.file_clipboard,
         })
     }
 

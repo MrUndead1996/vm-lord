@@ -20,7 +20,7 @@ use prost::Message as _;
 use crate::viewer::v1::{self as wire, envelope};
 
 /// The revision of the launch contract this build speaks.
-pub const REVISION: u32 = 1;
+pub const REVISION: u32 = 2;
 
 /// The largest message a launch pipe may carry.
 ///
@@ -83,6 +83,29 @@ pub struct LaunchParameters {
     pub token: Vec<u8>,
     /// The `ClientHello` record to write once the control socket connects.
     pub client_hello: Vec<u8>,
+    /// Limits and completed-file lifetime for clipboard file transfers.
+    pub file_policy: FilePolicy,
+}
+
+/// Parsed file clipboard settings handed to the viewer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FilePolicy {
+    pub max_file_bytes: u64,
+    pub max_transfer_bytes: u64,
+    pub retention_seconds: u64,
+}
+
+impl FilePolicy {
+    fn validate(self) -> Result<Self, LaunchError> {
+        if self.max_file_bytes == 0
+            || self.max_transfer_bytes == 0
+            || self.retention_seconds == 0
+            || self.max_file_bytes > self.max_transfer_bytes
+        {
+            return Err(LaunchError::Policy);
+        }
+        Ok(self)
+    }
 }
 
 /// The one-shot derived credential, and what the handshake settled on.
@@ -133,6 +156,9 @@ pub fn encode(message: &Message) -> Vec<u8> {
             tile_size: parameters.tile_size,
             token: parameters.token.clone(),
             client_hello: parameters.client_hello.clone(),
+            clipboard_max_file_bytes: parameters.file_policy.max_file_bytes,
+            clipboard_max_transfer_bytes: parameters.file_policy.max_transfer_bytes,
+            clipboard_retention_seconds: parameters.file_policy.retention_seconds,
         }),
         Message::RelayToViewer(bytes) => envelope::Kind::RelayToViewer(wire::Relay {
             bytes: bytes.clone(),
@@ -208,6 +234,12 @@ pub fn decode(bytes: &[u8]) -> Result<Message, LaunchError> {
             tile_size: parameters.tile_size,
             token: parameters.token,
             client_hello: parameters.client_hello,
+            file_policy: FilePolicy {
+                max_file_bytes: parameters.clipboard_max_file_bytes,
+                max_transfer_bytes: parameters.clipboard_max_transfer_bytes,
+                retention_seconds: parameters.clipboard_retention_seconds,
+            }
+            .validate()?,
         }),
         envelope::Kind::RelayToViewer(relay) => Message::RelayToViewer(relay.bytes),
         envelope::Kind::RelayFromViewer(relay) => Message::RelayFromViewer(relay.bytes),
@@ -388,6 +420,8 @@ pub enum LaunchError {
     Decode(prost::DecodeError),
     /// The pipe failed.
     Io(io::Error),
+    /// File clipboard limits are zero or internally inconsistent.
+    Policy,
 }
 
 impl fmt::Display for LaunchError {
@@ -408,6 +442,7 @@ impl fmt::Display for LaunchError {
             ),
             Self::Decode(error) => write!(formatter, "a launch message is unreadable: {error}"),
             Self::Io(error) => write!(formatter, "a launch pipe failed: {error}"),
+            Self::Policy => formatter.write_str("the launch file clipboard policy is invalid"),
         }
     }
 }
@@ -426,7 +461,9 @@ impl Error for LaunchError {
 mod tests {
     use std::io;
 
-    use super::{Command, Handover, LaunchError, LaunchParameters, Link, Message, decode, encode};
+    use super::{
+        Command, FilePolicy, Handover, LaunchError, LaunchParameters, Link, Message, decode, encode,
+    };
 
     fn parameters() -> LaunchParameters {
         LaunchParameters {
@@ -441,6 +478,11 @@ mod tests {
             tile_size: 32,
             token: vec![9; 32],
             client_hello: vec![1, 2, 3, 4],
+            file_policy: FilePolicy {
+                max_file_bytes: 1 << 30,
+                max_transfer_bytes: 4 << 30,
+                retention_seconds: 86_400,
+            },
         }
     }
 
@@ -482,6 +524,41 @@ mod tests {
     }
 
     #[test]
+    fn file_policy_survives_the_launch_pipe() {
+        let decoded = decode(&encode(&Message::Launch(parameters()))).unwrap();
+
+        let Message::Launch(parameters) = decoded else {
+            panic!("the launch message changed kind");
+        };
+        assert_eq!(parameters.file_policy.max_file_bytes, 1 << 30);
+        assert_eq!(parameters.file_policy.max_transfer_bytes, 4 << 30);
+        assert_eq!(parameters.file_policy.retention_seconds, 86_400);
+    }
+
+    #[test]
+    fn a_zero_or_inverted_file_policy_is_refused() {
+        for policy in [
+            FilePolicy {
+                max_file_bytes: 0,
+                max_transfer_bytes: 4,
+                retention_seconds: 1,
+            },
+            FilePolicy {
+                max_file_bytes: 5,
+                max_transfer_bytes: 4,
+                retention_seconds: 1,
+            },
+        ] {
+            let mut launch = parameters();
+            launch.file_policy = policy;
+            assert!(matches!(
+                decode(&encode(&Message::Launch(launch))),
+                Err(LaunchError::Policy)
+            ));
+        }
+    }
+
+    #[test]
     fn a_message_from_another_revision_is_refused() {
         let mut bytes = encode(&Message::Command(Command::Focus));
         // Field 1, varint: the revision is the first two bytes of the envelope.
@@ -496,8 +573,8 @@ mod tests {
 
     #[test]
     fn an_envelope_naming_no_message_is_refused() {
-        // Revision 1 and nothing else.
-        assert!(matches!(decode(&[0x08, 0x01]), Err(LaunchError::Empty)));
+        // Current revision and nothing else.
+        assert!(matches!(decode(&[0x08, 0x02]), Err(LaunchError::Empty)));
     }
 
     #[test]

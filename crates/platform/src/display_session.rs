@@ -15,14 +15,14 @@
 //! session and no longer.
 
 use uuid::Uuid;
-use vmlord_core::{DiagnosticLevel, DisplayMode};
+use vmlord_core::{DiagnosticLevel, DisplayMode, FileClipboardSettings};
 use vmlord_display_protocol::{
     keys::{self, Secret},
     record::{self, Channel, Limits, Record},
     session::{Event, Offer, Session},
     v1::{Capability, Mode},
 };
-use vmlord_display_viewer::launch::{Handover, LaunchParameters, Message};
+use vmlord_display_viewer::launch::{FilePolicy, Handover, LaunchParameters, Message};
 
 use crate::hvsocket::{
     DISPLAY_CLIPBOARD_VSOCK_PORT, DISPLAY_CONTROL_VSOCK_PORT, DISPLAY_FRAME_VSOCK_PORT,
@@ -105,6 +105,7 @@ impl Driver {
         secret: Secret,
         runtime_id: Uuid,
         mode: Option<DisplayMode>,
+        file_settings: FileClipboardSettings,
     ) -> (Self, LaunchParameters) {
         let offer = Offer {
             // What the guest announces and what this viewer implements.
@@ -137,6 +138,11 @@ impl Driver {
             tile_size: offer.tile_size,
             token: token.clone(),
             client_hello: framed(&hello),
+            file_policy: FilePolicy {
+                max_file_bytes: file_settings.max_file_size.bytes(),
+                max_transfer_bytes: file_settings.max_transfer_size.bytes(),
+                retention_seconds: file_settings.retention.seconds(),
+            },
         };
 
         (
@@ -349,6 +355,7 @@ fn name_of(message: &Message) -> &'static str {
 #[cfg(test)]
 mod tests {
     use uuid::Uuid;
+    use vmlord_core::FileClipboardSettings;
     use vmlord_display_protocol::{
         keys::Secret,
         record::{self, Record},
@@ -378,7 +385,13 @@ mod tests {
     fn driver(mode: Option<vmlord_core::DisplayMode>) -> (Driver, Secret, Vec<u8>, Vec<u8>) {
         let secret = Secret::generate();
         let guest_secret = Secret::from_base64(&secret.to_base64()).expect("the same secret");
-        let (driver, parameters) = Driver::open("dev", secret, Uuid::from_u128(7), mode);
+        let (driver, parameters) = Driver::open(
+            "dev",
+            secret,
+            Uuid::from_u128(7),
+            mode,
+            FileClipboardSettings::default(),
+        );
 
         (
             driver,
@@ -451,8 +464,13 @@ mod tests {
 
     #[test]
     fn the_launch_parameters_name_the_partition_and_the_three_ports() {
-        let (_driver, parameters) =
-            Driver::open("dev", Secret::generate(), Uuid::from_u128(7), None);
+        let (_driver, parameters) = Driver::open(
+            "dev",
+            Secret::generate(),
+            Uuid::from_u128(7),
+            None,
+            FileClipboardSettings::default(),
+        );
 
         assert_eq!(parameters.vm_name, "dev");
         assert_eq!(parameters.runtime_id, *Uuid::from_u128(7).as_bytes());
@@ -470,6 +488,7 @@ mod tests {
             Secret::generate(),
             Uuid::from_u128(7),
             vmlord_core::DisplayMode::new(2560, 1440),
+            FileClipboardSettings::default(),
         );
 
         assert_eq!((parameters.width, parameters.height), (2560, 1440));
@@ -477,8 +496,13 @@ mod tests {
 
     #[test]
     fn a_vm_with_no_stored_mode_is_offered_the_size_every_vm_has_come_up_at() {
-        let (_driver, parameters) =
-            Driver::open("dev", Secret::generate(), Uuid::from_u128(7), None);
+        let (_driver, parameters) = Driver::open(
+            "dev",
+            Secret::generate(),
+            Uuid::from_u128(7),
+            None,
+            FileClipboardSettings::default(),
+        );
 
         assert_eq!((parameters.width, parameters.height), (1920, 1080));
     }
