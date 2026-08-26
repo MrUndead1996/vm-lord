@@ -11,7 +11,11 @@
 //! magic number: the version is settled in the handshake, and four bytes per
 //! frame to make a packet dump readable is not a trade worth making.
 
-use std::{error::Error, fmt, io};
+use std::{
+    error::Error,
+    fmt, io,
+    time::{Duration, Instant},
+};
 
 /// The width of the header this build writes and understands.
 pub const HEADER_LEN: usize = 24;
@@ -391,14 +395,20 @@ pub fn read<R: io::Read>(
         // At most 231 bytes, since `header_len` is one byte wide, so the
         // buffer is a stack array rather than an allocation a peer sizes.
         let mut skipped = [0u8; 256];
-        reader
-            .read_exact(&mut skipped[..extra])
-            .map_err(RecordError::Io)?;
+        fill(
+            reader,
+            &mut skipped[..extra],
+            "the connection ended part-way through a record header",
+        )?;
     }
 
     payload.clear();
     payload.resize(header.length as usize, 0);
-    reader.read_exact(payload).map_err(RecordError::Io)?;
+    fill(
+        reader,
+        payload,
+        "the connection ended part-way through a record payload",
+    )?;
 
     let found = crc32c::crc32c(payload);
     if found != header.checksum {
@@ -411,40 +421,93 @@ pub fn read<R: io::Read>(
     Ok(header)
 }
 
+/// How long the rest of a record that has already begun is waited for.
+///
+/// A record arrives across as many reads as the transport needs, and the poll
+/// a socket reads with expires between them: a 2560x1440 keyframe does not fit
+/// in one. So a timeout part-way through is "not all the bytes yet" and is
+/// waited out rather than reported -- but not forever, because a peer that
+/// stopped mid-record must not hold the thread that reads it. Generous against
+/// what a keyframe costs, short against a session nobody is serving.
+const RECORD_COMPLETION: Duration = Duration::from_secs(5);
+
+/// Whether this is a transport saying "nothing more has arrived yet".
+fn is_idle(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    )
+}
+
+/// Fills `bytes` from a record that has already begun.
+///
+/// Not `Read::read_exact`: that retries [`io::ErrorKind::Interrupted`] and
+/// nothing else, so a poll expiring in the middle of a payload comes back as a
+/// fault. What it means is that the rest is still on its way, which is what
+/// this waits for -- up to [`RECORD_COMPLETION`], after which a peer that
+/// stopped talking mid-record is a fault after all.
+fn fill<R: io::Read>(
+    reader: &mut R,
+    bytes: &mut [u8],
+    what: &'static str,
+) -> Result<(), RecordError> {
+    let deadline = Instant::now() + RECORD_COMPLETION;
+    let mut filled = 0;
+    while filled < bytes.len() {
+        match reader.read(&mut bytes[filled..]) {
+            Ok(0) => {
+                return Err(RecordError::Io(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    what,
+                )));
+            }
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if is_idle(&error) => {
+                if Instant::now() >= deadline {
+                    return Err(RecordError::Io(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        what,
+                    )));
+                }
+            }
+            Err(error) => return Err(RecordError::Io(error)),
+        }
+    }
+
+    Ok(())
+}
+
 /// Fills `bytes`, telling a connection that ended between records from one
 /// that ended inside a header.
 ///
 /// `Read::read_exact` reports both as `UnexpectedEof`, and they mean opposite
 /// things: the first is a peer that finished, the second is a cut stream.
+///
+/// The first read is the one that decides: a poll that expires before any byte
+/// of a record has arrived is an idle connection, and the caller may send a
+/// record of its own. Once a header has started, it is finished like any other
+/// part of a record.
 fn read_header_bytes<R: io::Read>(
     reader: &mut R,
     bytes: &mut [u8; HEADER_LEN],
 ) -> Result<(), RecordError> {
     let mut filled = 0;
-    while filled < bytes.len() {
-        match reader.read(&mut bytes[filled..]) {
-            Ok(0) if filled == 0 => return Err(RecordError::Closed),
-            Ok(0) => {
-                return Err(RecordError::Io(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "the connection ended part-way through a record header",
-                )));
-            }
-            Ok(read) => filled += read,
+    while filled == 0 {
+        match reader.read(&mut bytes[..]) {
+            Ok(0) => return Err(RecordError::Closed),
+            Ok(read) => filled = read,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error)
-                if filled == 0
-                    && matches!(
-                        error.kind(),
-                        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
-                    ) =>
-            {
-                return Err(RecordError::Idle);
-            }
+            Err(error) if is_idle(&error) => return Err(RecordError::Idle),
             Err(error) => return Err(RecordError::Io(error)),
         }
     }
-    Ok(())
+
+    fill(
+        reader,
+        &mut bytes[filled..],
+        "the connection ended part-way through a record header",
+    )
 }
 
 #[cfg(test)]
@@ -588,6 +651,69 @@ mod tests {
 
         assert_eq!(header, record.header);
         assert_eq!(payload, b"payload");
+    }
+
+    /// A socket that hands over `chunk` bytes at a time and answers
+    /// `WouldBlock` between them.
+    ///
+    /// What an HvSocket does under a keyframe: the poll it reads with expires
+    /// while the rest of the record is still on its way, which the transport
+    /// documents as "not all bytes yet" rather than a broken channel.
+    struct Trickle {
+        bytes: Vec<u8>,
+        sent: usize,
+        chunk: usize,
+        blocked: bool,
+    }
+
+    impl io::Read for Trickle {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.sent == self.bytes.len() {
+                return Ok(0);
+            }
+            // Every other call, so that no read of a partial record runs to
+            // the end without meeting one.
+            self.blocked = !self.blocked;
+            if self.blocked {
+                return Err(io::Error::from(io::ErrorKind::WouldBlock));
+            }
+
+            let take = self
+                .chunk
+                .min(self.bytes.len() - self.sent)
+                .min(buffer.len());
+            buffer[..take].copy_from_slice(&self.bytes[self.sent..self.sent + take]);
+            self.sent += take;
+
+            Ok(take)
+        }
+    }
+
+    #[test]
+    fn a_record_that_arrives_in_pieces_is_read_rather_than_refused() {
+        // A 2560x1440 keyframe does not fit in one poll, and a viewer that
+        // treated the gap as a fault would drop the channel and ask for a
+        // keyframe that does not fit either.
+        let limits = Limits::new(2560, 1440);
+        let record = Record::new(Channel::Frame, 6, 3, 0, 0, vec![7u8; 300_000]);
+
+        let mut wire = Vec::new();
+        write(&mut wire, &record, &limits).expect("a record within the frame cap");
+        // Starts ready, so the first read delivers bytes: a poll that expires
+        // before a record begins is a legitimate `Idle` and not what this is
+        // about.
+        let mut stream = Trickle {
+            bytes: wire,
+            sent: 0,
+            chunk: 4096,
+            blocked: true,
+        };
+
+        let mut payload = Vec::new();
+        let header = read(&mut stream, &limits, &mut payload).expect("what was written");
+
+        assert_eq!(header, record.header);
+        assert_eq!(payload.len(), 300_000);
     }
 
     #[test]
