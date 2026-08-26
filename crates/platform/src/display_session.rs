@@ -117,6 +117,11 @@ impl Driver {
                 Capability::DynamicResolution,
                 Capability::Clipboard,
                 Capability::FileClipboard,
+                // The viewer publishes the modes of the monitor its window is
+                // on. Asked for here because negotiation is an intersection: a
+                // capability only the guest announces is one the session does
+                // not have.
+                Capability::HostDisplayModes,
             ],
             // A host-side policy that resolves to `Desktop` until a motion
             // codec exists. The guest is what resolves it.
@@ -409,7 +414,27 @@ mod tests {
         );
     }
 
-    /// What the MVP guest announces.
+    #[test]
+    fn the_host_and_the_guest_agree_on_the_monitor_mode_list() {
+        // Negotiation is an intersection: a capability the guest announces and
+        // the host never asks for is one the session does not have, and the
+        // viewer then drops every mode list it builds.
+        let (mut driver, secret, hello, _) = driver(None);
+
+        let Message::Handover(handover) = handshake(&mut driver, hello, &secret) else {
+            panic!("the handshake did not end in a hand-over");
+        };
+
+        assert!(
+            handover
+                .capabilities
+                .contains(&(Capability::HostDisplayModes as i32)),
+            "the host publishes its monitor's modes, so it has to ask for the capability: {:?}",
+            handover.capabilities
+        );
+    }
+
+    /// What the guest announces, as `control::support_from` builds it.
     fn support() -> Support {
         Support {
             capabilities: vec![
@@ -417,6 +442,7 @@ mod tests {
                 Capability::DynamicResolution,
                 Capability::Clipboard,
                 Capability::FileClipboard,
+                Capability::HostDisplayModes,
             ],
             modes: vec![Mode::Desktop],
             tile_sizes: vec![16, 32, 64],
