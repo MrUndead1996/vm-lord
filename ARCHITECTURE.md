@@ -3146,7 +3146,7 @@ The limits are the host's settings, and both ends enforce the narrower of what
 each holds:
 
 ```toml
-[clipboard.files]
+[clipboard_files]
 max_file_size = "1GB"
 max_transfer_size = "4GB"
 retention = "24h"

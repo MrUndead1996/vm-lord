@@ -51,7 +51,7 @@ text, HTML and images.
   `settings.toml`:
 
   ```toml
-  [clipboard.files]
+  [clipboard_files]
   max_file_size = "1GB"
   max_transfer_size = "4GB"
   retention = "24h"
