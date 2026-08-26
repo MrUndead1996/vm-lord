@@ -3217,16 +3217,45 @@ from it would put a small desktop on a big screen and then blur it back up.
 `drm_cvt_mode` builds (a width to a multiple of eight, a height to an even
 number), refuses anything outside 640x480..2560x1440 with
 `ERROR_CODE_RESOLUTION_REJECTED`, and writes what is left to
-`/sys/module/vmlord_drm/parameters/mode`. The module moves its preferred mode
-and hotplugs the connector; it cannot commit a mode, because the compositor
-holds DRM master and this is an ordinary client.
+`/sys/module/vmlord_drm/parameters/mode` as `WIDTHxHEIGHT@HZ`. The module marks
+that mode preferred and hotplugs the connector; it cannot commit a mode,
+because the compositor holds DRM master and this is an ordinary client.
 
-That is why the connector offers **one** mode. On a hotplug a compositor
-re-derives its configuration, and a connector that still listed the mode it was
-already on leaves it free to stay there -- a window that was resized and a
-desktop that was not. With one mode there is nothing to stay on. What it costs
-is a resolution picker inside the guest, and a picture that disagreed with the
-window is what there would be if there were one.
+**The connector's list is the host monitor's.** The viewer enumerates the
+screen its window sits on -- `MonitorFromWindow`, `GetMonitorInfoW`,
+`EnumDisplaySettingsW`, and `DisplayConfigGetDeviceInfo` for the panel's own
+preferred timing -- normalizes what it finds, and publishes it with
+`SET_AVAILABLE_MODES`; the selection follows in `SET_DISPLAY_MODE`. The guest
+writes the list to `/sys/module/vmlord_drm/parameters/modes` before the
+selection, because a mode marked preferred while the connector still offers the
+old list is a hotplug onto a mode about to be withdrawn. At most 32 modes and
+512 bytes, parsed into a fixed array and swapped whole: a list the module
+refuses leaves the guest offering the modes it already had.
+
+**Modes are three integers and nothing else.** Width, height and whole hertz,
+deduplicated by all three and sorted by pixel area, width, height, then refresh.
+Refresh is an integer because `dmDisplayFrequency` is one -- Windows reports 60
+for a 59.94 Hz panel, and pretending otherwise would be a precision the source
+does not have. Nothing above 144 Hz is offered: that is what a software vblank
+timer and a capture thread keep up with, not a limit of `drm_cvt_mode`. No EDID
+is synthesized in either direction; the physical size stays at 96 DPI, which is
+what keeps a compositor on scale 1 through a resize.
+
+**Selection is deterministic.** A selection the new list still offers is kept;
+otherwise 1920x1080@60 when it is there; otherwise the greatest resolution and,
+among its refresh variants, the greatest refresh; and when enumeration finds
+nothing at all, a synthetic 1920x1080@60, because a connector with no modes is
+an output no compositor lights. An explicit choice from the window's
+*Resolution* submenu is remembered per VM in the viewer's state file and is
+considered before every fallback. A monitor change -- `WM_DISPLAYCHANGE`, a
+move onto another screen, a DPI transition -- is debounced for the same 250 ms
+as a resize and re-published only when the normalized list actually differs.
+
+The preferred mode is offered whether or not it is in the list, which is what
+keeps a dragged window the authority on this output's size: a geometry nobody
+enumerated is still a mode the connector will carry, at the refresh the host
+selected. On a hotplug the compositor re-derives its configuration and finds
+the preferred mode first and marked, which is what it moves to.
 
 **Nothing is reported until it has happened.** A `SetResolution` is answered
 with silence. The size the session runs at is read off the primary plane's
@@ -3237,6 +3266,21 @@ size, so its encoder is rebuilt before a frame of the new shape reaches it; the
 host then gets a `DisplayState` from the control thread. A frame captured on
 the wrong side of a commit is dropped rather than encoded -- a tile grid is
 built on a geometry and cannot take another shape.
+
+The refresh in that `DisplayState` is read the same way: off the CRTC's own
+timing with `DRM_IOCTL_MODE_GETCRTC`, as the pixel clock over what a frame
+spends, never off the mode that was written. Zero means the CRTC would not say,
+which is a guest whose desktop has not come up yet.
+
+**A picture that is too slow is said out loud.** The viewer counts frames that
+both decoded and presented, one second at a time, against the refresh the guest
+confirmed. Delivered FPS under `display.fps_gap_threshold_percent` of it (50 by
+default, 1..100) for ten unbroken seconds is one `Warning` diagnostic naming the
+mode, the rate and the share -- and only one: another needs ten unbroken seconds
+back at or above the threshold first, so a session hovering on the line is one
+line in the log rather than one every ten. Measurement pauses outside a running
+visible session, because a minimised window and a session that is still coming
+up are seconds of nothing rather than a guest failing to keep up.
 
 **The picture never goes black or stretches.** `placement.rs` letterboxes:
 scaled to fit, whole, centred, aspect ratio kept. Nothing is cropped, because a
@@ -3556,14 +3600,16 @@ retried across a concurrent commit. It is acknowledged only after delivery to
 the peer and host-session epoch that requested it; replacing either resets the
 observation so a reconnect receives the current static frame immediately.
 
-The connector offers exactly **one** mode,
-between 640x480 and 2560x1440, marked preferred, with a physical size at 96 DPI
-and no synthesized EDID -- the name a monitor would carry costs a fifth kernel
-version guard and is deferred. The module declares its payload's version, which
-is what an update's verification compares against.
+The connector offers the host monitor's modes, between 640x480 and 2560x1440 at
+1..144 Hz, with the viewer's selection marked preferred, a physical size at 96
+DPI and no synthesized EDID -- the name a monitor would carry costs a fifth
+kernel version guard and is deferred. Until a host publishes a list it offers
+the single mode its `width`, `height` and `refresh` parameters name. The module
+declares its payload's version, which is what an update's verification compares
+against.
 
-One mode rather than a list is what makes a resize certain, and it is task
-#120's decision rather than an omission -- see *Resizing the desktop* below.
+Every mode it offers came from the host, and none was invented here -- see
+*Resizing the desktop* below.
 
 ### Display: updating and rolling back
 

@@ -10,8 +10,8 @@ use vmlord_display_protocol::{
     record::{Channel, Record},
     session::{Offer, Session, SessionError, Support},
     v1::{
-        Capability, ClientHello, ControlRecord, DisplayTiming, Mode, ProtocolVersion,
-        ServerHello, SetAvailableModes, SetDisplayMode,
+        Capability, ClientHello, ControlRecord, DisplayTiming, Mode, ProtocolVersion, ServerHello,
+        SetAvailableModes, SetDisplayMode,
     },
 };
 
@@ -78,9 +78,7 @@ fn display_timings_and_mode_updates_survive_the_wire() {
         modes: vec![timing.clone()],
         preferred: Some(timing.clone()),
     };
-    let selected = SetDisplayMode {
-        mode: Some(timing),
-    };
+    let selected = SetDisplayMode { mode: Some(timing) };
 
     assert_eq!(
         SetAvailableModes::decode(available.encode_to_vec().as_slice()).unwrap(),
