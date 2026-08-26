@@ -2980,7 +2980,11 @@ whether a viewer already exists before anything else happens, and a named pipe
 user's default DACL -- carries the only two things a later VMLord may ask for:
 focus and close. Asking for a *new session* is deliberately not on that pipe.
 So a repeated Connect focuses the window that is there rather than opening a
-second one.
+second one. The VMLord process makes that decision from the launch worker it
+already owns. A newly started VMLord owns no such worker: its new viewer asks
+the orphaned old one to close, waits for the mutex, and continues with the new
+process's launch pipes. Focusing the orphan would leave it unable to request a
+fresh handshake from either VMLord.
 
 `unsafe` lives in `src/windows/{hvsocket, ipc, window, d3d, hook}.rs` and
 nowhere else in the crate: the workspace denies it, and those five module
@@ -2998,7 +3002,9 @@ an established handshake with the hand-over. It is driven by
 parameters and keeps a thread on its pipes -- a thread deliberately never
 joined, because a display session outlives the application that opened it:
 VMLord exiting closes the pipes, which costs the viewer the right to ask for a
-fresh session and nothing else. Stopping a VM does close its window: the
+fresh session and nothing else. The desktop remains visible while its existing
+session lives; a Connect from a later VMLord replaces that viewer so the next
+handshake has live pipes. Stopping a VM does close its window: the
 `SystemExited` event names the VM, and `DisplayLaunches::close` asks the viewer
 it opened for that VM to close over the command pipe, addressed by the runtime
 id the launch recorded. The forced stop asks straight away rather than waiting
@@ -3007,9 +3013,8 @@ launch pipe, because that is the channel the window itself reads -- and only an
 exit, so a guest that reboots keeps both its compute system and its window,
 which reconnects when the guest's services come back. A window this process
 never opened is left to notice on its own: the partition goes and its next
-connect fails with it. A repeated Connect
-starts a second process, which finds the named mutex taken, asks the window
-that is already open to come forward, and exits.
+connect fails with it. A repeated Connect is answered by the worker registry
+and focuses the existing window without starting another process.
 
 ### Keyboard and mouse
 

@@ -100,7 +100,7 @@ fn main() -> ExitCode {
 
     match SingleInstance::take(&parameters.runtime_id) {
         Ok(Some(claim)) => run(parameters, claim),
-        Ok(None) => focus_the_window_that_is_already_open(&parameters),
+        Ok(None) => replace_the_window_left_by_the_previous_parent(parameters),
         Err(error) => {
             let message = format!("VMLord Display could not start: {error}");
             tracing::error!("{message}");
@@ -111,18 +111,16 @@ fn main() -> ExitCode {
 }
 
 /// A second Connect on a VM that already has a window.
-fn focus_the_window_that_is_already_open(parameters: &LaunchParameters) -> ExitCode {
+fn replace_the_window_left_by_the_previous_parent(parameters: LaunchParameters) -> ExitCode {
     tracing::info!(
-        "a viewer for {} is already running; asking it to come forward",
+        "a viewer for {} is already running; replacing its stale VMLord session",
         parameters.vm_name
     );
 
-    match ipc::send_command(&parameters.runtime_id, Command::Focus) {
-        Ok(()) => ExitCode::SUCCESS,
+    match ipc::replace_instance(&parameters.runtime_id) {
+        Ok(claim) => run(parameters, claim),
         Err(error) => {
-            // The mutex was held but nobody answered: a viewer that is on its
-            // way out. Saying so beats opening a second window over it.
-            tracing::warn!("the running viewer could not be reached: {error}");
+            tracing::warn!("the running viewer could not be replaced: {error}");
             ExitCode::FAILURE
         }
     }

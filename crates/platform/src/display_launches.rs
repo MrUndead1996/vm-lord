@@ -1,10 +1,9 @@
 //! The display windows VMLord has opened, and the pipes it serves them on.
 //!
-//! One process per Connect, and no map of open windows: the viewer answers
-//! "is one already open?" itself, with a named mutex on the partition's
-//! runtime id, and a second launch asks the window that is there to come
-//! forward and exits. What is kept here is only the threads holding the launch
-//! pipes.
+//! One process per open window. This process keeps its launch threads, so a
+//! repeated Connect can focus its existing window without starting another
+//! viewer. A later VMLord has no such worker; the viewer it starts replaces
+//! the orphan whose launch pipes belonged to the earlier process.
 //!
 //! What is tracked beyond the threads is the pair of ids one window is
 //! addressed by: the VM it belongs to, and the partition whose runtime id names
@@ -14,9 +13,10 @@
 //! Those threads are never joined at shutdown. A display session outliving the
 //! application is the property the separate process was built for: closing
 //! VMLord closes the pipes, which costs the viewer the right to ask for a
-//! fresh session and nothing else, and leaves the desktop on screen. Threads
-//! are collected when the viewer they served has gone, which the next launch
-//! does.
+//! fresh session and nothing else, and leaves the desktop on screen. If a new
+//! VMLord later opens that display, its viewer asks the orphan to close and
+//! takes over with fresh pipes. Threads are collected when the viewer they
+//! served has gone.
 
 use std::{
     io,
@@ -98,11 +98,13 @@ struct Worker {
 /// Behind a function so that the tests can watch what would be sent without a
 /// viewer process to send it to.
 type ViewerCloser = Arc<dyn Fn(&[u8; 16]) -> Result<(), String> + Send + Sync>;
+type ViewerFocuser = Arc<dyn Fn(&[u8; 16]) -> Result<(), String> + Send + Sync>;
 
 /// The display windows this process has opened.
 pub(crate) struct DisplayLaunches {
     workers: Mutex<Vec<Worker>>,
     closer: ViewerCloser,
+    focuser: ViewerFocuser,
 }
 
 impl Default for DisplayLaunches {
@@ -111,6 +113,10 @@ impl Default for DisplayLaunches {
             workers: Mutex::new(Vec::new()),
             closer: Arc::new(|runtime_id: &[u8; 16]| {
                 ipc::send_command(runtime_id, launch::Command::Close)
+                    .map_err(|error| error.to_string())
+            }),
+            focuser: Arc::new(|runtime_id: &[u8; 16]| {
+                ipc::send_command(runtime_id, launch::Command::Focus)
                     .map_err(|error| error.to_string())
             }),
         }
@@ -136,6 +142,18 @@ impl DisplayLaunches {
     pub(crate) fn start(&self, request: LaunchRequest<'_>) -> Result<(), RepositoryError> {
         let mut workers = self.lock();
         collect_finished(&mut workers);
+
+        if workers
+            .iter()
+            .any(|worker| worker.runtime_id == request.runtime_id)
+        {
+            return (self.focuser)(request.runtime_id.as_bytes()).map_err(|error| {
+                RepositoryError::new(format!(
+                    "the display window of VM \"{}\" could not be focused: {error}",
+                    request.vm_name
+                ))
+            });
+        }
 
         if !request.viewer.is_file() {
             return Err(RepositoryError::new(format!(
@@ -394,10 +412,18 @@ mod tests {
     fn launches(workers: Vec<Worker>) -> (DisplayLaunches, Closed) {
         let closed: Closed = Arc::new(Mutex::new(Vec::new()));
         let recorder = Arc::clone(&closed);
+        let focus_recorder = Arc::clone(&closed);
         let launches = DisplayLaunches {
             workers: Mutex::new(workers),
             closer: Arc::new(move |runtime_id: &[u8; 16]| {
                 recorder
+                    .lock()
+                    .expect("an uncontended lock")
+                    .push(*runtime_id);
+                Ok(())
+            }),
+            focuser: Arc::new(move |runtime_id: &[u8; 16]| {
+                focus_recorder
                     .lock()
                     .expect("an uncontended lock")
                     .push(*runtime_id);
@@ -495,6 +521,29 @@ mod tests {
         assert!(
             closed.lock().expect("an uncontended lock").is_empty(),
             "a VM VMLord never opened a display for has no window to close"
+        );
+    }
+
+    #[test]
+    fn an_open_window_of_this_process_is_focused_without_starting_another() {
+        let runtime_id = Uuid::from_u128(11);
+        let (launches, focused) = launches(vec![worker("dev", Uuid::from_u128(1), runtime_id)]);
+
+        launches
+            .start(LaunchRequest {
+                vm_name: "dev",
+                vm_id: Uuid::from_u128(1),
+                secret: Secret::generate(),
+                runtime_id,
+                mode: None,
+                viewer: PathBuf::from(r"C:\nowhere\vmlord-display.exe"),
+                file_policy: FileClipboardSettings::default(),
+            })
+            .expect("an existing viewer needs no new executable");
+
+        assert_eq!(
+            *focused.lock().expect("an uncontended lock"),
+            vec![*runtime_id.as_bytes()]
         );
     }
 }
