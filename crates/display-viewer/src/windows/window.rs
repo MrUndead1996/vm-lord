@@ -14,7 +14,7 @@ use std::{
     cell::OnceCell,
     mem::ManuallyDrop,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::Sender,
     },
@@ -44,20 +44,21 @@ use windows::{
             },
             Shell::{ITaskbarList2, TaskbarList},
             WindowsAndMessaging::{
-                AdjustWindowRect, AppendMenuW, CW_USEDEFAULT, CheckMenuRadioItem, CreateWindowExW,
-                DefWindowProcW, DestroyWindow, DispatchMessageW, GWL_EXSTYLE, GWL_STYLE,
-                GWLP_USERDATA, GetClientRect, GetSystemMenu, GetWindowLongPtrW, GetWindowPlacement,
-                GetWindowRect, HWND_TOP, IDC_ARROW, LoadCursorW, MB_ICONERROR, MB_OK, MF_BYCOMMAND,
-                MF_SEPARATOR, MF_STRING, MONITORINFOF_PRIMARY, MSG, MessageBoxW, PM_REMOVE,
-                PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SW_RESTORE, SW_SHOW,
-                SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
-                SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW, SetWindowPlacement,
-                SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE,
-                WINDOWPLACEMENT, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE, WM_DPICHANGED,
-                WM_ERASEBKGND, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-                WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_QUIT,
-                WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_SYSCOMMAND, WM_XBUTTONDOWN,
-                WM_XBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_POPUP,
+                AdjustWindowRect, AppendMenuW, CW_USEDEFAULT, CheckMenuRadioItem, CreatePopupMenu,
+                CreateWindowExW, DefWindowProcW, DeleteMenu, DestroyMenu, DestroyWindow,
+                DispatchMessageW, GWL_EXSTYLE, GWL_STYLE, GWLP_USERDATA, GetClientRect,
+                GetSystemMenu, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, HMENU,
+                HWND_TOP, IDC_ARROW, LoadCursorW, MB_ICONERROR, MB_OK, MF_BYCOMMAND, MF_BYPOSITION,
+                MF_POPUP, MF_SEPARATOR, MF_STRING, MONITORINFOF_PRIMARY, MSG, MessageBoxW,
+                PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage, RegisterClassW, SW_RESTORE,
+                SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOOWNERZORDER,
+                SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowLongPtrW,
+                SetWindowPlacement, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
+                WINDOW_STYLE, WINDOWPLACEMENT, WM_APP, WM_CLOSE, WM_DESTROY, WM_DISPLAYCHANGE,
+                WM_DPICHANGED, WM_ERASEBKGND, WM_KILLFOCUS, WM_LBUTTONDOWN, WM_LBUTTONUP,
+                WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE,
+                WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETFOCUS, WM_SIZE, WM_SYSCOMMAND,
+                WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_POPUP,
             },
         },
     },
@@ -65,6 +66,7 @@ use windows::{
 };
 
 use crate::{
+    display_modes::{DisplayMode, MAX_MENU_MODES, label, menu_command, menu_index},
     fullscreen::{self, Frame},
     input::{self, Report},
     monitors::{self, opening_position},
@@ -99,6 +101,13 @@ pub const SC_QUALITY_AUTO: usize = 0x9040;
 /// Encode a desktop, whatever the picture is doing.
 pub const SC_QUALITY_DESKTOP: usize = 0x9050;
 
+/// The submenu the host monitor's modes are offered in.
+///
+/// Its own popup rather than more items on the system menu: a monitor with
+/// thirty modes would otherwise bury Full screen and the quality items under
+/// a list nobody reads.
+const RESOLUTION_MENU: &str = "Resolution";
+
 /// The class every viewer window is registered under.
 const CLASS_NAME: &str = "VMLordDisplayWindow";
 
@@ -118,6 +127,13 @@ pub struct Shared {
     /// Which buttons are down, one bit each, so that the capture is released
     /// when the last of them lifts rather than when the first does.
     buttons: AtomicU32,
+    /// The modes the resolution submenu currently offers, in menu order.
+    ///
+    /// A lock the pump takes, which everything else in this module refuses to
+    /// do -- and it is safe here because the only other holder is the main
+    /// loop that rebuilds the menu, which is the thread that pumps. Nothing
+    /// waits on this: it is a short read of at most 32 modes.
+    modes: Mutex<Vec<DisplayMode>>,
     events: Sender<UiEvent>,
 }
 
@@ -129,6 +145,7 @@ impl Shared {
             failed: AtomicBool::new(false),
             tracking: AtomicBool::new(false),
             buttons: AtomicU32::new(0),
+            modes: Mutex::new(Vec::new()),
             events,
         }
     }
@@ -164,6 +181,8 @@ pub enum UiEvent {
     ToggleFullscreen,
     /// The user picked an encoding mode from the system menu.
     Quality(Quality),
+    /// The user picked a resolution from the system menu.
+    DisplayMode(DisplayMode),
     /// The monitor the window is on may not be the one it was on.
     ///
     /// A signal rather than a snapshot: what the monitor now is takes a
@@ -188,6 +207,8 @@ pub struct Window {
     /// the window was maximised, and the frame carries the two style words
     /// exactly as they were, extended styles included.
     restore: Option<(Frame, WINDOWPLACEMENT)>,
+    /// The resolution submenu, owned by the system menu it hangs off.
+    resolution: HMENU,
 }
 
 impl Window {
@@ -259,6 +280,7 @@ impl Window {
 
         // SAFETY: the window's own menu, which belongs to it until it is
         // destroyed, and two strings that live across their calls.
+        let mut resolution = HMENU::default();
         unsafe {
             let menu = GetSystemMenu(hwnd, false);
             if !menu.is_invalid() {
@@ -275,6 +297,18 @@ impl Window {
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
                 let full = HSTRING::from("Full screen\tF11");
                 let _ = AppendMenuW(menu, MF_STRING, SC_FULLSCREEN, PCWSTR(full.as_ptr()));
+                // Empty until the host has published a monitor's modes, which
+                // is a submenu the user finds greyed rather than one that
+                // appears halfway through a session.
+                if let Ok(popup) = CreatePopupMenu() {
+                    let text = HSTRING::from(RESOLUTION_MENU);
+                    if AppendMenuW(menu, MF_POPUP, popup.0 as usize, PCWSTR(text.as_ptr())).is_ok()
+                    {
+                        resolution = popup;
+                    } else {
+                        let _ = DestroyMenu(popup);
+                    }
+                }
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
                 // Two modes and not three: Motion is task #123's, and a menu
                 // offering a mode the guest refuses is a menu that lies.
@@ -301,6 +335,7 @@ impl Window {
             hwnd,
             shared,
             restore: None,
+            resolution,
         };
         // Said once here rather than left to the first drag: a session that
         // never moves the window still has a place worth remembering, and
@@ -318,6 +353,56 @@ impl Window {
         }
 
         Ok(window)
+    }
+
+    /// Rebuilds the resolution submenu from the modes the host published.
+    ///
+    /// The whole submenu each time rather than a diff: a monitor change is a
+    /// new list, and a menu built by patching the last one is a menu that
+    /// drifts from what the guest is being told.
+    pub fn set_modes(&self, modes: &[DisplayMode], selected: Option<DisplayMode>) {
+        let offered: Vec<_> = modes.iter().copied().take(MAX_MENU_MODES).collect();
+        *self
+            .shared
+            .modes
+            .lock()
+            .expect("the window's mode list is not poisoned") = offered.clone();
+
+        // SAFETY: the window's own menu and its submenu, which belong to it
+        // until it is destroyed, and one string per item that lives across
+        // its call.
+        unsafe {
+            let menu = GetSystemMenu(self.hwnd, false);
+            if menu.is_invalid() {
+                return;
+            }
+            let submenu = self.resolution;
+            if submenu.is_invalid() {
+                return;
+            }
+            while DeleteMenu(submenu, 0, MF_BYPOSITION).is_ok() {}
+
+            for (index, mode) in offered.iter().enumerate() {
+                let Some(command) = menu_command(index) else {
+                    break;
+                };
+                let text = HSTRING::from(label(*mode));
+                let _ = AppendMenuW(submenu, MF_STRING, command, PCWSTR(text.as_ptr()));
+            }
+
+            if let Some(chosen) = selected
+                && let Some(index) = offered.iter().position(|mode| *mode == chosen)
+                && let Some(command) = menu_command(index)
+            {
+                let _ = CheckMenuRadioItem(
+                    submenu,
+                    0,
+                    u32::try_from(offered.len().saturating_sub(1)).unwrap_or(0),
+                    u32::try_from(command).unwrap_or(0),
+                    MF_BYCOMMAND.0,
+                );
+            }
+        }
     }
 
     /// Marks which encoding mode is in force.
@@ -935,7 +1020,23 @@ extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
 
                     return LRESULT(0);
                 }
-                _ => {}
+                command => {
+                    // The mode block, resolved here rather than in the main
+                    // loop: what the user picked is a mode, and an index into
+                    // a list that may have been rebuilt in between is not.
+                    if let Some(index) = menu_index(command)
+                        && let Some(mode) = shared
+                            .modes
+                            .lock()
+                            .expect("the window's mode list is not poisoned")
+                            .get(index)
+                            .copied()
+                    {
+                        shared.report(UiEvent::DisplayMode(mode));
+
+                        return LRESULT(0);
+                    }
+                }
             }
 
             // SAFETY: the default handler, which owns Move, Size and Close.
@@ -1139,6 +1240,7 @@ mod tests {
         WM_SIGNAL, Window,
     };
     use crate::{
+        display_modes::{DisplayMode, MAX_MENU_MODES, menu_command},
         fullscreen::{EDGES, Frame, OVERLAPPED_WINDOW, POPUP},
         input::{BTN_RIGHT, Report},
         state::{Quality, WindowState},
@@ -1422,6 +1524,78 @@ mod tests {
         assert!(
             reported.contains(&UiEvent::Moved(position.0, position.1)),
             "a moved window reports its place: {reported:?}"
+        );
+    }
+
+    #[test]
+    fn a_resolution_picked_from_the_menu_is_reported_as_the_mode_it_names() {
+        let (shared, events) = shared();
+        let window = opened(&events, &shared);
+        let offered = [
+            DisplayMode::new(1280, 720, 60).expect("a valid fixture"),
+            DisplayMode::new(1920, 1080, 144).expect("a valid fixture"),
+        ];
+        window.set_modes(&offered, Some(offered[0]));
+
+        // SAFETY: a message sent to this process's own window.
+        unsafe {
+            SendMessageW(
+                window.handle(),
+                WM_SYSCOMMAND,
+                Some(WPARAM(menu_command(1).expect("a command"))),
+                None,
+            );
+        }
+
+        assert!(drain(&events).contains(&UiEvent::DisplayMode(offered[1])));
+    }
+
+    #[test]
+    fn a_mode_the_menu_no_longer_offers_is_not_reported() {
+        // The list is rebuilt whenever the monitor changes, and a command for
+        // an entry that is gone is one the window has nothing to answer with.
+        let (shared, events) = shared();
+        let window = opened(&events, &shared);
+        window.set_modes(
+            &[DisplayMode::new(1280, 720, 60).expect("a valid fixture")],
+            None,
+        );
+
+        // SAFETY: a message sent to this process's own window.
+        unsafe {
+            SendMessageW(
+                window.handle(),
+                WM_SYSCOMMAND,
+                Some(WPARAM(menu_command(5).expect("a command"))),
+                None,
+            );
+        }
+
+        assert!(
+            !drain(&events)
+                .iter()
+                .any(|event| matches!(event, UiEvent::DisplayMode(_))),
+            "an entry that is gone is not a mode"
+        );
+    }
+
+    #[test]
+    fn a_menu_longer_than_the_guest_holds_is_cut_to_what_it_holds() {
+        let (shared, events) = shared();
+        let window = opened(&events, &shared);
+        let offered: Vec<_> = (0..MAX_MENU_MODES + 8)
+            .map(|step| DisplayMode::new(640 + step as u32 * 8, 480, 60).expect("a valid fixture"))
+            .collect();
+        window.set_modes(&offered, None);
+
+        assert_eq!(
+            window
+                .shared
+                .modes
+                .lock()
+                .expect("the window's mode list")
+                .len(),
+            MAX_MENU_MODES
         );
     }
 

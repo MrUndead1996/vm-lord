@@ -87,6 +87,43 @@ pub fn select_mode(selected: Option<DisplayMode>, modes: &[DisplayMode]) -> Disp
         .unwrap_or_else(|| fallback_mode(modes))
 }
 
+/// The first system-menu command id a mode is offered under.
+///
+/// `WM_SYSCOMMAND` masks the low four bits off a command, so every id is a
+/// multiple of sixteen below `0xF000`, where the system's own live. The block
+/// starts above the fixed items in `windows::window`.
+pub const SC_MODE_FIRST: usize = 0x9100;
+
+/// The distance between two of them.
+pub const SC_MODE_STEP: usize = 0x10;
+
+/// How many modes the menu offers, which is what the guest's list holds.
+pub const MAX_MENU_MODES: usize = 32;
+
+/// The command id the mode at `index` is offered under.
+#[must_use]
+pub fn menu_command(index: usize) -> Option<usize> {
+    (index < MAX_MENU_MODES).then(|| SC_MODE_FIRST + index * SC_MODE_STEP)
+}
+
+/// Which mode a system command names, if it names one.
+#[must_use]
+pub fn menu_index(command: usize) -> Option<usize> {
+    let offset = command.checked_sub(SC_MODE_FIRST)?;
+    if offset % SC_MODE_STEP != 0 {
+        return None;
+    }
+    let index = offset / SC_MODE_STEP;
+
+    (index < MAX_MENU_MODES).then_some(index)
+}
+
+/// How a mode reads in the menu.
+#[must_use]
+pub fn label(mode: DisplayMode) -> String {
+    format!("{} x {} @ {} Hz", mode.width, mode.height, mode.refresh_hz)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DisplayMode, fallback_mode, normalize_modes, select_mode};
@@ -144,5 +181,31 @@ mod tests {
         let modes = [mode(1920, 1080, 60), retained];
 
         assert_eq!(select_mode(Some(retained), &modes), retained);
+    }
+
+    #[test]
+    fn a_menu_command_names_the_mode_it_was_built_from() {
+        for index in 0..super::MAX_MENU_MODES {
+            let command = super::menu_command(index).expect("a command for every offered mode");
+
+            assert_eq!(super::menu_index(command), Some(index));
+            assert_eq!(command % 0x10, 0, "the low four bits are the system's");
+            assert!(command < 0xF000, "and 0xF000 upwards is the system's too");
+        }
+    }
+
+    #[test]
+    fn a_command_that_is_not_a_mode_is_not_read_as_one() {
+        assert_eq!(super::menu_command(super::MAX_MENU_MODES), None);
+        // The fixed items below the block, and a system command above it.
+        assert_eq!(super::menu_index(0x9050), None);
+        assert_eq!(super::menu_index(0xF060), None);
+        // And an id inside the block that is not on the step.
+        assert_eq!(super::menu_index(super::SC_MODE_FIRST + 4), None);
+    }
+
+    #[test]
+    fn a_mode_reads_as_its_three_numbers() {
+        assert_eq!(super::label(mode(1920, 1080, 60)), "1920 x 1080 @ 60 Hz");
     }
 }

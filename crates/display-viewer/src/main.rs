@@ -48,6 +48,7 @@ use vmlord_display_protocol::{
     v1::{Capability, Mode},
 };
 use vmlord_display_viewer::{
+    display_modes::{DisplayMode, select_mode},
     input::{self, Report},
     launch::{self, Command, Handover, LaunchParameters, Link, Message},
     live::{Live, Signal},
@@ -303,6 +304,15 @@ enum Order {
     },
     /// The user picked an encoding mode.
     Mode(Mode),
+    /// The monitor the window is on, and the mode to prefer on it.
+    AvailableModes {
+        /// Every mode the host monitor drives, normalized.
+        modes: Vec<DisplayMode>,
+        /// The one the viewer chose, by policy or by the user.
+        preferred: Option<DisplayMode>,
+    },
+    /// The user picked a resolution from the system menu.
+    DisplayMode(DisplayMode),
 }
 
 /// Everything the session thread owns.
@@ -547,6 +557,19 @@ where
                 Ok(Order::Input(event)) => live.send_input(event),
                 Ok(Order::Resolution { width, height }) => live.set_resolution(width, height),
                 Ok(Order::Mode(mode)) => live.set_mode(mode),
+                // Dropped rather than queued for a guest that never asked for
+                // them: an older payload resizes its output from the window
+                // and has nothing to do with a monitor's mode list.
+                Ok(Order::AvailableModes { modes, preferred }) => {
+                    if live.host_modes() {
+                        live.set_available_modes(&modes, preferred);
+                    }
+                }
+                Ok(Order::DisplayMode(mode)) => {
+                    if live.host_modes() {
+                        live.set_display_mode(mode);
+                    }
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return Attempt::Stop,
             }
@@ -664,8 +687,11 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
     let mut policy = input::Policy::new();
     let mut stream: Option<Geometry> = None;
     let mut resize = Resize::new();
-    // The monitor the window is on, enumerated once a rearrangement settles.
+    // The monitor the window is on, enumerated once a rearrangement settles,
+    // and what its last enumeration said.
     let mut monitors = MonitorWatch::new();
+    let mut offered: Vec<DisplayMode> = Vec::new();
+    let mut native: Option<DisplayMode> = None;
     // While this lives the keyboard is the guest's. It is taken on focus and
     // given back the moment the window loses it -- or the user asks.
     let mut hook: Option<Hook> = None;
@@ -694,6 +720,11 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
                     let (width, height) = context.window.client_size();
                     resize.observe(width.max(0) as u32, height.max(0) as u32, Instant::now());
                     mode_owed = true;
+                    // And the same for the monitor: the list and the selection
+                    // are sent to the guest that is listening now, in that
+                    // order, rather than assumed to have survived the socket.
+                    monitors.forget();
+                    monitors.observe(Instant::now());
                 }
                 _ => {}
             }
@@ -746,6 +777,14 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
                     }
                 }
                 UiEvent::MonitorChanged => monitors.observe(Instant::now()),
+                UiEvent::DisplayMode(mode) => {
+                    // Remembered because the user said so: a mode chosen by
+                    // policy is one the next monitor may not have, and a mode
+                    // chosen from the menu is what this VM opens at.
+                    state.display_mode = Some(mode);
+                    context.window.set_modes(&offered, Some(mode));
+                    let _ = context.orders.send(Order::DisplayMode(mode));
+                }
                 UiEvent::Moved(x, y) => {
                     // Only a restored window reports this, so what is kept is
                     // the place the user left the window rather than the
@@ -756,6 +795,12 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
                     let wanted = !context.window.is_fullscreen();
                     context.window.set_fullscreen(wanted);
                     state.fullscreen = context.window.is_fullscreen();
+                    // A window filling a monitor wants that monitor's own
+                    // timing, which is not always the one the desktop is on.
+                    if wanted && let Some(mode) = native.filter(|mode| offered.contains(mode)) {
+                        context.window.set_modes(&offered, Some(mode));
+                        let _ = context.orders.send(Order::DisplayMode(mode));
+                    }
                 }
                 UiEvent::Quality(quality) => {
                     state.quality = quality;
@@ -788,6 +833,17 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState) -> ExitCode {
                     snapshot.identity,
                     snapshot.modes.len()
                 );
+                // The selection survives a monitor that still offers it and
+                // falls back by policy when it does not, which is what a
+                // laptop coming back without its dock looks like.
+                let chosen = select_mode(state.display_mode, &snapshot.modes);
+                offered = snapshot.modes;
+                native = snapshot.preferred;
+                context.window.set_modes(&offered, Some(chosen));
+                let _ = context.orders.send(Order::AvailableModes {
+                    modes: offered.clone(),
+                    preferred: Some(chosen),
+                });
             }
         }
 

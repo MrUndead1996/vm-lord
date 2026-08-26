@@ -21,13 +21,14 @@ use vmlord_display_protocol::{
     record::{self, Channel, Limits, Record, RecordError},
     session::{Event as SessionEvent, HandedOver, Negotiated, Session, SessionError},
     v1::{
-        Capability, ControlRecord, DisplayState, Error as ErrorRecord, InputRecord, KeyEvent, Mode,
-        Ping, PointerButton, PointerMotion, PointerScroll, Pong, ProtocolVersion, SetMode,
-        SetResolution,
+        Capability, ControlRecord, DisplayState, DisplayTiming, Error as ErrorRecord, InputRecord,
+        KeyEvent, Mode, Ping, PointerButton, PointerMotion, PointerScroll, Pong, ProtocolVersion,
+        SetAvailableModes, SetDisplayMode, SetMode, SetResolution,
     },
 };
 
 use crate::{
+    display_modes::DisplayMode,
     input,
     launch::Handover,
     status::Event,
@@ -209,6 +210,54 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
         self.write_control(
             ControlRecord::SetResolution,
             SetResolution { width, height }.encode_to_vec(),
+        );
+    }
+
+    /// Whether the guest agreed to take this host's monitor mode list.
+    ///
+    /// A guest on an older payload has not, and everything about host modes is
+    /// then left alone: the window still resizes the output, which is the
+    /// contract that build implements.
+    #[must_use]
+    pub fn host_modes(&self) -> bool {
+        self.session.negotiated().is_some_and(|negotiated| {
+            negotiated
+                .capabilities
+                .contains(&Capability::HostDisplayModes)
+        })
+    }
+
+    /// Publishes the host monitor's modes, and the one to prefer.
+    ///
+    /// The list and the selection in one record because the guest has to apply
+    /// them in that order, which is the guest's business rather than a
+    /// sequence this side has to get right.
+    pub fn set_available_modes(&mut self, modes: &[DisplayMode], preferred: Option<DisplayMode>) {
+        tracing::info!("publishing {} host modes", modes.len());
+        self.write_control(
+            ControlRecord::SetAvailableModes,
+            SetAvailableModes {
+                modes: modes.iter().copied().map(timing).collect(),
+                preferred: preferred.map(timing),
+            }
+            .encode_to_vec(),
+        );
+    }
+
+    /// Asks the guest to prefer one of the modes it was published.
+    pub fn set_display_mode(&mut self, mode: DisplayMode) {
+        tracing::info!(
+            "asking the guest for {}x{}@{}",
+            mode.width,
+            mode.height,
+            mode.refresh_hz
+        );
+        self.write_control(
+            ControlRecord::SetDisplayMode,
+            SetDisplayMode {
+                mode: Some(timing(mode)),
+            }
+            .encode_to_vec(),
         );
     }
 
@@ -620,6 +669,15 @@ pub(crate) fn read_awaited<S: Read + Write>(
     }
 }
 
+/// One mode as the wire carries it.
+fn timing(mode: DisplayMode) -> DisplayTiming {
+    DisplayTiming {
+        width: mode.width,
+        height: mode.height,
+        refresh_hz: mode.refresh_hz,
+    }
+}
+
 /// Reads a channel key out of a hand-over.
 pub(crate) fn channel_key(bytes: &[u8], what: &str) -> Result<ChannelKey, String> {
     let bytes: [u8; 32] = bytes
@@ -640,7 +698,8 @@ mod tests {
         record::{self, Channel, Limits, Record},
         v1::{
             ChannelAck, ChannelAuth, ChannelHello, ControlRecord, FrameRecord, InputRecord, Mode,
-            Ping, PixelFormat as WireFormat, Pong, SetMode, SetResolution, StreamConfig,
+            Ping, PixelFormat as WireFormat, Pong, SetAvailableModes, SetDisplayMode, SetMode,
+            SetResolution, StreamConfig,
         },
     };
 
@@ -1217,6 +1276,42 @@ mod tests {
             header = wait_for_record(&mut harness.control, &limits, &mut payload);
         }
         assert_eq!(header.channel, Channel::Control);
+    }
+
+    #[test]
+    fn the_monitor_list_reaches_the_guest_before_the_mode_chosen_from_it() {
+        // The order the guest applies them in: a mode marked preferred while
+        // the connector is still offering the old list is a hotplug onto a
+        // mode about to be withdrawn.
+        let now = Instant::now();
+        let (mut live, mut harness) = start(now);
+        let limits = Limits::new(0, 0);
+        let offered = [
+            super::DisplayMode::new(1280, 720, 60).expect("a valid fixture"),
+            super::DisplayMode::new(1920, 1080, 144).expect("a valid fixture"),
+        ];
+
+        live.set_available_modes(&offered, Some(offered[1]));
+        live.set_display_mode(offered[1]);
+
+        let mut payload = Vec::new();
+        let mut header = wait_for_record(&mut harness.control, &limits, &mut payload);
+        while header.message_type != ControlRecord::SetAvailableModes as u16 {
+            header = wait_for_record(&mut harness.control, &limits, &mut payload);
+        }
+        let published = SetAvailableModes::decode(payload.as_slice()).expect("a mode list");
+        assert_eq!(published.modes.len(), 2);
+        assert_eq!(
+            published.preferred,
+            Some(super::timing(offered[1])),
+            "the list carries the selection the policy made"
+        );
+
+        while header.message_type != ControlRecord::SetDisplayMode as u16 {
+            header = wait_for_record(&mut harness.control, &limits, &mut payload);
+        }
+        let chosen = SetDisplayMode::decode(payload.as_slice()).expect("a mode");
+        assert_eq!(chosen.mode, Some(super::timing(offered[1])));
     }
 
     #[test]
