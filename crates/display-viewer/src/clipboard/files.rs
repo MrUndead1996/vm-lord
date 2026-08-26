@@ -129,6 +129,17 @@ pub fn dropfiles_of(paths: &[PathBuf]) -> Vec<u8> {
     block
 }
 
+/// Where every session's staging lives, if this user has a profile at all.
+#[must_use]
+pub fn staging_root() -> Option<PathBuf> {
+    let mut root = PathBuf::from(std::env::var_os("LOCALAPPDATA")?);
+    for component in STAGING {
+        root.push(component);
+    }
+
+    Some(root)
+}
+
 /// Removes staged trees that nothing can refer to any more.
 ///
 /// Clipboard data outlives the process that put it there, so a committed tree
@@ -372,10 +383,7 @@ impl Staging {
     /// [`FileError::NoProfile`] without `LOCALAPPDATA`, and [`FileError::Io`]
     /// if the directories cannot be made.
     pub fn create(session: &str, transfer: u32) -> Result<Self, FileError> {
-        let mut base = PathBuf::from(std::env::var_os("LOCALAPPDATA").ok_or(FileError::NoProfile)?);
-        for component in STAGING {
-            base.push(component);
-        }
+        let mut base = staging_root().ok_or(FileError::NoProfile)?;
         base.push(session);
         fs::create_dir_all(&base)?;
 
@@ -537,6 +545,7 @@ fn names_in(path: &Path) -> Result<Vec<OsString>, FileError> {
 mod tests {
     use std::{
         fs,
+        sync::atomic::{AtomicU64, Ordering},
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
@@ -547,12 +556,18 @@ mod tests {
     }
 
     fn temporary_directory() -> PathBuf {
+        // A counter beside the clock: tests run at once, and a clock whose
+        // resolution is coarser than they are would hand two of them the same
+        // directory.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
         let unique_id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("a clock after the epoch")
             .as_nanos();
+        let count = NEXT.fetch_add(1, Ordering::Relaxed);
 
-        std::env::temp_dir().join(format!("vmlord-clipboard-files-test-{unique_id}"))
+        std::env::temp_dir().join(format!("vmlord-clipboard-files-test-{unique_id}-{count}"))
     }
 
     fn drained(source: &mut SourceTree) -> Result<Vec<Produced>, FileError> {

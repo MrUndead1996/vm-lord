@@ -491,6 +491,7 @@ fn start_clipboard(session: &Session, handover: &Handover) -> Option<JoinHandle<
         runtime_id: session.parameters.runtime_id,
         port: session.parameters.clipboard_port,
         handover: handover.clone(),
+        file_policy: session.parameters.file_policy,
     });
     *session
         .clipboard

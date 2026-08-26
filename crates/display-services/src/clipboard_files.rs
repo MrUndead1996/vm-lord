@@ -790,6 +790,7 @@ mod tests {
     use std::{
         fs,
         os::unix::fs::{PermissionsExt, symlink},
+        sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -802,12 +803,18 @@ mod tests {
     }
 
     fn temporary_directory() -> PathBuf {
+        // A counter beside the clock: tests run at once, and a clock whose
+        // resolution is coarser than they are would hand two of them the same
+        // directory.
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+
         let unique_id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("a clock after the epoch")
             .as_nanos();
+        let count = NEXT.fetch_add(1, Ordering::Relaxed);
 
-        std::env::temp_dir().join(format!("vmlord-clipboard-files-test-{unique_id}"))
+        std::env::temp_dir().join(format!("vmlord-clipboard-files-test-{unique_id}-{count}"))
     }
 
     /// Everything a source tree produces, in order.

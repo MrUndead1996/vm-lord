@@ -371,6 +371,30 @@ impl Exchange {
         self.heard = true;
     }
 
+    /// Whether the peer has stated its limits at all.
+    ///
+    /// A side that has heard nothing is talking to a peer that either has no
+    /// file clipboard or has not started one, and offering files to it would
+    /// put records on the wire that the peer has no name for.
+    #[must_use]
+    pub fn heard_policy(&self) -> bool {
+        self.heard
+    }
+
+    /// States this side's limits, once, whether or not anything is offered.
+    ///
+    /// The side that holds the configuration says so as soon as the channel
+    /// is up: the other side offers nothing until it has heard a policy, so
+    /// this is what opens the file clipboard at all.
+    pub fn announce(&mut self) -> Vec<Op> {
+        if self.announced {
+            return Vec::new();
+        }
+        self.announced = true;
+
+        vec![Op::Send(Message::Policy(self.policy))]
+    }
+
     /// The local selection has files in it.
     ///
     /// Like the in-memory clipboard, this costs one record however large the
@@ -498,6 +522,24 @@ impl Exchange {
         self.outgoing.tree = Tree::default();
 
         vec![Op::Send(Message::Complete { transfer })]
+    }
+
+    /// The local walk could not go on.
+    pub fn produced_failed(&mut self, transfer: u32, reason: FileCancelReason) -> Vec<Op> {
+        if self.outgoing.transfer != Some(transfer) {
+            return Vec::new();
+        }
+
+        self.cancel_outgoing(reason)
+    }
+
+    /// The staging of the tree this side is receiving could not go on.
+    pub fn staging_failed(&mut self, transfer: u32, reason: FileCancelReason) -> Vec<Op> {
+        if self.incoming.transfer != Some(transfer) {
+            return Vec::new();
+        }
+
+        self.cancel_incoming(reason)
     }
 
     /// An entry of the tree this side is staging.
@@ -696,6 +738,22 @@ mod tests {
         assert_eq!(
             exchange.local_offer(now),
             vec![Op::Send(Message::Offer { serial: 2 })]
+        );
+    }
+
+    #[test]
+    fn the_limits_are_stated_once_however_they_come_to_be_said() {
+        let now = now();
+        let mut exchange = Exchange::new(policy(), now);
+
+        assert_eq!(
+            exchange.announce(),
+            vec![Op::Send(Message::Policy(policy()))]
+        );
+        assert_eq!(exchange.announce(), Vec::new());
+        assert_eq!(
+            exchange.local_offer(now),
+            vec![Op::Send(Message::Offer { serial: 1 })]
         );
     }
 
@@ -1070,6 +1128,44 @@ mod tests {
             receiver.peer_cancel(1, FileCancelReason::Unavailable),
             vec![Op::Abort { transfer: 1 }]
         );
+    }
+
+    #[test]
+    fn a_side_whose_own_filesystem_failed_says_so_once() {
+        let now = now();
+        let mut exchange = pulling(now);
+        exchange.local_offer(now);
+        exchange.peer_request(1, 4, now);
+
+        assert_eq!(
+            exchange.produced_failed(4, FileCancelReason::IoFailed),
+            vec![Op::Send(Message::Cancel {
+                transfer: 4,
+                reason: FileCancelReason::IoFailed,
+            })]
+        );
+        assert_eq!(
+            exchange.produced_failed(4, FileCancelReason::IoFailed),
+            Vec::new()
+        );
+        assert_eq!(
+            exchange.staging_failed(1, FileCancelReason::IoFailed),
+            cancelled(1, FileCancelReason::IoFailed)
+        );
+        assert_eq!(
+            exchange.staging_failed(1, FileCancelReason::IoFailed),
+            Vec::new()
+        );
+    }
+
+    #[test]
+    fn a_peer_that_has_stated_nothing_is_a_peer_with_no_file_clipboard() {
+        let now = now();
+        let mut exchange = Exchange::new(policy(), now);
+
+        assert!(!exchange.heard_policy());
+        exchange.peer_policy(policy());
+        assert!(exchange.heard_policy());
     }
 
     /// What a receiver emits when it ends the transfer it is pulling.

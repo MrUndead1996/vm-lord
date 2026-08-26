@@ -25,19 +25,24 @@ use std::{
 
 use prost::Message as _;
 use vmlord_display_protocol::{
-    clipboard::{Exchange, Kind, Message as Outgoing, Op, Piece},
+    clipboard::{
+        Exchange, Kind, Message as Outgoing, Op, Piece,
+        files::{self, EntryKind, Message as FileOutgoing, Op as FileOp, Policy},
+    },
     keys::ChannelKey,
-    record::{self, Channel, Header, Limits, Record, RecordError},
+    record::{self, CLIPBOARD_MAX_PAYLOAD, Channel, Header, Limits, Record, RecordError},
     v1::{
-        CancelReason, ClipboardCancel, ClipboardData, ClipboardOffer, ClipboardRecord,
-        ClipboardRequest,
+        CancelReason, ClipboardCancel, ClipboardData, ClipboardFileCancel, ClipboardFileChunk,
+        ClipboardFileComplete, ClipboardFileEntry, ClipboardFileOffer, ClipboardFilePolicy,
+        ClipboardFileRequest, ClipboardOffer, ClipboardRecord, ClipboardRequest, FileCancelReason,
     },
 };
 
 use crate::{
     channel::{self, BindError},
+    clipboard_files::{Produced, SourceTree, Staging, parse_uri_list, uri_lists},
     ipc::Message,
-    mutter::{self, Clipboard},
+    mutter::{self, Clipboard, GNOME_COPIED_MIME, URI_LIST_MIME},
     unix::Connection,
     vsock::{self, CLIPBOARD_PORT},
 };
@@ -200,7 +205,18 @@ fn serve_session(
         .set_read_timeout(PATIENCE)
         .map_err(|error| format!("the clipboard socket refused a timeout: {error}"))?;
 
-    pump(&mut stream, generation)
+    pump(&mut stream, generation, &session_token(&session_id))
+}
+
+/// The name a session's staging directory is made under.
+///
+/// The session id and nothing else: it is already unpredictable, and a
+/// directory named after it is one a second session never lands in.
+fn session_token(session_id: &[u8]) -> String {
+    session_id
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// The generation a hello has to climb past, for this session.
@@ -217,14 +233,23 @@ fn guard(last_bound: Option<&(Vec<u8>, u32)>, session_id: &[u8]) -> Option<u32> 
 }
 
 /// The loop: records in, compositor events in, records out.
-fn pump<S: Read + Write>(stream: &mut S, generation: u32) -> Result<(), String> {
+fn pump<S: Read + Write>(stream: &mut S, generation: u32, session: &str) -> Result<(), String> {
     let limits = Limits::new(0, 0);
     let mut exchange = Exchange::new();
+    let mut files = files::Exchange::new(Policy::default(), Instant::now());
     let mut sequence = 0u32;
     let mut payload = Vec::new();
     // What the host's last selection produced, to answer the compositor's
     // transfer requests from. Never logged.
     let mut held: Vec<Piece> = Vec::new();
+    // The tree being read out of this guest, and the transfer it answers.
+    let mut source: Option<(u32, SourceTree)> = None;
+    // The tree arriving from the host. Dropping it removes what it staged, so
+    // a lost socket or a returning `?` leaves nothing behind.
+    let mut staging: Option<Staging> = None;
+    // The top-level paths of the last tree that arrived whole, which is what a
+    // paste in the guest is answered from. Never logged.
+    let mut held_files: Vec<PathBuf> = Vec::new();
 
     // The compositor may not be reachable yet -- this daemon can outlive a
     // logout -- so it is opened lazily and reopened when it closes.
@@ -255,10 +280,13 @@ fn pump<S: Read + Write>(stream: &mut S, generation: u32) -> Result<(), String> 
             }
         }
 
+        let mut file_ops = Vec::new();
+
         match record::read(stream, &limits, &mut payload) {
             Ok(header) => {
                 if header.generation == generation {
                     ops.extend(handle(&mut exchange, &header, &payload, now));
+                    file_ops.extend(handle_file(&mut files, &header, &payload, now));
                 }
             }
             Err(RecordError::Idle) => {}
@@ -268,7 +296,10 @@ fn pump<S: Read + Write>(stream: &mut S, generation: u32) -> Result<(), String> 
         if let Some((mutter_clipboard, events)) = clipboard.as_ref() {
             loop {
                 match events.try_recv() {
-                    Ok(mutter::Event::PeerOffer { kinds, .. }) => {
+                    Ok(mutter::Event::PeerOffer {
+                        kinds,
+                        files: has_files,
+                    }) => {
                         // The guest's selection is the local one from here.
                         // The kinds and never the bytes: this is what tells
                         // somebody whether a copy in the guest was seen at all.
@@ -281,14 +312,19 @@ fn pump<S: Read + Write>(stream: &mut S, generation: u32) -> Result<(), String> 
                                 .join(", ")
                         );
                         ops.extend(exchange.local_offer(&kinds, now));
+                        // Only to a host that has said what its limits are: a
+                        // viewer without the capability has no name for a file
+                        // record and would end the session over one.
+                        if has_files && files.heard_policy() {
+                            eprintln!("vmlord-display-clipboard: the desktop offers files");
+                            file_ops.extend(files.local_offer(now));
+                        }
                     }
                     Ok(mutter::Event::Transfer { kind, serial }) => {
                         answer_transfer(mutter_clipboard, &held, kind, serial);
                     }
-                    Ok(mutter::Event::TransferFiles { serial, .. }) => {
-                        // Nothing owns files here yet; the transfer is
-                        // refused rather than left for the desktop to wait on.
-                        let _ = mutter_clipboard.refuse(serial);
+                    Ok(mutter::Event::TransferFiles { mime, serial }) => {
+                        answer_files(mutter_clipboard, &held_files, &mime, serial);
                     }
                     Ok(mutter::Event::Closed) | Err(TryRecvError::Disconnected) => {
                         eprintln!("vmlord-display-clipboard: the desktop's clipboard went away");
@@ -302,6 +338,32 @@ fn pump<S: Read + Write>(stream: &mut S, generation: u32) -> Result<(), String> 
         }
 
         ops.extend(exchange.tick(now));
+        file_ops.extend(files.tick(now));
+
+        // One entry or one chunk per turn round the loop, so that a directory
+        // of a thousand files cannot hold the socket, the compositor's events
+        // or the ordinary clipboard behind it.
+        if let Some((transfer, tree)) = source.as_mut() {
+            let transfer = *transfer;
+            match tree.next() {
+                Ok(Some(Produced::Entry { path, kind, size })) => {
+                    file_ops.extend(files.produced_entry(transfer, &path, kind, size, now));
+                }
+                Ok(Some(Produced::Chunk(bytes))) => {
+                    file_ops.extend(files.produced_chunk(transfer, bytes, now));
+                }
+                Ok(None) => {
+                    source = None;
+                    file_ops.extend(files.produced_complete(transfer, now));
+                }
+                Err(error) => {
+                    // The name of what failed, never the name of the file.
+                    eprintln!("vmlord-display-clipboard: the tree could not be read: {error}");
+                    source = None;
+                    file_ops.extend(files.produced_failed(transfer, FileCancelReason::IoFailed));
+                }
+            }
+        }
 
         // A queue rather than a list: producing a selection appends the chunks
         // that carry it, and those have to follow what is already waiting.
@@ -349,7 +411,7 @@ fn pump<S: Read + Write>(stream: &mut S, generation: u32) -> Result<(), String> 
                     );
                     held = pieces;
                     if let Some((clipboard, _)) = clipboard.as_ref()
-                        && let Err(error) = clipboard.own(&kinds, false)
+                        && let Err(error) = clipboard.own(&kinds, !held_files.is_empty())
                     {
                         eprintln!(
                             "vmlord-display-clipboard: the desktop refused the selection: {error}"
@@ -359,6 +421,138 @@ fn pump<S: Read + Write>(stream: &mut S, generation: u32) -> Result<(), String> 
                 }
             }
         }
+
+        let mut file_queue: VecDeque<FileOp> = file_ops.into();
+        while let Some(op) = file_queue.pop_front() {
+            match op {
+                FileOp::Send(message) => {
+                    let record = record_of_file(&message, sequence, generation);
+                    sequence = sequence.wrapping_add(1);
+                    if let Err(error) = record::write(stream, &record, &limits) {
+                        return Err(format!(
+                            "the clipboard channel could not be written: {error}"
+                        ));
+                    }
+                }
+                FileOp::Enumerate { transfer } => {
+                    let opened = clipboard
+                        .as_ref()
+                        .ok_or_else(|| "no desktop clipboard".to_owned())
+                        .and_then(|(clipboard, _)| {
+                            clipboard
+                                .read_mime(URI_LIST_MIME, CLIPBOARD_MAX_PAYLOAD as usize)
+                                .map_err(|error| error.to_string())
+                        })
+                        .and_then(|list| parse_uri_list(&list).map_err(|error| error.to_string()))
+                        .and_then(|paths| {
+                            SourceTree::open(&paths, files.policy())
+                                .map_err(|error| error.to_string())
+                        });
+
+                    match opened {
+                        Ok(tree) => source = Some((transfer, tree)),
+                        Err(reason) => {
+                            eprintln!(
+                                "vmlord-display-clipboard: the desktop's files could not be read: {reason}"
+                            );
+                            file_queue.extend(
+                                files.produced_failed(transfer, FileCancelReason::Unavailable),
+                            );
+                        }
+                    }
+                }
+                FileOp::CreateEntry {
+                    transfer,
+                    path,
+                    kind,
+                    size,
+                } => {
+                    let staged = match staging.as_mut() {
+                        Some(staging) => staging.create_entry(&path, kind, size),
+                        None => Staging::create(session, transfer).and_then(|mut fresh| {
+                            let created = fresh.create_entry(&path, kind, size);
+                            staging = Some(fresh);
+                            created
+                        }),
+                    };
+
+                    if let Err(error) = staged {
+                        eprintln!("vmlord-display-clipboard: staging failed: {error}");
+                        staging = None;
+                        file_queue
+                            .extend(files.staging_failed(transfer, FileCancelReason::IoFailed));
+                    }
+                }
+                FileOp::WriteChunk { transfer, bytes } => {
+                    let written = staging
+                        .as_mut()
+                        .ok_or_else(|| "nothing is being staged".to_owned())
+                        .and_then(|staging| {
+                            staging
+                                .write_chunk(&bytes)
+                                .map_err(|error| error.to_string())
+                        });
+
+                    if let Err(reason) = written {
+                        eprintln!("vmlord-display-clipboard: staging failed: {reason}");
+                        staging = None;
+                        file_queue
+                            .extend(files.staging_failed(transfer, FileCancelReason::IoFailed));
+                    }
+                }
+                FileOp::Commit { transfer } => match staging.take().map(Staging::commit) {
+                    Some(Ok(paths)) => {
+                        eprintln!(
+                            "vmlord-display-clipboard: taking a selection of {} file(s)",
+                            paths.len()
+                        );
+                        held_files = paths;
+                        let kinds: Vec<Kind> = held.iter().map(|piece| piece.kind).collect();
+                        if let Some((clipboard, _)) = clipboard.as_ref()
+                            && let Err(error) = clipboard.own(&kinds, true)
+                        {
+                            eprintln!(
+                                "vmlord-display-clipboard: the desktop refused the files: {error}"
+                            );
+                            held_files.clear();
+                        }
+                    }
+                    Some(Err(error)) => {
+                        eprintln!("vmlord-display-clipboard: staging failed: {error}");
+                        file_queue
+                            .extend(files.staging_failed(transfer, FileCancelReason::IoFailed));
+                    }
+                    None => {}
+                },
+                FileOp::Abort { .. } => {
+                    // Dropping it removes the whole partial tree.
+                    staging = None;
+                }
+            }
+        }
+    }
+}
+
+/// Answers the compositor's request for the files this side owns.
+fn answer_files(clipboard: &Clipboard, held: &[PathBuf], mime: &str, serial: u32) {
+    if held.is_empty() {
+        let _ = clipboard.refuse(serial);
+
+        return;
+    }
+
+    let payloads = uri_lists(held);
+    let bytes = if mime == GNOME_COPIED_MIME {
+        payloads.gnome_copied
+    } else {
+        payloads.uri_list
+    };
+
+    if let Err(error) = clipboard.write(serial, &bytes) {
+        eprintln!(
+            "vmlord-display-clipboard: {} could not be handed to the desktop: {error}",
+            mime
+        );
     }
 }
 
@@ -461,6 +655,174 @@ fn parse(header: &Header, payload: &[u8]) -> Option<Incoming> {
         }
         _ => None,
     }
+}
+
+/// What one file record off the channel means to the file exchange.
+fn handle_file(
+    exchange: &mut files::Exchange,
+    header: &Header,
+    payload: &[u8],
+    now: Instant,
+) -> Vec<FileOp> {
+    match parse_file(header, payload) {
+        Some(FileOutgoing::Policy(policy)) => {
+            exchange.peer_policy(policy);
+
+            Vec::new()
+        }
+        Some(FileOutgoing::Offer { serial }) => exchange.peer_offer(serial, now),
+        Some(FileOutgoing::Request { serial, transfer }) => {
+            exchange.peer_request(serial, transfer, now)
+        }
+        Some(FileOutgoing::Entry {
+            transfer,
+            path,
+            kind,
+            size,
+        }) => exchange.peer_entry(transfer, &path, kind, size, now),
+        Some(FileOutgoing::Chunk { transfer, chunk }) => exchange.peer_chunk(transfer, &chunk, now),
+        Some(FileOutgoing::Complete { transfer }) => exchange.peer_complete(transfer, now),
+        Some(FileOutgoing::Cancel { transfer, reason }) => exchange.peer_cancel(transfer, reason),
+        None => Vec::new(),
+    }
+}
+
+/// Reads a file record, or nothing at all for one this build has no name for.
+fn parse_file(header: &Header, payload: &[u8]) -> Option<FileOutgoing> {
+    match ClipboardRecord::try_from(i32::from(header.message_type)).ok()? {
+        ClipboardRecord::FilePolicy => {
+            let policy = ClipboardFilePolicy::decode(payload).ok()?;
+
+            Some(FileOutgoing::Policy(Policy::new(
+                policy.max_file_bytes,
+                policy.max_transfer_bytes,
+                policy.retention_seconds,
+            )))
+        }
+        ClipboardRecord::FileOffer => {
+            let offer = ClipboardFileOffer::decode(payload).ok()?;
+
+            Some(FileOutgoing::Offer {
+                serial: offer.serial,
+            })
+        }
+        ClipboardRecord::FileRequest => {
+            let request = ClipboardFileRequest::decode(payload).ok()?;
+
+            Some(FileOutgoing::Request {
+                serial: request.serial,
+                transfer: request.transfer,
+            })
+        }
+        ClipboardRecord::FileEntry => {
+            let entry = ClipboardFileEntry::decode(payload).ok()?;
+
+            Some(FileOutgoing::Entry {
+                transfer: entry.transfer,
+                path: entry.path,
+                kind: EntryKind::from_wire(entry.kind)?,
+                size: entry.size,
+            })
+        }
+        ClipboardRecord::FileChunk => {
+            let chunk = ClipboardFileChunk::decode(payload).ok()?;
+
+            Some(FileOutgoing::Chunk {
+                transfer: chunk.transfer,
+                chunk: chunk.chunk,
+            })
+        }
+        ClipboardRecord::FileComplete => {
+            let complete = ClipboardFileComplete::decode(payload).ok()?;
+
+            Some(FileOutgoing::Complete {
+                transfer: complete.transfer,
+            })
+        }
+        ClipboardRecord::FileCancel => {
+            let cancel = ClipboardFileCancel::decode(payload).ok()?;
+
+            Some(FileOutgoing::Cancel {
+                transfer: cancel.transfer,
+                reason: FileCancelReason::try_from(cancel.reason).unwrap_or_default(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Wraps one file message as the record that carries it.
+fn record_of_file(message: &FileOutgoing, sequence: u32, generation: u32) -> Record {
+    let (message_type, payload) = match message {
+        FileOutgoing::Policy(policy) => (
+            ClipboardRecord::FilePolicy,
+            ClipboardFilePolicy {
+                max_file_bytes: policy.max_file_bytes(),
+                max_transfer_bytes: policy.max_transfer_bytes(),
+                retention_seconds: policy.retention_seconds(),
+            }
+            .encode_to_vec(),
+        ),
+        FileOutgoing::Offer { serial } => (
+            ClipboardRecord::FileOffer,
+            ClipboardFileOffer { serial: *serial }.encode_to_vec(),
+        ),
+        FileOutgoing::Request { serial, transfer } => (
+            ClipboardRecord::FileRequest,
+            ClipboardFileRequest {
+                serial: *serial,
+                transfer: *transfer,
+            }
+            .encode_to_vec(),
+        ),
+        FileOutgoing::Entry {
+            transfer,
+            path,
+            kind,
+            size,
+        } => (
+            ClipboardRecord::FileEntry,
+            ClipboardFileEntry {
+                transfer: *transfer,
+                path: path.clone(),
+                kind: kind.as_wire(),
+                size: *size,
+            }
+            .encode_to_vec(),
+        ),
+        FileOutgoing::Chunk { transfer, chunk } => (
+            ClipboardRecord::FileChunk,
+            ClipboardFileChunk {
+                transfer: *transfer,
+                chunk: chunk.clone(),
+            }
+            .encode_to_vec(),
+        ),
+        FileOutgoing::Complete { transfer } => (
+            ClipboardRecord::FileComplete,
+            ClipboardFileComplete {
+                transfer: *transfer,
+            }
+            .encode_to_vec(),
+        ),
+        FileOutgoing::Cancel { transfer, reason } => (
+            ClipboardRecord::FileCancel,
+            ClipboardFileCancel {
+                transfer: *transfer,
+                reason: i32::from(*reason),
+            }
+            .encode_to_vec(),
+        ),
+    };
+
+    Record::new(
+        Channel::Clipboard,
+        message_type as u16,
+        sequence,
+        0,
+        generation,
+        payload,
+    )
 }
 
 /// Wraps one message as the record that carries it.
@@ -606,6 +968,86 @@ mod tests {
                 "{message:?} came back as nothing"
             );
         }
+    }
+
+    #[test]
+    fn every_file_message_survives_the_wire() {
+        let messages = [
+            FileOutgoing::Policy(Policy::new(1024, 4096, 3600)),
+            FileOutgoing::Offer { serial: 7 },
+            FileOutgoing::Request {
+                serial: 7,
+                transfer: 1,
+            },
+            FileOutgoing::Entry {
+                transfer: 1,
+                path: "tree/a.txt".to_owned(),
+                kind: EntryKind::File,
+                size: 3,
+            },
+            FileOutgoing::Chunk {
+                transfer: 1,
+                chunk: b"abc".to_vec(),
+            },
+            FileOutgoing::Complete { transfer: 1 },
+            FileOutgoing::Cancel {
+                transfer: 1,
+                reason: FileCancelReason::FocusLost,
+            },
+        ];
+
+        for message in messages {
+            let record = record_of_file(&message, 0, 3);
+
+            assert_eq!(record.header.channel, Channel::Clipboard);
+            assert_eq!(record.header.generation, 3);
+            assert_eq!(
+                parse_file(&record.header, &record.payload).as_ref(),
+                Some(&message),
+                "{message:?} did not come back as itself"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_entry_of_a_kind_this_build_has_no_name_for_is_ignored() {
+        let record = Record::new(
+            Channel::Clipboard,
+            ClipboardRecord::FileEntry as u16,
+            0,
+            0,
+            0,
+            ClipboardFileEntry {
+                transfer: 1,
+                path: "a.txt".to_owned(),
+                kind: 4242,
+                size: 0,
+            }
+            .encode_to_vec(),
+        );
+
+        assert_eq!(parse_file(&record.header, &record.payload), None);
+    }
+
+    #[test]
+    fn an_ordinary_record_is_not_a_file_one_and_the_other_way_round() {
+        let ordinary = record_of(
+            &Outgoing::Offer {
+                serial: 1,
+                mime_types: vec![Kind::Text.mime()],
+            },
+            0,
+            0,
+        );
+        let file = record_of_file(&FileOutgoing::Offer { serial: 1 }, 0, 0);
+
+        assert_eq!(parse_file(&ordinary.header, &ordinary.payload), None);
+        assert_eq!(parse(&file.header, &file.payload), None);
+    }
+
+    #[test]
+    fn a_staging_directory_is_named_after_the_session_and_nothing_else() {
+        assert_eq!(session_token(&[0x0f, 0xa0, 0x01]), "0fa001");
     }
 
     #[test]
