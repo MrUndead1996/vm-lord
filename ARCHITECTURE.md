@@ -3092,9 +3092,76 @@ until the other asks, so a picture copied in a guest costs nothing until
 somebody pastes it. Text, HTML and one picture are carried -- `image/bmp` in
 preference to `image/png`, because a DIB is a BMP without its file header and
 needs no codec. Arbitrary registered Windows formats are not passed through,
-which is what AppSandbox did and what an allowlist exists to refuse, and files
-are refused outright: they need a model this design does not have, and they are
-task #139.
+which is what AppSandbox did and what an allowlist exists to refuse.
+
+**Files are carried, under a capability of their own.** Protocol 1.3 adds
+`CAPABILITY_FILE_CLIPBOARD`, which is settled only beside the ordinary
+clipboard capability and only at that revision, so an older peer never receives
+a record it has no name for. File transfer is a second state machine,
+`clipboard::files`, on the same channel: one transfer in each direction, its
+own identifiers, its own cancellation, and no interaction with a text or
+picture transfer running beside it. The viewer states the limits it was
+configured with as soon as a file-capable channel binds, and the guest offers
+nothing until it has heard them.
+
+The model is still pull. Copying a directory announces one record; enumeration
+and reading begin when the other side asks, and each side then sends one entry
+or one 60-KiB chunk per turn round its loop, so a tree of a thousand files
+cannot hold focus, the socket or an ordinary selection behind it. The sender
+walks depth-first, sends each regular file in order, and finishes with a
+`FileComplete` that is the only thing that publishes a tree: before it, nothing
+partial is on anybody's clipboard.
+
+Only regular files and directories cross. Linux opens every component from the
+one above it with `O_NOFOLLOW`; Windows opens with `FILE_FLAG_OPEN_REPARSE_POINT`
+and judges the handle's attributes, so a junction is refused rather than
+followed. A symlink, reparse point, socket, FIFO or device ends the whole
+transfer rather than producing a tree that is quietly not what was copied.
+Every wire path is relative UTF-8 with `/` separators and is checked lexically
+before anything is opened: no empty, `.` or `..` component, no NUL, control
+character, colon, backslash or `<>"|*?`, no component ending in a dot or a
+space, no Windows device name such as `CON` or `COM1` with or without an
+extension, at most 1024 UTF-8 bytes and 64 components. Two entries that are one
+file under Windows' case-insensitive comparison are refused, so a tree either
+arrives whole on both platforms or does not arrive.
+
+An arriving tree is staged in a fresh private directory --
+`$XDG_RUNTIME_DIR/vmlord/clipboard/<session>/<transfer>` in the guest, which
+has no `/tmp` fallback, and `%LOCALAPPDATA%\VMLord\Clipboard\<session>\<transfer>`
+in the viewer -- with every destination created new and every component opened
+without following what it might stand for. Containment comes from directory
+handles and attributes, never from comparing the text of a path. When the tree
+is whole, what is published is its top-level entries: `CF_HDROP` on Windows,
+`text/uri-list` and `x-special/gnome-copied-files` in GNOME. Cancellation,
+focus loss, a validation failure, a five-second silence or a lost channel
+closes the handles and removes the partial tree at once.
+
+Windows clipboard data outlives the process that wrote it, so a completed
+Windows tree is not deleted when the viewer exits: the viewer removes stale
+incomplete trees at startup and completed ones older than the configured
+retention, without ever descending through a reparse point. Guest staging goes
+with the user's runtime directory.
+
+The limits are the host's settings, and both ends enforce the narrower of what
+each holds:
+
+```toml
+[clipboard.files]
+max_file_size = "1GB"
+max_transfer_size = "4GB"
+retention = "24h"
+```
+
+Those are the defaults, and an absent table or field takes them, so no settings
+file needs migrating. Sizes are a positive integer and, case-insensitively,
+`B`, `KB`, `MB` or `GB`, which are binary multiples -- the default `1GB` is
+exactly one GiB. Durations are a positive integer and `s`, `m` or `h`.
+Whitespace, fractions, compound values, unknown units, zero and overflow are
+refused, and `max_file_size` may not exceed `max_transfer_size`. There is no
+settings UI and no separate toggle: file transfer is on wherever ordinary
+clipboard sync is, which means while the viewer has keyboard focus. Entry
+count (4096), depth (64), wire-path length (1024 bytes) and one transfer per
+direction are protocol constants rather than settings.
 
 Two rules keep it honest. A selection crosses only while the viewer's window
 has keyboard focus -- in *both* directions, so a VM in the background can
@@ -3109,8 +3176,10 @@ taken as it writes, the guest with `session-is-owner` out of mutter's
 `SelectionOwnerChanged` -- because without that, applying the other side's
 selection would immediately offer it back.
 
-Nothing about a selection is logged. A mime type, a byte count, a transfer id
-and an outcome are what a clipboard problem is diagnosed from, on both sides.
+Nothing about a selection is logged, files included. A mime type, a byte count,
+an entry count, a transfer id and an outcome are what a clipboard problem is
+diagnosed from, on both sides; a file name and a file's contents are the two
+things that must never be diagnosed from.
 
 ### Resizing the desktop
 

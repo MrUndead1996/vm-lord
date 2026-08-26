@@ -58,7 +58,8 @@ pub const IDLE: Duration = Duration::from_secs(5);
 /// An allowlist rather than a pass-through. AppSandbox forwards any registered
 /// Windows format by name, which is an unbounded channel between a guest and
 /// its host offered to whatever either side happens to register; these four are
-/// what people actually copy. Files are refused by policy and are task #139's.
+/// what people actually copy. Files are not one of these kinds: they are a
+/// stream of their own, in [`files`], and never an in-memory payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// UTF-8 text.
@@ -590,7 +591,8 @@ mod tests {
         assert_eq!(Kind::from_mime("image/bmp"), Some(Kind::Bmp));
         assert_eq!(Kind::from_mime("image/png"), Some(Kind::Png));
 
-        // Files are refused by policy, not by omission: task #139 owns them.
+        // A uri-list is how a file selection is named, and files are carried
+        // by `files`, not as one of these in-memory kinds.
         assert_eq!(Kind::from_mime("text/uri-list"), None);
         assert_eq!(Kind::from_mime("text/plain"), None);
         assert_eq!(Kind::from_mime("application/x-anything"), None);
