@@ -301,6 +301,9 @@ impl Control {
             height: self.height,
             tile_size: self.tile_size,
             mode: Mode::Desktop as i32,
+            // Zero while nothing has been committed: a refresh is only known
+            // once the compositor has settled on one of the offered modes.
+            refresh_hz: 0,
         };
         self.write(stream, ControlRecord::DisplayState, state.encode_to_vec());
     }

@@ -20,7 +20,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use vmlord_display_protocol::{keys::Secret, v1::ErrorCode};
+use vmlord_display_protocol::{
+    keys::Secret,
+    v1::{DisplayTiming, ErrorCode},
+};
 
 use crate::{
     control::{Control, Outcome, support_from},
@@ -1006,7 +1009,11 @@ fn geometry(output: &Output, shared: &Shared) -> (u32, u32) {
         .expect("the broker's lock is not poisoned")
         .geometry;
 
-    seen.unwrap_or_else(|| output.current())
+    seen.unwrap_or_else(|| {
+        let mode = output.current();
+
+        (mode.width, mode.height)
+    })
 }
 
 /// Asks the module for a mode, and says so on the socket if it will not take it.
@@ -1021,7 +1028,14 @@ fn request_mode(
     width: u32,
     height: u32,
 ) {
-    if let Err(error) = output.request(width, height) {
+    // The refresh the output is already on: a window being dragged asks for a
+    // geometry, and the mode it is asked for keeps the timing it was chosen at.
+    let mode = DisplayTiming {
+        width,
+        height,
+        refresh_hz: output.current().refresh_hz,
+    };
+    if let Err(error) = output.request(&mode) {
         eprintln!(
             "vmlord-display-broker: {} would not take {width}x{height}: {error}",
             output.path().display()
