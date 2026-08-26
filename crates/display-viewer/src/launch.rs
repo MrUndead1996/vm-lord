@@ -20,7 +20,7 @@ use prost::Message as _;
 use crate::viewer::v1::{self as wire, envelope};
 
 /// The revision of the launch contract this build speaks.
-pub const REVISION: u32 = 2;
+pub const REVISION: u32 = 3;
 
 /// The largest message a launch pipe may carry.
 ///
@@ -85,6 +85,8 @@ pub struct LaunchParameters {
     pub client_hello: Vec<u8>,
     /// Limits and completed-file lifetime for clipboard file transfers.
     pub file_policy: FilePolicy,
+    /// Delivered FPS below this share of DRM refresh is diagnostic-worthy.
+    pub fps_gap_threshold_percent: u8,
 }
 
 /// Parsed file clipboard settings handed to the viewer.
@@ -159,6 +161,7 @@ pub fn encode(message: &Message) -> Vec<u8> {
             clipboard_max_file_bytes: parameters.file_policy.max_file_bytes,
             clipboard_max_transfer_bytes: parameters.file_policy.max_transfer_bytes,
             clipboard_retention_seconds: parameters.file_policy.retention_seconds,
+            fps_gap_threshold_percent: u32::from(parameters.fps_gap_threshold_percent),
         }),
         Message::RelayToViewer(bytes) => envelope::Kind::RelayToViewer(wire::Relay {
             bytes: bytes.clone(),
@@ -240,6 +243,12 @@ pub fn decode(bytes: &[u8]) -> Result<Message, LaunchError> {
                 retention_seconds: parameters.clipboard_retention_seconds,
             }
             .validate()?,
+            fps_gap_threshold_percent: parameters
+                .fps_gap_threshold_percent
+                .try_into()
+                .ok()
+                .filter(|percent| (1..=100).contains(percent))
+                .ok_or(LaunchError::Policy)?,
         }),
         envelope::Kind::RelayToViewer(relay) => Message::RelayToViewer(relay.bytes),
         envelope::Kind::RelayFromViewer(relay) => Message::RelayFromViewer(relay.bytes),
@@ -483,6 +492,7 @@ mod tests {
                 max_transfer_bytes: 4 << 30,
                 retention_seconds: 86_400,
             },
+            fps_gap_threshold_percent: 50,
         }
     }
 
@@ -536,6 +546,19 @@ mod tests {
     }
 
     #[test]
+    fn fps_gap_threshold_survives_the_launch_pipe() {
+        let mut parameters = parameters();
+        parameters.fps_gap_threshold_percent = 73;
+
+        let decoded = decode(&encode(&Message::Launch(parameters))).unwrap();
+
+        let Message::Launch(parameters) = decoded else {
+            panic!("the launch message changed kind");
+        };
+        assert_eq!(parameters.fps_gap_threshold_percent, 73);
+    }
+
+    #[test]
     fn a_zero_or_inverted_file_policy_is_refused() {
         for policy in [
             FilePolicy {
@@ -574,7 +597,7 @@ mod tests {
     #[test]
     fn an_envelope_naming_no_message_is_refused() {
         // Current revision and nothing else.
-        assert!(matches!(decode(&[0x08, 0x02]), Err(LaunchError::Empty)));
+        assert!(matches!(decode(&[0x08, 0x03]), Err(LaunchError::Empty)));
     }
 
     #[test]

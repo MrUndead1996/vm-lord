@@ -10,11 +10,11 @@ use rust_i18n::t;
 use vmlord_app::{BackendStatus, VmAction, WorkspaceApp};
 use vmlord_core::{
     Advisory, AgentStatus, AppSettings, BuildProgress, BuildStep, CloudImage, DesktopProfile,
-    DiagnosticLevel, DisplayState, DistroProfile, DownloadPhase, FileClipboardSettings, GpuMode,
-    GpuState, GuestDefaults, GuestReadinessTimeouts, HostGpuCapabilities, Language, LogLevel,
-    NetworkMode, Password, Provisioning, SshAccess, SshAuthentication, SshConfig, SshPort,
-    VmCreateRequest, VmDeleteRequest, VmDisplayStatus, VmGpuStatus, VmSource, VmState, VmSummary,
-    VmUpdateRequest,
+    DiagnosticLevel, DisplaySettings, DisplayState, DistroProfile, DownloadPhase,
+    FileClipboardSettings, GpuMode, GpuState, GuestDefaults, GuestReadinessTimeouts,
+    HostGpuCapabilities, Language, LogLevel, NetworkMode, Password, Provisioning, SshAccess,
+    SshAuthentication, SshConfig, SshPort, VmCreateRequest, VmDeleteRequest, VmDisplayStatus,
+    VmGpuStatus, VmSource, VmState, VmSummary, VmUpdateRequest,
 };
 
 // The catalogues in `locales/`, embedded at compile time. English is the
@@ -154,6 +154,7 @@ struct SettingsForm {
     guest_readiness: GuestReadinessTimeouts,
     /// TOML-only in task 139; the settings dialog must preserve it unchanged.
     clipboard_files: FileClipboardSettings,
+    display: DisplaySettings,
     error: Option<String>,
 }
 
@@ -168,6 +169,7 @@ impl SettingsForm {
             default_distro: settings.default_distro.clone(),
             guest_readiness: settings.guest_readiness,
             clipboard_files: settings.clipboard_files,
+            display: settings.display,
             error: None,
         }
     }
@@ -182,6 +184,10 @@ impl SettingsForm {
             return Err(t!("settings.log_file_required").to_string());
         }
 
+        self.display
+            .validate()
+            .map_err(|_| t!("settings.fps_gap_threshold_invalid").to_string())?;
+
         Ok(AppSettings {
             vm_storage_path: PathBuf::from(vm_storage_path),
             language: self.language,
@@ -191,6 +197,7 @@ impl SettingsForm {
             default_distro: self.default_distro.clone(),
             guest_readiness: self.guest_readiness,
             clipboard_files: self.clipboard_files,
+            display: self.display,
         })
     }
 }
@@ -972,6 +979,20 @@ fn render_settings_dialog(
                         if ui.button(t!("common.browse").to_string()).clicked() {
                             action = Some(SettingsDialogAction::BrowseVmStorage);
                         }
+                    });
+                    ui.end_row();
+
+                    ui.add_sized(
+                        [110.0, 24.0],
+                        egui::Label::new(t!("settings.fps_gap_threshold").to_string()),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::DragValue::new(&mut form.display.fps_gap_threshold_percent)
+                                .range(1..=100)
+                                .suffix("%"),
+                        );
+                        ui.label(t!("settings.fps_gap_threshold_hint").to_string());
                     });
                     ui.end_row();
 

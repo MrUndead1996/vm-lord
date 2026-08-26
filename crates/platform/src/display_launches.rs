@@ -58,6 +58,7 @@ pub(crate) struct LaunchRequest<'a> {
     pub(crate) mode: Option<DisplayMode>,
     pub(crate) viewer: PathBuf,
     pub(crate) file_policy: FileClipboardSettings,
+    pub(crate) fps_gap_threshold_percent: u8,
 }
 
 /// Where the viewer is, given where the application is.
@@ -168,6 +169,7 @@ impl DisplayLaunches {
             request.runtime_id,
             request.mode,
             request.file_policy,
+            request.fps_gap_threshold_percent,
         );
         let mut child = spawn(&request.viewer, request.vm_name)?;
         let (reader, writer) = pipes(&mut child, request.vm_name)?;
@@ -462,6 +464,7 @@ mod tests {
                     mode: None,
                     viewer: PathBuf::from(r"C:\nowhere\vmlord-display.exe"),
                     file_policy: FileClipboardSettings::default(),
+                    fps_gap_threshold_percent: 50,
                 })
                 .expect_err("there is no viewer at that path")
         });
@@ -538,6 +541,7 @@ mod tests {
                 mode: None,
                 viewer: PathBuf::from(r"C:\nowhere\vmlord-display.exe"),
                 file_policy: FileClipboardSettings::default(),
+                fps_gap_threshold_percent: 50,
             })
             .expect("an existing viewer needs no new executable");
 

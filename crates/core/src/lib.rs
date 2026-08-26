@@ -54,8 +54,9 @@ pub use provisioning::{
     validate_vm_name,
 };
 pub use settings::{
-    AppSettings, DataSize, FileClipboardSettings, FileClipboardSettingsError,
-    GuestReadinessTimeouts, Language, LogLevel, Retention, SettingsError, SettingsStore,
+    AppSettings, DataSize, DisplaySettings, DisplaySettingsError, FileClipboardSettings,
+    FileClipboardSettingsError, GuestReadinessTimeouts, Language, LogLevel, Retention,
+    SettingsError, SettingsStore,
 };
 pub use ssh::{SshAuthentication, SshAvailability, SshConfig, SshEndpoint, SshPort};
 

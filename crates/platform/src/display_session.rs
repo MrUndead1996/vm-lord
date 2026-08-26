@@ -106,6 +106,7 @@ impl Driver {
         runtime_id: Uuid,
         mode: Option<DisplayMode>,
         file_settings: FileClipboardSettings,
+        fps_gap_threshold_percent: u8,
     ) -> (Self, LaunchParameters) {
         let offer = Offer {
             // What the guest announces and what this viewer implements.
@@ -144,6 +145,7 @@ impl Driver {
                 max_transfer_bytes: file_settings.max_transfer_size.bytes(),
                 retention_seconds: file_settings.retention.seconds(),
             },
+            fps_gap_threshold_percent,
         };
 
         (
@@ -418,6 +420,7 @@ mod tests {
             Uuid::from_u128(7),
             mode,
             FileClipboardSettings::default(),
+            50,
         );
 
         (
@@ -497,6 +500,7 @@ mod tests {
             Uuid::from_u128(7),
             None,
             FileClipboardSettings::default(),
+            50,
         );
 
         assert_eq!(parameters.vm_name, "dev");
@@ -516,6 +520,7 @@ mod tests {
             Uuid::from_u128(7),
             vmlord_core::DisplayMode::new(2560, 1440),
             FileClipboardSettings::default(),
+            50,
         );
 
         assert_eq!((parameters.width, parameters.height), (2560, 1440));
@@ -529,6 +534,7 @@ mod tests {
             Uuid::from_u128(7),
             None,
             FileClipboardSettings::default(),
+            50,
         );
 
         assert_eq!((parameters.width, parameters.height), (1920, 1080));

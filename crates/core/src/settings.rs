@@ -43,7 +43,52 @@ pub struct AppSettings {
     /// Limits and retention for file transfers over the display clipboard.
     #[serde(default)]
     pub clipboard_files: FileClipboardSettings,
+    /// Display stream diagnostics policy.
+    #[serde(default)]
+    pub display: DisplaySettings,
 }
+
+/// Application-wide policy for comparing guest refresh with delivered frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DisplaySettings {
+    pub fps_gap_threshold_percent: u8,
+}
+
+impl Default for DisplaySettings {
+    fn default() -> Self {
+        Self {
+            fps_gap_threshold_percent: 50,
+        }
+    }
+}
+
+impl DisplaySettings {
+    /// Refuses a threshold that is not a percentage.
+    pub fn validate(self) -> Result<(), DisplaySettingsError> {
+        if !(1..=100).contains(&self.fps_gap_threshold_percent) {
+            return Err(DisplaySettingsError::FpsGapThreshold);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisplaySettingsError {
+    FpsGapThreshold,
+}
+
+impl fmt::Display for DisplaySettingsError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FpsGapThreshold => {
+                formatter.write_str("display FPS gap threshold must be between 1 and 100 percent")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DisplaySettingsError {}
 
 /// A byte count stored in settings with a human-readable binary unit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -307,6 +352,10 @@ impl SettingsStore {
                     .clipboard_files
                     .validate()
                     .map_err(SettingsError::Validation)?;
+                settings
+                    .display
+                    .validate()
+                    .map_err(SettingsError::DisplayValidation)?;
                 if settings.image_cache_path.as_os_str().is_empty() {
                     settings.image_cache_path =
                         self.config_directory()?.join(DEFAULT_IMAGE_DIRECTORY);
@@ -336,6 +385,10 @@ impl SettingsStore {
             .clipboard_files
             .validate()
             .map_err(SettingsError::Validation)?;
+        settings
+            .display
+            .validate()
+            .map_err(SettingsError::DisplayValidation)?;
         let config_directory = self.config_directory()?;
         fs::create_dir_all(config_directory).map_err(|source| SettingsError::Io {
             operation: "create configuration directory",
@@ -386,6 +439,7 @@ impl SettingsStore {
             default_distro: default_distro(),
             guest_readiness: GuestReadinessTimeouts::default(),
             clipboard_files: FileClipboardSettings::default(),
+            display: DisplaySettings::default(),
         })
     }
 
@@ -419,6 +473,7 @@ pub enum SettingsError {
     },
     Serialize(toml::ser::Error),
     Validation(FileClipboardSettingsError),
+    DisplayValidation(DisplaySettingsError),
 }
 
 impl fmt::Display for SettingsError {
@@ -452,6 +507,7 @@ impl fmt::Display for SettingsError {
             }
             Self::Serialize(source) => write!(formatter, "failed to serialize settings: {source}"),
             Self::Validation(source) => write!(formatter, "invalid settings: {source}"),
+            Self::DisplayValidation(source) => write!(formatter, "invalid settings: {source}"),
         }
     }
 }
@@ -463,6 +519,7 @@ impl std::error::Error for SettingsError {
             Self::Parse { source, .. } => Some(source),
             Self::Serialize(source) => Some(source),
             Self::Validation(source) => Some(source),
+            Self::DisplayValidation(source) => Some(source),
             Self::LocalAppDataUnavailable | Self::MissingParent { .. } => None,
         }
     }
@@ -476,8 +533,8 @@ mod tests {
     };
 
     use super::{
-        AppSettings, DataSize, FileClipboardSettings, GuestReadinessTimeouts, Language, LogLevel,
-        Retention, SettingsError, SettingsStore,
+        AppSettings, DataSize, DisplaySettings, FileClipboardSettings, GuestReadinessTimeouts,
+        Language, LogLevel, Retention, SettingsError, SettingsStore,
     };
 
     fn temporary_directory() -> std::path::PathBuf {
@@ -571,6 +628,7 @@ mod tests {
             default_distro: "fedora".into(),
             guest_readiness: GuestReadinessTimeouts::default(),
             clipboard_files: FileClipboardSettings::default(),
+            display: DisplaySettings::default(),
         };
 
         store.save(&settings).unwrap();
@@ -594,6 +652,7 @@ mod tests {
             default_distro: "ubuntu".into(),
             guest_readiness: GuestReadinessTimeouts::default(),
             clipboard_files: FileClipboardSettings::default(),
+            display: DisplaySettings::default(),
         };
 
         store.save(&settings).unwrap();
@@ -719,6 +778,40 @@ mod tests {
     }
 
     #[test]
+    fn an_old_settings_file_gets_the_display_fps_gap_default() {
+        let settings: AppSettings = toml::from_str(
+            "vm_storage_path = \"vms\"\nlanguage = \"en-US\"\nlog_file_path = \"vmlord.log\"\nlog_level = \"info\"",
+        )
+        .unwrap();
+
+        assert_eq!(settings.display.fps_gap_threshold_percent, 50);
+    }
+
+    #[test]
+    fn display_fps_gap_threshold_is_a_percentage() {
+        for percent in [1, 50, 100] {
+            assert!(
+                DisplaySettings {
+                    fps_gap_threshold_percent: percent,
+                }
+                .validate()
+                .is_ok(),
+                "{percent}% should be valid"
+            );
+        }
+        for percent in [0, 101] {
+            assert!(
+                DisplaySettings {
+                    fps_gap_threshold_percent: percent,
+                }
+                .validate()
+                .is_err(),
+                "{percent}% should be refused"
+            );
+        }
+    }
+
+    #[test]
     fn settings_written_before_the_default_distribution_existed_select_ubuntu() {
         let directory = temporary_directory();
         fs::create_dir_all(&directory).unwrap();
@@ -753,6 +846,7 @@ mod tests {
             default_distro: "ubuntu".into(),
             guest_readiness: GuestReadinessTimeouts::default(),
             clipboard_files: FileClipboardSettings::default(),
+            display: DisplaySettings::default(),
         }
     }
 
