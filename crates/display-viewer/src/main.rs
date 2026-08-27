@@ -720,6 +720,13 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState, fps_gap_threshold_percen
             match &signal {
                 Signal::Configured(geometry) => {
                     stream = Some(*geometry);
+                    // A geometry that is not the answer to a size the window
+                    // asked for is the guest choosing a mode of its own -- the
+                    // *Resolution* submenu, or the settings inside the guest --
+                    // and on that the window is the one that has to move.
+                    if resize.is_guests_own(geometry.width(), geometry.height()) {
+                        follow(context.window, &mut resize, *geometry);
+                    }
                     reposition(&mut policy, stream, context.window);
                 }
                 Signal::Committed(mode) => {
@@ -952,6 +959,26 @@ fn reposition(policy: &mut input::Policy, stream: Option<Geometry>, window: &Win
 
     let (width, height) = window.client_size();
     policy.set_placement(place(geometry.width(), geometry.height(), width, height));
+}
+
+/// Gives the window the size of the mode the guest chose for itself.
+///
+/// The direction the arrow points the other way: a dragged edge makes the
+/// window the authority and the guest follows it, and an explicitly chosen mode
+/// makes the guest the authority and the window follows that. A window left at
+/// the size it happened to be would show the new desktop scaled down inside it,
+/// which is the choice not having been honoured.
+fn follow(window: &Window, resize: &mut Resize, geometry: Geometry) {
+    let Some((width, height)) = window.set_client_size(geometry.width(), geometry.height()) else {
+        // Full screen, maximised or minimised: none of the three is a window
+        // whose size is the viewer's to set, and the letterbox is what covers
+        // the difference until it is.
+        return;
+    };
+
+    // The `WM_SIZE` that move raises settles into a request like any other, and
+    // that request would ask the guest to undo what it has just done.
+    resize.assume(width, height);
 }
 
 /// Moves one signal into the status machine and the renderer.

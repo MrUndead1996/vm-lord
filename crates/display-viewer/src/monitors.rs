@@ -75,6 +75,60 @@ pub fn opening_position(
     Some(centred(target, size))
 }
 
+/// Where a window goes, and how big it is, once it has to fit somewhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fit {
+    /// The left edge of the whole window, frame included.
+    pub x: i32,
+    /// The top edge of it.
+    pub y: i32,
+    /// How wide the whole window is.
+    pub width: i32,
+    /// How tall it is.
+    pub height: i32,
+}
+
+/// The window that shows `client` pixels without leaving the work area.
+///
+/// What a mode chosen inside the guest asks of the window: a client area of
+/// exactly the geometry the guest came up on. `frame` is what the window's
+/// borders and caption add to that, `at` is where the window is now, and `work`
+/// is the usable part of the monitor it is on -- the taskbar's own strip
+/// excluded, because a window sized to the whole monitor is one whose bottom
+/// edge is behind it.
+///
+/// A mode larger than the monitor is where this stops being exact: 2560x1440
+/// does not open whole on a 1080p panel, the window is given every pixel there
+/// is, and the letterbox covers the difference. That is the one case where a
+/// picture scaled down is the right answer -- the alternative is a window with
+/// corners nobody can reach.
+///
+/// The window is moved as little as the fit allows: it grows from where the
+/// user left it and is pulled back only by however much it would hang off the
+/// right or the bottom.
+#[must_use]
+pub fn fitted(client: (u32, u32), frame: (i32, i32), at: (i32, i32), work: Rect) -> Fit {
+    let across = fit(width(client.0).saturating_add(frame.0), work.left, work.right);
+    let down = fit(width(client.1).saturating_add(frame.1), work.top, work.bottom);
+
+    Fit {
+        x: place(at.0, across, work.left, work.right),
+        y: place(at.1, down, work.top, work.bottom),
+        width: across,
+        height: down,
+    }
+}
+
+/// One dimension, never larger than the space there is and never nothing.
+fn fit(wanted: i32, low: i32, high: i32) -> i32 {
+    wanted.min(high.saturating_sub(low)).max(1)
+}
+
+/// One edge, pulled back inside the space rather than moved for its own sake.
+fn place(at: i32, size: i32, low: i32, high: i32) -> i32 {
+    at.min(high.saturating_sub(size)).max(low)
+}
+
 /// The rectangle a window of this size at this position covers.
 fn rectangle(position: (i32, i32), size: (u32, u32)) -> Rect {
     Rect {
@@ -143,7 +197,88 @@ fn centred(monitor: &Rect, size: (u32, u32)) -> (i32, i32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Rect, opening_position};
+    use super::{Fit, Rect, fitted, opening_position};
+
+    /// The usable part of a 1920x1080 monitor, taskbar excluded.
+    const WORK: Rect = Rect {
+        left: 0,
+        top: 0,
+        right: 1920,
+        bottom: 1040,
+    };
+
+    /// What a caption and a sizing border add to a client area.
+    const FRAME: (i32, i32) = (16, 39);
+
+    #[test]
+    fn a_mode_that_fits_gets_a_window_of_exactly_that_client_area() {
+        let fit = fitted((1280, 720), FRAME, (100, 80), WORK);
+
+        assert_eq!(fit.width - FRAME.0, 1280);
+        assert_eq!(fit.height - FRAME.1, 720);
+        assert_eq!((fit.x, fit.y), (100, 80), "and stays where the user left it");
+    }
+
+    #[test]
+    fn a_mode_larger_than_the_monitor_gets_every_pixel_there_is() {
+        // 2560x1440 on a 1080p panel: the window cannot hold it, so it takes
+        // the work area whole and the letterbox covers the difference.
+        let fit = fitted((2560, 1440), FRAME, (100, 80), WORK);
+
+        assert_eq!(
+            fit,
+            Fit {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1040
+            }
+        );
+    }
+
+    #[test]
+    fn a_window_that_would_hang_off_the_edge_is_pulled_back_by_that_much() {
+        // Grown from near the right edge: moved, but only as far as it has to
+        // be, and never off the left.
+        let fit = fitted((1600, 900), FRAME, (700, 300), WORK);
+
+        assert_eq!(fit.width, 1616);
+        assert_eq!(fit.x, 1920 - 1616);
+        assert_eq!(fit.y, 1040 - (900 + FRAME.1));
+    }
+
+    #[test]
+    fn a_window_on_the_monitor_left_of_the_primary_is_fitted_to_that_one() {
+        let work = Rect {
+            left: -1920,
+            top: 0,
+            right: 0,
+            bottom: 1040,
+        };
+
+        let fit = fitted((1280, 720), FRAME, (-1800, 40), work);
+
+        assert_eq!((fit.x, fit.y), (-1800, 40));
+    }
+
+    #[test]
+    fn a_work_area_that_answered_nothing_still_leaves_a_window_with_pixels() {
+        // Never zero: a swapchain of no pixels is a viewer that has gone black.
+        let fit = fitted(
+            (1280, 720),
+            FRAME,
+            (0, 0),
+            Rect {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+        );
+
+        assert!(fit.width >= 1 && fit.height >= 1);
+    }
+
 
     /// A 1920x1080 monitor at the origin, and a 1920x1080 one to the left of
     /// it -- the arrangement a second monitor set as primary's neighbour has.
