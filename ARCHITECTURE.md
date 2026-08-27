@@ -3210,9 +3210,11 @@ things that must never be diagnosed from.
 
 ### Resizing the desktop
 
-The window is the authority on the guest's resolution. Dragging the viewer's
-edge changes the desktop inside it, rather than scaling a fixed desktop into a
-different rectangle, and the whole path exists to make that certain rather than
+A size is never scaled into a rectangle it does not belong in: whichever end
+the resolution was decided at, the other end takes it. Dragging the viewer's
+edge changes the desktop inside it, and choosing a mode -- from the window's
+*Resolution* submenu or from the settings inside the guest -- changes the
+window around it. The whole path exists to make that certain rather than
 likely.
 
 **The host holds a size until it stops moving.** A drag is hundreds of
@@ -3311,6 +3313,29 @@ against request: a size already asked for is never asked for twice, and the
 difference between the answer and the window is exactly what the letterbox is
 for. A new session forgets, because the guest that was told is not the guest
 that is listening.
+
+**A mode chosen rather than dragged moves the window.** Both arrive as the same
+`StreamConfig`, so what tells them apart is arithmetic: the broker's rounding
+rule is mirrored in `resize.rs`, and a geometry that is not what the last
+request would have produced is the guest going its own way -- the submenu, or
+GNOME's own display settings. Then the window takes that geometry as its client
+area, because a 2560x1440 desktop letterboxed into the 1848x1048 the window
+happened to be is the choice not having been honoured. Nothing before the first
+request of a session counts: the guest is still on the mode the last one left,
+and the window's own size is on its way to it.
+
+The window that results is fitted rather than obeyed. It grows from where the
+user left it and is pulled back only by however much it would hang off the work
+area -- the taskbar's strip excluded, because a window sized to the whole
+monitor has its bottom edge behind it. A mode larger than the monitor gets
+every pixel there is and letterboxes the rest, which is the one case where a
+picture scaled down is the right answer: the alternative is a desktop with
+corners nobody can reach. Full screen, maximised and minimised windows are left
+alone -- the first already covers a monitor, the second is sized by Windows and
+un-maximising it would be the viewer overruling the user, and the third has no
+client area to give. Whatever size the window ends up at is then taken as the
+size last asked for, so that the `WM_SIZE` the move raises does not settle into
+a request that asks the guest to undo what it just did.
 
 **Full screen** is `F11` or the system menu, borderless: a frame and a
 rectangle, both given back on the way out. Exclusive would take the display for

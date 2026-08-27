@@ -14,9 +14,19 @@
 //! asked for twice, and the difference between the answer and the window is
 //! what the letterbox is for.
 //!
+//! That comparison is also what tells the two directions apart. Since #136 a
+//! mode can be chosen rather than dragged -- from the window's *Resolution*
+//! submenu, or from the settings inside the guest -- and on such a choice the
+//! window is the one that has to move. Both arrive as the same `StreamConfig`,
+//! so what separates them is whether the geometry is the one the last request
+//! would have produced: the guest's rounding rule is arithmetic, mirrored here,
+//! and anything else is the guest going its own way.
+//!
 //! No Win32 here, so the rule is tested without a window.
 
 use std::time::{Duration, Instant};
+
+use crate::display_modes::{MAX_HEIGHT, MAX_WIDTH, MIN_HEIGHT, MIN_WIDTH};
 
 /// How long a size must hold still before it is asked for.
 ///
@@ -75,6 +85,38 @@ impl Resize {
         Some(size)
     }
 
+    /// Whether the guest reporting this geometry is it going its own way.
+    ///
+    /// The answer to a size the viewer asked for is not: that is the request
+    /// rounded to what the output builds, and a window that resized itself to
+    /// it would be the loop this module exists to keep open.
+    ///
+    /// Nor is anything before the first request of a session. The guest is
+    /// still on whatever mode the last one left it on, the window's own size is
+    /// on its way to it, and a window that took that stale geometry would give
+    /// up being the authority it is about to exercise.
+    #[must_use]
+    pub fn is_guests_own(&self, width: u32, height: u32) -> bool {
+        match self.requested {
+            None => false,
+            Some((wanted_width, wanted_height)) => {
+                admissible(wanted_width, wanted_height) != Some((width, height))
+            }
+        }
+    }
+
+    /// Takes a size the guest is already on as the one last asked for.
+    ///
+    /// What follows the window moving to the guest's own choice of mode: the
+    /// `WM_SIZE` that move raises would otherwise settle into a request that
+    /// asked the guest to undo it -- and on a mode too large for the monitor,
+    /// where the window is smaller than the geometry, that request would be the
+    /// user's choice being taken back from them.
+    pub fn assume(&mut self, width: u32, height: u32) {
+        self.pending = None;
+        self.requested = Some((width, height));
+    }
+
     /// Forgets what has been asked for, so the window is asked for again.
     ///
     /// What a new session means: the guest that was told is not the guest
@@ -89,6 +131,29 @@ impl Default for Resize {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// What the guest makes of a size the viewer asks for.
+///
+/// The broker's own rule, mirrored: clamped to what the output drives, then
+/// rounded down to what `drm_cvt_mode` builds -- a width to a multiple of
+/// eight, a height to an even number -- and refused outright when there is not
+/// enough left. It is duplicated rather than shared because the two ends are
+/// separate binaries on separate machines; `display-services`' `output` module
+/// is the original, and the tests below pin the numbers.
+#[must_use]
+fn admissible(width: u32, height: u32) -> Option<(u32, u32)> {
+    if width < MIN_WIDTH || height < MIN_HEIGHT {
+        return None;
+    }
+
+    let width = (width.min(MAX_WIDTH) / 8) * 8;
+    let height = (height.min(MAX_HEIGHT) / 2) * 2;
+    if width < MIN_WIDTH || height < MIN_HEIGHT {
+        return None;
+    }
+
+    Some((width, height))
 }
 
 #[cfg(test)]
@@ -168,6 +233,65 @@ mod tests {
         resize.observe(0, 0, start + Duration::from_millis(10));
 
         assert_eq!(resize.due(start + DEBOUNCE * 4), None);
+    }
+
+    #[test]
+    fn the_answer_to_a_request_is_not_the_guest_going_its_own_way() {
+        // 1727x971 asked for, 1720x970 applied: the rounding is the guest's,
+        // and a window that moved to it would be chasing its own request.
+        let start = Instant::now();
+        let mut resize = Resize::new();
+        resize.observe(1727, 971, start);
+        assert_eq!(resize.due(start + DEBOUNCE), Some((1727, 971)));
+
+        assert!(!resize.is_guests_own(1720, 970));
+    }
+
+    #[test]
+    fn a_mode_nobody_asked_for_is_the_guest_going_its_own_way() {
+        // The *Resolution* submenu and the settings inside the guest both land
+        // here, and both are a size the window has to take.
+        let start = Instant::now();
+        let mut resize = Resize::new();
+        resize.observe(1848, 1048, start);
+        assert_eq!(resize.due(start + DEBOUNCE), Some((1848, 1048)));
+
+        assert!(resize.is_guests_own(2560, 1440));
+    }
+
+    #[test]
+    fn a_request_the_guest_had_to_clamp_is_still_its_answer() {
+        // A window dragged wider than the output drives comes back at the
+        // limit, which is the request and not a choice of the guest's.
+        let start = Instant::now();
+        let mut resize = Resize::new();
+        resize.observe(3000, 1600, start);
+        assert_eq!(resize.due(start + DEBOUNCE), Some((3000, 1600)));
+
+        assert!(!resize.is_guests_own(2560, 1440));
+    }
+
+    #[test]
+    fn nothing_asked_for_yet_is_never_the_guest_going_its_own_way() {
+        // The first `StreamConfig` of a session is the mode the last one left
+        // behind, with the window's own size still on its way to the guest.
+        let resize = Resize::new();
+
+        assert!(!resize.is_guests_own(2560, 1440));
+    }
+
+    #[test]
+    fn the_window_moving_to_the_guests_mode_does_not_ask_for_it_back() {
+        // The `WM_SIZE` that move raises would otherwise settle into a request
+        // -- and on a mode too large for the monitor the window is smaller than
+        // the geometry, so that request would undo what the user picked.
+        let start = Instant::now();
+        let mut resize = Resize::new();
+
+        resize.assume(1920, 1040);
+        resize.observe(1920, 1040, start);
+
+        assert_eq!(resize.due(start + DEBOUNCE), None);
     }
 
     #[test]

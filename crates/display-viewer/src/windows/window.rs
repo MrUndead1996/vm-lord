@@ -575,8 +575,8 @@ impl Window {
         restored_origin(self.hwnd)
     }
 
-    /// The monitor this window is mostly on, in virtual-desktop pixels.
-    fn monitor_rectangle(&self) -> Option<RECT> {
+    /// What Windows knows about the monitor this window is mostly on.
+    fn monitor_info(&self) -> Option<MONITORINFO> {
         // SAFETY: `self.hwnd` names a window of this process.
         let monitor: HMONITOR = unsafe { MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST) };
         if monitor.is_invalid() {
@@ -593,7 +593,45 @@ impl Window {
             return None;
         }
 
-        Some(info.rcMonitor)
+        Some(info)
+    }
+
+    /// The monitor this window is mostly on, in virtual-desktop pixels.
+    fn monitor_rectangle(&self) -> Option<RECT> {
+        self.monitor_info().map(|info| info.rcMonitor)
+    }
+
+    /// The part of that monitor a window can have, taskbar excluded.
+    fn work_rectangle(&self) -> Option<monitors::Rect> {
+        self.monitor_info().map(|info| monitors::Rect {
+            left: info.rcWork.left,
+            top: info.rcWork.top,
+            right: info.rcWork.right,
+            bottom: info.rcWork.bottom,
+        })
+    }
+
+    /// Where the whole window is, and what its frame adds to the client area.
+    ///
+    /// Measured rather than computed: `AdjustWindowRectEx` would need this
+    /// window's styles and this monitor's DPI, and the difference between the
+    /// two rectangles Windows is already keeping is the same number without
+    /// either. It is only the truth for a window that is neither maximised nor
+    /// full screen, which is the only kind this is asked about.
+    fn outside(&self) -> Option<((i32, i32), (i32, i32))> {
+        let mut rectangle = RECT::default();
+        // SAFETY: `self.hwnd` names a window of this process and `rectangle`
+        // lives across the call.
+        unsafe { GetWindowRect(self.hwnd, &raw mut rectangle) }.ok()?;
+        let (across, down) = self.client_size();
+
+        Some((
+            (rectangle.left, rectangle.top),
+            (
+                (rectangle.right - rectangle.left) - across,
+                (rectangle.bottom - rectangle.top) - down,
+            ),
+        ))
     }
 
     /// The window itself, for the renderer's swapchain.
@@ -612,6 +650,53 @@ impl Window {
     #[must_use]
     pub fn client_size(&self) -> (i32, i32) {
         client_size(self.hwnd)
+    }
+
+    /// Takes a client area of this size, and answers the one it got.
+    ///
+    /// What a mode chosen rather than dragged asks of the window: the guest is
+    /// on a geometry nobody's window asked for, and letterboxing it into the
+    /// size the window happened to be would be showing a 2560x1440 desktop
+    /// scaled down inside a 1848x1048 rectangle.
+    ///
+    /// `None` when the window is in no position to take a size, which is three
+    /// cases and all of them deliberate. Full screen already covers a monitor
+    /// and its letterbox is the honest answer. A maximised window is sized by
+    /// Windows, and un-maximising one because the guest changed mode would be
+    /// the viewer overruling the user's own window state. A minimised one has
+    /// no client area to give.
+    ///
+    /// The size that comes back is read off the window rather than assumed: it
+    /// is what the caller has to tell the guest it is already on, and on a
+    /// monitor too small for the mode the two are not the same number.
+    pub fn set_client_size(&self, width: u32, height: u32) -> Option<(u32, u32)> {
+        if self.is_fullscreen() || fullscreen::is_a_state(self.frame().style) {
+            return None;
+        }
+
+        let work = self.work_rectangle()?;
+        let (at, frame) = self.outside()?;
+        let fit = monitors::fitted((width, height), frame, at, work);
+
+        // SAFETY: a position and a size on this process's own window. The
+        // z-order flags leave the stack alone: a guest changing mode must not
+        // raise a window the user has put behind something else.
+        unsafe {
+            SetWindowPos(
+                self.hwnd,
+                None,
+                fit.x,
+                fit.y,
+                fit.width,
+                fit.height,
+                SWP_NOZORDER | SWP_NOOWNERZORDER,
+            )
+        }
+        .ok()?;
+
+        let (across, down) = self.client_size();
+
+        (across > 0 && down > 0).then_some((across.unsigned_abs(), down.unsigned_abs()))
     }
 
     /// Brings the window forward. What a repeated Connect means.
