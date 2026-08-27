@@ -153,6 +153,16 @@ pub(crate) fn report(vm_name: &str, outcome: &UpdateOutcome) -> (DiagnosticLevel
         );
     }
 
+    if failure.code == DisplayStatusCode::PayloadUpdateRebootRequired {
+        return (
+            DiagnosticLevel::Warning,
+            format!(
+                "Display payload of VM \"{vm_name}\" was installed and needs a guest reboot: {}",
+                failure.message
+            ),
+        );
+    }
+
     (
         DiagnosticLevel::Error,
         format!(
@@ -284,6 +294,25 @@ mod tests {
         );
 
         assert_eq!(level, vmlord_core::DiagnosticLevel::Error);
+    }
+
+    #[test]
+    fn an_installed_update_waiting_for_reboot_is_a_warning() {
+        let (level, message) = report(
+            "dev-linux",
+            &outcome(
+                Some("0.2.0"),
+                Some(DisplayFailure::new(
+                    DisplayStage::Payload,
+                    DisplayStatusCode::PayloadUpdateRebootRequired,
+                    "vmlord_drm is busy; reboot the guest to load 0.2.0",
+                )),
+            ),
+        );
+
+        assert_eq!(level, vmlord_core::DiagnosticLevel::Warning);
+        assert!(message.contains("installed"), "{message}");
+        assert!(message.contains("reboot"), "{message}");
     }
 
     #[test]

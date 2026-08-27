@@ -384,6 +384,9 @@ pub enum DisplayStatusCode {
     /// An update did not verify, and the previous version is running again.
     #[serde(rename = "display-payload-update-rolled-back")]
     PayloadUpdateRolledBack,
+    /// The new module is installed and will replace the busy one after reboot.
+    #[serde(rename = "display-payload-update-reboot-required")]
+    PayloadUpdateRebootRequired,
     /// An update did not verify and the previous version did not come back.
     #[serde(rename = "display-payload-update-failed")]
     PayloadUpdateFailed,
@@ -411,6 +414,7 @@ impl DisplayStatusCode {
             Self::PayloadModuleNotLoaded => "display-payload-module-not-loaded",
             Self::PayloadNoDevice => "display-payload-no-device",
             Self::PayloadUpdateRolledBack => "display-payload-update-rolled-back",
+            Self::PayloadUpdateRebootRequired => "display-payload-update-reboot-required",
             Self::PayloadUpdateFailed => "display-payload-update-failed",
         }
     }
@@ -674,6 +678,18 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&code).unwrap(),
             "\"display-payload-update-rolled-back\""
+        );
+    }
+
+    #[test]
+    fn a_display_update_waiting_for_reboot_has_a_distinct_status() {
+        let code: DisplayStatusCode =
+            serde_json::from_str("\"display-payload-update-reboot-required\"").unwrap();
+
+        assert_eq!(code.as_str(), "display-payload-update-reboot-required");
+        assert!(
+            !code.is_retryable(),
+            "repeating the update cannot unload a module held by the compositor"
         );
     }
 

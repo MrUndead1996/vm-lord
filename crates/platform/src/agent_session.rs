@@ -596,6 +596,11 @@ fn report_display_update(
             DisplayStatusCode::PayloadUpdateRolledBack,
             reason,
         )),
+        DisplayUpdateOutcome::RebootRequired => Some(DisplayFailure::new(
+            DisplayStage::Payload,
+            DisplayStatusCode::PayloadUpdateRebootRequired,
+            reason,
+        )),
         _ => Some(DisplayFailure::new(
             DisplayStage::Payload,
             DisplayStatusCode::PayloadUpdateFailed,
@@ -623,6 +628,10 @@ fn report_display_update(
         DisplayUpdateOutcome::RolledBack => tracing::warn!(
             "the display payload update of VM \"{vm_name}\" did not verify; {} is running again",
             versions.loaded
+        ),
+        DisplayUpdateOutcome::RebootRequired => tracing::warn!(
+            "display payload {} is installed for VM \"{vm_name}\" and will load after reboot",
+            versions.installed
         ),
         _ => tracing::error!("the display payload update of VM \"{vm_name}\" left nothing running"),
     }
@@ -780,7 +789,7 @@ fn code_for(step: vmlord_agent_protocol::v1::DisplayRecipeStep) -> DisplayStatus
     match step {
         Step::BuildDependencies => DisplayStatusCode::PayloadDependenciesFailed,
         Step::ModuleBuild | Step::ModuleSource => DisplayStatusCode::PayloadBuildFailed,
-        Step::ModuleLoad => DisplayStatusCode::PayloadModuleNotLoaded,
+        Step::Initramfs | Step::ModuleLoad => DisplayStatusCode::PayloadModuleNotLoaded,
         Step::Device => DisplayStatusCode::PayloadNoDevice,
         Step::Services | Step::ServicesStart => DisplayStatusCode::GuestServicesFailed,
         Step::Distribution | Step::Payload | Step::Unspecified => DisplayStatusCode::PayloadInvalid,
@@ -1217,11 +1226,11 @@ mod tests {
         v1::{
             ApplyDisplayRecipeResponse, ApplyGpuRecipeResponse, AttachDisplayPayloadResponse,
             AttachGpuSharesResponse, AuthenticateResponse, Capability, DisplayMountState,
-            DisplayRecipeStage, DisplayRecipeStageState, DisplayRecipeStep, Envelope, ErrorCode,
-            GpuMount, GpuMountState, GpuProbeCheck, GpuProbeCheckState, GpuProbeStep,
-            GpuProbeVerdict, GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep, GpuShareRole,
-            HeartbeatRequest, HelloRequest, ProbeGpuResponse, ProtocolVersion, envelope, request,
-            response,
+            DisplayPayloadVersions, DisplayRecipeStage, DisplayRecipeStageState, DisplayRecipeStep,
+            DisplayUpdateOutcome, Envelope, ErrorCode, GpuMount, GpuMountState, GpuProbeCheck,
+            GpuProbeCheckState, GpuProbeStep, GpuProbeVerdict, GpuRecipeStage, GpuRecipeStageState,
+            GpuRecipeStep, GpuShareRole, HeartbeatRequest, HelloRequest, ProbeGpuResponse,
+            ProtocolVersion, UpdateDisplayPayloadResponse, envelope, request, response,
         },
     };
 
@@ -1232,7 +1241,7 @@ mod tests {
 
     use super::{
         AgentSession, GuestDisplaySink, GuestGpuSink, SessionError, SessionWork, open,
-        report_display_recipe, serve,
+        report_display_recipe, report_display_update, serve,
     };
 
     /// The readiness a recipe with these stages reports, if any.
@@ -1303,6 +1312,37 @@ mod tests {
             )]),
             None,
             "a guest that has not got there yet has not failed either"
+        );
+    }
+
+    #[test]
+    fn an_update_waiting_for_reboot_is_not_reported_as_failed() {
+        let report = UpdateDisplayPayloadResponse {
+            stages: vec![DisplayRecipeStage {
+                step: DisplayRecipeStep::ModuleLoad as i32,
+                state: DisplayRecipeStageState::Failed as i32,
+                message: "vmlord_drm is busy; reboot the guest".to_owned(),
+            }],
+            versions: Some(DisplayPayloadVersions {
+                installed: "0.2.0".to_owned(),
+                previous: "0.1.0".to_owned(),
+                loaded: "0.1.0".to_owned(),
+            }),
+            outcome: DisplayUpdateOutcome::RebootRequired as i32,
+        };
+        let seen = Mutex::new(None);
+
+        let answer = report_display_update(&report, "dev", &|report| {
+            *seen.lock().expect("an uncontended lock") = report.failure;
+        });
+
+        assert_eq!(answer.outcome, DisplayUpdateOutcome::RebootRequired);
+        assert_eq!(
+            seen.into_inner()
+                .expect("an uncontended lock")
+                .expect("a reboot is actionable")
+                .code,
+            DisplayStatusCode::PayloadUpdateRebootRequired
         );
     }
 
