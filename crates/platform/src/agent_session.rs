@@ -18,6 +18,7 @@ use std::{
     fmt,
     io::{Read, Write},
     sync::mpsc::{Receiver, Sender},
+    time::{Duration, Instant},
 };
 
 use vmlord_agent_protocol::{
@@ -30,8 +31,8 @@ use vmlord_agent_protocol::{
         AttachGpuSharesRequest, AttachGpuSharesResponse, AuthenticateRequest, Capability,
         DisplayMountState, DisplayRecipeStageState, DisplayRecipeStep,
         DisplayShare as WireDisplayShare, DisplayUpdateOutcome, Envelope, ErrorCode, GpuMountState,
-        GpuProbeCheckState, GpuProbeVerdict, GpuRecipeStageState, GpuShareRole, HeartbeatResponse,
-        HelloResponse, ProbeGpuRequest, ProbeGpuResponse, ProtocolVersion,
+        GpuProbeCheckState, GpuProbeVerdict, GpuRecipeStageState, GpuShareRole, HeartbeatRequest,
+        HeartbeatResponse, HelloResponse, ProbeGpuRequest, ProbeGpuResponse, ProtocolVersion,
         UpdateDisplayPayloadRequest, UpdateDisplayPayloadResponse, envelope, request, response,
     },
 };
@@ -51,6 +52,14 @@ use crate::agent::{DisplayUpdate, DisplayUpdateAnswer};
 /// says what the two builds can do, and a VM with no GPU or no desktop is
 /// simply a session that is sent nothing about one.
 const HOST_CAPABILITIES: &[Capability] = &[Capability::Gpu, Capability::Display];
+
+/// A booting guest may be scheduled late, but opening cannot hold the only
+/// listener forever.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A candidate is checked while an authenticated session is still active, so
+/// it gets enough time for scheduling jitter without monopolising that session.
+const REPLACEMENT_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The id the host numbers its challenge with.
 ///
@@ -89,6 +98,30 @@ const DISPLAY_APPLY_REQUEST_ID: u32 = DISPLAY_ATTACH_REQUEST_ID + 1;
 /// carries at most one update at a time: a second while the first is building
 /// would be a second question on a socket still waiting for an answer.
 const DISPLAY_UPDATE_REQUEST_ID: u32 = DISPLAY_APPLY_REQUEST_ID + 1;
+
+/// The id of the host's proof that an otherwise silent guest is still there.
+const LIVENESS_REQUEST_ID: u32 = DISPLAY_UPDATE_REQUEST_ID + 1;
+
+#[derive(Clone, Copy)]
+struct SessionTiming {
+    idle_before_probe: Duration,
+    probe_timeout: Duration,
+}
+
+impl SessionTiming {
+    const NORMAL: Self = Self {
+        // The guest sends a heartbeat after 30 seconds without a frame. Give
+        // it another poll window before asking independently.
+        idle_before_probe: Duration::from_secs(31),
+        probe_timeout: Duration::from_secs(5),
+    };
+
+    #[cfg(test)]
+    const IMMEDIATE: Self = Self {
+        idle_before_probe: Duration::ZERO,
+        probe_timeout: Duration::ZERO,
+    };
+}
 
 /// Where a session hands what the guest said about its GPU.
 ///
@@ -183,9 +216,27 @@ pub(crate) fn open<S: Read + Write>(
     secret: &Secret,
     vm_name: &str,
 ) -> Result<AgentSession, SessionError> {
+    open_with_timeout(stream, secret, vm_name, OPEN_TIMEOUT)
+}
+
+pub(crate) fn open_replacement<S: Read + Write>(
+    stream: &mut S,
+    secret: &Secret,
+    vm_name: &str,
+) -> Result<AgentSession, SessionError> {
+    open_with_timeout(stream, secret, vm_name, REPLACEMENT_OPEN_TIMEOUT)
+}
+
+fn open_with_timeout<S: Read + Write>(
+    stream: &mut S,
+    secret: &Secret,
+    vm_name: &str,
+    timeout: Duration,
+) -> Result<AgentSession, SessionError> {
     let mut buffer = Vec::new();
-    let session = greet(stream, vm_name, &mut buffer)?;
-    authenticate(stream, secret, vm_name, &mut buffer)?;
+    let deadline = Instant::now() + timeout;
+    let session = greet(stream, vm_name, &mut buffer, deadline)?;
+    authenticate(stream, secret, vm_name, &mut buffer, deadline)?;
 
     tracing::info!(
         "the agent of VM \"{vm_name}\" is build \"{}\" and opened a session on protocol \
@@ -209,12 +260,53 @@ pub(crate) fn open<S: Read + Write>(
 /// [`SessionError`] if the connection failed or the guest sent something that
 /// cannot be read as a frame. Both leave the stream at an unknown position, so
 /// the connection is dropped rather than resynchronised.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionExit {
+    Closed,
+    Replaced,
+}
+
+#[cfg(test)]
 pub(crate) fn serve<S: Read + Write>(
     stream: &mut S,
     session: &AgentSession,
     work: SessionWork<'_>,
     vm_name: &str,
 ) -> Result<(), SessionError> {
+    serve_with_timing(stream, session, work, vm_name, SessionTiming::NORMAL, None).map(|_| ())
+}
+
+/// Serves until the peer closes or the transport owner has authenticated a
+/// newer connection for the same VM.
+///
+/// `replacement_ready` is called only between frames. It must return `true`
+/// only after the candidate has completed [`open`], so an unauthenticated peer
+/// cannot evict the session that already proved its secret.
+pub(crate) fn serve_with_replacement<S: Read + Write>(
+    stream: &mut S,
+    session: &AgentSession,
+    work: SessionWork<'_>,
+    vm_name: &str,
+    replacement_ready: &mut dyn FnMut() -> bool,
+) -> Result<SessionExit, SessionError> {
+    serve_with_timing(
+        stream,
+        session,
+        work,
+        vm_name,
+        SessionTiming::NORMAL,
+        Some(replacement_ready),
+    )
+}
+
+fn serve_with_timing<S: Read + Write>(
+    stream: &mut S,
+    session: &AgentSession,
+    work: SessionWork<'_>,
+    vm_name: &str,
+    timing: SessionTiming,
+    mut replacement_ready: Option<&mut dyn FnMut() -> bool>,
+) -> Result<SessionExit, SessionError> {
     let mut buffer = Vec::new();
     tracing::debug!(
         "serving the agent of VM \"{vm_name}\" on protocol {}.{}",
@@ -237,13 +329,19 @@ pub(crate) fn serve<S: Read + Write>(
     // request while one is in flight would be a second question on a socket
     // that is still waiting for the first answer.
     let mut pending_update: Option<Sender<DisplayUpdateAnswer>> = None;
+    let mut update_after_probe: Option<DisplayUpdate> = None;
+    let mut liveness_deadline = None;
+    let mut last_received = Instant::now();
 
     loop {
         let envelope = match frame::read(stream, &mut buffer) {
-            Ok(envelope) => envelope,
+            Ok(envelope) => {
+                last_received = Instant::now();
+                envelope
+            }
             Err(FrameError::Closed) => {
                 tracing::info!("the agent of VM \"{vm_name}\" closed its session");
-                return Ok(());
+                return Ok(SessionExit::Closed);
             }
             // `Idle` is reported only before a peer starts another frame, so
             // retrying cannot abandon a partial prefix or body. This is the
@@ -252,22 +350,35 @@ pub(crate) fn serve<S: Read + Write>(
             // The one place another thread's request can get onto this socket:
             // between frames, where nothing is half-written.
             Err(FrameError::Idle) => {
-                if pending_update.is_none()
-                    && let Some(update) = work.updates.and_then(|updates| updates.try_recv().ok())
+                if replacement_ready
+                    .as_mut()
+                    .is_some_and(|replacement_ready| replacement_ready())
                 {
-                    pending_update = start_update(stream, session, &update, vm_name, &mut buffer)?;
-                    if pending_update.is_none() {
-                        let _ = update.answer.send(DisplayUpdateAnswer {
-                            outcome: DisplayUpdateOutcome::Failed,
-                            report: GuestDisplayPayloadReport {
-                                failure: Some(DisplayFailure::new(
-                                    DisplayStage::Payload,
-                                    DisplayStatusCode::PayloadUpdateFailed,
-                                    "this guest's agent does not speak the display capability",
-                                )),
-                                ..GuestDisplayPayloadReport::default()
-                            },
-                        });
+                    return Ok(SessionExit::Replaced);
+                }
+                let now = Instant::now();
+                if liveness_deadline.is_some_and(|deadline| now >= deadline) {
+                    return Err(SessionError::Unresponsive);
+                }
+
+                let has_pending_work = pending_manifest.is_some()
+                    || pending_recipe.is_some()
+                    || pending_probe.is_some()
+                    || pending_display_attach.is_some()
+                    || pending_display_recipe.is_some()
+                    || pending_update.is_some();
+                if liveness_deadline.is_none() && !has_pending_work {
+                    if let Some(update) = work.updates.and_then(|updates| updates.try_recv().ok()) {
+                        if session.capabilities.contains(&Capability::Display) {
+                            send_liveness_probe(stream, &mut buffer)?;
+                            update_after_probe = Some(update);
+                            liveness_deadline = Some(now + timing.probe_timeout);
+                        } else {
+                            answer_unsupported_update(update);
+                        }
+                    } else if now.duration_since(last_received) >= timing.idle_before_probe {
+                        send_liveness_probe(stream, &mut buffer)?;
+                        liveness_deadline = Some(now + timing.probe_timeout);
                     }
                 }
                 continue;
@@ -331,6 +442,13 @@ pub(crate) fn serve<S: Read + Write>(
                     let _ = waiting.send(answer);
                 }
             }
+            Body::Response(response::Kind::Heartbeat(_))
+                if request_id == LIVENESS_REQUEST_ID && liveness_deadline.take().is_some() =>
+            {
+                if let Some(update) = update_after_probe.take() {
+                    pending_update = start_update(stream, session, &update, vm_name, &mut buffer)?;
+                }
+            }
             // A response to a request this side did not send, or one it has
             // already had an answer to. Worth a line and nothing more: there is
             // no id left to fail, and the session is otherwise intact.
@@ -340,6 +458,28 @@ pub(crate) fn serve<S: Read + Write>(
             ),
         }
     }
+}
+
+fn send_liveness_probe<S: Write>(stream: &mut S, buffer: &mut Vec<u8>) -> Result<(), SessionError> {
+    let heartbeat = Envelope::request(
+        LIVENESS_REQUEST_ID,
+        request::Kind::Heartbeat(HeartbeatRequest {}),
+    );
+    frame::write(stream, &heartbeat, buffer).map_err(SessionError::Frame)
+}
+
+fn answer_unsupported_update(update: DisplayUpdate) {
+    let _ = update.answer.send(DisplayUpdateAnswer {
+        outcome: DisplayUpdateOutcome::Failed,
+        report: GuestDisplayPayloadReport {
+            failure: Some(DisplayFailure::new(
+                DisplayStage::Payload,
+                DisplayStatusCode::PayloadUpdateFailed,
+                "this guest's agent does not speak the display capability",
+            )),
+            ..GuestDisplayPayloadReport::default()
+        },
+    });
 }
 
 /// Hands the guest the shares its VM was given, and says which id asked.
@@ -937,8 +1077,9 @@ fn greet<S: Read + Write>(
     stream: &mut S,
     vm_name: &str,
     buffer: &mut Vec<u8>,
+    deadline: Instant,
 ) -> Result<AgentSession, SessionError> {
-    let envelope = frame::read(stream, buffer).map_err(SessionError::Frame)?;
+    let envelope = read_opening_frame(stream, buffer, deadline)?;
     let request_id = envelope.request_id;
     let Body::Request(request::Kind::Hello(hello)) = body(envelope, vm_name)? else {
         // The first frame of a session is the hello and nothing else: until
@@ -997,6 +1138,7 @@ fn authenticate<S: Read + Write>(
     secret: &Secret,
     vm_name: &str,
     buffer: &mut Vec<u8>,
+    deadline: Instant,
 ) -> Result<(), SessionError> {
     let nonce = Nonce::generate();
     let challenge = Envelope::request(
@@ -1008,7 +1150,7 @@ fn authenticate<S: Read + Write>(
     frame::write(stream, &challenge, buffer).map_err(SessionError::Frame)?;
 
     loop {
-        let envelope = frame::read(stream, buffer).map_err(SessionError::Frame)?;
+        let envelope = read_opening_frame(stream, buffer, deadline)?;
         let request_id = envelope.request_id;
         let kind = match body(envelope, vm_name)? {
             Body::Request(kind) => kind,
@@ -1060,6 +1202,21 @@ fn authenticate<S: Read + Write>(
              challenge; it was refused"
         );
         frame::write(stream, &refusal, buffer).map_err(SessionError::Frame)?;
+    }
+}
+
+fn read_opening_frame<S: Read>(
+    stream: &mut S,
+    buffer: &mut Vec<u8>,
+    deadline: Instant,
+) -> Result<Envelope, SessionError> {
+    loop {
+        match frame::read(stream, buffer) {
+            Ok(envelope) => return Ok(envelope),
+            Err(FrameError::Idle) if Instant::now() < deadline => {}
+            Err(FrameError::Idle) => return Err(SessionError::OpeningTimedOut),
+            Err(error) => return Err(SessionError::Frame(error)),
+        }
     }
 }
 
@@ -1185,6 +1342,10 @@ pub(crate) enum SessionError {
     OutOfOrder(&'static str),
     /// A frame this build cannot make sense of.
     Malformed(String),
+    /// The connection accepted a liveness probe but never answered it.
+    Unresponsive,
+    /// Hello and authentication did not finish inside their shared budget.
+    OpeningTimedOut,
 }
 
 impl fmt::Display for SessionError {
@@ -1201,6 +1362,10 @@ impl fmt::Display for SessionError {
             }
             Self::OutOfOrder(what) => formatter.write_str(what),
             Self::Malformed(what) => write!(formatter, "the agent sent {what}"),
+            Self::Unresponsive => formatter.write_str("the agent stopped answering heartbeats"),
+            Self::OpeningTimedOut => {
+                formatter.write_str("the agent did not open its session in time")
+            }
         }
     }
 }
@@ -1219,7 +1384,11 @@ impl Error for SessionError {
 mod tests {
     use std::io::{self, Read, Write};
 
-    use std::sync::Mutex;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    };
     use vmlord_agent_protocol::{
         auth::{Nonce, Secret, tag},
         frame::{self, LENGTH_PREFIX_LEN},
@@ -1229,8 +1398,9 @@ mod tests {
             DisplayPayloadVersions, DisplayRecipeStage, DisplayRecipeStageState, DisplayRecipeStep,
             DisplayUpdateOutcome, Envelope, ErrorCode, GpuMount, GpuMountState, GpuProbeCheck,
             GpuProbeCheckState, GpuProbeStep, GpuProbeVerdict, GpuRecipeStage, GpuRecipeStageState,
-            GpuRecipeStep, GpuShareRole, HeartbeatRequest, HelloRequest, ProbeGpuResponse,
-            ProtocolVersion, UpdateDisplayPayloadResponse, envelope, request, response,
+            GpuRecipeStep, GpuShareRole, HeartbeatRequest, HeartbeatResponse, HelloRequest,
+            ProbeGpuResponse, ProtocolVersion, UpdateDisplayPayloadResponse, envelope, request,
+            response,
         },
     };
 
@@ -1239,9 +1409,12 @@ mod tests {
         GuestDisplayReport, GuestGpuDetail, GuestGpuReport,
     };
 
+    use crate::agent::DisplayUpdate;
+
     use super::{
-        AgentSession, GuestDisplaySink, GuestGpuSink, SessionError, SessionWork, open,
-        report_display_recipe, report_display_update, serve,
+        AgentSession, GuestDisplaySink, GuestGpuSink, SessionError, SessionExit, SessionTiming,
+        SessionWork, open, report_display_recipe, report_display_update, serve,
+        serve_with_replacement, serve_with_timing,
     };
 
     /// The readiness a recipe with these stages reports, if any.
@@ -1521,6 +1694,34 @@ mod tests {
         idle: bool,
     }
 
+    struct IdleBeforeRead<S> {
+        inner: S,
+        idle_at: usize,
+        reads: usize,
+        idled: bool,
+    }
+
+    impl<S: Read> Read for IdleBeforeRead<S> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if self.reads == self.idle_at && !self.idled {
+                self.idled = true;
+                return Err(io::Error::new(io::ErrorKind::WouldBlock, "delayed guest"));
+            }
+            self.reads += 1;
+            self.inner.read(buffer)
+        }
+    }
+
+    impl<S: Write> Write for IdleBeforeRead<S> {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.inner.write(buffer)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
     impl Read for IdleThenClosed {
         fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
             if self.idle {
@@ -1533,6 +1734,84 @@ mod tests {
 
     impl Write for IdleThenClosed {
         fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct IdleForever;
+
+    impl Read for IdleForever {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "idle guest"))
+        }
+    }
+
+    impl Write for IdleForever {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct ProbeGuest {
+        outbox: Vec<u8>,
+        read: usize,
+        received: Vec<Envelope>,
+        close: bool,
+        close_after_update: bool,
+        update_sent: Arc<AtomicBool>,
+    }
+
+    impl Read for ProbeGuest {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let available = &self.outbox[self.read..];
+            if !available.is_empty() {
+                let taken = available.len().min(buffer.len());
+                buffer[..taken].copy_from_slice(&available[..taken]);
+                self.read += taken;
+                return Ok(taken);
+            }
+            if self.close {
+                Ok(0)
+            } else {
+                Err(io::Error::new(io::ErrorKind::WouldBlock, "idle guest"))
+            }
+        }
+    }
+
+    impl Write for ProbeGuest {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            let envelope = frame::decode(&buffer[LENGTH_PREFIX_LEN..])
+                .expect("the host writes one complete frame");
+            match &envelope.body {
+                Some(envelope::Body::Request(request))
+                    if matches!(request.kind, Some(request::Kind::Heartbeat(_))) =>
+                {
+                    let answer = Envelope::response(
+                        envelope.request_id,
+                        response::Kind::Heartbeat(HeartbeatResponse {}),
+                    );
+                    let mut encoded = Vec::new();
+                    frame::encode(&answer, &mut encoded).expect("a heartbeat response fits");
+                    self.outbox.extend_from_slice(&encoded);
+                }
+                Some(envelope::Body::Request(request))
+                    if matches!(request.kind, Some(request::Kind::UpdateDisplayPayload(_))) =>
+                {
+                    self.update_sent.store(true, Ordering::Relaxed);
+                    self.close = self.close_after_update;
+                }
+                _ => {}
+            }
+            self.received.push(envelope);
             Ok(buffer.len())
         }
 
@@ -1589,6 +1868,37 @@ mod tests {
             panic!("the hello should have been answered");
         };
         assert!(matches!(response.kind, Some(response::Kind::Hello(_))));
+    }
+
+    #[test]
+    fn an_idle_boundary_before_hello_does_not_reject_the_guest() {
+        let secret = Secret::generate();
+        let guest = Guest::new(Secret::from_base64(&secret.to_base64()).expect("the secret"));
+        let mut guest = IdleBeforeRead {
+            inner: guest,
+            idle_at: 0,
+            reads: 0,
+            idled: false,
+        };
+
+        open(&mut guest, &secret, VM).expect("a delayed hello stays inside the opening budget");
+    }
+
+    #[test]
+    fn an_idle_boundary_before_authentication_does_not_reject_the_guest() {
+        let secret = Secret::generate();
+        let guest = Guest::new(Secret::from_base64(&secret.to_base64()).expect("the secret"));
+        let mut guest = IdleBeforeRead {
+            inner: guest,
+            // Reading the hello takes its prefix and body; pause before the
+            // authentication response starts.
+            idle_at: 2,
+            reads: 0,
+            idled: false,
+        };
+
+        open(&mut guest, &secret, VM)
+            .expect("a delayed authentication stays inside the opening budget");
     }
 
     #[test]
@@ -2532,5 +2842,124 @@ mod tests {
 
         serve(&mut stream, &session, work(None, &|_| {}), VM)
             .expect("an idle boundary is not a failed session");
+    }
+
+    #[test]
+    fn a_guest_that_answers_no_liveness_probe_ends_its_session() {
+        let mut stream = IdleForever;
+        let session = AgentSession {
+            version: ProtocolVersion::current(),
+            capabilities: Vec::new(),
+            build: String::new(),
+        };
+
+        let error = serve_with_timing(
+            &mut stream,
+            &session,
+            work(None, &|_| {}),
+            VM,
+            SessionTiming::IMMEDIATE,
+            None,
+        )
+        .expect_err("a peer that never answers a liveness probe is gone");
+
+        assert!(matches!(error, SessionError::Unresponsive));
+    }
+
+    #[test]
+    fn an_authenticated_replacement_ends_the_old_session() {
+        let mut stream = IdleForever;
+        let session = AgentSession {
+            version: ProtocolVersion::current(),
+            capabilities: Vec::new(),
+            build: String::new(),
+        };
+
+        let exit =
+            serve_with_replacement(&mut stream, &session, work(None, &|_| {}), VM, &mut || true)
+                .expect("a replacement is an orderly session transition");
+
+        assert_eq!(exit, SessionExit::Replaced);
+    }
+
+    #[test]
+    fn an_update_is_sent_only_after_the_session_proves_it_is_alive() {
+        let mut stream = ProbeGuest {
+            close_after_update: true,
+            ..ProbeGuest::default()
+        };
+        let session = AgentSession {
+            version: ProtocolVersion::current(),
+            capabilities: vec![Capability::Display],
+            build: String::new(),
+        };
+        let (updates, pending_updates) = mpsc::channel();
+        let (answer, answered) = mpsc::channel();
+        updates
+            .send(DisplayUpdate {
+                target_version: "0.2.0".to_owned(),
+                answer,
+            })
+            .expect("the session queue is open");
+        let work = SessionWork {
+            updates: Some(&pending_updates),
+            ..work(None, &|_| {})
+        };
+
+        serve(&mut stream, &session, work, VM).expect("the guest closes after the update");
+
+        assert!(matches!(
+            stream.received.as_slice(),
+            [
+                Envelope {
+                    body: Some(envelope::Body::Request(
+                        vmlord_agent_protocol::v1::Request {
+                            kind: Some(request::Kind::Heartbeat(_)),
+                        }
+                    )),
+                    ..
+                },
+                Envelope {
+                    body: Some(envelope::Body::Request(
+                        vmlord_agent_protocol::v1::Request {
+                            kind: Some(request::Kind::UpdateDisplayPayload(_)),
+                        }
+                    )),
+                    ..
+                }
+            ]
+        ));
+        assert!(matches!(answered.recv(), Err(mpsc::RecvError)));
+    }
+
+    #[test]
+    fn a_replacement_ends_a_session_with_an_update_in_flight() {
+        let mut stream = ProbeGuest::default();
+        let update_sent = Arc::clone(&stream.update_sent);
+        let session = AgentSession {
+            version: ProtocolVersion::current(),
+            capabilities: vec![Capability::Display],
+            build: String::new(),
+        };
+        let (updates, pending_updates) = mpsc::channel();
+        let (answer, answered) = mpsc::channel();
+        updates
+            .send(DisplayUpdate {
+                target_version: "0.2.0".to_owned(),
+                answer,
+            })
+            .expect("the session queue is open");
+        let work = SessionWork {
+            updates: Some(&pending_updates),
+            ..work(None, &|_| {})
+        };
+
+        let exit = serve_with_replacement(&mut stream, &session, work, VM, &mut || {
+            update_sent.load(Ordering::Relaxed)
+        })
+        .expect("the replacement preempts the in-flight update");
+
+        assert_eq!(exit, SessionExit::Replaced);
+        assert!(matches!(answered.recv(), Err(mpsc::RecvError)));
     }
 }

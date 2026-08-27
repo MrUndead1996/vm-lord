@@ -2729,11 +2729,12 @@ Nothing can interrupt a blocking socket call, so every wait is bounded: the
 accept waits a quarter of a second at a time and the read the same, and the
 thread checks between waits whether it should still be there. The interval is
 also how long stopping a VM takes to join the thread, on the thread that draws
-the window, which is why it is a fraction of a second rather than one. A read that times out is
-reported as `Interrupted`, which every reader in the standard library retries
--- an idle agent is not a broken one, and a frame half-read must not be
-abandoned because the guest paused in the middle of it. Once the connection has
-been told to stop, that same timeout ends it instead. This is what makes
+the window, which is why it is a fraction of a second rather than one. A read
+that times out is reported as `WouldBlock`, which the frame reader exposes as
+idle only before the next frame has begun. The session uses that boundary to
+service host work and its liveness timer; a timeout after a frame has begun
+closes the unusable connection rather than resynchronising it. Once the
+connection has been told to stop, that same timeout ends it instead. This is what makes
 dropping an `AgentConnection` a bounded operation: it sets the flag and joins
 the thread, and the socket never outlives the VM it was bound to.
 
@@ -2757,7 +2758,17 @@ not the transport's. This build announces `CAPABILITY_GPU`, so a session with a
 current agent agrees on it and is the one a share manifest may be sent on.
 After the challenge the session hands the guest that manifest when the VM has
 one, answers heartbeats, refuses a second hello, and ends when the guest hangs
-up at a frame boundary, which is not a fault.
+up at a frame boundary, which is not a fault. A quiet guest normally speaks
+every 30 seconds; after that interval the host sends its own heartbeat and
+drops a session that does not answer promptly. This is necessary because a
+guest reboot can leave HvSocket looking open without a FIN and otherwise keep
+the listener from accepting the rebooted agent forever. The listener is also
+polled between frames while a session is open. A candidate must complete hello
+and authentication before it displaces that session; once it does, the old
+socket and any request waiting on it are dropped and the authenticated
+replacement is served immediately, without reconnect backoff. This remains
+true while a long guest operation is in flight, when silence alone cannot
+distinguish a reboot from legitimate work.
 
 Whether a VM's agent has a session open is what `AgentStatus` in a `VmSummary`
 now reports. A running VM VMLord is not listening for at all -- one whose
@@ -3621,9 +3632,12 @@ action a person takes on a running VM.
 The host refuses everything it can before the guest is asked: a VM that is not
 running, a release with nothing newer, a payload that will not stage. Then the
 new version is published into the directory the VM already exports, and the
-request goes to the thread that owns that VM's agent session -- written onto
-the socket between frames, because a session is one conversation and a second
-writer would interleave halfway through one.
+request goes to the thread that owns that VM's agent session. That thread first
+gets a heartbeat answer from the same socket and only then writes the update
+between frames, because an HvSocket left apparently open by a reboot must not
+consume the update's twenty-minute budget. A session ending closes admission
+and drains its queue under one lock, so a request concurrent with that close is
+either owned by the session or rejected, never inherited by the next one.
 
 The guest builds, refreshes the running kernel's initramfs, reloads and then
 *verifies*: the module loaded, its version the one that was asked for, and a

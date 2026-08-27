@@ -18,12 +18,12 @@ use std::{
     fs,
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use uuid::Uuid;
@@ -38,7 +38,7 @@ use crate::{
     },
     display_runs::DisplayRuns,
     gpu_runs::GpuRuns,
-    hvsocket::{ACCEPT_POLL, AgentListener},
+    hvsocket::{ACCEPT_POLL, AgentListener, AgentStream},
     metadata::VmComputeSystemMapping,
 };
 
@@ -86,7 +86,7 @@ impl AgentSessions {
     pub(crate) fn is_online(&self, vm_id: Uuid) -> Option<bool> {
         self.0
             .get(&vm_id)
-            .map(|connection| connection.online.load(Ordering::Relaxed))
+            .map(|connection| session_online(&connection.online))
     }
 }
 
@@ -100,7 +100,7 @@ pub(crate) struct AgentConnection {
     /// Shared with the thread because it is the only thing about a session the
     /// rest of VMLord asks about between refreshes, and asking the thread would
     /// mean a channel for a single bit.
-    online: Arc<AtomicBool>,
+    online: Arc<Mutex<bool>>,
     running: Arc<AtomicBool>,
     /// Where a display payload update is handed to the thread that owns the
     /// session.
@@ -140,7 +140,7 @@ const UPDATE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// it, whichever thread asked.
 pub(crate) struct DisplayUpdateChannel {
     vm_name: String,
-    online: Arc<AtomicBool>,
+    online: Arc<Mutex<bool>>,
     updates: Sender<DisplayUpdate>,
 }
 
@@ -165,7 +165,11 @@ impl DisplayUpdateChannel {
     /// would move a version at a moment nobody chose.
     pub(crate) fn ask(&self, target_version: &str) -> Result<DisplayUpdateAnswer, RepositoryError> {
         let (answer, answered) = mpsc::channel();
-        if !self.online.load(Ordering::Relaxed) {
+        let online = self
+            .online
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*online {
             return Err(RepositoryError::new(format!(
                 "the agent of VM \"{}\" has no open session, so its display payload cannot be \
                  updated right now",
@@ -183,6 +187,7 @@ impl DisplayUpdateChannel {
                     self.vm_name
                 ))
             })?;
+        drop(online);
 
         answered.recv_timeout(UPDATE_TIMEOUT).map_err(|error| {
             let reason = match error {
@@ -239,7 +244,7 @@ impl AgentConnection {
         let secret = read_secret(secret_path, &vm_name)?;
         let listener = AgentListener::bind(&vm_name, runtime_id)?;
 
-        let online = Arc::new(AtomicBool::new(false));
+        let online = Arc::new(Mutex::new(false));
         let running = Arc::new(AtomicBool::new(true));
         let (updates, pending_updates) = mpsc::channel();
         let worker = thread::Builder::new()
@@ -300,7 +305,7 @@ impl AgentConnection {
         Self {
             vm_id,
             vm_name: format!("vm-{}", vm_id.as_simple()),
-            online: Arc::new(AtomicBool::new(online)),
+            online: Arc::new(Mutex::new(online)),
             running: Arc::new(AtomicBool::new(true)),
             // Nothing serves this one, so an update sent into it is never read
             // -- which is what a connection with no session is.
@@ -331,11 +336,12 @@ impl Drop for AgentConnection {
 
 /// Accepts one connection at a time and serves it, until VMLord says stop.
 ///
-/// One at a time because a VM has one agent: a second connection while a
-/// session is open would be a second thing claiming to speak for the guest, and
-/// the one already proved it holds the secret. A reconnecting agent is served
-/// by the next turn of this loop, which is what makes losing a connection
-/// survivable without anything here knowing that it was lost.
+/// One active session at a time because a VM has one agent. A candidate may
+/// arrive while the active socket still looks open, which is what an unclean
+/// guest reboot does to HvSocket; it displaces the old session only after it
+/// proves the same secret. A reconnecting agent is otherwise served by the
+/// next turn of this loop, which makes losing a connection survivable without
+/// anything here knowing why it was lost.
 ///
 /// Nothing on that turn touches Hyper-V. The listener stays bound to the
 /// runtime id of the run it was created for, and a reconnect is a new session
@@ -360,55 +366,119 @@ fn serve(
     display_share: Option<&DisplayShare>,
     display_mode: Option<DisplayMode>,
     vm_name: &str,
-    online: &AtomicBool,
+    online: &Mutex<bool>,
     running: &Arc<AtomicBool>,
     sink: GuestGpuSink<'_>,
     display_sink: GuestDisplaySink<'_>,
 ) {
     let mut backoff = Backoff::new();
+    let mut candidate_backoff = Backoff::new();
+    let mut candidate_after = Instant::now();
+    let mut replacement: Option<(AgentStream, agent_session::AgentSession)> = None;
 
     while running.load(Ordering::Relaxed) {
-        let mut stream = match listener.accept(ACCEPT_POLL, running) {
-            Ok(Some(stream)) => stream,
-            // Nobody connected in the last poll, which is what a guest that
-            // has not finished booting looks like.
-            Ok(None) => continue,
-            // The listener is broken rather than idle: retrying it in a loop
-            // would spin a thread on a socket that cannot recover.
-            Err(_) => break,
+        let (mut stream, session) = if let Some(replacement) = replacement.take() {
+            replacement
+        } else {
+            let mut stream = match listener.accept(ACCEPT_POLL, running) {
+                Ok(Some(stream)) => stream,
+                // Nobody connected in the last poll, which is what a guest
+                // that has not finished booting looks like.
+                Ok(None) => continue,
+                // The listener is broken rather than idle: retrying it in a
+                // loop would spin a thread on a socket that cannot recover.
+                Err(_) => break,
+            };
+            match agent_session::open(&mut stream, secret, vm_name) {
+                Ok(session) => (stream, session),
+                Err(error) => {
+                    report(vm_name, &error);
+                    drop(stream);
+                    wait_before_offering_again(backoff.after(false), running);
+                    continue;
+                }
+            }
         };
 
-        let authenticated = match agent_session::open(&mut stream, secret, vm_name) {
-            Ok(session) => {
-                online.store(true, Ordering::Relaxed);
-                let outcome = agent_session::serve(
-                    &mut stream,
-                    &session,
-                    agent_session::SessionWork {
-                        gpu_shares: shares,
-                        display_share,
-                        display_mode,
-                        gpu: sink,
-                        display: display_sink,
-                        updates: Some(updates),
-                    },
-                    vm_name,
-                );
-                online.store(false, Ordering::Relaxed);
-                if let Err(error) = outcome {
-                    report(vm_name, &error);
+        *online
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        let mut next_session = None;
+        let mut listener_failed = false;
+        let outcome = agent_session::serve_with_replacement(
+            &mut stream,
+            &session,
+            agent_session::SessionWork {
+                gpu_shares: shares,
+                display_share,
+                display_mode,
+                gpu: sink,
+                display: display_sink,
+                updates: Some(updates),
+            },
+            vm_name,
+            &mut || {
+                if Instant::now() < candidate_after {
+                    return false;
                 }
-                true
-            }
-            Err(error) => {
-                report(vm_name, &error);
-                false
-            }
-        };
-        // Dropped before the wait: a guest reconnecting during it must not find
-        // the socket of the session that just ended still open.
+                match listener.accept(Duration::ZERO, running) {
+                    Ok(Some(mut candidate)) => {
+                        match agent_session::open_replacement(&mut candidate, secret, vm_name) {
+                            Ok(session) => {
+                                let _ = candidate_backoff.after(true);
+                                next_session = Some((candidate, session));
+                                true
+                            }
+                            Err(error) => {
+                                report(vm_name, &error);
+                                candidate_after = Instant::now() + candidate_backoff.after(false);
+                                false
+                            }
+                        }
+                    }
+                    Ok(None) => false,
+                    Err(_) => {
+                        listener_failed = true;
+                        true
+                    }
+                }
+            },
+        );
+        set_offline_and_cancel_updates(online, updates);
         drop(stream);
-        wait_before_offering_again(backoff.after(authenticated), running);
+
+        if listener_failed {
+            break;
+        }
+        if matches!(outcome, Ok(agent_session::SessionExit::Replaced))
+            && let Some(next_session) = next_session
+        {
+            replacement = Some(next_session);
+            continue;
+        }
+        if let Err(error) = outcome {
+            report(vm_name, &error);
+        }
+        wait_before_offering_again(backoff.after(true), running);
+    }
+}
+
+fn session_online(online: &Mutex<bool>) -> bool {
+    *online
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Closes the admission gate before discarding work that belonged to the
+/// session which just ended. Holding the same gate as `ask` makes the state
+/// change and queue drain one indivisible transition to callers.
+fn set_offline_and_cancel_updates(online: &Mutex<bool>, updates: &Receiver<DisplayUpdate>) {
+    let mut online = online
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *online = false;
+    while let Ok(update) = updates.try_recv() {
+        drop(update);
     }
 }
 
@@ -487,7 +557,10 @@ mod tests {
     use uuid::Uuid;
     use vmlord_agent_protocol::auth::{Nonce, Secret, tag, verify};
 
-    use super::{AgentConnection, AgentSessions, read_secret};
+    use super::{
+        AgentConnection, AgentSessions, DisplayUpdate, read_secret, session_online,
+        set_offline_and_cancel_updates,
+    };
 
     fn temporary_file(name: &str) -> PathBuf {
         let path = env::temp_dir().join(format!("vmlord-agent-secret-{name}"));
@@ -599,7 +672,7 @@ mod tests {
         let connection = AgentConnection {
             vm_id: Uuid::from_u128(3),
             vm_name: "dev-linux".to_owned(),
-            online: Arc::new(AtomicBool::new(true)),
+            online: Arc::new(std::sync::Mutex::new(true)),
             running: Arc::clone(&running),
             updates: mpsc::channel().0,
             worker: None,
@@ -608,5 +681,23 @@ mod tests {
         drop(connection);
 
         assert!(!running.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn ending_a_session_rejects_an_update_still_in_its_queue() {
+        let online = Arc::new(std::sync::Mutex::new(true));
+        let (updates, pending_updates) = mpsc::channel();
+        let (answer, answered) = mpsc::channel();
+        updates
+            .send(DisplayUpdate {
+                target_version: "0.2.0".to_owned(),
+                answer,
+            })
+            .expect("the session queue is open");
+
+        set_offline_and_cancel_updates(&online, &pending_updates);
+
+        assert!(!session_online(&online));
+        assert!(matches!(answered.recv(), Err(mpsc::RecvError)));
     }
 }

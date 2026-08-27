@@ -336,9 +336,9 @@ impl Read for AgentStream {
     /// The wait is `select`, rather than `SO_RCVTIMEO`: HvSocket can signal a
     /// receive timeout as a clean read, which is indistinguishable from the
     /// guest closing its session. A poll expiry becomes
-    /// [`io::ErrorKind::Interrupted`], which every reader in the standard
-    /// library retries. Once the session has been told to stop, the same
-    /// expiry ends it instead.
+    /// [`io::ErrorKind::WouldBlock`], which the frame reader exposes as an idle
+    /// boundary so the session can service host work and its liveness timer.
+    /// Once the session has been told to stop, the same expiry ends it instead.
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let mut readable = FD_SET {
             fd_count: 1,
@@ -372,7 +372,10 @@ impl Read for AgentStream {
 /// Turns a completed read poll into an interrupt or a local shutdown.
 fn idle_read(running: bool) -> io::Result<usize> {
     if running {
-        Err(io::Error::from(io::ErrorKind::Interrupted))
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "the agent connection is idle",
+        ))
     } else {
         Err(io::Error::new(
             io::ErrorKind::ConnectionAborted,
@@ -509,10 +512,10 @@ mod tests {
     }
 
     #[test]
-    fn an_idle_read_retries_while_the_connection_is_still_owned() {
+    fn an_idle_read_yields_to_the_session_while_the_connection_is_still_owned() {
         let error = idle_read(true).expect_err("an idle socket is not readable yet");
 
-        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
     }
 
     #[test]
