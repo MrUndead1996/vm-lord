@@ -3249,10 +3249,37 @@ refuses leaves the guest offering the modes it already had.
 deduplicated by all three and sorted by pixel area, width, height, then refresh.
 Refresh is an integer because `dmDisplayFrequency` is one -- Windows reports 60
 for a 59.94 Hz panel, and pretending otherwise would be a precision the source
-does not have. Nothing above 144 Hz is offered: that is what a software vblank
-timer and a capture thread keep up with, not a limit of `drm_cvt_mode`. No EDID
-is synthesized in either direction; the physical size stays at 96 DPI, which is
-what keeps a compositor on scale 1 through a resize.
+does not have. Nothing above 144 Hz is offered anywhere: that is the ceiling of
+the wire format and of `drm_cvt_mode`'s caller, and it is not a rate any size is
+promised at. No EDID is synthesized in either direction; the physical size stays
+at 96 DPI, which is what keeps a compositor on scale 1 through a resize.
+
+**A refresh nobody can deliver is not offered.** The ceiling that matters is the
+guest's encoder, and what it costs is the frame's pixel count: capture hands the
+encoder no damage, so every frame is a comparison of every tile. `cargo
+display-bench --width W --height H` measures it, and inside a guest with eight
+virtual processors an ordinary desktop -- the static, typing and moving-window
+scenes, not full-screen motion -- came to 5.5 ms at 1280x720, 9.3 ms at
+1600x900, 12.6 ms at 1920x1080 and 24.7 ms at 2560x1440. That is a flat
+150 million pixels a second, and `deliverable_refresh_hz` divides it by the
+frame to get the fastest rate a size is offered at: 144 Hz at 1280x720, 104 at
+1600x900, 72 at 1920x1080, 40 at 2560x1440. Faster variants of a size are
+dropped from the list.
+
+Overrunning the frame interval does not cost a few frames a second, which is why
+this is a filter and not a warning. Capture is paced by the output's vblank, so
+an encode that does not finish inside one interval waits for the next and the
+stream alternates between one interval and two: 1920x1080 at 144 Hz delivered
+some ninety uneven frames a second and looked distinctly worse than sixty even
+ones. A resolution is never dropped for this, only its fast variants -- when a
+monitor drives a size at nothing the guest can keep up with, the slowest variant
+is kept anyway, and a monitor's own current and preferred modes are answered at
+their own size at the fastest rate that survived. Losing 2560x1440 entirely
+would be a worse answer than carrying it at the rate it has always run at.
+
+The figure is nominal, not a promise. It came off one guest, and full-screen
+video costs about twice as much per pixel as the desktop it was measured on;
+what it buys is a menu that no longer offers rates the stack has never reached.
 
 **Selection is deterministic.** A selection the new list still offers is kept;
 otherwise 1920x1080@60 when it is there; otherwise the greatest resolution and,

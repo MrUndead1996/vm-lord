@@ -78,6 +78,12 @@ impl MonitorSnapshot {
     /// The preferred mode joins the list: it is a mode the viewer may ask the
     /// guest for when a window fills the monitor, and a list without it would
     /// be a request nobody could make.
+    ///
+    /// A monitor's own mode is answered at its own size even when its refresh
+    /// did not survive normalization: a panel that runs at 1920x1080 at 144 Hz
+    /// is one the viewer opens at 1920x1080, at the fastest rate the guest is
+    /// offered there. Dropping it to `None` instead would take a full-screen
+    /// window off the monitor's native resolution over a rate.
     #[must_use]
     pub fn new(
         identity: String,
@@ -89,7 +95,14 @@ impl MonitorSnapshot {
         let modes = normalize_modes(modes.into_iter().chain(preferred).map(raw));
         let admissible = |mode: RawMode| {
             let mode = DisplayMode::new(mode.width, mode.height, mode.refresh_hz)?;
-            modes.contains(&mode).then_some(mode)
+            let at_this_size = || {
+                modes
+                    .iter()
+                    .filter(|offered| offered.width == mode.width && offered.height == mode.height)
+                    .max_by_key(|offered| offered.refresh_hz)
+                    .copied()
+            };
+            modes.contains(&mode).then_some(mode).or_else(at_this_size)
         };
 
         Self {
@@ -391,21 +404,41 @@ mod tests {
 
     #[test]
     fn one_resolution_keeps_every_refresh_the_device_offers() {
+        // At 1280x720 the guest encodes fast enough for both, so this is the
+        // list with nothing but the duplicate taken out of it.
         let snapshot = MonitorSnapshot::new(
             r"\\.\DISPLAY1".to_owned(),
             None,
             None,
-            [
-                raw(1920, 1080, 120),
-                raw(1920, 1080, 60),
-                raw(1920, 1080, 120),
-            ],
+            [raw(1280, 720, 120), raw(1280, 720, 60), raw(1280, 720, 120)],
         );
 
         assert_eq!(
             snapshot.modes,
-            vec![mode(1920, 1080, 60), mode(1920, 1080, 120)]
+            vec![mode(1280, 720, 60), mode(1280, 720, 120)]
         );
+    }
+
+    #[test]
+    fn a_monitor_at_a_rate_the_guest_cannot_encode_is_answered_at_its_own_size() {
+        let snapshot = MonitorSnapshot::new(
+            r"\\.\DISPLAY1".to_owned(),
+            Some(raw(1920, 1080, 144)),
+            Some(raw(1920, 1080, 144)),
+            [raw(1920, 1080, 60), raw(1920, 1080, 144)],
+        );
+
+        assert_eq!(
+            snapshot.modes,
+            vec![mode(1920, 1080, 60)],
+            "144 Hz at this size is a rate the stack has never delivered"
+        );
+        assert_eq!(
+            snapshot.current,
+            Some(mode(1920, 1080, 60)),
+            "and the size the panel is on is still the size the window opens at"
+        );
+        assert_eq!(snapshot.preferred, Some(mode(1920, 1080, 60)));
     }
 
     #[test]
