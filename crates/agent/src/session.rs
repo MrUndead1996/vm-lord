@@ -9,13 +9,13 @@ use std::{
 use vmlord_agent_protocol::{
     auth::{self, Nonce, Secret},
     frame::{self, FrameError},
-    handshake::{self, CURRENT_VERSION},
+    handshake::{self, CURRENT_VERSION, DISPLAY_REBOOT_REQUIRED_REVISION},
     v1::{
         ApplyDisplayRecipeResponse, ApplyGpuRecipeResponse, AttachDisplayPayloadResponse,
-        AttachGpuSharesResponse, AuthenticateResponse, Capability, DisplayMount, DisplayShare,
-        Envelope, ErrorCode, GpuMount, GpuRecipeStage, GpuShare, HeartbeatRequest,
-        HeartbeatResponse, HelloRequest, ProbeGpuResponse, ProtocolVersion,
-        UpdateDisplayPayloadResponse, envelope, request, response,
+        AttachGpuSharesResponse, AuthenticateResponse, Capability, DisplayMount, DisplayRecipeStep,
+        DisplayShare, DisplayUpdateOutcome, Envelope, ErrorCode, GpuMount, GpuRecipeStage,
+        GpuShare, HeartbeatRequest, HeartbeatResponse, HelloRequest, ProbeGpuResponse,
+        ProtocolVersion, UpdateDisplayPayloadResponse, envelope, request, response,
     },
 };
 
@@ -286,12 +286,10 @@ fn serve<S: Read + Write>(
             Body::Request(request::Kind::UpdateDisplayPayload(request))
                 if session.capabilities.contains(&Capability::Display) =>
             {
-                let report = Envelope::response(
-                    request_id,
-                    response::Kind::UpdateDisplayPayload((handlers.update_display)(
-                        &request.target_version,
-                    )),
-                );
+                let mut update = (handlers.update_display)(&request.target_version);
+                make_display_update_compatible(&mut update, session.version.minor);
+                let report =
+                    Envelope::response(request_id, response::Kind::UpdateDisplayPayload(update));
                 frame::write(stream, &report, buffer).map_err(SessionError::Frame)?;
             }
             Body::Request(_) | Body::UnknownRequest => {
@@ -310,6 +308,21 @@ fn serve<S: Read + Write>(
             }
             Body::Response(_) => return Err(SessionError::OutOfOrder("an unsolicited response")),
         }
+    }
+}
+
+/// Removes revision 1.8 additions from an answer negotiated down to an older
+/// peer. The old peer still receives a conservative failure and the module
+/// load message that tells its log a reboot is needed.
+fn make_display_update_compatible(report: &mut UpdateDisplayPayloadResponse, minor: u32) {
+    if minor >= DISPLAY_REBOOT_REQUIRED_REVISION {
+        return;
+    }
+    report
+        .stages
+        .retain(|stage| stage.step() != DisplayRecipeStep::Initramfs);
+    if report.outcome() == DisplayUpdateOutcome::RebootRequired {
+        report.outcome = DisplayUpdateOutcome::Failed as i32;
     }
 }
 
@@ -444,15 +457,61 @@ mod tests {
         frame,
         v1::{
             ApplyDisplayRecipeResponse, ApplyGpuRecipeRequest, AttachGpuSharesRequest,
-            AuthenticateRequest, Capability, DisplayMount, DisplayShare, ErrorCode, GpuMount,
-            GpuMountState, GpuProbeCheck, GpuProbeCheckState, GpuProbeStep, GpuProbeVerdict,
-            GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep, GpuShare, GpuShareRole,
-            HelloRequest, HelloResponse, ProbeGpuRequest, ProbeGpuResponse, ProtocolVersion,
-            UpdateDisplayPayloadResponse, envelope, request, response,
+            AuthenticateRequest, Capability, DisplayMount, DisplayRecipeStage,
+            DisplayRecipeStageState, DisplayRecipeStep, DisplayShare, DisplayUpdateOutcome,
+            ErrorCode, GpuMount, GpuMountState, GpuProbeCheck, GpuProbeCheckState, GpuProbeStep,
+            GpuProbeVerdict, GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep, GpuShare,
+            GpuShareRole, HelloRequest, HelloResponse, ProbeGpuRequest, ProbeGpuResponse,
+            ProtocolVersion, UpdateDisplayPayloadResponse, envelope, request, response,
         },
     };
 
-    use super::{Handlers, run};
+    use super::{Handlers, make_display_update_compatible, run};
+
+    #[test]
+    fn revision_seven_receives_only_the_update_answer_it_can_name() {
+        let mut report = UpdateDisplayPayloadResponse {
+            stages: vec![
+                DisplayRecipeStage {
+                    step: DisplayRecipeStep::Initramfs as i32,
+                    state: DisplayRecipeStageState::Ok as i32,
+                    message: "rebuilt initramfs".to_owned(),
+                },
+                DisplayRecipeStage {
+                    step: DisplayRecipeStep::ModuleLoad as i32,
+                    state: DisplayRecipeStageState::Failed as i32,
+                    message: "the guest must reboot".to_owned(),
+                },
+            ],
+            versions: None,
+            outcome: DisplayUpdateOutcome::RebootRequired as i32,
+        };
+
+        make_display_update_compatible(&mut report, 7);
+
+        assert_eq!(report.outcome(), DisplayUpdateOutcome::Failed);
+        assert_eq!(report.stages.len(), 1);
+        assert_eq!(report.stages[0].step(), DisplayRecipeStep::ModuleLoad);
+        assert!(report.stages[0].message.contains("reboot"));
+    }
+
+    #[test]
+    fn revision_eight_receives_the_reboot_required_outcome() {
+        let mut report = UpdateDisplayPayloadResponse {
+            stages: vec![DisplayRecipeStage {
+                step: DisplayRecipeStep::Initramfs as i32,
+                state: DisplayRecipeStageState::Ok as i32,
+                message: "rebuilt initramfs".to_owned(),
+            }],
+            versions: None,
+            outcome: DisplayUpdateOutcome::RebootRequired as i32,
+        };
+
+        make_display_update_compatible(&mut report, 8);
+
+        assert_eq!(report.outcome(), DisplayUpdateOutcome::RebootRequired);
+        assert_eq!(report.stages[0].step(), DisplayRecipeStep::Initramfs);
+    }
 
     /// An attach that mounts nothing, for the tests about message order.
     ///

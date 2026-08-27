@@ -36,3 +36,17 @@ pub mod v1 {
 /// artifact a reviewer can point at to say what the wire format was at a given
 /// commit, and `tests/descriptor.rs` fails if it stops matching the `.proto`.
 pub const FILE_DESCRIPTOR_SET: &[u8] = include_bytes!("../proto/agent.descriptor.bin");
+
+#[cfg(test)]
+mod tests {
+    use crate::v1::DisplayUpdateOutcome;
+
+    #[test]
+    fn an_installed_update_that_needs_a_reboot_has_its_own_outcome() {
+        assert_eq!(
+            DisplayUpdateOutcome::from_str_name("DISPLAY_UPDATE_OUTCOME_REBOOT_REQUIRED")
+                .map(|outcome| outcome.as_str_name()),
+            Some("DISPLAY_UPDATE_OUTCOME_REBOOT_REQUIRED")
+        );
+    }
+}

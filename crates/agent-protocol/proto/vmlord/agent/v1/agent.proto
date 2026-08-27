@@ -542,6 +542,9 @@ enum DisplayUpdateOutcome {
   DISPLAY_UPDATE_OUTCOME_ROLLED_BACK = 2;
   // Neither version is running.
   DISPLAY_UPDATE_OUTCOME_FAILED = 3;
+  // The target version is installed and will be loaded after the guest reboots.
+  // The currently loaded module could not be unloaded safely.
+  DISPLAY_UPDATE_OUTCOME_REBOOT_REQUIRED = 4;
 }
 
 // Which versions of the display payload are in play inside the guest.
@@ -572,6 +575,7 @@ enum DisplayRecipeStep {
   DISPLAY_RECIPE_STEP_DEVICE = 7;
   DISPLAY_RECIPE_STEP_SERVICES = 8;
   DISPLAY_RECIPE_STEP_SERVICES_START = 9;
+  DISPLAY_RECIPE_STEP_INITRAMFS = 10;
 }
 
 enum DisplayRecipeStageState {

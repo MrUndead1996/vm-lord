@@ -3542,8 +3542,9 @@ Stages, in order, reported as a list and never as a verdict:
 digest -- before anything is copied), `BUILD_DEPENDENCIES` (`dkms`,
 `build-essential` and the running kernel's headers, from the guest's own apt),
 `MODULE_SOURCE` (copied to `/usr/src/vmlord-display-<version>`, because 9p is
-read-only and DKMS writes beside its sources), `MODULE_BUILD`, `MODULE_LOAD`
-(`modules-load.d`, the modprobe options, the unit that unbinds
+read-only and DKMS writes beside its sources), `MODULE_BUILD`, `INITRAMFS`
+(`update-initramfs -u -k` for the running kernel after a successful DKMS
+install), then `MODULE_LOAD` (`modules-load.d`, the modprobe options, the unit that unbinds
 `simple-framebuffer`, the drop-in that keeps the compositor on the
 distribution's Mesa, and `modprobe`), `DEVICE` (a `/dev/dri/card*` whose
 driver is ours), and `SERVICES`/`SERVICES_START`, which are skipped with their
@@ -3624,12 +3625,23 @@ request goes to the thread that owns that VM's agent session -- written onto
 the socket between frames, because a session is one conversation and a second
 writer would interleave halfway through one.
 
-The guest builds, reloads and then *verifies*: the module loaded, its version
-the one that was asked for, and a device that exists. A verification that fails
-rolls back one version, which costs a `modprobe` and a `dkms remove` because
-the previous `/usr/src` tree was never deleted and DKMS still holds its build.
-One step and no further: keeping two would be a version history, and there is
-nothing in an MVP to build one from.
+The guest builds, refreshes the running kernel's initramfs, reloads and then
+*verifies*: the module loaded, its version the one that was asked for, and a
+device that exists. Refreshing the initramfs is part of the build budget: the
+image contains both `modules-load.d/vmlord-display.conf` and a copy of the DKMS
+module, so leaving it untouched would make the next boot restore the old
+version. A verification that fails rolls back one version, which costs a
+`modprobe`, a `dkms remove` and another initramfs refresh because the previous
+`/usr/src` tree was never deleted and DKMS still holds its build. One step and
+no further: keeping two would be a version history, and there is nothing in an
+MVP to build one from.
+
+A compositor may hold the loaded module and make `modprobe -r` refuse it. That
+is not a rollback and not a successful live update: the target remains
+installed, the refreshed initramfs will load it at the next boot, and the
+answer is `REBOOT_REQUIRED` with the installed and loaded versions reported
+separately. VMLord warns the user to reboot the guest; it does not interrupt a
+session by rebooting automatically.
 
 A successful rollback is **not** a degraded display. The desktop works, on the
 version that was working before, and `display-payload-update-rolled-back` says

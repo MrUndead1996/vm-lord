@@ -16,7 +16,11 @@ use crate::v1::{Capability, ProtocolVersion};
 /// `major` changes when an existing message changes meaning; `minor` changes
 /// when something is added. A guest agent is upgraded on its own schedule, so
 /// this is the number a session negotiates against, never the crate version.
-pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 7 };
+pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 8 };
+
+/// The first revision that can name an initramfs stage and a reboot-required
+/// display update outcome.
+pub const DISPLAY_REBOOT_REQUIRED_REVISION: u32 = 8;
 
 impl ProtocolVersion {
     /// The revision this build implements.
@@ -230,6 +234,18 @@ mod tests {
         assert_eq!(
             settled.minor, 6,
             "the older side never sees a message it has no field for"
+        );
+    }
+
+    #[test]
+    fn a_peer_without_the_reboot_required_outcome_negotiates_revision_seven() {
+        let settled = negotiate_version(CURRENT_VERSION, ProtocolVersion { major: 1, minor: 7 })
+            .expect("one major, so the two negotiate");
+
+        assert_eq!(settled.minor, 7);
+        assert!(
+            CURRENT_VERSION.minor > settled.minor,
+            "the new outcome belongs to a revision newer than seven"
         );
     }
 

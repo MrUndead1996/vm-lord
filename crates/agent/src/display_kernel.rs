@@ -91,6 +91,49 @@ const SHORT_BUDGET: Duration = Duration::from_secs(30);
 
 const KEPT_LOG_LINES: usize = 40;
 
+fn update_initramfs_arguments(kernel_release: &str) -> [&str; 3] {
+    ["-u", "-k", kernel_release]
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReloadDisposition {
+    Reload,
+    RebootRequired,
+}
+
+fn reload_disposition(unload_succeeded: bool, module_is_still_loaded: bool) -> ReloadDisposition {
+    if !unload_succeeded && module_is_still_loaded {
+        ReloadDisposition::RebootRequired
+    } else {
+        ReloadDisposition::Reload
+    }
+}
+
+fn reported_update_versions(
+    target_version: &str,
+    outcome: DisplayUpdateOutcome,
+    mut versions: DisplayPayloadVersions,
+) -> DisplayPayloadVersions {
+    if outcome == DisplayUpdateOutcome::RebootRequired {
+        versions.previous.clone_from(&versions.loaded);
+        versions.installed = target_version.to_owned();
+    }
+    versions
+}
+
+enum UpdateAttemptFailure {
+    Failed(String),
+    RebootRequired(String),
+}
+
+fn rollback_outcome(runtime_restored: bool) -> DisplayUpdateOutcome {
+    if runtime_restored {
+        DisplayUpdateOutcome::RolledBack
+    } else {
+        DisplayUpdateOutcome::Failed
+    }
+}
+
 /// Installs what the mounted payload says the guest should have.
 ///
 /// Idempotent by fact: a guest already running the mounted version passes
@@ -126,7 +169,8 @@ pub fn update(
         ),
         Err(UpdateFailure { reason, outcome }) => (reason, outcome),
     };
-    (report.finish(&reason), versions(), outcome)
+    let versions = reported_update_versions(target_version, outcome, versions());
+    (report.finish(&reason), versions, outcome)
 }
 
 /// What the guest has of the display payload right now.
@@ -185,7 +229,8 @@ fn run_stages(
     halted(stopping)?;
 
     let installed = installed_versions();
-    if needs_build(&installed, &payload.version, device_is_present()) {
+    let built = needs_build(&installed, &payload.version, device_is_present());
+    if built {
         dependencies_stage(report, &guest.kernel_release)?;
         halted(stopping)?;
         source_stage(report, &payload)?;
@@ -206,7 +251,7 @@ fn run_stages(
         }
     }
 
-    load_stage(report, mode)?;
+    load_stage(report, mode, built.then_some(guest.kernel_release.as_str()))?;
     device_stage(report)?;
     services_stages(report, &payload_services(), Path::new(SERVICES_INSTALL))?;
     Ok(())
@@ -244,12 +289,15 @@ fn run_update(
     let before = installed_versions();
     halted(stopping).map_err(failed)?;
 
-    let attempt = (|| -> Result<(), String> {
-        dependencies_stage(report, &guest.kernel_release)?;
-        source_stage(report, &payload)?;
-        build_stage(report, &payload.version, &guest.kernel_release)?;
-        reload_module(report)?;
-        verify(report, &payload.version)
+    let attempt = (|| -> Result<(), UpdateAttemptFailure> {
+        dependencies_stage(report, &guest.kernel_release).map_err(UpdateAttemptFailure::Failed)?;
+        source_stage(report, &payload).map_err(UpdateAttemptFailure::Failed)?;
+        build_stage(report, &payload.version, &guest.kernel_release)
+            .map_err(UpdateAttemptFailure::Failed)?;
+        update_initramfs_stage(report, &guest.kernel_release)
+            .map_err(UpdateAttemptFailure::Failed)?;
+        reload_module_for_update(report, &payload.version)?;
+        verify(report, &payload.version).map_err(UpdateAttemptFailure::Failed)
     })();
 
     match attempt {
@@ -258,7 +306,16 @@ fn run_update(
                 .map_err(failed)?;
             Ok(())
         }
-        Err(reason) => Err(roll_back(&before, &payload.version, reason)),
+        Err(UpdateAttemptFailure::RebootRequired(reason)) => Err(UpdateFailure {
+            reason,
+            outcome: DisplayUpdateOutcome::RebootRequired,
+        }),
+        Err(UpdateAttemptFailure::Failed(reason)) => Err(roll_back(
+            &before,
+            &payload.version,
+            &guest.kernel_release,
+            reason,
+        )),
     }
 }
 
@@ -266,7 +323,12 @@ fn run_update(
 ///
 /// The previous `/usr/src` tree was never removed and DKMS still holds its
 /// build, so this is a `modprobe` and a `dkms remove` rather than a download.
-fn roll_back(before: &InstalledVersions, attempted: &str, reason: String) -> UpdateFailure {
+fn roll_back(
+    before: &InstalledVersions,
+    attempted: &str,
+    kernel_release: &str,
+    reason: String,
+) -> UpdateFailure {
     let Some(previous) = before.loaded.clone().or_else(|| before.previous(attempted)) else {
         return UpdateFailure {
             reason: format!("{reason}; there is no previous version to return to"),
@@ -282,19 +344,36 @@ fn roll_back(before: &InstalledVersions, attempted: &str, reason: String) -> Upd
         SHORT_BUDGET,
     );
     let _ = command::run("modprobe", &[MODULE], &[], SHORT_BUDGET);
+    let initramfs = update_initramfs(kernel_release);
 
-    let restored = module_is_loaded(&read(Path::new("/proc/modules")))
+    let runtime_restored = module_is_loaded(&read(Path::new("/proc/modules")))
         && loaded_version().as_deref() == Some(previous.as_str())
         && device_is_present();
 
-    if restored {
+    if rollback_outcome(runtime_restored) == DisplayUpdateOutcome::RolledBack {
+        let boot = if initramfs.succeeded() {
+            String::new()
+        } else {
+            format!(
+                "; {previous} is running, but the rollback could not refresh initramfs: {}",
+                failure("update-initramfs", &initramfs)
+            )
+        };
         UpdateFailure {
-            reason: format!("{reason}; {previous} is running again"),
+            reason: format!("{reason}; {previous} is running again{boot}"),
             outcome: DisplayUpdateOutcome::RolledBack,
         }
     } else {
+        let boot = if initramfs.succeeded() {
+            String::new()
+        } else {
+            format!(
+                "; rollback also could not refresh initramfs: {}",
+                failure("update-initramfs", &initramfs)
+            )
+        };
         UpdateFailure {
-            reason: format!("{reason}; {previous} could not be brought back either"),
+            reason: format!("{reason}; {previous} could not be brought back either{boot}"),
             outcome: DisplayUpdateOutcome::Failed,
         }
     }
@@ -551,6 +630,30 @@ fn make_log(version: &str) -> Option<String> {
     )
 }
 
+/// Refreshes the boot image that may carry this module and its load policy.
+fn update_initramfs_stage(report: &mut Report, kernel_release: &str) -> Result<(), String> {
+    let outcome = update_initramfs(kernel_release);
+    if !outcome.succeeded() {
+        let reason = failure("update-initramfs", &outcome);
+        report.failed(DisplayRecipeStep::Initramfs, reason.clone());
+        return Err(reason);
+    }
+    report.ok(
+        DisplayRecipeStep::Initramfs,
+        format!("rebuilt initramfs for kernel {kernel_release}"),
+    );
+    Ok(())
+}
+
+fn update_initramfs(kernel_release: &str) -> command::Outcome {
+    command::run(
+        "update-initramfs",
+        &update_initramfs_arguments(kernel_release),
+        &[],
+        BUILD_BUDGET,
+    )
+}
+
 /// Loads the module now, and arranges for it on every boot after this one.
 ///
 /// The unit that unbinds `simple-framebuffer` is installed here too: simpledrm
@@ -562,7 +665,11 @@ fn make_log(version: &str) -> Option<String> {
 /// then cannot allocate a buffer on is a device it will not light. It is
 /// written rather than applied -- a drop-in is read when the unit next starts,
 /// and on a normal boot this recipe runs before the greeter does.
-fn load_stage(report: &mut Report, mode: Option<(u32, u32)>) -> Result<(), String> {
+fn load_stage(
+    report: &mut Report,
+    mode: Option<(u32, u32)>,
+    refresh_initramfs_for: Option<&str>,
+) -> Result<(), String> {
     let wanted = wanted_mode(mode);
     let payload_drm = Path::new(PAYLOAD_MOUNT).join("content").join("drm");
     let copy = |from: &str, to: &str| -> Result<(), String> {
@@ -598,6 +705,10 @@ fn load_stage(report: &mut Report, mode: Option<(u32, u32)>) -> Result<(), Strin
         &[],
         SHORT_BUDGET,
     );
+
+    if let Some(kernel_release) = refresh_initramfs_for {
+        update_initramfs_stage(report, kernel_release)?;
+    }
 
     if module_is_loaded(&read(Path::new("/proc/modules"))) {
         let loaded = parse_module_parameters(
@@ -642,6 +753,32 @@ fn reload_module(report: &mut Report) -> Result<(), String> {
         let reason = failure(&format!("modprobe {MODULE}"), &outcome);
         report.failed(DisplayRecipeStep::ModuleLoad, reason.clone());
         return Err(reason);
+    }
+    report.ok(DisplayRecipeStep::ModuleLoad, format!("reloaded {MODULE}"));
+    Ok(())
+}
+
+/// Reloads an updated module, or preserves it on disk for the next boot when
+/// the compositor still owns the currently loaded version.
+fn reload_module_for_update(
+    report: &mut Report,
+    target_version: &str,
+) -> Result<(), UpdateAttemptFailure> {
+    let unloaded = command::run("modprobe", &["-r", MODULE], &[], SHORT_BUDGET);
+    let still_loaded = module_is_loaded(&read(Path::new("/proc/modules")));
+    if reload_disposition(unloaded.succeeded(), still_loaded) == ReloadDisposition::RebootRequired {
+        let reason = format!(
+            "{MODULE} is still in use; display payload {target_version} is installed and the guest must reboot to load it"
+        );
+        report.failed(DisplayRecipeStep::ModuleLoad, reason.clone());
+        return Err(UpdateAttemptFailure::RebootRequired(reason));
+    }
+
+    let outcome = command::run("modprobe", &[MODULE], &[], SHORT_BUDGET);
+    if !outcome.succeeded() {
+        let reason = failure(&format!("modprobe {MODULE}"), &outcome);
+        report.failed(DisplayRecipeStep::ModuleLoad, reason.clone());
+        return Err(UpdateAttemptFailure::Failed(reason));
     }
     report.ok(DisplayRecipeStep::ModuleLoad, format!("reloaded {MODULE}"));
     Ok(())
@@ -1268,6 +1405,57 @@ mod tests {
                 .any(|stage| stage.step() == DisplayRecipeStep::Payload
                     && stage.state() == DisplayRecipeStageState::Failed),
             "an update to a version the mount does not carry changes nothing"
+        );
+    }
+
+    #[test]
+    fn initramfs_is_rebuilt_for_the_running_kernel() {
+        assert_eq!(
+            super::update_initramfs_arguments("7.0.0-30-generic"),
+            ["-u", "-k", "7.0.0-30-generic"]
+        );
+    }
+
+    #[test]
+    fn a_module_that_remains_loaded_after_unload_failed_needs_a_reboot() {
+        assert_eq!(
+            super::reload_disposition(false, true),
+            super::ReloadDisposition::RebootRequired
+        );
+        assert_eq!(
+            super::reload_disposition(true, false),
+            super::ReloadDisposition::Reload
+        );
+    }
+
+    #[test]
+    fn a_reboot_pending_report_distinguishes_installed_from_loaded() {
+        let versions = vmlord_agent_protocol::v1::DisplayPayloadVersions {
+            installed: "0.1.0".to_owned(),
+            previous: "0.2.0".to_owned(),
+            loaded: "0.1.0".to_owned(),
+        };
+
+        let reported = super::reported_update_versions(
+            "0.2.0",
+            vmlord_agent_protocol::v1::DisplayUpdateOutcome::RebootRequired,
+            versions,
+        );
+
+        assert_eq!(reported.installed, "0.2.0");
+        assert_eq!(reported.previous, "0.1.0");
+        assert_eq!(reported.loaded, "0.1.0");
+    }
+
+    #[test]
+    fn a_running_previous_module_is_a_rollback_even_if_boot_refresh_failed() {
+        assert_eq!(
+            super::rollback_outcome(true),
+            vmlord_agent_protocol::v1::DisplayUpdateOutcome::RolledBack
+        );
+        assert_eq!(
+            super::rollback_outcome(false),
+            vmlord_agent_protocol::v1::DisplayUpdateOutcome::Failed
         );
     }
 }
