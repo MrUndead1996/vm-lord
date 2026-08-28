@@ -173,9 +173,19 @@ mod tests {
     fn a_recipe_whose_range_excludes_this_build_is_refused() {
         // The range used to be a placeholder. Now the services in the archive
         // are what makes it a claim, so packing is where it is checked.
-        assert!(protocol_range_covers_this_build(1, 0, 0).is_ok());
-        assert!(protocol_range_covers_this_build(2, 0, 0).is_err());
-        assert!(protocol_range_covers_this_build(1, 3, 5).is_err());
+        //
+        // Written against `CURRENT_VERSION` rather than against the numbers it
+        // held the day this was added: a literal range goes stale the next
+        // time the protocol gains a minor, and the test then fails for saying
+        // something about the old protocol rather than about this check.
+        let current = vmlord_display_protocol::handshake::CURRENT_VERSION;
+
+        assert!(protocol_range_covers_this_build(current.major, 0, current.minor).is_ok());
+        assert!(protocol_range_covers_this_build(current.major + 1, 0, current.minor).is_err());
+        assert!(
+            protocol_range_covers_this_build(current.major, current.minor + 1, current.minor + 3)
+                .is_err()
+        );
     }
 
     fn arguments(items: &[&str]) -> Vec<String> {
