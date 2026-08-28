@@ -178,8 +178,9 @@ not publisher authentication, and Windows still asks before running it.
 
 Source lives on GitHub at
 [MrUndead1996/vm-lord](https://github.com/MrUndead1996/vm-lord) and is mirrored
-to Forgejo at `git.mrundead.org`. GitHub is where pull requests and releases
-happen; the mirror is a copy, and it never forces.
+to Forgejo at `ssh://git@git.mrundead.org:222/mrundead/vm-lord.git`. GitHub is
+where pull requests and releases happen; the mirror is a copy, and it never
+forces.
 
 Two workflows do the work, and `cargo run -p xtask -- workflow-check` reads
 them back as data before either can surprise anyone: the release must run on
@@ -216,7 +217,7 @@ configured on the GitHub repository:
 | Name | Kind | Holds |
 | --- | --- | --- |
 | `FORGEJO_SSH_PRIVATE_KEY` | Actions secret | the private half of a Forgejo deploy key with write access |
-| `FORGEJO_SSH_HOST_KEY` | Actions variable | the `known_hosts` line for `git.mrundead.org`, read from the server itself |
+| `FORGEJO_SSH_HOST_KEY` | Actions variable | the `known_hosts` line for the server, read from it with `ssh-keyscan -p 222 -t ed25519 git.mrundead.org` |
 
 The host key is pinned rather than accepted on first use: in a fresh runner,
 trust-on-first-use is trust in whoever answers, every time. If the mirror push

@@ -50,7 +50,8 @@ jobs:
           chmod 600 ~/.ssh/forgejo
           # The host key is pinned from a repository variable instead of being
           # accepted on first use: trust-on-first-use in a fresh runner is
-          # trust in whoever answers, every single time.
+          # trust in whoever answers, every single time. Forgejo answers on
+          # port 222, so the entry is bracketed: `[git.mrundead.org]:222 ...`.
           printf '%s\n' "${FORGEJO_SSH_HOST_KEY}" > ~/.ssh/known_hosts
           chmod 600 ~/.ssh/known_hosts
 
@@ -61,7 +62,7 @@ jobs:
             -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
         run: |
           set -euo pipefail
-          git remote add forgejo git@git.mrundead.org:MrUndead/vm-lord.git
+          git remote add forgejo ssh://git@git.mrundead.org:222/mrundead/vm-lord.git
           # The exact ref that was pushed here, under its own name, and no
           # force: a rejected push is the correct outcome of divergence, and a
           # person resolves it deliberately.
