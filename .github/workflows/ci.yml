@@ -38,15 +38,24 @@ jobs:
       - name: Install the guest target
         run: rustup target add x86_64-unknown-linux-musl
 
+      # Compiling and running are separate steps because a step's name is a
+      # claim about what it did, and a build error reported under "Test" sends
+      # a reader looking in the wrong place.
+      #
       # `--locked` so a run compiles what `Cargo.lock` says and fails on a
       # manifest change that was never locked, instead of quietly resolving
-      # something else.
-      - name: Test the workspace
-        run: cargo test --locked
+      # something else. Build automation is out of the default set, so it
+      # needs naming.
+      - name: Compile the tests
+        run: |
+          cargo test --locked --no-run
+          cargo test --locked -p xtask --no-run
 
-      # Build automation is out of the default set, so it needs naming.
-      - name: Test the build automation
-        run: cargo test --locked -p xtask
+      # Near-free: everything above is already built, so this only runs.
+      - name: Run the tests
+        run: |
+          cargo test --locked
+          cargo test --locked -p xtask
 
       # The guest programs cross-compile to musl and are not covered by the
       # workspace tests, so a break in them is otherwise invisible until a
@@ -87,9 +96,18 @@ jobs:
             --fail \
             --output-file "${RUNNER_TEMP}/THIRD-PARTY-LICENSES.txt" \
             installer/third-party-licenses.hbs
+          notices="${RUNNER_TEMP}/THIRD-PARTY-LICENSES.txt"
           # A template that renders to nothing would pass the command above.
-          test -s "${RUNNER_TEMP}/THIRD-PARTY-LICENSES.txt"
-          wc -l < "${RUNNER_TEMP}/THIRD-PARTY-LICENSES.txt"
+          test -s "$notices"
+          # Handlebars escapes for HTML by default and this file is plain text,
+          # so a `{{ }}` where `{{{ }}}` was meant ships licences whose quotes
+          # have become `&quot;`. The first release drafted 883 of them.
+          if grep -qE '&(quot|amp|lt|gt|#x27|#x3D);' "$notices"; then
+            echo "the notices contain HTML entities; a value is missing its triple stache" >&2
+            grep -nE '&(quot|amp|lt|gt|#x27|#x3D);' "$notices" | head -5 >&2
+            exit 1
+          fi
+          wc -l < "$notices"
 
   lint:
     # Linux, because neither of these compiles the Windows application and a
