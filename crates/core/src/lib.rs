@@ -6,6 +6,7 @@ pub mod distro;
 mod error;
 pub mod gpu;
 mod logging;
+pub mod update;
 
 pub use diagnostics::{Diagnostic, DiagnosticLevel, DiagnosticsLayer, DiagnosticsSink, Subsystem};
 pub use error::RepositoryError;
@@ -60,6 +61,7 @@ pub use settings::{
     SettingsError, SettingsLoad, SettingsStore,
 };
 pub use ssh::{SshAuthentication, SshAvailability, SshConfig, SshEndpoint, SshPort};
+pub use update::{InstallerAsset, ReleaseManifest, UpdateManifestError, ValidatedUpdate};
 
 use serde::{Deserialize, Serialize};
 

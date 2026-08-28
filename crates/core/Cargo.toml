@@ -8,6 +8,7 @@ license.workspace = true
 test-profile = []
 
 [dependencies]
+semver.workspace = true
 # Kept for the bridge alone: `LogTracer` forwards what dependencies write
 # through `log` into the subscriber below.
 log.workspace = true
