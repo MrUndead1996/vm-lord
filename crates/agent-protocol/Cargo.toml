@@ -15,7 +15,7 @@ prost = "0.14"
 # OpenSSL would cost that.
 base64 = "0.23"
 getrandom = "0.4"
-hmac = "0.12"
+hmac = "0.13"
 sha2 = "0.10"
 # Comparing a tag with `==` leaks where two tags first differ, which is enough
 # to forge one a byte at a time.
