@@ -25,6 +25,7 @@ tracing.workspace = true
 # traits. Wired here because those traits belong to `app`, which `platform`
 # does not depend on.
 rfd = "0.15"
+semver.workspace = true
 vmlord-app = { path = "../app" }
 vmlord-core = { path = "../core" }
 vmlord-image = { path = "../image" }

@@ -46,6 +46,13 @@ pub struct AppSettings {
     /// Display stream diagnostics policy.
     #[serde(default)]
     pub display: DisplaySettings,
+    /// RFC 3339 time of the last automatic application-update check.
+    ///
+    /// This deliberately records only scheduled checks: a person pressing
+    /// "Check for updates" should never be told to wait for the 24-hour
+    /// interval to expire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_automatic_update_check: Option<String>,
 }
 
 /// Application-wide policy for comparing guest refresh with delivered frames.
@@ -314,6 +321,13 @@ pub struct SettingsStore {
     config_path: PathBuf,
 }
 
+/// Settings loaded from disk, including whether this launch created them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettingsLoad {
+    pub settings: AppSettings,
+    pub created: bool,
+}
+
 impl SettingsStore {
     /// Creates a store for a specific TOML configuration file.
     #[must_use]
@@ -341,6 +355,12 @@ impl SettingsStore {
 
     /// Loads settings from disk, creating the default configuration if absent.
     pub fn load_or_create(&self) -> Result<AppSettings, SettingsError> {
+        self.load_or_create_with_status()
+            .map(|loaded| loaded.settings)
+    }
+
+    /// Loads settings from disk, creating the default configuration if absent.
+    pub fn load_or_create_with_status(&self) -> Result<SettingsLoad, SettingsError> {
         match fs::read_to_string(&self.config_path) {
             Ok(contents) => {
                 let mut settings: AppSettings =
@@ -364,12 +384,18 @@ impl SettingsStore {
                         settings.image_cache_path.display()
                     );
                 }
-                Ok(settings)
+                Ok(SettingsLoad {
+                    settings,
+                    created: false,
+                })
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 let settings = self.default_settings()?;
                 self.save(&settings)?;
-                Ok(settings)
+                Ok(SettingsLoad {
+                    settings,
+                    created: true,
+                })
             }
             Err(source) => Err(SettingsError::Io {
                 operation: "read settings",
@@ -440,6 +466,7 @@ impl SettingsStore {
             guest_readiness: GuestReadinessTimeouts::default(),
             clipboard_files: FileClipboardSettings::default(),
             display: DisplaySettings::default(),
+            last_automatic_update_check: None,
         })
     }
 
@@ -574,6 +601,29 @@ mod tests {
     }
 
     #[test]
+    fn loading_absent_settings_reports_that_the_defaults_were_created() {
+        let directory = temporary_directory();
+        let store = SettingsStore::new(directory.join("settings.toml"));
+
+        let loaded = store.load_or_create_with_status().unwrap();
+
+        assert!(loaded.created);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn loading_existing_valid_settings_reports_that_they_already_existed() {
+        let directory = temporary_directory();
+        let store = SettingsStore::new(directory.join("settings.toml"));
+        store.load_or_create().unwrap();
+
+        let loaded = store.load_or_create_with_status().unwrap();
+
+        assert!(!loaded.created);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn defaults_put_the_image_cache_next_to_the_other_application_directories() {
         let directory = temporary_directory();
         let store = SettingsStore::new(directory.join("settings.toml"));
@@ -629,6 +679,7 @@ mod tests {
             guest_readiness: GuestReadinessTimeouts::default(),
             clipboard_files: FileClipboardSettings::default(),
             display: DisplaySettings::default(),
+            last_automatic_update_check: None,
         };
 
         store.save(&settings).unwrap();
@@ -653,6 +704,7 @@ mod tests {
             guest_readiness: GuestReadinessTimeouts::default(),
             clipboard_files: FileClipboardSettings::default(),
             display: DisplaySettings::default(),
+            last_automatic_update_check: None,
         };
 
         store.save(&settings).unwrap();
@@ -847,6 +899,7 @@ mod tests {
             guest_readiness: GuestReadinessTimeouts::default(),
             clipboard_files: FileClipboardSettings::default(),
             display: DisplaySettings::default(),
+            last_automatic_update_check: None,
         }
     }
 

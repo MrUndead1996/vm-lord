@@ -42,6 +42,14 @@ test-windows = ["test", "--target", "x86_64-pc-windows-gnu"]
 # Production build: MSVC application plus musl agent, collected into `dist/`.
 # Windows-only, because the release executable must come from MSVC.
 dist = ["run", "-p", "xtask", "--", "dist"]
+# The JSON a release publishes beside its installer. Run after the setup
+# executable has been compiled, because its size and SHA-256 are read from the
+# finished file rather than passed in:
+#
+#     cargo release-manifest --tag v0.1.0 \
+#         --installer target/installer/VMLord-0.1.0-x86_64-setup.exe \
+#         --output target/installer/release-manifest.json
+release-manifest = ["run", "-p", "xtask", "--", "release-manifest"]
 gpu-payload = ["run", "-p", "xtask", "--", "gpu-payload", "pack"]
 display-payload = ["run", "-p", "xtask", "--", "display-payload", "pack"]
 

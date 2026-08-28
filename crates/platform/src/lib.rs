@@ -48,6 +48,7 @@ mod host_dns;
 mod host_guest_defaults;
 mod hvsocket;
 mod import;
+mod installer;
 mod layout;
 mod metadata;
 mod password_hash;
@@ -89,6 +90,7 @@ pub use hcs::{
 };
 pub use host_guest_defaults::host_guest_defaults;
 pub use import::{ImportSummary, import_image};
+pub use installer::{InstallerLaunch, launch_installer};
 pub use metadata::{MetadataStore, VmComputeSystemMapping};
 pub use password_hash::hash_password;
 pub use reconnect::{

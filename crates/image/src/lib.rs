@@ -28,11 +28,13 @@ mod open;
 mod part;
 mod qcow2;
 mod resolve;
+mod update;
 
 pub use distro::validated_release;
 pub use download::{ImageDownloadRequest, fetch_image};
-pub use error::{DownloadError, Qcow2Error, ResolveError};
+pub use error::{DownloadError, Qcow2Error, ResolveError, UpdateDownloadError};
 pub use open::open_cloud_image;
 pub use qcow2::Qcow2Image;
 pub use resolve::{ResolvedImage, resolve_image};
+pub use update::{GitHubRelease, fetch_latest_release, fetch_update_installer};
 pub use vmlord_core::DistroProfile;

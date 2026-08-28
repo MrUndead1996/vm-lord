@@ -2,8 +2,15 @@
 
 pub mod display;
 pub mod gpu;
+pub mod update;
 
-use std::{collections::HashMap, fmt, path::PathBuf, time::SystemTime};
+use std::{
+    collections::HashMap,
+    fmt,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use vmlord_core::{
     AppSettings, Diagnostic, DiagnosticsSink, DistroCatalog, DistroCatalogError, DistroProfile,
@@ -14,6 +21,7 @@ use vmlord_core::{
 
 pub use display::derive_status as derive_display_status;
 pub use gpu::derive_status as derive_gpu_status;
+pub use update::{AvailableUpdate, UpdateActionError, UpdateRuntime, UpdateState};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BackendStatus {
@@ -139,6 +147,8 @@ pub struct WorkspaceApp {
     /// `None` in tests and in a process that brought no panel up: a
     /// `WorkspaceApp` without a sink simply has nothing to read.
     sink: Option<DiagnosticsSink>,
+    updates: update::UpdateManager,
+    first_run: bool,
 }
 
 struct SettingsContext {
@@ -163,6 +173,8 @@ impl WorkspaceApp {
             host_gpu: None,
             diagnostics: Vec::new(),
             sink: None,
+            updates: update::UpdateManager::default(),
+            first_run: false,
         }
     }
 
@@ -194,7 +206,84 @@ impl WorkspaceApp {
             store,
             current: settings,
         });
+        self.start_automatic_update_check();
         self
+    }
+
+    /// Connects this application workflow to the composition root's update
+    /// runtime. Network retrieval and Windows process launch stay outside the
+    /// UI and application layers respectively.
+    #[must_use]
+    pub fn with_update_runtime(mut self, runtime: Arc<dyn UpdateRuntime>) -> Self {
+        self.updates.set_runtime(runtime);
+        self.start_automatic_update_check();
+        self
+    }
+
+    /// Carries the setting-store creation signal to presentation without
+    /// making the UI inspect filesystem state.
+    #[must_use]
+    pub fn with_first_run(mut self, first_run: bool) -> Self {
+        self.first_run = first_run;
+        self
+    }
+
+    #[must_use]
+    pub fn first_run(&self) -> bool {
+        self.first_run
+    }
+
+    /// Starts a manual check. Manual requests deliberately ignore the
+    /// automatic-check interval.
+    pub fn check_for_updates(&mut self) -> Result<(), UpdateActionError> {
+        self.updates.start_check(false)
+    }
+
+    /// Starts downloading the update currently offered by [`Self::update_state`].
+    pub fn download_update(&mut self) -> Result<(), UpdateActionError> {
+        self.updates.download()
+    }
+
+    /// Asks the active installer download to stop. Completion arrives through
+    /// [`Self::poll_update`] and restores the available release.
+    pub fn cancel_update(&mut self) -> Result<(), UpdateActionError> {
+        self.updates.cancel()
+    }
+
+    /// Launches the verified installer. `true` means the UI may request a
+    /// clean application exit; it is never true until the launcher succeeded.
+    pub fn install_update(&mut self) -> Result<bool, UpdateActionError> {
+        match self.updates.install() {
+            Ok(request_exit) => Ok(request_exit),
+            Err(error) => {
+                vmlord_core::diagnostic!(Error, Subsystem::App, "{error}");
+                self.read_records();
+                Err(error)
+            }
+        }
+    }
+
+    /// Drains completed update-worker events and refreshes download progress.
+    /// It is cheap enough for the UI's regular redraw path.
+    pub fn poll_update(&mut self) {
+        for failure in self.updates.poll() {
+            if failure.automatic {
+                tracing::warn!("automatic {} failed: {}", failure.action, failure.message);
+            }
+            vmlord_core::diagnostic!(
+                Error,
+                Subsystem::App,
+                "Failed to {}: {}",
+                failure.action,
+                failure.message
+            );
+        }
+        self.read_records();
+    }
+
+    #[must_use]
+    pub fn update_state(&self) -> &UpdateState {
+        self.updates.state()
     }
 
     #[must_use]
@@ -820,6 +909,44 @@ impl WorkspaceApp {
         self.read_records();
     }
 
+    /// Starts one scheduled check when a persisted check is absent, malformed,
+    /// or at least a day old. The timestamp is saved before starting work so a
+    /// process that closes while the network is unavailable does not retry on
+    /// every redraw or startup.
+    fn start_automatic_update_check(&mut self) {
+        if !self.updates.has_runtime() {
+            return;
+        }
+        let Some(context) = &mut self.settings else {
+            return;
+        };
+        if !automatic_update_check_is_due(context.current.last_automatic_update_check.as_deref()) {
+            return;
+        }
+
+        let timestamp = vmlord_core::format_timestamp(SystemTime::now());
+        let previous = context
+            .current
+            .last_automatic_update_check
+            .replace(timestamp);
+        if let Err(error) = context.store.save(&context.current) {
+            context.current.last_automatic_update_check = previous;
+            vmlord_core::diagnostic!(
+                Error,
+                Subsystem::App,
+                "Failed to save the automatic update-check time: {error}"
+            );
+            return;
+        }
+        if let Err(error) = self.updates.start_check(true) {
+            vmlord_core::diagnostic!(
+                Error,
+                Subsystem::App,
+                "Failed to check for updates: {error}"
+            );
+        }
+    }
+
     /// Moves whatever the layer has recorded into the panel's history.
     ///
     /// Separate from `collect_diagnostics` because reading records is cheap and
@@ -836,6 +963,92 @@ impl WorkspaceApp {
                 .drain(..self.diagnostics.len() - MAX_DIAGNOSTICS);
         }
     }
+}
+
+fn automatic_update_check_is_due(last_check: Option<&str>) -> bool {
+    let Some(last_check) = last_check else {
+        return true;
+    };
+    let Some(last_check) = parse_rfc3339_utc(last_check) else {
+        tracing::warn!("the stored automatic update-check time is not RFC 3339");
+        return true;
+    };
+    SystemTime::now()
+        .duration_since(last_check)
+        .is_ok_and(|elapsed| elapsed >= Duration::from_secs(24 * 60 * 60))
+}
+
+/// Parses the exact UTC RFC 3339 spelling VMLord writes through
+/// [`vmlord_core::format_timestamp`]. Keeping storage in that canonical form
+/// means old or hand-edited values can safely be retried rather than making an
+/// automatic check wait indefinitely.
+fn parse_rfc3339_utc(value: &str) -> Option<SystemTime> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 24
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'.'
+        || bytes[23] != b'Z'
+    {
+        return None;
+    }
+    let year = decimal(&bytes[0..4])?;
+    let month = decimal(&bytes[5..7])?;
+    let day = decimal(&bytes[8..10])?;
+    let hour = decimal(&bytes[11..13])?;
+    let minute = decimal(&bytes[14..16])?;
+    let second = decimal(&bytes[17..19])?;
+    let millisecond = decimal(&bytes[20..23])?;
+    if year < 1970 || !(1..=12).contains(&month) || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let month_days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let days_in_month = month_days[(month - 1) as usize];
+    if !(1..=days_in_month).contains(&day) {
+        return None;
+    }
+    let years = year - 1970;
+    let leap_years = |through: u64| through / 4 - through / 100 + through / 400;
+    let days_before_year = years
+        .checked_mul(365)?
+        .checked_add(leap_years(year - 1).checked_sub(leap_years(1969))?)?;
+    let days_before_month: u64 = month_days[..(month - 1) as usize]
+        .iter()
+        .map(|days| u64::from(*days))
+        .sum();
+    let seconds = days_before_year
+        .checked_add(days_before_month)?
+        .checked_add(day - 1)?
+        .checked_mul(24 * 60 * 60)?
+        .checked_add(hour * 60 * 60 + minute * 60 + second)?;
+    UNIX_EPOCH
+        .checked_add(Duration::from_secs(seconds))?
+        .checked_add(Duration::from_millis(millisecond))
+}
+
+fn decimal(bytes: &[u8]) -> Option<u64> {
+    bytes.iter().try_fold(0u64, |value, byte| {
+        byte.is_ascii_digit()
+            .then(|| value.checked_mul(10)?.checked_add(u64::from(*byte - b'0')))
+            .flatten()
+    })
 }
 
 pub fn unavailable_repository(message: impl Into<String>) -> Box<dyn VmRepository> {
@@ -934,6 +1147,7 @@ mod tests {
             guest_readiness: vmlord_core::GuestReadinessTimeouts::default(),
             clipboard_files: vmlord_core::FileClipboardSettings::default(),
             display: vmlord_core::DisplaySettings::default(),
+            last_automatic_update_check: None,
         };
         store.save(&stale).unwrap();
         let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()))
@@ -969,6 +1183,7 @@ mod tests {
             guest_readiness: vmlord_core::GuestReadinessTimeouts::default(),
             clipboard_files: vmlord_core::FileClipboardSettings::default(),
             display: vmlord_core::DisplaySettings::default(),
+            last_automatic_update_check: None,
         };
         store.save(&initial).unwrap();
         let mut updated = initial.clone();
@@ -1000,6 +1215,7 @@ mod tests {
             guest_readiness: vmlord_core::GuestReadinessTimeouts::default(),
             clipboard_files: vmlord_core::FileClipboardSettings::default(),
             display: vmlord_core::DisplaySettings::default(),
+            last_automatic_update_check: None,
         };
         store.save(&initial).unwrap();
         let mut updated = initial.clone();
@@ -1652,6 +1868,7 @@ mod tests {
             guest_readiness: vmlord_core::GuestReadinessTimeouts::default(),
             clipboard_files: vmlord_core::FileClipboardSettings::default(),
             display: vmlord_core::DisplaySettings::default(),
+            last_automatic_update_check: None,
         };
         let updated_settings = AppSettings {
             vm_storage_path: directory.join("virtual-machines"),
@@ -1663,6 +1880,7 @@ mod tests {
             guest_readiness: vmlord_core::GuestReadinessTimeouts::default(),
             clipboard_files: vmlord_core::FileClipboardSettings::default(),
             display: vmlord_core::DisplaySettings::default(),
+            last_automatic_update_check: None,
         };
         let mut app = WorkspaceApp::new(Box::new(FakeRepository::default()))
             .with_diagnostics(sink)
@@ -1856,5 +2074,16 @@ mod tests {
             "a backend that could not initialize has nothing to say about the host"
         );
         assert!(application.host_gpu_capabilities().is_none());
+    }
+
+    #[test]
+    fn automatic_update_checks_are_throttled_for_a_day() {
+        let current = vmlord_core::format_timestamp(SystemTime::now());
+
+        assert!(!automatic_update_check_is_due(Some(&current)));
+        assert!(automatic_update_check_is_due(Some(
+            "1970-01-01T00:00:00.000Z"
+        )));
+        assert!(automatic_update_check_is_due(Some("not-a-timestamp")));
     }
 }

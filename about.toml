@@ -1,0 +1,41 @@
+# What `cargo about` is allowed to put in THIRD-PARTY-LICENSES.txt.
+#
+# The set is the one the 28 August 2026 audit recorded in
+# `docs/dependency-licenses.md`: every expression in the graph offers at least
+# one of these, and none of them prevents distributing VMLord under
+# GPL-3.0-or-later. It is written out rather than left open on purpose --
+# a dependency arriving under terms nobody has read fails the release instead
+# of being copied into the notices unnoticed.
+#
+# Order matters: for an `OR` expression `cargo about` takes the first accepted
+# licence, so the permissive halves come first and the copyleft alternatives
+# (`r-efi`'s `LGPL-2.1-or-later`, for one) are never the chosen half.
+accepted = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "MIT-0",
+    "BSD-3-Clause",
+    "BSD-2-Clause",
+    "BSD-1-Clause",
+    "0BSD",
+    "ISC",
+    "Zlib",
+    "BSL-1.0",
+    "CC0-1.0",
+    "Unlicense",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
+    "CDLA-Permissive-2.0",
+]
+
+# The notices ship inside a Windows installer, so only what is compiled into it
+# needs to be listed.
+targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-musl"]
+
+# Development and build-only dependencies are not distributed, so they are not
+# in the notices either.
+ignore-build-dependencies = true
+ignore-dev-dependencies = true

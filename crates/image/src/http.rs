@@ -44,6 +44,7 @@ pub(crate) enum ResumeOutcome {
 pub(crate) fn build_agent() -> Agent {
     Agent::config_builder()
         .http_status_as_error(false)
+        .user_agent(concat!("VMLord/", env!("CARGO_PKG_VERSION")))
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_recv_response(Some(RESPONSE_TIMEOUT))
         .tls_config(

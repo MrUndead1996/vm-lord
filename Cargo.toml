@@ -56,6 +56,7 @@ license = "GPL-3.0-or-later"
 authors = ["VMLord contributors"]
 
 [workspace.dependencies]
+semver = { version = "1", features = ["serde"] }
 # The logging facade. `log` stays alongside it, not as a leftover: `eframe` and
 # other dependencies write through `log`, and `tracing-log` is what keeps their
 # records reaching the file.

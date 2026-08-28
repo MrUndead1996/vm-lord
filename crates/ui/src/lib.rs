@@ -7,7 +7,7 @@ use std::{
 
 use eframe::egui;
 use rust_i18n::t;
-use vmlord_app::{BackendStatus, VmAction, WorkspaceApp};
+use vmlord_app::{AvailableUpdate, BackendStatus, UpdateState, VmAction, WorkspaceApp};
 use vmlord_core::{
     Advisory, AgentStatus, AppSettings, BuildProgress, BuildStep, CloudImage, DesktopProfile,
     DiagnosticLevel, DisplaySettings, DisplayState, DistroProfile, DownloadPhase,
@@ -55,6 +55,14 @@ pub fn run(application: WorkspaceApp) -> eframe::Result<()> {
         "VMLord",
         options,
         Box::new(move |_| {
+            // A first run opens the settings window by itself, filled in from
+            // the settings that were just created: the paths and the default
+            // distribution are the choices a fresh installation is asking
+            // about, and finding them is otherwise the user's problem.
+            let settings_form = application
+                .first_run()
+                .then(|| application.settings().map(SettingsForm::first_run))
+                .flatten();
             Ok(Box::new(VmlordUi {
                 application,
                 last_refresh: Instant::now(),
@@ -62,7 +70,8 @@ pub fn run(application: WorkspaceApp) -> eframe::Result<()> {
                 create_vm_form: None,
                 edit_vm_form: None,
                 delete_vm_form: None,
-                settings_form: None,
+                settings_form,
+                install_confirmation: None,
             }))
         }),
     )
@@ -76,6 +85,11 @@ struct VmlordUi {
     edit_vm_form: Option<EditVmForm>,
     delete_vm_form: Option<DeleteVmForm>,
     settings_form: Option<SettingsForm>,
+    /// The version whose installer is waiting on a confirmation, if any.
+    ///
+    /// The version and not the installer path: the application layer already
+    /// holds the verified file, and the dialog only needs what to name.
+    install_confirmation: Option<String>,
 }
 
 /// Where the new VM's system comes from, as the dialog's two radio buttons.
@@ -155,6 +169,14 @@ struct SettingsForm {
     /// TOML-only in task 139; the settings dialog must preserve it unchanged.
     clipboard_files: FileClipboardSettings,
     display: DisplaySettings,
+    last_automatic_update_check: Option<String>,
+    /// Whether this window was opened by the application starting for the
+    /// first time rather than by the Settings button.
+    ///
+    /// It changes nothing that is saved; it only adds the line explaining why
+    /// the window is open at all, which is the difference between a settings
+    /// dialog and a settings dialog nobody asked for.
+    first_run: bool,
     error: Option<String>,
 }
 
@@ -170,7 +192,17 @@ impl SettingsForm {
             guest_readiness: settings.guest_readiness,
             clipboard_files: settings.clipboard_files,
             display: settings.display,
+            last_automatic_update_check: settings.last_automatic_update_check.clone(),
+            first_run: false,
             error: None,
+        }
+    }
+
+    /// The same form, marked as the one a first run opens by itself.
+    fn first_run(settings: &AppSettings) -> Self {
+        Self {
+            first_run: true,
+            ..Self::from_settings(settings)
         }
     }
 
@@ -198,6 +230,7 @@ impl SettingsForm {
             guest_readiness: self.guest_readiness,
             clipboard_files: self.clipboard_files,
             display: self.display,
+            last_automatic_update_check: self.last_automatic_update_check.clone(),
         })
     }
 }
@@ -310,13 +343,30 @@ enum DeleteVmDialogAction {
 enum SettingsDialogAction {
     BrowseVmStorage,
     BrowseLogFile,
+    /// Look for a newer release now, ignoring the daily throttle.
+    CheckUpdates,
+    DownloadUpdate,
+    CancelUpdate,
+    /// Open the confirmation that installing closes VMLord. The install itself
+    /// is never started straight from this button.
+    RequestInstall,
     Cancel,
     Submit(AppSettings),
+}
+
+/// The answer to "installing closes VMLord -- continue?".
+enum InstallConfirmationAction {
+    Cancel,
+    Install,
 }
 
 impl eframe::App for VmlordUi {
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         context.request_repaint_after(AUTO_REFRESH_INTERVAL);
+        // The update worker reports through a channel the application layer
+        // drains here, so a check or a download that finished between frames
+        // is on screen in this one.
+        self.application.poll_update();
         if matches!(self.application.status(), BackendStatus::Ready)
             && self.last_refresh.elapsed() >= AUTO_REFRESH_INTERVAL
         {
@@ -507,10 +557,11 @@ impl eframe::App for VmlordUi {
         }
 
         let distro_options = self.application.distro_options().collect::<Vec<_>>();
+        let update_state = self.application.update_state().clone();
         let settings_dialog_action = self
             .settings_form
             .as_mut()
-            .and_then(|form| render_settings_dialog(context, form, &distro_options));
+            .and_then(|form| render_settings_dialog(context, form, &distro_options, &update_state));
         match settings_dialog_action {
             Some(SettingsDialogAction::BrowseVmStorage) => {
                 match self.application.pick_vm_storage_directory() {
@@ -542,6 +593,32 @@ impl eframe::App for VmlordUi {
                     }
                 }
             },
+            Some(SettingsDialogAction::CheckUpdates) => {
+                if let Err(error) = self.application.check_for_updates()
+                    && let Some(form) = &mut self.settings_form
+                {
+                    form.error = Some(error.to_string());
+                }
+            }
+            Some(SettingsDialogAction::DownloadUpdate) => {
+                if let Err(error) = self.application.download_update()
+                    && let Some(form) = &mut self.settings_form
+                {
+                    form.error = Some(error.to_string());
+                }
+            }
+            Some(SettingsDialogAction::CancelUpdate) => {
+                if let Err(error) = self.application.cancel_update()
+                    && let Some(form) = &mut self.settings_form
+                {
+                    form.error = Some(error.to_string());
+                }
+            }
+            Some(SettingsDialogAction::RequestInstall) => {
+                if let UpdateState::Ready { update, .. } = self.application.update_state() {
+                    self.install_confirmation = Some(update.validated.version.to_string());
+                }
+            }
             Some(SettingsDialogAction::Cancel) => self.settings_form = None,
             Some(SettingsDialogAction::Submit(settings)) => {
                 let language = settings.language;
@@ -554,6 +631,31 @@ impl eframe::App for VmlordUi {
                     // the whole of switching language: no restart, no reload.
                     rust_i18n::set_locale(language.code());
                     self.settings_form = None;
+                }
+            }
+            None => {}
+        }
+
+        let confirmation_action = self
+            .install_confirmation
+            .as_deref()
+            .and_then(|version| render_install_confirmation(context, version));
+        match confirmation_action {
+            Some(InstallConfirmationAction::Cancel) => self.install_confirmation = None,
+            Some(InstallConfirmationAction::Install) => {
+                self.install_confirmation = None;
+                match self.application.install_update() {
+                    // Windows has the installer; staying open would only put
+                    // this executable in the way of replacing it.
+                    Ok(true) => {
+                        context.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        if let Some(form) = &mut self.settings_form {
+                            form.error = Some(error.to_string());
+                        }
+                    }
                 }
             }
             None => {}
@@ -950,6 +1052,7 @@ fn render_settings_dialog(
     context: &egui::Context,
     form: &mut SettingsForm,
     distro_options: &[(&str, &str)],
+    update_state: &UpdateState,
 ) -> Option<SettingsDialogAction> {
     let mut open = true;
     let mut action = None;
@@ -960,6 +1063,11 @@ fn render_settings_dialog(
         .open(&mut open)
         .show(context, |ui| {
             ui.label(t!("settings.description").to_string());
+            if form.first_run {
+                ui.add_space(4.0);
+                ui.strong(t!("settings.first_run_notice").to_string());
+                ui.label(t!("settings.first_run_hint").to_string());
+            }
             ui.add_space(8.0);
             egui::Grid::new("application-settings-form")
                 .num_columns(2)
@@ -1083,6 +1191,12 @@ fn render_settings_dialog(
                     ui.end_row();
                 });
 
+            ui.add_space(8.0);
+            ui.separator();
+            if let Some(update_action) = render_update_section(ui, update_state) {
+                action = Some(update_action);
+            }
+
             if let Some(error) = &form.error {
                 ui.add_space(4.0);
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
@@ -1120,6 +1234,100 @@ fn render_settings_dialog(
 
     if !open && action.is_none() {
         action = Some(SettingsDialogAction::Cancel);
+    }
+    action
+}
+
+/// The Updates part of the settings window: what the update state says, and
+/// the one step it offers next.
+///
+/// Every decision here comes from [`update_presentation`]; this draws it and
+/// nothing else, which is why the section needs no state of its own.
+fn render_update_section(ui: &mut egui::Ui, state: &UpdateState) -> Option<SettingsDialogAction> {
+    let mut action = None;
+    let presentation = update_presentation(state);
+
+    ui.add_space(4.0);
+    ui.strong(t!("updates.section").to_string());
+    ui.label(presentation.status);
+    if let Some(percent) = presentation.percent {
+        ui.add(
+            egui::ProgressBar::new(percent as f32 / 100.0)
+                .desired_width(300.0)
+                .text(t!("selected_vm.percent", percent = percent).to_string()),
+        );
+    }
+    if let Some(detail) = presentation.detail {
+        ui.label(detail);
+    }
+
+    ui.horizontal(|ui| {
+        if let Some(offer) = presentation.action
+            && ui.button(update_offer_label(offer)).clicked()
+        {
+            action = Some(match offer {
+                UpdateOffer::Check | UpdateOffer::Retry => SettingsDialogAction::CheckUpdates,
+                UpdateOffer::Download => SettingsDialogAction::DownloadUpdate,
+                UpdateOffer::Install => SettingsDialogAction::RequestInstall,
+            });
+        }
+        if presentation.cancellable && ui.button(t!("common.cancel").to_string()).clicked() {
+            action = Some(SettingsDialogAction::CancelUpdate);
+        }
+    });
+    ui.label(t!("updates.unsigned_note").to_string());
+
+    action
+}
+
+/// The confirmation between a verified installer and running it.
+///
+/// Its own window rather than a button in the section: launching the installer
+/// closes VMLord, and that is not something a mis-click on a settings page
+/// should be able to do.
+fn render_install_confirmation(
+    context: &egui::Context,
+    version: &str,
+) -> Option<InstallConfirmationAction> {
+    let mut open = true;
+    let mut action = None;
+    egui::Window::new(t!("updates.confirm_title").to_string())
+        .collapsible(false)
+        .resizable(false)
+        .default_width(420.0)
+        .open(&mut open)
+        .show(context, |ui| {
+            ui.label(t!("updates.confirm_body", version = version).to_string());
+            ui.add_space(8.0);
+            ui.separator();
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let install = ui.add(
+                    egui::Button::new(
+                        egui::RichText::new(t!("updates.confirm_install").to_string())
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(47, 158, 97))
+                    .min_size(egui::vec2(88.0, 30.0)),
+                );
+                if install.clicked() {
+                    action = Some(InstallConfirmationAction::Install);
+                }
+                let cancel = ui.add(
+                    egui::Button::new(
+                        egui::RichText::new(t!("common.cancel").to_string())
+                            .color(egui::Color32::WHITE),
+                    )
+                    .fill(egui::Color32::from_rgb(100, 100, 100))
+                    .min_size(egui::vec2(88.0, 30.0)),
+                );
+                if cancel.clicked() {
+                    action = Some(InstallConfirmationAction::Cancel);
+                }
+            });
+        });
+
+    if !open && action.is_none() {
+        action = Some(InstallConfirmationAction::Cancel);
     }
     action
 }
@@ -2580,7 +2788,16 @@ fn vm_state_label(state: VmState) -> String {
 /// hashing-complete are not fractions of anything -- hence `None` rather than a
 /// zero that would read as no progress.
 fn download_percentage(progress: BuildProgress) -> Option<u64> {
-    match progress.download? {
+    phase_percentage(progress.download?)
+}
+
+/// The share of a transfer that is done, when the phase publishes both halves
+/// of the fraction.
+///
+/// Shared with the application-update section: a downloaded installer and a
+/// downloaded cloud image are the same transfer to a progress bar.
+fn phase_percentage(phase: DownloadPhase) -> Option<u64> {
+    match phase {
         DownloadPhase::Downloading {
             downloaded,
             total: Some(total),
@@ -2600,7 +2817,13 @@ fn download_percentage(progress: BuildProgress) -> Option<u64> {
 /// them would be inventing a denominator. `None` therefore means the step name
 /// already says everything, not that progress was lost.
 fn build_detail(progress: BuildProgress) -> Option<String> {
-    Some(match progress.download? {
+    Some(download_detail(progress.download?))
+}
+
+/// What a transfer is doing right now, in bytes a person can compare with the
+/// size they were told to expect.
+fn download_detail(phase: DownloadPhase) -> String {
+    match phase {
         DownloadPhase::Connecting => t!("build.connecting").to_string(),
         DownloadPhase::Downloading {
             downloaded,
@@ -2626,7 +2849,125 @@ fn build_detail(progress: BuildProgress) -> Option<String> {
         )
         .to_string(),
         DownloadPhase::Completed => t!("build.image_ready").to_string(),
-    })
+    }
+}
+
+/// Everything the Updates section shows for one application-update state.
+///
+/// Separated from the egui code because these are decisions, not drawing: what
+/// a person is told and what they are allowed to press follows from the state
+/// alone, and that is what the tests hold onto. `render_update_section` then
+/// only lays this out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UpdatePresentation {
+    /// The single line above the buttons: the phase, and the version it is about.
+    status: String,
+    /// Release notes, transfer counts, or the message of a failure.
+    detail: Option<String>,
+    /// The fraction a bar is drawn at, when the phase publishes counts.
+    percent: Option<u64>,
+    /// The button that starts the next step, when the state has a next step.
+    action: Option<UpdateOffer>,
+    /// Whether the work in flight can be called off.
+    cancellable: bool,
+}
+
+/// The one thing the Updates section offers to start.
+///
+/// `Retry` is not `Check` even though both end in a check: after a failure the
+/// button says so, and a section that offers "Check for updates" under an error
+/// reads as if the error had been forgotten.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpdateOffer {
+    Check,
+    Download,
+    Install,
+    Retry,
+}
+
+/// What the Updates section shows for the state the application reports.
+fn update_presentation(state: &UpdateState) -> UpdatePresentation {
+    match state {
+        UpdateState::Idle => UpdatePresentation {
+            status: t!("updates.idle").to_string(),
+            detail: None,
+            percent: None,
+            action: Some(UpdateOffer::Check),
+            cancellable: false,
+        },
+        UpdateState::Checking => UpdatePresentation {
+            status: t!("updates.checking").to_string(),
+            detail: None,
+            percent: None,
+            action: None,
+            cancellable: false,
+        },
+        UpdateState::Available(update) => UpdatePresentation {
+            status: t!("updates.available", version = update.validated.version).to_string(),
+            detail: release_notes(update),
+            percent: None,
+            action: Some(UpdateOffer::Download),
+            cancellable: false,
+        },
+        UpdateState::Downloading { update, progress } => UpdatePresentation {
+            status: t!("updates.downloading", version = update.validated.version).to_string(),
+            // Before the first byte there is no phase to report; the status
+            // line already says a download is under way.
+            detail: progress.map(download_detail),
+            percent: progress.and_then(phase_percentage),
+            action: None,
+            cancellable: true,
+        },
+        UpdateState::Ready {
+            update,
+            installing: false,
+            ..
+        } => UpdatePresentation {
+            status: t!("updates.ready", version = update.validated.version).to_string(),
+            detail: Some(t!("updates.ready_hint").to_string()),
+            percent: None,
+            action: Some(UpdateOffer::Install),
+            cancellable: false,
+        },
+        // Windows has the installer and this process is on its way out, so
+        // there is nothing left to press and nothing left to call off.
+        UpdateState::Ready {
+            update,
+            installing: true,
+            ..
+        } => UpdatePresentation {
+            status: t!("updates.installing", version = update.validated.version).to_string(),
+            detail: Some(t!("updates.installing_hint").to_string()),
+            percent: None,
+            action: None,
+            cancellable: false,
+        },
+        UpdateState::Failed { message } => UpdatePresentation {
+            status: t!("updates.failed").to_string(),
+            detail: Some(message.clone()),
+            percent: None,
+            action: Some(UpdateOffer::Retry),
+            cancellable: false,
+        },
+    }
+}
+
+/// The notes a person reads before accepting a version, or nothing when the
+/// release carried none: an empty box under the version says less than no box.
+fn release_notes(update: &AvailableUpdate) -> Option<String> {
+    let notes = update.release_notes.trim();
+    (!notes.is_empty()).then(|| notes.to_string())
+}
+
+/// The label on the button that starts the next step.
+fn update_offer_label(offer: UpdateOffer) -> String {
+    match offer {
+        UpdateOffer::Check => t!("updates.check"),
+        UpdateOffer::Download => t!("updates.download"),
+        UpdateOffer::Install => t!("updates.install"),
+        UpdateOffer::Retry => t!("updates.retry"),
+    }
+    .to_string()
 }
 
 fn mebibytes(bytes: u64) -> String {
@@ -2827,7 +3168,8 @@ mod tests {
 
     use vmlord_core::{
         DisplayStage, DisplayState, DisplayStatusCode, GpuAvailability, GpuFailure, GpuStatusCode,
-        SshAuthentication, SshAvailability, SshConfig, VmGpuFacts, ubuntu,
+        InstallerAsset, SshAuthentication, SshAvailability, SshConfig, ValidatedUpdate, VmGpuFacts,
+        ubuntu,
     };
 
     use super::*;
@@ -3941,5 +4283,139 @@ mod tests {
         )));
 
         assert!(detail.contains("gpu-assignment-partial"), "{detail}");
+    }
+
+    /// A validated update, as the application layer hands one over.
+    fn available_update(version: &str) -> AvailableUpdate {
+        AvailableUpdate {
+            validated: ValidatedUpdate {
+                version: version.parse().expect("the fixture version parses"),
+                installer: InstallerAsset {
+                    url: format!(
+                        "https://github.com/MrUndead1996/vm-lord/releases/download/v{version}/vmlord-setup.exe"
+                    ),
+                    size: 40 * 1024 * 1024,
+                    sha256: "a".repeat(64),
+                },
+            },
+            release_notes: "Fixes the installer".into(),
+        }
+    }
+
+    /// Nothing has been asked for yet, so the only thing on offer is asking.
+    #[test]
+    fn an_idle_update_state_offers_a_check() {
+        let presentation = update_presentation(&UpdateState::Idle);
+
+        assert_eq!(presentation.action, Some(UpdateOffer::Check));
+        assert!(!presentation.cancellable);
+        assert_eq!(presentation.percent, None);
+    }
+
+    /// A check in flight offers nothing: a second one would be refused anyway.
+    #[test]
+    fn a_running_check_offers_no_action() {
+        let presentation = update_presentation(&UpdateState::Checking);
+
+        assert_eq!(presentation.action, None);
+        assert!(!presentation.cancellable);
+    }
+
+    /// The version and its notes are what a person decides on, so both are on
+    /// screen before the download button they decide with.
+    #[test]
+    fn an_available_update_offers_a_download_with_its_notes() {
+        let presentation = update_presentation(&UpdateState::Available(available_update("1.4.0")));
+
+        assert_eq!(presentation.action, Some(UpdateOffer::Download));
+        assert!(
+            presentation.status.contains("1.4.0"),
+            "{}",
+            presentation.status
+        );
+        assert_eq!(presentation.detail.as_deref(), Some("Fixes the installer"));
+    }
+
+    /// A download is the one phase a person can call off, and the one that
+    /// publishes counts to draw a bar from.
+    #[test]
+    fn a_running_download_offers_cancellation_and_progress() {
+        let presentation = update_presentation(&UpdateState::Downloading {
+            update: available_update("1.4.0"),
+            progress: Some(DownloadPhase::Downloading {
+                downloaded: 10 * 1024 * 1024,
+                total: Some(40 * 1024 * 1024),
+            }),
+        });
+
+        assert_eq!(presentation.action, None);
+        assert!(presentation.cancellable);
+        assert_eq!(presentation.percent, Some(25));
+        assert!(presentation.detail.is_some());
+    }
+
+    /// A verified installer on disk is still not run without being asked to.
+    #[test]
+    fn a_ready_installer_offers_an_install() {
+        let presentation = update_presentation(&UpdateState::Ready {
+            update: available_update("1.4.0"),
+            installer: PathBuf::from(r"C:\Temp\vmlord-setup.exe"),
+            installing: false,
+        });
+
+        assert_eq!(presentation.action, Some(UpdateOffer::Install));
+        assert!(!presentation.cancellable);
+    }
+
+    /// Once Windows has been handed the installer there is nothing left to
+    /// press: the application is on its way out.
+    #[test]
+    fn a_launching_installer_offers_nothing() {
+        let presentation = update_presentation(&UpdateState::Ready {
+            update: available_update("1.4.0"),
+            installer: PathBuf::from(r"C:\Temp\vmlord-setup.exe"),
+            installing: true,
+        });
+
+        assert_eq!(presentation.action, None);
+        assert!(!presentation.cancellable);
+    }
+
+    /// A failure says what went wrong and offers the one thing that can follow
+    /// it, rather than leaving the section stuck.
+    #[test]
+    fn a_failed_update_offers_a_retry_and_says_why() {
+        let presentation = update_presentation(&UpdateState::Failed {
+            message: "the installer hash did not match".into(),
+        });
+
+        assert_eq!(presentation.action, Some(UpdateOffer::Retry));
+        assert_eq!(
+            presentation.detail.as_deref(),
+            Some("the installer hash did not match")
+        );
+    }
+
+    /// The first run opens the settings window filled in from the settings
+    /// that were just created, so nothing is offered as blank.
+    #[test]
+    fn a_first_run_settings_form_carries_the_current_settings() {
+        let settings = AppSettings {
+            vm_storage_path: PathBuf::from(r"C:\VMLord\VMs"),
+            language: Language::EnUs,
+            log_file_path: PathBuf::from(r"C:\VMLord\vmlord.log"),
+            log_level: LogLevel::Info,
+            image_cache_path: PathBuf::from(r"C:\VMLord\Images"),
+            default_distro: "ubuntu".into(),
+            guest_readiness: GuestReadinessTimeouts::default(),
+            clipboard_files: FileClipboardSettings::default(),
+            display: DisplaySettings::default(),
+            last_automatic_update_check: None,
+        };
+
+        let form = SettingsForm::first_run(&settings);
+
+        assert!(form.first_run);
+        assert_eq!(form.vm_storage_path, r"C:\VMLord\VMs");
     }
 }

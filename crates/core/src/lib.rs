@@ -6,6 +6,7 @@ pub mod distro;
 mod error;
 pub mod gpu;
 mod logging;
+pub mod update;
 
 pub use diagnostics::{Diagnostic, DiagnosticLevel, DiagnosticsLayer, DiagnosticsSink, Subsystem};
 pub use error::RepositoryError;
@@ -35,6 +36,7 @@ pub use display::{
 pub use distro::ubuntu;
 pub use distro::{
     DesktopSetup, DistroCatalog, DistroCatalogError, DistroProfile, SshDaemon, SshUnits,
+    sync_bundled_profiles,
 };
 pub use gpu::{
     GPU_PAYLOAD_SHARE, GpuAssignment, GpuAvailability, GpuFailure, GpuMode, GpuShare,
@@ -56,9 +58,12 @@ pub use provisioning::{
 pub use settings::{
     AppSettings, DataSize, DisplaySettings, DisplaySettingsError, FileClipboardSettings,
     FileClipboardSettingsError, GuestReadinessTimeouts, Language, LogLevel, Retention,
-    SettingsError, SettingsStore,
+    SettingsError, SettingsLoad, SettingsStore,
 };
 pub use ssh::{SshAuthentication, SshAvailability, SshConfig, SshEndpoint, SshPort};
+pub use update::{
+    InstallerAsset, RELEASE_DOWNLOAD_PREFIX, ReleaseManifest, UpdateManifestError, ValidatedUpdate,
+};
 
 use serde::{Deserialize, Serialize};
 

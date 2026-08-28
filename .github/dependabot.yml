@@ -1,0 +1,22 @@
+# Dependency updates as pull requests.
+#
+# Both ecosystems are here because both end up inside the installer: a Cargo
+# dependency is compiled into the binaries and listed in the third-party
+# notices, and an action is code that runs with this repository's token.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    # A new dependency changes the licence notices `cargo dist` generates, and
+    # `about.toml` refuses an expression the audit never accepted -- so an
+    # update that would need a licence decision fails the build rather than
+    # arriving in a release unread.
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

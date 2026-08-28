@@ -23,6 +23,8 @@ fps_gap_threshold_invalid = "Display FPS warning threshold must be between 1% an
 default_distro = "Default distribution"
 vm_storage_required = "VM storage path is required."
 log_file_required = "Log file path is required."
+first_run_notice = "This is VMLord's first run on this account."
+first_run_hint = "The paths and the default distribution below were filled in with defaults; change them now if they are not where you want VM data and logs."
 
 [log_level]
 error = "Error"
@@ -224,3 +226,23 @@ desktop_needs_cores = "A GNOME desktop is slow below %{required} CPU cores; this
 desktop_needs_ram = "A GNOME desktop is slow below %{required} GiB of RAM; this VM has %{actual} MiB."
 desktop_needs_cores_and_ram = "A GNOME desktop is slow below %{required_cores} CPU cores and %{required_gib} GiB of RAM; this VM has %{actual_cores} cores and %{actual_mb} MiB."
 desktop_needs_password = "A desktop VM without a password has nothing to log in with at its login screen; set one here, or set one later over SSH."
+
+[updates]
+section = "Application updates"
+idle = "No update check has been made yet."
+checking = "Checking for a newer version..."
+available = "Version %{version} is available."
+downloading = "Downloading version %{version}..."
+ready = "Version %{version} is verified and ready to install."
+ready_hint = "The downloaded installer matches the SHA-256 the release published."
+installing = "Handing version %{version} to Windows..."
+installing_hint = "VMLord closes so the installer can replace it."
+failed = "The update could not be completed."
+check = "Check for updates"
+download = "Download"
+install = "Install"
+retry = "Try again"
+confirm_title = "Install the update"
+confirm_body = "VMLord will close and the installer for version %{version} will start. Your VMs, settings and images are left untouched."
+confirm_install = "Close and install"
+unsigned_note = "Installers are checked against the SHA-256 the release publishes. They are not signed with a certificate, so Windows will still ask before running one."

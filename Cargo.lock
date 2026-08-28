@@ -3885,6 +3885,10 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+dependencies = [
+ "serde",
+ "serde_core",
+]
 
 [[package]]
 name = "serde"
@@ -4779,6 +4783,7 @@ version = "0.1.0"
 dependencies = [
  "embed-resource",
  "rfd",
+ "semver",
  "tracing",
  "vmlord-app",
  "vmlord-core",
@@ -4816,6 +4821,7 @@ dependencies = [
 name = "vmlord-app"
 version = "0.1.0"
 dependencies = [
+ "semver",
  "tracing",
  "tracing-subscriber",
  "vmlord-core",
@@ -4826,8 +4832,11 @@ name = "vmlord-core"
 version = "0.1.0"
 dependencies = [
  "log",
+ "semver",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
  "toml 0.8.23",
  "tracing",
  "tracing-log",
@@ -4913,6 +4922,8 @@ name = "vmlord-image"
 version = "0.1.0"
 dependencies = [
  "qcow",
+ "serde",
+ "serde_json",
  "sha2 0.11.0",
  "tracing",
  "ureq",
@@ -5964,8 +5975,12 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "semver",
  "serde",
  "serde_json",
+ "serde_yaml_ng",
+ "sha2 0.11.0",
+ "vmlord-core",
  "vmlord-display-codec",
  "vmlord-display-payload",
  "vmlord-display-protocol",

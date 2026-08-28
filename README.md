@@ -119,6 +119,7 @@ application and a Linux guest agent. The commands are Cargo aliases, defined in
 | `cargo test-windows` | builds and runs the Windows tests, the display viewer's included | WSL |
 | `cargo dist` | release build of everything -- `vmlord.exe`, `vmlord-com1.exe`, `vmlord-display.exe` and the agent -- collected into `target/dist/` | Windows |
 | `cargo gpu-payload pack ...` | release tooling that packs a prepared GPU payload | Windows, Linux |
+| `cargo release-manifest ...` | writes `release-manifest.json` from a finished installer's own bytes | Windows, Linux |
 
 Prerequisites:
 
@@ -129,8 +130,108 @@ Prerequisites:
   (`x86_64-w64-mingw32-gcc`, from `gcc-mingw-w64-x86-64` on Debian and Ubuntu).
   Windows test binaries then run directly, through WSL's interop -- no Wine.
 
-`cargo dist` is Windows-only: release executables must come from MSVC. See
-**ARCHITECTURE.md** for why each target was chosen.
+`cargo dist` is Windows-only: release executables must come from MSVC. It also
+generates `THIRD-PARTY-LICENSES.txt` from the resolved dependency graph, which
+needs the pinned tool:
+
+```powershell
+cargo install --locked cargo-about@0.9.2
+```
+
+`about.toml` lists the licences the [dependency audit](docs/dependency-licenses.md)
+accepted. A dependency arriving under anything else fails `cargo dist` rather
+than being copied into the notices unread.
+
+See **ARCHITECTURE.md** for why each target was chosen.
+
+## Packaging
+
+The installer is [Inno Setup](https://jrsoftware.org/isinfo.php) 6.6 and is
+declarative packaging only: it places files, offers shortcuts and registers an
+uninstaller. Settings, distribution profiles and updates belong to the
+application. From the repository root on Windows:
+
+```powershell
+cargo dist --gpu-payload <dir> --display-payload <dir>
+powershell -File installer\check.ps1 target\dist
+iscc installer\vmlord.iss
+cargo release-manifest --tag v0.1.0 `
+    --installer target\installer\VMLord-0.1.0-x86_64-setup.exe `
+    --output target\installer\release-manifest.json
+```
+
+`check.ps1` runs first because the installer copies whatever was staged: a
+binary that failed to build would otherwise ship as a file missing from
+Program Files rather than as a build error. It also reads the script back to
+confirm both installation modes are still offered.
+
+The setup program installs into `{autopf}\VMLord` -- Program Files when the
+user chooses an all-users installation and elevates, their own Programs
+directory when they do not. Uninstalling removes only what was installed;
+`%LOCALAPPDATA%\VMLord`, which holds settings, VMs and images, is left alone.
+
+There is no code-signing certificate. The SHA-256 in `release-manifest.json` is
+an integrity check that the downloaded installer is the published one; it is
+not publisher authentication, and Windows still asks before running it.
+
+## Releasing
+
+Source lives on GitHub at
+[MrUndead1996/vm-lord](https://github.com/MrUndead1996/vm-lord) and is mirrored
+to Forgejo at `ssh://git@git.mrundead.org:222/mrundead/vm-lord.git`. GitHub is
+where pull requests and releases happen; the mirror is a copy, and it never
+forces.
+
+Two workflows do the work, and `cargo run -p xtask -- workflow-check` reads
+them back as data before either can surprise anyone: the release must run on
+`v*` alone, default permissions must be `contents: read`, only the `release`
+job may write, every action must be pinned to a commit SHA, and the mirror must
+follow only `main` and `v*` and must never force-push.
+
+**Cutting a release.** Everything is driven by the tag, and the tag has to
+agree with `Cargo.toml`:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` then checks that the tag is reachable from
+`main` and matches the workspace version, runs the tests, builds the
+distribution, checks the staging, compiles the installer, writes
+`release-manifest.json`, recomputes its SHA-256 with a second tool, and creates
+a **draft** release carrying the installer, the manifest, `SHA256SUMS.txt`, the
+third-party notices and a source archive.
+
+The draft is never published automatically. Download the installer, confirm its
+SHA-256 equals the manifest's, and install it in both scope modes before
+publishing. Until it is published, no VMLord in the world can discover it: the
+update check reads the latest published release.
+
+The GPU and display payload archives are prepared from guest sources outside
+the workflow, so a release built by CI carries none. Attach them and rebuild
+the installer locally when a release needs them; VMLord runs without them.
+
+**Mirror setup.** `.github/workflows/mirror-forgejo.yml` needs two things
+configured on the GitHub repository:
+
+| Name | Kind | Holds |
+| --- | --- | --- |
+| `FORGEJO_SSH_PRIVATE_KEY` | Actions secret | the private half of a Forgejo deploy key with write access |
+| `FORGEJO_SSH_HOST_KEY` | Actions variable | the `known_hosts` line for the server, read from it with `ssh-keyscan -p 222 -t ed25519 git.mrundead.org` |
+
+The host key is pinned rather than accepted on first use: in a fresh runner,
+trust-on-first-use is trust in whoever answers, every time. If the mirror push
+is rejected, the two histories have diverged -- reconcile them by hand and push
+deliberately. Do not add `--force` to the workflow; `workflow-check` refuses it.
+
+**What a user is trusting.** There is no Authenticode certificate, so
+SmartScreen warns about the installer and will keep warning until enough people
+have run it. What the release does offer is that the bytes are the published
+ones: the manifest's hash is generated from the installer's own bytes, checked
+again independently, published beside it, and verified by VMLord before it
+launches anything. A user who prefers not to rely on the in-application update
+can download the installer from the releases page and compare the hash
+themselves.
 
 ## Running
 
