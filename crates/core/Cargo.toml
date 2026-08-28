@@ -17,6 +17,7 @@ tracing-log.workspace = true
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.11"
+tempfile = "3.27"
 toml = "0.8"
 # A VM's stable identity, which the SSH contract remembers a guest's host key
 # under. No random generation here: ids are minted where VMs are created.

@@ -19,6 +19,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tempfile::NamedTempFile;
 
 use crate::{SettingsStore, display::DesktopProfile};
 
@@ -154,32 +155,36 @@ fn write_ownership_document(
 fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), DistroCatalogError> {
     use std::io::Write;
 
-    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-    let mut file = fs::OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)
-        .map_err(|source| DistroCatalogError::Io {
-            operation: "create temporary distribution profile",
-            path: temporary.clone(),
-            source,
-        })?;
+    let directory = path.parent().ok_or_else(|| DistroCatalogError::Io {
+        operation: "create temporary distribution profile",
+        path: path.to_path_buf(),
+        source: io::Error::new(io::ErrorKind::InvalidInput, "profile path has no parent"),
+    })?;
+    let mut file = NamedTempFile::new_in(directory).map_err(|source| DistroCatalogError::Io {
+        operation: "create temporary distribution profile",
+        path: directory.to_path_buf(),
+        source,
+    })?;
+    let temporary = file.path().to_path_buf();
     file.write_all(contents)
         .map_err(|source| DistroCatalogError::Io {
             operation: "write temporary distribution profile",
             path: temporary.clone(),
             source,
         })?;
-    file.sync_all().map_err(|source| DistroCatalogError::Io {
-        operation: "sync temporary distribution profile",
-        path: temporary.clone(),
-        source,
-    })?;
-    fs::rename(&temporary, path).map_err(|source| DistroCatalogError::Io {
+    file.as_file()
+        .sync_all()
+        .map_err(|source| DistroCatalogError::Io {
+            operation: "sync temporary distribution profile",
+            path: temporary.clone(),
+            source,
+        })?;
+    file.persist(path).map_err(|error| DistroCatalogError::Io {
         operation: "replace distribution profile",
         path: path.to_path_buf(),
-        source,
-    })
+        source: error.error,
+    })?;
+    Ok(())
 }
 
 /// Where a distribution publishes its cloud images, and what the guest inside
@@ -592,6 +597,17 @@ mod tests {
         sync_bundled_profiles(&fixture.bundle, &fixture.store).unwrap();
 
         assert_eq!(fixture.read_user("ubuntu.json"), "new bundle");
+    }
+
+    #[test]
+    fn synchronizing_an_unchanged_bundle_twice_keeps_its_ownership_record() {
+        let fixture = ProfileFixture::new();
+        fixture.write_bundle("ubuntu.json", "bundle copy");
+        sync_bundled_profiles(&fixture.bundle, &fixture.store).unwrap();
+
+        sync_bundled_profiles(&fixture.bundle, &fixture.store).unwrap();
+
+        assert_eq!(fixture.read_user("ubuntu.json"), "bundle copy");
     }
 
     #[test]
