@@ -1,5 +1,4 @@
-//! `cargo run -p xtask -- workflow-check`: the release and mirror workflows,
-//! read as data.
+//! `cargo run -p xtask -- workflow-check`: the release workflow, read as data.
 //!
 //! Two things make a release workflow dangerous, and neither shows up in a
 //! test run: a token with more rights than the job needs, and an action
@@ -11,18 +10,15 @@ use std::{fs, path::Path};
 use serde_yaml_ng::Value;
 
 const RELEASE_WORKFLOW: &str = ".github/workflows/release.yml";
-const MIRROR_WORKFLOW: &str = ".github/workflows/mirror-forgejo.yml";
 
 /// The job in the release workflow that is allowed to write to the repository.
 const RELEASE_JOB: &str = "release";
 
 pub fn run(workspace: &Path) -> Result<(), String> {
-    let mut problems = Vec::new();
-    problems.extend(check(workspace, RELEASE_WORKFLOW, check_release)?);
-    problems.extend(check(workspace, MIRROR_WORKFLOW, check_mirror)?);
+    let problems = check(workspace, RELEASE_WORKFLOW, check_release)?;
 
     if problems.is_empty() {
-        println!("workflow-check: {RELEASE_WORKFLOW} and {MIRROR_WORKFLOW} are sound");
+        println!("workflow-check: {RELEASE_WORKFLOW} is sound");
         return Ok(());
     }
     for problem in &problems {
@@ -82,42 +78,6 @@ fn check_release(document: &Value) -> Vec<String> {
                 "job `{name}` has `contents: write`; only `{RELEASE_JOB}` may write"
             )),
             _ => {}
-        }
-    }
-
-    problems
-}
-
-/// What the Forgejo mirror has to be true of.
-fn check_mirror(document: &Value) -> Vec<String> {
-    let mut problems = Vec::new();
-
-    let branches = triggers(document, "push", "branches");
-    if branches != vec!["main".to_owned()] {
-        problems.push(format!(
-            "the mirror follows branches {branches:?}, not `main` alone"
-        ));
-    }
-    let tags = triggers(document, "push", "tags");
-    if tags != vec!["v*".to_owned()] {
-        problems.push(format!("the mirror follows tags {tags:?}, not `v*`"));
-    }
-    // A pull request ref is not history: mirroring one would publish an
-    // unreviewed branch to Forgejo under this repository's name.
-    if trigger(document, "pull_request").is_some() {
-        problems.push("a pull request must never be mirrored".to_owned());
-    }
-
-    if permission(document.get("permissions"), "contents").as_deref() != Some("read") {
-        problems.push("the workflow's default permissions are not `contents: read`".to_owned());
-    }
-
-    // The mirror is a copy, and a copy that can overwrite is a copy that can
-    // destroy the thing it mirrors. A rejected push is the correct outcome of
-    // divergence; a human resolves it.
-    for command in run_commands(document) {
-        if command.contains("push") && (command.contains("--force") || command.contains(" -f ")) {
-            problems.push("the mirror force-pushes; divergence must fail instead".to_owned());
         }
     }
 
@@ -196,27 +156,11 @@ fn permission(permissions: Option<&Value>, name: &str) -> Option<String> {
     permissions?.get(name)?.as_str().map(str::to_owned)
 }
 
-/// Every `run:` script in a workflow, from every job.
-fn run_commands(document: &Value) -> Vec<String> {
-    let mut commands = Vec::new();
-    for (_, job) in jobs(document) {
-        let Some(steps) = job.get("steps").and_then(Value::as_sequence) else {
-            continue;
-        };
-        for step in steps {
-            if let Some(command) = step.get("run").and_then(Value::as_str) {
-                commands.push(command.to_owned());
-            }
-        }
-    }
-    commands
-}
-
 #[cfg(test)]
 mod tests {
     use serde_yaml_ng::Value;
 
-    use super::{check_mirror, check_release, unpinned_actions};
+    use super::{check_release, unpinned_actions};
 
     fn parse(text: &str) -> Value {
         serde_yaml_ng::from_str(text).expect("the fixture is valid YAML")
@@ -296,53 +240,5 @@ mod tests {
 
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(problems[0].contains("checkout@v4"), "{problems:?}");
-    }
-
-    /// The mirror copies `main` and the version tags, and nothing else.
-    #[test]
-    fn the_mirror_follows_main_and_version_tags_only() {
-        let sound = parse(&format!(
-            "on:\n  push:\n    branches:\n      - main\n    tags:\n      - \
-             'v*'\npermissions:\n  contents: read\njobs:\n  mirror:\n    steps:\n      - uses: \
-             {PINNED}\n      - run: git push forgejo HEAD\n"
-        ));
-
-        assert_eq!(check_mirror(&sound), Vec::<String>::new());
-    }
-
-    /// A pull request branch is not history and must never be published.
-    #[test]
-    fn a_pull_request_is_never_mirrored() {
-        let document = parse(&format!(
-            "on:\n  push:\n    branches:\n      - main\n    tags:\n      - 'v*'\n  \
-             pull_request:\npermissions:\n  contents: read\njobs:\n  mirror:\n    steps:\n      \
-             - uses: {PINNED}\n"
-        ));
-
-        let problems = check_mirror(&document);
-
-        assert!(
-            problems
-                .iter()
-                .any(|problem| problem.contains("pull request")),
-            "{problems:?}"
-        );
-    }
-
-    /// Divergence has to fail loudly; overwriting the mirror hides it.
-    #[test]
-    fn the_mirror_never_force_pushes() {
-        let document = parse(&format!(
-            "on:\n  push:\n    branches:\n      - main\n    tags:\n      - \
-             'v*'\npermissions:\n  contents: read\njobs:\n  mirror:\n    steps:\n      - uses: \
-             {PINNED}\n      - run: git push --force forgejo HEAD\n"
-        ));
-
-        let problems = check_mirror(&document);
-
-        assert!(
-            problems.iter().any(|problem| problem.contains("force")),
-            "{problems:?}"
-        );
     }
 }

@@ -4164,14 +4164,21 @@ own tag. SmartScreen says so, in its own way, and will keep warning until an
 installer has been run often enough -- that warning is accurate, and the
 honest answer to it is a certificate, not a workaround.
 
-The GitHub Actions workflows are held to the same standard as the product:
-default permissions are `contents: read`, only the job that creates the release
-may write, every action is pinned to a commit SHA rather than a movable tag,
-and the Forgejo mirror never force-pushes -- divergence is a fact for a person
-to resolve, not something a copy should be able to erase.
-`cargo run -p xtask -- workflow-check` reads both files back as data and
-asserts exactly those properties, so a later edit that loosens one fails the
-branch rather than the release.
+The release workflow is held to the same standard as the product: default
+permissions are `contents: read`, only the job that creates the release may
+write, and every action is pinned to a commit SHA rather than a movable tag --
+a tag is a name its owner can move onto other code, and that job holds a token
+that can write to this repository. `cargo run -p xtask -- workflow-check` reads
+the file back as data and asserts exactly those properties, so a later edit
+that loosens one fails the branch rather than the release.
+
+The Forgejo mirror at `git.mrundead.org` is a pull mirror configured on Forgejo
+itself, not a push from Actions. Forgejo's SSH is not reachable from GitHub's
+runners, and rather than exposing it, the direction was inverted: Forgejo
+fetches over HTTPS on its own schedule. GitHub therefore holds no credential
+that can write to Forgejo, nothing has to be opened to the internet for it, and
+the copy cannot write back to what it copies. The mirror lags by up to one
+interval; a mirror is not a source of truth, so it may.
 
 ---
 
