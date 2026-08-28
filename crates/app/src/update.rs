@@ -98,6 +98,7 @@ pub(crate) struct UpdateManager {
     state: UpdateState,
     receiver: Option<Receiver<UpdateEvent>>,
     cancel: Option<Arc<AtomicBool>>,
+    cancellation_requested: bool,
     download_progress: Option<ProgressPublisher<DownloadPhase>>,
 }
 
@@ -108,6 +109,7 @@ impl Default for UpdateManager {
             state: UpdateState::Idle,
             receiver: None,
             cancel: None,
+            cancellation_requested: false,
             download_progress: None,
         }
     }
@@ -128,7 +130,10 @@ impl UpdateManager {
 
     pub(crate) fn start_check(&mut self, automatic: bool) -> Result<(), UpdateActionError> {
         self.require_no_operation()?;
-        if matches!(self.state, UpdateState::Available(_)) {
+        if matches!(
+            self.state,
+            UpdateState::Available(_) | UpdateState::Ready { .. }
+        ) {
             return Err(UpdateActionError::UpdateAlreadyAvailable);
         }
         let runtime = Arc::clone(self.runtime()?);
@@ -159,6 +164,7 @@ impl UpdateManager {
             progress: None,
         };
         self.cancel = Some(Arc::clone(&cancel));
+        self.cancellation_requested = false;
         self.download_progress = Some(progress.clone());
 
         self.start_worker(
@@ -181,6 +187,7 @@ impl UpdateManager {
             return Err(UpdateActionError::NoAvailableUpdate);
         };
         cancel.store(true, Ordering::Relaxed);
+        self.cancellation_requested = true;
         tracing::info!("cancelling application update download");
         Ok(())
     }
@@ -232,6 +239,7 @@ impl UpdateManager {
                 Some(Err(TryRecvError::Disconnected)) => {
                     self.receiver = None;
                     self.cancel = None;
+                    self.cancellation_requested = false;
                     self.download_progress = None;
                     self.state = UpdateState::Failed {
                         message: "the update worker stopped without reporting a result".to_owned(),
@@ -247,6 +255,8 @@ impl UpdateManager {
             self.receiver = None;
             self.cancel = None;
             self.download_progress = None;
+            let cancellation_requested = self.cancellation_requested;
+            self.cancellation_requested = false;
             match event {
                 UpdateEvent::Check { result, automatic } => match result {
                     Ok(Some(update)) => self.state = UpdateState::Available(update),
@@ -267,6 +277,9 @@ impl UpdateManager {
                     result,
                     cancelled,
                 } => match result {
+                    Ok(_) if cancelled || cancellation_requested => {
+                        self.state = UpdateState::Available(update);
+                    }
                     Ok(installer) => {
                         self.state = UpdateState::Ready {
                             update,
@@ -274,7 +287,9 @@ impl UpdateManager {
                             installing: false,
                         };
                     }
-                    Err(_) if cancelled => self.state = UpdateState::Available(update),
+                    Err(_) if cancelled || cancellation_requested => {
+                        self.state = UpdateState::Available(update);
+                    }
                     Err(message) => {
                         self.state = UpdateState::Failed {
                             message: message.clone(),
@@ -373,4 +388,104 @@ enum UpdateEvent {
         result: Result<PathBuf, String>,
         cancelled: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        path::{Path, PathBuf},
+        sync::{Arc, atomic::AtomicBool, mpsc},
+    };
+
+    use semver::Version;
+    use vmlord_core::InstallerAsset;
+
+    use super::{
+        AvailableUpdate, UpdateActionError, UpdateEvent, UpdateManager, UpdateRuntime, UpdateState,
+    };
+
+    struct ReadyRuntime;
+
+    impl UpdateRuntime for ReadyRuntime {
+        fn check(&self) -> Result<Option<AvailableUpdate>, String> {
+            Ok(None)
+        }
+
+        fn download(
+            &self,
+            _update: &AvailableUpdate,
+            _progress: vmlord_core::ProgressPublisher<vmlord_core::DownloadPhase>,
+            _cancel: Arc<AtomicBool>,
+        ) -> Result<PathBuf, String> {
+            unreachable!("the ready-state regression never downloads")
+        }
+
+        fn launch(&self, _installer: &Path) -> Result<(), String> {
+            unreachable!("the ready-state regression never launches")
+        }
+    }
+
+    fn update() -> AvailableUpdate {
+        AvailableUpdate {
+            validated: vmlord_core::ValidatedUpdate {
+                version: Version::new(0, 2, 0),
+                installer: InstallerAsset {
+                    url: "https://github.com/MrUndead1996/vm-lord/releases/download/v0.2.0/VMLord-0.2.0-x86_64-setup.exe".to_owned(),
+                    size: 2,
+                    sha256: "a".repeat(64),
+                },
+            },
+            release_notes: "A verified release.".to_owned(),
+        }
+    }
+
+    #[test]
+    fn cancellation_after_a_successful_download_event_restores_the_available_update() {
+        let update = update();
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(UpdateEvent::Download {
+                update: update.clone(),
+                result: Ok(PathBuf::from("installer.exe")),
+                cancelled: false,
+            })
+            .unwrap();
+        let mut manager = UpdateManager {
+            state: UpdateState::Downloading {
+                update: update.clone(),
+                progress: None,
+            },
+            receiver: Some(receiver),
+            cancel: Some(Arc::new(AtomicBool::new(false))),
+            ..UpdateManager::default()
+        };
+
+        manager.cancel().unwrap();
+        manager.poll();
+
+        assert_eq!(manager.state(), &UpdateState::Available(update));
+    }
+
+    #[test]
+    fn checks_are_refused_without_losing_a_verified_ready_installer() {
+        for installing in [false, true] {
+            let update = update();
+            let ready = UpdateState::Ready {
+                update,
+                installer: PathBuf::from("installer.exe"),
+                installing,
+            };
+            let mut manager = UpdateManager {
+                runtime: Some(Arc::new(ReadyRuntime)),
+                state: ready.clone(),
+                ..UpdateManager::default()
+            };
+
+            assert_eq!(
+                manager.start_check(false),
+                Err(UpdateActionError::UpdateAlreadyAvailable)
+            );
+            assert_eq!(manager.state(), &ready);
+        }
+    }
 }
