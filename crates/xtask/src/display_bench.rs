@@ -12,7 +12,12 @@ use vmlord_display_codec::{
     scenes::{Generator, Scene},
 };
 
-/// The resolution the table is measured at.
+/// The resolution the table is measured at unless `--width` and `--height`
+/// name another one.
+///
+/// A default rather than the only choice: what a refresh costs is what a
+/// frame costs, and a frame's cost is its pixel count. A cap on the refresh
+/// the viewer publishes is read off this table at more than one size.
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
 
@@ -39,14 +44,25 @@ struct Report {
 struct Arguments {
     frames: u32,
     tile: TileSize,
+    width: u32,
+    height: u32,
+    /// The one scene to measure, or every scene when unnamed.
+    ///
+    /// Scenes share a process, and a scene that touched eight megabytes leaves
+    /// the caches to the next one. Naming a single scene is how a number gets
+    /// compared against the same number from another build.
+    scene: Option<Scene>,
 }
 
-/// Reads `--frames` and `--tile`.
+/// Reads `--frames`, `--tile`, `--width`, `--height` and `--scene`.
 fn parse<I: IntoIterator<Item = String>>(arguments: I) -> Result<Arguments, String> {
     let mut values = arguments.into_iter();
     let mut parsed = Arguments {
         frames: 300,
         tile: TileSize::ThirtyTwo,
+        width: WIDTH,
+        height: HEIGHT,
+        scene: None,
     };
 
     while let Some(flag) = values.next() {
@@ -68,6 +84,25 @@ fn parse<I: IntoIterator<Item = String>>(arguments: I) -> Result<Arguments, Stri
                 parsed.tile = TileSize::from_pixels(pixels)
                     .map_err(|_| "--tile wants 16, 32 or 64".to_owned())?;
             }
+            "--width" => {
+                parsed.width = value()?
+                    .parse()
+                    .map_err(|_| "--width wants a number".to_owned())?;
+            }
+            "--height" => {
+                parsed.height = value()?
+                    .parse()
+                    .map_err(|_| "--height wants a number".to_owned())?;
+            }
+            "--scene" => {
+                let wanted = value()?;
+                parsed.scene = Some(
+                    Scene::ALL
+                        .into_iter()
+                        .find(|scene| scene.name() == wanted)
+                        .ok_or_else(|| format!("no scene is called `{wanted}`"))?,
+                );
+            }
             _ => return Err(format!("unknown argument `{flag}`")),
         }
     }
@@ -80,9 +115,14 @@ fn parse<I: IntoIterator<Item = String>>(arguments: I) -> Result<Arguments, Stri
 }
 
 /// The geometry the table is measured at.
-fn geometry(tile: TileSize) -> Geometry {
-    Geometry::new(WIDTH, HEIGHT, tile, PixelFormat::Bgra8888)
-        .expect("1920x1080 is a geometry the codec accepts")
+///
+/// # Errors
+///
+/// The message the codec refused the size with, which is what a `--width` of
+/// nothing looks like.
+fn geometry(width: u32, height: u32, tile: TileSize) -> Result<Geometry, String> {
+    Geometry::new(width, height, tile, PixelFormat::Bgra8888)
+        .map_err(|error| format!("{width}x{height} is not a geometry the codec accepts: {error}"))
 }
 
 /// Drives one scene through the codec, verifying the round trip as it goes.
@@ -188,7 +228,7 @@ fn measure(scene: Scene, geometry: Geometry, frames: u32) -> Result<Report, Stri
 /// Measures every scene and prints the table.
 pub(crate) fn run<I: IntoIterator<Item = String>>(arguments: I) -> Result<(), String> {
     let arguments = parse(arguments)?;
-    let geometry = geometry(arguments.tile);
+    let geometry = geometry(arguments.width, arguments.height, arguments.tile)?;
 
     println!(
         "{}x{}, tile {}, {} frames per scene\n",
@@ -212,7 +252,11 @@ pub(crate) fn run<I: IntoIterator<Item = String>>(arguments: I) -> Result<(), St
         "dec ms"
     );
 
-    for scene in Scene::ALL {
+    let scenes: Vec<Scene> = arguments
+        .scene
+        .map_or_else(|| Scene::ALL.to_vec(), |scene| vec![scene]);
+
+    for scene in scenes {
         let report = measure(scene, geometry, arguments.frames)?;
         println!(
             "{:<18}{:>4}/{:<5}{:>12.0}{:>13.0}{:>9.1}{:>12}{:>11.2}{:>10.2}{:>10.2}{:>11.2}{:>9.2}",
@@ -244,7 +288,12 @@ mod tests {
 
     #[test]
     fn a_short_run_of_a_scene_round_trips_and_reports() {
-        let report = measure(Scene::Typing, geometry(TileSize::ThirtyTwo), 4).unwrap();
+        let report = measure(
+            Scene::Typing,
+            geometry(WIDTH, HEIGHT, TileSize::ThirtyTwo).unwrap(),
+            4,
+        )
+        .unwrap();
 
         assert_eq!(report.frames, 4);
         assert!(report.keyframes >= 1);
@@ -256,7 +305,12 @@ mod tests {
 
     #[test]
     fn a_static_desktop_sends_only_its_keyframe() {
-        let report = measure(Scene::StaticDesktop, geometry(TileSize::ThirtyTwo), 4).unwrap();
+        let report = measure(
+            Scene::StaticDesktop,
+            geometry(WIDTH, HEIGHT, TileSize::ThirtyTwo).unwrap(),
+            4,
+        )
+        .unwrap();
 
         assert_eq!(report.keyframes, 1);
     }
@@ -267,10 +321,35 @@ mod tests {
 
         assert_eq!(parsed.frames, 300);
         assert_eq!(parsed.tile, TileSize::ThirtyTwo);
+        assert_eq!((parsed.width, parsed.height), (WIDTH, HEIGHT));
+    }
+
+    #[test]
+    fn a_size_can_be_named_and_one_the_codec_refuses_is_reported() {
+        let parsed = parse(arguments(&["--width", "1280", "--height", "720"])).unwrap();
+
+        assert_eq!((parsed.width, parsed.height), (1280, 720));
+        assert!(geometry(parsed.width, parsed.height, parsed.tile).is_ok());
+        // A partial tile is a geometry the codec does accept, so the size that
+        // proves the error path is one with no pixels in it.
+        assert!(geometry(0, 720, TileSize::ThirtyTwo).is_err());
+    }
+
+    #[test]
+    fn one_scene_can_be_named_so_the_others_do_not_share_its_caches() {
+        let parsed = parse(arguments(&["--scene", "typing"])).unwrap();
+
+        assert_eq!(parsed.scene, Some(Scene::Typing));
+        assert_eq!(
+            parse(arguments(&[])).unwrap().scene,
+            None,
+            "naming no scene measures all of them"
+        );
     }
 
     #[test]
     fn an_unknown_argument_is_refused() {
+        assert!(parse(arguments(&["--scene", "solitaire"])).is_err());
         assert!(parse(arguments(&["--nope"])).is_err());
         assert!(parse(arguments(&["--tile", "48"])).is_err());
         assert!(parse(arguments(&["--frames", "0"])).is_err());

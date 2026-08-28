@@ -3249,10 +3249,58 @@ refuses leaves the guest offering the modes it already had.
 deduplicated by all three and sorted by pixel area, width, height, then refresh.
 Refresh is an integer because `dmDisplayFrequency` is one -- Windows reports 60
 for a 59.94 Hz panel, and pretending otherwise would be a precision the source
-does not have. Nothing above 144 Hz is offered: that is what a software vblank
-timer and a capture thread keep up with, not a limit of `drm_cvt_mode`. No EDID
-is synthesized in either direction; the physical size stays at 96 DPI, which is
-what keeps a compositor on scale 1 through a resize.
+does not have. Nothing above 144 Hz is offered anywhere: that is the ceiling of
+the wire format and of `drm_cvt_mode`'s caller. No EDID is synthesized in either
+direction; the physical size stays at 96 DPI, which is what keeps a compositor
+on scale 1 through a resize.
+
+**Every size carries every rate it is offered at.** The ceiling that decides
+this is the guest's encoder. A delta frame used to gather each tile twice -- the
+captured one and the reference -- to find out whether they differed, which on a
+desktop they almost never do; it now compares the rows where they lie and
+gathers only a tile that changed. What made that the ceiling rather than merely
+wasteful is that the guest links musl, whose `memcpy` and `memcmp` have no SIMD
+and run at about a quarter of glibc's, so the copying was the whole workload.
+
+`cargo display-bench --scene S --width W --height H` measures it. Inside a guest
+with eight virtual processors, on the heaviest of the desktop scenes and in mean
+milliseconds a frame:
+
+| size      | before | after | share of the 6.94 ms a 144 Hz frame gets |
+|-----------|--------|-------|------------------------------------------|
+| 1280x720  |   2.28 |  0.55 |  8% |
+| 1600x900  |   4.30 |  0.97 | 14% |
+| 1920x1080 |   5.50 |  1.54 | 22% |
+| 2560x1440 |  11.61 |  2.53 | 36% |
+
+The before column is why 1920x1080 at 144 Hz looked worse than the same size at
+60. It fit, at four fifths of the interval, until anything at all went wrong --
+and an encode that misses one interval does not cost a frame here and there.
+Capture is paced by the output's vblank, so it waits for the next one and the
+stream alternates between one interval and two. Ninety uneven frames read worse
+than sixty even ones. At a fifth of the interval that margin is no longer thin,
+and 2560x1440, which did not fit at all, now does.
+
+The largest size the viewer will publish uses a third of the interval, so the
+menu is cut to nothing: what a monitor drives, the guest encodes.
+
+Naming one scene is not optional when comparing builds. The scenes share a
+process, and one that has just walked eight megabytes leaves the caches to the
+next; measured together, this change reads as a regression on two of the scenes
+it in fact improves by a third.
+
+Scrolling and full-screen video are the exception, and stay so: they change
+every tile, so the copies are the work rather than the waste, and 1920x1080
+costs 14.5 ms whatever the mode is. That is a limit of the content and not of
+the refresh -- 60 Hz does not carry it either -- so nothing about the mode list
+would help, and it is what the delivered-frames diagnostic is for.
+
+Damage would narrow this further and is deliberately not plumbed. The module
+does advertise `FB_DAMAGE_CLIPS`, and mutter does populate it: instrumented over
+a live GNOME session, 396 of 618 plane updates carried clips, most of them a few
+thousand pixels against a frame of two million. It buys nothing worth its cost
+now -- a desktop frame already fits four times over, and the scenes that do
+overrun are exactly the ones whose damage is the whole frame.
 
 **Selection is deterministic.** A selection the new list still offers is kept;
 otherwise 1920x1080@60 when it is there; otherwise the greatest resolution and,
