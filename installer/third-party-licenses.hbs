@@ -1,0 +1,30 @@
+VMLord -- third-party licences
+==============================
+
+VMLord itself is distributed under the GNU General Public License, version 3
+or later; its text is in the LICENSE file beside this one.
+
+The components listed below are the work of other authors and are distributed
+under their own terms, reproduced in full. Nothing here grants rights over
+VMLord, and nothing in LICENSE takes rights away from these components.
+
+Contents
+--------
+{{#each licenses}}
+  * {{name}}{{#if id}} ({{id}}){{/if}}
+{{/each}}
+
+{{#each licenses}}
+================================================================================
+{{name}}{{#if id}} ({{id}}){{/if}}
+
+Applies to:
+{{#each used_by}}
+  * {{crate.name}} {{crate.version}}{{#if crate.repository}} -- {{crate.repository}}{{/if}}
+{{/each}}
+
+{{text}}
+
+{{/each}}
+================================================================================
+End of third-party licences.

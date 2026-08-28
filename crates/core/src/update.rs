@@ -5,7 +5,13 @@ use serde::{Deserialize, Serialize};
 
 const SUPPORTED_SCHEMA: u32 = 1;
 const MAX_INSTALLER_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/MrUndead1996/vm-lord/releases/download/";
+/// Where a release asset of this project is downloaded from.
+///
+/// Public because the release tooling builds the manifest's URL from it: the
+/// generator and the validator have to mean the same host and path, and one
+/// constant is the only way to be sure of that.
+pub const RELEASE_DOWNLOAD_PREFIX: &str =
+    "https://github.com/MrUndead1996/vm-lord/releases/download/";
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReleaseManifest {
@@ -98,7 +104,7 @@ fn is_release_installer_url(url: &str, version: &Version) -> bool {
 mod tests {
     use semver::Version;
 
-    use super::{InstallerAsset, ReleaseManifest, UpdateManifestError, MAX_INSTALLER_BYTES};
+    use super::{InstallerAsset, MAX_INSTALLER_BYTES, ReleaseManifest, UpdateManifestError};
 
     fn manifest() -> ReleaseManifest {
         ReleaseManifest {

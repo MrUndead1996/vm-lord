@@ -5975,8 +5975,11 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "semver",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "vmlord-core",
  "vmlord-display-codec",
  "vmlord-display-payload",
  "vmlord-display-protocol",

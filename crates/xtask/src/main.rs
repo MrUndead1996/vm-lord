@@ -14,6 +14,7 @@ mod display_bench;
 mod display_payload;
 mod dist_arguments;
 mod gpu_payload;
+mod release;
 
 /// The release target for the application. MSVC is the toolchain Windows
 /// itself is built against, and the one the HCS bindings expect.
@@ -40,6 +41,7 @@ fn main() -> ExitCode {
         Some("gpu-payload") => gpu_payload::run(env::args().skip(2)),
         Some("display-payload") => display_payload::run(env::args().skip(2)),
         Some("display-bench") => display_bench::run(env::args().skip(2)),
+        Some("release-manifest") => release::run(env::args().skip(2)),
         Some(other) => Err(format!("unknown task `{other}`")),
         None => Err("missing task".to_owned()),
     };
@@ -115,6 +117,8 @@ fn dist(payloads: Vec<dist_arguments::DistPayload>) -> Result<(), String> {
         println!("dist: {file}");
     }
     stage_distros(&workspace, &destination)?;
+    stage_licence(&workspace, &destination)?;
+    stage_third_party_notices(&workspace, &destination)?;
 
     if payloads.is_empty() {
         println!(
@@ -137,6 +141,60 @@ fn dist(payloads: Vec<dist_arguments::DistPayload>) -> Result<(), String> {
     }
 
     println!("dist: written to {}", destination.display());
+    Ok(())
+}
+
+/// The name the notices are staged and installed under.
+///
+/// Plain text and not HTML: it is opened from a Program Files directory by
+/// whoever wants to read it, and Notepad is the one viewer every Windows has.
+const THIRD_PARTY_NOTICES: &str = "THIRD-PARTY-LICENSES.txt";
+
+/// Copies VMLord's own licence beside the binaries.
+///
+/// The GPL requires the text to travel with the program, and the installed
+/// tree is the only copy a user who never saw the repository has.
+fn stage_licence(workspace: &Path, destination: &Path) -> Result<(), String> {
+    let source = workspace.join("LICENSE");
+    fs::copy(&source, destination.join("LICENSE"))
+        .map_err(|error| format!("cannot copy {}: {error}", source.display()))?;
+    println!("dist: LICENSE");
+    Ok(())
+}
+
+/// Generates the third-party licence notices from the resolved dependency
+/// graph, through `cargo-about` and the repository's own template.
+///
+/// Generated rather than kept in the repository: a hand-written list is one
+/// dependency upgrade away from being wrong, and being wrong here means
+/// shipping someone's code without their licence. `about.toml` names the
+/// licences the audit accepted, so an unfamiliar one fails this build rather
+/// than reaching the notices unread.
+fn stage_third_party_notices(workspace: &Path, destination: &Path) -> Result<(), String> {
+    let output = destination.join(THIRD_PARTY_NOTICES);
+    let output = output
+        .to_str()
+        .ok_or("the distribution path is not UTF-8")?;
+    cargo(
+        workspace,
+        &[
+            "about",
+            "generate",
+            "--config",
+            "about.toml",
+            "--fail",
+            "--output-file",
+            output,
+            "installer/third-party-licenses.hbs",
+        ],
+    )
+    .map_err(|error| {
+        format!(
+            "{error}\n`cargo dist` needs the pinned cargo-about release: \
+             cargo install --locked cargo-about@0.9.2"
+        )
+    })?;
+    println!("dist: {THIRD_PARTY_NOTICES}");
     Ok(())
 }
 

@@ -119,6 +119,7 @@ application and a Linux guest agent. The commands are Cargo aliases, defined in
 | `cargo test-windows` | builds and runs the Windows tests, the display viewer's included | WSL |
 | `cargo dist` | release build of everything -- `vmlord.exe`, `vmlord-com1.exe`, `vmlord-display.exe` and the agent -- collected into `target/dist/` | Windows |
 | `cargo gpu-payload pack ...` | release tooling that packs a prepared GPU payload | Windows, Linux |
+| `cargo release-manifest ...` | writes `release-manifest.json` from a finished installer's own bytes | Windows, Linux |
 
 Prerequisites:
 
@@ -129,8 +130,49 @@ Prerequisites:
   (`x86_64-w64-mingw32-gcc`, from `gcc-mingw-w64-x86-64` on Debian and Ubuntu).
   Windows test binaries then run directly, through WSL's interop -- no Wine.
 
-`cargo dist` is Windows-only: release executables must come from MSVC. See
-**ARCHITECTURE.md** for why each target was chosen.
+`cargo dist` is Windows-only: release executables must come from MSVC. It also
+generates `THIRD-PARTY-LICENSES.txt` from the resolved dependency graph, which
+needs the pinned tool:
+
+```powershell
+cargo install --locked cargo-about@0.9.2
+```
+
+`about.toml` lists the licences the [dependency audit](docs/dependency-licenses.md)
+accepted. A dependency arriving under anything else fails `cargo dist` rather
+than being copied into the notices unread.
+
+See **ARCHITECTURE.md** for why each target was chosen.
+
+## Packaging
+
+The installer is [Inno Setup](https://jrsoftware.org/isinfo.php) 6.6 and is
+declarative packaging only: it places files, offers shortcuts and registers an
+uninstaller. Settings, distribution profiles and updates belong to the
+application. From the repository root on Windows:
+
+```powershell
+cargo dist --gpu-payload <dir> --display-payload <dir>
+powershell -File installer\check.ps1 target\dist
+iscc installer\vmlord.iss
+cargo release-manifest --tag v0.1.0 `
+    --installer target\installer\VMLord-0.1.0-x86_64-setup.exe `
+    --output target\installer\release-manifest.json
+```
+
+`check.ps1` runs first because the installer copies whatever was staged: a
+binary that failed to build would otherwise ship as a file missing from
+Program Files rather than as a build error. It also reads the script back to
+confirm both installation modes are still offered.
+
+The setup program installs into `{autopf}\VMLord` -- Program Files when the
+user chooses an all-users installation and elevates, their own Programs
+directory when they do not. Uninstalling removes only what was installed;
+`%LOCALAPPDATA%\VMLord`, which holds settings, VMs and images, is left alone.
+
+There is no code-signing certificate. The SHA-256 in `release-manifest.json` is
+an integrity check that the downloaded installer is the published one; it is
+not publisher authentication, and Windows still asks before running it.
 
 ## Running
 

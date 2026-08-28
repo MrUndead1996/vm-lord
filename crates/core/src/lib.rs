@@ -61,7 +61,9 @@ pub use settings::{
     SettingsError, SettingsLoad, SettingsStore,
 };
 pub use ssh::{SshAuthentication, SshAvailability, SshConfig, SshEndpoint, SshPort};
-pub use update::{InstallerAsset, ReleaseManifest, UpdateManifestError, ValidatedUpdate};
+pub use update::{
+    InstallerAsset, RELEASE_DOWNLOAD_PREFIX, ReleaseManifest, UpdateManifestError, ValidatedUpdate,
+};
 
 use serde::{Deserialize, Serialize};
 
