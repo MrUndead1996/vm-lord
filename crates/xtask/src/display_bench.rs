@@ -46,9 +46,15 @@ struct Arguments {
     tile: TileSize,
     width: u32,
     height: u32,
+    /// The one scene to measure, or every scene when unnamed.
+    ///
+    /// Scenes share a process, and a scene that touched eight megabytes leaves
+    /// the caches to the next one. Naming a single scene is how a number gets
+    /// compared against the same number from another build.
+    scene: Option<Scene>,
 }
 
-/// Reads `--frames`, `--tile`, `--width` and `--height`.
+/// Reads `--frames`, `--tile`, `--width`, `--height` and `--scene`.
 fn parse<I: IntoIterator<Item = String>>(arguments: I) -> Result<Arguments, String> {
     let mut values = arguments.into_iter();
     let mut parsed = Arguments {
@@ -56,6 +62,7 @@ fn parse<I: IntoIterator<Item = String>>(arguments: I) -> Result<Arguments, Stri
         tile: TileSize::ThirtyTwo,
         width: WIDTH,
         height: HEIGHT,
+        scene: None,
     };
 
     while let Some(flag) = values.next() {
@@ -86,6 +93,15 @@ fn parse<I: IntoIterator<Item = String>>(arguments: I) -> Result<Arguments, Stri
                 parsed.height = value()?
                     .parse()
                     .map_err(|_| "--height wants a number".to_owned())?;
+            }
+            "--scene" => {
+                let wanted = value()?;
+                parsed.scene = Some(
+                    Scene::ALL
+                        .into_iter()
+                        .find(|scene| scene.name() == wanted)
+                        .ok_or_else(|| format!("no scene is called `{wanted}`"))?,
+                );
             }
             _ => return Err(format!("unknown argument `{flag}`")),
         }
@@ -236,7 +252,11 @@ pub(crate) fn run<I: IntoIterator<Item = String>>(arguments: I) -> Result<(), St
         "dec ms"
     );
 
-    for scene in Scene::ALL {
+    let scenes: Vec<Scene> = arguments
+        .scene
+        .map_or_else(|| Scene::ALL.to_vec(), |scene| vec![scene]);
+
+    for scene in scenes {
         let report = measure(scene, geometry, arguments.frames)?;
         println!(
             "{:<18}{:>4}/{:<5}{:>12.0}{:>13.0}{:>9.1}{:>12}{:>11.2}{:>10.2}{:>10.2}{:>11.2}{:>9.2}",
@@ -316,7 +336,20 @@ mod tests {
     }
 
     #[test]
+    fn one_scene_can_be_named_so_the_others_do_not_share_its_caches() {
+        let parsed = parse(arguments(&["--scene", "typing"])).unwrap();
+
+        assert_eq!(parsed.scene, Some(Scene::Typing));
+        assert_eq!(
+            parse(arguments(&[])).unwrap().scene,
+            None,
+            "naming no scene measures all of them"
+        );
+    }
+
+    #[test]
     fn an_unknown_argument_is_refused() {
+        assert!(parse(arguments(&["--scene", "solitaire"])).is_err());
         assert!(parse(arguments(&["--nope"])).is_err());
         assert!(parse(arguments(&["--tile", "48"])).is_err());
         assert!(parse(arguments(&["--frames", "0"])).is_err());

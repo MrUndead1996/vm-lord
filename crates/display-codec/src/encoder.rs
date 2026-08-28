@@ -269,6 +269,11 @@ impl Encoder {
                 continue;
             }
 
+            if !differs(self.staging.frame(), &self.reference, self.geometry, rect) {
+                index += 1;
+                continue;
+            }
+
             gather(self.staging.frame(), self.geometry, rect, &mut self.tile);
             gather(
                 &self.reference,
@@ -277,17 +282,15 @@ impl Encoder {
                 &mut self.previous_tile,
             );
 
-            if self.tile != self.previous_tile {
-                varint::write(&mut self.output, index);
-                write_tile(
-                    &mut self.output,
-                    &self.tile,
-                    Some(&self.previous_tile),
-                    &mut self.scratch,
-                );
-                scatter(&mut self.reference, self.geometry, rect, &self.tile);
-                written = true;
-            }
+            varint::write(&mut self.output, index);
+            write_tile(
+                &mut self.output,
+                &self.tile,
+                Some(&self.previous_tile),
+                &mut self.scratch,
+            );
+            scatter(&mut self.reference, self.geometry, rect, &self.tile);
+            written = true;
 
             index += 1;
         }
@@ -328,6 +331,30 @@ fn select_tiles(selected: &mut [bool], geometry: Geometry, hint: Option<&[Rect]>
             }
         }
     }
+}
+
+/// Whether a tile's pixels differ between a frame and the reference.
+///
+/// Asked before the tile is gathered, because on an ordinary desktop almost
+/// every tile is unchanged and copying eight kilobytes to discover that is the
+/// larger half of what a delta frame costs. The rows are compared where they
+/// lie, and the first difference ends the tile.
+///
+/// Written as a loop over pairs rather than as a slice comparison on purpose:
+/// `==` on a slice is `memcmp`, and the guest links musl, whose `memcmp` is a
+/// byte at a time. This form vectorises instead.
+fn differs(frame: &[u32], reference: &[u32], geometry: Geometry, rect: Rect) -> bool {
+    let width = geometry.width() as usize;
+
+    (rect.y..rect.y + rect.height).any(|y| {
+        let start = y as usize * width + rect.x as usize;
+        let end = start + rect.width as usize;
+
+        frame[start..end]
+            .iter()
+            .zip(&reference[start..end])
+            .any(|(current, previous)| current != previous)
+    })
 }
 
 /// Writes a tile's pixels back into a frame, row by row.
