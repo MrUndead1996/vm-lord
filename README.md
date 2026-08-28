@@ -143,8 +143,15 @@ and without it the install builds the library, installs nothing, and still
 succeeds.
 
 `about.toml` lists the licences the [dependency audit](docs/dependency-licenses.md)
-accepted. A dependency arriving under anything else fails `cargo dist` rather
-than being copied into the notices unread.
+accepted. A dependency arriving under anything else fails rather than being
+copied into the notices unread -- on the pull request that introduces it, not
+on the tag that would have shipped it.
+
+VMLord's own crates are excluded from the notices: `LICENSE` covers them, and a
+file that opens "the work of other authors" should not list them. That is what
+`private = { ignore = true }` does, and it works because every workspace crate
+declares `publish = false` -- none of them is on crates.io, and saying so is
+also what stops one being published by accident.
 
 See **ARCHITECTURE.md** for why each target was chosen.
 
@@ -187,7 +194,8 @@ pull requests and releases happen, and is mirrored to Forgejo at
 
 Every pull request runs `.github/workflows/ci.yml`: the workspace tests and the
 build automation's on Windows against MSVC, the two guest programs
-cross-compiled to musl, `cargo fmt --all --check`, and the workflow validator.
+cross-compiled to musl, the third-party licence notices, `cargo fmt --all
+--check`, and the workflow validator.
 
 `cargo run -p xtask -- workflow-check` reads the workflows back as data before
 they can surprise anyone. Every workflow must have `contents: read` default

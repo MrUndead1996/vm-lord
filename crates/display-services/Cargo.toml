@@ -3,6 +3,7 @@ name = "vmlord-display-services"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 build = "build.rs"
 
 # Guest programs, so they are not part of the workspace's default build -- see

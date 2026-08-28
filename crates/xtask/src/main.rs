@@ -191,9 +191,15 @@ fn stage_third_party_notices(workspace: &Path, destination: &Path) -> Result<(),
         ],
     )
     .map_err(|error| {
+        // Two quite different failures reach here, and naming only the first
+        // sends a reader to reinstall a tool that ran perfectly well: the tool
+        // may be missing, or it may have run and refused a licence.
         format!(
-            "{error}\n`cargo dist` needs the pinned cargo-about release: \
-             cargo install --locked --features cli cargo-about@0.9.2"
+            "{error}\nEither the pinned generator is not installed -- \
+             cargo install --locked --features cli cargo-about@0.9.2 -- or a \
+             dependency's licence is not in about.toml's accepted set, in \
+             which case the errors above name it and the audit in \
+             docs/dependency-licenses.md has to be repeated before it ships."
         )
     })?;
     println!("dist: {THIRD_PARTY_NOTICES}");

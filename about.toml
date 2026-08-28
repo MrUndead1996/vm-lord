@@ -39,3 +39,10 @@ targets = ["x86_64-pc-windows-msvc", "x86_64-unknown-linux-musl"]
 # in the notices either.
 ignore-build-dependencies = true
 ignore-dev-dependencies = true
+
+# VMLord's own crates are the program, not a notice about someone else's work:
+# LICENSE covers them, and listing them in a file that opens "the work of other
+# authors" would be false. `ignore` skips workspace members that are not
+# published, which is why every one of them says `publish = false` -- none is
+# on crates.io, and saying so is what makes them skippable here.
+private = { ignore = true }

@@ -3,6 +3,7 @@ name = "vmlord-agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 # The agent is a guest program, so it is not part of the workspace's default
 # build -- see `default-members` in the root manifest. Build it with:
