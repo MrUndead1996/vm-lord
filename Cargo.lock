@@ -4828,6 +4828,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "toml 0.8.23",
  "tracing",
  "tracing-log",

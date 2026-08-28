@@ -8,55 +8,85 @@ use vmlord_core::{AppSettings, BuildMonitor, BuildStep, VmRepository};
 mod pickers;
 
 fn main() {
-    let settings = vmlord_core::SettingsStore::for_current_user()
-        .and_then(|store| store.load_or_create().map(|settings| (store, settings)));
+    let settings = vmlord_core::SettingsStore::for_current_user().and_then(|store| {
+        store
+            .load_or_create_with_status()
+            .map(|settings_load| (store, settings_load))
+    });
     let mut diagnostics = None;
     let repository = match &settings {
-        Ok((_, settings)) => match vmlord_core::initialize_with_diagnostics(settings) {
-            Ok(sink) => {
-                diagnostics = Some(sink);
-                tracing::info!(
-                    "logging initialized at {} with {:?} level",
-                    settings.log_file_path.display(),
-                    settings.log_level
-                );
-                load_backend(settings)
+        Ok((_, settings_load)) => {
+            match vmlord_core::initialize_with_diagnostics(&settings_load.settings) {
+                Ok(sink) => {
+                    diagnostics = Some(sink);
+                    tracing::info!(
+                        "logging initialized at {} with {:?} level",
+                        settings_load.settings.log_file_path.display(),
+                        settings_load.settings.log_level
+                    );
+                    load_backend(&settings_load.settings)
+                }
+                Err(error) => {
+                    eprintln!("failed to initialize logging: {error}");
+                    vmlord_app::unavailable_repository(format!(
+                        "failed to initialize logging: {error}"
+                    ))
+                }
             }
-            Err(error) => {
-                eprintln!("failed to initialize logging: {error}");
-                vmlord_app::unavailable_repository(format!("failed to initialize logging: {error}"))
-            }
-        },
+        }
         Err(error) => {
             eprintln!("failed to initialize settings: {error}");
             vmlord_app::unavailable_repository(format!("failed to initialize settings: {error}"))
         }
     };
-    let distro_catalog =
-        settings.as_ref().ok().and_then(
-            |(store, settings)| match vmlord_core::DistroCatalog::load(store) {
-                Ok(catalog) => {
-                    if let Err(error) = catalog.select(&settings.default_distro) {
-                        eprintln!("failed to load distribution profiles: {error}");
-                        vmlord_core::diagnostic!(
-                            Error,
-                            vmlord_core::Subsystem::App,
-                            "Failed to load distribution profiles: {error}"
-                        );
-                    }
-                    Some(catalog)
-                }
-                Err(error) => {
+    let distro_catalog = settings.as_ref().ok().and_then(|(store, settings_load)| {
+        let bundle = match std::env::current_exe()
+            .ok()
+            .and_then(|executable| executable.parent().map(|parent| parent.join("distros")))
+        {
+            Some(bundle) => bundle,
+            None => {
+                eprintln!("failed to locate installed distribution profiles");
+                vmlord_core::diagnostic!(
+                    Error,
+                    vmlord_core::Subsystem::App,
+                    "Failed to locate installed distribution profiles"
+                );
+                return None;
+            }
+        };
+        if let Err(error) = vmlord_core::sync_bundled_profiles(&bundle, store) {
+            eprintln!("failed to synchronize distribution profiles: {error}");
+            vmlord_core::diagnostic!(
+                Error,
+                vmlord_core::Subsystem::App,
+                "Failed to synchronize distribution profiles: {error}"
+            );
+            return None;
+        }
+        match vmlord_core::DistroCatalog::load(store) {
+            Ok(catalog) => {
+                if let Err(error) = catalog.select(&settings_load.settings.default_distro) {
                     eprintln!("failed to load distribution profiles: {error}");
                     vmlord_core::diagnostic!(
                         Error,
                         vmlord_core::Subsystem::App,
                         "Failed to load distribution profiles: {error}"
                     );
-                    None
                 }
-            },
-        );
+                Some(catalog)
+            }
+            Err(error) => {
+                eprintln!("failed to load distribution profiles: {error}");
+                vmlord_core::diagnostic!(
+                    Error,
+                    vmlord_core::Subsystem::App,
+                    "Failed to load distribution profiles: {error}"
+                );
+                None
+            }
+        }
+    });
     let mut application = vmlord_app::WorkspaceApp::new(repository)
         .with_guest_defaults(vmlord_platform::host_guest_defaults())
         .with_image_picker(Box::new(pickers::WindowsImagePicker::new()))
@@ -68,8 +98,9 @@ fn main() {
     if let Some(sink) = diagnostics {
         application = application.with_diagnostics(sink);
     }
-    if let Ok((store, settings)) = settings {
-        application = application.with_settings(store, settings);
+    if let Ok((store, settings_load)) = settings {
+        let _created = settings_load.created;
+        application = application.with_settings(store, settings_load.settings);
     }
     application.start();
     if let Err(error) = vmlord_ui::run(application) {

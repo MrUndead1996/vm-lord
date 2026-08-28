@@ -702,18 +702,22 @@ filled in on load when absent, so a `settings.toml` written before the field
 existed keeps loading without a migration.
 
 Distribution profiles are installed under
-`%LOCALAPPDATA%\VMLord\distros\*.json`. The application does not create or
-embed them: `cargo dist` copies every JSON document from the workspace's
-`distros` directory into the release, and the installer is responsible for
-placing that directory beside `settings.toml`. `core::distro::DistroCatalog`
-enumerates the directory once at startup, derives each profile identifier from
-its file name and deserializes the complete catalog. `default_distro` in
-`settings.toml` selects the profile used for new cloud-image VMs and defaults
-to `ubuntu` when an older settings file has no such field. The settings dialog
-lists every loaded profile and applies a new default immediately to subsequent
-VM creation. Directory, file and JSON errors retain the failing path; an
-unknown configured identifier names the missing profile rather than silently
-falling back.
+`{app}\distros\*.json` by the release build. Before loading the catalog, the
+composition root passes that directory (derived from `current_exe`) to
+`core::distro::sync_bundled_profiles`, which copies profiles into
+`%LOCALAPPDATA%\VMLord\distros`. The ownership file
+`%LOCALAPPDATA%\VMLord\distros\.bundled-profiles.json` records SHA-256 hashes
+by filename: a new bundled profile is copied, and a changed bundle replaces
+only a recorded bundled copy. Files not recorded there are user profiles and
+are never replaced or deleted; profiles removed from a later bundle stay in
+place. `core::distro::DistroCatalog` enumerates the per-user directory once at
+startup, derives each profile identifier from its file name and deserializes
+the complete catalog. `default_distro` in `settings.toml` selects the profile
+used for new cloud-image VMs and defaults to `ubuntu` when an older settings
+file has no such field. The settings dialog lists every loaded profile and
+applies a new default immediately to subsequent VM creation. Directory, file
+and JSON errors retain the failing path; an unknown configured identifier names
+the missing profile rather than silently falling back.
 
 `core::logging` installs the shared `log` backend after settings are loaded and
 before the backend starts. It writes records at the configured `log_level` to

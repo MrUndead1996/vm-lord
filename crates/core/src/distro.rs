@@ -11,14 +11,176 @@
 //! are to be read from a JSON file, and a parsed file yields no `&'static str`
 //! short of leaking it.
 
-use std::{collections::BTreeMap, fmt, fs, io, path::PathBuf};
+use std::{
+    collections::BTreeMap,
+    fmt, fs, io,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{SettingsStore, display::DesktopProfile};
 
 /// The placeholder both templates carry.
 const RELEASE_PLACEHOLDER: &str = "{release}";
+const BUNDLED_PROFILES_FILE_NAME: &str = ".bundled-profiles.json";
+
+/// Copies installed profiles into the current user's catalogue without taking
+/// ownership of profiles the user already created.
+pub fn sync_bundled_profiles(
+    bundle: &Path,
+    store: &SettingsStore,
+) -> Result<(), DistroCatalogError> {
+    let directory = distro_directory(store)?;
+    fs::create_dir_all(&directory).map_err(|source| DistroCatalogError::Io {
+        operation: "create distribution profile directory",
+        path: directory.clone(),
+        source,
+    })?;
+
+    let ownership_path = directory.join(BUNDLED_PROFILES_FILE_NAME);
+    let mut ownership = read_bundled_profile_hashes(&ownership_path)?;
+    let entries = fs::read_dir(bundle).map_err(|source| DistroCatalogError::Io {
+        operation: "read bundled distribution profile directory",
+        path: bundle.to_path_buf(),
+        source,
+    })?;
+
+    for entry in entries {
+        let entry = entry.map_err(|source| DistroCatalogError::Io {
+            operation: "read bundled distribution profile directory entry",
+            path: bundle.to_path_buf(),
+            source,
+        })?;
+        let profile_path = entry.path();
+        if !entry
+            .file_type()
+            .map_err(|source| DistroCatalogError::Io {
+                operation: "read bundled distribution profile type",
+                path: profile_path.clone(),
+                source,
+            })?
+            .is_file()
+        {
+            continue;
+        }
+        let name = validated_profile_file_name(&profile_path)?;
+        let contents = fs::read(&profile_path).map_err(|source| DistroCatalogError::Io {
+            operation: "read bundled distribution profile",
+            path: profile_path.clone(),
+            source,
+        })?;
+        let hash = Sha256::digest(&contents)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let destination = directory.join(&name);
+        let owned_hash = ownership.get(&name);
+        let managed = !destination.exists() || owned_hash.is_some();
+        if managed
+            && (!destination.exists() || owned_hash.is_some_and(|recorded| recorded != &hash))
+        {
+            write_atomically(&destination, &contents)?;
+        }
+        if managed {
+            ownership.insert(name, hash);
+        }
+    }
+
+    write_ownership_document(&ownership_path, &ownership)
+}
+
+fn distro_directory(store: &SettingsStore) -> Result<PathBuf, DistroCatalogError> {
+    store
+        .config_path()
+        .parent()
+        .map(|parent| parent.join("distros"))
+        .ok_or_else(|| DistroCatalogError::MissingSettingsParent {
+            path: store.config_path().to_path_buf(),
+        })
+}
+
+fn read_bundled_profile_hashes(
+    path: &Path,
+) -> Result<BTreeMap<String, String>, DistroCatalogError> {
+    match fs::read_to_string(path) {
+        Ok(document) => {
+            serde_json::from_str(&document).map_err(|source| DistroCatalogError::OwnershipParse {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(source) => Err(DistroCatalogError::Io {
+            operation: "read bundled profile ownership",
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn validated_profile_file_name(path: &Path) -> Result<String, DistroCatalogError> {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| DistroCatalogError::InvalidBundledProfileName {
+            path: path.to_path_buf(),
+        })?;
+    if Path::new(name).components().count() != 1
+        || Path::new(name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("json")
+        || Path::new(name)
+            .file_stem()
+            .is_none_or(|stem| stem.is_empty())
+    {
+        return Err(DistroCatalogError::InvalidBundledProfileName {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(name.to_owned())
+}
+
+fn write_ownership_document(
+    path: &Path,
+    ownership: &BTreeMap<String, String>,
+) -> Result<(), DistroCatalogError> {
+    let document = serde_json::to_vec_pretty(ownership).expect("a string map always serializes");
+    write_atomically(path, &document)
+}
+
+fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), DistroCatalogError> {
+    use std::io::Write;
+
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temporary)
+        .map_err(|source| DistroCatalogError::Io {
+            operation: "create temporary distribution profile",
+            path: temporary.clone(),
+            source,
+        })?;
+    file.write_all(contents)
+        .map_err(|source| DistroCatalogError::Io {
+            operation: "write temporary distribution profile",
+            path: temporary.clone(),
+            source,
+        })?;
+    file.sync_all().map_err(|source| DistroCatalogError::Io {
+        operation: "sync temporary distribution profile",
+        path: temporary.clone(),
+        source,
+    })?;
+    fs::rename(&temporary, path).map_err(|source| DistroCatalogError::Io {
+        operation: "replace distribution profile",
+        path: path.to_path_buf(),
+        source,
+    })
+}
 
 /// Where a distribution publishes its cloud images, and what the guest inside
 /// them looks like.
@@ -73,13 +235,7 @@ pub struct DistroCatalog {
 
 impl DistroCatalog {
     pub fn load(settings: &SettingsStore) -> Result<Self, DistroCatalogError> {
-        let directory = settings
-            .config_path()
-            .parent()
-            .ok_or_else(|| DistroCatalogError::MissingSettingsParent {
-                path: settings.config_path().to_path_buf(),
-            })?
-            .join("distros");
+        let directory = distro_directory(settings)?;
         let entries = fs::read_dir(&directory).map_err(|source| DistroCatalogError::Io {
             operation: "read distribution profile directory",
             path: directory.clone(),
@@ -93,6 +249,9 @@ impl DistroCatalog {
                 source,
             })?;
             let path = entry.path();
+            if path.file_name().and_then(|name| name.to_str()) == Some(BUNDLED_PROFILES_FILE_NAME) {
+                continue;
+            }
             if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
                 continue;
             }
@@ -148,6 +307,13 @@ pub enum DistroCatalogError {
         path: PathBuf,
         source: serde_json::Error,
     },
+    OwnershipParse {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    InvalidBundledProfileName {
+        path: PathBuf,
+    },
     ProfileNotFound {
         id: String,
     },
@@ -178,6 +344,20 @@ impl fmt::Display for DistroCatalogError {
                 write!(
                     formatter,
                     "failed to parse distribution profile at {}: {source}",
+                    path.display()
+                )
+            }
+            Self::OwnershipParse { path, source } => {
+                write!(
+                    formatter,
+                    "failed to parse bundled profile ownership at {}: {source}",
+                    path.display()
+                )
+            }
+            Self::InvalidBundledProfileName { path } => {
+                write!(
+                    formatter,
+                    "bundled distribution profile has an invalid file name: {}",
                     path.display()
                 )
             }
@@ -315,10 +495,13 @@ impl DistroProfile {
 mod tests {
     use std::{
         fs,
+        path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use super::{DesktopProfile, DistroCatalog, DistroProfile, SshUnits, ubuntu};
+    use super::{
+        DesktopProfile, DistroCatalog, DistroProfile, SshUnits, sync_bundled_profiles, ubuntu,
+    };
     use crate::SettingsStore;
 
     fn temporary_directory() -> std::path::PathBuf {
@@ -346,6 +529,80 @@ mod tests {
                 "desktop": null
             }}"#
         )
+    }
+
+    struct ProfileFixture {
+        directory: PathBuf,
+        bundle: PathBuf,
+        user: PathBuf,
+        store: SettingsStore,
+    }
+
+    impl ProfileFixture {
+        fn new() -> Self {
+            let directory = temporary_directory();
+            let bundle = directory.join("bundle");
+            let user = directory.join("user").join("distros");
+            fs::create_dir_all(&bundle).unwrap();
+            fs::create_dir_all(&user).unwrap();
+            Self {
+                store: SettingsStore::new(directory.join("user").join("settings.toml")),
+                directory,
+                bundle,
+                user,
+            }
+        }
+
+        fn write_bundle(&self, name: &str, contents: &str) {
+            fs::write(self.bundle.join(name), contents).unwrap();
+        }
+
+        fn write_user(&self, name: &str, contents: &str) {
+            fs::write(self.user.join(name), contents).unwrap();
+        }
+
+        fn read_user(&self, name: &str) -> String {
+            fs::read_to_string(self.user.join(name)).unwrap()
+        }
+    }
+
+    impl Drop for ProfileFixture {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.directory).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_missing_bundled_profile_is_copied_to_the_users_catalog() {
+        let fixture = ProfileFixture::new();
+        fixture.write_bundle("ubuntu.json", "bundle copy");
+
+        sync_bundled_profiles(&fixture.bundle, &fixture.store).unwrap();
+
+        assert_eq!(fixture.read_user("ubuntu.json"), "bundle copy");
+    }
+
+    #[test]
+    fn a_changed_bundled_profile_replaces_its_recorded_copy() {
+        let fixture = ProfileFixture::new();
+        fixture.write_bundle("ubuntu.json", "old bundle");
+        sync_bundled_profiles(&fixture.bundle, &fixture.store).unwrap();
+        fixture.write_bundle("ubuntu.json", "new bundle");
+
+        sync_bundled_profiles(&fixture.bundle, &fixture.store).unwrap();
+
+        assert_eq!(fixture.read_user("ubuntu.json"), "new bundle");
+    }
+
+    #[test]
+    fn a_user_profile_is_never_replaced_by_a_bundled_profile() {
+        let fixture = ProfileFixture::new();
+        fixture.write_bundle("ubuntu.json", "new bundle");
+        fixture.write_user("ubuntu.json", "user copy");
+
+        sync_bundled_profiles(&fixture.bundle, &fixture.store).unwrap();
+
+        assert_eq!(fixture.read_user("ubuntu.json"), "user copy");
     }
 
     #[test]
