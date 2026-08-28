@@ -148,6 +148,91 @@ impl fmt::Display for ResolveError {
 
 impl std::error::Error for ResolveError {}
 
+/// A failure checking for, or downloading, an application update.
+#[derive(Debug)]
+pub enum UpdateDownloadError {
+    Io {
+        operation: &'static str,
+        path: PathBuf,
+        source: io::Error,
+    },
+    Http(String),
+    UnexpectedStatus {
+        status: u16,
+    },
+    UnpublishedRelease,
+    ManifestAssetMissing,
+    ResponseTooLarge {
+        limit: u64,
+    },
+    MalformedRelease(String),
+    SizeMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    ChecksumMismatch {
+        expected: String,
+        actual: String,
+    },
+    Cancelled,
+}
+
+impl fmt::Display for UpdateDownloadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io {
+                operation,
+                path,
+                source,
+            } => write!(
+                formatter,
+                "failed to {operation} at {}: {source}",
+                path.display()
+            ),
+            Self::Http(message) => write!(formatter, "the update request failed: {message}"),
+            Self::UnexpectedStatus { status } => {
+                write!(formatter, "the update server answered with status {status}")
+            }
+            Self::UnpublishedRelease => {
+                formatter.write_str("the update server returned a draft or prerelease")
+            }
+            Self::ManifestAssetMissing => {
+                formatter.write_str("the update release has no release-manifest.json asset")
+            }
+            Self::ResponseTooLarge { limit } => {
+                write!(
+                    formatter,
+                    "the update response exceeds its {limit}-byte limit"
+                )
+            }
+            Self::MalformedRelease(message) => {
+                write!(
+                    formatter,
+                    "the update release response is malformed: {message}"
+                )
+            }
+            Self::SizeMismatch { expected, actual } => write!(
+                formatter,
+                "the downloaded installer is {actual} bytes instead of the expected {expected}"
+            ),
+            Self::ChecksumMismatch { expected, actual } => write!(
+                formatter,
+                "the downloaded installer hashes to {actual} instead of the expected {expected}"
+            ),
+            Self::Cancelled => formatter.write_str("the update download was cancelled"),
+        }
+    }
+}
+
+impl std::error::Error for UpdateDownloadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
 /// A refusal to read a qcow2 image, or a failure part-way through reading one.
 ///
 /// Most variants are refusals rather than failures, and that is the point: the

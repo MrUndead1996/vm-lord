@@ -4920,6 +4920,8 @@ name = "vmlord-image"
 version = "0.1.0"
 dependencies = [
  "qcow",
+ "serde",
+ "serde_json",
  "sha2 0.11.0",
  "tracing",
  "ureq",
