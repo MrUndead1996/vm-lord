@@ -8,22 +8,30 @@ The components listed below are the work of other authors and are distributed
 under their own terms, reproduced in full. Nothing here grants rights over
 VMLord, and nothing in LICENSE takes rights away from these components.
 
-Contents
---------
-{{#each licenses}}
-  * {{name}}{{#if id}} ({{id}}){{/if}}
+Every value below is written with a triple stache. Handlebars escapes for HTML
+by default, and this is a plain text file: with two braces a licence saying
+"AS IS" reaches the reader as &quot;AS IS&quot;.
+
+Summary
+-------
+{{#each overview}}
+  * {{{name}}} ({{{id}}}) -- {{count}} crate(s)
 {{/each}}
+
+The sections that follow are one per licence file, not one per licence: two
+crates offering MIT name different copyright holders in it, so each text is
+reproduced as that crate ships it rather than deduplicated into one.
 
 {{#each licenses}}
 ================================================================================
-{{name}}{{#if id}} ({{id}}){{/if}}
+{{{name}}}{{#if id}} ({{{id}}}){{/if}}
 
 Applies to:
 {{#each used_by}}
-  * {{crate.name}} {{crate.version}}{{#if crate.repository}} -- {{crate.repository}}{{/if}}
+  * {{{crate.name}}} {{{crate.version}}}{{#if crate.repository}} -- {{{crate.repository}}}{{/if}}
 {{/each}}
 
-{{text}}
+{{{text}}}
 
 {{/each}}
 ================================================================================
