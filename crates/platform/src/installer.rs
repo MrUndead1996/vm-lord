@@ -52,6 +52,10 @@ impl InstallerLaunch {
     pub fn arguments(&self) -> [&'static str; 2] {
         [CLOSE_APPLICATIONS, RESTART_APPLICATIONS]
     }
+
+    fn elevation_verb(&self) -> Option<&'static str> {
+        self.elevated.then_some("runas")
+    }
 }
 
 /// Starts a verified installer and returns as soon as Windows creates it.
@@ -69,7 +73,7 @@ pub fn launch_installer(request: &InstallerLaunch) -> Result<(), RepositoryError
 
     let installer = wide_path(&installer_path);
     let arguments = wide_arguments(request.arguments());
-    let runas = request.elevated.then(|| wide("runas"));
+    let runas = request.elevation_verb().map(wide);
 
     let mut shell_execute = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
@@ -140,6 +144,23 @@ fn canonical_installer_path(path: &Path) -> Result<PathBuf, RepositoryError> {
         ))
     })?;
 
+    if has_alternate_data_stream(&canonical) {
+        return Err(RepositoryError::new(format!(
+            "the canonical update installer path names an alternate data stream: {}",
+            canonical.display()
+        )));
+    }
+
+    if !canonical
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+    {
+        return Err(RepositoryError::new(format!(
+            "the canonical update installer is not an .exe file: {}",
+            canonical.display()
+        )));
+    }
+
     if !canonical.is_file() {
         return Err(RepositoryError::new(format!(
             "the update installer is not a regular file: {}",
@@ -180,9 +201,44 @@ fn wide(value: &str) -> Vec<u16> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{
+        fs,
+        os::windows::fs::symlink_file,
+        path::{Path, PathBuf},
+    };
 
-    use super::InstallerLaunch;
+    use uuid::Uuid;
+
+    use super::{canonical_installer_path, has_alternate_data_stream, InstallerLaunch};
+
+    struct Fixture {
+        directory: PathBuf,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            let directory =
+                std::env::temp_dir().join(format!("vmlord-installer-{}", Uuid::new_v4()));
+            fs::create_dir_all(&directory).expect("test fixture directory should be created");
+            Self { directory }
+        }
+
+        fn path(&self, name: &str) -> PathBuf {
+            self.directory.join(name)
+        }
+
+        fn write(&self, name: &str) -> PathBuf {
+            let path = self.path(name);
+            fs::write(&path, b"installer fixture").expect("test fixture file should be written");
+            path
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
 
     // This catches an update becoming a silent installer invocation, or one
     // that overrides the install scope selected by the existing installation.
@@ -194,5 +250,100 @@ mod tests {
             request.arguments(),
             ["/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"]
         );
+    }
+
+    #[test]
+    fn only_an_all_users_update_requests_elevation() {
+        let mut request = InstallerLaunch::new(PathBuf::from(r"C:\Temp\VMLord-0.2.0-setup.exe"));
+        assert_eq!(request.elevation_verb(), None);
+
+        request.elevated = true;
+
+        assert_eq!(request.elevation_verb(), Some("runas"));
+    }
+
+    // This catches validation of the link's spelling instead of the file that
+    // ShellExecuteExW will actually receive.
+    #[test]
+    fn an_executable_link_to_a_non_executable_target_is_refused() {
+        let fixture = Fixture::new();
+        let target = fixture.write("installer.txt");
+        let link = fixture.path("installer.exe");
+        symlink_file(target, &link).expect("test fixture symlink should be created");
+
+        let error = canonical_installer_path(&link).expect_err("a non-executable target is unsafe");
+
+        assert!(error.to_string().contains("not an .exe"), "{error}");
+    }
+
+    #[test]
+    fn an_executable_link_to_an_alternate_data_stream_target_is_refused() {
+        let fixture = Fixture::new();
+        let target = fixture.write("installer.exe");
+        let stream = PathBuf::from(format!("{}:verified", target.display()));
+        fs::write(&stream, b"installer fixture stream")
+            .expect("test fixture alternate data stream should be written");
+        let link = fixture.path("installer-link.exe");
+        symlink_file(stream, &link).expect("test fixture symlink should be created");
+
+        let error = canonical_installer_path(&link)
+            .expect_err("an alternate data stream target is not an installer");
+
+        assert!(
+            error.to_string().contains("alternate data stream"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_alternate_data_stream_spelling_is_refused() {
+        assert!(has_alternate_data_stream(Path::new(
+            r"C:\Temp\installer.exe:verified"
+        )));
+        assert!(!has_alternate_data_stream(Path::new(
+            r"C:\Temp\installer.exe"
+        )));
+
+        let error = canonical_installer_path(Path::new(r"C:\Temp\installer.exe:verified"))
+            .expect_err("alternate data streams are never installers");
+        assert!(
+            error.to_string().contains("alternate data stream"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_relative_installer_path_is_refused() {
+        let error = canonical_installer_path(Path::new("installer.exe"))
+            .expect_err("an installer path must be absolute");
+
+        assert!(error.to_string().contains("not absolute"), "{error}");
+    }
+
+    #[test]
+    fn a_regular_executable_is_canonicalized() {
+        let fixture = Fixture::new();
+        let installer = fixture.write("installer.exe");
+
+        let canonical =
+            canonical_installer_path(&installer).expect("a regular executable is accepted");
+
+        assert_eq!(
+            canonical,
+            fs::canonicalize(&installer).expect("test fixture path should canonicalize")
+        );
+        assert!(canonical.is_file());
+    }
+
+    #[test]
+    fn a_directory_named_like_an_executable_is_refused() {
+        let fixture = Fixture::new();
+        let directory = fixture.path("installer.exe");
+        fs::create_dir(&directory).expect("test fixture directory should be created");
+
+        let error =
+            canonical_installer_path(&directory).expect_err("a directory is not an installer");
+
+        assert!(error.to_string().contains("not a regular file"), "{error}");
     }
 }
