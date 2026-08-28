@@ -177,16 +177,14 @@ not publisher authentication, and Windows still asks before running it.
 ## Releasing
 
 Source lives on GitHub at
-[MrUndead1996/vm-lord](https://github.com/MrUndead1996/vm-lord) and is mirrored
-to Forgejo at `ssh://git@git.mrundead.org:222/mrundead/vm-lord.git`. GitHub is
-where pull requests and releases happen; the mirror is a copy, and it never
-forces.
+[MrUndead1996/vm-lord](https://github.com/MrUndead1996/vm-lord), which is where
+pull requests and releases happen, and is mirrored to Forgejo at
+`https://git.mrundead.org/mrundead/vm-lord`.
 
-Two workflows do the work, and `cargo run -p xtask -- workflow-check` reads
-them back as data before either can surprise anyone: the release must run on
-`v*` alone, default permissions must be `contents: read`, only the `release`
-job may write, every action must be pinned to a commit SHA, and the mirror must
-follow only `main` and `v*` and must never force-push.
+`cargo run -p xtask -- workflow-check` reads the release workflow back as data
+before it can surprise anyone: it must run on `v*` alone, default permissions
+must be `contents: read`, only the `release` job may write, and every action
+must be pinned to a commit SHA rather than to a movable tag.
 
 **Cutting a release.** Everything is driven by the tag, and the tag has to
 agree with `Cargo.toml`:
@@ -211,18 +209,21 @@ The GPU and display payload archives are prepared from guest sources outside
 the workflow, so a release built by CI carries none. Attach them and rebuild
 the installer locally when a release needs them; VMLord runs without them.
 
-**Mirror setup.** `.github/workflows/mirror-forgejo.yml` needs two things
-configured on the GitHub repository:
+**The mirror.** Forgejo pulls; GitHub does not push. The mirror is configured
+on the Forgejo repository itself (Settings -> Mirror Settings) as a pull mirror
+of `https://github.com/MrUndead1996/vm-lord.git`, and it runs on Forgejo's own
+schedule.
 
-| Name | Kind | Holds |
-| --- | --- | --- |
-| `FORGEJO_SSH_PRIVATE_KEY` | Actions secret | the private half of a Forgejo deploy key with write access |
-| `FORGEJO_SSH_HOST_KEY` | Actions variable | the `known_hosts` line for the server, read from it with `ssh-keyscan -p 222 -t ed25519 git.mrundead.org` |
+Pulling rather than pushing is what the network allows -- Forgejo's SSH is not
+reachable from GitHub's runners -- but it is also the better shape. No port is
+exposed to the internet for it, GitHub holds no credential that can write to
+Forgejo, and the copy has no way to write back to the thing it copies. The
+price is that the mirror lags by up to one interval rather than updating with
+the push.
 
-The host key is pinned rather than accepted on first use: in a fresh runner,
-trust-on-first-use is trust in whoever answers, every time. If the mirror push
-is rejected, the two histories have diverged -- reconcile them by hand and push
-deliberately. Do not add `--force` to the workflow; `workflow-check` refuses it.
+Forgejo force-updates its own refs when it pulls, which is correct here: the
+mirror is a copy, and GitHub is the history it copies. Nothing should ever be
+committed to the mirror directly.
 
 **What a user is trusting.** There is no Authenticode certificate, so
 SmartScreen warns about the installer and will keep warning until enough people
