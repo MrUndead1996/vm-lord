@@ -73,7 +73,16 @@ jobs:
 
       - name: Install the licence-notice generator
         shell: pwsh
-        run: cargo install --locked cargo-about@0.9.2
+        run: |
+          # `--features cli` is not optional: from 0.9 the binary is behind
+          # that feature, and without it `cargo install` builds the library,
+          # installs nothing, and still exits 0 with a warning -- which is how
+          # this step once passed while leaving `cargo dist` to fail two steps
+          # later with a different message.
+          cargo install --locked --features cli cargo-about@0.9.2
+          # So the step proves what it claims: an install that produced no
+          # binary fails here, where the log says what went wrong.
+          cargo about --version
 
       # No `--gpu-payload` or `--display-payload`: those archives are prepared
       # from guest sources outside this workflow. A release that needs them has

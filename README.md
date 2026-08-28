@@ -135,8 +135,12 @@ generates `THIRD-PARTY-LICENSES.txt` from the resolved dependency graph, which
 needs the pinned tool:
 
 ```powershell
-cargo install --locked cargo-about@0.9.2
+cargo install --locked --features cli cargo-about@0.9.2
 ```
+
+`--features cli` is not optional: from 0.9 the binary is behind that feature,
+and without it the install builds the library, installs nothing, and still
+succeeds.
 
 `about.toml` lists the licences the [dependency audit](docs/dependency-licenses.md)
 accepted. A dependency arriving under anything else fails `cargo dist` rather

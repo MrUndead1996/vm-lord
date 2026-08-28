@@ -193,7 +193,7 @@ fn stage_third_party_notices(workspace: &Path, destination: &Path) -> Result<(),
     .map_err(|error| {
         format!(
             "{error}\n`cargo dist` needs the pinned cargo-about release: \
-             cargo install --locked cargo-about@0.9.2"
+             cargo install --locked --features cli cargo-about@0.9.2"
         )
     })?;
     println!("dist: {THIRD_PARTY_NOTICES}");
