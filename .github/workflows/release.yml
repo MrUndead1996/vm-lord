@@ -62,15 +62,6 @@ jobs:
         shell: pwsh
         run: rustup target add x86_64-unknown-linux-musl
 
-      # The MSVC tests, not `cargo test-windows`: that alias exists so WSL can
-      # cross-check the Windows code, and here the native toolchain is the one
-      # the released binaries are actually built with.
-      - name: Test
-        shell: pwsh
-        run: |
-          cargo test --locked
-          cargo test --locked -p xtask
-
       - name: Install the licence-notice generator
         shell: pwsh
         run: |
@@ -84,9 +75,34 @@ jobs:
           # binary fails here, where the log says what went wrong.
           cargo about --version
 
-      # No `--gpu-payload` or `--display-payload`: those archives are prepared
-      # from guest sources outside this workflow. A release that needs them has
-      # them attached by the operator, and VMLord runs without them.
+      # Compiling and running are separate steps because a step's name is a
+      # claim about what it did: a build error under a step called "Test" is
+      # reported as a test problem, which is the wrong place to start looking.
+      #
+      # The MSVC toolchain, not `cargo test-windows`: that alias exists so WSL
+      # can cross-check the Windows code, and here the native toolchain is the
+      # one the released binaries are actually built with.
+      - name: Compile the tests
+        shell: pwsh
+        run: |
+          cargo test --locked --no-run
+          cargo test --locked -p xtask --no-run
+
+      # Near-free: everything above is already built, so this only runs.
+      - name: Run the tests
+        shell: pwsh
+        run: |
+          cargo test --locked
+          cargo test --locked -p xtask
+
+      # No `--gpu-payload` or `--display-payload`. Not because they cannot be
+      # built here -- `./rebuild_payload.sh` and
+      # `payloads/ubuntu-26.04-amd64/prepare.sh` reproduce both from pinned
+      # public sources -- but because nothing in this workflow builds them yet.
+      # They need Docker and a Linux runner, so it would take a second job and
+      # an artifact handed to this one. A release that needs them has them
+      # attached by the operator; VMLord runs without them, with no GPU-PV and
+      # no guest display.
       - name: Build the distribution
         shell: pwsh
         run: cargo dist

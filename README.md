@@ -222,9 +222,13 @@ SHA-256 equals the manifest's, and install it in both scope modes before
 publishing. Until it is published, no VMLord in the world can discover it: the
 update check reads the latest published release.
 
-The GPU and display payload archives are prepared from guest sources outside
-the workflow, so a release built by CI carries none. Attach them and rebuild
-the installer locally when a release needs them; VMLord runs without them.
+A release built by CI carries no GPU or display payload. Not because they
+cannot be built there -- `./rebuild_payload.sh` and
+`payloads/ubuntu-26.04-amd64/prepare.sh` reproduce both from sources pinned by
+commit -- but because nothing in the workflow builds them yet: they need Docker
+and a Linux runner, so it would take a second job and an artifact handed to the
+Windows one. Until then, build them locally and pass them to `cargo dist`.
+VMLord runs without them, with no GPU-PV and no guest display.
 
 **The mirror.** Forgejo pulls; GitHub does not push. The mirror is configured
 on the Forgejo repository itself (Settings -> Mirror Settings) as a pull mirror

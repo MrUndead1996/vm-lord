@@ -38,15 +38,24 @@ jobs:
       - name: Install the guest target
         run: rustup target add x86_64-unknown-linux-musl
 
+      # Compiling and running are separate steps because a step's name is a
+      # claim about what it did, and a build error reported under "Test" sends
+      # a reader looking in the wrong place.
+      #
       # `--locked` so a run compiles what `Cargo.lock` says and fails on a
       # manifest change that was never locked, instead of quietly resolving
-      # something else.
-      - name: Test the workspace
-        run: cargo test --locked
+      # something else. Build automation is out of the default set, so it
+      # needs naming.
+      - name: Compile the tests
+        run: |
+          cargo test --locked --no-run
+          cargo test --locked -p xtask --no-run
 
-      # Build automation is out of the default set, so it needs naming.
-      - name: Test the build automation
-        run: cargo test --locked -p xtask
+      # Near-free: everything above is already built, so this only runs.
+      - name: Run the tests
+        run: |
+          cargo test --locked
+          cargo test --locked -p xtask
 
       # The guest programs cross-compile to musl and are not covered by the
       # workspace tests, so a break in them is otherwise invisible until a
