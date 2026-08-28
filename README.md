@@ -165,3 +165,8 @@ amd64. See the **[display compatibility matrix](docs/display-compatibility.md)**
 **[user guide](docs/display-user-guide.md)** and
 **[troubleshooting guide](docs/display-troubleshooting.md)**. Snapshots remain
 migration work.
+
+## License
+
+VMLord is free software licensed under the
+[GNU General Public License, version 3 or later](LICENSE).
