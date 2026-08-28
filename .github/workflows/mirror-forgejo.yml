@@ -1,0 +1,68 @@
+# Copies accepted history from GitHub to the Forgejo instance at
+# git.mrundead.org.
+#
+# A copy, and only a copy: it never forces. Divergence between the two hosts is
+# a fact somebody has to look at, and a mirror that overwrites is a mirror that
+# destroys the evidence of what diverged.
+name: Mirror to Forgejo
+
+# Accepted refs only. A pull request branch is not history, and publishing one
+# to Forgejo under this repository's name would present unreviewed work as if
+# it had been accepted.
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+# This workflow reads GitHub and writes only to Forgejo, over SSH, with a key
+# GitHub's own token has nothing to do with.
+permissions:
+  contents: read
+
+jobs:
+  mirror:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the pushed ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # The full history: Forgejo needs the commits, not just the tree, and
+          # a shallow push would be rejected.
+          fetch-depth: 0
+
+      - name: Install the deploy key and pin the host key
+        env:
+          FORGEJO_SSH_PRIVATE_KEY: ${{ secrets.FORGEJO_SSH_PRIVATE_KEY }}
+          FORGEJO_SSH_HOST_KEY: ${{ vars.FORGEJO_SSH_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${FORGEJO_SSH_PRIVATE_KEY}" ] || [ -z "${FORGEJO_SSH_HOST_KEY}" ]; then
+            echo "the mirror needs both FORGEJO_SSH_PRIVATE_KEY and FORGEJO_SSH_HOST_KEY" >&2
+            exit 1
+          fi
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          # Written with redirection rather than echoed: the key never reaches
+          # a command line, an argument list, or the step's log.
+          printf '%s\n' "${FORGEJO_SSH_PRIVATE_KEY}" > ~/.ssh/forgejo
+          chmod 600 ~/.ssh/forgejo
+          # The host key is pinned from a repository variable instead of being
+          # accepted on first use: trust-on-first-use in a fresh runner is
+          # trust in whoever answers, every single time.
+          printf '%s\n' "${FORGEJO_SSH_HOST_KEY}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Push the pushed ref to Forgejo
+        env:
+          GIT_SSH_COMMAND: >-
+            ssh -i ~/.ssh/forgejo -o IdentitiesOnly=yes
+            -o UserKnownHostsFile=~/.ssh/known_hosts -o StrictHostKeyChecking=yes
+        run: |
+          set -euo pipefail
+          git remote add forgejo git@git.mrundead.org:MrUndead/vm-lord.git
+          # The exact ref that was pushed here, under its own name, and no
+          # force: a rejected push is the correct outcome of divergence, and a
+          # person resolves it deliberately.
+          git push forgejo "${GITHUB_REF}:${GITHUB_REF}"

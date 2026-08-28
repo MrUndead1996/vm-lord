@@ -174,6 +174,64 @@ There is no code-signing certificate. The SHA-256 in `release-manifest.json` is
 an integrity check that the downloaded installer is the published one; it is
 not publisher authentication, and Windows still asks before running it.
 
+## Releasing
+
+Source lives on GitHub at
+[MrUndead1996/vm-lord](https://github.com/MrUndead1996/vm-lord) and is mirrored
+to Forgejo at `git.mrundead.org`. GitHub is where pull requests and releases
+happen; the mirror is a copy, and it never forces.
+
+Two workflows do the work, and `cargo run -p xtask -- workflow-check` reads
+them back as data before either can surprise anyone: the release must run on
+`v*` alone, default permissions must be `contents: read`, only the `release`
+job may write, every action must be pinned to a commit SHA, and the mirror must
+follow only `main` and `v*` and must never force-push.
+
+**Cutting a release.** Everything is driven by the tag, and the tag has to
+agree with `Cargo.toml`:
+
+```sh
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+`.github/workflows/release.yml` then checks that the tag is reachable from
+`main` and matches the workspace version, runs the tests, builds the
+distribution, checks the staging, compiles the installer, writes
+`release-manifest.json`, recomputes its SHA-256 with a second tool, and creates
+a **draft** release carrying the installer, the manifest, `SHA256SUMS.txt`, the
+third-party notices and a source archive.
+
+The draft is never published automatically. Download the installer, confirm its
+SHA-256 equals the manifest's, and install it in both scope modes before
+publishing. Until it is published, no VMLord in the world can discover it: the
+update check reads the latest published release.
+
+The GPU and display payload archives are prepared from guest sources outside
+the workflow, so a release built by CI carries none. Attach them and rebuild
+the installer locally when a release needs them; VMLord runs without them.
+
+**Mirror setup.** `.github/workflows/mirror-forgejo.yml` needs two things
+configured on the GitHub repository:
+
+| Name | Kind | Holds |
+| --- | --- | --- |
+| `FORGEJO_SSH_PRIVATE_KEY` | Actions secret | the private half of a Forgejo deploy key with write access |
+| `FORGEJO_SSH_HOST_KEY` | Actions variable | the `known_hosts` line for `git.mrundead.org`, read from the server itself |
+
+The host key is pinned rather than accepted on first use: in a fresh runner,
+trust-on-first-use is trust in whoever answers, every time. If the mirror push
+is rejected, the two histories have diverged -- reconcile them by hand and push
+deliberately. Do not add `--force` to the workflow; `workflow-check` refuses it.
+
+**What a user is trusting.** There is no Authenticode certificate, so
+SmartScreen warns about the installer and will keep warning until enough people
+have run it. What the release does offer is that the bytes are the published
+ones: the manifest's hash is generated from the installer's own bytes, checked
+again independently, published beside it, and verified by VMLord before it
+launches anything. A user who prefers not to rely on the in-application update
+can download the installer from the releases page and compare the hash
+themselves.
+
 ## Running
 
 Build with `cargo build -p vmlord`, then launch the elevated executable with:

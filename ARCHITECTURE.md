@@ -4119,6 +4119,62 @@ Windows tests run from WSL without Wine: WSL's binfmt interop hands a
 
 ---
 
+# Packaging and Releases
+
+Shipping VMLord adds no layer. Every piece of it lands in the layer that
+already owns the concern, and the packaging itself is declarative:
+
+| Piece | Lives in | Because |
+| --- | --- | --- |
+| release manifest types and validation, bundled-profile synchronization | `core` | deterministic rules over data and files, with no Windows API and no network |
+| downloading release metadata and the verified installer | `image` | it is the layer that already speaks HTTP and verifies bytes against a digest |
+| launching a verified installer through Windows | `platform` | every Windows API call is isolated there |
+| the update state machine, and the first-run signal | `app` | it owns worker threads, diagnostics and what the UI is allowed to see |
+| the Updates section and the install confirmation | `ui` | it draws state and collects a decision; it calls only application methods |
+| staging, licence notices, the release manifest, workflow validation | `xtask` | build automation, reached through Cargo aliases and never linked into the product |
+| file placement, shortcuts, uninstaller | `installer/vmlord.iss` | Inno Setup is packaging, not application logic |
+
+The installer never writes or reads `settings.toml`, and never touches
+`%LOCALAPPDATA%\VMLord`. It installs canonical distribution profiles into
+`{app}\distros`; the application copies them into the current user's own
+directory on startup, which is the only way an all-users installation can reach
+a user who did not exist when it ran.
+
+## The trust model of an unsigned release
+
+There is no Authenticode certificate, and pretending otherwise would be the
+worst possible outcome. What the release chain actually establishes is
+*integrity*, not *authorship*:
+
+* `cargo release-manifest` derives the installer's size and SHA-256 from the
+  file's own bytes, never from a workflow variable, and puts the result through
+  `vmlord-core`'s own validation before writing it. The generator and the
+  validator therefore cannot disagree about what a valid manifest is.
+* The release workflow recomputes the hash with a different tool and refuses to
+  publish if the two disagree.
+* The URL is built from one constant, `RELEASE_DOWNLOAD_PREFIX`, that core also
+  validates against: a manifest pointing anywhere but this project's release
+  assets is refused by every installation.
+* VMLord verifies the downloaded installer against the manifest before handing
+  it to Windows, and never launches anything without a person confirming it.
+
+What none of that establishes is who built the bytes. A user is trusting
+GitHub's control of the release assets and this repository's control of its
+own tag. SmartScreen says so, in its own way, and will keep warning until an
+installer has been run often enough -- that warning is accurate, and the
+honest answer to it is a certificate, not a workaround.
+
+The GitHub Actions workflows are held to the same standard as the product:
+default permissions are `contents: read`, only the job that creates the release
+may write, every action is pinned to a commit SHA rather than a movable tag,
+and the Forgejo mirror never force-pushes -- divergence is a fact for a person
+to resolve, not something a copy should be able to erase.
+`cargo run -p xtask -- workflow-check` reads both files back as data and
+asserts exactly those properties, so a later edit that loosens one fails the
+branch rather than the release.
+
+---
+
 # Future Components
 
 The architecture should support additional frontends without modifying the core.

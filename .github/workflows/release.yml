@@ -1,0 +1,141 @@
+# Turns a version tag into a draft GitHub Release.
+#
+# Draft and never published automatically: the assets are inspected, and the
+# installer's SHA-256 is checked against the manifest by hand, before anyone
+# can download them. Nothing here decides what a release contains -- the tag
+# does, and `cargo release-manifest` refuses a tag that disagrees with the
+# workspace version.
+name: Release
+
+# Only a version tag. A push to a branch is not a release, and a workflow that
+# also ran on one would publish "releases" of whatever happened to be there.
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Read by default, so a step added later starts with no rights over this
+# repository and has to be given them deliberately.
+permissions:
+  contents: read
+
+jobs:
+  release:
+    # The only job allowed to write, and it writes exactly one thing: the draft
+    # release it creates at the end.
+    permissions:
+      contents: write
+    # Windows, because the release executables must come from MSVC and the
+    # installer is compiled by Inno Setup, which the image already carries.
+    runs-on: windows-2025
+    steps:
+      # Pinned to a commit rather than to `v7`: a tag is a name its owner can
+      # move onto other code, and this job holds a token that can write here.
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          # The whole history: the next step has to prove the tag is on `main`,
+          # which a shallow clone cannot answer.
+          fetch-depth: 0
+
+      - name: Verify the tag is on main and matches the workspace version
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor HEAD origin/main
+          if ($LASTEXITCODE -ne 0) {
+            throw "$tag is not reachable from main; releases are cut from merged history"
+          }
+          # The same rule `cargo release-manifest` enforces, applied before the
+          # build rather than after it: a mismatch here costs a second, and a
+          # mismatch at the end costs the whole build.
+          $version = (cargo metadata --locked --format-version 1 --no-deps |
+            ConvertFrom-Json).packages |
+            Where-Object { $_.name -eq 'vmlord' } |
+            Select-Object -ExpandProperty version
+          if ($tag -ne "v$version") {
+            throw "tag $tag does not match the workspace version $version"
+          }
+
+      - name: Install the guest agent's target
+        shell: pwsh
+        run: rustup target add x86_64-unknown-linux-musl
+
+      # The MSVC tests, not `cargo test-windows`: that alias exists so WSL can
+      # cross-check the Windows code, and here the native toolchain is the one
+      # the released binaries are actually built with.
+      - name: Test
+        shell: pwsh
+        run: |
+          cargo test --locked
+          cargo test --locked -p xtask
+
+      - name: Install the licence-notice generator
+        shell: pwsh
+        run: cargo install --locked cargo-about@0.9.2
+
+      # No `--gpu-payload` or `--display-payload`: those archives are prepared
+      # from guest sources outside this workflow. A release that needs them has
+      # them attached by the operator, and VMLord runs without them.
+      - name: Build the distribution
+        shell: pwsh
+        run: cargo dist
+
+      - name: Check the staged distribution
+        shell: pwsh
+        run: pwsh -File installer/check.ps1 target/dist
+
+      - name: Compile the installer
+        shell: pwsh
+        run: |
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path -LiteralPath $iscc)) {
+            throw "Inno Setup 6 is not on this image at $iscc"
+          }
+          & $iscc installer/vmlord.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
+
+      - name: Write and re-verify the release manifest
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $installer = "target/installer/VMLord-$version-x86_64-setup.exe"
+          cargo release-manifest `
+            --tag $env:GITHUB_REF_NAME `
+            --installer $installer `
+            --output target/installer/release-manifest.json
+          # Independently recomputed: the manifest is what every installation
+          # will trust, so it is checked against the file once more by a
+          # different tool than the one that wrote it.
+          $expected = (Get-Content target/installer/release-manifest.json |
+            ConvertFrom-Json).installer.sha256
+          $actual = (Get-FileHash -Algorithm SHA256 $installer).Hash.ToLowerInvariant()
+          if ($expected -ne $actual) {
+            throw "the manifest says $expected but the installer hashes to $actual"
+          }
+          "$actual  VMLord-$version-x86_64-setup.exe" |
+            Set-Content -Encoding ascii target/installer/SHA256SUMS.txt
+          # The corresponding sources, as the GPL expects them to travel with
+          # the binary. `git archive` uses the tag, so it is the exact tree.
+          git archive --format=zip --prefix="vmlord-$version/" `
+            -o "target/installer/vmlord-$version-source.zip" $env:GITHUB_REF_NAME
+
+      # Drafted, never published: a person compares the installer's hash with
+      # the manifest and installs it in both scope modes before anyone else can
+      # download it.
+      - name: Create the draft release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          gh release create $env:GITHUB_REF_NAME `
+            --draft `
+            --title "VMLord $version" `
+            --generate-notes `
+            "target/installer/VMLord-$version-x86_64-setup.exe" `
+            target/installer/release-manifest.json `
+            target/installer/SHA256SUMS.txt `
+            target/dist/THIRD-PARTY-LICENSES.txt `
+            "target/installer/vmlord-$version-source.zip"

@@ -15,6 +15,7 @@ mod display_payload;
 mod dist_arguments;
 mod gpu_payload;
 mod release;
+mod workflow;
 
 /// The release target for the application. MSVC is the toolchain Windows
 /// itself is built against, and the one the HCS bindings expect.
@@ -42,6 +43,7 @@ fn main() -> ExitCode {
         Some("display-payload") => display_payload::run(env::args().skip(2)),
         Some("display-bench") => display_bench::run(env::args().skip(2)),
         Some("release-manifest") => release::run(env::args().skip(2)),
+        Some("workflow-check") => workspace_root().and_then(|workspace| workflow::run(&workspace)),
         Some(other) => Err(format!("unknown task `{other}`")),
         None => Err("missing task".to_owned()),
     };
