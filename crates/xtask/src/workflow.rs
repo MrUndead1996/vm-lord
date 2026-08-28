@@ -1,24 +1,53 @@
-//! `cargo run -p xtask -- workflow-check`: the release workflow, read as data.
+//! `cargo run -p xtask -- workflow-check`: the workflows, read as data.
 //!
-//! Two things make a release workflow dangerous, and neither shows up in a
-//! test run: a token with more rights than the job needs, and an action
-//! reference that can change under it. Both are properties of the YAML, so
-//! they are checked here rather than discovered after a tag is pushed.
+//! Two things make a workflow dangerous, and neither shows up in a test run: a
+//! token with more rights than the job needs, and an action reference that can
+//! change under it. Both are properties of the YAML, so they are checked here
+//! rather than discovered after a tag is pushed.
+//!
+//! Every workflow is checked for those two. The release workflow is checked
+//! for more, because it is the one that publishes.
 
 use std::{fs, path::Path};
 
 use serde_yaml_ng::Value;
 
-const RELEASE_WORKFLOW: &str = ".github/workflows/release.yml";
+const WORKFLOW_DIRECTORY: &str = ".github/workflows";
+const RELEASE_WORKFLOW_FILE: &str = "release.yml";
 
 /// The job in the release workflow that is allowed to write to the repository.
 const RELEASE_JOB: &str = "release";
 
 pub fn run(workspace: &Path) -> Result<(), String> {
-    let problems = check(workspace, RELEASE_WORKFLOW, check_release)?;
+    let directory = workspace.join(WORKFLOW_DIRECTORY);
+    let mut files = Vec::new();
+    let entries = fs::read_dir(&directory)
+        .map_err(|error| format!("cannot read {}: {error}", directory.display()))?;
+    for entry in entries {
+        let path = entry
+            .map_err(|error| format!("cannot read {}: {error}", directory.display()))?
+            .path();
+        if matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("yml" | "yaml")
+        ) {
+            files.push(path);
+        }
+    }
+    if files.is_empty() {
+        return Err(format!("no workflows found in {}", directory.display()));
+    }
+    // Read in a fixed order so two runs report the same problems in the same
+    // sequence, whatever order the filesystem hands them over in.
+    files.sort();
+
+    let mut problems = Vec::new();
+    for path in &files {
+        problems.extend(check(workspace, path)?);
+    }
 
     if problems.is_empty() {
-        println!("workflow-check: {RELEASE_WORKFLOW} is sound");
+        println!("workflow-check: {} workflow(s) are sound", files.len());
         return Ok(());
     }
     for problem in &problems {
@@ -27,22 +56,35 @@ pub fn run(workspace: &Path) -> Result<(), String> {
     Err(format!("{} workflow problem(s)", problems.len()))
 }
 
-fn check(
-    workspace: &Path,
-    relative: &str,
-    checks: fn(&Value) -> Vec<String>,
-) -> Result<Vec<String>, String> {
-    let path = workspace.join(relative);
-    let text = fs::read_to_string(&path)
+fn check(workspace: &Path, path: &Path) -> Result<Vec<String>, String> {
+    let text = fs::read_to_string(path)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let document: Value = serde_yaml_ng::from_str(&text)
         .map_err(|error| format!("{} is not valid YAML: {error}", path.display()))?;
 
-    Ok(checks(&document)
+    // Named by its path relative to the workspace, so a problem reads the same
+    // way whether it was found from the repository root or from anywhere else.
+    let relative = path.strip_prefix(workspace).unwrap_or(path).display();
+    let mut problems = every_workflow(&document);
+    if path.ends_with(RELEASE_WORKFLOW_FILE) {
+        problems.extend(check_release(&document));
+    }
+
+    Ok(problems
         .into_iter()
-        .chain(unpinned_actions(&document))
         .map(|problem| format!("{relative}: {problem}"))
         .collect())
+}
+
+/// What is true of every workflow in this repository, whatever it does.
+fn every_workflow(document: &Value) -> Vec<String> {
+    let mut problems = unpinned_actions(document);
+    // Read by default, so a step added later starts with no rights over this
+    // repository and has to be given them deliberately.
+    if permission(document.get("permissions"), "contents").as_deref() != Some("read") {
+        problems.push("the workflow's default permissions are not `contents: read`".to_owned());
+    }
+    problems
 }
 
 /// What the release workflow has to be true of.
@@ -59,12 +101,6 @@ fn check_release(document: &Value) -> Vec<String> {
     }
     if document.get("pull_request").is_some() || trigger(document, "pull_request").is_some() {
         problems.push("a pull request must not be able to start a release".to_owned());
-    }
-
-    // Read by default, so a step added later starts with no rights and has to
-    // be given them deliberately.
-    if permission(document.get("permissions"), "contents").as_deref() != Some("read") {
-        problems.push("the workflow's default permissions are not `contents: read`".to_owned());
     }
 
     for (name, job) in jobs(document) {
@@ -160,7 +196,7 @@ fn permission(permissions: Option<&Value>, name: &str) -> Option<String> {
 mod tests {
     use serde_yaml_ng::Value;
 
-    use super::{check_release, unpinned_actions};
+    use super::{check_release, every_workflow, unpinned_actions};
 
     fn parse(text: &str) -> Value {
         serde_yaml_ng::from_str(text).expect("the fixture is valid YAML")
@@ -194,7 +230,8 @@ mod tests {
     }
 
     /// Read by default: a step added later must ask for more rather than
-    /// inherit them.
+    /// inherit them. Asserted of every workflow, not just the release, because
+    /// a token is a token whatever the job around it is for.
     #[test]
     fn the_default_permissions_are_read_only() {
         let writable = release(
@@ -203,7 +240,7 @@ mod tests {
             "      - 'v*'\n",
         );
 
-        let problems = check_release(&writable);
+        let problems = every_workflow(&writable);
 
         assert!(
             problems

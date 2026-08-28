@@ -181,10 +181,15 @@ Source lives on GitHub at
 pull requests and releases happen, and is mirrored to Forgejo at
 `https://git.mrundead.org/mrundead/vm-lord`.
 
-`cargo run -p xtask -- workflow-check` reads the release workflow back as data
-before it can surprise anyone: it must run on `v*` alone, default permissions
-must be `contents: read`, only the `release` job may write, and every action
-must be pinned to a commit SHA rather than to a movable tag.
+Every pull request runs `.github/workflows/ci.yml`: the workspace tests and the
+build automation's on Windows against MSVC, the two guest programs
+cross-compiled to musl, `cargo fmt --all --check`, and the workflow validator.
+
+`cargo run -p xtask -- workflow-check` reads the workflows back as data before
+they can surprise anyone. Every workflow must have `contents: read` default
+permissions and pin every action to a commit SHA rather than to a movable tag;
+the release must additionally run on `v*` alone, with only the `release` job
+able to write.
 
 **Cutting a release.** Everything is driven by the tag, and the tag has to
 agree with `Cargo.toml`:
