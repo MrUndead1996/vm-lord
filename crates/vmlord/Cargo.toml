@@ -25,7 +25,7 @@ tracing.workspace = true
 # The Windows common file dialogs, behind the application layer's picker
 # traits. Wired here because those traits belong to `app`, which `platform`
 # does not depend on.
-rfd = "0.15"
+rfd = "0.17"
 semver.workspace = true
 vmlord-app = { path = "../app" }
 vmlord-core = { path = "../core" }
