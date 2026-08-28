@@ -1,0 +1,74 @@
+# What every pull request has to pass.
+#
+# This exists because it was missing: five dependency updates -- two of them
+# semantic-major, in crates that use those APIs directly -- were merged with
+# nothing checking them, and the first thing that would have compiled the
+# result was a release build from a tag. That is the worst possible place to
+# find out.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+# A second push to a branch makes the first run's answer worthless, so it is
+# cancelled rather than left to finish. `main` is exempt: its runs are the
+# record of what was merged.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  test:
+    # Windows, because the product is a Windows application: this runs the
+    # tests against the MSVC toolchain the release is actually built with,
+    # rather than the `x86_64-pc-windows-gnu` cross-check that exists so a
+    # Linux machine can say something about the Windows code.
+    runs-on: windows-2025
+    steps:
+      # Pinned to a commit rather than to `v7`: a tag is a name its owner can
+      # move onto other code.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install the guest target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      # `--locked` so a run compiles what `Cargo.lock` says and fails on a
+      # manifest change that was never locked, instead of quietly resolving
+      # something else.
+      - name: Test the workspace
+        run: cargo test --locked
+
+      # Build automation is out of the default set, so it needs naming.
+      - name: Test the build automation
+        run: cargo test --locked -p xtask
+
+      # The guest programs cross-compile to musl and are not covered by the
+      # workspace tests, so a break in them is otherwise invisible until a
+      # release build.
+      - name: Build the guest agent
+        run: cargo agent
+
+      - name: Build the guest display services
+        run: cargo display-services
+
+  lint:
+    # Linux, because neither of these compiles the Windows application and a
+    # Linux runner starts sooner.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      # The workflows check themselves: every action pinned to a commit SHA,
+      # read-only default permissions, and the release triggered by `v*` alone
+      # with only its own job able to write.
+      - name: Check the workflows
+        run: cargo run -p xtask -- workflow-check

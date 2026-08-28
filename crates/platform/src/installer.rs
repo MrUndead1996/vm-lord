@@ -7,14 +7,14 @@ use std::{
 
 use vmlord_core::RepositoryError;
 use windows::{
-    core::PCWSTR,
     Win32::{
         Foundation::CloseHandle,
         UI::{
-            Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW},
+            Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW},
             WindowsAndMessaging::SW_SHOWNORMAL,
         },
     },
+    core::PCWSTR,
 };
 
 use crate::error::windows_error;
@@ -209,7 +209,7 @@ mod tests {
 
     use uuid::Uuid;
 
-    use super::{canonical_installer_path, has_alternate_data_stream, InstallerLaunch};
+    use super::{InstallerLaunch, canonical_installer_path, has_alternate_data_stream};
 
     struct Fixture {
         directory: PathBuf,
@@ -262,6 +262,30 @@ mod tests {
         assert_eq!(request.elevation_verb(), Some("runas"));
     }
 
+    /// Creates the test's symlink, or reports that this account cannot.
+    ///
+    /// Creating a symbolic link on Windows needs `SeCreateSymbolicLinkPrivilege`,
+    /// which an ordinary account holds only in Developer Mode or when elevated.
+    /// The two tests below are about what `canonical_installer_path` does with
+    /// a link, not about whether the operating system handed this account a
+    /// privilege -- so where the link cannot be made, they say so and stop
+    /// rather than failing and blaming the code under test.
+    fn link_fixture(target: &Path, link: &Path) -> bool {
+        match symlink_file(target, link) {
+            Ok(()) => true,
+            // ERROR_PRIVILEGE_NOT_HELD.
+            Err(error) if error.raw_os_error() == Some(1314) => {
+                eprintln!(
+                    "skipped: this account may not create symbolic links; run elevated or turn on \
+                     Developer Mode to exercise {}",
+                    link.display()
+                );
+                false
+            }
+            Err(error) => panic!("test fixture symlink should be created: {error:?}"),
+        }
+    }
+
     // This catches validation of the link's spelling instead of the file that
     // ShellExecuteExW will actually receive.
     #[test]
@@ -269,7 +293,9 @@ mod tests {
         let fixture = Fixture::new();
         let target = fixture.write("installer.txt");
         let link = fixture.path("installer.exe");
-        symlink_file(target, &link).expect("test fixture symlink should be created");
+        if !link_fixture(&target, &link) {
+            return;
+        }
 
         let error = canonical_installer_path(&link).expect_err("a non-executable target is unsafe");
 
@@ -284,7 +310,9 @@ mod tests {
         fs::write(&stream, b"installer fixture stream")
             .expect("test fixture alternate data stream should be written");
         let link = fixture.path("installer-link.exe");
-        symlink_file(stream, &link).expect("test fixture symlink should be created");
+        if !link_fixture(&stream, &link) {
+            return;
+        }
 
         let error = canonical_installer_path(&link)
             .expect_err("an alternate data stream target is not an installer");

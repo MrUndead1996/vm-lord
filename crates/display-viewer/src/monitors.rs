@@ -108,8 +108,16 @@ pub struct Fit {
 /// right or the bottom.
 #[must_use]
 pub fn fitted(client: (u32, u32), frame: (i32, i32), at: (i32, i32), work: Rect) -> Fit {
-    let across = fit(width(client.0).saturating_add(frame.0), work.left, work.right);
-    let down = fit(width(client.1).saturating_add(frame.1), work.top, work.bottom);
+    let across = fit(
+        width(client.0).saturating_add(frame.0),
+        work.left,
+        work.right,
+    );
+    let down = fit(
+        width(client.1).saturating_add(frame.1),
+        work.top,
+        work.bottom,
+    );
 
     Fit {
         x: place(at.0, across, work.left, work.right),
@@ -216,7 +224,11 @@ mod tests {
 
         assert_eq!(fit.width - FRAME.0, 1280);
         assert_eq!(fit.height - FRAME.1, 720);
-        assert_eq!((fit.x, fit.y), (100, 80), "and stays where the user left it");
+        assert_eq!(
+            (fit.x, fit.y),
+            (100, 80),
+            "and stays where the user left it"
+        );
     }
 
     #[test]
@@ -278,7 +290,6 @@ mod tests {
 
         assert!(fit.width >= 1 && fit.height >= 1);
     }
-
 
     /// A 1920x1080 monitor at the origin, and a 1920x1080 one to the left of
     /// it -- the arrangement a second monitor set as primary's neighbour has.
