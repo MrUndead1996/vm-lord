@@ -57,6 +57,40 @@ jobs:
       - name: Build the guest display services
         run: cargo display-services
 
+  licences:
+    # The licence notices, generated but not shipped from here.
+    #
+    # This job exists because two release runs in a row failed inside
+    # `cargo dist` on this exact step -- once because the generator had not
+    # actually installed, once because `about.toml` refused a licence -- and a
+    # tag is a terrible place to discover either. It runs on Linux and in
+    # parallel with the Windows tests, so it costs no wall-clock time.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Install the licence-notice generator
+        run: |
+          # `--features cli` is not optional: from 0.9 the binary is behind
+          # that feature, and without it this installs the library, no binary,
+          # and still succeeds.
+          cargo install --locked --features cli cargo-about@0.9.2
+          cargo about --version
+
+      # The same invocation `cargo dist` makes. `--fail` is what turns an
+      # unrecognised licence into a failed pull request instead of a notice
+      # file that quietly omits somebody's terms.
+      - name: Generate the third-party notices
+        run: |
+          cargo about generate \
+            --config about.toml \
+            --fail \
+            --output-file "${RUNNER_TEMP}/THIRD-PARTY-LICENSES.txt" \
+            installer/third-party-licenses.hbs
+          # A template that renders to nothing would pass the command above.
+          test -s "${RUNNER_TEMP}/THIRD-PARTY-LICENSES.txt"
+          wc -l < "${RUNNER_TEMP}/THIRD-PARTY-LICENSES.txt"
+
   lint:
     # Linux, because neither of these compiles the Windows application and a
     # Linux runner starts sooner.

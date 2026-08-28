@@ -3,6 +3,7 @@ name = "vmlord-keys"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [dependencies]
 tracing.workspace = true
