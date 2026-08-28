@@ -4807,7 +4807,7 @@ name = "vmlord-agent-protocol"
 version = "0.1.0"
 dependencies = [
  "base64",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "hmac",
  "prost",
  "prost-build",
@@ -4864,7 +4864,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "crc32c",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "hkdf",
  "hmac",
  "prost",
