@@ -155,6 +155,7 @@ struct SettingsForm {
     /// TOML-only in task 139; the settings dialog must preserve it unchanged.
     clipboard_files: FileClipboardSettings,
     display: DisplaySettings,
+    last_automatic_update_check: Option<String>,
     error: Option<String>,
 }
 
@@ -170,6 +171,7 @@ impl SettingsForm {
             guest_readiness: settings.guest_readiness,
             clipboard_files: settings.clipboard_files,
             display: settings.display,
+            last_automatic_update_check: settings.last_automatic_update_check.clone(),
             error: None,
         }
     }
@@ -198,6 +200,7 @@ impl SettingsForm {
             guest_readiness: self.guest_readiness,
             clipboard_files: self.clipboard_files,
             display: self.display,
+            last_automatic_update_check: self.last_automatic_update_check.clone(),
         })
     }
 }

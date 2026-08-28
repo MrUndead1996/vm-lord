@@ -1,9 +1,15 @@
 #[cfg(not(windows))]
 compile_error!("VMLord currently supports Windows only");
 
-use std::path::PathBuf;
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, atomic::AtomicBool},
+};
 
-use vmlord_core::{AppSettings, BuildMonitor, BuildStep, VmRepository};
+use semver::Version;
+use vmlord_core::{
+    AppSettings, BuildMonitor, BuildStep, DownloadPhase, ProgressPublisher, VmRepository,
+};
 
 mod pickers;
 
@@ -99,12 +105,66 @@ fn main() {
         application = application.with_diagnostics(sink);
     }
     if let Ok((store, settings_load)) = settings {
-        let _created = settings_load.created;
-        application = application.with_settings(store, settings_load.settings);
+        application = application
+            .with_settings(store, settings_load.settings)
+            .with_first_run(settings_load.created)
+            .with_update_runtime(Arc::new(WindowsUpdateRuntime::new()));
     }
     application.start();
     if let Err(error) = vmlord_ui::run(application) {
         panic!("failed to run VMLord UI: {error}");
+    }
+}
+
+/// The composition-root implementation that joins portable release retrieval
+/// and the Windows-only verified-installer launcher.
+struct WindowsUpdateRuntime {
+    current_version: Version,
+}
+
+impl WindowsUpdateRuntime {
+    fn new() -> Self {
+        Self {
+            current_version: Version::parse(env!("CARGO_PKG_VERSION"))
+                .expect("the package version is valid semantic versioning"),
+        }
+    }
+}
+
+impl vmlord_app::UpdateRuntime for WindowsUpdateRuntime {
+    fn check(&self) -> Result<Option<vmlord_app::AvailableUpdate>, String> {
+        let release = vmlord_image::fetch_latest_release().map_err(|error| error.to_string())?;
+        let validated = release
+            .manifest
+            .validate(&self.current_version)
+            .map_err(|error| error.to_string())?;
+        Ok(validated.map(|validated| vmlord_app::AvailableUpdate {
+            validated,
+            release_notes: release.release_notes,
+        }))
+    }
+
+    fn download(
+        &self,
+        update: &vmlord_app::AvailableUpdate,
+        progress: ProgressPublisher<DownloadPhase>,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<PathBuf, String> {
+        let directory = std::env::temp_dir().join("VMLord").join("updates");
+        vmlord_image::fetch_update_installer(
+            &update.validated,
+            &directory,
+            &progress,
+            cancel.as_ref(),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn launch(&self, installer: &Path) -> Result<(), String> {
+        vmlord_platform::launch_installer(&vmlord_platform::InstallerLaunch::new(
+            installer.to_path_buf(),
+        ))
+        .map_err(|error| error.to_string())
     }
 }
 

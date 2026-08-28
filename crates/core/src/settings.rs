@@ -46,6 +46,13 @@ pub struct AppSettings {
     /// Display stream diagnostics policy.
     #[serde(default)]
     pub display: DisplaySettings,
+    /// RFC 3339 time of the last automatic application-update check.
+    ///
+    /// This deliberately records only scheduled checks: a person pressing
+    /// "Check for updates" should never be told to wait for the 24-hour
+    /// interval to expire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_automatic_update_check: Option<String>,
 }
 
 /// Application-wide policy for comparing guest refresh with delivered frames.
@@ -459,6 +466,7 @@ impl SettingsStore {
             guest_readiness: GuestReadinessTimeouts::default(),
             clipboard_files: FileClipboardSettings::default(),
             display: DisplaySettings::default(),
+            last_automatic_update_check: None,
         })
     }
 
@@ -671,6 +679,7 @@ mod tests {
             guest_readiness: GuestReadinessTimeouts::default(),
             clipboard_files: FileClipboardSettings::default(),
             display: DisplaySettings::default(),
+            last_automatic_update_check: None,
         };
 
         store.save(&settings).unwrap();
@@ -695,6 +704,7 @@ mod tests {
             guest_readiness: GuestReadinessTimeouts::default(),
             clipboard_files: FileClipboardSettings::default(),
             display: DisplaySettings::default(),
+            last_automatic_update_check: None,
         };
 
         store.save(&settings).unwrap();
@@ -889,6 +899,7 @@ mod tests {
             guest_readiness: GuestReadinessTimeouts::default(),
             clipboard_files: FileClipboardSettings::default(),
             display: DisplaySettings::default(),
+            last_automatic_update_check: None,
         }
     }
 

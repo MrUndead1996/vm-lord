@@ -4783,6 +4783,7 @@ version = "0.1.0"
 dependencies = [
  "embed-resource",
  "rfd",
+ "semver",
  "tracing",
  "vmlord-app",
  "vmlord-core",
@@ -4820,6 +4821,7 @@ dependencies = [
 name = "vmlord-app"
 version = "0.1.0"
 dependencies = [
+ "semver",
  "tracing",
  "tracing-subscriber",
  "vmlord-core",
