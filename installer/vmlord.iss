@@ -32,6 +32,7 @@ AppPublisherURL={#AppUrl}
 AppSupportURL={#AppUrl}/issues
 AppUpdatesURL={#AppUrl}/releases
 VersionInfoVersion={#AppVersion}
+SetupIconFile=..\assets\vmlord.ico
 
 ; Both installation modes. `lowest` means the setup program does not ask for
 ; elevation on its own; `dialog` gives the user the choice between installing
