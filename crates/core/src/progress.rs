@@ -17,6 +17,32 @@ use std::{
 
 use crate::RepositoryError;
 
+use serde::{Deserialize, Serialize};
+
+/// Which user-visible stage an AppSandbox import has reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AppSandboxImportStage {
+    Validating,
+    Copying,
+    Creating,
+    BootstrapStarting,
+    Converting,
+    Restarting,
+    Verifying,
+    NeedsAttention,
+    Complete,
+}
+
+/// The latest user-visible state of an AppSandbox import.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppSandboxImportProgress {
+    pub stage: AppSandboxImportStage,
+    /// Bytes copied from the source disk so far, meaningful while copying.
+    pub copied_bytes: u64,
+    /// The source disk size when known, meaningful while copying.
+    pub total_bytes: Option<u64>,
+}
+
 /// What a download is doing right now.
 ///
 /// There is no `Failed` variant on purpose. A failure is the `Err` of the

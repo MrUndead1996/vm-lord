@@ -1,5 +1,6 @@
 //! UI-independent domain types and repository boundary for VMLord.
 
+pub mod appsandbox;
 mod diagnostics;
 pub mod display;
 pub mod distro;
@@ -8,6 +9,10 @@ pub mod gpu;
 mod logging;
 pub mod update;
 
+pub use appsandbox::{
+    AppSandboxCompatibility, AppSandboxImportRequest, AppSandboxIncompatibility,
+    AppSandboxSourceId, AppSandboxVmCandidate, IncompleteAppSandboxImport,
+};
 pub use diagnostics::{Diagnostic, DiagnosticLevel, DiagnosticsLayer, DiagnosticsSink, Subsystem};
 pub use error::RepositoryError;
 
@@ -49,7 +54,8 @@ pub use logging::{
     initialize_without_console as initialize_logging_without_console,
 };
 pub use progress::{
-    BuildMonitor, BuildProgress, BuildStep, DownloadPhase, ProgressPublisher, ProgressThrottle,
+    AppSandboxImportProgress, AppSandboxImportStage, BuildMonitor, BuildProgress, BuildStep,
+    DownloadPhase, ProgressPublisher, ProgressThrottle,
 };
 pub use provisioning::{
     CloudImage, GuestDefaults, Password, Provisioning, SshAccess, VmSource, validate_username,
@@ -274,6 +280,50 @@ pub trait VmRepository {
             "this backend creates VMs in the foreground, so there is nothing to cancel",
         ))
     }
+    /// Discovers VMs that the AppSandbox importer can examine.
+    fn discover_appsandbox_vms(&mut self) -> Result<Vec<AppSandboxVmCandidate>, RepositoryError> {
+        Err(RepositoryError::new(
+            "AppSandbox imports are not supported by this backend",
+        ))
+    }
+    /// Starts an AppSandbox import in the background.
+    fn start_appsandbox_import(
+        &mut self,
+        _request: AppSandboxImportRequest,
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(
+            "AppSandbox imports are not supported by this backend",
+        ))
+    }
+    /// Cancels an AppSandbox import that is still safe to roll back.
+    fn cancel_appsandbox_import(&mut self, _destination_name: &str) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(
+            "AppSandbox imports are not supported by this backend",
+        ))
+    }
+    /// Lists imports retained for explicit retry or discard.
+    fn incomplete_appsandbox_imports(
+        &self,
+    ) -> Result<Vec<IncompleteAppSandboxImport>, RepositoryError> {
+        Err(RepositoryError::new(
+            "AppSandbox imports are not supported by this backend",
+        ))
+    }
+    /// Retries a retained incomplete import.
+    fn retry_appsandbox_import(&mut self, _destination_name: &str) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(
+            "AppSandbox imports are not supported by this backend",
+        ))
+    }
+    /// Discards VMLord-owned data retained for an incomplete import.
+    fn discard_appsandbox_import(
+        &mut self,
+        _destination_name: &str,
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(
+            "AppSandbox imports are not supported by this backend",
+        ))
+    }
     /// Where the private half of the VM's own SSH key pair is, or will be.
     ///
     /// A path rather than a file: the create form shows it beside the toggle
@@ -349,8 +399,9 @@ pub trait VmRepository {
 #[cfg(test)]
 mod tests {
     use super::{
-        Advisory, DesktopProfile, GpuMode, NetworkMode, RepositoryError, VmCreateRequest,
-        VmDeleteRequest, VmRepository, VmSource, VmSummary, VmUpdateRequest,
+        Advisory, AppSandboxImportRequest, AppSandboxSourceId, DesktopProfile, GpuMode,
+        NetworkMode, RepositoryError, VmCreateRequest, VmDeleteRequest, VmRepository, VmSource,
+        VmSummary, VmUpdateRequest,
     };
 
     fn valid_request() -> VmCreateRequest {
@@ -576,5 +627,183 @@ mod tests {
             error.to_string().contains("not supported by this backend"),
             "a backend that cannot answer has to say so rather than report an empty host: {error}"
         );
+    }
+
+    #[test]
+    fn a_backend_without_appsandbox_support_says_so() {
+        struct SilentBackend;
+
+        impl VmRepository for SilentBackend {
+            fn initialize(&mut self) -> Result<(), RepositoryError> {
+                Ok(())
+            }
+            fn create_vm(&mut self, _request: VmCreateRequest) -> Result<(), RepositoryError> {
+                Ok(())
+            }
+            fn update_vm(&mut self, _request: VmUpdateRequest) -> Result<(), RepositoryError> {
+                Ok(())
+            }
+            fn start_vm(&mut self, _name: &str) -> Result<(), RepositoryError> {
+                Ok(())
+            }
+            fn stop_vm(&mut self, _name: &str) -> Result<(), RepositoryError> {
+                Ok(())
+            }
+            fn force_stop_vm(&mut self, _name: &str) -> Result<(), RepositoryError> {
+                Ok(())
+            }
+            fn delete_vm(&mut self, _request: VmDeleteRequest) -> Result<(), RepositoryError> {
+                Ok(())
+            }
+            fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError> {
+                Ok(Vec::new())
+            }
+            fn refresh(&mut self) {}
+        }
+
+        let mut backend = SilentBackend;
+        assert!(
+            backend
+                .discover_appsandbox_vms()
+                .unwrap_err()
+                .to_string()
+                .contains("not supported")
+        );
+        assert!(
+            backend
+                .start_appsandbox_import(AppSandboxImportRequest {
+                    source_id: AppSandboxSourceId::from_stable_hash("source-ubuntu").unwrap(),
+                    destination_name: "ubuntu-copy".into(),
+                })
+                .unwrap_err()
+                .to_string()
+                .contains("not supported")
+        );
+        assert!(
+            backend
+                .cancel_appsandbox_import("ubuntu-copy")
+                .unwrap_err()
+                .to_string()
+                .contains("not supported")
+        );
+        assert!(
+            backend
+                .incomplete_appsandbox_imports()
+                .unwrap_err()
+                .to_string()
+                .contains("not supported")
+        );
+        assert!(
+            backend
+                .retry_appsandbox_import("ubuntu-copy")
+                .unwrap_err()
+                .to_string()
+                .contains("not supported")
+        );
+        assert!(
+            backend
+                .discard_appsandbox_import("ubuntu-copy")
+                .unwrap_err()
+                .to_string()
+                .contains("not supported")
+        );
+    }
+}
+
+#[cfg(test)]
+mod appsandbox_contract_tests {
+    use super::{
+        AppSandboxCompatibility, AppSandboxImportProgress, AppSandboxImportRequest,
+        AppSandboxImportStage, AppSandboxSourceId, AppSandboxVmCandidate, GpuMode, NetworkMode,
+    };
+
+    fn valid_candidate() -> AppSandboxVmCandidate {
+        AppSandboxVmCandidate {
+            source_id: AppSandboxSourceId::from_stable_hash("source-ubuntu").unwrap(),
+            name: "ubuntu".into(),
+            ram_mb: 4096,
+            disk_gb: 80,
+            cpu_cores: 4,
+            network_mode: NetworkMode::Nat,
+            gpu_mode: GpuMode::None,
+            ssh_user: "ubuntu".into(),
+            ssh_port: 22,
+            compatibility: AppSandboxCompatibility::Compatible,
+        }
+    }
+
+    fn valid_import_request() -> AppSandboxImportRequest {
+        AppSandboxImportRequest {
+            source_id: AppSandboxSourceId::from_stable_hash("source-ubuntu").unwrap(),
+            destination_name: "ubuntu-copy".into(),
+        }
+    }
+
+    #[test]
+    fn import_request_accepts_a_valid_renamed_destination() {
+        assert!(valid_import_request().validate().is_ok());
+    }
+
+    #[test]
+    fn import_request_rejects_an_empty_destination_name() {
+        let mut request = valid_import_request();
+        request.destination_name.clear();
+
+        assert!(request.validate().unwrap_err().to_string().contains("name"));
+    }
+
+    #[test]
+    fn import_request_rejects_a_path_escaping_vm_name() {
+        let mut request = valid_import_request();
+        request.destination_name = "../ubuntu".into();
+
+        assert!(request.validate().unwrap_err().to_string().contains("name"));
+    }
+
+    #[test]
+    fn source_identity_rejects_an_empty_stable_hash() {
+        assert!(AppSandboxSourceId::from_stable_hash("").is_err());
+    }
+
+    #[test]
+    fn candidate_rejects_zero_resources() {
+        for candidate in [
+            AppSandboxVmCandidate {
+                ram_mb: 0,
+                ..valid_candidate()
+            },
+            AppSandboxVmCandidate {
+                disk_gb: 0,
+                ..valid_candidate()
+            },
+            AppSandboxVmCandidate {
+                cpu_cores: 0,
+                ..valid_candidate()
+            },
+        ] {
+            assert!(candidate.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn import_progress_round_trips_through_json() {
+        let progress = AppSandboxImportProgress {
+            stage: AppSandboxImportStage::Copying,
+            copied_bytes: 2_048,
+            total_bytes: Some(4_096),
+        };
+
+        let encoded = serde_json::to_string(&progress).unwrap();
+        assert_eq!(
+            serde_json::from_str::<AppSandboxImportProgress>(&encoded).unwrap(),
+            progress
+        );
+    }
+
+    #[test]
+    fn source_private_key_is_not_part_of_candidate_debug() {
+        let candidate = valid_candidate();
+
+        assert!(!format!("{candidate:?}").contains("PRIVATE KEY"));
     }
 }
