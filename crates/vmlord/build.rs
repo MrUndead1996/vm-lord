@@ -11,4 +11,5 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=vmlord.rc");
     println!("cargo:rerun-if-changed=vmlord.manifest");
+    println!("cargo:rerun-if-changed=../../assets/vmlord.ico");
 }

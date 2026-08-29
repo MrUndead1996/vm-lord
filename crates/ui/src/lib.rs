@@ -33,6 +33,11 @@ const VM_TABLE_COLUMN_COUNT: f32 = 9.0;
 
 const BYTES_PER_MIB: f64 = 1024.0 * 1024.0;
 
+fn application_icon() -> egui::IconData {
+    eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/vmlord.png"))
+        .expect("the embedded VMLord icon is a valid PNG")
+}
+
 /// The height a text field in a form claims.
 ///
 /// Stated rather than left at zero: a widget added with no height of its own
@@ -48,7 +53,9 @@ pub fn run(application: WorkspaceApp) -> eframe::Result<()> {
         rust_i18n::set_locale(settings.language.code());
     }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([960.0, 640.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([960.0, 640.0])
+            .with_icon(application_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -3173,6 +3180,15 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn application_icon_decodes_to_rgba_pixels() {
+        let icon = application_icon();
+
+        assert_eq!(icon.width, 256);
+        assert_eq!(icon.height, 256);
+        assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+    }
 
     /// One derived display status, as the application layer hands it over.
     fn display_status(state: DisplayState, message: &str) -> VmDisplayStatus {
