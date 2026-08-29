@@ -120,7 +120,7 @@ impl WindowsEvent {
         match unsafe { WaitForSingleObject(self.0, timeout_ms) } {
             WAIT_OBJECT_0 => Ok(EventWaitResult::Signaled),
             WAIT_TIMEOUT => Ok(EventWaitResult::TimedOut),
-            WAIT_FAILED => Err(windows_error("wait for event", None, Error::from_win32())),
+            WAIT_FAILED => Err(windows_error("wait for event", None, Error::from_thread())),
             result => Err(vmlord_core::RepositoryError::new(format!(
                 "Windows API operation \"wait for event\" returned unexpected status {}",
                 result.0
