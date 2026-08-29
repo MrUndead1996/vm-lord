@@ -4724,7 +4724,7 @@ dependencies = [
  "prost",
  "prost-build",
  "protox",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "subtle",
  "zeroize",
 ]
@@ -4782,7 +4782,7 @@ dependencies = [
  "prost",
  "prost-build",
  "protox",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "subtle",
  "zeroize",
 ]
