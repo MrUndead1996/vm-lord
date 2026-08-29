@@ -441,7 +441,7 @@ fn wait_for_read(
         WAIT_FAILED => Err(windows_error(
             "wait for COM1 read",
             None,
-            Error::from_win32(),
+            Error::from_thread(),
         )),
         result => Err(RepositoryError::new(format!(
             "Windows API operation \"wait for COM1 read\" returned unexpected status {}",
@@ -499,7 +499,7 @@ fn has_exited(process: &OwnedHandle) -> Result<bool, RepositoryError> {
         WAIT_FAILED => Err(windows_error(
             "wait for VMLord process",
             None,
-            Error::from_win32(),
+            Error::from_thread(),
         )),
         result => Err(RepositoryError::new(format!(
             "Windows API operation \"wait for VMLord process\" returned unexpected status {}",

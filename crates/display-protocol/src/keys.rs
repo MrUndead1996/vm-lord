@@ -15,7 +15,7 @@ use std::{error::Error, fmt};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;

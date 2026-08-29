@@ -3047,7 +3047,7 @@ mod tests {
             }
         }
 
-        let document: toml::Value = document.parse().expect("catalogue parses");
+        let document: toml::Value = toml::from_str(document).expect("catalogue parses");
         let mut keys = std::collections::BTreeSet::new();
         walk("", &document, &mut keys);
         keys

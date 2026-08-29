@@ -264,7 +264,7 @@ fn canonical_directory(path: &Path) -> Result<PathBuf, RepositoryError> {
             return Err(windows_error(
                 "resolve a GPU export directory",
                 None,
-                windows::core::Error::from_win32(),
+                windows::core::Error::from_thread(),
             ));
         }
         if length >= buffer.len() {
