@@ -40,6 +40,52 @@ function Require-File {
     }
 }
 
+function Read-PeSubsystem {
+    param([string] $Path)
+
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -lt 64 -or $bytes[0] -ne 0x4d -or $bytes[1] -ne 0x5a) {
+        throw 'not a PE file: missing DOS header'
+    }
+
+    $pe = [BitConverter]::ToInt32($bytes, 0x3c)
+    $optional = $pe + 24
+    $subsystem = $optional + 68
+    if ($pe -lt 0 -or $subsystem + 2 -gt $bytes.Length -or
+        $bytes[$pe] -ne 0x50 -or $bytes[$pe + 1] -ne 0x45 -or
+        $bytes[$pe + 2] -ne 0 -or $bytes[$pe + 3] -ne 0) {
+        throw 'not a PE file: missing PE header'
+    }
+
+    $magic = [BitConverter]::ToUInt16($bytes, $optional)
+    if ($magic -ne 0x10b -and $magic -ne 0x20b) {
+        throw "not a PE file: unknown optional-header magic 0x$($magic.ToString('x'))"
+    }
+
+    [BitConverter]::ToUInt16($bytes, $subsystem)
+}
+
+function Require-PeSubsystem {
+    param(
+        [string] $Relative,
+        [uint16] $Expected,
+        [string] $Name
+    )
+
+    $path = Join-Path $DistDir $Relative
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return
+    }
+    try {
+        $actual = Read-PeSubsystem $path
+        if ($actual -ne $Expected) {
+            $problems.Add("$Relative uses PE subsystem $actual, not $Name ($Expected)")
+        }
+    } catch {
+        $problems.Add("cannot read the PE subsystem from ${Relative}: $($_.Exception.Message)")
+    }
+}
+
 if (-not (Test-Path -LiteralPath $DistDir -PathType Container)) {
     Write-Error "no staged distribution at $DistDir; run ``cargo dist`` first"
     exit 1
@@ -49,6 +95,7 @@ if (-not (Test-Path -LiteralPath $DistDir -PathType Container)) {
 Require-File 'vmlord.exe'
 Require-File 'vmlord-com1.exe'
 Require-File 'vmlord-display.exe'
+Require-PeSubsystem 'vmlord.exe' 2 'Windows GUI'
 # The guest agent, which is copied into the VM rather than run on the host.
 Require-File 'vmlord-agent'
 
