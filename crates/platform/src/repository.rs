@@ -6,6 +6,7 @@
 //! pipeline that already implements it.
 
 use std::{
+    collections::HashMap,
     fs,
     net::IpAddr,
     path::{Path, PathBuf},
@@ -14,10 +15,11 @@ use std::{
 
 use uuid::Uuid;
 use vmlord_core::{
-    AgentStatus, DiagnosticLevel, DisplayProvisioning, DisplaySettings, FileClipboardSettings,
-    GpuAssignment, GpuMode, GuestDisplayReport, GuestReadinessTimeouts, HostGpuCapabilities,
-    NetworkMode, RepositoryError, SshAvailability, SshPort, Subsystem, VmCreateRequest,
-    VmDeleteRequest, VmDisplayFacts, VmRepository, VmState, VmSummary, VmUpdateRequest,
+    AgentStatus, AppSandboxSourceId, AppSandboxVmCandidate, DiagnosticLevel, DisplayProvisioning,
+    DisplaySettings, FileClipboardSettings, GpuAssignment, GpuMode, GuestDisplayReport,
+    GuestReadinessTimeouts, HostGpuCapabilities, NetworkMode, RepositoryError, SshAvailability,
+    SshPort, Subsystem, VmCreateRequest, VmDeleteRequest, VmDisplayFacts, VmRepository, VmState,
+    VmSummary, VmUpdateRequest,
 };
 
 use crate::{
@@ -25,6 +27,7 @@ use crate::{
     VmComputeSystemMapping, VmConnections, VmDeletionPipeline, VmForceStopPipeline,
     VmShutdownPipeline, VmStartPipeline,
     agent::{AgentConnection, AgentSessions},
+    appsandbox::{Discovery, DiscoveryResult, ValidatedSource},
     build::{BuildRegistry, StartedVm},
     cleanup,
     com1_terminal::{Com1Launcher, Com1Sessions},
@@ -64,6 +67,10 @@ pub struct HcsVmRepository {
     client: HcsClient,
     store: MetadataStore,
     storage_root: PathBuf,
+    appsandbox_discovery: Discovery,
+    /// The only resolution from an opaque discovery ID to AppSandbox-owned
+    /// paths. Replaced as one snapshot on every successful discovery.
+    appsandbox_sources: HashMap<AppSandboxSourceId, ValidatedSource>,
     connections: VmConnections,
     events: VmEventSink,
     /// The whole creation cycle -- build, start, wait for the guest -- shared
@@ -144,6 +151,8 @@ impl HcsVmRepository {
             display_runs: display_runs.clone(),
             store: MetadataStore::new(storage_root.join(MAPPING_FILE_NAME)),
             storage_root: storage_root.clone(),
+            appsandbox_discovery: Discovery::default_windows(),
+            appsandbox_sources: HashMap::new(),
             connections: VmConnections::with_events(events.clone()),
             cycle: Arc::new(VmBuildCycle::production(
                 cloud_disk,
@@ -1282,6 +1291,19 @@ impl VmRepository for HcsVmRepository {
         Ok(())
     }
 
+    fn discover_appsandbox_vms(&mut self) -> Result<Vec<AppSandboxVmCandidate>, RepositoryError> {
+        // A failed refresh must not leave an older opaque ID resolving after
+        // the configuration or filesystem observation that produced it is no
+        // longer available.
+        self.appsandbox_sources.clear();
+        let DiscoveryResult {
+            candidates,
+            sources,
+        } = self.appsandbox_discovery.discover()?;
+        self.appsandbox_sources = sources;
+        Ok(candidates)
+    }
+
     /// Accepts the creation of a VM and returns; the VM is built on a thread of
     /// its own and appears in the list as `Building` until it is done.
     ///
@@ -1987,15 +2009,17 @@ fn report_console_failures(sessions: &mut Com1Sessions, storage_root: &Path) {
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
+        fs, io,
+        path::{Path, PathBuf},
         sync::{Arc, Mutex},
     };
 
     use uuid::Uuid;
     use vmlord_core::{
-        AgentStatus, DiagnosticLevel, DisplayProvisioning, GpuMode, GuestDisplayReport,
-        NetworkMode, RepositoryError, SshAuthentication, SshAvailability, SshConfig, SshPort,
-        VmDeleteRequest, VmGpuFacts, VmRepository, VmState, VmSummary, VmUpdateRequest,
+        AgentStatus, AppSandboxCompatibility, DiagnosticLevel, DisplayProvisioning, GpuMode,
+        GuestDisplayReport, NetworkMode, RepositoryError, SshAuthentication, SshAvailability,
+        SshConfig, SshPort, VmDeleteRequest, VmGpuFacts, VmRepository, VmState, VmSummary,
+        VmUpdateRequest,
     };
 
     use super::{
@@ -2058,6 +2082,7 @@ mod tests {
     use crate::{
         Com1Launcher, Com1LogMode, KnownVm, MetadataStore, VmComputeSystemMapping,
         agent::AgentConnection,
+        appsandbox::{Discovery, FileSystem},
         build::BuildRegistry,
         com1_terminal::{Com1Sessions, TerminalCommand},
         hcn_endpoint::EndpointAddress,
@@ -2075,6 +2100,57 @@ mod tests {
                 ))
             }),
         )
+    }
+
+    struct AppSandboxFiles {
+        config: String,
+        disk: PathBuf,
+        key: PathBuf,
+    }
+
+    impl FileSystem for AppSandboxFiles {
+        fn read_to_string(&self, _path: &Path) -> io::Result<String> {
+            Ok(self.config.clone())
+        }
+
+        fn is_file(&self, path: &Path) -> bool {
+            path == self.disk || path == self.key
+        }
+
+        fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+            self.is_file(path)
+                .then(|| path.to_path_buf())
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not found"))
+        }
+    }
+
+    #[test]
+    fn discovers_appsandbox_vms_and_replaces_the_private_source_snapshot() {
+        let root = PathBuf::from(r"C:\ProgramData\AppSandbox");
+        let disk = root.join("ubuntu").join("disk.vhdx");
+        let key = root.join("ssh").join("id_appsandbox");
+        let config = format!(
+            "[VM]\nName=ubuntu\nOsType=Linux\nRamMB=4096\nCpuCores=4\nHddGB=64\n\
+             NetworkMode=1\nGpuMode=1\nAdminUser=ubuntu\nSshEnabled=1\nSshPort=22\n\
+             SshDeployKey=1\nInstallComplete=1\nVhdxPath={}\n",
+            disk.display()
+        );
+        let mut repository = repository();
+        repository.appsandbox_discovery =
+            Discovery::with_file_system(root, Arc::new(AppSandboxFiles { config, disk, key }));
+
+        let candidates = repository.discover_appsandbox_vms().unwrap();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].compatibility,
+            AppSandboxCompatibility::Compatible
+        );
+        assert!(
+            repository
+                .appsandbox_sources
+                .contains_key(&candidates[0].source_id)
+        );
     }
 
     #[test]
