@@ -1,0 +1,11 @@
+[advisories]
+# Low and medium vulnerabilities are below the blocking threshold. Any
+# exception belongs here as a RustSec ID with a justification.
+severity_threshold = "high"
+ignore = []
+
+[output]
+# Informational advisories and yanked crates are reported without turning the
+# High/Critical merge gate into an unrelated maintenance gate.
+deny = []
+quiet = false
