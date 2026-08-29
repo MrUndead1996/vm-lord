@@ -11,6 +11,8 @@ compile_error!("vmlord-platform supports Windows only");
 
 mod agent;
 mod agent_session;
+#[allow(dead_code)] // Discovery consumes this private module in the next import task.
+mod appsandbox;
 mod build;
 mod cleanup;
 mod com1_input;
