@@ -84,6 +84,16 @@ fn every_workflow(document: &Value) -> Vec<String> {
     if permission(document.get("permissions"), "contents").as_deref() != Some("read") {
         problems.push("the workflow's default permissions are not `contents: read`".to_owned());
     }
+    if let Some(permissions) = document.get("permissions").and_then(Value::as_mapping) {
+        for (name, access) in permissions {
+            if access.as_str() == Some("write") {
+                problems.push(format!(
+                    "the workflow grants default `{}: write`; write access must be scoped to one job",
+                    name.as_str().unwrap_or("unknown")
+                ));
+            }
+        }
+    }
     problems
 }
 
@@ -246,6 +256,24 @@ mod tests {
             problems
                 .iter()
                 .any(|problem| problem.contains("default permissions")),
+            "{problems:?}"
+        );
+    }
+
+    /// A named read permission does not make the defaults read-only when a
+    /// second capability is granted write access beside it.
+    #[test]
+    fn the_default_permissions_reject_other_write_capabilities() {
+        let document = parse(
+            "permissions:\n  contents: read\n  security-events: write\njobs:\n  check:\n    steps: []\n",
+        );
+
+        let problems = every_workflow(&document);
+
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("security-events")),
             "{problems:?}"
         );
     }
