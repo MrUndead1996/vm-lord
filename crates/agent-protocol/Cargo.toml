@@ -15,7 +15,7 @@ prost = "0.14"
 # statically against musl with no C toolchain, and a crypto crate that wanted
 # OpenSSL would cost that.
 base64 = "0.23"
-getrandom = "0.3"
+getrandom = "0.4"
 hmac = "0.12"
 sha2 = "0.10"
 # Comparing a tag with `==` leaks where two tags first differ, which is enough

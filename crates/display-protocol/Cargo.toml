@@ -18,7 +18,7 @@ crc32c = "0.6"
 # What `keys` is made of. All pure Rust: the guest side of this protocol ships
 # in a static musl binary built without a C toolchain.
 base64 = "0.23"
-getrandom = "0.3"
+getrandom = "0.4"
 hkdf = "0.12"
 hmac = "0.12"
 sha2 = "0.10"
