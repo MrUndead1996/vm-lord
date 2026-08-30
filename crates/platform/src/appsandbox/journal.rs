@@ -333,6 +333,21 @@ impl ImportJournal {
         Ok(())
     }
 
+    pub(crate) const fn source_fingerprint(&self) -> &SourceFingerprint {
+        &self.source_fingerprint
+    }
+
+    /// Re-reads what another writer of the same journal has confirmed.
+    ///
+    /// The conversion runner advances the confirmed step through the file
+    /// rather than through this value, so whoever holds a copy across a
+    /// conversion has to take the file's word for it afterwards. Writing a
+    /// stale copy back would silently undo a resumable step.
+    pub(crate) fn reload(&mut self) -> Result<(), RepositoryError> {
+        *self = Self::load(self.storage_root.clone(), self.import_id)?;
+        Ok(())
+    }
+
     pub(crate) const fn requested_resources(&self) -> &ImportResources {
         &self.requested_resources
     }

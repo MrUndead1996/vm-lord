@@ -71,6 +71,13 @@ pub(crate) struct ImportWorker {
     journal: ImportJournal,
     progress: ProgressPublisher<AppSandboxImportProgress>,
     actions: ImportWorkerActions,
+    /// Whether a failure before guest conversion must keep what is on disk.
+    ///
+    /// A first attempt owns everything it made and removes all of it. A retry
+    /// runs against a copy the user was shown and asked to keep, so the same
+    /// failure must not silently destroy it -- discarding a retained import is
+    /// a separate command they have to give.
+    retain_on_failure: bool,
     #[cfg(test)]
     after_conversion: Option<Box<dyn Fn() + Send + Sync>>,
 }
@@ -85,9 +92,16 @@ impl ImportWorker {
             journal,
             progress,
             actions,
+            retain_on_failure: false,
             #[cfg(test)]
             after_conversion: None,
         }
+    }
+
+    /// Marks this run as the resumption of an import already retained on disk.
+    pub(crate) const fn resumed(mut self) -> Self {
+        self.retain_on_failure = true;
+        self
     }
 
     #[cfg(test)]
@@ -165,7 +179,14 @@ impl ImportWorker {
         if let Err(error) = self.transition_with_bytes(JournalStage::Converting, &copied, &total) {
             return self.rollback(error, Some(&hcs_id));
         }
-        let identity = match (self.actions.convert)(&bootstrap) {
+        let converted = (self.actions.convert)(&bootstrap);
+        // Whatever the conversion did or did not confirm, it wrote it to the
+        // same journal file. Taking the stale in-memory copy forward would
+        // undo every step a resumption could have skipped.
+        if let Err(error) = self.journal.reload() {
+            tracing::warn!("the import journal could not be re-read after the conversion: {error}");
+        }
+        let identity = match converted {
             Ok(identity) => identity,
             Err(error) => return self.needs_attention(error, None, &copied, &total),
         };
@@ -257,6 +278,13 @@ impl ImportWorker {
     }
 
     fn rollback(&mut self, error: RepositoryError, hcs_id: Option<&str>) -> ImportWorkerOutcome {
+        if self.retain_on_failure {
+            // The copy this run resumed from was already retained once. Only an
+            // explicit discard may remove it.
+            let copied = Cell::new(0);
+            let total = Cell::new(None);
+            return self.needs_attention(error, None, &copied, &total);
+        }
         if let Err(cleanup_error) = (self.actions.rollback)(self.journal.destination(), hcs_id) {
             let error = cleanup::combine_failures(
                 "the AppSandbox import failed before guest conversion and rollback was incomplete",
@@ -613,6 +641,30 @@ mod tests {
             .launch(&mapping, vm_directory, Com1LogMode::Truncate)
             .unwrap();
         StartedVm { mapping, session }
+    }
+
+    #[test]
+    fn a_resumed_run_keeps_the_copy_a_first_attempt_would_have_removed() {
+        // The user was shown this import as needing attention and chose to
+        // retry it. A pre-conversion failure on that retry must leave the copy
+        // exactly where the previous failure left it: discarding is a separate
+        // command.
+        let fixture = Fixture::new("resumed-retain", FailurePoint::BootstrapStart);
+        let journal_path = fixture.journal().path();
+
+        let outcome = fixture.worker().resumed().run(&fixture.monitor);
+
+        assert!(matches!(
+            outcome,
+            ImportWorkerOutcome::NeedsAttention { .. }
+        ));
+        assert!(
+            fixture.cleanup_targets.lock().unwrap().is_empty(),
+            "a resumed run must not roll back the copy it resumed from"
+        );
+        assert!(fixture.destination.exists());
+        assert!(fixture.source.exists());
+        assert!(journal_path.exists());
     }
 
     #[test]

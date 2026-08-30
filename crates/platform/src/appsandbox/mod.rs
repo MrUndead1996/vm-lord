@@ -5,6 +5,7 @@ mod conversion;
 mod copy;
 mod discovery;
 mod journal;
+mod pipeline;
 mod source;
 mod verify;
 mod worker;
@@ -26,6 +27,8 @@ pub(crate) use journal::{
     BootstrapSshFacts, ConversionStep, ImportJournal, ImportJournalDetails, ImportResources,
     JournalStage, SourceFingerprint,
 };
+#[allow(unused_imports)] // Repository wiring consumes the assembled pipeline in Task 9.
+pub(crate) use pipeline::{ImportPipeline, ImportSubject};
 #[cfg(test)]
 pub(crate) use source::SourceFileIdentity;
 pub(crate) use source::ValidatedSource;

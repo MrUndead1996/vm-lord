@@ -50,6 +50,7 @@ mod host_dns;
 mod host_guest_defaults;
 mod hvsocket;
 mod import;
+mod import_registry;
 mod installer;
 mod layout;
 mod metadata;

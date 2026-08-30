@@ -1,0 +1,737 @@
+//! Assembling one import's real side effects out of the production pipelines.
+//!
+//! [`super::worker::ImportWorkerActions`] is a table of seams so that the
+//! rollback/retain decisions can be tested without HCS, HNS, SSH or a large
+//! VHDX. This module is the other half: it fills that table with the things
+//! those seams stand for, and it is the only place that knows both the copy and
+//! the conversion, which is why it -- rather than the repository -- owns the
+//! assembly. `copy_vhdx` is private to this module tree on purpose: nothing
+//! outside it may name an AppSandbox path.
+
+use std::{
+    fs,
+    io::Read,
+    net::{IpAddr, SocketAddr, TcpStream},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+use uuid::Uuid;
+use vmlord_agent_protocol::auth;
+use vmlord_core::{GpuMode, RepositoryError, SshAuthentication, SshConfig, SshEndpoint, SshPort};
+
+use super::{
+    BootstrapRequest, BootstrapSshFacts, ConversionCommand, ConversionRequest, ConversionRunner,
+    ImportBootstrapPipeline, ImportJournal, ImportResources, SecretText, ValidatedSource,
+    Verification, VerificationRequest,
+    copy::{CopyRequest, copy_vhdx},
+    worker::ImportWorkerActions,
+};
+use crate::{
+    cleanup,
+    com1_terminal::Com1Session,
+    create,
+    guest_ready::ReadinessTimeouts,
+    hcs::HCS_ACCESS_ALL,
+    layout,
+    metadata::{MetadataStore, VmComputeSystemMapping},
+    ssh::{self, SshInvocation},
+    start::VmStartPipeline,
+};
+
+/// How often the waits below ask again.
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long one conversion command may take.
+///
+/// Generous because the longest of them installs packages inside the guest,
+/// and short enough that a guest which stopped answering does not hold an
+/// import open for the rest of the session.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// How long the converted guest is given to power itself off before the second
+/// boot takes its compute system apart.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+
+/// How long one second-boot check may take. Each of them asks the guest one
+/// question and expects an immediate answer.
+const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The file name the guest agent is shipped beside VMLord under.
+const AGENT_FILE_NAME: &str = "vmlord-agent";
+
+/// What the second boot has to prove before ordinary metadata may claim it.
+///
+/// Every one of these is a fact about the guest that a *created* VM gets the
+/// same way -- the key VMLord deployed, the unit VMLord installed, and the two
+/// payload shares the host offers and the agent mounts. None of them reads a
+/// payload out of the guest's own disk, because nothing puts one there.
+const SSH_CHECK: &str = "true";
+const AGENT_CHECK: &str = "systemctl is-active vmlord-agent.service";
+const DISPLAY_CHECK: &str = "mountpoint -q /opt/vmlord/display-payload";
+const GPU_CHECK: &str = "mountpoint -q /usr/lib/wsl/lib";
+
+/// One import, as the pipeline needs to know it.
+///
+/// Owned rather than borrowed: every field crosses onto the import's thread.
+pub(crate) struct ImportSubject {
+    pub(crate) vm_name: String,
+    pub(crate) destination: PathBuf,
+    pub(crate) import_id: Uuid,
+    /// The discovered source, when the latest discovery still resolves it.
+    ///
+    /// `None` on a retry taken after a restart: an import whose copy is already
+    /// promoted has nothing left to read from AppSandbox, and refusing it for
+    /// want of a rediscovery would strand recoverable work.
+    pub(crate) source: Option<ValidatedSource>,
+    pub(crate) resources: ImportResources,
+    pub(crate) ssh: BootstrapSshFacts,
+    pub(crate) desired_gpu: GpuMode,
+}
+
+/// Builds the side effects of one import out of the production pipelines.
+pub(crate) struct ImportPipeline {
+    storage_root: PathBuf,
+    store: MetadataStore,
+    bootstrap: Arc<ImportBootstrapPipeline>,
+    start: Arc<VmStartPipeline>,
+    timeouts: ReadinessTimeouts,
+}
+
+impl ImportPipeline {
+    pub(crate) fn new(
+        storage_root: impl Into<PathBuf>,
+        store: MetadataStore,
+        start: Arc<VmStartPipeline>,
+        timeouts: ReadinessTimeouts,
+    ) -> Self {
+        Self {
+            storage_root: storage_root.into(),
+            store,
+            bootstrap: Arc::new(ImportBootstrapPipeline::production()),
+            start,
+            timeouts,
+        }
+    }
+
+    /// Fills the worker's table for `subject`.
+    ///
+    /// Everything that can be refused without touching a disk is refused here,
+    /// before the thread: an import that has no `ssh.exe` to run or no agent to
+    /// install is not going to acquire one halfway through copying eighty
+    /// gigabytes.
+    pub(crate) fn actions(
+        &self,
+        subject: ImportSubject,
+    ) -> Result<ImportWorkerActions, RepositoryError> {
+        let ssh_client = ssh::client_path().ok_or_else(|| {
+            RepositoryError::new(
+                "importing an AppSandbox VM needs Windows OpenSSH, and ssh.exe could not be found",
+            )
+        })?;
+        let scp_client = ssh::copy_client_path().ok_or_else(|| {
+            RepositoryError::new(
+                "importing an AppSandbox VM needs Windows OpenSSH, and scp.exe could not be found",
+            )
+        })?;
+        let agent_binary = agent_binary_path()?;
+
+        let storage_root = self.storage_root.clone();
+        let store = self.store.clone();
+        let bootstrap_pipeline = Arc::clone(&self.bootstrap);
+        let start = Arc::clone(&self.start);
+        let timeouts = self.timeouts;
+
+        let ImportSubject {
+            vm_name,
+            destination,
+            import_id,
+            source,
+            resources,
+            ssh: bootstrap_ssh,
+            desired_gpu,
+        } = subject;
+        let source_disk_path = source
+            .as_ref()
+            .map_or_else(PathBuf::new, |source| source.source_disk.clone());
+
+        let staging = layout::import_staging_directory(&storage_root, import_id);
+        let staged_disk = staging.join("system.vhdx");
+        let transcript = layout::import_transcript_path(&staging);
+        let bundle_directory = staging.join("bundle");
+        let final_disk = layout::system_disk_path(&destination);
+
+        // The first boot's console. Held here rather than on `BootstrapVm`,
+        // which is what the worker's seams pass around: dropping a session is
+        // what cancels its reader, and the reader has to live until the guest
+        // it is reading from is shut down for the second boot.
+        let bootstrap_console: Arc<Mutex<Option<Com1Session>>> = Arc::new(Mutex::new(None));
+
+        Ok(ImportWorkerActions {
+            copy: {
+                let source = source.clone();
+                let disk_path = source_disk_path.clone();
+                let staged_disk = staged_disk.clone();
+                let final_disk = final_disk.clone();
+                Box::new(move |cancel, publish| {
+                    if final_disk.is_file() {
+                        // A resumed import: the copy this run would make is
+                        // already promoted, and remaking it would overwrite the
+                        // guest the conversion has been changing.
+                        tracing::info!(
+                            "the copied disk of this import is already in place at {}",
+                            final_disk.display()
+                        );
+                        return Ok(());
+                    }
+                    fs::create_dir_all(&staging).map_err(|error| {
+                        RepositoryError::new(format!(
+                            "failed to create the import staging directory {}: {error}",
+                            staging.display()
+                        ))
+                    })?;
+                    if staged_disk.exists() {
+                        // A previous attempt was interrupted mid-copy. Its
+                        // bytes are unverifiable, and the copy refuses to write
+                        // over an existing staging file.
+                        fs::remove_file(&staged_disk).map_err(|error| {
+                            RepositoryError::new(format!(
+                                "failed to remove the partial import staging disk {}: {error}",
+                                staged_disk.display()
+                            ))
+                        })?;
+                    }
+                    let Some(source) = source.as_ref() else {
+                        return Err(RepositoryError::new(format!(
+                            "the AppSandbox VM at {} is no longer among the discovered sources, \
+                             so its disk cannot be copied; discover AppSandbox VMs again and \
+                             retry",
+                            disk_path.display()
+                        )));
+                    };
+                    copy_vhdx(CopyRequest {
+                        source,
+                        target: &staged_disk,
+                        cancel,
+                        publish,
+                    })
+                    .map(drop)
+                })
+            },
+            promote: {
+                let staged_disk = staged_disk.clone();
+                let final_disk = final_disk.clone();
+                Box::new(move || {
+                    if final_disk.is_file() {
+                        return Ok(());
+                    }
+                    let disks = final_disk.parent().ok_or_else(|| {
+                        RepositoryError::new("the imported system disk has no parent directory")
+                    })?;
+                    fs::create_dir_all(disks).map_err(|error| {
+                        RepositoryError::new(format!(
+                            "failed to create the VM disk directory {}: {error}",
+                            disks.display()
+                        ))
+                    })?;
+                    fs::rename(&staged_disk, &final_disk).map_err(|error| {
+                        RepositoryError::new(format!(
+                            "failed to move the copied disk into {}: {error}",
+                            final_disk.display()
+                        ))
+                    })
+                })
+            },
+            bootstrap: {
+                let store = store.clone();
+                let vm_name = vm_name.clone();
+                let destination = destination.clone();
+                let resources = resources.clone();
+                let bootstrap_ssh = bootstrap_ssh.clone();
+                Box::new(move || {
+                    // A resumed import finds its own previous compute system
+                    // registered. The disk is the expensive half of an import
+                    // and the system is the cheap one, so the system is
+                    // rebuilt rather than adopted: nothing here has to reason
+                    // about what state a half-configured system was left in.
+                    discard_previous_bootstrap(&store, &vm_name)?;
+                    bootstrap_pipeline.create(
+                        &store,
+                        &BootstrapRequest {
+                            vm_name: &vm_name,
+                            vm_directory: &destination,
+                            resources: &resources,
+                            ssh: &bootstrap_ssh,
+                        },
+                    )
+                })
+            },
+            start_bootstrap: {
+                let store = store.clone();
+                let start = Arc::clone(&start);
+                let destination = destination.clone();
+                let console = Arc::clone(&bootstrap_console);
+                Box::new(move |bootstrap| {
+                    let started = start.start_mapping(&store, &bootstrap.mapping, &destination)?;
+                    // The endpoint the start took is how the address is found
+                    // below, so it travels back with the bootstrap rather than
+                    // being read out of the store again.
+                    bootstrap.mapping = started.mapping;
+                    *console
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(started.session);
+                    Ok(())
+                })
+            },
+            convert: {
+                let storage_root = storage_root.clone();
+                let destination = destination.clone();
+                let source_key = source.as_ref().map(|source| source.private_key.clone());
+                let ssh_client = ssh_client.clone();
+                let scp_client = scp_client.clone();
+                let bootstrap_ssh = bootstrap_ssh.clone();
+                Box::new(move |bootstrap| {
+                    let endpoint = wait_for_guest(&bootstrap.mapping, &bootstrap_ssh, &timeouts)?;
+                    let secret = agent_secret(&destination)?;
+                    let public_key = fs::read_to_string(layout::ssh_public_key_path(&destination))
+                        .map_err(|error| {
+                            RepositoryError::new(format!(
+                                "failed to read the imported VM's own public key: {error}"
+                            ))
+                        })?;
+                    // Reloaded rather than shared: the runner advances the
+                    // confirmed conversion step through the same file the
+                    // worker writes its stages into, and the worker reloads it
+                    // afterwards.
+                    let Some(source_key) = source_key.as_ref() else {
+                        return Err(RepositoryError::new(
+                            "converting the copied guest needs the AppSandbox key of its source, \
+                             which the latest discovery no longer resolves; discover AppSandbox \
+                             VMs again and retry",
+                        ));
+                    };
+                    let mut journal = ImportJournal::load(&storage_root, import_id)?;
+                    let transcript = transcript.clone();
+                    let report = ConversionRunner::new(
+                        ConversionRequest {
+                            endpoint: &endpoint,
+                            vm_directory: &destination,
+                            ssh_client: &ssh_client,
+                            scp_client: &scp_client,
+                            bootstrap_key: source_key,
+                            staging_directory: &bundle_directory,
+                            agent_binary: &agent_binary,
+                            vmlord_public_key: public_key.trim(),
+                            agent_secret: &secret,
+                        },
+                        &mut journal,
+                        Box::new(move |command: &ConversionCommand| {
+                            run_remote(&command.invocation, &transcript, COMMAND_TIMEOUT)
+                        }),
+                    )
+                    .run()?;
+                    Ok(report.identity)
+                })
+            },
+            restart: {
+                let store = store.clone();
+                let start = Arc::clone(&start);
+                let destination = destination.clone();
+                let console = Arc::clone(&bootstrap_console);
+                Box::new(move |mapping| {
+                    // The conversion's last command asked the guest to power
+                    // off. Its console is released and its compute system taken
+                    // apart before the second one is built, because HCS holds
+                    // one system per identifier and the second boot's Plan9
+                    // sections are fixed for the lifetime of a boot.
+                    console
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .take();
+                    wait_for_shutdown(&mapping.hcs_compute_system_id)?;
+                    start.start_mapping(&store, &mapping, &destination)
+                })
+            },
+            verify: {
+                let destination = destination.clone();
+                let ssh_client = ssh_client.clone();
+                let desktop_profile = resources.desktop_profile;
+                Box::new(move |started| {
+                    let checks = GuestChecks {
+                        mapping: started.mapping.clone(),
+                        vm_directory: destination.clone(),
+                        client: ssh_client.clone(),
+                        timeouts,
+                    };
+                    Verification::new(
+                        checks.check("SSH", SSH_CHECK),
+                        checks.check("the VMLord agent", AGENT_CHECK),
+                        checks.check("the display payload", DISPLAY_CHECK),
+                        checks.check("the GPU payload", GPU_CHECK),
+                    )
+                    .run(VerificationRequest {
+                        desktop_profile,
+                        gpu_mode: desired_gpu,
+                    })
+                })
+            },
+            finalize: {
+                let store = store.clone();
+                Box::new(move |mapping| store.insert(mapping.clone()))
+            },
+            rollback: Box::new(move |destination, hcs_id| {
+                let mut failures = Vec::new();
+                if let Some(hcs_id) = hcs_id
+                    && let Err(error) = cleanup::teardown_compute_system(hcs_id)
+                {
+                    failures.push(error.to_string());
+                }
+                if let Some(hcs_id) = hcs_id
+                    && let Err(error) = forget_mapping(&store, hcs_id)
+                {
+                    failures.push(error.to_string());
+                }
+                if let Err(error) = cleanup::remove_vm_directory(destination) {
+                    failures.push(error.to_string());
+                }
+                if failures.is_empty() {
+                    Ok(())
+                } else {
+                    Err(cleanup::combine_failures(
+                        "the AppSandbox import could not be rolled back completely",
+                        failures,
+                    ))
+                }
+            }),
+        })
+    }
+}
+
+/// The four second-boot checks, which differ only in what they ask.
+struct GuestChecks {
+    mapping: VmComputeSystemMapping,
+    vm_directory: PathBuf,
+    client: PathBuf,
+    timeouts: ReadinessTimeouts,
+}
+
+impl GuestChecks {
+    fn check(
+        &self,
+        what: &'static str,
+        command: &'static str,
+    ) -> impl Fn() -> Result<(), RepositoryError> + Send + Sync + use<> {
+        let mapping = self.mapping.clone();
+        let vm_directory = self.vm_directory.clone();
+        let client = self.client.clone();
+        let timeouts = self.timeouts;
+        move || {
+            let Some(config) = mapping.ssh.clone() else {
+                return Err(RepositoryError::new(
+                    "the imported VM has no SSH configuration to verify it with",
+                ));
+            };
+            let address = wait_for_address(&mapping, &timeouts)?;
+            wait_for_port(address, config.port.get(), &timeouts)?;
+            let endpoint = SshEndpoint::new(mapping.vm_id, &config, address)?;
+            let invocation = ssh::invocation(
+                &client,
+                &endpoint,
+                &vm_directory,
+                Some(timeouts.connect),
+                Some(command),
+            );
+            let transcript = layout::ssh_port_log_path(&vm_directory);
+            let answer = run_remote(&invocation, &transcript, CHECK_TIMEOUT);
+            answer.map(drop).map_err(|error| {
+                RepositoryError::new(format!(
+                    "the imported VM \"{}\" did not answer for {what}: {error}",
+                    mapping.vm_name
+                ))
+            })
+        }
+    }
+}
+
+/// Where the guest agent is shipped, beside VMLord itself.
+fn agent_binary_path() -> Result<PathBuf, RepositoryError> {
+    let executable = std::env::current_exe().map_err(|error| {
+        RepositoryError::new(format!(
+            "cannot locate the VMLord executable to find {AGENT_FILE_NAME}: {error}"
+        ))
+    })?;
+    let agent = executable.with_file_name(AGENT_FILE_NAME);
+    if !agent.is_file() {
+        return Err(RepositoryError::new(format!(
+            "the guest agent is not installed beside VMLord at {}, so an imported VM could not \
+             be given one",
+            agent.display()
+        )));
+    }
+    Ok(agent)
+}
+
+/// The agent secret for this VM: the one already minted, or a new one.
+///
+/// Read back rather than reminted on a resumed import, because the guest may
+/// already be holding the first one and a VM's secret lives as long as the VM.
+fn agent_secret(vm_directory: &Path) -> Result<SecretText, RepositoryError> {
+    let path = layout::agent_secret_path(vm_directory);
+    if let Ok(existing) = fs::read_to_string(&path) {
+        let trimmed = existing.trim();
+        if !trimmed.is_empty() {
+            return Ok(SecretText::new(trimmed));
+        }
+    }
+    let secret = auth::Secret::generate().to_base64();
+    create::write_restricted(
+        &path,
+        format!("{}\n", secret.as_str()).as_bytes(),
+        "the agent secret",
+    )?;
+    Ok(SecretText::new(secret.as_str()))
+}
+
+/// Removes whatever a previous attempt at this import registered.
+fn discard_previous_bootstrap(store: &MetadataStore, vm_name: &str) -> Result<(), RepositoryError> {
+    let Some(previous) = store.find_by_vm_name(vm_name)? else {
+        return Ok(());
+    };
+    tracing::info!(
+        "taking apart the previous bootstrap compute system \"{}\" of import \"{vm_name}\"",
+        previous.hcs_compute_system_id
+    );
+    cleanup::teardown_compute_system(&previous.hcs_compute_system_id)?;
+    store.remove(previous.vm_id)
+}
+
+/// Removes the mapping that names `hcs_id`, if the store still has one.
+fn forget_mapping(store: &MetadataStore, hcs_id: &str) -> Result<(), RepositoryError> {
+    match store.find_by_hcs_id(hcs_id)? {
+        Some(mapping) => store.remove(mapping.vm_id),
+        None => Ok(()),
+    }
+}
+
+/// The bootstrap session's endpoint, once the copied guest answers on it.
+fn wait_for_guest(
+    mapping: &VmComputeSystemMapping,
+    ssh: &BootstrapSshFacts,
+    timeouts: &ReadinessTimeouts,
+) -> Result<SshEndpoint, RepositoryError> {
+    let port = SshPort::new(ssh.port)?;
+    let address = wait_for_address(mapping, timeouts)?;
+    wait_for_port(address, port.get(), timeouts)?;
+    SshEndpoint::new(
+        mapping.vm_id,
+        &SshConfig {
+            username: ssh.username.clone(),
+            port,
+            // The AppSandbox key is handed to each invocation explicitly, so
+            // this field never decides which credential is offered.
+            authentication: SshAuthentication::VmlordKey,
+        },
+        address,
+    )
+}
+
+fn wait_for_address(
+    mapping: &VmComputeSystemMapping,
+    timeouts: &ReadinessTimeouts,
+) -> Result<IpAddr, RepositoryError> {
+    let deadline = Instant::now() + timeouts.address;
+    loop {
+        match ssh::guest_address(mapping) {
+            Ok(Some(address)) => return Ok(address),
+            Ok(None) => {}
+            Err(error) => tracing::debug!(
+                "the address of VM \"{}\" is not readable yet: {error}",
+                mapping.vm_name
+            ),
+        }
+        if Instant::now() >= deadline {
+            return Err(RepositoryError::new(format!(
+                "VM \"{}\" was never given an address",
+                mapping.vm_name
+            )));
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+fn wait_for_port(
+    address: IpAddr,
+    port: u16,
+    timeouts: &ReadinessTimeouts,
+) -> Result<(), RepositoryError> {
+    let deadline = Instant::now() + timeouts.ssh_port;
+    // Deliberately uninitialised: the only way out of this loop that reads it
+    // is one that has probed at least once and been refused.
+    let mut last_error;
+    loop {
+        match TcpStream::connect_timeout(&SocketAddr::new(address, port), timeouts.connect) {
+            Ok(_) => return Ok(()),
+            Err(error) => last_error = error.to_string(),
+        }
+        if Instant::now() >= deadline {
+            return Err(RepositoryError::new(format!(
+                "nothing answered at {address}:{port}: {last_error}"
+            )));
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Waits for a converted guest to finish powering itself off, then makes sure
+/// its compute system is gone.
+fn wait_for_shutdown(hcs_compute_system_id: &str) -> Result<(), RepositoryError> {
+    let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+    loop {
+        match crate::HcsSystem::open_if_present(hcs_compute_system_id, HCS_ACCESS_ALL) {
+            Ok(None) => return Ok(()),
+            Ok(Some(_)) => {}
+            Err(error) => tracing::debug!(
+                "the state of compute system \"{hcs_compute_system_id}\" is not readable: {error}"
+            ),
+        }
+        if Instant::now() >= deadline {
+            // The guest was asked to shut down and did not. Taking the system
+            // apart is what the second boot needs, and the disk it leaves is
+            // the one the conversion already finished writing.
+            tracing::warn!(
+                "the converted guest of compute system \"{hcs_compute_system_id}\" did not power \
+                 itself off; taking its compute system apart"
+            );
+            return cleanup::teardown_compute_system(hcs_compute_system_id);
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// Runs one remote command and answers with what it printed.
+///
+/// The output goes through a file rather than a pipe, like every other remote
+/// command in VMLord: it is what a person reads when a guest refuses something
+/// nobody was watching it refuse, and a file survives the process that wrote
+/// it.
+fn run_remote(
+    invocation: &SshInvocation,
+    transcript: &Path,
+    timeout: Duration,
+) -> Result<String, RepositoryError> {
+    if let Some(parent) = transcript.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            RepositoryError::new(format!(
+                "failed to create the import transcript directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    let output = fs::File::create(transcript).map_err(|error| {
+        RepositoryError::new(format!(
+            "failed to open the import transcript {}: {error}",
+            transcript.display()
+        ))
+    })?;
+    let errors = output.try_clone().map_err(|error| {
+        RepositoryError::new(format!(
+            "failed to capture the errors of an import command: {error}"
+        ))
+    })?;
+
+    tracing::debug!("running {}", invocation.command_line());
+    let mut child = spawn(invocation, output, errors)?;
+
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let printed = read_transcript(transcript);
+                return if status.success() {
+                    Ok(printed)
+                } else {
+                    Err(RepositoryError::new(format!(
+                        "the guest command failed with status {}: {}",
+                        status
+                            .code()
+                            .map_or_else(|| "unknown".to_owned(), |code| code.to_string()),
+                        printed.trim()
+                    )))
+                };
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(RepositoryError::new(format!(
+                    "failed to wait for an import command: {error}"
+                )));
+            }
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(RepositoryError::new(format!(
+                "the guest did not answer within {} seconds: {}",
+                timeout.as_secs(),
+                read_transcript(transcript).trim()
+            )));
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
+}
+
+#[cfg(windows)]
+fn spawn(
+    invocation: &SshInvocation,
+    output: fs::File,
+    errors: fs::File,
+) -> Result<std::process::Child, RepositoryError> {
+    use std::os::windows::process::CommandExt;
+
+    /// No console window for a command nobody asked to watch.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    Command::new(&invocation.program)
+        .args(&invocation.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(output))
+        .stderr(Stdio::from(errors))
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|error| {
+            RepositoryError::new(format!(
+                "failed to run {}: {error}",
+                invocation.program.display()
+            ))
+        })
+}
+
+#[cfg(not(windows))]
+fn spawn(
+    invocation: &SshInvocation,
+    output: fs::File,
+    errors: fs::File,
+) -> Result<std::process::Child, RepositoryError> {
+    Command::new(&invocation.program)
+        .args(&invocation.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(output))
+        .stderr(Stdio::from(errors))
+        .spawn()
+        .map_err(|error| {
+            RepositoryError::new(format!(
+                "failed to run {}: {error}",
+                invocation.program.display()
+            ))
+        })
+}
+
+/// What a command printed, or an empty answer when the file cannot be read.
+fn read_transcript(transcript: &Path) -> String {
+    let mut text = String::new();
+    if let Ok(mut file) = fs::File::open(transcript) {
+        let _ = file.read_to_string(&mut text);
+    }
+    text
+}

@@ -15,9 +15,10 @@ use std::{
 
 use uuid::Uuid;
 use vmlord_core::{
-    AgentStatus, AppSandboxSourceId, AppSandboxVmCandidate, DiagnosticLevel, DisplayProvisioning,
-    DisplaySettings, FileClipboardSettings, GpuAssignment, GpuMode, GuestDisplayReport,
-    GuestReadinessTimeouts, HostGpuCapabilities, NetworkMode, RepositoryError, SshAvailability,
+    AgentStatus, AppSandboxCompatibility, AppSandboxImportRequest, AppSandboxSourceId,
+    AppSandboxVmCandidate, DesktopProfile, DiagnosticLevel, DisplayProvisioning, DisplaySettings,
+    FileClipboardSettings, GpuAssignment, GpuMode, GuestDisplayReport, GuestReadinessTimeouts,
+    HostGpuCapabilities, IncompleteAppSandboxImport, NetworkMode, RepositoryError, SshAvailability,
     SshPort, Subsystem, VmCreateRequest, VmDeleteRequest, VmDisplayFacts, VmRepository, VmState,
     VmSummary, VmUpdateRequest,
 };
@@ -27,7 +28,11 @@ use crate::{
     VmComputeSystemMapping, VmConnections, VmDeletionPipeline, VmForceStopPipeline,
     VmShutdownPipeline, VmStartPipeline,
     agent::{AgentConnection, AgentSessions},
-    appsandbox::{Discovery, DiscoveryResult, ValidatedSource},
+    appsandbox::{
+        BootstrapSshFacts, Discovery, DiscoveryResult, ImportJournal, ImportJournalDetails,
+        ImportPipeline, ImportResources, ImportSubject, ImportWorker, SourceFingerprint,
+        ValidatedSource,
+    },
     build::{BuildRegistry, StartedVm},
     cleanup,
     com1_terminal::{Com1Launcher, Com1Sessions},
@@ -41,6 +46,7 @@ use crate::{
     hcn_endpoint::{EndpointAddress, HcnEndpoint},
     hcs::{HCS_ACCESS_ALL, HcsSystemState},
     hcs_config::{self, VmTopology},
+    import_registry::{ImportListing, ImportRegistry},
     layout, list_known_vms,
     reconnect::{ReconnectOutcome, reconnect_known_vms},
     run_recovery,
@@ -83,6 +89,11 @@ pub struct HcsVmRepository {
     display_settings: DisplaySettings,
     /// The VMs being created right now.
     builds: Arc<BuildRegistry>,
+    /// The VMs being imported from AppSandbox right now.
+    imports: Arc<ImportRegistry>,
+    /// Assembles the side effects of one import. Built once, because it holds
+    /// the same start pipeline and metadata store every import runs against.
+    import_pipeline: Arc<ImportPipeline>,
     /// Starts VMs. Shared rather than owned because a start now runs on a
     /// thread of its own.
     start: Arc<VmStartPipeline>,
@@ -146,10 +157,27 @@ impl HcsVmRepository {
         // what they did to a VM's GPU in it, and they have to be the same one.
         let gpu_runs = GpuRuns::default();
         let display_runs = DisplayRuns::default();
+        let store = MetadataStore::new(storage_root.join(MAPPING_FILE_NAME));
+        // Built before the struct because the import pipeline starts its
+        // second boot through the very same pipeline every other start uses.
+        let start = Arc::new(
+            VmStartPipeline::production(com1_launcher.clone()).for_vms_under(
+                &storage_root,
+                gpu_runs.clone(),
+                display_runs.clone(),
+            ),
+        );
         Self {
+            import_pipeline: Arc::new(ImportPipeline::new(
+                &storage_root,
+                store.clone(),
+                Arc::clone(&start),
+                ReadinessTimeouts::default(),
+            )),
+            imports: Arc::new(ImportRegistry::default()),
             client: HcsClient::new(),
             display_runs: display_runs.clone(),
-            store: MetadataStore::new(storage_root.join(MAPPING_FILE_NAME)),
+            store,
             storage_root: storage_root.clone(),
             appsandbox_discovery: Discovery::default_windows(),
             appsandbox_sources: HashMap::new(),
@@ -166,13 +194,7 @@ impl HcsVmRepository {
             file_clipboard: FileClipboardSettings::default(),
             display_settings: DisplaySettings::default(),
             builds: Arc::new(BuildRegistry::default()),
-            start: Arc::new(
-                VmStartPipeline::production(com1_launcher.clone()).for_vms_under(
-                    &storage_root,
-                    gpu_runs.clone(),
-                    display_runs.clone(),
-                ),
-            ),
+            start,
             starts: Arc::new(StartRegistry::default()),
             com1_launcher,
             com1_sessions: Com1Sessions::default(),
@@ -226,6 +248,154 @@ impl HcsVmRepository {
     pub fn with_display_settings(mut self, settings: DisplaySettings) -> Self {
         self.display_settings = settings;
         self
+    }
+
+    /// Claims `name` for a VM that does not exist yet, and answers with the
+    /// directory it will be made in.
+    ///
+    /// One check for both ways a VM comes into being. A build and an import
+    /// write the same metadata document and the same directory, so a name held
+    /// by either is a name neither may take -- and a directory that is already
+    /// there is refused whichever of them is asking, because nothing here may
+    /// write into a directory it did not make.
+    fn reserve_vm_name(&self, name: &str) -> Result<PathBuf, RepositoryError> {
+        if self.store.find_by_vm_name(name)?.is_some()
+            || self.builds.contains(name)
+            || self.imports.contains(name)
+        {
+            let error = RepositoryError::new(format!("VM \"{name}\" already exists"));
+            tracing::error!("{error}");
+            return Err(error);
+        }
+        let vm_directory = layout::vm_directory(&self.storage_root, name)?;
+        if vm_directory.exists() {
+            let error = RepositoryError::new(format!(
+                "VM directory already exists: {}",
+                vm_directory.display()
+            ));
+            tracing::error!("{error}");
+            return Err(error);
+        }
+        Ok(vm_directory)
+    }
+
+    /// The durable journal of the incomplete import called `destination_name`.
+    ///
+    /// Named by the VM the user sees rather than by the identifier the journal
+    /// is filed under: the identifier is platform-private, and the application
+    /// layer has only ever been given the name.
+    fn incomplete_import(&self, destination_name: &str) -> Result<ImportJournal, RepositoryError> {
+        ImportJournal::list(&self.storage_root)?
+            .into_iter()
+            .find(|journal| import_destination_name(journal).as_deref() == Some(destination_name))
+            .ok_or_else(|| {
+                let error = RepositoryError::new(format!(
+                    "there is no incomplete AppSandbox import called \"{destination_name}\""
+                ));
+                tracing::error!("{error}");
+                error
+            })
+    }
+
+    /// Runs one import journal on a thread of its own.
+    ///
+    /// The same call for a first attempt and for a retry, because they differ
+    /// in exactly one thing: whether a failure before the guest was changed may
+    /// remove what is on disk. A first attempt owns everything it made; a retry
+    /// runs against a copy the user was shown and asked to keep.
+    fn run_import(
+        &self,
+        request: AppSandboxImportRequest,
+        listing: ImportListing,
+        journal: ImportJournal,
+        source: Option<ValidatedSource>,
+        resumed: bool,
+    ) -> Result<(), RepositoryError> {
+        let actions = self.import_pipeline.actions(ImportSubject {
+            vm_name: request.destination_name.clone(),
+            destination: journal.destination().to_path_buf(),
+            import_id: journal.import_id(),
+            source,
+            resources: journal.requested_resources().clone(),
+            ssh: journal.bootstrap_ssh().clone(),
+            desired_gpu: journal.desired_gpu(),
+        })?;
+        self.imports
+            .start(request, listing, move |monitor, progress| {
+                let worker = ImportWorker::new(journal, progress.clone(), actions);
+                if resumed {
+                    worker.resumed().run(monitor)
+                } else {
+                    worker.run(monitor)
+                }
+            })
+    }
+
+    /// The discovered candidate behind an opaque identity, refused unless it is
+    /// still importable.
+    ///
+    /// Re-evaluated rather than trusted from when the user chose it: the list
+    /// they picked from may be minutes old, and a source that started running
+    /// since is one this must not copy.
+    fn importable_candidate(
+        &mut self,
+        source_id: &AppSandboxSourceId,
+    ) -> Result<AppSandboxVmCandidate, RepositoryError> {
+        let candidate = self
+            .appsandbox_discovery
+            .discover()?
+            .candidates
+            .into_iter()
+            .find(|candidate| &candidate.source_id == source_id)
+            .ok_or_else(|| {
+                let error = RepositoryError::new(
+                    "that AppSandbox VM is no longer there; discover AppSandbox VMs again and \
+                     retry",
+                );
+                tracing::error!("{error}");
+                error
+            })?;
+        if candidate.compatibility != AppSandboxCompatibility::Compatible {
+            let error = RepositoryError::new(format!(
+                "the AppSandbox VM \"{}\" cannot be imported as it is now",
+                candidate.name
+            ));
+            tracing::error!("{error}");
+            return Err(error);
+        }
+        candidate.validate()?;
+        Ok(candidate)
+    }
+
+    /// Tells the user about every import a previous process left unfinished.
+    ///
+    /// Reported rather than resumed: an import that stopped may have stopped
+    /// because the guest refused something, and taking it further without being
+    /// asked would change a guest nobody is watching.
+    fn report_incomplete_imports(&self) {
+        let journals = match ImportJournal::list(&self.storage_root) {
+            Ok(journals) => journals,
+            Err(error) => {
+                tracing::warn!("the incomplete AppSandbox imports could not be listed: {error}");
+                return;
+            }
+        };
+        for journal in journals {
+            let Some(name) = import_destination_name(&journal) else {
+                tracing::warn!(
+                    "the import journal at {} names no VM directory and is ignored",
+                    journal.path().display()
+                );
+                continue;
+            };
+            vmlord_core::diagnostic!(
+                Warning,
+                Subsystem::Hcs,
+                vm = name.as_str(),
+                "The AppSandbox import of VM \"{name}\" did not finish; it is kept for you to \
+                 retry or discard."
+            );
+        }
     }
 
     fn require_initialized(&self) -> Result<(), RepositoryError> {
@@ -1072,6 +1242,34 @@ impl HcsVmRepository {
 ///
 /// A build that failed rolled itself back and never reached the store, so its
 /// row simply stops being here.
+/// The VM name an import journal's destination directory spells.
+///
+/// `None` for a destination that is not one directory under the storage root,
+/// which is a journal nothing may act on: the containment check refuses it, and
+/// listing it would offer the user a retry that could only fail.
+fn import_destination_name(journal: &ImportJournal) -> Option<String> {
+    journal
+        .destination()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+}
+
+/// Adds the imports in flight to what the store and HCS already know.
+///
+/// Same rule as a build's, for the same reason: an import that has just written
+/// ordinary metadata is in the store *and* in the registry until the next reap,
+/// and the row the user should see is the one that is still moving.
+fn merge_with_imports(known: Vec<VmSummary>, imports: &ImportRegistry) -> Vec<VmSummary> {
+    let importing = imports.summaries();
+    let mut summaries: Vec<VmSummary> = known
+        .into_iter()
+        .filter(|vm| !importing.iter().any(|import| import.name == vm.name))
+        .collect();
+    summaries.extend(importing);
+    summaries
+}
+
 fn merge_with_builds(known: Vec<VmSummary>, builds: &BuildRegistry) -> Vec<VmSummary> {
     let building = builds.summaries();
     let mut summaries: Vec<VmSummary> = known
@@ -1250,6 +1448,11 @@ impl VmRepository for HcsVmRepository {
         // A VM that survived the previous VMLord process is still writing to
         // its serial port, so its console comes back -- appending, because the
         // log of the boot it is in the middle of is the same log.
+        // After the metadata and before the enumeration below: an import that
+        // did not finish has a directory and may have a registered compute
+        // system, and both would otherwise be listed as an ordinary healthy VM
+        // that nothing ever verified.
+        self.report_incomplete_imports();
         let known = list_known_vms(&self.client, &self.store)?;
         for failure in launch_running_consoles(
             &self.com1_launcher,
@@ -1304,6 +1507,193 @@ impl VmRepository for HcsVmRepository {
         Ok(candidates)
     }
 
+    /// Accepts an import and returns; the VM is copied, converted and verified
+    /// on a thread of its own and appears in the list as building until it is
+    /// done.
+    ///
+    /// Everything that can be refused cheaply is refused here, before the
+    /// thread and before the first byte is copied: an opaque identity the
+    /// latest discovery does not resolve, a source that is not importable, a
+    /// name something else already holds.
+    fn start_appsandbox_import(
+        &mut self,
+        request: AppSandboxImportRequest,
+    ) -> Result<(), RepositoryError> {
+        let _span = tracing::info_span!(
+            "start_appsandbox_import",
+            vm = request.destination_name.as_str()
+        )
+        .entered();
+        self.require_initialized()?;
+        request.validate()?;
+
+        let candidate = self.importable_candidate(&request.source_id)?;
+        let source = self
+            .appsandbox_sources
+            .get(&request.source_id)
+            .cloned()
+            .ok_or_else(|| {
+                let error = RepositoryError::new(
+                    "that AppSandbox VM is not among the discovered sources; discover AppSandbox \
+                     VMs again and retry",
+                );
+                tracing::error!("{error}");
+                error
+            })?;
+        let destination = self.reserve_vm_name(&request.destination_name)?;
+
+        let listing = ImportListing {
+            ram_mb: candidate.ram_mb,
+            cpu_cores: candidate.cpu_cores,
+            disk_gb: candidate.disk_gb,
+            desktop_profile: DesktopProfile::Gnome,
+            network_mode: NetworkMode::Nat,
+        };
+        // Durable before anything is copied: an import that cannot record what
+        // it is about to do is an import nothing could recover.
+        let journal = ImportJournal::create(
+            &self.storage_root,
+            ImportJournalDetails {
+                import_id: Uuid::new_v4(),
+                source_fingerprint: SourceFingerprint {
+                    source_id: request.source_id.clone(),
+                    disk_path: source.source_disk.clone(),
+                    vm_ordinal: source.vm_ordinal,
+                },
+                destination,
+                requested_resources: ImportResources {
+                    ram_mb: candidate.ram_mb,
+                    cpu_cores: candidate.cpu_cores,
+                    disk_gb: candidate.disk_gb,
+                    // An AppSandbox Linux VM is a desktop guest, which is what
+                    // makes it worth importing rather than recreating.
+                    desktop_profile: DesktopProfile::Gnome,
+                },
+                desired_gpu: candidate.gpu_mode,
+                bootstrap_ssh: BootstrapSshFacts {
+                    username: candidate.ssh_user.clone(),
+                    port: candidate.ssh_port,
+                },
+            },
+        )?;
+
+        self.run_import(request, listing, journal, Some(source), false)
+    }
+
+    fn cancel_appsandbox_import(&mut self, destination_name: &str) -> Result<(), RepositoryError> {
+        self.require_initialized()?;
+        self.imports.cancel(destination_name)
+    }
+
+    /// The imports retained on disk for an explicit retry or discard.
+    ///
+    /// Read from the journals rather than from memory: a retained import is
+    /// exactly one that outlived the process that made it, and the file is the
+    /// only thing that did. An import still running is not one of these -- it
+    /// is in the VM list as building.
+    fn incomplete_appsandbox_imports(
+        &self,
+    ) -> Result<Vec<IncompleteAppSandboxImport>, RepositoryError> {
+        Ok(ImportJournal::list(&self.storage_root)?
+            .into_iter()
+            .filter_map(|journal| {
+                let destination_name = import_destination_name(&journal)?;
+                (!self.imports.contains(&destination_name)).then(|| IncompleteAppSandboxImport {
+                    destination_name,
+                    stage: journal.stage().import_stage(),
+                })
+            })
+            .collect())
+    }
+
+    /// Runs a retained import again, from whatever it already confirmed.
+    ///
+    /// The copy is not made twice and the guest steps already confirmed are not
+    /// taken again: the journal is what says which, and the conversion checks
+    /// every confirmed step rather than trusting it.
+    fn retry_appsandbox_import(&mut self, destination_name: &str) -> Result<(), RepositoryError> {
+        let _span = tracing::info_span!("retry_appsandbox_import", vm = destination_name).entered();
+        self.require_initialized()?;
+        if self.imports.contains(destination_name) {
+            let error = RepositoryError::new(format!(
+                "the import of VM \"{destination_name}\" is already running"
+            ));
+            tracing::error!("{error}");
+            return Err(error);
+        }
+
+        let journal = self.incomplete_import(destination_name)?;
+        journal.validate_destination()?;
+        let resources = journal.requested_resources();
+        let listing = ImportListing {
+            ram_mb: resources.ram_mb,
+            cpu_cores: resources.cpu_cores,
+            disk_gb: resources.disk_gb,
+            desktop_profile: resources.desktop_profile,
+            network_mode: NetworkMode::Nat,
+        };
+        // A retry after a restart has no discovery behind it. That is not a
+        // reason to refuse: an import whose copy is already promoted needs
+        // nothing from AppSandbox, and the pipeline says so plainly if it turns
+        // out to need the source after all.
+        let source = self
+            .appsandbox_sources
+            .get(&journal.source_fingerprint().source_id)
+            .cloned();
+        let request = AppSandboxImportRequest {
+            source_id: journal.source_fingerprint().source_id.clone(),
+            destination_name: destination_name.to_owned(),
+        };
+
+        self.run_import(request, listing, journal, source, true)
+    }
+
+    /// Removes everything VMLord made for a retained import.
+    ///
+    /// Never the source: the AppSandbox VM this was copied from is not
+    /// VMLord's, was never modified, and is not named by anything this removes.
+    fn discard_appsandbox_import(&mut self, destination_name: &str) -> Result<(), RepositoryError> {
+        let _span =
+            tracing::info_span!("discard_appsandbox_import", vm = destination_name).entered();
+        self.require_initialized()?;
+        self.imports.refuse_if_importing(destination_name)?;
+
+        let journal = self.incomplete_import(destination_name)?;
+        // Refused before any removal, not after: a journal whose destination is
+        // not one exact VMLord VM directory must not reach recursive cleanup.
+        journal.validate_destination()?;
+
+        let mut failures = Vec::new();
+        if let Some(mapping) = self.store.find_by_vm_name(destination_name)? {
+            if let Err(error) = cleanup::teardown_compute_system(&mapping.hcs_compute_system_id) {
+                failures.push(error.to_string());
+            }
+            if let Err(error) = self.store.remove(mapping.vm_id) {
+                failures.push(error.to_string());
+            }
+        }
+        if let Err(error) = cleanup::remove_vm_directory(journal.destination()) {
+            failures.push(error.to_string());
+        }
+        // Last: while the journal is there the import is still recoverable, and
+        // an interrupted discard has to leave it that way.
+        if let Err(error) = journal.remove() {
+            failures.push(error.to_string());
+        }
+        if failures.is_empty() {
+            tracing::info!("discarded the incomplete import of VM \"{destination_name}\"");
+            Ok(())
+        } else {
+            Err(cleanup::combine_failures(
+                &format!(
+                    "the incomplete import of VM \"{destination_name}\" could not be discarded \
+                     completely"
+                ),
+                failures,
+            ))
+        }
+    }
+
     /// Accepts the creation of a VM and returns; the VM is built on a thread of
     /// its own and appears in the list as `Building` until it is done.
     ///
@@ -1315,22 +1705,7 @@ impl VmRepository for HcsVmRepository {
         self.require_initialized()?;
         request.validate()?;
 
-        if self.store.find_by_vm_name(&request.name)?.is_some()
-            || self.builds.contains(&request.name)
-        {
-            let error = RepositoryError::new(format!("VM \"{}\" already exists", request.name));
-            tracing::error!("{error}");
-            return Err(error);
-        }
-        let vm_directory = layout::vm_directory(&self.storage_root, &request.name)?;
-        if vm_directory.exists() {
-            let error = RepositoryError::new(format!(
-                "VM directory already exists: {}",
-                vm_directory.display()
-            ));
-            tracing::error!("{error}");
-            return Err(error);
-        }
+        let vm_directory = self.reserve_vm_name(&request.name)?;
 
         let cycle = Arc::clone(&self.cycle);
         let store = self.store.clone();
@@ -1395,6 +1770,7 @@ impl VmRepository for HcsVmRepository {
         let _span = tracing::info_span!("update_vm", vm = request.name.as_str()).entered();
         self.require_initialized()?;
         self.builds.refuse_if_building(&request.name)?;
+        self.imports.refuse_if_importing(&request.name)?;
         self.starts.refuse_if_starting(&request.name)?;
 
         let mapping = self.mapping(&request.name)?;
@@ -1457,6 +1833,7 @@ impl VmRepository for HcsVmRepository {
         let _span = tracing::info_span!("start_vm", vm = name).entered();
         self.require_initialized()?;
         self.builds.refuse_if_building(name)?;
+        self.imports.refuse_if_importing(name)?;
         self.starts.refuse_if_starting(name)?;
 
         // Read here rather than on the thread: a VM VMLord does not know, or
@@ -1500,6 +1877,7 @@ impl VmRepository for HcsVmRepository {
         let _span = tracing::info_span!("stop_vm", vm = name).entered();
         self.require_initialized()?;
         self.builds.refuse_if_building(name)?;
+        self.imports.refuse_if_importing(name)?;
 
         let mapping = self.mapping(name)?;
         // Before the request: what the guest prints on its way down is the only
@@ -1520,6 +1898,7 @@ impl VmRepository for HcsVmRepository {
         let _span = tracing::info_span!("force_stop_vm", vm = name).entered();
         self.require_initialized()?;
         self.builds.refuse_if_building(name)?;
+        self.imports.refuse_if_importing(name)?;
 
         let mapping = self.mapping(name)?;
         self.force_stop.force_stop(&self.store, name)?;
@@ -1546,6 +1925,7 @@ impl VmRepository for HcsVmRepository {
         let _span = tracing::info_span!("delete_vm", vm = request.name.as_str()).entered();
         self.require_initialized()?;
         self.builds.refuse_if_building(&request.name)?;
+        self.imports.refuse_if_importing(&request.name)?;
         // A VM in the middle of starting is not a VM to remove: its thread is
         // about to hand over a console and a compute system for a VM that
         // would no longer exist.
@@ -1605,6 +1985,7 @@ impl VmRepository for HcsVmRepository {
         let _span = tracing::info_span!("open_console", vm = name).entered();
         self.require_initialized()?;
         self.builds.refuse_if_building(name)?;
+        self.imports.refuse_if_importing(name)?;
 
         let mapping = self.mapping(name)?;
         let state = self.reported_state(&mapping)?;
@@ -1630,6 +2011,7 @@ impl VmRepository for HcsVmRepository {
         let _span = tracing::info_span!("open_ssh", vm = name).entered();
         self.require_initialized()?;
         self.builds.refuse_if_building(name)?;
+        self.imports.refuse_if_importing(name)?;
 
         let mapping = self.mapping(name)?;
         let state = self.reported_state(&mapping)?;
@@ -1645,6 +2027,7 @@ impl VmRepository for HcsVmRepository {
         let _span = tracing::info_span!("open_display", vm = name).entered();
         self.require_initialized()?;
         self.builds.refuse_if_building(name)?;
+        self.imports.refuse_if_importing(name)?;
 
         let mapping = self.mapping(name)?;
         let state = self.reported_state(&mapping)?;
@@ -1675,6 +2058,7 @@ impl VmRepository for HcsVmRepository {
         let _span = tracing::info_span!("update_display_payload", vm = name).entered();
         self.require_initialized()?;
         self.builds.refuse_if_building(name)?;
+        self.imports.refuse_if_importing(name)?;
 
         let mapping = self.mapping(name)?;
         let Some(target) = mapping.guest_target.clone() else {
@@ -1785,7 +2169,10 @@ impl VmRepository for HcsVmRepository {
             .into_iter()
             .map(|known| self.summary(known))
             .collect();
-        Ok(merge_with_builds(known, &self.builds))
+        Ok(merge_with_imports(
+            merge_with_builds(known, &self.builds),
+            &self.imports,
+        ))
     }
 
     /// Reports everything the repository has to say since the last call,
@@ -1805,6 +2192,11 @@ impl VmRepository for HcsVmRepository {
         // console session and a compute system to hand over, and both are
         // reachable only here.
         let started = self.starts.take_started();
+        self.adopt_started(started);
+        // The same call for the same reason: an import that finished has a
+        // second boot to hand over -- including one that ended needing
+        // attention, whose guest may well be up.
+        let started = self.imports.take_started();
         self.adopt_started(started);
         // The same call for the same reason: a guest that started offering its
         // desktop since the last refresh has an installation to write down.
@@ -1874,6 +2266,10 @@ impl Drop for HcsVmRepository {
         // process that owns what it is about to produce.
         self.starts.join_all();
         self.builds.cancel_all_and_join();
+        // Joined for the same reason, and after the builds: an import thread
+        // left behind would go on copying into, or converting a guest of, a
+        // directory this process is about to stop owning.
+        self.imports.cancel_all_and_join();
         // A request still being delivered holds a handle to a compute system
         // this repository is about to drop.
         self.shutdowns.join_all();
@@ -2023,9 +2419,11 @@ mod tests {
     };
 
     use super::{
-        GpuAssignment, HcsSystemState, HcsVmRepository, OS_TYPE, guest_ip, launch_running_consoles,
-        merge_with_builds, record_gpu_mode, record_network_mode, refuse_gpu_mode_change,
-        report_console_failures,
+        AppSandboxImportRequest, AppSandboxSourceId, BootstrapSshFacts, DesktopProfile,
+        GpuAssignment, HcsSystemState, HcsVmRepository, ImportJournal, ImportJournalDetails,
+        ImportListing, ImportResources, OS_TYPE, SourceFingerprint, guest_ip,
+        launch_running_consoles, merge_with_builds, record_gpu_mode, record_network_mode,
+        refuse_gpu_mode_change, report_console_failures,
     };
 
     /// Installs a diagnostics sink for the duration of `body` and hands back
@@ -2157,6 +2555,228 @@ mod tests {
             repository
                 .appsandbox_sources
                 .contains_key(&candidates[0].source_id)
+        );
+    }
+
+    /// A journal for `name` under `root`, filed the way a real import files it.
+    fn import_journal(root: &std::path::Path, destination: std::path::PathBuf) -> ImportJournal {
+        ImportJournal::create(
+            root,
+            ImportJournalDetails {
+                import_id: Uuid::new_v4(),
+                source_fingerprint: SourceFingerprint {
+                    source_id: AppSandboxSourceId::from_stable_hash("source-ubuntu").unwrap(),
+                    disk_path: PathBuf::from(r"C:\ProgramData\AppSandbox\ubuntu\disk.vhdx"),
+                    vm_ordinal: 1,
+                },
+                destination,
+                requested_resources: ImportResources {
+                    ram_mb: 4096,
+                    cpu_cores: 4,
+                    disk_gb: 80,
+                    desktop_profile: DesktopProfile::Gnome,
+                },
+                desired_gpu: GpuMode::Default,
+                bootstrap_ssh: BootstrapSshFacts {
+                    username: "sandbox".into(),
+                    port: 22,
+                },
+            },
+        )
+        .expect("the journal should be created")
+    }
+
+    #[test]
+    fn one_name_check_answers_for_stored_vms_builds_and_imports_alike() {
+        // A build and an import write the same document and the same directory,
+        // so a name either of them holds is a name neither may take.
+        let (root, store) = temp_store("one-name");
+        let repository = repository_over(&root);
+        store
+            .insert(mapping(NetworkMode::Nat))
+            .expect("the mapping should be stored");
+
+        let stored = repository
+            .reserve_vm_name(&mapping(NetworkMode::Nat).vm_name)
+            .expect_err("a stored VM already holds its name");
+        assert!(stored.to_string().contains("already exists"));
+
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held = std::sync::Arc::clone(&release);
+        repository
+            .imports
+            .start(
+                AppSandboxImportRequest {
+                    source_id: AppSandboxSourceId::from_stable_hash("source-ubuntu").unwrap(),
+                    destination_name: "ubuntu-copy".into(),
+                },
+                ImportListing {
+                    ram_mb: 4096,
+                    cpu_cores: 4,
+                    disk_gb: 80,
+                    desktop_profile: DesktopProfile::Gnome,
+                    network_mode: NetworkMode::Nat,
+                },
+                move |_, _| {
+                    while !held.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::thread::yield_now();
+                    }
+                    crate::appsandbox::ImportWorkerOutcome::RolledBack {
+                        error: RepositoryError::new("stopped"),
+                    }
+                },
+            )
+            .expect("the import should start");
+
+        let importing = repository
+            .reserve_vm_name("ubuntu-copy")
+            .expect_err("an import in flight already holds its name");
+        assert!(importing.to_string().contains("already exists"));
+        assert!(repository.reserve_vm_name("something-else").is_ok());
+
+        release.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn an_interrupted_import_is_offered_for_recovery_rather_than_listed_as_a_vm() {
+        let (root, _) = temp_store("recoverable");
+        let repository = repository_over(&root);
+        import_journal(&root, root.join("ubuntu-copy"));
+
+        let incomplete = repository
+            .incomplete_appsandbox_imports()
+            .expect("the journals should be listed");
+
+        assert_eq!(incomplete.len(), 1);
+        assert_eq!(incomplete[0].destination_name, "ubuntu-copy");
+        assert_eq!(
+            incomplete[0].stage,
+            vmlord_core::AppSandboxImportStage::Validating
+        );
+        assert!(
+            repository.imports.summaries().is_empty(),
+            "a journal on disk is not an import in flight"
+        );
+    }
+
+    #[test]
+    fn an_import_still_running_is_not_offered_for_recovery() {
+        // It is in the VM list as building. Offering a retry of something that
+        // has not stopped would start it twice.
+        let (root, _) = temp_store("running-not-recoverable");
+        let repository = repository_over(&root);
+        import_journal(&root, root.join("ubuntu-copy"));
+        let release = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held = std::sync::Arc::clone(&release);
+        repository
+            .imports
+            .start(
+                AppSandboxImportRequest {
+                    source_id: AppSandboxSourceId::from_stable_hash("source-ubuntu").unwrap(),
+                    destination_name: "ubuntu-copy".into(),
+                },
+                ImportListing {
+                    ram_mb: 4096,
+                    cpu_cores: 4,
+                    disk_gb: 80,
+                    desktop_profile: DesktopProfile::Gnome,
+                    network_mode: NetworkMode::Nat,
+                },
+                move |_, _| {
+                    while !held.load(std::sync::atomic::Ordering::Relaxed) {
+                        std::thread::yield_now();
+                    }
+                    crate::appsandbox::ImportWorkerOutcome::RolledBack {
+                        error: RepositoryError::new("stopped"),
+                    }
+                },
+            )
+            .expect("the import should start");
+
+        assert!(
+            repository
+                .incomplete_appsandbox_imports()
+                .unwrap()
+                .is_empty()
+        );
+
+        release.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[test]
+    fn discarding_an_import_removes_what_vmlord_made_and_nothing_else() {
+        let (root, _) = temp_store("discard");
+        let mut repository = repository_over(&root);
+        repository.initialized = true;
+        let destination = root.join("ubuntu-copy");
+        fs::create_dir_all(destination.join("disks")).unwrap();
+        fs::write(destination.join("disks").join("system.vhdx"), b"copy").unwrap();
+        let source = root.join("appsandbox").join("disk.vhdx");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"the source is never touched").unwrap();
+        let journal = import_journal(&root, destination.clone());
+
+        repository
+            .discard_appsandbox_import("ubuntu-copy")
+            .expect("a retained import should be discardable");
+
+        assert!(!destination.exists(), "the copy VMLord made is removed");
+        assert!(!journal.path().exists(), "the recovery marker is removed");
+        assert!(source.exists(), "the AppSandbox source is never VMLord's");
+        assert!(
+            repository
+                .incomplete_appsandbox_imports()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn discarding_refuses_a_journal_that_does_not_name_one_exact_vm_directory() {
+        // The removal below is recursive. A destination that is not one
+        // directory under the storage root must never reach it.
+        let (root, _) = temp_store("discard-contained");
+        let mut repository = repository_over(&root);
+        repository.initialized = true;
+        let destination = root.join("nested").join("ubuntu-copy");
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(destination.join("keep"), b"not an exact VM target").unwrap();
+        import_journal(&root, destination.clone());
+
+        let error = repository
+            .discard_appsandbox_import("ubuntu-copy")
+            .expect_err("a target that is not one VM directory is refused");
+
+        assert!(
+            error
+                .to_string()
+                .contains("not one exact VMLord VM directory")
+        );
+        assert!(destination.join("keep").exists());
+    }
+
+    #[test]
+    fn recovering_an_import_nobody_retained_says_so() {
+        let (root, _) = temp_store("no-such-import");
+        let mut repository = repository_over(&root);
+        repository.initialized = true;
+
+        let retried = repository
+            .retry_appsandbox_import("ubuntu-copy")
+            .expect_err("there is no such import");
+        let discarded = repository
+            .discard_appsandbox_import("ubuntu-copy")
+            .expect_err("there is no such import");
+
+        assert!(
+            retried
+                .to_string()
+                .contains("no incomplete AppSandbox import")
+        );
+        assert!(
+            discarded
+                .to_string()
+                .contains("no incomplete AppSandbox import")
         );
     }
 

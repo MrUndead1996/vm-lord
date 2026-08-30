@@ -62,6 +62,7 @@ impl SourceFileIdentity {
 /// AppSandbox private-key path and must never cross into the application or UI
 /// layers. A later import resolves an opaque source ID only through the latest
 /// discovery snapshot and revalidates these observations before copying.
+#[derive(Clone)]
 pub(crate) struct ValidatedSource {
     pub(crate) config_path: PathBuf,
     pub(crate) vm_ordinal: usize,

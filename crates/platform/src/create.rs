@@ -586,7 +586,11 @@ fn write_provisioning(
 /// is added explicitly afterwards -- `HcsGrantVmAccess` still puts the VM's own
 /// SID on the seed, which is why the guest can go on reading it. Nothing
 /// grants the VM its way onto `agent.secret`: the guest has its own copy.
-fn write_restricted(path: &Path, bytes: &[u8], description: &str) -> Result<(), RepositoryError> {
+pub(crate) fn write_restricted(
+    path: &Path,
+    bytes: &[u8],
+    description: &str,
+) -> Result<(), RepositoryError> {
     let mut file =
         fs::File::create(path).map_err(|error| write_failure(path, description, &error))?;
     vm_key::restrict_to_owner(path)?;
