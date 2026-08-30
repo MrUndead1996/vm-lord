@@ -5,12 +5,19 @@ use std::{
     sync::Arc,
 };
 
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+
 use vmlord_core::{
     AppSandboxCompatibility, AppSandboxIncompatibility, AppSandboxSourceId, AppSandboxVmCandidate,
     GpuMode, NetworkMode, RepositoryError,
 };
 
-use super::{ValidatedSource, config::parse_vms_cfg};
+use super::{
+    ValidatedSource,
+    config::parse_vms_cfg,
+    source::{SourceFileIdentity, paths_equal, source_file_identity},
+};
 
 type SourceIdFactory =
     Arc<dyn Fn(&Path, usize) -> Result<AppSandboxSourceId, RepositoryError> + Send + Sync>;
@@ -20,6 +27,7 @@ pub(crate) trait FileSystem: Send + Sync {
     fn read_to_string(&self, path: &Path) -> io::Result<String>;
     fn is_file(&self, path: &Path) -> bool;
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf>;
+    fn source_identity(&self, path: &Path) -> Result<SourceFileIdentity, RepositoryError>;
 }
 
 struct WindowsFileSystem;
@@ -35,6 +43,10 @@ impl FileSystem for WindowsFileSystem {
 
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
         fs::canonicalize(path)
+    }
+
+    fn source_identity(&self, path: &Path) -> Result<SourceFileIdentity, RepositoryError> {
+        source_file_identity(path)
     }
 }
 
@@ -132,12 +144,17 @@ impl Discovery {
             }
 
             let validated = match private_key.clone() {
-                Some(private_key) if incompatibilities.is_empty() => Some(ValidatedSource {
-                    config_path: self.config_path.clone(),
-                    vm_ordinal: vm.ordinal(),
-                    source_disk: source_disk.canonical_path,
-                    private_key,
-                }),
+                Some(private_key) if incompatibilities.is_empty() => {
+                    let source_identity =
+                        self.files.source_identity(&source_disk.canonical_path)?;
+                    Some(ValidatedSource {
+                        config_path: self.config_path.clone(),
+                        vm_ordinal: vm.ordinal(),
+                        source_disk: source_disk.canonical_path,
+                        source_identity,
+                        private_key,
+                    })
+                }
                 _ => None,
             };
             drafts.push(DraftCandidate {
@@ -318,11 +335,6 @@ fn unknown_mode(raw: u32) -> i32 {
     i32::try_from(raw).unwrap_or(i32::MAX)
 }
 
-fn paths_equal(left: &Path, right: &Path) -> bool {
-    left.to_string_lossy()
-        .eq_ignore_ascii_case(&right.to_string_lossy())
-}
-
 fn stable_source_id(
     canonical_disk: &Path,
     vm_ordinal: usize,
@@ -331,17 +343,31 @@ fn stable_source_id(
     // is specified and remains stable across Rust releases. This identity is
     // opaque, not a security digest; collisions are rejected above.
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in canonical_disk
-        .to_string_lossy()
-        .to_ascii_lowercase()
-        .bytes()
-        .chain([0])
-        .chain(vm_ordinal.to_le_bytes())
-    {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    #[cfg(windows)]
+    for unit in canonical_disk.as_os_str().encode_wide() {
+        let unit = if (b'A' as u16..=b'Z' as u16).contains(&unit) {
+            unit + u16::from(b'a' - b'A')
+        } else {
+            unit
+        };
+        for byte in unit.to_le_bytes() {
+            hash_byte(&mut hash, byte);
+        }
+    }
+    #[cfg(not(windows))]
+    for byte in canonical_disk.as_os_str().as_encoded_bytes() {
+        hash_byte(&mut hash, byte.to_ascii_lowercase());
+    }
+    hash_byte(&mut hash, 0);
+    for byte in vm_ordinal.to_le_bytes() {
+        hash_byte(&mut hash, byte);
     }
     AppSandboxSourceId::from_stable_hash(format!("{hash:016x}"))
+}
+
+fn hash_byte(hash: &mut u64, byte: u8) {
+    *hash ^= u64::from(byte);
+    *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
 }
 
 #[cfg(test)]
@@ -355,10 +381,13 @@ mod tests {
 
     use vmlord_core::{
         AppSandboxCompatibility, AppSandboxIncompatibility, AppSandboxSourceId, GpuMode,
-        NetworkMode,
+        NetworkMode, RepositoryError,
     };
 
+    #[cfg(unix)]
+    use super::stable_source_id;
     use super::{Discovery, FileSystem};
+    use crate::appsandbox::source::SourceFileIdentity;
 
     // Forward slashes keep the injected tests portable while still naming a
     // valid absolute Windows path in the production target.
@@ -417,6 +446,10 @@ mod tests {
                     format!("{} is absent", path.display()),
                 )
             })
+        }
+
+        fn source_identity(&self, _path: &Path) -> Result<SourceFileIdentity, RepositoryError> {
+            Ok(SourceFileIdentity::new(7, 11))
         }
     }
 
@@ -480,6 +513,8 @@ mod tests {
         assert_eq!(candidate.ssh_port, 22);
         assert_eq!(candidate.compatibility, AppSandboxCompatibility::Compatible);
         assert!(result.sources.contains_key(&candidate.source_id));
+        let source = result.sources.get(&candidate.source_id).unwrap();
+        assert!(source.source_identity == SourceFileIdentity::new(7, 11));
     }
 
     #[test]
@@ -658,6 +693,17 @@ mod tests {
             first.candidates[0].source_id,
             second.candidates[0].source_id
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn distinct_native_path_units_never_collapse_to_one_source_id() {
+        use std::{ffi::OsString, os::unix::ffi::OsStringExt};
+
+        let first = PathBuf::from(OsString::from_vec(vec![b'/', 0x80]));
+        let second = PathBuf::from(OsString::from_vec(vec![b'/', 0x81]));
+
+        assert!(stable_source_id(&first, 1).unwrap() != stable_source_id(&second, 1).unwrap());
     }
 
     #[test]

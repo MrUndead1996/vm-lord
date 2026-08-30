@@ -2122,6 +2122,13 @@ mod tests {
                 .then(|| path.to_path_buf())
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not found"))
         }
+
+        fn source_identity(
+            &self,
+            _path: &Path,
+        ) -> Result<crate::appsandbox::SourceFileIdentity, RepositoryError> {
+            Ok(crate::appsandbox::SourceFileIdentity::new(7, 11))
+        }
     }
 
     #[test]

@@ -2,36 +2,42 @@
 
 use std::{
     any::Any,
+    ffi::OsString,
     path::{Path, PathBuf},
     sync::atomic::{AtomicBool, Ordering},
 };
 
 use vmlord_core::RepositoryError;
 
-use super::{ValidatedSource, config::parse_vms_cfg};
+use super::{
+    ValidatedSource,
+    config::parse_vms_cfg,
+    source::{SourceFileIdentity, paths_equal},
+};
 
 #[cfg(windows)]
-use std::{fs, panic::AssertUnwindSafe};
+use super::source::identity_from_handle;
+
+#[cfg(windows)]
+use std::{fs, os::windows::ffi::OsStrExt, panic::AssertUnwindSafe};
 #[cfg(windows)]
 use windows::{
     Win32::{
         Foundation::{CloseHandle, HANDLE},
         Storage::FileSystem::{
             COPY_FILE_FAIL_IF_EXISTS, COPYPROGRESSROUTINE_PROGRESS, CopyFileExW, CreateFileW,
-            FILE_FLAG_SEQUENTIAL_SCAN, FILE_GENERIC_READ, FILE_NAME_NORMALIZED, FILE_SHARE_READ,
-            GetDiskFreeSpaceExW, GetFileSizeEx, GetFinalPathNameByHandleW, OPEN_EXISTING,
-            PROGRESS_CANCEL, PROGRESS_CONTINUE,
+            FILE_FLAG_SEQUENTIAL_SCAN, FILE_GENERIC_READ, FILE_SHARE_READ, GetDiskFreeSpaceExW,
+            GetFileSizeEx, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING, PROGRESS_CANCEL,
+            PROGRESS_CONTINUE,
         },
     },
-    core::HSTRING,
+    core::PCWSTR,
 };
 
 #[cfg(windows)]
 use crate::error::windows_error;
 
 const ERROR_REQUEST_ABORTED_HRESULT: u32 = 0x8007_04D3;
-#[cfg(windows)]
-const FINAL_PATH_BUFFER: usize = 260;
 
 /// The private paths resolved by discovery and the VMLord-owned staging path.
 pub(super) struct CopyRequest<'a> {
@@ -51,13 +57,18 @@ pub(super) struct CopySummary {
 /// An opened source whose handle remains alive until copying finishes.
 struct LockedSource {
     path: PathBuf,
-    identity: PathBuf,
+    identity: SourceFileIdentity,
     bytes: u64,
     _lease: Box<dyn Any>,
 }
 
 impl LockedSource {
-    fn new(path: PathBuf, identity: PathBuf, bytes: u64, lease: impl Any + 'static) -> Self {
+    fn new(
+        path: PathBuf,
+        identity: SourceFileIdentity,
+        bytes: u64,
+        lease: impl Any + 'static,
+    ) -> Self {
         Self {
             path,
             identity,
@@ -99,6 +110,7 @@ trait CopyFileSystem {
         target: &Path,
         progress: &mut dyn FnMut(u64, u64) -> ProgressDecision,
     ) -> Result<(), CopyFailure>;
+    fn promote_file(&self, staged: &Path, target: &Path) -> Result<(), RepositoryError>;
     fn remove_file(&self, path: &Path) -> Result<(), RepositoryError>;
 }
 
@@ -133,6 +145,7 @@ fn copy_vhdx_with(
         )));
     }
     check_cancelled(request.cancel)?;
+    let staged = unique_staging_artifact(&target)?;
 
     let mut copied_bytes = 0;
     let mut total_bytes = source.bytes;
@@ -150,19 +163,37 @@ fn copy_vhdx_with(
         }
     };
 
-    match files.copy_file(&source, &target, &mut progress) {
-        Ok(()) => Ok(CopySummary {
-            copied_bytes,
-            total_bytes,
-        }),
+    match files.copy_file(&source, &staged, &mut progress) {
+        Ok(()) => match files.promote_file(&staged, &target) {
+            Ok(()) => Ok(CopySummary {
+                copied_bytes,
+                total_bytes,
+            }),
+            Err(error) => Err(remove_partial_target(files, &staged, error)),
+        },
         Err(failure) => {
             let error = match failure {
                 CopyFailure::Cancelled => cancelled_error(),
                 CopyFailure::Other(error) => error,
             };
-            Err(remove_partial_target(files, &target, error))
+            Err(remove_partial_target(files, &staged, error))
         }
     }
+}
+
+fn unique_staging_artifact(target: &Path) -> Result<PathBuf, RepositoryError> {
+    let name = target.file_name().ok_or_else(|| {
+        RepositoryError::new("the AppSandbox import staging disk has no file name")
+    })?;
+    let parent = target.parent().ok_or_else(|| {
+        RepositoryError::new("the AppSandbox import staging disk has no parent directory")
+    })?;
+    let mut artifact = OsString::from(".");
+    artifact.push(name);
+    artifact.push(".");
+    artifact.push(uuid::Uuid::new_v4().as_hyphenated().to_string());
+    artifact.push(".copying");
+    Ok(parent.join(artifact))
 }
 
 fn revalidate_and_lock(
@@ -185,7 +216,7 @@ fn revalidate_and_lock(
     }
 
     let locked = files.lock_source(&resolved)?;
-    if !paths_equal(&locked.identity, &source.source_disk) {
+    if locked.identity != source.source_identity {
         return Err(RepositoryError::new(
             "the selected AppSandbox source identity changed while it was opened",
         ));
@@ -239,11 +270,6 @@ fn cancelled_error() -> RepositoryError {
     )
 }
 
-fn paths_equal(left: &Path, right: &Path) -> bool {
-    left.to_string_lossy()
-        .eq_ignore_ascii_case(&right.to_string_lossy())
-}
-
 #[cfg(windows)]
 struct WindowsFileSystem;
 
@@ -266,14 +292,14 @@ impl CopyFileSystem for WindowsFileSystem {
     }
 
     fn lock_source(&self, path: &Path) -> Result<LockedSource, RepositoryError> {
-        let wide = HSTRING::from(path.as_os_str().to_string_lossy().as_ref());
+        let wide = wide_path(path);
         // SAFETY: `wide` outlives the call. The returned handle is immediately
         // owned and stays alive through CopyFileExW. Sharing read but neither
         // write nor delete rejects a running VM and prevents a new writer or
         // path replacement from appearing during the copy.
         let handle = unsafe {
             CreateFileW(
-                &wide,
+                PCWSTR(wide.as_ptr()),
                 FILE_GENERIC_READ.0,
                 FILE_SHARE_READ,
                 None,
@@ -291,7 +317,7 @@ impl CopyFileSystem for WindowsFileSystem {
             .map_err(|error| windows_error("read AppSandbox source disk size", None, error))?;
         let bytes = u64::try_from(size)
             .map_err(|_| RepositoryError::new("the AppSandbox source disk has a negative size"))?;
-        let identity = final_path(handle.0)?;
+        let identity = identity_from_handle(handle.0)?;
 
         Ok(LockedSource::new(
             path.to_path_buf(),
@@ -302,11 +328,11 @@ impl CopyFileSystem for WindowsFileSystem {
     }
 
     fn available_bytes(&self, directory: &Path) -> Result<u64, RepositoryError> {
-        let wide = HSTRING::from(directory.as_os_str().to_string_lossy().as_ref());
+        let wide = wide_path(directory);
         let mut available = 0_u64;
         // SAFETY: `wide` and the out value live for the call; the unused totals
         // are explicitly omitted.
-        unsafe { GetDiskFreeSpaceExW(&wide, Some(&raw mut available), None, None) }
+        unsafe { GetDiskFreeSpaceExW(PCWSTR(wide.as_ptr()), Some(&raw mut available), None, None) }
             .map_err(|error| windows_error("read AppSandbox import free space", None, error))?;
         Ok(available)
     }
@@ -321,8 +347,8 @@ impl CopyFileSystem for WindowsFileSystem {
         target: &Path,
         progress: &mut dyn FnMut(u64, u64) -> ProgressDecision,
     ) -> Result<(), CopyFailure> {
-        let source_wide = HSTRING::from(source.path.as_os_str().to_string_lossy().as_ref());
-        let target_wide = HSTRING::from(target.as_os_str().to_string_lossy().as_ref());
+        let source_wide = wide_path(&source.path);
+        let target_wide = wide_path(target);
         let mut context = Box::new(ProgressContext {
             progress,
             cancelled: false,
@@ -335,8 +361,8 @@ impl CopyFileSystem for WindowsFileSystem {
         // casts it back to the exact `ProgressContext` allocated above.
         let result = unsafe {
             CopyFileExW(
-                &source_wide,
-                &target_wide,
+                PCWSTR(source_wide.as_ptr()),
+                PCWSTR(target_wide.as_ptr()),
                 Some(copy_progress),
                 Some(context_pointer),
                 None,
@@ -361,6 +387,22 @@ impl CopyFileSystem for WindowsFileSystem {
         })
     }
 
+    fn promote_file(&self, staged: &Path, target: &Path) -> Result<(), RepositoryError> {
+        let staged = wide_path(staged);
+        let target = wide_path(target);
+        // SAFETY: both exact UTF-16 buffers are NUL-terminated and live for
+        // the call. Omitting `MOVEFILE_REPLACE_EXISTING` makes promotion fail
+        // if another operation created the final target during the copy.
+        unsafe {
+            MoveFileExW(
+                PCWSTR(staged.as_ptr()),
+                PCWSTR(target.as_ptr()),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        }
+        .map_err(|error| windows_error("promote AppSandbox staging disk", None, error))
+    }
+
     fn remove_file(&self, path: &Path) -> Result<(), RepositoryError> {
         fs::remove_file(path).map_err(|error| {
             RepositoryError::new(format!(
@@ -368,6 +410,14 @@ impl CopyFileSystem for WindowsFileSystem {
             ))
         })
     }
+}
+
+#[cfg(windows)]
+fn wide_path(path: &Path) -> Vec<u16> {
+    path.as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
 }
 
 #[cfg(windows)]
@@ -410,29 +460,6 @@ unsafe extern "system" fn copy_progress(
 }
 
 #[cfg(windows)]
-fn final_path(handle: HANDLE) -> Result<PathBuf, RepositoryError> {
-    let mut buffer = vec![0_u16; FINAL_PATH_BUFFER];
-    loop {
-        // SAFETY: `handle` is live and the buffer is passed with its length.
-        let length = unsafe { GetFinalPathNameByHandleW(handle, &mut buffer, FILE_NAME_NORMALIZED) }
-            as usize;
-        if length == 0 {
-            return Err(windows_error(
-                "resolve opened AppSandbox source disk",
-                None,
-                windows::core::Error::from_thread(),
-            ));
-        }
-        if length >= buffer.len() {
-            buffer.resize(length + 1, 0);
-            continue;
-        }
-        let path = String::from_utf16_lossy(&buffer[..length]);
-        return Ok(PathBuf::from(path));
-    }
-}
-
-#[cfg(windows)]
 struct OwnedHandle(HANDLE);
 
 #[cfg(windows)]
@@ -456,12 +483,12 @@ mod tests {
     };
 
     use uuid::Uuid;
-    use vmlord_core::RepositoryError;
+    use vmlord_core::{AppSandboxImportProgress, AppSandboxImportStage, RepositoryError};
 
     use super::{
         CopyFailure, CopyFileSystem, CopyRequest, LockedSource, ProgressDecision, copy_vhdx_with,
     };
-    use crate::appsandbox::ValidatedSource;
+    use crate::appsandbox::{ValidatedSource, source::SourceFileIdentity};
 
     const SOURCE_BYTES: usize = 256 * 1024;
     const CHUNK_BYTES: usize = 32 * 1024;
@@ -503,6 +530,7 @@ mod tests {
                     config_path,
                     vm_ordinal: 1,
                     source_disk: fs::canonicalize(source_disk).unwrap(),
+                    source_identity: SourceFileIdentity::new(7, 11),
                     private_key,
                 },
                 target,
@@ -541,8 +569,9 @@ mod tests {
 
     struct TestFileSystem {
         free_bytes: u64,
-        opened_identity: Option<PathBuf>,
+        opened_identity: Option<SourceFileIdentity>,
         lock_error: Option<&'static str>,
+        promotion_race: bool,
         copy_attempted: AtomicBool,
         removed: Mutex<Vec<PathBuf>>,
     }
@@ -553,6 +582,7 @@ mod tests {
                 free_bytes,
                 opened_identity: None,
                 lock_error: None,
+                promotion_race: false,
                 copy_attempted: AtomicBool::new(false),
                 removed: Mutex::new(Vec::new()),
             }
@@ -580,8 +610,7 @@ mod tests {
             Ok(LockedSource::new(
                 path.to_path_buf(),
                 self.opened_identity
-                    .clone()
-                    .unwrap_or_else(|| path.to_path_buf()),
+                    .unwrap_or_else(|| SourceFileIdentity::new(7, 11)),
                 bytes,
                 file,
             ))
@@ -634,6 +663,14 @@ mod tests {
             self.removed.lock().unwrap().push(path.to_path_buf());
             fs::remove_file(path).map_err(|error| RepositoryError::new(error.to_string()))
         }
+
+        fn promote_file(&self, staged: &Path, target: &Path) -> Result<(), RepositoryError> {
+            if self.promotion_race {
+                fs::write(target, b"another operation's disk").unwrap();
+                return Err(RepositoryError::new("the staging destination now exists"));
+            }
+            fs::rename(staged, target).map_err(|error| RepositoryError::new(error.to_string()))
+        }
     }
 
     #[test]
@@ -684,12 +721,45 @@ mod tests {
     }
 
     #[test]
+    fn a_target_created_during_copy_is_preserved_when_promotion_loses_the_race() {
+        let fixture = Fixture::new();
+        let mut files = TestFileSystem::with_free_bytes(u64::MAX);
+        files.promotion_race = true;
+
+        let error = copy_vhdx_with(fixture.request(&AtomicBool::new(false), &|_, _| {}), &files)
+            .expect_err("promotion must not replace a destination that appeared during copy");
+
+        assert!(error.to_string().contains("now exists"), "got {error}");
+        assert_eq!(
+            fs::read(&fixture.target).unwrap(),
+            b"another operation's disk"
+        );
+        assert!(fixture.source.source_disk.exists());
+        let staging_files = fs::read_dir(fixture.target.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(staging_files.len(), 2, "owned partial artifact leaked");
+    }
+
+    #[test]
+    fn a_preexisting_target_is_never_removed_or_replaced() {
+        let fixture = Fixture::new();
+        fs::write(&fixture.target, b"preexisting disk").unwrap();
+        let files = TestFileSystem::with_free_bytes(u64::MAX);
+
+        copy_vhdx_with(fixture.request(&AtomicBool::new(false), &|_, _| {}), &files)
+            .expect_err("an existing destination must be refused");
+
+        assert_eq!(fs::read(&fixture.target).unwrap(), b"preexisting disk");
+        assert!(!files.copy_attempted.load(Ordering::Relaxed));
+    }
+
+    #[test]
     fn source_identity_changing_between_validation_and_open_is_rejected() {
         let fixture = Fixture::new();
-        let changed = fixture.root.join("changed-disk.vhdx");
-        fs::write(&changed, b"different source").unwrap();
         let mut files = TestFileSystem::with_free_bytes(u64::MAX);
-        files.opened_identity = Some(fs::canonicalize(changed).unwrap());
+        files.opened_identity = Some(SourceFileIdentity::new(7, 12));
 
         let error = copy_vhdx_with(fixture.request(&AtomicBool::new(false), &|_, _| {}), &files)
             .expect_err("an opened file with a different identity must be rejected");
@@ -723,7 +793,11 @@ mod tests {
 
         let summary = copy_vhdx_with(
             fixture.request(&AtomicBool::new(false), &|copied, total| {
-                progress.lock().unwrap().push((copied, total));
+                progress.lock().unwrap().push(AppSandboxImportProgress {
+                    stage: AppSandboxImportStage::Copying,
+                    copied_bytes: copied,
+                    total_bytes: Some(total),
+                });
             }),
             &files,
         )
@@ -735,9 +809,17 @@ mod tests {
         );
         assert_eq!(summary.copied_bytes, SOURCE_BYTES as u64);
         assert_eq!(summary.total_bytes, SOURCE_BYTES as u64);
-        assert_eq!(
-            progress.lock().unwrap().last(),
-            Some(&(SOURCE_BYTES as u64, SOURCE_BYTES as u64))
-        );
+        let progress = progress.lock().unwrap();
+        assert!(!progress.is_empty());
+        assert_eq!(progress[0].copied_bytes, 0);
+        assert_eq!(progress.last().unwrap().copied_bytes, SOURCE_BYTES as u64);
+        for report in progress.iter() {
+            assert_eq!(report.stage, AppSandboxImportStage::Copying);
+            assert_eq!(report.total_bytes, Some(SOURCE_BYTES as u64));
+            assert!(report.copied_bytes <= SOURCE_BYTES as u64);
+        }
+        for pair in progress.windows(2) {
+            assert!(pair[0].copied_bytes <= pair[1].copied_bytes);
+        }
     }
 }

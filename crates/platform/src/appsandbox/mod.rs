@@ -12,4 +12,6 @@ pub(crate) use journal::{
     BootstrapSshFacts, ConversionStep, ImportJournal, ImportJournalDetails, ImportResources,
     JournalStage, SourceFingerprint,
 };
+#[cfg(test)]
+pub(crate) use source::SourceFileIdentity;
 pub(crate) use source::ValidatedSource;
