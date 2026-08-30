@@ -23,7 +23,7 @@ use crate::{
     create::{self, AccessGranter, StateFileCreator, SystemCreator},
     hcs_config::{HcsVmConfigBuilder, ImportBootstrap, StateFilePaths, VmTopology},
     layout,
-    metadata::{CompletedImport, MetadataStore, VmComputeSystemMapping},
+    metadata::{BootstrapImportMapping, MetadataStore, VmComputeSystemMapping},
 };
 
 use super::journal::{BootstrapSshFacts, ImportResources};
@@ -105,10 +105,9 @@ impl ImportBootstrapPipeline {
     /// Builds the compute system for the copied disk under
     /// `request.vm_directory` and registers it in `store`.
     ///
-    /// Nothing on disk is rolled back when a step fails, and that is the
-    /// point: the copied disk is the expensive half of an import and the only
-    /// thing that cannot be made again cheaply, so a failure here leaves the
-    /// destination exactly as it was for the import journal to resume from.
+    /// This layer does not decide whether a copied disk is retained. It leaves
+    /// destination rollback to the import worker, whose transaction boundary
+    /// knows whether guest mutation has begun.
     ///
     /// The compute system is the exception, because it is the one thing a
     /// failure could leave behind that nothing could ever find again. VMLord
@@ -122,7 +121,7 @@ impl ImportBootstrapPipeline {
         store: &MetadataStore,
         request: &BootstrapRequest<'_>,
     ) -> Result<BootstrapVm, RepositoryError> {
-        let ssh_port = SshPort::new(request.ssh.port)?;
+        SshPort::new(request.ssh.port)?;
         let system_disk_path = layout::system_disk_path(request.vm_directory);
         if !system_disk_path.is_file() {
             let error = RepositoryError::new(format!(
@@ -189,13 +188,11 @@ impl ImportBootstrapPipeline {
 
         (self.system_creator)(&hcs_compute_system_id, &configuration)?;
 
-        let mapping = VmComputeSystemMapping::from_completed_import(&CompletedImport {
+        let mapping = VmComputeSystemMapping::from_import_bootstrap(&BootstrapImportMapping {
             vm_id,
             vm_name: request.vm_name,
             hcs_compute_system_id: &hcs_compute_system_id,
             disk_gb: request.resources.disk_gb,
-            ssh_username: &request.ssh.username,
-            ssh_port,
         });
         if let Err(error) = store.insert(mapping.clone()) {
             // The system exists and nothing names it: an unwritable
@@ -205,7 +202,8 @@ impl ImportBootstrapPipeline {
             let mut failures = vec![error.to_string()];
             if let Err(teardown_error) = (self.system_teardown)(&hcs_compute_system_id) {
                 failures.push(format!(
-                    "the unregistered compute system \"{hcs_compute_system_id}\" could not be                      torn down either: {teardown_error}"
+                    "the unregistered compute system \"{hcs_compute_system_id}\" could not be \
+                     torn down either: {teardown_error}"
                 ));
             }
             return Err(cleanup::combine_failures(
@@ -235,7 +233,7 @@ mod tests {
 
     use serde_json::Value;
     use uuid::Uuid;
-    use vmlord_core::{DesktopProfile, GpuMode, NetworkMode, RepositoryError, SshAuthentication};
+    use vmlord_core::{DesktopProfile, GpuMode, NetworkMode, RepositoryError};
 
     use super::{BootstrapRequest, ImportBootstrapPipeline};
     use crate::{
@@ -342,7 +340,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bootstrap_registers_a_nat_vm_with_the_copied_guests_ssh_facts() {
+    fn a_bootstrap_registers_a_nat_vm_that_advertises_no_ssh_yet() {
         let root = temporary_root("registers");
         let store = MetadataStore::new(root.0.join("metadata.json"));
         let vm_directory = copied_destination(&root.0);
@@ -371,10 +369,12 @@ mod tests {
         );
         assert_eq!(stored.network_mode, NetworkMode::Nat);
         assert_eq!(stored.disk_gb, 80);
-        let ssh = stored.ssh.expect("the copied guest answers SSH already");
-        assert_eq!(ssh.username, "sandbox");
-        assert_eq!(ssh.port.get(), 2222);
-        assert_eq!(ssh.authentication, SshAuthentication::VmlordKey);
+        assert!(
+            stored.ssh.is_none(),
+            "the bootstrap session is the conversion's alone: the guest still \
+             answers only the AppSandbox key, so ordinary Connect must find \
+             nothing to try until the VMLord key has been deployed"
+        );
     }
 
     #[test]

@@ -6,6 +6,8 @@ mod copy;
 mod discovery;
 mod journal;
 mod source;
+mod verify;
+mod worker;
 
 #[allow(unused_imports)] // The import pipeline consumes the bootstrap in the next task.
 pub(crate) use bootstrap::{BootstrapRequest, BootstrapVm, ImportBootstrapPipeline};
@@ -27,3 +29,7 @@ pub(crate) use journal::{
 #[cfg(test)]
 pub(crate) use source::SourceFileIdentity;
 pub(crate) use source::ValidatedSource;
+#[allow(unused_imports)] // Repository wiring consumes verification in Task 9.
+pub(crate) use verify::{Verification, VerificationRequest};
+#[allow(unused_imports)] // Repository wiring consumes worker outcomes in Task 9.
+pub(crate) use worker::{ImportWorker, ImportWorkerActions, ImportWorkerOutcome};

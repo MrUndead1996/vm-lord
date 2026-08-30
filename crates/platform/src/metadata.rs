@@ -171,16 +171,23 @@ where
     Ok(DisplayMode::new(stored.width, stored.height))
 }
 
-/// The three facts that pick a GPU payload out of the catalog.
+/// The guest facts that pick a GPU payload out of the catalog.
 ///
 /// Not a [`vmlord_gpu_payload::GuestTarget`]: that type carries the kernel a
-/// payload was proven on, which is a property of a booted guest and not of a
-/// VM that has never run.
+/// payload was proven on. It is absent until VMLord has observed a booted
+/// guest and is otherwise retained so exact selection is possible.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestTargetKey {
     pub distribution: String,
     pub release: String,
     pub architecture: String,
+    /// The running kernel when the guest was observed directly.
+    ///
+    /// Created VMs have not booted when their mapping is written, so this is
+    /// `None` for them. Imported VMs have already answered `uname -r`, which
+    /// lets the GPU catalog prefer an exact proven payload when one exists.
+    #[serde(default)]
+    pub kernel_release: Option<String>,
 }
 
 impl GuestTargetKey {
@@ -189,6 +196,7 @@ impl GuestTargetKey {
             distribution: &self.distribution,
             release: &self.release,
             architecture: &self.architecture,
+            kernel_release: self.kernel_release.as_deref(),
         }
     }
 
@@ -221,6 +229,8 @@ pub(crate) fn guest_target_key(source: &VmSource) -> Option<GuestTargetKey> {
             distribution: image.profile.name.to_ascii_lowercase(),
             release: image.release.clone(),
             architecture: GUEST_ARCHITECTURE.to_owned(),
+            // The mapping is written before this guest's first boot.
+            kernel_release: None,
         }),
     }
 }
@@ -231,16 +241,25 @@ pub(crate) fn guest_target_key(source: &VmSource) -> Option<GuestTargetKey> {
 /// finished and the import owns a disk of its own, so nothing that follows has
 /// any reason to name the machine it came from -- and nothing that reads a
 /// mapping can be handed a path into the source application's storage.
-pub(crate) struct CompletedImport<'a> {
+pub(crate) struct BootstrapImportMapping<'a> {
     pub(crate) vm_id: Uuid,
     pub(crate) vm_name: &'a str,
     pub(crate) hcs_compute_system_id: &'a str,
     pub(crate) disk_gb: u32,
-    /// The guest user the source VM was provisioned with, which is also who
-    /// the conversion connects as.
+}
+
+/// Everything ordinary metadata may claim after the converted guest has
+/// passed its second-boot checks.
+pub(crate) struct CompletedImport<'a> {
+    pub(crate) bootstrap: &'a VmComputeSystemMapping,
     pub(crate) ssh_username: &'a str,
-    /// The port that guest's own SSH daemon already listens on.
     pub(crate) ssh_port: SshPort,
+    pub(crate) gpu_mode: GpuMode,
+    pub(crate) desktop_profile: DesktopProfile,
+    pub(crate) distribution: &'a str,
+    pub(crate) release: &'a str,
+    pub(crate) architecture: &'a str,
+    pub(crate) kernel_release: &'a str,
 }
 
 impl VmComputeSystemMapping {
@@ -255,13 +274,11 @@ impl VmComputeSystemMapping {
     /// desktop the first boot has none of would have it export shares the
     /// guest cannot mount.
     ///
-    /// The SSH facts are the exception, and are the source guest's own: it
-    /// already answers as that user on that port, which is how the conversion
-    /// reaches it at all. The recorded authentication is
-    /// [`SshAuthentication::VmlordKey`] because that is the key the conversion
-    /// deploys and the one every later connection uses; the AppSandbox key
-    /// that opens the first session is never recorded anywhere.
-    pub(crate) fn from_completed_import(import: &CompletedImport<'_>) -> Self {
+    /// Bootstrap SSH facts remain in the import journal instead of this
+    /// mapping. The conversion owns the only caller allowed to offer the
+    /// AppSandbox key, and ordinary Connect must remain unavailable until the
+    /// VMLord key has actually been deployed.
+    pub(crate) fn from_import_bootstrap(import: &BootstrapImportMapping<'_>) -> Self {
         Self {
             vm_id: import.vm_id,
             vm_name: import.vm_name.to_owned(),
@@ -270,11 +287,10 @@ impl VmComputeSystemMapping {
             // Taken on the first start, like any other VM's.
             endpoint_id: None,
             network_mode: NetworkMode::Nat,
-            ssh: Some(SshConfig {
-                username: import.ssh_username.to_owned(),
-                port: import.ssh_port,
-                authentication: SshAuthentication::VmlordKey,
-            }),
+            // The conversion reaches this boot through the AppSandbox key it
+            // owns privately. Advertising VmlordKey here would let another
+            // caller try a key that has not been deployed into the guest yet.
+            ssh: None,
             // VMLord did not configure this guest's SSH daemon, so it has
             // nothing to say about where that daemon's files are: a port move
             // would be guessing which distribution answered.
@@ -286,6 +302,42 @@ impl VmComputeSystemMapping {
             // Learned from the guest during conversion, never guessed from the
             // source application's configuration.
             guest_target: None,
+        }
+    }
+
+    /// The ordinary mapping published only after the second boot proves every
+    /// service it promises.
+    pub(crate) fn from_completed_import(import: &CompletedImport<'_>) -> Self {
+        let bootstrap = import.bootstrap;
+        Self {
+            vm_id: bootstrap.vm_id,
+            vm_name: bootstrap.vm_name.clone(),
+            hcs_compute_system_id: bootstrap.hcs_compute_system_id.clone(),
+            disk_gb: bootstrap.disk_gb,
+            endpoint_id: bootstrap.endpoint_id,
+            network_mode: NetworkMode::Nat,
+            ssh: Some(SshConfig {
+                username: import.ssh_username.to_owned(),
+                port: import.ssh_port,
+                authentication: SshAuthentication::VmlordKey,
+            }),
+            // Conversion preserves the source guest's daemon and port rather
+            // than installing a distro-specific VMLord drop-in.
+            ssh_daemon: None,
+            gpu_mode: import.gpu_mode,
+            desktop_profile: import.desktop_profile,
+            display_provisioning: if import.desktop_profile.wants_desktop() {
+                DisplayProvisioning::Ready
+            } else {
+                DisplayProvisioning::NotRequested
+            },
+            display_mode: None,
+            guest_target: Some(GuestTargetKey {
+                distribution: import.distribution.to_ascii_lowercase(),
+                release: import.release.to_owned(),
+                architecture: import.architecture.to_ascii_lowercase(),
+                kernel_release: Some(import.kernel_release.to_owned()),
+            }),
         }
     }
 
@@ -494,7 +546,8 @@ mod tests {
     };
 
     use super::{
-        CompletedImport, GuestTargetKey, MetadataStore, VmComputeSystemMapping, guest_target_key,
+        BootstrapImportMapping, CompletedImport, GuestTargetKey, MetadataStore,
+        VmComputeSystemMapping, guest_target_key,
     };
 
     #[test]
@@ -972,6 +1025,7 @@ mod tests {
                 distribution: "ubuntu".into(),
                 release: "26.04".into(),
                 architecture: "amd64".into(),
+                kernel_release: None,
             }),
             ..mapping(Uuid::from_u128(1), "dev", "vmlord-dev")
         };
@@ -1024,47 +1078,39 @@ mod tests {
 
     /// A copied AppSandbox guest as VMLord first registers it: the source
     /// VM's identity is gone, and what is left is a VM of VMLord's own.
-    fn completed_import() -> CompletedImport<'static> {
-        CompletedImport {
+    fn import_bootstrap() -> BootstrapImportMapping<'static> {
+        BootstrapImportMapping {
             vm_id: Uuid::from_u128(11),
             vm_name: "imported",
             hcs_compute_system_id: "vmlord-imported",
             disk_gb: 80,
-            ssh_username: "sandbox",
-            ssh_port: SshPort::new(2222).unwrap(),
         }
     }
 
     #[test]
-    fn completed_import_takes_nat_and_the_source_guests_ssh_facts() {
+    fn import_bootstrap_takes_nat_without_premature_vmlord_authentication() {
         // The copied guest already answers SSH as the AppSandbox user on the
-        // port its own daemon was configured with, and it reaches the network
-        // the way every VMLord VM does.
-        let mapping = VmComputeSystemMapping::from_completed_import(&completed_import());
+        // source port, but only the conversion owns those temporary facts.
+        // Publishing VmlordKey here would make Connect offer a key the guest
+        // has not received yet.
+        let mapping = VmComputeSystemMapping::from_import_bootstrap(&import_bootstrap());
 
         assert_eq!(mapping.network_mode, NetworkMode::Nat);
         assert_eq!(
             mapping.endpoint_id, None,
             "the endpoint is taken on the first start, like any other VM's"
         );
-        assert_eq!(
-            mapping.ssh,
-            Some(SshConfig {
-                username: "sandbox".to_owned(),
-                port: SshPort::new(2222).unwrap(),
-                authentication: SshAuthentication::VmlordKey,
-            })
-        );
+        assert_eq!(mapping.ssh, None);
         assert_eq!(mapping.disk_gb, 80);
     }
 
     #[test]
-    fn completed_import_claims_no_gpu_desktop_or_guest_before_conversion() {
+    fn import_bootstrap_claims_no_gpu_desktop_or_guest_before_conversion() {
         // What the import asked for stays in its journal until the conversion
         // has put it inside the guest: a mapping that claimed a GPU or a
         // desktop the first boot has none of would have the next start attach
         // shares nothing can mount.
-        let mapping = VmComputeSystemMapping::from_completed_import(&completed_import());
+        let mapping = VmComputeSystemMapping::from_import_bootstrap(&import_bootstrap());
 
         assert_eq!(mapping.gpu_mode, GpuMode::None);
         assert_eq!(mapping.desktop_profile, DesktopProfile::Headless);
@@ -1084,9 +1130,67 @@ mod tests {
     }
 
     #[test]
-    fn completed_import_is_a_mapping_the_store_accepts() {
-        let mapping = VmComputeSystemMapping::from_completed_import(&completed_import());
+    fn import_bootstrap_is_a_mapping_the_store_accepts() {
+        let mapping = VmComputeSystemMapping::from_import_bootstrap(&import_bootstrap());
 
         assert!(mapping.validate().is_ok());
+    }
+
+    fn completed_import<'a>(bootstrap: &'a VmComputeSystemMapping) -> CompletedImport<'a> {
+        CompletedImport {
+            bootstrap,
+            ssh_username: "sandbox",
+            ssh_port: SshPort::new(2222).unwrap(),
+            gpu_mode: GpuMode::Default,
+            desktop_profile: DesktopProfile::Gnome,
+            distribution: "ubuntu",
+            release: "26.04",
+            architecture: "amd64",
+            kernel_release: "7.0.0-14-generic",
+        }
+    }
+
+    #[test]
+    fn completed_import_publishes_vmlord_authentication_and_observed_guest_facts() {
+        let bootstrap = VmComputeSystemMapping::from_import_bootstrap(&import_bootstrap());
+        let mapping = VmComputeSystemMapping::from_completed_import(&completed_import(&bootstrap));
+
+        assert_eq!(
+            mapping.ssh,
+            Some(SshConfig {
+                username: "sandbox".to_owned(),
+                port: SshPort::new(2222).unwrap(),
+                authentication: SshAuthentication::VmlordKey,
+            })
+        );
+        assert_eq!(mapping.gpu_mode, GpuMode::Default);
+        assert_eq!(mapping.desktop_profile, DesktopProfile::Gnome);
+        assert_eq!(mapping.display_provisioning, DisplayProvisioning::Ready);
+        assert_eq!(
+            mapping.guest_target,
+            Some(GuestTargetKey {
+                distribution: "ubuntu".into(),
+                release: "26.04".into(),
+                architecture: "amd64".into(),
+                kernel_release: Some("7.0.0-14-generic".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn completed_import_keeps_the_endpoint_the_bootstrap_boot_obtained() {
+        let bootstrap = VmComputeSystemMapping {
+            endpoint_id: Some(Uuid::from_u128(91)),
+            ..VmComputeSystemMapping::from_import_bootstrap(&import_bootstrap())
+        };
+
+        let mapping = VmComputeSystemMapping::from_completed_import(&completed_import(&bootstrap));
+
+        assert_eq!(mapping.endpoint_id, Some(Uuid::from_u128(91)));
+        assert_eq!(mapping.vm_id, bootstrap.vm_id);
+        assert_eq!(
+            mapping.hcs_compute_system_id,
+            bootstrap.hcs_compute_system_id
+        );
     }
 }

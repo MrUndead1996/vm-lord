@@ -309,6 +309,42 @@ impl ImportJournal {
         self.stage
     }
 
+    pub(crate) fn validate_destination(&self) -> Result<(), RepositoryError> {
+        self.validate_under(&self.storage_root)?;
+        let relative = self
+            .destination
+            .strip_prefix(&self.storage_root)
+            .expect("validate_under accepted this prefix");
+        let mut components = relative.components();
+        let only = components.next();
+        if components.next().is_some()
+            || only.is_some_and(|component| {
+                component
+                    .as_os_str()
+                    .to_string_lossy()
+                    .eq_ignore_ascii_case("imports")
+            })
+        {
+            return Err(RepositoryError::new(format!(
+                "import cleanup target {} is not one exact VMLord VM directory",
+                self.destination.display()
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn requested_resources(&self) -> &ImportResources {
+        &self.requested_resources
+    }
+
+    pub(crate) const fn desired_gpu(&self) -> GpuMode {
+        self.desired_gpu
+    }
+
+    pub(crate) const fn bootstrap_ssh(&self) -> &BootstrapSshFacts {
+        &self.bootstrap_ssh
+    }
+
     pub(crate) const fn last_confirmed_conversion_step(&self) -> Option<ConversionStep> {
         self.last_confirmed_conversion_step
     }

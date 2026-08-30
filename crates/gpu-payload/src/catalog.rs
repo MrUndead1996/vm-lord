@@ -14,16 +14,17 @@ pub struct GuestTarget {
 }
 /// A guest as the host knows it before that guest has booted.
 ///
-/// Three fields and not four: `kernel_release` is a property of a running
-/// kernel, and the host chooses a payload before there is one. The guest
-/// checks applicability itself and DKMS rebuilds the module for whatever
-/// kernel it runs, so the catalog's kernel records what a payload was proven
-/// on rather than what it requires.
+/// The kernel is optional because a created VM has not booted when the host
+/// first chooses its payload. An imported VM has already answered `uname -r`;
+/// it prefers an exact proven payload when available. The guest still checks
+/// applicability and DKMS rebuilds for the running kernel, so a mismatch falls
+/// back to the newest payload proven for the same distribution triple.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GuestSelector<'a> {
     pub distribution: &'a str,
     pub release: &'a str,
     pub architecture: &'a str,
+    pub kernel_release: Option<&'a str>,
 }
 impl GuestTarget {
     pub fn ubuntu_26_04_amd64(kernel_release: impl Into<String>) -> Self {
@@ -256,7 +257,8 @@ impl PayloadCatalog {
         &self,
         guest: &GuestSelector<'_>,
     ) -> Result<&CatalogEntry, PayloadError> {
-        self.entries
+        let matching: Vec<&CatalogEntry> = self
+            .entries
             .iter()
             .filter(|entry| {
                 entry
@@ -269,6 +271,16 @@ impl PayloadCatalog {
                         .architecture
                         .eq_ignore_ascii_case(guest.architecture)
             })
+            .collect();
+        if let Some(kernel_release) = guest.kernel_release
+            && let Some(exact) = matching
+                .iter()
+                .find(|entry| entry.target.kernel_release == kernel_release)
+        {
+            return Ok(exact);
+        }
+        matching
+            .into_iter()
             .max_by_key(|entry| kernel_order(&entry.target.kernel_release))
             .ok_or_else(|| PayloadError::NoPayloadForGuest {
                 distribution: guest.distribution.to_owned(),
@@ -384,7 +396,51 @@ mod tests {
             distribution: "ubuntu",
             release: "26.04",
             architecture: "amd64",
+            kernel_release: None,
         }
+    }
+
+    #[test]
+    fn an_observed_guest_prefers_its_exact_kernel_when_the_catalog_has_it() {
+        let catalog = catalog_with(&[
+            entry_json("ubuntu", "26.04", "amd64", "7.0.0-9-generic"),
+            entry_json("ubuntu", "26.04", "amd64", "7.0.0-14-generic"),
+        ]);
+        let guest = GuestSelector {
+            kernel_release: Some("7.0.0-9-generic"),
+            ..ubuntu_2604()
+        };
+
+        assert_eq!(
+            catalog
+                .select_for_guest(&guest)
+                .unwrap()
+                .target()
+                .kernel_release,
+            "7.0.0-9-generic"
+        );
+    }
+
+    #[test]
+    fn an_observed_newer_kernel_uses_the_documented_dkms_fallback() {
+        let catalog = catalog_with(&[
+            entry_json("ubuntu", "26.04", "amd64", "7.0.0-9-generic"),
+            entry_json("ubuntu", "26.04", "amd64", "7.0.0-14-generic"),
+        ]);
+        let guest = GuestSelector {
+            kernel_release: Some("7.0.0-20-generic"),
+            ..ubuntu_2604()
+        };
+
+        assert_eq!(
+            catalog
+                .select_for_guest(&guest)
+                .unwrap()
+                .target()
+                .kernel_release,
+            "7.0.0-14-generic",
+            "DKMS rebuilds for the running kernel, so the newest proven payload is the safe fallback"
+        );
     }
     #[test]
     fn a_guest_selects_an_entry_whatever_kernel_it_runs() {

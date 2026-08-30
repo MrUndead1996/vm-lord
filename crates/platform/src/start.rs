@@ -11,7 +11,9 @@ use uuid::Uuid;
 use vmlord_core::{GpuAssignment, GpuFailure, GpuMode, NetworkMode, RepositoryError};
 
 use crate::{
-    Com1LogMode, HcsClient, HcsSystem, cleanup,
+    Com1LogMode, HcsClient, HcsSystem,
+    build::StartedVm,
+    cleanup,
     com1_terminal::{Com1Launcher, Com1Session},
     dhcp::{self, DhcpRegistrar},
     display_exports::DisplayExport,
@@ -279,6 +281,26 @@ impl VmStartPipeline {
             error
         })?;
 
+        self.start_mapping(store, &mapping, vm_directory)
+            .map(|started| started.session)
+    }
+
+    /// Starts from a caller-supplied mapping while keeping the mapping already
+    /// in `store` as the only durable metadata until the caller publishes a
+    /// replacement.
+    ///
+    /// Import uses this for its second boot: payload preparation must see the
+    /// observed guest and requested GPU/display fields, but those fields must
+    /// not become ordinary metadata until verification passes. Endpoint
+    /// changes are still recorded against the existing mapping so DHCP and
+    /// later retries keep the same address without publishing the richer
+    /// caller-supplied state early.
+    pub(crate) fn start_mapping(
+        &self,
+        store: &MetadataStore,
+        mapping: &VmComputeSystemMapping,
+        vm_directory: &Path,
+    ) -> Result<StartedVm, RepositoryError> {
         tracing::info!(
             "starting VM \"{}\" ({}) as HCS compute system \"{}\"",
             mapping.vm_name,
@@ -288,36 +310,42 @@ impl VmStartPipeline {
 
         // After reading the configuration, so that a VM whose stored state is
         // unusable never opens a window for a start that cannot happen.
-        let stored = self.read_configuration(&mapping, vm_directory)?;
+        let stored = self.read_configuration(mapping, vm_directory)?;
 
         // Before anything is granted or built: the shares below become part of
         // the compute system, and a system's Plan9 section is fixed for the
         // lifetime of a boot. Prepared once even though the start below may be
         // retried -- staging, enumeration and assignment are never repeated.
-        let prepared = self.prepare_gpu(&mapping, vm_directory);
-        let display = self.prepare_display(&mapping, vm_directory);
+        let prepared = self.prepare_gpu(mapping, vm_directory);
+        let display = self.prepare_display(mapping, vm_directory);
 
         let (configuration, endpoint) = self.attach_network(
             store,
-            &mapping,
+            mapping,
             vm_directory,
             stored.clone(),
             mapping.endpoint_id,
             EndpointPolicy::Reuse,
         )?;
         let configuration = with_plan9_shares(
-            &mapping,
+            mapping,
             configuration,
             prepared.as_ref(),
             display.as_ref().and_then(|display| display.export.as_ref()),
         );
-        self.grant_access_to_attachments(&mapping, &configuration)?;
+        self.grant_access_to_attachments(mapping, &configuration)?;
 
-        let failure = match self.open_console_and_start(&mapping, vm_directory, &configuration) {
+        let failure = match self.open_console_and_start(mapping, vm_directory, &configuration) {
             Ok(session) => {
                 tracing::info!("started VM \"{}\" ({})", mapping.vm_name, mapping.vm_id);
-                self.attach_gpu(&mapping, prepared.as_ref());
-                return Ok(session);
+                self.attach_gpu(mapping, prepared.as_ref());
+                return Ok(StartedVm {
+                    mapping: VmComputeSystemMapping {
+                        endpoint_id: endpoint.or(mapping.endpoint_id),
+                        ..mapping.clone()
+                    },
+                    session,
+                });
             }
             Err(failure) => failure,
         };
@@ -343,23 +371,23 @@ impl VmStartPipeline {
             mapping.vm_name
         );
 
-        let (configuration, _) = self.attach_network(
+        let (configuration, replacement_endpoint) = self.attach_network(
             store,
-            &mapping,
+            mapping,
             vm_directory,
             stored,
             Some(endpoint),
             EndpointPolicy::Replace,
         )?;
         let configuration = with_plan9_shares(
-            &mapping,
+            mapping,
             configuration,
             prepared.as_ref(),
             display.as_ref().and_then(|display| display.export.as_ref()),
         );
-        self.grant_access_to_attachments(&mapping, &configuration)?;
+        self.grant_access_to_attachments(mapping, &configuration)?;
         let session = self
-            .open_console_and_start(&mapping, vm_directory, &configuration)
+            .open_console_and_start(mapping, vm_directory, &configuration)
             .map_err(|failure| {
                 let error = failure.into_error();
                 tracing::error!("failed to start VM \"{}\": {error}", mapping.vm_name);
@@ -367,8 +395,14 @@ impl VmStartPipeline {
             })?;
 
         tracing::info!("started VM \"{}\" ({})", mapping.vm_name, mapping.vm_id);
-        self.attach_gpu(&mapping, prepared.as_ref());
-        Ok(session)
+        self.attach_gpu(mapping, prepared.as_ref());
+        Ok(StartedVm {
+            mapping: VmComputeSystemMapping {
+                endpoint_id: replacement_endpoint.or(mapping.endpoint_id),
+                ..mapping.clone()
+            },
+            session,
+        })
     }
 
     /// Works out what this VM's GPU can be, and records what was found.
@@ -535,9 +569,15 @@ impl VmStartPipeline {
 
         let adapter = (self.endpoint_provider)(&mapping.vm_name, recorded, policy)?;
         if recorded != Some(adapter.endpoint_id) {
+            let persisted = store.find_by_vm_id(mapping.vm_id)?.ok_or_else(|| {
+                RepositoryError::new(format!(
+                    "no HCS mapping found for VM \"{}\" while recording its endpoint",
+                    mapping.vm_name
+                ))
+            })?;
             store.insert(VmComputeSystemMapping {
                 endpoint_id: Some(adapter.endpoint_id),
-                ..mapping.clone()
+                ..persisted
             })?;
         }
 
@@ -1602,6 +1642,99 @@ mod tests {
             vec![(None, EndpointPolicy::Reuse)]
         );
         assert_eq!(fixture.recorded_endpoint(), Some(NEW_ENDPOINT_ID));
+    }
+
+    #[test]
+    fn an_unpublished_import_start_does_not_publish_its_final_fields_while_recording_an_endpoint() {
+        let fixture = fixture_with("import-endpoint", NetworkMode::Nat, None);
+        let calls = fixture.calls.clone();
+        let final_mapping = VmComputeSystemMapping {
+            ssh: Some(vmlord_core::SshConfig {
+                username: "sandbox".into(),
+                port: vmlord_core::SshPort::new(2222).unwrap(),
+                authentication: vmlord_core::SshAuthentication::VmlordKey,
+            }),
+            gpu_mode: vmlord_core::GpuMode::Default,
+            desktop_profile: vmlord_core::DesktopProfile::Gnome,
+            display_provisioning: vmlord_core::DisplayProvisioning::Ready,
+            guest_target: Some(crate::metadata::GuestTargetKey {
+                distribution: "ubuntu".into(),
+                release: "26.04".into(),
+                architecture: "amd64".into(),
+                kernel_release: Some("7.0.0-14-generic".into()),
+            }),
+            ..fixture.mapping.clone()
+        };
+
+        pipeline(&calls, Behavior::default())
+            .start_mapping(&fixture.store, &final_mapping, &fixture.vm_directory)
+            .expect("the second boot should start from the completed in-memory mapping");
+
+        let stored = fixture.store.find_by_vm_name("dev").unwrap().unwrap();
+        assert_eq!(stored.endpoint_id, Some(NEW_ENDPOINT_ID));
+        assert_eq!(
+            stored.ssh, None,
+            "the VMLord key is published only after verification"
+        );
+        assert_eq!(stored.gpu_mode, vmlord_core::GpuMode::None);
+        assert_eq!(stored.guest_target, None);
+    }
+
+    #[test]
+    fn an_imports_observed_identity_drives_the_normal_second_boot_preparers() {
+        let fixture = fixture("import-payload-selection");
+        let calls = fixture.calls.clone();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let final_mapping = VmComputeSystemMapping {
+            gpu_mode: vmlord_core::GpuMode::Default,
+            desktop_profile: vmlord_core::DesktopProfile::Gnome,
+            display_provisioning: vmlord_core::DisplayProvisioning::Ready,
+            guest_target: Some(crate::metadata::GuestTargetKey {
+                distribution: "ubuntu".into(),
+                release: "26.04".into(),
+                architecture: "amd64".into(),
+                kernel_release: Some("7.0.0-14-generic".into()),
+            }),
+            ..fixture.mapping.clone()
+        };
+        let gpu_observed = Arc::clone(&observed);
+        let display_observed = Arc::clone(&observed);
+        let pipeline = pipeline(&calls, Behavior::default())
+            .with_gpu(
+                move |mapping, _directory| {
+                    let target = mapping.guest_target.as_ref().unwrap();
+                    gpu_observed.lock().unwrap().push(format!(
+                        "gpu:{}:{}:{}:{}",
+                        target.distribution,
+                        target.release,
+                        target.architecture,
+                        target.kernel_release.as_deref().unwrap()
+                    ));
+                    None
+                },
+                |_id, _mode| Ok(()),
+                GpuRuns::default(),
+            )
+            .with_display(move |mapping, _directory| {
+                let target = mapping.guest_target.as_ref().unwrap();
+                display_observed.lock().unwrap().push(format!(
+                    "display:{}:{}:{}",
+                    target.distribution, target.release, target.architecture
+                ));
+                None
+            });
+
+        pipeline
+            .start_mapping(&fixture.store, &final_mapping, &fixture.vm_directory)
+            .unwrap();
+
+        assert_eq!(
+            observed.lock().unwrap().as_slice(),
+            [
+                "gpu:ubuntu:26.04:amd64:7.0.0-14-generic",
+                "display:ubuntu:26.04:amd64"
+            ]
+        );
     }
 
     #[test]

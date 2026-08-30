@@ -150,6 +150,7 @@ mod tests {
                 distribution: "ubuntu",
                 release: "1.04",
                 architecture: "amd64",
+                kernel_release: None,
             },
             progress: &|_| {},
             cancel: &AtomicBool::new(false),
