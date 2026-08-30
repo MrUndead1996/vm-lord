@@ -5,6 +5,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod appsandbox_import;
+
+use appsandbox_import::{AppSandboxImportAction, AppSandboxImportForm};
 use eframe::egui;
 use rust_i18n::t;
 use vmlord_app::{AvailableUpdate, BackendStatus, UpdateState, VmAction, WorkspaceApp};
@@ -75,6 +78,7 @@ pub fn run(application: WorkspaceApp) -> eframe::Result<()> {
                 last_refresh: Instant::now(),
                 selected_vm_name: None,
                 create_vm_form: None,
+                appsandbox_import_form: None,
                 edit_vm_form: None,
                 delete_vm_form: None,
                 settings_form,
@@ -89,6 +93,12 @@ struct VmlordUi {
     last_refresh: Instant,
     selected_vm_name: Option<String>,
     create_vm_form: Option<CreateVmForm>,
+    /// The import dialog's own field, present only while the window is open.
+    ///
+    /// Which VM was chosen and what was discovered are the application's, and
+    /// survive this window being closed; the name being typed is this dialog's
+    /// and does not.
+    appsandbox_import_form: Option<AppSandboxImportForm>,
     edit_vm_form: Option<EditVmForm>,
     delete_vm_form: Option<DeleteVmForm>,
     settings_form: Option<SettingsForm>,
@@ -381,6 +391,9 @@ impl eframe::App for VmlordUi {
             self.last_refresh = Instant::now();
         }
 
+        // Set inside the panel closure and read after it: the import dialog is
+        // not one of the per-VM actions, so it has no `VmAction` to travel as.
+        let mut open_import = false;
         let action = egui::CentralPanel::default().show(context, |ui| {
             let mut selected_action = None;
 
@@ -424,6 +437,27 @@ impl eframe::App for VmlordUi {
                     }
                     if create.clicked() {
                         selected_action = Some(VmAction::Create);
+                    }
+
+                    // Beside Create rather than inside it: importing an
+                    // existing VM and making a new one are different jobs, and
+                    // a dialog that did both would ask for one set of fields
+                    // and use the other.
+                    let import = ui.add_enabled(
+                        can_refresh,
+                        egui::Button::new(t!("app.import_vm").to_string()),
+                    );
+                    if can_refresh {
+                        import
+                            .clone()
+                            .on_hover_text(t!("app.import_vm_hint").to_string());
+                    } else {
+                        import
+                            .clone()
+                            .on_disabled_hover_text(t!("app.refresh_hint").to_string());
+                    }
+                    if import.clicked() {
+                        open_import = true;
                     }
 
                     let settings = ui.button(t!("app.settings").to_string());
@@ -516,6 +550,80 @@ impl eframe::App for VmlordUi {
                 }
             }
             context.request_repaint();
+        }
+
+        if open_import {
+            self.appsandbox_import_form = Some(AppSandboxImportForm::default());
+            self.create_vm_form = None;
+            self.edit_vm_form = None;
+            // Opened on what is already known, then refreshed: the window shows
+            // the last discovery immediately rather than an empty list while
+            // another application's files are walked.
+            let _ = self.application.discover_appsandbox_vms();
+            let _ = self.application.incomplete_appsandbox_imports();
+        }
+
+        let running_imports = self.application.running_imports();
+        let import_dialog_action = self.appsandbox_import_form.as_mut().and_then(|form| {
+            appsandbox_import::render(
+                context,
+                form,
+                self.application.appsandbox(),
+                self.application.vms(),
+                &running_imports,
+            )
+        });
+        match import_dialog_action {
+            Some(AppSandboxImportAction::Discover) => {
+                if let Err(error) = self.application.discover_appsandbox_vms()
+                    && let Some(form) = &mut self.appsandbox_import_form
+                {
+                    form.error = Some(error.to_string());
+                }
+            }
+            Some(AppSandboxImportAction::Select(source_id)) => {
+                if let Err(error) = self.application.appsandbox_mut().select(&source_id) {
+                    if let Some(form) = &mut self.appsandbox_import_form {
+                        form.error = Some(error.to_string());
+                    }
+                } else if let Some(candidate) = self.application.appsandbox().selected() {
+                    self.appsandbox_import_form =
+                        Some(AppSandboxImportForm::from_candidate(candidate));
+                }
+            }
+            Some(AppSandboxImportAction::Submit(request)) => {
+                if let Err(error) = self.application.start_appsandbox_import(request) {
+                    if let Some(form) = &mut self.appsandbox_import_form {
+                        form.error = Some(error.to_string());
+                    }
+                } else {
+                    self.appsandbox_import_form = None;
+                    self.last_refresh = Instant::now();
+                }
+            }
+            Some(AppSandboxImportAction::StopImport(name)) => {
+                if let Err(error) = self.application.cancel_appsandbox_import(&name)
+                    && let Some(form) = &mut self.appsandbox_import_form
+                {
+                    form.error = Some(error.to_string());
+                }
+            }
+            Some(AppSandboxImportAction::Retry(name)) => {
+                if let Err(error) = self.application.retry_appsandbox_import(&name)
+                    && let Some(form) = &mut self.appsandbox_import_form
+                {
+                    form.error = Some(error.to_string());
+                }
+            }
+            Some(AppSandboxImportAction::Discard(name)) => {
+                if let Err(error) = self.application.discard_appsandbox_import(&name)
+                    && let Some(form) = &mut self.appsandbox_import_form
+                {
+                    form.error = Some(error.to_string());
+                }
+            }
+            Some(AppSandboxImportAction::Cancel) => self.appsandbox_import_form = None,
+            None => {}
         }
 
         // Asked before the form is borrowed for drawing, and asked of the

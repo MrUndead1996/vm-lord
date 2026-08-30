@@ -216,7 +216,6 @@ impl ImportRegistry {
     }
 
     /// The latest published progress of one import, for the application layer.
-    #[allow(dead_code)] // The import dialog consumes the detailed stage in Task 11.
     pub(crate) fn progress(&self, name: &str) -> Option<AppSandboxImportProgress> {
         self.reap();
         self.lock()

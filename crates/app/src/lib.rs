@@ -150,6 +150,12 @@ pub struct WorkspaceApp {
     /// `WorkspaceApp` without a sink simply has nothing to read.
     sink: Option<DiagnosticsSink>,
     updates: update::UpdateManager,
+    /// How far each import in flight has got, keyed by destination VM name.
+    ///
+    /// Derived once per refresh like the GPU and display statuses, and only
+    /// for the VMs the list already reports as building: an import's own stage
+    /// is not something the VM list's creation steps can spell.
+    import_progress: HashMap<String, vmlord_core::AppSandboxImportProgress>,
     /// What the AppSandbox import dialog is looking at.
     ///
     /// Application-owned rather than asked for on every redraw: a discovery
@@ -182,6 +188,7 @@ impl WorkspaceApp {
             diagnostics: Vec::new(),
             sink: None,
             updates: update::UpdateManager::default(),
+            import_progress: HashMap::new(),
             appsandbox: appsandbox::ImportWorkflow::default(),
             first_run: false,
         }
@@ -471,6 +478,17 @@ impl WorkspaceApp {
                         )
                     })
                     .collect();
+                self.import_progress = vms
+                    .iter()
+                    .filter(|vm| matches!(vm.state, VmState::Building { .. }))
+                    .filter_map(|vm| {
+                        self.repository
+                            .appsandbox_import_progress(&vm.name)
+                            .ok()
+                            .flatten()
+                            .map(|progress| (vm.name.clone(), progress))
+                    })
+                    .collect();
                 self.vms = vms;
             }
             Err(error) => self.status = BackendStatus::Unavailable(error.to_string()),
@@ -498,6 +516,21 @@ impl WorkspaceApp {
                 Err(error)
             }
         }
+    }
+
+    /// How far each import in flight has got, newest reading per refresh.
+    ///
+    /// Sorted by name so the dialog's rows do not change places between two
+    /// frames of the same import.
+    #[must_use]
+    pub fn running_imports(&self) -> Vec<(&str, vmlord_core::AppSandboxImportProgress)> {
+        let mut running: Vec<(&str, vmlord_core::AppSandboxImportProgress)> = self
+            .import_progress
+            .iter()
+            .map(|(name, progress)| (name.as_str(), *progress))
+            .collect();
+        running.sort_by_key(|(name, _)| *name);
+        running
     }
 
     /// What the import dialog is looking at.

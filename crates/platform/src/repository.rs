@@ -1580,6 +1580,13 @@ impl VmRepository for HcsVmRepository {
         self.run_import(request, listing, journal, Some(source), false)
     }
 
+    fn appsandbox_import_progress(
+        &self,
+        destination_name: &str,
+    ) -> Result<Option<vmlord_core::AppSandboxImportProgress>, RepositoryError> {
+        Ok(self.imports.progress(destination_name))
+    }
+
     fn cancel_appsandbox_import(&mut self, destination_name: &str) -> Result<(), RepositoryError> {
         self.require_initialized()?;
         self.imports.cancel(destination_name)

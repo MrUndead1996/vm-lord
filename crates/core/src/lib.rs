@@ -301,6 +301,18 @@ pub trait VmRepository {
             "AppSandbox imports are not supported by this backend",
         ))
     }
+    /// How far the import of `destination_name` has got, when there is one.
+    ///
+    /// `Ok(None)` for a VM that is not being imported, which is every VM in
+    /// most backends. The VM list already says an import is running; this says
+    /// what it is doing, in the import's own vocabulary rather than in the
+    /// creation steps [`VmState::Building`] can spell.
+    fn appsandbox_import_progress(
+        &self,
+        _destination_name: &str,
+    ) -> Result<Option<AppSandboxImportProgress>, RepositoryError> {
+        Ok(None)
+    }
     /// Lists imports retained for explicit retry or discard.
     fn incomplete_appsandbox_imports(
         &self,
