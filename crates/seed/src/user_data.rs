@@ -160,7 +160,7 @@ fn agent_install_commands() -> Vec<Vec<String>> {
             "-g".into(),
             "root".into(),
             format!("/run/vmlord-tools/{AGENT_FILE}"),
-            "/usr/local/lib/vmlord/vmlord-agent".into(),
+            GUEST_AGENT_PATH.into(),
         ],
         vec!["umount".into(), "/run/vmlord-tools".into()],
         vec!["systemctl".into(), "daemon-reload".into()],
@@ -168,7 +168,7 @@ fn agent_install_commands() -> Vec<Vec<String>> {
             "systemctl".into(),
             "enable".into(),
             "--now".into(),
-            "vmlord-agent.service".into(),
+            AGENT_SERVICE_NAME.into(),
         ],
     ]
 }
@@ -310,8 +310,23 @@ fn entry(path: &str, content: &str, permissions: &str, owner: Option<&str>) -> S
 /// value, so it waits for a second distribution.
 const KEYBOARD_PATH: &str = "/etc/default/keyboard";
 
-const AGENT_SERVICE_PATH: &str = "/etc/systemd/system/vmlord-agent.service";
-const AGENT_SERVICE: &str = "[Unit]\nDescription=VMLord guest agent\nConditionPathExists=/etc/vmlord/agent.secret\n\n[Service]\nExecStart=/usr/local/lib/vmlord/vmlord-agent\nUser=root\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n";
+/// Where the agent's unit file lives inside a guest.
+///
+/// Public because a VM does not always get its agent from a seed: an imported
+/// AppSandbox guest has no cloud-init run to write one, and the conversion
+/// installs the same unit over SSH. Two spellings of one path would be two
+/// paths that could diverge, with the guest that had the older one still
+/// passing every check.
+pub const AGENT_SERVICE_PATH: &str = "/etc/systemd/system/vmlord-agent.service";
+
+/// The name systemd knows that unit by.
+pub const AGENT_SERVICE_NAME: &str = "vmlord-agent.service";
+
+/// Where the agent binary is installed inside a guest.
+pub const GUEST_AGENT_PATH: &str = "/usr/local/lib/vmlord/vmlord-agent";
+
+/// The unit itself, shared for the same reason as its path.
+pub const AGENT_SERVICE: &str = "[Unit]\nDescription=VMLord guest agent\nConditionPathExists=/etc/vmlord/agent.secret\n\n[Service]\nExecStart=/usr/local/lib/vmlord/vmlord-agent\nUser=root\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n";
 
 /// The content of that file.
 ///

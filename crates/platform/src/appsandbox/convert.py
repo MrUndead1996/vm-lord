@@ -15,28 +15,14 @@ import pwd
 import shutil
 import subprocess
 import sys
-import zipfile
 
 HOME = "/var/lib/vmlord/convert"
-AGENT = "/usr/local/lib/vmlord/vmlord-agent"
-AGENT_SECRET = "/etc/vmlord/agent.secret"
-AGENT_UNIT = "/etc/systemd/system/vmlord-agent.service"
-PAYLOADS = "/var/lib/vmlord/payloads"
 
-AGENT_UNIT_TEXT = (
-    "[Unit]\n"
-    "Description=VMLord guest agent\n"
-    "ConditionPathExists=/etc/vmlord/agent.secret\n"
-    "\n"
-    "[Service]\n"
-    "ExecStart=/usr/local/lib/vmlord/vmlord-agent\n"
-    "User=root\n"
-    "Restart=always\n"
-    "RestartSec=5\n"
-    "\n"
-    "[Install]\n"
-    "WantedBy=multi-user.target\n"
-)
+# Where the agent goes, what its unit is called and what the unit says are all
+# VMLord's, not this program's: they come from vmlord-seed and
+# vmlord-agent-protocol through input.json, so that a change to the unit or to
+# the secret's path reaches an imported guest and a created one alike. A copy
+# here would be a copy that falls behind while verify-agent-files still passes.
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -83,47 +69,33 @@ def write_root_file(path, text, mode):
     os.chown(path, 0, 0)
 
 
-def payload_directory(kind, payload_id):
-    return os.path.join(PAYLOADS, kind, payload_id)
-
-
-def install_payload(kind, key):
-    payload_id = load_input()[key]
-    target = payload_directory(kind, payload_id)
-    if os.path.isdir(target):
-        shutil.rmtree(target)
-    os.makedirs(target)
-    with zipfile.ZipFile(os.path.join(HOME, kind + "-payload.zip")) as archive:
-        for member in archive.namelist():
-            resolved = os.path.realpath(os.path.join(target, member))
-            if not resolved.startswith(os.path.realpath(target) + os.sep):
-                fail("%s escapes its payload directory" % member)
-        archive.extractall(target)
-    os.chmod(target, 0o755)
-
-
-def check_payload(kind, key):
-    target = payload_directory(kind, load_input()[key])
-    if not os.path.isdir(target) or not os.listdir(target):
-        fail("the %s payload is not installed at %s" % (kind, target))
-
-
 # --- steps -----------------------------------------------------------------
 
 
 def install_bundle():
+    # The upload arrived with the modes of the account that wrote it, so the
+    # secret that authenticates this VM's agent to the host is readable by that
+    # account's group and possibly by everyone. Narrow it where it lies, before
+    # anything else, so that the window is as short as this program can make it.
+    staged_secret = os.path.join(HERE, "agent.secret")
+    if os.path.isfile(staged_secret):
+        os.chmod(staged_secret, 0o600)
     check_manifest(HERE)
-    if os.path.realpath(HERE) != os.path.realpath(HOME):
-        if os.path.isdir(HOME):
-            shutil.rmtree(HOME)
-        os.makedirs(os.path.dirname(HOME), exist_ok=True)
-        shutil.copytree(HERE, HOME)
+    if os.path.realpath(HERE) == os.path.realpath(HOME):
+        fail("the bundle is already installed; it is not staged from %s" % HOME)
+    if os.path.isdir(HOME):
+        shutil.rmtree(HOME)
+    os.makedirs(os.path.dirname(HOME), exist_ok=True)
+    shutil.copytree(HERE, HOME)
     for name in os.listdir(HOME):
         path = os.path.join(HOME, name)
         os.chown(path, 0, 0)
         os.chmod(path, 0o600)
     os.chown(HOME, 0, 0)
     os.chmod(HOME, 0o700)
+    # Nothing needs the staged copy again, and leaving it behind would leave
+    # the agent secret on a disk /tmp-or-not makes no promises about.
+    shutil.rmtree(HERE, ignore_errors=True)
 
 
 def verify_bundle():
@@ -164,42 +136,34 @@ def verify_vmlord_key():
 
 
 def install_agent():
-    os.makedirs(os.path.dirname(AGENT), exist_ok=True)
-    shutil.copyfile(os.path.join(HOME, "vmlord-agent"), AGENT)
-    os.chmod(AGENT, 0o755)
-    os.chown(AGENT, 0, 0)
+    values = load_input()
+    agent = values["agent_binary_path"]
+    os.makedirs(os.path.dirname(agent), exist_ok=True)
+    shutil.copyfile(os.path.join(HOME, "vmlord-agent"), agent)
+    os.chmod(agent, 0o755)
+    os.chown(agent, 0, 0)
     with open(os.path.join(HOME, "agent.secret"), "r", encoding="utf-8") as handle:
-        write_root_file(AGENT_SECRET, handle.read().strip() + "\n", 0o600)
-    write_root_file(AGENT_UNIT, AGENT_UNIT_TEXT, 0o644)
+        write_root_file(values["agent_secret_path"], handle.read().strip() + "\n", 0o600)
+    write_root_file(values["agent_unit_path"], values["agent_unit_text"], 0o644)
     systemctl("daemon-reload")
-    if systemctl("enable", "vmlord-agent.service") != 0:
+    if systemctl("enable", values["agent_unit_name"]) != 0:
         fail("the VMLord agent unit could not be enabled")
 
 
 def verify_agent_files():
-    for path, mode in ((AGENT, 0o755), (AGENT_SECRET, 0o600), (AGENT_UNIT, 0o644)):
+    values = load_input()
+    installed = (
+        (values["agent_binary_path"], 0o755),
+        (values["agent_secret_path"], 0o600),
+        (values["agent_unit_path"], 0o644),
+    )
+    for path, mode in installed:
         if not os.path.isfile(path):
             fail("%s is missing" % path)
         if os.stat(path).st_mode & 0o777 != mode:
             fail("%s does not have the permissions VMLord installed it with" % path)
-    if systemctl("is-enabled", "--quiet", "vmlord-agent.service") != 0:
-        fail("vmlord-agent.service is not enabled")
-
-
-def install_display_payload():
-    install_payload("display", "display_payload_id")
-
-
-def verify_display_payload():
-    check_payload("display", "display_payload_id")
-
-
-def install_gpu_payload():
-    install_payload("gpu", "gpu_payload_id")
-
-
-def verify_gpu_payload():
-    check_payload("gpu", "gpu_payload_id")
+    if systemctl("is-enabled", "--quiet", values["agent_unit_name"]) != 0:
+        fail("%s is not enabled" % values["agent_unit_name"])
 
 
 def disable_appsandbox_units():
@@ -225,10 +189,9 @@ def validate_replacements():
     enabled and accepted by systemd itself.
     """
     verify_agent_files()
-    verify_display_payload()
-    verify_gpu_payload()
-    if subprocess.call(["systemd-analyze", "verify", AGENT_UNIT]) != 0:
-        fail("systemd does not accept %s" % AGENT_UNIT)
+    unit = load_input()["agent_unit_path"]
+    if subprocess.call(["systemd-analyze", "verify", unit]) != 0:
+        fail("systemd does not accept %s" % unit)
 
 
 def remove_obsolete_files():
@@ -258,10 +221,6 @@ STEPS = {
     "verify-vmlord-key": verify_vmlord_key,
     "install-agent": install_agent,
     "verify-agent-files": verify_agent_files,
-    "install-display-payload": install_display_payload,
-    "verify-display-payload": verify_display_payload,
-    "install-gpu-payload": install_gpu_payload,
-    "verify-gpu-payload": verify_gpu_payload,
     "disable-appsandbox-units": disable_appsandbox_units,
     "verify-appsandbox-units-disabled": verify_appsandbox_units_disabled,
     "validate-replacements": validate_replacements,

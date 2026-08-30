@@ -71,9 +71,8 @@ pub(crate) enum ConversionStep {
     GuestObserved,
     BundleUploaded,
     VmlordSshKeyDeployed,
+    #[serde(alias = "DisplayPayloadInstalled", alias = "GpuPayloadInstalled")]
     AgentInstalled,
-    DisplayPayloadInstalled,
-    GpuPayloadInstalled,
     AppSandboxUnitsDisabled,
     ReplacementsValidated,
     ObsoleteFilesRemoved,
@@ -82,13 +81,11 @@ pub(crate) enum ConversionStep {
 
 impl ConversionStep {
     /// Every step, in the order a conversion confirms them.
-    pub(crate) const ALL: [Self; 10] = [
+    pub(crate) const ALL: [Self; 8] = [
         Self::GuestObserved,
         Self::BundleUploaded,
         Self::VmlordSshKeyDeployed,
         Self::AgentInstalled,
-        Self::DisplayPayloadInstalled,
-        Self::GpuPayloadInstalled,
         Self::AppSandboxUnitsDisabled,
         Self::ReplacementsValidated,
         Self::ObsoleteFilesRemoved,
@@ -494,6 +491,34 @@ mod tests {
         }
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Payload delivery moved to the second boot's host-side Plan9 shares.
+    /// Journals written by the first Task 7 conversion still name the two
+    /// removed guest payload stages, though, and a recovery must treat either
+    /// as having reached the preceding durable agent step rather than calling
+    /// an otherwise recoverable import corrupted.
+    #[test]
+    fn journals_from_the_removed_guest_payload_stages_resume_after_agent_installation() {
+        for old_step in ["DisplayPayloadInstalled", "GpuPayloadInstalled"] {
+            let root = temporary_root("legacy-payload-step");
+            let mut journal =
+                ImportJournal::create(&root, fixture_details(root.join("ubuntu"))).unwrap();
+            journal.set_last_confirmed_conversion_step(Some(ConversionStep::AgentInstalled));
+            journal.save().unwrap();
+
+            let contents = fs::read_to_string(journal.path()).unwrap();
+            fs::write(journal.path(), contents.replace("AgentInstalled", old_step)).unwrap();
+
+            let loaded = ImportJournal::load(&root, journal.import_id()).unwrap();
+            assert_eq!(
+                loaded.last_confirmed_conversion_step(),
+                Some(ConversionStep::AgentInstalled),
+                "a journal at the removed {old_step} stage must rerun from the agent boundary"
+            );
+
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]

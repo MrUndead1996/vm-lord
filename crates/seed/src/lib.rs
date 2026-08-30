@@ -14,6 +14,12 @@ mod user_data;
 
 use vmlord_core::{SshAccess, SshDaemon};
 
+// The agent's own names inside a guest. Exported because a seed is not the
+// only thing that installs it: an imported AppSandbox guest never runs
+// cloud-init, and its conversion writes the same unit to the same path over
+// SSH.
+pub use user_data::{AGENT_SERVICE, AGENT_SERVICE_NAME, AGENT_SERVICE_PATH, GUEST_AGENT_PATH};
+
 /// Everything the two documents are printed from.
 pub struct SeedRequest<'a> {
     /// Becomes `local-hostname`.

@@ -18,8 +18,9 @@
 //! Nothing here builds a command out of a value from outside VMLord. The
 //! remote commands are a fixed set of constants naming a fixed program that was
 //! uploaded and hashed; everything that program needs to know about this
-//! particular guest -- its user name, the key to install, which payload was
-//! chosen -- is in the JSON document beside it. See [`super::bundle`].
+//! particular guest -- its user name and the key to install -- is in the JSON
+//! document beside it. The facts observed below remain in the report for the
+//! host-side second-boot payload selection. See [`super::bundle`].
 //!
 //! The source VM is never contacted. What opens the first session is the
 //! AppSandbox key, read by `ssh.exe` from the path the source application keeps
@@ -34,7 +35,7 @@ use zeroize::Zeroizing;
 use super::{
     bundle::{
         BundleRequest, ConversionBundle, GUEST_BUNDLE_DIRECTORY, GUEST_PROGRAM_NAME,
-        GUEST_STAGED_DIRECTORY,
+        GUEST_STAGED_DIRECTORY, GUEST_STAGED_PATH,
     },
     journal::{ConversionStep, ImportJournal, JournalStage},
 };
@@ -99,7 +100,7 @@ impl fmt::Debug for SecretText {
 /// Read from the guest rather than taken from the source application's
 /// configuration: the VM in `vms.cfg` records what someone asked for years ago,
 /// and what boots off the copied disk is whatever it has been upgraded into
-/// since. The payloads are chosen from this and nothing else.
+/// since. The host retains these facts for its second-boot payload selection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GuestIdentity {
     distribution: String,
@@ -223,7 +224,8 @@ pub(crate) struct ConversionCommand {
 /// What one run of the conversion did.
 #[derive(Debug)]
 pub(crate) struct ConversionReport {
-    /// What the guest said it is, which is what the payloads were chosen for.
+    /// What the guest said it is, retained for second-boot host-side payload
+    /// selection.
     pub(crate) identity: GuestIdentity,
     /// Every command this run issued, in order. A run that skipped a confirmed
     /// step has no command for it, which is how a report says what it resumed.
@@ -251,15 +253,40 @@ pub(crate) struct ConversionRequest<'a> {
     /// The AppSandbox private key, at the path the source application keeps it
     /// at. Named and never read: see [`SshCredential::AppSandboxBootstrapKey`].
     pub(crate) bootstrap_key: &'a Path,
-    pub(crate) release_directory: &'a Path,
     pub(crate) staging_directory: &'a Path,
     pub(crate) agent_binary: &'a Path,
     pub(crate) vmlord_public_key: &'a str,
     pub(crate) agent_secret: &'a SecretText,
 }
 
-/// The label of the one command that is a file copy rather than a session.
+/// The labels of the three commands that surround the copy.
+///
+/// The copy is the only command in the conversion that is not a session, and
+/// the two beside it are what make it safe to run what it delivered:
+///
+/// * `clear-staged-bundle` empties the destination first. `scp -r` copies a
+///   directory *into* a destination that already exists, so a second attempt
+///   after a failed verification would land at `~/.vmlord-convert/bundle` and
+///   leave the first, broken upload in place -- and `install-bundle` would then
+///   install that. A corrupt upload has to be repairable by retrying, which is
+///   the whole reason any of this is resumable.
+/// * `verify-staged-program` is the host asking the guest for the SHA-256 of
+///   the uploaded program and comparing it with the digest the host computed
+///   when it wrote the file. The program cannot establish its own integrity --
+///   a manifest check inside it is the thing being verified doing the
+///   verifying -- so the one party that knows what the bytes should be does it
+///   instead, before root runs anything.
+const CLEAR_LABEL: &str = "clear-staged-bundle";
 const UPLOAD_LABEL: &str = "upload-bundle";
+const VERIFY_PROGRAM_LABEL: &str = "verify-staged-program";
+
+/// Empties the staged directory. Not `sudo`: it is the login's own home, and a
+/// step that needed root to undo its own upload would be a step that could
+/// leave one behind.
+const CLEAR_COMMAND: &str = "rm -rf ~/.vmlord-convert";
+
+/// Asks for the digest of the uploaded program, and nothing else.
+const PROGRAM_DIGEST_COMMAND: &str = "sha256sum ~/.vmlord-convert/vmlord-convert";
 
 /// One step of the conversion, as the runner walks it.
 struct Stage {
@@ -277,7 +304,7 @@ struct Stage {
 
 /// Every step after the observation, which the runner takes before this list
 /// because its answer is what the bundle is built from.
-const STAGES: [Stage; 9] = [
+const STAGES: [Stage; 7] = [
     Stage {
         step: ConversionStep::BundleUploaded,
         uploads_bundle: true,
@@ -295,18 +322,6 @@ const STAGES: [Stage; 9] = [
         uploads_bundle: false,
         actions: &["install-agent"],
         check: Some("verify-agent-files"),
-    },
-    Stage {
-        step: ConversionStep::DisplayPayloadInstalled,
-        uploads_bundle: false,
-        actions: &["install-display-payload"],
-        check: Some("verify-display-payload"),
-    },
-    Stage {
-        step: ConversionStep::GpuPayloadInstalled,
-        uploads_bundle: false,
-        actions: &["install-gpu-payload"],
-        check: Some("verify-gpu-payload"),
     },
     Stage {
         step: ConversionStep::AppSandboxUnitsDisabled,
@@ -372,10 +387,8 @@ impl<'a> ConversionRunner<'a> {
 
         let identity = self.observe()?;
         let bundle = ConversionBundle::build(&BundleRequest {
-            release_directory: self.request.release_directory,
             staging_directory: self.request.staging_directory,
             agent_binary: self.request.agent_binary,
-            guest: &identity,
             guest_username: &self.request.endpoint.username,
             vmlord_public_key: self.request.vmlord_public_key,
             agent_secret: self.request.agent_secret,
@@ -388,14 +401,25 @@ impl<'a> ConversionRunner<'a> {
                 .is_some_and(|last| stage.step <= last);
             if !confirmed {
                 if stage.uploads_bundle {
-                    self.run_command(UPLOAD_LABEL, self.upload(bundle.root()))?;
+                    self.deliver(&bundle)?;
                 }
                 for action in stage.actions {
                     self.run_command(action, self.staged_step(action))?;
                 }
             }
-            if let Some(check) = stage.check {
-                self.run_command(check, self.installed_step(check))?;
+            if let Some(check) = stage.check
+                && let Err(error) = self.run_command(check, self.installed_step(check))
+            {
+                // The journal records what VMLord did; only the guest knows
+                // what it still is. A confirmed step whose check now fails is a
+                // guest that lost it -- a rolled-back disk, a file removed by
+                // hand -- so the record is walked back below that step and the
+                // next pass does the work again. Without this the same pass
+                // would skip the same action and fail the same check forever.
+                if confirmed {
+                    self.demote_below(stage.step)?;
+                }
+                return Err(error);
             }
             self.confirm(stage.step)?;
         }
@@ -525,6 +549,48 @@ impl<'a> ConversionRunner<'a> {
         self.journal.save()
     }
 
+    /// Walks the record back to just before `step`, so the next pass redoes it.
+    fn demote_below(&mut self, step: ConversionStep) -> Result<(), RepositoryError> {
+        let position = ConversionStep::ALL
+            .iter()
+            .position(|candidate| *candidate == step)
+            .expect("every step is in ConversionStep::ALL");
+        let demoted = position
+            .checked_sub(1)
+            .map(|before| ConversionStep::ALL[before]);
+        tracing::warn!(
+            "the copied guest no longer satisfies {step:?}, which the journal had confirmed; \
+             the record is walked back to {demoted:?} so the next attempt does it again"
+        );
+        self.journal.set_last_confirmed_conversion_step(demoted);
+        self.journal.save()
+    }
+
+    /// Clears the staged directory, copies the bundle in, and proves the
+    /// program the next step will run as root is the one the host wrote.
+    fn deliver(&mut self, bundle: &ConversionBundle) -> Result<(), RepositoryError> {
+        let expected = bundle.program_sha256().to_owned();
+        self.run_command(CLEAR_LABEL, self.session(Some(CLEAR_COMMAND)))?;
+        self.run_command(UPLOAD_LABEL, self.upload(bundle.root()))?;
+        let answer = self.run_command(
+            VERIFY_PROGRAM_LABEL,
+            self.session(Some(PROGRAM_DIGEST_COMMAND)),
+        )?;
+        // `sha256sum` prints "<hex>  <path>"; only the digest is compared, and
+        // it is compared against what the host itself hashed rather than
+        // against anything that travelled with the upload.
+        let found = answer.split_whitespace().next().unwrap_or_default();
+        if !found.eq_ignore_ascii_case(&expected) {
+            let error = RepositoryError::new(format!(
+                "the conversion program that reached the copied guest is not the one VMLord \
+                 uploaded: expected SHA-256 {expected}, and the guest answered {found:?}"
+            ));
+            tracing::error!("{error}");
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// A bootstrap session running `remote_command`, or an interactive one.
     fn session(&self, remote_command: Option<&str>) -> SshInvocation {
         ssh::invocation_with(
@@ -553,7 +619,7 @@ impl<'a> ConversionRunner<'a> {
     /// One step of the freshly uploaded copy of the program, before it is
     /// rooted.
     fn staged_step(&self, label: &'static str) -> SshInvocation {
-        self.session(Some(&guest_step_command(GUEST_STAGED_DIRECTORY, label)))
+        self.session(Some(&guest_step_command(GUEST_STAGED_PATH, label)))
     }
 
     /// One step of the installed, root-owned copy of the program.
@@ -590,14 +656,12 @@ mod tests {
         AppSandboxSourceId, DesktopProfile, GpuMode, RepositoryError, SshAuthentication, SshConfig,
         SshEndpoint, SshPort,
     };
+    use vmlord_payload::Sha256Digest;
 
     use super::{ConversionReport, ConversionRequest, ConversionRunner, GuestIdentity, SecretText};
-    use crate::appsandbox::{
-        bundle::test_release_directory,
-        journal::{
-            BootstrapSshFacts, ConversionStep, ImportJournal, ImportJournalDetails,
-            ImportResources, SourceFingerprint,
-        },
+    use crate::appsandbox::journal::{
+        BootstrapSshFacts, ConversionStep, ImportJournal, ImportJournalDetails, ImportResources,
+        SourceFingerprint,
     };
 
     /// What the observation command's own output looks like coming back from a
@@ -606,21 +670,19 @@ mod tests {
                             PRETTY_NAME=\"Ubuntu 24.04.1 LTS\"\n";
 
     /// Every label one complete conversion asks of a guest, in order.
-    const EVERY_LABEL: [&str; 20] = [
+    const EVERY_LABEL: [&str; 18] = [
         "verify-guest-sudo",
         "verify-guest-python",
         "observe-guest",
+        "clear-staged-bundle",
         "upload-bundle",
+        "verify-staged-program",
         "install-bundle",
         "verify-bundle",
         "deploy-vmlord-key",
         "verify-vmlord-key",
         "install-agent",
         "verify-agent-files",
-        "install-display-payload",
-        "verify-display-payload",
-        "install-gpu-payload",
-        "verify-gpu-payload",
         "disable-appsandbox-units",
         "verify-appsandbox-units-disabled",
         "validate-replacements",
@@ -691,7 +753,6 @@ mod tests {
     /// Everything one conversion is run against, kept alive for the run.
     struct Fixture {
         root: TempRoot,
-        release: PathBuf,
         agent: PathBuf,
         endpoint: SshEndpoint,
         ssh_client: PathBuf,
@@ -704,13 +765,11 @@ mod tests {
     impl Fixture {
         fn new(label: &str) -> Self {
             let root = temporary_root(label);
-            let release = test_release_directory(&root.0);
             let agent = root.0.join("vmlord-agent");
             fs::write(&agent, b"static musl agent").unwrap();
             let vm_directory = root.0.join("imported");
             fs::create_dir_all(&vm_directory).unwrap();
             Self {
-                release,
                 agent,
                 endpoint: endpoint(),
                 ssh_client: PathBuf::from(r"C:\Windows\System32\OpenSSH\ssh.exe"),
@@ -731,7 +790,6 @@ mod tests {
                 ssh_client: &self.ssh_client,
                 scp_client: &self.scp_client,
                 bootstrap_key: &self.bootstrap_key,
-                release_directory: &self.release,
                 staging_directory: staging,
                 agent_binary: &self.agent,
                 vmlord_public_key: "ssh-ed25519 AAAAC3Nz vmlord",
@@ -742,6 +800,15 @@ mod tests {
 
     /// A conversion whose journal already confirms `resume_from`, run against a
     /// guest that answers everything.
+    fn staged_program_answer() -> String {
+        format!(
+            "{}  ~/.vmlord-convert/vmlord-convert",
+            Sha256Digest::hash_reader(include_bytes!("convert.py").as_slice())
+                .unwrap()
+                .as_hex()
+        )
+    }
+
     fn run_resuming_from(
         fixture: &Fixture,
         resume_from: Option<ConversionStep>,
@@ -760,10 +827,10 @@ mod tests {
             fixture.request(&staging),
             &mut journal,
             Box::new(|command| {
-                Ok(if command.label == "observe-guest" {
-                    OBSERVED.to_owned()
-                } else {
-                    String::new()
+                Ok(match command.label {
+                    "observe-guest" => OBSERVED.to_owned(),
+                    "verify-staged-program" => staged_program_answer(),
+                    _ => String::new(),
                 })
             }),
         )
@@ -891,18 +958,40 @@ mod tests {
             let report = run_resuming_from(&fixture, Some(step)).unwrap();
             let seen = labels(&report);
 
-            for label in EVERY_LABEL {
-                let is_check = label.starts_with("verify-")
-                    || label == "observe-guest"
-                    || label == "validate-replacements";
-                if is_check {
-                    assert!(seen.contains(&label), "{step:?} must still check {label}");
-                }
+            for label in [
+                "verify-guest-sudo",
+                "verify-guest-python",
+                "observe-guest",
+                "verify-bundle",
+                "verify-vmlord-key",
+                "verify-agent-files",
+                "verify-appsandbox-units-disabled",
+                "validate-replacements",
+                "verify-obsolete-files-removed",
+            ] {
+                assert!(seen.contains(&label), "{step:?} must still check {label}");
             }
-            assert!(
-                !seen.contains(&"install-agent") || step < ConversionStep::AgentInstalled,
-                "{step:?} re-ran an action it had already confirmed: {seen:?}"
-            );
+            for (action, action_step) in [
+                ("clear-staged-bundle", ConversionStep::BundleUploaded),
+                ("upload-bundle", ConversionStep::BundleUploaded),
+                ("install-bundle", ConversionStep::BundleUploaded),
+                ("deploy-vmlord-key", ConversionStep::VmlordSshKeyDeployed),
+                ("install-agent", ConversionStep::AgentInstalled),
+                (
+                    "disable-appsandbox-units",
+                    ConversionStep::AppSandboxUnitsDisabled,
+                ),
+                (
+                    "remove-obsolete-files",
+                    ConversionStep::ObsoleteFilesRemoved,
+                ),
+                ("request-shutdown", ConversionStep::ShutdownRequested),
+            ] {
+                assert!(
+                    !seen.contains(&action) || step < action_step,
+                    "{step:?} re-ran {action}, which it had already confirmed: {seen:?}"
+                );
+            }
             assert_eq!(
                 report.last_confirmed_step,
                 Some(ConversionStep::ShutdownRequested)
@@ -988,6 +1077,7 @@ mod tests {
             &mut journal,
             Box::new(|command| match command.label {
                 "observe-guest" => Ok(OBSERVED.to_owned()),
+                "verify-staged-program" => Ok(staged_program_answer()),
                 "verify-agent-files" => Err(RepositoryError::new("the agent unit is not enabled")),
                 _ => Ok(String::new()),
             }),
@@ -1000,6 +1090,62 @@ mod tests {
             journal.last_confirmed_conversion_step(),
             Some(ConversionStep::VmlordSshKeyDeployed),
             "the failed step is not recorded as confirmed"
+        );
+    }
+
+    /// Root must not execute an upload whose program bytes differ from the
+    /// exact bytes VMLord wrote. The manifest travels with that upload, so it
+    /// cannot independently establish this first trust boundary.
+    #[test]
+    fn a_staged_program_that_does_not_match_the_host_digest_is_refused_before_root_runs() {
+        let fixture = Fixture::new("staged-program-digest");
+        let storage_root = fixture.root.0.join("storage");
+        fs::create_dir_all(&storage_root).unwrap();
+        let mut journal = ImportJournal::create(
+            &storage_root,
+            journal_details(storage_root.join("imported")),
+        )
+        .unwrap();
+        let staging = fixture.root.0.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+
+        let error = ConversionRunner::new(
+            fixture.request(&staging),
+            &mut journal,
+            Box::new(move |command| {
+                recorded.lock().unwrap().push(command.label);
+                match command.label {
+                    "observe-guest" => Ok(OBSERVED.to_owned()),
+                    "verify-staged-program" => Ok("not-the-host-digest  vmlord-convert".to_owned()),
+                    _ => Ok(String::new()),
+                }
+            }),
+        )
+        .run()
+        .expect_err("a program the host cannot identify must not be executed as root");
+
+        assert!(
+            error.to_string().contains("not the one VMLord uploaded"),
+            "{error}"
+        );
+        assert_eq!(
+            journal.last_confirmed_conversion_step(),
+            Some(ConversionStep::GuestObserved),
+            "the upload is not confirmed when its program cannot be trusted"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                "verify-guest-sudo",
+                "verify-guest-python",
+                "observe-guest",
+                "clear-staged-bundle",
+                "upload-bundle",
+                "verify-staged-program",
+            ],
+            "the uploaded program is checked before any root-run stage"
         );
     }
 
