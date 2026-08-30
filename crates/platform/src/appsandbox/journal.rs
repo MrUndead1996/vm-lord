@@ -69,9 +69,16 @@ impl JournalStage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum ConversionStep {
     GuestObserved,
+    /// A journal written before payload delivery moved to the host.
+    ///
+    /// This is a migration marker, not a current conversion stage, so it is
+    /// deliberately absent from [`Self::ALL`]. The runner replaces the guest
+    /// program, checks that replacement and then resumes at the agent boundary
+    /// which both historical payload steps necessarily followed.
+    #[serde(alias = "DisplayPayloadInstalled", alias = "GpuPayloadInstalled")]
+    LegacyPayloadBundleRefreshRequired,
     BundleUploaded,
     VmlordSshKeyDeployed,
-    #[serde(alias = "DisplayPayloadInstalled", alias = "GpuPayloadInstalled")]
     AgentInstalled,
     AppSandboxUnitsDisabled,
     ReplacementsValidated,
@@ -495,9 +502,9 @@ mod tests {
 
     /// Payload delivery moved to the second boot's host-side Plan9 shares.
     /// Journals written by the first Task 7 conversion still name the two
-    /// removed guest payload stages, though, and a recovery must treat either
-    /// as having reached the preceding durable agent step rather than calling
-    /// an otherwise recoverable import corrupted.
+    /// removed guest payload stages, though, and a recovery must mark either
+    /// for a fresh conversion-program delivery rather than calling an
+    /// otherwise recoverable import corrupted.
     #[test]
     fn journals_from_the_removed_guest_payload_stages_resume_after_agent_installation() {
         for old_step in ["DisplayPayloadInstalled", "GpuPayloadInstalled"] {
@@ -513,8 +520,8 @@ mod tests {
             let loaded = ImportJournal::load(&root, journal.import_id()).unwrap();
             assert_eq!(
                 loaded.last_confirmed_conversion_step(),
-                Some(ConversionStep::AgentInstalled),
-                "a journal at the removed {old_step} stage must rerun from the agent boundary"
+                Some(ConversionStep::LegacyPayloadBundleRefreshRequired),
+                "a journal at the removed {old_step} stage must refresh its program first"
             );
 
             fs::remove_dir_all(root).unwrap();

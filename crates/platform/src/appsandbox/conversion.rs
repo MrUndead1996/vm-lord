@@ -394,6 +394,8 @@ impl<'a> ConversionRunner<'a> {
             agent_secret: self.request.agent_secret,
         })?;
 
+        self.refresh_legacy_payload_bundle(&bundle)?;
+
         for stage in &STAGES {
             let confirmed = self
                 .journal
@@ -437,6 +439,37 @@ impl<'a> ConversionRunner<'a> {
             commands: self.commands,
             last_confirmed_step,
         })
+    }
+
+    /// Replaces the program in journals written before payload delivery moved
+    /// from the guest to the second boot's host-side shares.
+    ///
+    /// Both historical payload stages came after the agent installation, so
+    /// the key and agent do not need their mutating actions repeated. Their
+    /// program did still know how to validate guest payloads, though, and any
+    /// installed-program check before replacing it would wedge recovery. The
+    /// marker is kept durably until the current staged program has been hashed,
+    /// installed and checked; only then can the journal resume at the known
+    /// `AgentInstalled` boundary.
+    fn refresh_legacy_payload_bundle(
+        &mut self,
+        bundle: &ConversionBundle,
+    ) -> Result<(), RepositoryError> {
+        if self.journal.last_confirmed_conversion_step()
+            != Some(ConversionStep::LegacyPayloadBundleRefreshRequired)
+        {
+            return Ok(());
+        }
+
+        tracing::warn!(
+            "a conversion journal from before host-side payload delivery needs its guest program refreshed"
+        );
+        self.deliver(bundle)?;
+        self.run_command("install-bundle", self.staged_step("install-bundle"))?;
+        self.run_command("verify-bundle", self.installed_step("verify-bundle"))?;
+        self.journal
+            .set_last_confirmed_conversion_step(Some(ConversionStep::AgentInstalled));
+        self.journal.save()
     }
 
     /// Checks the two preconditions and asks the guest what it is.
@@ -837,6 +870,49 @@ mod tests {
         .run()
     }
 
+    /// Resumes from a journal written by the ten-step conversion, which named
+    /// one of the guest-side payload steps after the VMLord agent was present.
+    fn run_legacy_payload_journal(
+        fixture: &Fixture,
+        legacy_step: &str,
+    ) -> (ConversionReport, Vec<String>) {
+        let storage_root = fixture.root.0.join("storage");
+        fs::create_dir_all(&storage_root).unwrap();
+        let destination = storage_root.join("imported");
+        let mut journal =
+            ImportJournal::create(&storage_root, journal_details(destination)).unwrap();
+        journal.set_last_confirmed_conversion_step(Some(ConversionStep::AgentInstalled));
+        journal.save().unwrap();
+        let contents = fs::read_to_string(journal.path()).unwrap();
+        fs::write(
+            journal.path(),
+            contents.replace("AgentInstalled", legacy_step),
+        )
+        .unwrap();
+        let mut journal = ImportJournal::load(&storage_root, journal.import_id()).unwrap();
+
+        let staging = fixture.root.0.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let report = ConversionRunner::new(
+            fixture.request(&staging),
+            &mut journal,
+            Box::new(move |command| {
+                recorded.lock().unwrap().push(command.label.to_owned());
+                Ok(match command.label {
+                    "observe-guest" => OBSERVED.to_owned(),
+                    "verify-staged-program" => staged_program_answer(),
+                    _ => String::new(),
+                })
+            }),
+        )
+        .run()
+        .expect("a legacy payload journal must resume safely");
+
+        (report, seen.lock().unwrap().clone())
+    }
+
     /// A fresh conversion whose guest refuses `refused`, with the labels it
     /// managed to ask about before giving up.
     fn run_refusing(
@@ -995,6 +1071,61 @@ mod tests {
             assert_eq!(
                 report.last_confirmed_step,
                 Some(ConversionStep::ShutdownRequested)
+            );
+        }
+    }
+
+    /// The current guest program removed payload validation. A historical
+    /// journal that claimed a removed payload step must therefore replace the
+    /// old program before any installed-program check can invoke it, but it
+    /// must not repeat the already-confirmed key or agent mutations.
+    #[test]
+    fn legacy_payload_journals_refresh_the_bundle_before_running_the_new_validation_steps() {
+        for legacy_step in ["DisplayPayloadInstalled", "GpuPayloadInstalled"] {
+            let fixture = Fixture::new("legacy-payload-recovery");
+            let (report, seen) = run_legacy_payload_journal(&fixture, legacy_step);
+
+            let install_bundle = seen
+                .iter()
+                .position(|label| label == "install-bundle")
+                .expect("the current program must be installed before its checks run");
+            assert_eq!(
+                &seen[..install_bundle],
+                [
+                    "verify-guest-sudo",
+                    "verify-guest-python",
+                    "observe-guest",
+                    "clear-staged-bundle",
+                    "upload-bundle",
+                    "verify-staged-program",
+                ],
+                "{legacy_step} must deliver the current program before any root-run validation"
+            );
+            assert!(
+                seen.iter()
+                    .position(|label| label == "verify-bundle")
+                    .is_some_and(|verify_bundle| install_bundle < verify_bundle),
+                "{legacy_step} validated with a program before replacing it: {seen:?}"
+            );
+            assert_eq!(
+                seen.iter()
+                    .filter(|label| label.as_str() == "install-bundle")
+                    .count(),
+                1,
+                "{legacy_step} must perform exactly the one bundle installation the migration needs: {seen:?}"
+            );
+            assert!(
+                !seen.iter().any(|label| label == "deploy-vmlord-key"),
+                "{legacy_step} needlessly repeated the confirmed SSH-key mutation: {seen:?}"
+            );
+            assert!(
+                !seen.iter().any(|label| label == "install-agent"),
+                "{legacy_step} needlessly repeated the confirmed agent mutation: {seen:?}"
+            );
+            assert_eq!(
+                report.last_confirmed_step,
+                Some(ConversionStep::ShutdownRequested),
+                "{legacy_step} finishes the current conversion after the refresh"
             );
         }
     }
