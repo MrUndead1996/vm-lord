@@ -86,68 +86,168 @@ impl HcsVmConfigBuilder {
             );
         }
 
-        let configuration = HcsConfiguration {
-            schema_version: SCHEMA_VERSION,
-            owner: "VMLord",
-            // `false`: VMLord opens a fresh HCS handle per operation and
-            // closes it when done (see ARCHITECTURE.md); a compute system is
-            // owned by its own `vmwp` worker process, not by the client that
-            // started it. `true` would tear the system down -- even one that
-            // was only just created and never started -- as soon as this
-            // process's creating handle closes.
-            should_terminate_on_last_handle_closed: false,
-            virtual_machine: VirtualMachine {
-                chipset: Chipset {
-                    uefi: Uefi { console: "Default" },
+        configuration_document(
+            attachments,
+            VmTopology {
+                ram_mb: request.ram_mb,
+                cpu_cores: request.cpu_cores,
+            },
+            state,
+            vm_id,
+        )
+    }
+
+    /// Builds the JSON configuration for the single boot a copied AppSandbox
+    /// guest gets before VMLord converts it.
+    ///
+    /// The differences from [`Self::build`] are all subtractions, and each is
+    /// the point of this boot. The copied VHDX is the only attachment: the
+    /// guest is installed, so there is no installer to boot from, no seed for
+    /// a cloud-init that already ran inside the source VM, and no tools volume
+    /// -- the agent is carried in over SSH by the conversion that follows.
+    /// Nothing of the source VM is named, so nothing of it can be opened by a
+    /// compute system VMLord owns.
+    ///
+    /// What is *not* subtracted is the HvSocket service table: the agent's
+    /// service and the display's four are listed for this compute system as
+    /// they are for any other, because a start rebuilds the system from this
+    /// document and a service left out of it cannot be added to the running
+    /// machine afterwards. The GPU the import asked for is a different matter
+    /// -- it reaches a guest through Plan9 shares and adapter assignment, both
+    /// of which need a converted guest, so it waits in the import journal.
+    pub(crate) fn build_import_bootstrap(
+        bootstrap: &ImportBootstrap<'_>,
+    ) -> Result<String, RepositoryError> {
+        bootstrap.validate()?;
+
+        let attachments = BTreeMap::from([(
+            "0".to_string(),
+            Attachment {
+                attachment_type: "VirtualDisk",
+                path: bootstrap.system_disk.to_path_buf(),
+            },
+        )]);
+
+        configuration_document(
+            attachments,
+            bootstrap.topology,
+            &bootstrap.state,
+            bootstrap.vm_id,
+        )
+    }
+}
+
+/// Everything the copied guest's first compute system is built from.
+///
+/// One argument rather than four, because the four are only ever passed
+/// together and three of them are paths: a call site that swapped two would
+/// describe a machine HCS builds and nobody wants.
+pub(crate) struct ImportBootstrap<'a> {
+    /// The copied system VHDX at the import destination -- never the source
+    /// VM's own disk.
+    pub(crate) system_disk: &'a Path,
+    /// State files of VMLord's own making, beside the copied disk. The source
+    /// VM's firmware store stays with the source VM.
+    pub(crate) state: StateFilePaths<'a>,
+    /// The RAM and cores the source VM was configured with.
+    pub(crate) topology: VmTopology,
+    pub(crate) vm_id: Uuid,
+}
+
+impl ImportBootstrap<'_> {
+    /// Refuses a topology no machine can boot.
+    ///
+    /// The values come from a configuration file the source application wrote
+    /// and VMLord only read, so they are checked here -- where the failure can
+    /// name what was wrong with them -- rather than in HCS, which answers a
+    /// zero-core machine with an HRESULT.
+    fn validate(&self) -> Result<(), RepositoryError> {
+        if self.topology.ram_mb == 0 || self.topology.cpu_cores == 0 {
+            let error = RepositoryError::new(format!(
+                "the imported VM's resources are not bootable: {} MB of RAM and {} CPU cores",
+                self.topology.ram_mb, self.topology.cpu_cores
+            ));
+            tracing::error!("{error}");
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+/// Serializes one compute system out of the parts its callers disagree about.
+///
+/// Creation and import bootstrap differ in exactly what they attach and what
+/// resources they ask for; everything else -- the chipset, the serial port, the
+/// service table, the display devices, the integration services and the state
+/// files -- is what makes a compute system a VMLord one, and is written here
+/// once so that the two cannot drift apart.
+fn configuration_document(
+    attachments: BTreeMap<String, Attachment>,
+    topology: VmTopology,
+    state: &StateFilePaths<'_>,
+    vm_id: Uuid,
+) -> Result<String, RepositoryError> {
+    let configuration = HcsConfiguration {
+        schema_version: SCHEMA_VERSION,
+        owner: "VMLord",
+        // `false`: VMLord opens a fresh HCS handle per operation and
+        // closes it when done (see ARCHITECTURE.md); a compute system is
+        // owned by its own `vmwp` worker process, not by the client that
+        // started it. `true` would tear the system down -- even one that
+        // was only just created and never started -- as soon as this
+        // process's creating handle closes.
+        should_terminate_on_last_handle_closed: false,
+        virtual_machine: VirtualMachine {
+            chipset: Chipset {
+                uefi: Uefi { console: "Default" },
+            },
+            compute_topology: ComputeTopology {
+                memory: Memory {
+                    size_in_mb: topology.ram_mb,
+                    allow_overcommit: true,
+                    enable_deferred_commit: true,
+                    enable_cold_discard_hint: true,
                 },
-                compute_topology: ComputeTopology {
-                    memory: Memory {
-                        size_in_mb: request.ram_mb,
-                        allow_overcommit: true,
-                        enable_deferred_commit: true,
-                        enable_cold_discard_hint: true,
-                    },
-                    processor: Processor {
-                        count: request.cpu_cores,
-                    },
-                },
-                devices: Devices {
-                    scsi: Scsi {
-                        primary: ScsiController { attachments },
-                    },
-                    com_ports: BTreeMap::from([(
-                        "0".to_owned(),
-                        ComPort {
-                            named_pipe: com1_pipe_path(vm_id),
-                        },
-                    )]),
-                    hv_socket: HvSocket {
-                        config: HvSocketConfig {
-                            service_table: service_table(),
-                        },
-                    },
-                    keyboard: EmptyObject {},
-                    mouse: EmptyObject {},
-                    video_monitor: VideoMonitor {
-                        horizontal_resolution: VIDEO_WIDTH,
-                        vertical_resolution: VIDEO_HEIGHT,
-                    },
-                },
-                services: Services {
-                    shutdown: EmptyObject {},
-                    timesync: EmptyObject {},
-                },
-                guest_state: GuestState {
-                    guest_state_file_path: state.guest_state.to_path_buf(),
-                    runtime_state_file_path: state.runtime_state.to_path_buf(),
+                processor: Processor {
+                    count: topology.cpu_cores,
                 },
             },
-        };
+            devices: Devices {
+                scsi: Scsi {
+                    primary: ScsiController { attachments },
+                },
+                com_ports: BTreeMap::from([(
+                    "0".to_owned(),
+                    ComPort {
+                        named_pipe: com1_pipe_path(vm_id),
+                    },
+                )]),
+                hv_socket: HvSocket {
+                    config: HvSocketConfig {
+                        service_table: service_table(),
+                    },
+                },
+                keyboard: EmptyObject {},
+                mouse: EmptyObject {},
+                video_monitor: VideoMonitor {
+                    horizontal_resolution: VIDEO_WIDTH,
+                    vertical_resolution: VIDEO_HEIGHT,
+                },
+            },
+            services: Services {
+                shutdown: EmptyObject {},
+                timesync: EmptyObject {},
+            },
+            guest_state: GuestState {
+                guest_state_file_path: state.guest_state.to_path_buf(),
+                runtime_state_file_path: state.runtime_state.to_path_buf(),
+            },
+        },
+    };
 
-        serde_json::to_string(&configuration).map_err(|error| {
-            RepositoryError::new(format!("failed to serialize HCS VM configuration: {error}"))
-        })
-    }
+    serde_json::to_string(&configuration).map_err(|error| {
+        RepositoryError::new(format!("failed to serialize HCS VM configuration: {error}"))
+    })
 }
 
 /// The key the agent's HvSocket service is listed under.
@@ -745,7 +845,7 @@ mod tests {
     };
 
     use super::{
-        HcsVmConfigBuilder, Plan9Export, StateFilePaths, VmTopology, adapter_key,
+        HcsVmConfigBuilder, ImportBootstrap, Plan9Export, StateFilePaths, VmTopology, adapter_key,
         apply_network_adapter, apply_plan9_shares, apply_topology, com1_pipe_path,
         ensure_supported_network_mode, media_path, read_topology, remove_network_adapter,
         remove_plan9_shares,
@@ -1737,5 +1837,122 @@ mod tests {
             document,
             "a document needing no change comes back byte for byte"
         );
+    }
+    /// The one boot a copied AppSandbox guest gets before it is converted:
+    /// the copied disk, the resources the source VM was configured with, and
+    /// state files of VMLord's own making.
+    fn import_bootstrap() -> ImportBootstrap<'static> {
+        ImportBootstrap {
+            system_disk: Path::new(r"C:\vms\imported\disks\system.vhdx"),
+            state: StateFilePaths {
+                guest_state: Path::new(r"C:\vms\imported\vm.vmgs"),
+                runtime_state: Path::new(r"C:\vms\imported\vm.vmrs"),
+            },
+            topology: VmTopology {
+                ram_mb: 4096,
+                cpu_cores: 4,
+            },
+            vm_id: VM_ID,
+        }
+    }
+
+    #[test]
+    fn import_bootstrap_attaches_only_the_copied_system_disk() {
+        // The guest is already installed: there is no installer to boot, no
+        // seed for a cloud-init that will never run again, and no tools volume
+        // -- the agent reaches this guest over SSH, in the conversion that
+        // follows this boot.
+        let json: Value = serde_json::from_str(
+            &HcsVmConfigBuilder::build_import_bootstrap(&import_bootstrap()).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            json.pointer("/VirtualMachine/Devices/Scsi/Primary/Attachments"),
+            Some(&json!({
+                "0": { "Type": "VirtualDisk", "Path": r"C:\vms\imported\disks\system.vhdx" }
+            }))
+        );
+    }
+
+    #[test]
+    fn import_bootstrap_has_no_appsandbox_or_gpu_exports() {
+        // Nothing of the source VM may reach the copy's compute system, and
+        // the GPU the import asked for waits in the journal until the guest
+        // can mount the shares that carry it.
+        let document = HcsVmConfigBuilder::build_import_bootstrap(&import_bootstrap()).unwrap();
+
+        assert!(!document.contains("AppSandbox"), "got {document}");
+        assert!(!document.contains("Plan9"), "got {document}");
+    }
+
+    #[test]
+    fn import_bootstrap_is_given_the_services_its_converted_guest_will_use() {
+        // The same five as any other VM, and for the same reason: a service
+        // absent from this document cannot be added to the compute system
+        // later, and the second boot is the one that uses them.
+        let json: Value = serde_json::from_str(
+            &HcsVmConfigBuilder::build_import_bootstrap(&import_bootstrap()).unwrap(),
+        )
+        .unwrap();
+        let table = json
+            .pointer("/VirtualMachine/Devices/HvSocket/HvSocketConfig/ServiceTable")
+            .and_then(Value::as_object)
+            .expect("the bootstrap VM should have a service table");
+
+        for key in [
+            AGENT_SERVICE_KEY,
+            DISPLAY_CONTROL_SERVICE_KEY,
+            DISPLAY_FRAME_SERVICE_KEY,
+            DISPLAY_INPUT_SERVICE_KEY,
+            DISPLAY_CLIPBOARD_SERVICE_KEY,
+        ] {
+            assert_eq!(
+                table[key].pointer("/BindSecurityDescriptor"),
+                Some(&json!("D:P(A;;FA;;;SY)(A;;FA;;;BA)")),
+                "the copied guest's services are as narrow as any other VM's"
+            );
+        }
+    }
+
+    #[test]
+    fn import_bootstrap_takes_the_copied_topology_and_fresh_state_files() {
+        // The state files are VMLord's, made beside the copied disk: the
+        // source VM's firmware store stays with the source VM.
+        let json: Value = serde_json::from_str(
+            &HcsVmConfigBuilder::build_import_bootstrap(&import_bootstrap()).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            json.pointer("/VirtualMachine/ComputeTopology/Memory/SizeInMB"),
+            Some(&json!(4096))
+        );
+        assert_eq!(
+            json.pointer("/VirtualMachine/ComputeTopology/Processor/Count"),
+            Some(&json!(4))
+        );
+        assert_eq!(
+            json.pointer("/VirtualMachine/GuestState"),
+            Some(&json!({
+                "GuestStateFilePath": r"C:\vms\imported\vm.vmgs",
+                "RuntimeStateFilePath": r"C:\vms\imported\vm.vmrs"
+            }))
+        );
+    }
+
+    #[test]
+    fn import_bootstrap_refuses_a_topology_no_machine_can_boot() {
+        // A source VM whose configuration was read as zero cores is refused
+        // here, with a message, rather than by HCS with an HRESULT.
+        let no_cores = ImportBootstrap {
+            topology: VmTopology {
+                ram_mb: 4096,
+                cpu_cores: 0,
+            },
+            ..import_bootstrap()
+        };
+
+        assert!(HcsVmConfigBuilder::build_import_bootstrap(&no_cores).is_err());
     }
 }

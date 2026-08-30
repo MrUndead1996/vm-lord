@@ -1,9 +1,12 @@
+mod bootstrap;
 mod config;
 mod copy;
 mod discovery;
 mod journal;
 mod source;
 
+#[allow(unused_imports)] // The import pipeline consumes the bootstrap in the next task.
+pub(crate) use bootstrap::{BootstrapRequest, BootstrapVm, ImportBootstrapPipeline};
 #[cfg(test)]
 pub(crate) use discovery::FileSystem;
 pub(crate) use discovery::{Discovery, DiscoveryResult};

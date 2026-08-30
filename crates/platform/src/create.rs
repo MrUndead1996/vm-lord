@@ -29,9 +29,15 @@ const CREATE_TIMEOUT: Duration = Duration::from_secs(30);
 const BYTES_PER_GIB: u64 = 1024 * 1024 * 1024;
 
 type VhdCreator = Box<dyn Fn(&Path, u64) -> Result<(), RepositoryError> + Send + Sync>;
-type AccessGranter = Box<dyn Fn(&str, &Path) -> Result<(), RepositoryError> + Send + Sync>;
-type SystemCreator = Box<dyn Fn(&str, &str) -> Result<(), RepositoryError> + Send + Sync>;
-type StateFileCreator = Box<dyn Fn(&Path, &Path) -> Result<(), RepositoryError> + Send + Sync>;
+/// Puts the VM's own SID on a file its worker process has to open.
+pub(crate) type AccessGranter =
+    Box<dyn Fn(&str, &Path) -> Result<(), RepositoryError> + Send + Sync>;
+/// Builds the compute system HCS will later be asked to start.
+pub(crate) type SystemCreator =
+    Box<dyn Fn(&str, &str) -> Result<(), RepositoryError> + Send + Sync>;
+/// Makes the `.vmgs`/`.vmrs` pair the configuration document names.
+pub(crate) type StateFileCreator =
+    Box<dyn Fn(&Path, &Path) -> Result<(), RepositoryError> + Send + Sync>;
 type AgentReader = Box<dyn Fn() -> Option<Vec<u8>> + Send + Sync>;
 
 const AGENT_FILE_NAME: &str = "vmlord-agent";
@@ -391,15 +397,32 @@ impl VmCreationPipeline {
     }
 }
 
-fn grant_vm_access(id: &str, path: &Path) -> Result<(), RepositoryError> {
+/// Puts the compute system's own SID on `path`.
+///
+/// Hyper-V opens VM-owned files under the VM's own security principal rather
+/// than the creating user's token, so a file the worker was never granted is a
+/// start that fails with access denied however readable the file is to this
+/// process. Shared with the AppSandbox import, whose copied disk and state
+/// files need exactly the same grants.
+pub(crate) fn grant_vm_access(id: &str, path: &Path) -> Result<(), RepositoryError> {
     HcsClient::new().grant_vm_access(id, path)
 }
 
-fn create_state_files(guest_state: &Path, runtime_state: &Path) -> Result<(), RepositoryError> {
+/// Asks HCS to make a compute system's firmware and runtime state stores.
+///
+/// HCS makes them rather than VMLord writing empty files: both have a format
+/// only Hyper-V knows, and a compute system pointed at anything else is
+/// refused outright.
+pub(crate) fn create_state_files(
+    guest_state: &Path,
+    runtime_state: &Path,
+) -> Result<(), RepositoryError> {
     HcsClient::new().create_state_files(guest_state, runtime_state)
 }
 
-fn create_hcs_system(id: &str, configuration: &str) -> Result<(), RepositoryError> {
+/// Creates the compute system `configuration` describes, tearing down an
+/// ambiguously-created one if the operation fails.
+pub(crate) fn create_hcs_system(id: &str, configuration: &str) -> Result<(), RepositoryError> {
     let (system, operation) = HcsClient::new().create_system(id, configuration)?;
     let result = operation.wait_for_completion(CREATE_TIMEOUT);
     // Persisting past this handle close relies on the configuration setting
@@ -423,6 +446,23 @@ fn create_hcs_system(id: &str, configuration: &str) -> Result<(), RepositoryErro
             Err(RepositoryError::new(message))
         }
     }
+}
+
+/// Generates the VM's own SSH key pair, writes it into the VM's directory and
+/// returns its public half as an `authorized_keys` line.
+///
+/// One pair per VM and never rotated: the guest holds the public half, so a
+/// second pair would leave it trusting a key the host no longer has. A cloud
+/// VM's line travels into its seed; an imported guest's is deployed over the
+/// bootstrap SSH session instead, which is the only difference between the two
+/// callers.
+pub(crate) fn generate_vm_key_pair(
+    vm_directory: &Path,
+    vm_name: &str,
+) -> Result<String, RepositoryError> {
+    let pair = vmlord_keys::generate(vm_name)?;
+    vm_key::write_key_pair(vm_directory, &pair)?;
+    Ok(pair.public_openssh().to_owned())
 }
 
 /// Reads the guest agent bundled beside the running VMLord executable.
@@ -471,11 +511,7 @@ fn write_provisioning(
     let authorized_key = match provisioning.ssh {
         SshAccess::Enabled {
             deploy_key: true, ..
-        } => {
-            let pair = vmlord_keys::generate(vm_name)?;
-            vm_key::write_key_pair(vm_directory, &pair)?;
-            Some(pair.public_openssh().to_owned())
-        }
+        } => Some(generate_vm_key_pair(vm_directory, vm_name)?),
         _ => None,
     };
 
