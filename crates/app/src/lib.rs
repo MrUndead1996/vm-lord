@@ -1,5 +1,6 @@
 //! Application workflows shared by desktop, CLI, and future automation clients.
 
+pub mod appsandbox;
 pub mod display;
 pub mod gpu;
 pub mod update;
@@ -13,12 +14,13 @@ use std::{
 };
 
 use vmlord_core::{
-    AppSettings, Diagnostic, DiagnosticsSink, DistroCatalog, DistroCatalogError, DistroProfile,
-    GuestDefaults, HostGpuCapabilities, RepositoryError, SettingsError, SettingsStore, Subsystem,
-    VmCreateRequest, VmDeleteRequest, VmDisplayStatus, VmGpuStatus, VmRepository, VmState,
-    VmSummary, VmUpdateRequest,
+    AppSandboxImportRequest, AppSettings, Diagnostic, DiagnosticsSink, DistroCatalog,
+    DistroCatalogError, DistroProfile, GuestDefaults, HostGpuCapabilities, RepositoryError,
+    SettingsError, SettingsStore, Subsystem, VmCreateRequest, VmDeleteRequest, VmDisplayStatus,
+    VmGpuStatus, VmRepository, VmState, VmSummary, VmUpdateRequest,
 };
 
+pub use appsandbox::ImportWorkflow;
 pub use display::derive_status as derive_display_status;
 pub use gpu::derive_status as derive_gpu_status;
 pub use update::{AvailableUpdate, UpdateActionError, UpdateRuntime, UpdateState};
@@ -148,6 +150,12 @@ pub struct WorkspaceApp {
     /// `WorkspaceApp` without a sink simply has nothing to read.
     sink: Option<DiagnosticsSink>,
     updates: update::UpdateManager,
+    /// What the AppSandbox import dialog is looking at.
+    ///
+    /// Application-owned rather than asked for on every redraw: a discovery
+    /// walks the source application's configuration and disks, and the form a
+    /// person is halfway through filling in must not be rebuilt under them.
+    appsandbox: appsandbox::ImportWorkflow,
     first_run: bool,
 }
 
@@ -174,6 +182,7 @@ impl WorkspaceApp {
             diagnostics: Vec::new(),
             sink: None,
             updates: update::UpdateManager::default(),
+            appsandbox: appsandbox::ImportWorkflow::default(),
             first_run: false,
         }
     }
@@ -484,6 +493,198 @@ impl WorkspaceApp {
                     Subsystem::Hcs,
                     code = error.code().unwrap_or_default(),
                     "Failed to create VM: {error}"
+                );
+                self.collect_diagnostics();
+                Err(error)
+            }
+        }
+    }
+
+    /// What the import dialog is looking at.
+    #[must_use]
+    pub const fn appsandbox(&self) -> &appsandbox::ImportWorkflow {
+        &self.appsandbox
+    }
+
+    /// The same, for the form values a person edits.
+    pub const fn appsandbox_mut(&mut self) -> &mut appsandbox::ImportWorkflow {
+        &mut self.appsandbox
+    }
+
+    /// Asks the backend what AppSandbox VMs it can see, and keeps the answer.
+    ///
+    /// The list is retained rather than returned: the dialog reads it many
+    /// times per second while a discovery walks another application's files
+    /// once.
+    pub fn discover_appsandbox_vms(&mut self) -> Result<(), RepositoryError> {
+        self.require_ready_backend("AppSandbox discovery")?;
+
+        match self.repository.discover_appsandbox_vms() {
+            Ok(candidates) => {
+                vmlord_core::diagnostic!(
+                    Info,
+                    Subsystem::Hcs,
+                    "Found {} AppSandbox VM(s) that can be examined",
+                    candidates.len()
+                );
+                self.appsandbox.replace_candidates(candidates);
+                self.collect_diagnostics();
+                Ok(())
+            }
+            Err(error) => {
+                vmlord_core::diagnostic!(
+                    Error,
+                    Subsystem::Hcs,
+                    code = error.code().unwrap_or_default(),
+                    "Failed to look for AppSandbox VMs: {error}"
+                );
+                self.collect_diagnostics();
+                Err(error)
+            }
+        }
+    }
+
+    /// Submits an import and shows the copy in the VM list straight away.
+    pub fn start_appsandbox_import(
+        &mut self,
+        request: AppSandboxImportRequest,
+    ) -> Result<(), RepositoryError> {
+        self.require_ready_backend("AppSandbox import")?;
+        // Refused before the backend hears of it: an empty name or an unchosen
+        // source is the form's mistake, and belongs to the layer that owns the
+        // form.
+        if let Err(error) = request.validate() {
+            vmlord_core::diagnostic!(Error, Subsystem::App, "{error}");
+            self.collect_diagnostics();
+            return Err(error);
+        }
+        let name = request.destination_name.clone();
+
+        match self.repository.start_appsandbox_import(request) {
+            Ok(()) => {
+                vmlord_core::diagnostic!(
+                    Info,
+                    Subsystem::Hcs,
+                    vm = name.as_str(),
+                    "Importing the AppSandbox VM as \"{name}\""
+                );
+                self.refresh();
+                Ok(())
+            }
+            Err(error) => {
+                vmlord_core::diagnostic!(
+                    Error,
+                    Subsystem::Hcs,
+                    vm = name.as_str(),
+                    code = error.code().unwrap_or_default(),
+                    "Failed to import an AppSandbox VM as \"{name}\": {error}"
+                );
+                self.collect_diagnostics();
+                Err(error)
+            }
+        }
+    }
+
+    /// Asks an import to stop.
+    ///
+    /// What stopping costs depends on how far it got, and the backend decides
+    /// that: before the copied guest was changed everything is removed, and
+    /// after it the copy is kept for an explicit retry or discard.
+    pub fn cancel_appsandbox_import(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.require_ready_backend("AppSandbox import cancellation")?;
+
+        match self.repository.cancel_appsandbox_import(name) {
+            Ok(()) => {
+                vmlord_core::diagnostic!(
+                    Info,
+                    Subsystem::Hcs,
+                    vm = name,
+                    "Asked the import of \"{name}\" to stop"
+                );
+                self.refresh();
+                Ok(())
+            }
+            Err(error) => {
+                vmlord_core::diagnostic!(
+                    Error,
+                    Subsystem::Hcs,
+                    vm = name,
+                    code = error.code().unwrap_or_default(),
+                    "Failed to stop the import of \"{name}\": {error}"
+                );
+                self.collect_diagnostics();
+                Err(error)
+            }
+        }
+    }
+
+    /// Reads the imports retained for recovery, and keeps the answer.
+    pub fn incomplete_appsandbox_imports(&mut self) -> Result<(), RepositoryError> {
+        self.require_ready_backend("AppSandbox import recovery")?;
+
+        match self.repository.incomplete_appsandbox_imports() {
+            Ok(incomplete) => {
+                self.appsandbox.replace_incomplete(incomplete);
+                Ok(())
+            }
+            Err(error) => {
+                vmlord_core::diagnostic!(
+                    Error,
+                    Subsystem::Hcs,
+                    code = error.code().unwrap_or_default(),
+                    "Failed to list the unfinished AppSandbox imports: {error}"
+                );
+                self.collect_diagnostics();
+                Err(error)
+            }
+        }
+    }
+
+    /// Runs a retained import again from where it stopped.
+    pub fn retry_appsandbox_import(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.run_import_recovery(name, "AppSandbox import retry", |repository| {
+            repository.retry_appsandbox_import(name)
+        })
+    }
+
+    /// Removes everything VMLord made for a retained import.
+    pub fn discard_appsandbox_import(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.run_import_recovery(name, "AppSandbox import discard", |repository| {
+            repository.discard_appsandbox_import(name)
+        })
+    }
+
+    /// The two recovery commands, which differ only in what they ask for.
+    ///
+    /// Both refresh the retained list and the VM list afterwards, because both
+    /// change which of the two a given import belongs to.
+    fn run_import_recovery(
+        &mut self,
+        name: &str,
+        action: &str,
+        operation: impl FnOnce(&mut dyn VmRepository) -> Result<(), RepositoryError>,
+    ) -> Result<(), RepositoryError> {
+        self.require_ready_backend(action)?;
+
+        match operation(self.repository.as_mut()) {
+            Ok(()) => {
+                vmlord_core::diagnostic!(
+                    Info,
+                    Subsystem::Hcs,
+                    vm = name,
+                    "{action} accepted for \"{name}\""
+                );
+                let _ = self.incomplete_appsandbox_imports();
+                self.refresh();
+                Ok(())
+            }
+            Err(error) => {
+                vmlord_core::diagnostic!(
+                    Error,
+                    Subsystem::Hcs,
+                    vm = name,
+                    code = error.code().unwrap_or_default(),
+                    "{action} failed for \"{name}\": {error}"
                 );
                 self.collect_diagnostics();
                 Err(error)
@@ -1233,6 +1434,31 @@ mod tests {
     }
     use vmlord_core::{DiagnosticLevel, HostGpuCapabilities, Language, LogLevel, VmState};
 
+    /// One VM the way a backend lists an import that is still running.
+    fn importing_summary(name: &str) -> VmSummary {
+        VmSummary {
+            name: name.to_owned(),
+            os_type: "Linux".into(),
+            state: VmState::Building {
+                progress: vmlord_core::BuildProgress {
+                    step: vmlord_core::BuildStep::WritingDisk,
+                    download: None,
+                },
+            },
+            ram_mb: 4096,
+            disk_gb: 80,
+            cpu_cores: 4,
+            gpu_mode: vmlord_core::GpuMode::None,
+            gpu: vmlord_core::VmGpuFacts::default(),
+            desktop_profile: vmlord_core::DesktopProfile::Gnome,
+            display_provisioning: vmlord_core::DisplayProvisioning::NotRequested,
+            display: vmlord_core::VmDisplayFacts::default(),
+            network_mode: vmlord_core::NetworkMode::Nat,
+            ip_address: None,
+            ssh: vmlord_core::SshAvailability::Disabled,
+        }
+    }
+
     /// A backend that works: every test names only what it changes about it.
     #[derive(Default)]
     struct FakeRepository {
@@ -1253,6 +1479,17 @@ mod tests {
         reports_host_gpu: bool,
         host_gpu_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         actions: Vec<String>,
+        /// What discovery answers, and whether it answers at all.
+        appsandbox_candidates: Vec<vmlord_core::AppSandboxVmCandidate>,
+        appsandbox_discovery_fails: bool,
+        appsandbox_import_fails: bool,
+        /// The imports this backend has retained for recovery.
+        appsandbox_incomplete: Vec<vmlord_core::IncompleteAppSandboxImport>,
+        /// The destinations accepted so far, which `list_vms` then shows the
+        /// way the native backend shows an import in flight.
+        appsandbox_imported: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        /// Every import command this backend was given, in order.
+        appsandbox_actions: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl VmRepository for FakeRepository {
@@ -1305,7 +1542,77 @@ mod tests {
                     port: vmlord_core::SshPort::DEFAULT,
                     authentication: vmlord_core::SshAuthentication::VmlordKey,
                 }),
-            }])
+            }]
+            .into_iter()
+            .chain(
+                self.appsandbox_imported
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|name| importing_summary(name)),
+            )
+            .collect())
+        }
+
+        fn discover_appsandbox_vms(
+            &mut self,
+        ) -> Result<Vec<vmlord_core::AppSandboxVmCandidate>, RepositoryError> {
+            self.appsandbox_actions
+                .lock()
+                .unwrap()
+                .push("discover".into());
+            if self.appsandbox_discovery_fails {
+                return Err(RepositoryError::new("AppSandbox storage is unreadable"));
+            }
+            Ok(self.appsandbox_candidates.clone())
+        }
+
+        fn start_appsandbox_import(
+            &mut self,
+            request: AppSandboxImportRequest,
+        ) -> Result<(), RepositoryError> {
+            self.appsandbox_actions
+                .lock()
+                .unwrap()
+                .push(format!("start:{}", request.destination_name));
+            if self.appsandbox_import_fails {
+                return Err(RepositoryError::new("the source disk could not be read"));
+            }
+            self.appsandbox_imported
+                .lock()
+                .unwrap()
+                .push(request.destination_name);
+            Ok(())
+        }
+
+        fn cancel_appsandbox_import(&mut self, name: &str) -> Result<(), RepositoryError> {
+            self.appsandbox_actions
+                .lock()
+                .unwrap()
+                .push(format!("cancel:{name}"));
+            Ok(())
+        }
+
+        fn incomplete_appsandbox_imports(
+            &self,
+        ) -> Result<Vec<vmlord_core::IncompleteAppSandboxImport>, RepositoryError> {
+            Ok(self.appsandbox_incomplete.clone())
+        }
+
+        fn retry_appsandbox_import(&mut self, name: &str) -> Result<(), RepositoryError> {
+            self.appsandbox_actions
+                .lock()
+                .unwrap()
+                .push(format!("retry:{name}"));
+            Ok(())
+        }
+
+        fn discard_appsandbox_import(&mut self, name: &str) -> Result<(), RepositoryError> {
+            self.appsandbox_actions
+                .lock()
+                .unwrap()
+                .push(format!("discard:{name}"));
+            Ok(())
         }
 
         fn create_vm(&mut self, _request: VmCreateRequest) -> Result<(), RepositoryError> {
@@ -1605,6 +1912,263 @@ mod tests {
     fn update_vm_is_available_to_ui_clients() {
         let _: fn(&mut WorkspaceApp, VmUpdateRequest) -> Result<(), RepositoryError> =
             WorkspaceApp::update_vm;
+    }
+
+    fn candidate(
+        name: &str,
+        compatibility: vmlord_core::AppSandboxCompatibility,
+    ) -> vmlord_core::AppSandboxVmCandidate {
+        vmlord_core::AppSandboxVmCandidate {
+            source_id: vmlord_core::AppSandboxSourceId::from_stable_hash(format!("source-{name}"))
+                .unwrap(),
+            name: name.to_owned(),
+            ram_mb: 4096,
+            disk_gb: 80,
+            cpu_cores: 4,
+            network_mode: vmlord_core::NetworkMode::Nat,
+            gpu_mode: vmlord_core::GpuMode::Default,
+            ssh_user: "sandbox".into(),
+            ssh_port: 22,
+            compatibility,
+        }
+    }
+
+    /// A ready app whose backend has one importable AppSandbox VM.
+    fn app_with_candidate() -> (WorkspaceApp, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let actions = std::sync::Arc::<std::sync::Mutex<Vec<String>>>::default();
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            appsandbox_candidates: vec![candidate(
+                "ubuntu",
+                vmlord_core::AppSandboxCompatibility::Compatible,
+            )],
+            appsandbox_actions: std::sync::Arc::clone(&actions),
+            ..FakeRepository::default()
+        }));
+        app.start();
+        (app, actions)
+    }
+
+    #[test]
+    fn every_import_command_needs_a_ready_backend() {
+        let (sink, _guard) = records();
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            should_fail: true,
+            ..FakeRepository::default()
+        }))
+        .with_diagnostics(sink);
+        app.start();
+
+        assert!(app.discover_appsandbox_vms().is_err());
+        assert!(
+            app.start_appsandbox_import(AppSandboxImportRequest {
+                source_id: vmlord_core::AppSandboxSourceId::from_stable_hash("source-ubuntu")
+                    .unwrap(),
+                destination_name: "ubuntu-copy".into(),
+            })
+            .is_err()
+        );
+        assert!(app.cancel_appsandbox_import("ubuntu-copy").is_err());
+        assert!(app.incomplete_appsandbox_imports().is_err());
+        assert!(app.retry_appsandbox_import("ubuntu-copy").is_err());
+        assert!(app.discard_appsandbox_import("ubuntu-copy").is_err());
+    }
+
+    #[test]
+    fn discovery_is_retained_and_a_choice_offers_the_sources_own_name() {
+        let (mut app, _) = app_with_candidate();
+
+        app.discover_appsandbox_vms().unwrap();
+        let source_id = app.appsandbox().candidates()[0].source_id.clone();
+        app.appsandbox_mut().select(&source_id).unwrap();
+
+        assert_eq!(app.appsandbox().candidates().len(), 1);
+        assert_eq!(app.appsandbox().selected().unwrap().name, "ubuntu");
+        assert_eq!(app.appsandbox().destination_name(), "ubuntu");
+    }
+
+    #[test]
+    fn a_discovery_that_no_longer_sees_the_chosen_vm_clears_the_choice() {
+        // The platform resolves the opaque identity through its latest
+        // snapshot, so a choice the new list has lost could only be refused.
+        let (mut app, _) = app_with_candidate();
+        app.discover_appsandbox_vms().unwrap();
+        let source_id = app.appsandbox().candidates()[0].source_id.clone();
+        app.appsandbox_mut().select(&source_id).unwrap();
+
+        app.appsandbox_mut().replace_candidates(Vec::new());
+
+        assert!(app.appsandbox().selected().is_none());
+        assert_eq!(app.appsandbox().destination_name(), "");
+        assert!(app.appsandbox().request().is_err());
+    }
+
+    #[test]
+    fn a_renamed_request_carries_the_chosen_source_and_the_typed_name() {
+        let (mut app, _) = app_with_candidate();
+        app.discover_appsandbox_vms().unwrap();
+        let source_id = app.appsandbox().candidates()[0].source_id.clone();
+        app.appsandbox_mut().select(&source_id).unwrap();
+
+        app.appsandbox_mut().set_destination_name("ubuntu-copy");
+        let request = app.appsandbox().request().unwrap();
+
+        assert_eq!(request.source_id, source_id);
+        assert_eq!(request.destination_name, "ubuntu-copy");
+    }
+
+    #[test]
+    fn an_incompatible_or_unnamed_choice_makes_no_request() {
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            appsandbox_candidates: vec![candidate(
+                "windows",
+                vmlord_core::AppSandboxCompatibility::Incompatible(vec![
+                    vmlord_core::AppSandboxIncompatibility::NotLinux,
+                ]),
+            )],
+            ..FakeRepository::default()
+        }));
+        app.start();
+        app.discover_appsandbox_vms().unwrap();
+        let source_id = app.appsandbox().candidates()[0].source_id.clone();
+        app.appsandbox_mut().select(&source_id).unwrap();
+
+        let incompatible = app.appsandbox().request().unwrap_err();
+        app.appsandbox_mut().set_destination_name("");
+        let unnamed = app.appsandbox().request().unwrap_err();
+
+        assert!(incompatible.to_string().contains("cannot be imported"));
+        assert!(!unnamed.to_string().is_empty());
+    }
+
+    #[test]
+    fn accepted_import_is_refreshed_into_the_vm_list() {
+        let (mut app, actions) = app_with_candidate();
+        app.discover_appsandbox_vms().unwrap();
+        let source_id = app.appsandbox().candidates()[0].source_id.clone();
+
+        app.start_appsandbox_import(AppSandboxImportRequest {
+            source_id,
+            destination_name: "ubuntu-copy".into(),
+        })
+        .unwrap();
+
+        assert!(app.vms().iter().any(|vm| vm.name == "ubuntu-copy"));
+        assert_eq!(
+            actions.lock().unwrap().clone(),
+            ["discover", "start:ubuntu-copy"]
+        );
+    }
+
+    #[test]
+    fn a_request_the_form_could_have_refused_never_reaches_the_backend() {
+        let (sink, _guard) = records();
+        let (mut app, actions) = app_with_candidate();
+        app = app.with_diagnostics(sink);
+
+        let error = app
+            .start_appsandbox_import(AppSandboxImportRequest {
+                source_id: vmlord_core::AppSandboxSourceId::from_stable_hash("source-ubuntu")
+                    .unwrap(),
+                destination_name: String::new(),
+            })
+            .expect_err("an unnamed destination is the form's mistake");
+
+        assert!(!error.to_string().is_empty());
+        assert!(actions.lock().unwrap().is_empty());
+        assert!(
+            app.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.subsystem == Subsystem::App),
+            "a form mistake is reported as the application's, not the backend's"
+        );
+    }
+
+    #[test]
+    fn a_refused_import_is_reported_against_the_vm_it_was_for() {
+        let (sink, _guard) = records();
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            appsandbox_import_fails: true,
+            ..FakeRepository::default()
+        }))
+        .with_diagnostics(sink);
+        app.start();
+
+        let error = app
+            .start_appsandbox_import(AppSandboxImportRequest {
+                source_id: vmlord_core::AppSandboxSourceId::from_stable_hash("source-ubuntu")
+                    .unwrap(),
+                destination_name: "ubuntu-copy".into(),
+            })
+            .expect_err("the backend refused it");
+
+        assert!(error.to_string().contains("source disk"));
+        let reported = app
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.level == DiagnosticLevel::Error)
+            .expect("the refusal is reported")
+            .clone();
+        assert_eq!(reported.subsystem, Subsystem::Hcs);
+        assert!(reported.message.contains("ubuntu-copy"));
+    }
+
+    #[test]
+    fn cancelling_names_the_vm_and_refreshes_the_list() {
+        let (sink, _guard) = records();
+        let (mut app, actions) = app_with_candidate();
+        app = app.with_diagnostics(sink);
+
+        app.cancel_appsandbox_import("ubuntu-copy").unwrap();
+
+        assert_eq!(actions.lock().unwrap().clone(), ["cancel:ubuntu-copy"]);
+        assert!(
+            app.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("ubuntu-copy"))
+        );
+    }
+
+    #[test]
+    fn retained_imports_are_read_and_the_recovery_commands_reach_the_backend() {
+        let actions = std::sync::Arc::<std::sync::Mutex<Vec<String>>>::default();
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            appsandbox_incomplete: vec![vmlord_core::IncompleteAppSandboxImport {
+                destination_name: "ubuntu-copy".into(),
+                stage: vmlord_core::AppSandboxImportStage::Converting,
+            }],
+            appsandbox_actions: std::sync::Arc::clone(&actions),
+            ..FakeRepository::default()
+        }));
+        app.start();
+
+        app.incomplete_appsandbox_imports().unwrap();
+        assert_eq!(app.appsandbox().incomplete().len(), 1);
+        assert_eq!(
+            app.appsandbox().incomplete()[0].stage,
+            vmlord_core::AppSandboxImportStage::Converting
+        );
+
+        app.retry_appsandbox_import("ubuntu-copy").unwrap();
+        app.discard_appsandbox_import("ubuntu-copy").unwrap();
+
+        assert_eq!(
+            actions.lock().unwrap().clone(),
+            ["retry:ubuntu-copy", "discard:ubuntu-copy"]
+        );
+    }
+
+    #[test]
+    fn nothing_the_workflow_holds_names_an_appsandbox_path_or_key() {
+        // The candidate is the whole of what this layer is given, and it is a
+        // domain value with no host path in it at all.
+        let (mut app, _) = app_with_candidate();
+        app.discover_appsandbox_vms().unwrap();
+
+        let shown = format!("{:?}", app.appsandbox().candidates());
+
+        assert!(!shown.contains("AppSandbox\\"), "{shown}");
+        assert!(!shown.to_ascii_lowercase().contains(".vhdx"), "{shown}");
+        assert!(!shown.to_ascii_lowercase().contains("id_"), "{shown}");
     }
 
     #[test]
