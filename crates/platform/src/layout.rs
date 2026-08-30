@@ -9,6 +9,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+use uuid::Uuid;
 use vmlord_core::RepositoryError;
 
 /// The HCS configuration document creation writes and start re-creates the
@@ -37,6 +38,27 @@ pub(crate) fn vm_directory(storage_root: &Path, vm_name: &str) -> Result<PathBuf
             Err(error)
         }
     }
+}
+
+/// Returns the VMLord-owned root for import staging directories.
+pub(crate) fn imports_root(storage_root: &Path) -> PathBuf {
+    storage_root.join("imports")
+}
+
+/// Returns the VMLord-owned staging directory for one AppSandbox import.
+pub(crate) fn import_staging_directory(storage_root: &Path, import_id: Uuid) -> PathBuf {
+    imports_root(storage_root).join(import_id.to_string())
+}
+
+/// Returns the durable recovery marker for an incomplete import.
+pub(crate) fn import_journal_path(import_staging_directory: &Path) -> PathBuf {
+    import_staging_directory.join("journal.json")
+}
+
+/// Returns the import-specific transcript for bootstrap and conversion work.
+#[allow(dead_code)] // The conversion stage writes it after the journal is durable.
+pub(crate) fn import_transcript_path(import_staging_directory: &Path) -> PathBuf {
+    import_staging_directory.join("transcript.log")
 }
 
 /// Returns the path of the VM's stored HCS configuration document.
@@ -207,6 +229,24 @@ mod tests {
         ssh_keys_directory, ssh_known_hosts_path, ssh_public_key_path, system_disk_path,
         tools_path, vm_directory,
     };
+
+    #[test]
+    fn import_paths_stay_in_the_vmlord_storage_root() {
+        let root = Path::new(r"C:\VMLord\vms");
+        let import_id = uuid::Uuid::from_u128(7);
+        let staging = super::import_staging_directory(root, import_id);
+
+        assert_eq!(super::imports_root(root), root.join("imports"));
+        assert_eq!(staging, root.join("imports").join(import_id.to_string()));
+        assert_eq!(
+            super::import_journal_path(&staging),
+            staging.join("journal.json")
+        );
+        assert_eq!(
+            super::import_transcript_path(&staging),
+            staging.join("transcript.log")
+        );
+    }
 
     #[test]
     fn a_vm_learns_host_keys_into_a_file_of_its_own() {
