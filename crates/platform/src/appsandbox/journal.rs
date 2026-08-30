@@ -60,7 +60,13 @@ impl JournalStage {
 }
 
 /// An idempotent guest-conversion step that has been confirmed on the copied guest.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Ordered, and declared in the order a conversion takes them: a resumed run
+/// asks "is this step behind the last one confirmed?", and the answer has to be
+/// the same one every time regardless of which module is asking. Renaming or
+/// reordering a variant changes both what a stored journal reads back as and
+/// where a resumption starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(crate) enum ConversionStep {
     GuestObserved,
     BundleUploaded,
@@ -72,6 +78,22 @@ pub(crate) enum ConversionStep {
     ReplacementsValidated,
     ObsoleteFilesRemoved,
     ShutdownRequested,
+}
+
+impl ConversionStep {
+    /// Every step, in the order a conversion confirms them.
+    pub(crate) const ALL: [Self; 10] = [
+        Self::GuestObserved,
+        Self::BundleUploaded,
+        Self::VmlordSshKeyDeployed,
+        Self::AgentInstalled,
+        Self::DisplayPayloadInstalled,
+        Self::GpuPayloadInstalled,
+        Self::AppSandboxUnitsDisabled,
+        Self::ReplacementsValidated,
+        Self::ObsoleteFilesRemoved,
+        Self::ShutdownRequested,
+    ];
 }
 
 /// Stable source facts needed to reject a recovery request for a different VM.

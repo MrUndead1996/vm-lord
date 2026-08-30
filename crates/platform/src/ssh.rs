@@ -34,6 +34,9 @@ use crate::{hcn_endpoint::HcnEndpoint, layout, metadata::VmComputeSystemMapping}
 /// Where Windows keeps its OpenSSH client.
 const SSH_CLIENT_RELATIVE_PATH: &str = r"System32\OpenSSH\ssh.exe";
 
+/// Where Windows keeps the file-copy half of the same OpenSSH installation.
+const COPY_CLIENT_RELATIVE_PATH: &str = r"System32\OpenSSH\scp.exe";
+
 /// Windows' own OpenSSH client, if this installation has one.
 ///
 /// Optional Windows features can be absent, so this is a state to report rather
@@ -43,6 +46,35 @@ pub(crate) fn client_path() -> Option<PathBuf> {
     let root = std::env::var_os("SystemRoot")?;
     let path = PathBuf::from(root).join(SSH_CLIENT_RELATIVE_PATH);
     path.is_file().then_some(path)
+}
+
+/// Windows' own `scp.exe`, if this installation has one.
+///
+/// Beside `ssh.exe` and from the same optional feature, so its absence means
+/// the same thing and is reported the same way.
+#[allow(dead_code)] // The import pipeline reaches for it in the next task.
+pub(crate) fn copy_client_path() -> Option<PathBuf> {
+    let root = std::env::var_os("SystemRoot")?;
+    let path = PathBuf::from(root).join(COPY_CLIENT_RELATIVE_PATH);
+    path.is_file().then_some(path)
+}
+
+/// Which credential one run of the OpenSSH client offers.
+///
+/// A VM's stored configuration answers this for every ordinary connection, and
+/// there is exactly one case it cannot: the first session into a copied
+/// AppSandbox guest. That guest has never heard of the VM VMLord built around
+/// its disk, and the only key it accepts is the one the source application
+/// deployed -- which lives in that application's own storage and is never
+/// copied into VMLord's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SshCredential<'a> {
+    /// Whatever the endpoint's stored configuration says.
+    Stored,
+    /// The AppSandbox key, named by the path the source application keeps it
+    /// at. Nothing here reads it: what travels is a path, so no private key
+    /// material can pass through an argument, a log or a journal.
+    AppSandboxBootstrapKey(&'a Path),
 }
 
 /// The address HNS has given the VM's endpoint, if it has one yet.
@@ -170,6 +202,103 @@ pub(crate) fn invocation(
     connect_timeout: Option<Duration>,
     remote_command: Option<&str>,
 ) -> SshInvocation {
+    invocation_with(
+        client,
+        endpoint,
+        vm_directory,
+        connect_timeout,
+        SshCredential::Stored,
+        remote_command,
+    )
+}
+
+/// The same command, with the credential chosen by the caller.
+///
+/// Only the import needs this: every other connection takes the credential the
+/// VM was created with, and the one that cannot is the bootstrap session into a
+/// guest VMLord has not configured yet.
+pub(crate) fn invocation_with(
+    client: &Path,
+    endpoint: &SshEndpoint,
+    vm_directory: &Path,
+    connect_timeout: Option<Duration>,
+    credential: SshCredential<'_>,
+    remote_command: Option<&str>,
+) -> SshInvocation {
+    let mut args = shared_options(endpoint, vm_directory, connect_timeout, credential);
+
+    args.push(OsString::from("-p"));
+    args.push(OsString::from(endpoint.port.get().to_string()));
+    // `-l user host` rather than `user@host`: a user name containing an `@`
+    // would otherwise be split in the wrong place by ssh itself.
+    args.push(OsString::from("-l"));
+    args.push(OsString::from(&endpoint.username));
+    args.push(OsString::from(endpoint.address.to_string()));
+    if let Some(command) = remote_command {
+        args.push(OsString::from(command));
+    }
+
+    SshInvocation {
+        program: client.to_path_buf(),
+        args,
+    }
+}
+
+/// Builds the command that copies `local` into `remote_directory` on the guest.
+///
+/// `remote_directory` is a `&'static str` and not a path the caller composed:
+/// it is the one place in this module where a value ends up inside a string
+/// `scp` hands to a remote shell, so the only values it may hold are the fixed
+/// ones VMLord compiled in. The user name and the address join it there because
+/// `scp` has no `-l`, and both have already been through
+/// [`SshEndpoint::new`]'s validation.
+pub(crate) fn copy_invocation(
+    client: &Path,
+    endpoint: &SshEndpoint,
+    vm_directory: &Path,
+    connect_timeout: Option<Duration>,
+    credential: SshCredential<'_>,
+    local: &Path,
+    remote_directory: &'static str,
+) -> SshInvocation {
+    let mut args = shared_options(endpoint, vm_directory, connect_timeout, credential);
+
+    // `-r`: the bundle is a directory of files that have to arrive together.
+    args.push(OsString::from("-r"));
+    // `scp` spells the port with a capital `P`; the lower-case one is its own
+    // flag, and passing the wrong one would silently mean something else.
+    args.push(OsString::from("-P"));
+    args.push(OsString::from(endpoint.port.get().to_string()));
+    args.push(local.as_os_str().to_owned());
+    args.push(OsString::from(copy_destination(endpoint, remote_directory)));
+
+    SshInvocation {
+        program: client.to_path_buf(),
+        args,
+    }
+}
+
+/// `user@host:directory`, with an IPv6 address bracketed.
+///
+/// The brackets are what tells `scp` where the address ends and the path
+/// begins: `fd00::1:/tmp` has no other reading.
+fn copy_destination(endpoint: &SshEndpoint, remote_directory: &str) -> String {
+    let address = endpoint.address.to_string();
+    if endpoint.address.is_ipv6() {
+        format!("{}@[{address}]:{remote_directory}", endpoint.username)
+    } else {
+        format!("{}@{address}:{remote_directory}", endpoint.username)
+    }
+}
+
+/// The `-o` options and identity both clients are given, which are the same for
+/// both because the two reach the same guest with the same rules.
+fn shared_options(
+    endpoint: &SshEndpoint,
+    vm_directory: &Path,
+    connect_timeout: Option<Duration>,
+    credential: SshCredential<'_>,
+) -> Vec<OsString> {
     let mut args = Vec::new();
     let mut option = |value: OsString| {
         args.push(OsString::from("-o"));
@@ -195,45 +324,39 @@ pub(crate) fn invocation(
         ));
     }
 
-    match endpoint.authentication {
-        // The VM's key and nothing else: `IdentitiesOnly` keeps the keys of a
-        // running agent out of it, and `BatchMode` makes a key that stopped
-        // working an error rather than a password prompt nobody is there to
-        // answer.
-        SshAuthentication::VmlordKey => {
-            option(config_option("IdentitiesOnly", OsStr::new("yes")));
-            option(config_option("BatchMode", OsStr::new("yes")));
-            args.push(OsString::from("-i"));
-            args.push(identity_file(&layout::ssh_key_path(vm_directory)));
-        }
-        // A password the person at the keyboard types. No key is offered at
-        // all -- an agent key that happened to work would be a login VMLord
-        // cannot reproduce -- and no `BatchMode`, because the prompt is the
-        // point.
-        SshAuthentication::Password => {
-            option(config_option("PubkeyAuthentication", OsStr::new("no")));
-            option(config_option(
-                "PreferredAuthentications",
-                OsStr::new("keyboard-interactive,password"),
-            ));
-        }
+    let key = match credential {
+        SshCredential::Stored => match endpoint.authentication {
+            SshAuthentication::VmlordKey => Some(layout::ssh_key_path(vm_directory)),
+            // A password the person at the keyboard types. No key is offered at
+            // all -- an agent key that happened to work would be a login VMLord
+            // cannot reproduce -- and no `BatchMode`, because the prompt is the
+            // point.
+            SshAuthentication::Password => {
+                option(config_option("PubkeyAuthentication", OsStr::new("no")));
+                option(config_option(
+                    "PreferredAuthentications",
+                    OsStr::new("keyboard-interactive,password"),
+                ));
+                None
+            }
+        },
+        // The stored mapping already records `VmlordKey`, because that is what
+        // every connection after the conversion uses. This session is the one
+        // before it, and takes the key it was handed instead.
+        SshCredential::AppSandboxBootstrapKey(path) => Some(path.to_path_buf()),
+    };
+
+    // One key and nothing else: `IdentitiesOnly` keeps the keys of a running
+    // agent out of it, and `BatchMode` makes a key that stopped working an
+    // error rather than a password prompt nobody is there to answer.
+    if let Some(key) = key {
+        option(config_option("IdentitiesOnly", OsStr::new("yes")));
+        option(config_option("BatchMode", OsStr::new("yes")));
+        args.push(OsString::from("-i"));
+        args.push(identity_file(&key));
     }
 
-    args.push(OsString::from("-p"));
-    args.push(OsString::from(endpoint.port.get().to_string()));
-    // `-l user host` rather than `user@host`: a user name containing an `@`
-    // would otherwise be split in the wrong place by ssh itself.
-    args.push(OsString::from("-l"));
-    args.push(OsString::from(&endpoint.username));
-    args.push(OsString::from(endpoint.address.to_string()));
-    if let Some(command) = remote_command {
-        args.push(OsString::from(command));
-    }
-
-    SshInvocation {
-        program: client.to_path_buf(),
-        args,
-    }
+    args
 }
 
 /// One `-o Name=value` option, written so that OpenSSH reads back the value
@@ -287,7 +410,9 @@ mod tests {
     use uuid::Uuid;
     use vmlord_core::{NetworkMode, SshAuthentication, SshConfig, SshEndpoint, SshPort};
 
-    use super::{SshInvocation, endpoint, invocation};
+    use super::{
+        SshCredential, SshInvocation, copy_invocation, endpoint, invocation, invocation_with,
+    };
     use crate::metadata::VmComputeSystemMapping;
 
     fn vm_id() -> Uuid {
@@ -668,6 +793,170 @@ mod tests {
         assert_eq!(
             args.last().map(String::as_str),
             Some("172.22.42.7"),
+            "{args:?}"
+        );
+    }
+
+    fn appsandbox_key() -> PathBuf {
+        PathBuf::from(r"C:\ProgramData\AppSandbox\keys\id_ed25519_appsandbox")
+    }
+
+    fn bootstrap_built(remote_command: Option<&str>) -> SshInvocation {
+        invocation_with(
+            &client(),
+            &endpoint_with(config()),
+            &vm_directory(),
+            Some(Duration::from_secs(10)),
+            SshCredential::AppSandboxBootstrapKey(&appsandbox_key()),
+            remote_command,
+        )
+    }
+
+    /// The copied guest has never heard of the VM's own key: the only
+    /// credential that opens its first session is the one the source
+    /// application deployed, read from where that application keeps it.
+    #[test]
+    fn bootstrap_offers_the_appsandbox_key_at_its_own_path_and_nothing_else() {
+        let invocation = bootstrap_built(Some("uname -m"));
+
+        assert_eq!(
+            value_after(&invocation, "-i").as_deref(),
+            Some(r"C:\ProgramData\AppSandbox\keys\id_ed25519_appsandbox")
+        );
+        assert_eq!(
+            option(&invocation, "IdentitiesOnly").as_deref(),
+            Some("yes"),
+            "an agent key that happened to work would be a login VMLord cannot reproduce"
+        );
+        assert_eq!(option(&invocation, "BatchMode").as_deref(), Some("yes"));
+        assert_eq!(
+            arguments(&invocation)
+                .iter()
+                .filter(|argument| *argument == "-i")
+                .count(),
+            1,
+            "one identity, and it is the source application's"
+        );
+    }
+
+    /// The key stays where the source application put it. Nothing here reads
+    /// its bytes, and nothing here can leak them: what the arguments carry is a
+    /// path.
+    #[test]
+    fn bootstrap_names_the_key_by_path_and_never_carries_its_contents() {
+        let line = bootstrap_built(None).command_line();
+
+        assert!(
+            line.contains(r"-i C:\ProgramData\AppSandbox\keys\id_ed25519_appsandbox"),
+            "{line}"
+        );
+        assert!(!line.contains("PRIVATE KEY"), "{line}");
+    }
+
+    /// The host key of the copied guest is the copied guest's, learned under
+    /// the new VM's id and into the new VM's own file -- not the source
+    /// application's, and not the user's.
+    #[test]
+    fn bootstrap_learns_the_host_key_under_the_new_vms_own_identity() {
+        let invocation = bootstrap_built(None);
+
+        assert_eq!(
+            option(&invocation, "HostKeyAlias").as_deref(),
+            Some(vm_id().to_string().as_str())
+        );
+        assert_eq!(
+            option(&invocation, "UserKnownHostsFile").as_deref(),
+            Some(r"C:\VMs\dev-linux\known_hosts")
+        );
+        assert_eq!(
+            option(&invocation, "StrictHostKeyChecking").as_deref(),
+            Some("accept-new")
+        );
+    }
+
+    /// The stored mapping already says `VmlordKey`, because that is what every
+    /// connection after the conversion uses. The bootstrap session must not
+    /// take it at its word.
+    #[test]
+    fn bootstrap_ignores_the_authentication_the_stored_mapping_records() {
+        for authentication in [SshAuthentication::VmlordKey, SshAuthentication::Password] {
+            let invocation = invocation_with(
+                &client(),
+                &endpoint_with(SshConfig {
+                    authentication,
+                    ..config()
+                }),
+                &vm_directory(),
+                None,
+                SshCredential::AppSandboxBootstrapKey(&appsandbox_key()),
+                None,
+            );
+
+            assert_eq!(
+                value_after(&invocation, "-i").as_deref(),
+                Some(r"C:\ProgramData\AppSandbox\keys\id_ed25519_appsandbox")
+            );
+            assert_eq!(option(&invocation, "PubkeyAuthentication"), None);
+        }
+    }
+
+    /// The bundle travels as arguments too: the local directory is one, and the
+    /// destination is a fixed remote path beside the user and host `scp` needs
+    /// them joined to.
+    #[test]
+    fn bootstrap_copies_the_bundle_with_arguments_rather_than_a_command_line() {
+        let invocation = copy_invocation(
+            Path::new(r"C:\Windows\System32\OpenSSH\scp.exe"),
+            &endpoint_with(config()),
+            &vm_directory(),
+            None,
+            SshCredential::AppSandboxBootstrapKey(&appsandbox_key()),
+            Path::new(r"C:\VMLord\vms\imports\7\bundle"),
+            "/tmp/vmlord-convert",
+        );
+        let args = arguments(&invocation);
+
+        assert_eq!(
+            invocation.program,
+            PathBuf::from(r"C:\Windows\System32\OpenSSH\scp.exe")
+        );
+        assert_eq!(
+            value_after(&invocation, "-P").as_deref(),
+            Some("22"),
+            "scp spells the port with a capital P: {args:?}"
+        );
+        assert!(args.contains(&"-r".to_owned()), "{args:?}");
+        assert_eq!(
+            args[args.len() - 2],
+            r"C:\VMLord\vms\imports\7\bundle",
+            "{args:?}"
+        );
+        assert_eq!(
+            args[args.len() - 1],
+            "machi@172.22.42.7:/tmp/vmlord-convert",
+            "{args:?}"
+        );
+    }
+
+    /// A guest on IPv6 needs its address bracketed in the one place `scp` makes
+    /// the destination a joined string.
+    #[test]
+    fn bootstrap_brackets_an_ipv6_address_in_the_copy_destination() {
+        let address: IpAddr = "fd7a:115c:a1e0::1".parse().unwrap();
+        let invocation = copy_invocation(
+            Path::new(r"C:\Windows\System32\OpenSSH\scp.exe"),
+            &SshEndpoint::new(vm_id(), &config(), address).unwrap(),
+            &vm_directory(),
+            None,
+            SshCredential::AppSandboxBootstrapKey(&appsandbox_key()),
+            Path::new(r"C:\VMLord\bundle"),
+            "/tmp/vmlord-convert",
+        );
+        let args = arguments(&invocation);
+
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("machi@[fd7a:115c:a1e0::1]:/tmp/vmlord-convert"),
             "{args:?}"
         );
     }
