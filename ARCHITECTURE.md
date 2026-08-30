@@ -121,8 +121,15 @@ This is the only layer allowed to interact with operating system APIs.
 The native Rust backend owns HCS integration, VM lifecycle, networking, GPU-PV
 and display, and it is the only backend: `vmlord-legacy-backend`,
 `appsandbox_core.dll` and the `VMLORD_BACKEND` switch that reached them are
-gone. VMs created by AppSandbox are not read, migrated or listed -- VMLord
-manages the VMs it created itself.
+gone. VMLord manages the VMs it created itself and does not list, adopt or run
+the ones AppSandbox created.
+
+The one exception is a deliberate, one-way import: a finished AppSandbox Linux
+VM can be *copied* into a VMLord VM, converted and verified, leaving the
+AppSandbox VM byte-for-byte as it was. Nothing about it is adopted, linked or
+moved, and AppSandbox goes on owning it. See
+[docs/appsandbox-import.md](docs/appsandbox-import.md) for what is imported,
+what is refused, and what happens when an import stops partway.
 
 ## Implemented scaffold
 
