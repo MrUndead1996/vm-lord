@@ -1353,8 +1353,17 @@ mod tests {
 
         let printed = format!("{secret:?}");
 
-        assert!(!printed.contains("c2VjcmV0LXZhbHVl"), "{printed}");
-        assert!(printed.contains("redacted"), "{printed}");
+        // The rendering is never put in the failure message. The only run that
+        // would print it is the run where it carries the secret, and a test log
+        // is still a log.
+        assert!(
+            !printed.contains("c2VjcmV0LXZhbHVl"),
+            "the Debug rendering of a SecretText carries its text"
+        );
+        assert!(
+            printed.contains("redacted"),
+            "the Debug rendering of a SecretText does not say it was redacted"
+        );
     }
 
     #[test]
