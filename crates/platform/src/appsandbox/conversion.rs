@@ -56,6 +56,19 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// a minute apart would be a payload chosen for a guest that never existed.
 const OBSERVE_COMMAND: &str = "uname -m; uname -r; cat /etc/os-release";
 
+/// The two things this conversion needs of a guest before it needs anything
+/// else, and the labels they are asked under.
+///
+/// Both are checked in the observation step, before a byte is uploaded or a
+/// file is changed, because both are properties of the *source* VM that no
+/// amount of retrying will fix. A guest that fails either one has to be
+/// corrected in AppSandbox and imported again, and the only useful moment to
+/// say so is before VMLord has touched it.
+const SUDO_LABEL: &str = "verify-guest-sudo";
+const SUDO_COMMAND: &str = "sudo -n true";
+const PYTHON_LABEL: &str = "verify-guest-python";
+const PYTHON_COMMAND: &str = "python3 --version";
+
 /// A value that must not appear in a log, a journal or a command.
 ///
 /// The base64 the agent secret travels as. `Debug` says only that there is one;
@@ -402,8 +415,42 @@ impl<'a> ConversionRunner<'a> {
         })
     }
 
-    /// Asks the guest what it is, and records the step as confirmed.
+    /// Checks the two preconditions and asks the guest what it is.
+    ///
+    /// The preconditions come first and are named separately, because they fail
+    /// for reasons a person can act on and nothing further in the conversion
+    /// can distinguish them: every later step is one `sudo -n python3 ...`, and
+    /// a guest missing either would answer all of them with the same opaque
+    /// non-zero exit somewhere in the middle of a run that had already changed
+    /// the guest.
     fn observe(&mut self) -> Result<GuestIdentity, RepositoryError> {
+        // AppSandbox provisions its admin user into the `sudo` group with a
+        // password and writes no `sudoers.d` drop-in, so a stock guest fails
+        // this. VMLord holds no credential that would do better -- `vms.cfg`
+        // carries the user name and no password -- and driving AppSandbox's own
+        // root agent instead would mean keeping the stack this conversion
+        // exists to remove.
+        self.require(
+            SUDO_LABEL,
+            SUDO_COMMAND,
+            &format!(
+                "the copied guest's SSH user \"{}\" cannot run sudo without a password, and \
+                 every step of the conversion needs root to install units, keys and payloads; \
+                 give that user passwordless sudo in the source VM and import it again",
+                self.request.endpoint.username
+            ),
+        )?;
+        // The conversion program is Python 3. Every guest AppSandbox builds is
+        // a cloud-init-provisioned Ubuntu Desktop, which ships one -- but an
+        // image somebody has since stripped is a thing to name here rather than
+        // to discover when the first uploaded step will not start.
+        self.require(
+            PYTHON_LABEL,
+            PYTHON_COMMAND,
+            "the copied guest has no working python3, which VMLord's guest conversion program \
+             is written in; install python3 in the source VM and import it again",
+        )?;
+
         let invocation = self.session(Some(OBSERVE_COMMAND));
         let answer = self.run_command("observe-guest", invocation)?;
         let identity = GuestIdentity::parse(&answer)?;
@@ -418,7 +465,7 @@ impl<'a> ConversionRunner<'a> {
     }
 
     /// Runs one labelled command, keeping it in the report either way.
-    fn run_command(
+    fn issue(
         &mut self,
         label: &'static str,
         invocation: SshInvocation,
@@ -430,10 +477,38 @@ impl<'a> ConversionRunner<'a> {
         );
         let answer = (self.execute)(&command);
         self.commands.push(command);
-        answer.map_err(|error| {
+        answer
+    }
+
+    /// Runs one step, reporting a failure as the step that failed.
+    fn run_command(
+        &mut self,
+        label: &'static str,
+        invocation: SshInvocation,
+    ) -> Result<String, RepositoryError> {
+        self.issue(label, invocation).map_err(|error| {
             RepositoryError::new(format!(
                 "the conversion step \"{label}\" did not succeed on the copied guest: {error}"
             ))
+        })
+    }
+
+    /// Checks one precondition, reporting `unmet` rather than the step name.
+    ///
+    /// The message is the point: what a person has to do about it is not
+    /// derivable from "a command exited non-zero", and this is the only place
+    /// that knows which precondition was being asked about.
+    fn require(
+        &mut self,
+        label: &'static str,
+        remote_command: &str,
+        unmet: &str,
+    ) -> Result<(), RepositoryError> {
+        let invocation = self.session(Some(remote_command));
+        self.issue(label, invocation).map(|_| ()).map_err(|error| {
+            let error = RepositoryError::new(format!("{unmet} (the guest answered: {error})"));
+            tracing::error!("{error}");
+            error
         })
     }
 
@@ -507,6 +582,7 @@ mod tests {
     use std::{
         fs,
         path::{Path, PathBuf},
+        sync::{Arc, Mutex},
     };
 
     use uuid::Uuid;
@@ -530,7 +606,9 @@ mod tests {
                             PRETTY_NAME=\"Ubuntu 24.04.1 LTS\"\n";
 
     /// Every label one complete conversion asks of a guest, in order.
-    const EVERY_LABEL: [&str; 18] = [
+    const EVERY_LABEL: [&str; 20] = [
+        "verify-guest-sudo",
+        "verify-guest-python",
         "observe-guest",
         "upload-bundle",
         "install-bundle",
@@ -692,6 +770,53 @@ mod tests {
         .run()
     }
 
+    /// A fresh conversion whose guest refuses `refused`, with the labels it
+    /// managed to ask about before giving up.
+    fn run_refusing(
+        refused: &'static str,
+        answer: RepositoryError,
+    ) -> (RepositoryError, Vec<String>) {
+        let fixture = Fixture::new("refused");
+        let storage_root = fixture.root.0.join("storage");
+        fs::create_dir_all(&storage_root).unwrap();
+        let mut journal = ImportJournal::create(
+            &storage_root,
+            journal_details(storage_root.join("imported")),
+        )
+        .unwrap();
+        let staging = fixture.root.0.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        let answer = Mutex::new(Some(answer));
+        let error = ConversionRunner::new(
+            fixture.request(&staging),
+            &mut journal,
+            Box::new(move |command| {
+                recorded.lock().unwrap().push(command.label.to_owned());
+                if command.label == refused {
+                    return Err(answer.lock().unwrap().take().expect("asked once"));
+                }
+                Ok(if command.label == "observe-guest" {
+                    OBSERVED.to_owned()
+                } else {
+                    String::new()
+                })
+            }),
+        )
+        .run()
+        .expect_err("a guest that cannot be converted must not be half converted");
+
+        assert_eq!(
+            journal.last_confirmed_conversion_step(),
+            None,
+            "a refused precondition confirms nothing"
+        );
+        let seen = seen.lock().unwrap().clone();
+        (error, seen)
+    }
+
     fn labels(report: &ConversionReport) -> Vec<&str> {
         report
             .commands
@@ -716,9 +841,10 @@ mod tests {
         assert_eq!(report.identity.kernel_release(), "6.8.0-31-generic");
         assert_eq!(report.identity.pretty_name(), "Ubuntu 24.04.1 LTS");
         assert_eq!(
-            labels(&report).first().copied(),
-            Some("observe-guest"),
-            "nothing is chosen before the guest has said what it is"
+            labels(&report).iter().take(3).copied().collect::<Vec<_>>(),
+            vec!["verify-guest-sudo", "verify-guest-python", "observe-guest"],
+            "the guest proves it can be converted, then says what it is, and only then is \
+             anything chosen"
         );
     }
 
@@ -875,6 +1001,71 @@ mod tests {
             Some(ConversionStep::VmlordSshKeyDeployed),
             "the failed step is not recorded as confirmed"
         );
+    }
+
+    /// A guest whose SSH user cannot become root fails for a reason a person
+    /// can act on, and it fails before VMLord has changed anything.
+    ///
+    /// AppSandbox puts its admin user in the `sudo` group with a password and
+    /// writes no `sudoers.d` drop-in, so this is the ordinary answer from a
+    /// stock guest rather than an exotic one.
+    #[test]
+    fn a_guest_whose_user_cannot_become_root_is_named_and_refused_untouched() {
+        let (error, seen) = run_refusing(
+            "verify-guest-sudo",
+            RepositoryError::new("sudo: a password is required"),
+        );
+
+        assert!(error.to_string().contains("passwordless sudo"), "{error}");
+        assert!(error.to_string().contains("sandbox"), "{error}");
+        assert!(
+            !error.to_string().contains("conversion step"),
+            "a precondition is not a step that failed: {error}"
+        );
+        assert_eq!(
+            seen,
+            vec!["verify-guest-sudo"],
+            "nothing is asked of a guest that cannot be converted"
+        );
+    }
+
+    /// The guest program is Python 3, and an image somebody stripped it out of
+    /// says so here rather than when the first uploaded step will not start.
+    #[test]
+    fn a_guest_without_python3_is_named_and_refused_untouched() {
+        let (error, seen) = run_refusing(
+            "verify-guest-python",
+            RepositoryError::new("python3: command not found"),
+        );
+
+        assert!(error.to_string().contains("python3"), "{error}");
+        assert!(
+            !error.to_string().contains("conversion step"),
+            "a precondition is not a step that failed: {error}"
+        );
+        assert_eq!(
+            seen,
+            vec!["verify-guest-sudo", "verify-guest-python"],
+            "the guest is asked nothing else once a precondition is unmet"
+        );
+    }
+
+    /// Both preconditions are re-checked on a resumed run too: they are facts
+    /// about the source VM, and a guest that lost one between two boots cannot
+    /// be converted by the pass that comes after.
+    #[test]
+    fn the_preconditions_are_checked_again_on_every_resumed_pass() {
+        for step in ConversionStep::ALL {
+            let fixture = Fixture::new("preconditions");
+            let report = run_resuming_from(&fixture, Some(step)).unwrap();
+            let seen = labels(&report);
+
+            assert_eq!(
+                seen.iter().take(2).copied().collect::<Vec<_>>(),
+                vec!["verify-guest-sudo", "verify-guest-python"],
+                "{step:?} must prove the guest is still convertible first: {seen:?}"
+            );
+        }
     }
 
     /// The one property a secret type exists for: nothing that prints it prints
