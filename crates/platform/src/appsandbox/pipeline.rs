@@ -160,6 +160,7 @@ impl ImportPipeline {
         let staging = layout::import_staging_directory(&storage_root, import_id);
         let staged_disk = staging.join("system.vhdx");
         let transcript = layout::import_transcript_path(&staging);
+        let verify_transcript = transcript.clone();
         let bundle_directory = staging.join("bundle");
         let final_disk = layout::system_disk_path(&destination);
 
@@ -357,12 +358,14 @@ impl ImportPipeline {
             verify: {
                 let destination = destination.clone();
                 let ssh_client = ssh_client.clone();
+                let transcript = verify_transcript.clone();
                 let desktop_profile = resources.desktop_profile;
                 Box::new(move |started| {
                     let checks = GuestChecks {
                         mapping: started.mapping.clone(),
                         vm_directory: destination.clone(),
                         client: ssh_client.clone(),
+                        transcript: transcript.clone(),
                         timeouts,
                     };
                     Verification::new(
@@ -414,6 +417,9 @@ struct GuestChecks {
     mapping: VmComputeSystemMapping,
     vm_directory: PathBuf,
     client: PathBuf,
+    /// Where a check's answer is left, which is the import's own transcript and
+    /// not a VM log another operation writes.
+    transcript: PathBuf,
     timeouts: ReadinessTimeouts,
 }
 
@@ -426,6 +432,7 @@ impl GuestChecks {
         let mapping = self.mapping.clone();
         let vm_directory = self.vm_directory.clone();
         let client = self.client.clone();
+        let transcript = self.transcript.clone();
         let timeouts = self.timeouts;
         move || {
             let Some(config) = mapping.ssh.clone() else {
@@ -443,7 +450,6 @@ impl GuestChecks {
                 Some(timeouts.connect),
                 Some(command),
             );
-            let transcript = layout::ssh_port_log_path(&vm_directory);
             let answer = run_remote(&invocation, &transcript, CHECK_TIMEOUT);
             answer.map(drop).map_err(|error| {
                 RepositoryError::new(format!(

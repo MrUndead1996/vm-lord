@@ -219,14 +219,20 @@ impl ImportJournal {
         Ok(())
     }
 
-    /// Removes this import's recovery marker after ordinary metadata is durable.
+    /// Removes this import's staging directory once it is no longer needed.
+    ///
+    /// The whole directory and not the marker alone: the conversion bundle and
+    /// the guest transcript are written beside it, and a marker removed on its
+    /// own would leave both behind forever under a name nothing ever looks at
+    /// again. The directory is named by this import's own UUID under VMLord's
+    /// `imports` root, so nothing but this import can be inside it.
     pub(crate) fn remove(&self) -> Result<(), RepositoryError> {
         self.validate_under(&self.storage_root)?;
-        let path = self.path();
-        match fs::remove_file(&path) {
+        let staging = import_staging_directory(&self.storage_root, self.import_id);
+        match fs::remove_dir_all(&staging) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(remove_failure(&path, error)),
+            Err(error) => Err(remove_failure(&staging, error)),
         }
     }
 
@@ -503,6 +509,38 @@ mod tests {
             last_confirmed_conversion_step: None,
             storage_root: PathBuf::from(r"C:\VMLord\vms"),
         }
+    }
+
+    #[test]
+    fn removing_a_journal_takes_the_whole_staging_directory_with_it() {
+        // The conversion bundle and the guest transcript are written beside the
+        // marker. Removing the marker alone would leave both behind forever
+        // under a UUID nothing ever looks at again.
+        let root = temporary_root("remove-staging");
+        let journal = ImportJournal::create(&root, fixture_details(root.join("imported"))).unwrap();
+        let staging = journal.path().parent().unwrap().to_path_buf();
+        fs::create_dir_all(staging.join("bundle")).unwrap();
+        fs::write(staging.join("bundle").join("payload"), b"uploaded").unwrap();
+        fs::write(staging.join("transcript.log"), b"what the guest said").unwrap();
+
+        journal.remove().unwrap();
+
+        assert!(!staging.exists(), "{}", staging.display());
+        assert!(root.exists(), "only this import's own directory goes");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn removing_a_journal_that_is_already_gone_is_not_a_failure() {
+        let root = temporary_root("remove-twice");
+        let journal = ImportJournal::create(&root, fixture_details(root.join("imported"))).unwrap();
+
+        journal.remove().unwrap();
+        journal
+            .remove()
+            .expect("a second removal has nothing to do");
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     fn temporary_root(label: &str) -> PathBuf {

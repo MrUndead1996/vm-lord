@@ -331,20 +331,24 @@ impl HcsVmRepository {
             })
     }
 
-    /// The discovered candidate behind an opaque identity, refused unless it is
-    /// still importable.
+    /// The discovered candidate and source behind an opaque identity, refused
+    /// unless it is still importable.
     ///
     /// Re-evaluated rather than trusted from when the user chose it: the list
     /// they picked from may be minutes old, and a source that started running
-    /// since is one this must not copy.
+    /// since is one this must not copy. The snapshot this reads is the one it
+    /// keeps, so the candidate that was checked and the paths that are copied
+    /// come from the same reading of AppSandbox's storage.
     fn importable_candidate(
         &mut self,
         source_id: &AppSandboxSourceId,
-    ) -> Result<AppSandboxVmCandidate, RepositoryError> {
-        let candidate = self
-            .appsandbox_discovery
-            .discover()?
-            .candidates
+    ) -> Result<(AppSandboxVmCandidate, ValidatedSource), RepositoryError> {
+        let DiscoveryResult {
+            candidates,
+            sources,
+        } = self.appsandbox_discovery.discover()?;
+        self.appsandbox_sources = sources;
+        let candidate = candidates
             .into_iter()
             .find(|candidate| &candidate.source_id == source_id)
             .ok_or_else(|| {
@@ -364,7 +368,19 @@ impl HcsVmRepository {
             return Err(error);
         }
         candidate.validate()?;
-        Ok(candidate)
+        let source = self
+            .appsandbox_sources
+            .get(source_id)
+            .cloned()
+            .ok_or_else(|| {
+                let error = RepositoryError::new(
+                    "that AppSandbox VM was listed but its files could not be resolved; discover \
+                     AppSandbox VMs again and retry",
+                );
+                tracing::error!("{error}");
+                error
+            })?;
+        Ok((candidate, source))
     }
 
     /// Tells the user about every import a previous process left unfinished.
@@ -395,6 +411,24 @@ impl HcsVmRepository {
                 "The AppSandbox import of VM \"{name}\" did not finish; it is kept for you to \
                  retry or discard."
             );
+        }
+    }
+
+    /// The destination names of every import journal still on disk.
+    ///
+    /// An unreadable `imports` directory answers "none": a listing that fails
+    /// must not take the VM list down with it, and the worst it can cost is
+    /// showing an unverified VM for as long as the directory stays unreadable.
+    fn unfinished_import_names(&self) -> Vec<String> {
+        match ImportJournal::list(&self.storage_root) {
+            Ok(journals) => journals
+                .iter()
+                .filter_map(import_destination_name)
+                .collect(),
+            Err(error) => {
+                tracing::warn!("the incomplete AppSandbox imports could not be listed: {error}");
+                Vec::new()
+            }
         }
     }
 
@@ -1527,19 +1561,7 @@ impl VmRepository for HcsVmRepository {
         self.require_initialized()?;
         request.validate()?;
 
-        let candidate = self.importable_candidate(&request.source_id)?;
-        let source = self
-            .appsandbox_sources
-            .get(&request.source_id)
-            .cloned()
-            .ok_or_else(|| {
-                let error = RepositoryError::new(
-                    "that AppSandbox VM is not among the discovered sources; discover AppSandbox \
-                     VMs again and retry",
-                );
-                tracing::error!("{error}");
-                error
-            })?;
+        let (candidate, source) = self.importable_candidate(&request.source_id)?;
         let destination = self.reserve_vm_name(&request.destination_name)?;
 
         let listing = ImportListing {
@@ -2172,9 +2194,18 @@ impl VmRepository for HcsVmRepository {
     fn list_vms(&self) -> Result<Vec<VmSummary>, RepositoryError> {
         self.require_initialized()?;
 
+        // An import registers its compute system before it converts anything,
+        // so an import that stopped leaves a mapping the enumeration would
+        // otherwise report as an ordinary, healthy VM. It is not one: nothing
+        // has verified it, its SSH is the source guest's own, and the only
+        // things that may be done to it are retry and discard. It belongs to
+        // the recovery list, and -- while it is running -- to the row the
+        // registry contributes below.
+        let unfinished = self.unfinished_import_names();
         let known: Vec<VmSummary> = list_known_vms(&self.client, &self.store)?
             .into_iter()
             .map(|known| self.summary(known))
+            .filter(|vm| !unfinished.contains(&vm.name))
             .collect();
         Ok(merge_with_imports(
             merge_with_builds(known, &self.builds),
@@ -2663,6 +2694,27 @@ mod tests {
         assert!(
             repository.imports.summaries().is_empty(),
             "a journal on disk is not an import in flight"
+        );
+    }
+
+    #[test]
+    fn a_vm_an_unfinished_import_left_behind_is_not_listed_as_a_healthy_vm() {
+        // The bootstrap compute system is registered before the guest is
+        // converted, so an import that stopped leaves a mapping behind. Nothing
+        // has verified that VM; it belongs to the recovery list and to nothing
+        // else.
+        let (root, store) = temp_store("unfinished-not-listed");
+        let mut repository = repository_over(&root);
+        repository.initialized = true;
+        let mut mapping = mapping(NetworkMode::Nat);
+        mapping.vm_name = "ubuntu-copy".into();
+        store.insert(mapping).expect("the mapping should be stored");
+        import_journal(&root, root.join("ubuntu-copy"));
+
+        assert_eq!(repository.unfinished_import_names(), ["ubuntu-copy"]);
+        assert_eq!(
+            repository.incomplete_appsandbox_imports().unwrap()[0].destination_name,
+            "ubuntu-copy"
         );
     }
 

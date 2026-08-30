@@ -204,7 +204,7 @@ pub(crate) fn render(
             }
             ui.add_space(8.0);
 
-            if let Some(chosen) = render_candidates(ui, workflow, form) {
+            if let Some(chosen) = render_candidates(ui, workflow) {
                 action = Some(chosen);
             }
 
@@ -247,14 +247,12 @@ pub(crate) fn render(
 fn render_candidates(
     ui: &mut egui::Ui,
     workflow: &ImportWorkflow,
-    form: &AppSandboxImportForm,
 ) -> Option<AppSandboxImportAction> {
     let mut action = None;
     if workflow.candidates().is_empty() {
         ui.small(t!("appsandbox_import.no_candidates").to_string());
         return None;
     }
-    let _ = form;
     egui::ScrollArea::vertical()
         .id_salt("appsandbox-candidates")
         .max_height(200.0)
