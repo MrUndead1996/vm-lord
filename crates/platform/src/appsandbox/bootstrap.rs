@@ -19,6 +19,7 @@ use uuid::Uuid;
 use vmlord_core::{RepositoryError, SshPort};
 
 use crate::{
+    cleanup::{self, SystemTeardown},
     create::{self, AccessGranter, StateFileCreator, SystemCreator},
     hcs_config::{HcsVmConfigBuilder, ImportBootstrap, StateFilePaths, VmTopology},
     layout,
@@ -68,6 +69,7 @@ pub(crate) struct ImportBootstrapPipeline {
     access_granter: AccessGranter,
     state_file_creator: StateFileCreator,
     system_creator: SystemCreator,
+    system_teardown: SystemTeardown,
     key_generator: KeyGenerator,
 }
 
@@ -78,6 +80,7 @@ impl ImportBootstrapPipeline {
             access_granter: Box::new(create::grant_vm_access),
             state_file_creator: Box::new(create::create_state_files),
             system_creator: Box::new(create::create_hcs_system),
+            system_teardown: Box::new(cleanup::teardown_compute_system),
             key_generator: Box::new(create::generate_vm_key_pair),
         }
     }
@@ -87,12 +90,14 @@ impl ImportBootstrapPipeline {
         access_granter: impl Fn(&str, &Path) -> Result<(), RepositoryError> + Send + Sync + 'static,
         state_file_creator: impl Fn(&Path, &Path) -> Result<(), RepositoryError> + Send + Sync + 'static,
         system_creator: impl Fn(&str, &str) -> Result<(), RepositoryError> + Send + Sync + 'static,
+        system_teardown: impl Fn(&str) -> Result<(), RepositoryError> + Send + Sync + 'static,
         key_generator: impl Fn(&Path, &str) -> Result<String, RepositoryError> + Send + Sync + 'static,
     ) -> Self {
         Self {
             access_granter: Box::new(access_granter),
             state_file_creator: Box::new(state_file_creator),
             system_creator: Box::new(system_creator),
+            system_teardown: Box::new(system_teardown),
             key_generator: Box::new(key_generator),
         }
     }
@@ -100,12 +105,18 @@ impl ImportBootstrapPipeline {
     /// Builds the compute system for the copied disk under
     /// `request.vm_directory` and registers it in `store`.
     ///
-    /// Nothing is rolled back when a step fails, and that is the point: the
-    /// copied disk is the expensive half of an import and the only thing that
-    /// cannot be made again cheaply, so a failure here leaves the destination
-    /// exactly as it was for the import journal to resume from. What a failed
-    /// compute-system creation might have left behind inside HCS is torn down
-    /// by [`crate::create::create_hcs_system`] itself.
+    /// Nothing on disk is rolled back when a step fails, and that is the
+    /// point: the copied disk is the expensive half of an import and the only
+    /// thing that cannot be made again cheaply, so a failure here leaves the
+    /// destination exactly as it was for the import journal to resume from.
+    ///
+    /// The compute system is the exception, because it is the one thing a
+    /// failure could leave behind that nothing could ever find again. VMLord
+    /// reaches a compute system through the mapping that names it, so a system
+    /// created and then never registered is unreachable by delete, by
+    /// enumeration and by a journal-driven retry -- which would build a second
+    /// system around the same VHDX. It is torn down between the creation and
+    /// the registration, which is the whole of that window.
     pub(crate) fn create(
         &self,
         store: &MetadataStore,
@@ -186,7 +197,25 @@ impl ImportBootstrapPipeline {
             ssh_username: &request.ssh.username,
             ssh_port,
         });
-        store.insert(mapping.clone())?;
+        if let Err(error) = store.insert(mapping.clone()) {
+            // The system exists and nothing names it: an unwritable
+            // `metadata.json`, or a mapping the store refuses, would otherwise
+            // leave a `vmlord-<uuid>` holding the copied disk that no later
+            // delete or retry could reach.
+            let mut failures = vec![error.to_string()];
+            if let Err(teardown_error) = (self.system_teardown)(&hcs_compute_system_id) {
+                failures.push(format!(
+                    "the unregistered compute system \"{hcs_compute_system_id}\" could not be                      torn down either: {teardown_error}"
+                ));
+            }
+            return Err(cleanup::combine_failures(
+                &format!(
+                    "registering the bootstrapped VM \"{}\" failed",
+                    request.vm_name
+                ),
+                failures,
+            ));
+        }
 
         Ok(BootstrapVm {
             vm_id,
@@ -221,6 +250,7 @@ mod tests {
         grants: Arc<Mutex<Vec<(String, PathBuf)>>>,
         state_files: Arc<Mutex<Vec<(PathBuf, PathBuf)>>>,
         systems: Arc<Mutex<Vec<(String, String)>>>,
+        teardowns: Arc<Mutex<Vec<String>>>,
         keys: Arc<Mutex<Vec<(PathBuf, String)>>>,
     }
 
@@ -272,6 +302,7 @@ mod tests {
         let grants = Arc::clone(&calls.grants);
         let state_files = Arc::clone(&calls.state_files);
         let systems = Arc::clone(&calls.systems);
+        let teardowns = Arc::clone(&calls.teardowns);
         let keys = Arc::clone(&calls.keys);
         ImportBootstrapPipeline::for_test(
             move |id, path| {
@@ -295,6 +326,10 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push((id.to_owned(), configuration.to_owned()));
+                Ok(())
+            },
+            move |id| {
+                teardowns.lock().unwrap().push(id.to_owned());
                 Ok(())
             },
             move |vm_directory, vm_name| {
@@ -553,6 +588,7 @@ mod tests {
                 Ok(())
             },
             |_, _| Err(RepositoryError::new("HCS refused the compute system")),
+            |_| panic!("a system that was never created is not one to tear down"),
             |_, _| Ok("ssh-ed25519 AAAA test".to_owned()),
         );
 
@@ -576,6 +612,46 @@ mod tests {
         assert!(
             store.list().unwrap().is_empty(),
             "a VM whose compute system was refused is not a VM"
+        );
+    }
+    #[test]
+    fn a_compute_system_no_mapping_could_name_is_torn_down_again() {
+        // The system exists the moment the creator returns, and VMLord reaches
+        // a compute system only through the mapping that names it: one created
+        // and never registered could not be deleted, enumerated or found by a
+        // journal-driven retry, which would build a second system around the
+        // same copied disk.
+        let root = temporary_root("unregisterable");
+        // A store whose document can never be written: its parent is a file.
+        let blocked = root.0.join("blocked");
+        fs::write(&blocked, b"not a directory").unwrap();
+        let store = MetadataStore::new(blocked.join("metadata.json"));
+        let vm_directory = copied_destination(&root.0);
+        let calls = Calls::default();
+
+        let error = pipeline(&calls)
+            .create(
+                &store,
+                &BootstrapRequest {
+                    vm_name: "imported",
+                    vm_directory: &vm_directory,
+                    resources: &resources(),
+                    ssh: &ssh(),
+                },
+            )
+            .expect_err("a VM that could not be registered is not a VM");
+
+        assert!(error.to_string().contains("registering"), "{error}");
+        let created = calls.systems.lock().unwrap();
+        let (id, _) = created.first().expect("the system was created first");
+        assert_eq!(
+            *calls.teardowns.lock().unwrap(),
+            vec![id.clone()],
+            "the compute system nothing names must not outlive the failure"
+        );
+        assert!(
+            layout::system_disk_path(&vm_directory).is_file(),
+            "the copy still belongs to the import journal"
         );
     }
 }
