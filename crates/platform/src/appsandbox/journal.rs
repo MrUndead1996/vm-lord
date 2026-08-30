@@ -2,6 +2,7 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Component, Path, PathBuf},
+    sync::{Mutex, MutexGuard},
 };
 
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,29 @@ use windows::{
 };
 
 use crate::layout::{import_journal_path, import_staging_directory, imports_root};
+
+/// Serializes every access to the import journals.
+///
+/// A journal is written by the thread running its import and read by the UI
+/// thread, which lists the unfinished imports on every refresh. Replacing the
+/// journal is a rename over an existing file, and Windows refuses that with
+/// `ERROR_ACCESS_DENIED` while a reader holds the file it is about to replace
+/// -- so an import could be killed outright by nothing worse than the list
+/// beside it being drawn. The lock is process-wide because a journal is a path
+/// and nothing else: two `ImportJournal` values over one file are one document,
+/// exactly as they are for [`crate::metadata::MetadataStore`].
+///
+/// Two VMLord processes over one storage root are not covered, and are not a
+/// case this creates.
+static JOURNAL_LOCK: Mutex<()> = Mutex::new(());
+
+/// Recovers a poisoned lock rather than propagating the panic: an import thread
+/// that panicked must not make every later import unrecoverable.
+fn lock_journals() -> MutexGuard<'static, ()> {
+    JOURNAL_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// The import lifecycle retained on disk for recovery after an interrupted run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +206,15 @@ impl ImportJournal {
         storage_root: impl Into<PathBuf>,
         import_id: Uuid,
     ) -> Result<Self, RepositoryError> {
+        let _guard = lock_journals();
+        Self::load_locked(storage_root, import_id)
+    }
+
+    /// The body of [`Self::load`], for callers already holding the lock.
+    fn load_locked(
+        storage_root: impl Into<PathBuf>,
+        import_id: Uuid,
+    ) -> Result<Self, RepositoryError> {
         let storage_root = storage_root.into();
         let path = import_journal_path(&import_staging_directory(&storage_root, import_id));
         let contents = fs::read_to_string(&path).map_err(|error| read_failure(&path, error))?;
@@ -204,6 +237,7 @@ impl ImportJournal {
 
     /// Atomically replaces the journal with its latest confirmed state.
     pub(crate) fn save(&self) -> Result<(), RepositoryError> {
+        let _guard = lock_journals();
         self.validate_under(&self.storage_root)?;
         let staging = import_staging_directory(&self.storage_root, self.import_id);
         fs::create_dir_all(&staging).map_err(|error| create_directory_failure(&staging, error))?;
@@ -227,6 +261,7 @@ impl ImportJournal {
     /// again. The directory is named by this import's own UUID under VMLord's
     /// `imports` root, so nothing but this import can be inside it.
     pub(crate) fn remove(&self) -> Result<(), RepositoryError> {
+        let _guard = lock_journals();
         self.validate_under(&self.storage_root)?;
         let staging = import_staging_directory(&self.storage_root, self.import_id);
         match fs::remove_dir_all(&staging) {
@@ -238,6 +273,7 @@ impl ImportJournal {
 
     /// Lists durable, incomplete import markers after a fresh process starts.
     pub(crate) fn list(storage_root: impl Into<PathBuf>) -> Result<Vec<Self>, RepositoryError> {
+        let _guard = lock_journals();
         let storage_root = storage_root.into();
         let root = imports_root(&storage_root);
         let entries = match fs::read_dir(&root) {
@@ -265,7 +301,7 @@ impl ImportJournal {
             if !journal_path.is_file() {
                 continue;
             }
-            let journal = Self::load(storage_root.clone(), import_id)?;
+            let journal = Self::load_locked(storage_root.clone(), import_id)?;
             if journal.stage != JournalStage::Complete {
                 journals.push(journal);
             }
@@ -509,6 +545,66 @@ mod tests {
             last_confirmed_conversion_step: None,
             storage_root: PathBuf::from(r"C:\VMLord\vms"),
         }
+    }
+
+    /// An import must survive the list beside it being drawn.
+    ///
+    /// The UI thread lists the unfinished imports on every refresh while the
+    /// import thread is writing its journal, and replacing a journal is a
+    /// rename over a file a reader may be holding. Windows answers that with
+    /// `ERROR_ACCESS_DENIED`, which killed a real import seven milliseconds
+    /// after it started. Without the journal lock this fails a few times in
+    /// forty; with it, never.
+    #[test]
+    fn a_journal_can_be_saved_while_the_unfinished_imports_are_listed() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+
+        let root = temporary_root("concurrent-listing");
+        let stop = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let listing = {
+            let root = root.clone();
+            let stop = Arc::clone(&stop);
+            let reads = Arc::clone(&reads);
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = ImportJournal::list(&root);
+                    reads.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        };
+
+        let mut failures = Vec::new();
+        let mut ids = Vec::new();
+        for attempt in 0..40 {
+            let mut details = fixture_details(root.join("diagnostic-destination"));
+            details.import_id = Uuid::new_v4();
+            ids.push(details.import_id);
+            match ImportJournal::create(&root, details) {
+                Ok(mut journal) => {
+                    journal.stage = JournalStage::Validating;
+                    if let Err(error) = journal.save() {
+                        failures.push(format!("attempt {attempt}: save: {error}"));
+                    }
+                }
+                Err(error) => failures.push(format!("attempt {attempt}: create: {error}")),
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        let _ = listing.join();
+        for id in ids {
+            let _ = fs::remove_dir_all(crate::layout::import_staging_directory(&root, id));
+        }
+
+        assert!(
+            failures.is_empty(),
+            "{} of 40 saves were refused while {} listings ran: {failures:?}",
+            failures.len(),
+            reads.load(Ordering::Relaxed)
+        );
     }
 
     #[test]
