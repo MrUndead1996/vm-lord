@@ -1,4 +1,5 @@
 mod config;
+mod copy;
 mod discovery;
 mod journal;
 mod source;
