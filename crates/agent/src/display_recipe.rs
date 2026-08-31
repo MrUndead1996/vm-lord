@@ -745,12 +745,14 @@ other-module/1.0, 6.8.0-137-generic, x86_64: installed";
     #[test]
     fn secure_boot_is_read_out_of_mokutil_and_absent_when_it_says_nothing() {
         assert_eq!(parse_secure_boot_state("SecureBoot enabled\n"), Some(true));
-        assert_eq!(parse_secure_boot_state("SecureBoot disabled\n"), Some(false));
+        assert_eq!(
+            parse_secure_boot_state("SecureBoot disabled\n"),
+            Some(false)
+        );
         assert_eq!(
             parse_secure_boot_state("This system doesn't support Secure Boot\n"),
             None
         );
         assert_eq!(parse_secure_boot_state(""), None);
     }
-
 }

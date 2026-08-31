@@ -888,5 +888,4 @@ mod tests {
             "modprobe: ERROR: could not insert 'vmlord_drm': Invalid argument"
         ));
     }
-
 }

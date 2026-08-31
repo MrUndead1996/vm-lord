@@ -944,7 +944,10 @@ fn report_display_recipe(
 /// One code per stage rather than one for all of them: "the headers would not
 /// install" and "the module built and no device appeared" are one word apart
 /// in a summary and are different problems.
-fn code_for(step: vmlord_agent_protocol::v1::DisplayRecipeStep, message: &str) -> DisplayStatusCode {
+fn code_for(
+    step: vmlord_agent_protocol::v1::DisplayRecipeStep,
+    message: &str,
+) -> DisplayStatusCode {
     use vmlord_agent_protocol::v1::DisplayRecipeStep as Step;
 
     match step {
@@ -1427,11 +1430,11 @@ mod tests {
             ApplyDisplayRecipeResponse, ApplyGpuRecipeResponse, AttachDisplayPayloadResponse,
             AttachGpuSharesResponse, AuthenticateResponse, Capability, DisplayMountState,
             DisplayPayloadVersions, DisplayRecipeStage, DisplayRecipeStageState, DisplayRecipeStep,
-            DisplaySigningCertificate, DisplayUpdateOutcome, Envelope, ErrorCode, GpuMount, GpuMountState, GpuProbeCheck,
-            GpuProbeCheckState, GpuProbeStep, GpuProbeVerdict, GpuRecipeStage, GpuRecipeStageState,
-            GpuRecipeStep, GpuShareRole, HeartbeatRequest, HeartbeatResponse, HelloRequest,
-            ProbeGpuResponse, ProtocolVersion, UpdateDisplayPayloadResponse, envelope, request,
-            response,
+            DisplaySigningCertificate, DisplayUpdateOutcome, Envelope, ErrorCode, GpuMount,
+            GpuMountState, GpuProbeCheck, GpuProbeCheckState, GpuProbeStep, GpuProbeVerdict,
+            GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep, GpuShareRole, HeartbeatRequest,
+            HeartbeatResponse, HelloRequest, ProbeGpuResponse, ProtocolVersion,
+            UpdateDisplayPayloadResponse, envelope, request, response,
         },
     };
 
@@ -3018,7 +3021,9 @@ mod tests {
             *seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(report);
         });
 
-        let seen = seen.into_inner().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let seen = seen
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let failure = seen
             .expect("a failed recipe reports")
             .failure
@@ -3093,5 +3098,4 @@ mod tests {
             .expect("a recipe reports");
         assert_eq!(seen.signing_certificate, Some(vec![0x30, 0x82, 0x01]));
     }
-
 }

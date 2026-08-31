@@ -272,11 +272,7 @@ impl AgentConnection {
                         &|report| facts.record_guest(vm_id, report),
                         &|report| {
                             if let Some(certificate) = &report.signing_certificate {
-                                write_mok_certificate(
-                                    &mok_certificate_path,
-                                    certificate,
-                                    &vm_name,
-                                );
+                                write_mok_certificate(&mok_certificate_path, certificate, &vm_name);
                             }
                             if let Some(guest) = report.guest {
                                 display_facts.record_guest_display(vm_id, guest);

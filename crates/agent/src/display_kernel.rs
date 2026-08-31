@@ -28,11 +28,11 @@ use crate::{
     command,
     display_recipe::{
         DKMS_PACKAGE, InstalledVersions, MODULE, PayloadFacts, Report, SIGNING_CERTIFICATE,
-        SIGNING_KEY, SigningKeyState, applies_to, dkms_reports_installed, dkms_versions, has_recipe,
-        modprobe_options, module_is_loaded, needs_build, needs_reload, parse_module_parameters,
-        parse_module_signature_key, parse_module_version, parse_secure_boot_state,
-        parse_subject_key_identifier, read_payload_facts, signature_matches, signing_key_state,
-        wanted_mode, was_rejected_for_its_signature,
+        SIGNING_KEY, SigningKeyState, applies_to, dkms_reports_installed, dkms_versions,
+        has_recipe, modprobe_options, module_is_loaded, needs_build, needs_reload,
+        parse_module_parameters, parse_module_signature_key, parse_module_version,
+        parse_secure_boot_state, parse_subject_key_identifier, read_payload_facts,
+        signature_matches, signing_key_state, wanted_mode, was_rejected_for_its_signature,
     },
     gpu_kernel::guest_facts,
     guest_files::{copy_tree, failure, read, write_if_different},
@@ -774,13 +774,17 @@ fn load_failure_message(
 }
 
 /// What a failed `modprobe` of our module is reported as, asked once.
-fn load_failure(outcome: &command::Outcome, certificate: Option<&DisplaySigningCertificate>) -> String {
+fn load_failure(
+    outcome: &command::Outcome,
+    certificate: Option<&DisplaySigningCertificate>,
+) -> String {
     let reason = failure(&format!("modprobe {MODULE}"), outcome);
     if !was_rejected_for_its_signature(&reason) {
         return reason;
     }
-    let secure_boot =
-        parse_secure_boot_state(&command::run("mokutil", &["--sb-state"], &[], SHORT_BUDGET).output);
+    let secure_boot = parse_secure_boot_state(
+        &command::run("mokutil", &["--sb-state"], &[], SHORT_BUDGET).output,
+    );
     load_failure_message(
         &reason,
         secure_boot,
@@ -1778,10 +1782,19 @@ mod tests {
         };
 
         assert_eq!(STEPS.len(), 12);
-        assert!(position(DisplayRecipeStep::BuildDependencies) < position(DisplayRecipeStep::SigningKey));
-        assert!(position(DisplayRecipeStep::SigningKey) < position(DisplayRecipeStep::ModuleSource));
-        assert!(position(DisplayRecipeStep::ModuleBuild) < position(DisplayRecipeStep::ModuleSignature));
-        assert!(position(DisplayRecipeStep::ModuleSignature) < position(DisplayRecipeStep::Initramfs));
+        assert!(
+            position(DisplayRecipeStep::BuildDependencies)
+                < position(DisplayRecipeStep::SigningKey)
+        );
+        assert!(
+            position(DisplayRecipeStep::SigningKey) < position(DisplayRecipeStep::ModuleSource)
+        );
+        assert!(
+            position(DisplayRecipeStep::ModuleBuild) < position(DisplayRecipeStep::ModuleSignature)
+        );
+        assert!(
+            position(DisplayRecipeStep::ModuleSignature) < position(DisplayRecipeStep::Initramfs)
+        );
     }
 
     #[test]
@@ -1823,5 +1836,4 @@ mod tests {
         assert!(message.contains("Required key not available"), "{message}");
         assert!(message.contains("no certificate to enroll"), "{message}");
     }
-
 }
