@@ -825,7 +825,7 @@ impl HcsVmRepository {
         match AgentConnection::start(
             mapping,
             runtime_id,
-            &layout::agent_secret_path(&vm_directory),
+            &vm_directory,
             // What the start of this run prepared, if this process ran it. A
             // VM reclaimed from a previous process was prepared by nobody
             // here, and has nothing to be told to mount.

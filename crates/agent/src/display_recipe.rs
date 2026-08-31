@@ -20,12 +20,14 @@ pub const MODULE: &str = "vmlord_drm";
 /// The order is the report's order, and the report is what the host logs, so it
 /// is written once here rather than implied by the sequence of calls in
 /// `display_kernel`.
-pub const STEPS: [DisplayRecipeStep; 10] = [
+pub const STEPS: [DisplayRecipeStep; 12] = [
     DisplayRecipeStep::Distribution,
     DisplayRecipeStep::Payload,
     DisplayRecipeStep::BuildDependencies,
+    DisplayRecipeStep::SigningKey,
     DisplayRecipeStep::ModuleSource,
     DisplayRecipeStep::ModuleBuild,
+    DisplayRecipeStep::ModuleSignature,
     DisplayRecipeStep::Initramfs,
     DisplayRecipeStep::ModuleLoad,
     DisplayRecipeStep::Device,
@@ -248,6 +250,124 @@ pub fn parse_module_version(text: &str) -> Option<String> {
     (!version.is_empty()).then(|| version.to_owned())
 }
 
+/// Where the guest's own module-signing MOK lives.
+///
+/// Not a path VMLord chose: it is what `dkms` on 22.04, 24.04 and 26.04 all
+/// sign with by default, which is why VMLord configures no signing of its own
+/// and writes neither `framework.conf` nor a `framework.conf.d` file.
+pub const SIGNING_KEY: &str = "/var/lib/shim-signed/mok/MOK.priv";
+
+/// The certificate half of that pair, and the only half that ever leaves.
+pub const SIGNING_CERTIFICATE: &str = "/var/lib/shim-signed/mok/MOK.der";
+
+/// What the guest has of a signing pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SigningKeyState {
+    /// Both halves are there, and are what the modules are signed with.
+    Complete,
+    /// One half is there. A certificate cannot be derived from a private key,
+    /// so this is a broken pair rather than half a good one: both halves are
+    /// replaced, and the enrollment has to be performed again.
+    HalfPresent,
+    /// Neither half is there, which is every guest before its first build.
+    Absent,
+}
+
+#[must_use]
+pub fn signing_key_state(private_key_exists: bool, certificate_exists: bool) -> SigningKeyState {
+    match (private_key_exists, certificate_exists) {
+        (true, true) => SigningKeyState::Complete,
+        (false, false) => SigningKeyState::Absent,
+        _ => SigningKeyState::HalfPresent,
+    }
+}
+
+/// The subject key identifier out of `openssl x509 -noout -text` output.
+///
+/// Lower-case and without separators, which is the form [`signature_matches`]
+/// compares in. `None` is a certificate carrying no subject key identifier at
+/// all -- one generated without `/usr/lib/shim/mok/openssl.cnf` -- and means
+/// there is nothing a signature can be matched against.
+#[must_use]
+pub fn parse_subject_key_identifier(text: &str) -> Option<String> {
+    let mut lines = text
+        .lines()
+        .skip_while(|line| !line.contains("Subject Key Identifier"));
+    lines.next()?;
+    let identifier = hex_only(lines.next()?);
+    (!identifier.is_empty()).then_some(identifier)
+}
+
+/// The key `modinfo` says signed this module, in the same form.
+///
+/// `sign-file` writes the certificate's subject key identifier when it has
+/// one, which is why the certificate is generated with
+/// `/usr/lib/shim/mok/openssl.cnf` and its `subjectKeyIdentifier = hash`.
+#[must_use]
+pub fn parse_module_signature_key(modinfo: &str) -> Option<String> {
+    let key = hex_only(
+        modinfo
+            .lines()
+            .find_map(|line| line.strip_prefix("sig_key:"))?,
+    );
+    (!key.is_empty()).then_some(key)
+}
+
+/// Whether this module is signed by the certificate the guest holds.
+///
+/// An empty identifier never matches: a certificate with no subject key
+/// identifier gives nothing to compare, and reading that as agreement would
+/// report every module as signed by it.
+#[must_use]
+pub fn signature_matches(modinfo: &str, subject_key_identifier: &str) -> bool {
+    !subject_key_identifier.is_empty()
+        && parse_module_signature_key(modinfo).as_deref() == Some(subject_key_identifier)
+}
+
+/// What the kernel says when it refuses a module over its signature.
+///
+/// `EKEYREJECTED` is a module signed by a key the kernel does not trust;
+/// `ENOKEY` is a module with no signature at all under a kernel that demands
+/// one. Both mean one thing to a user: the certificate is not enrolled.
+///
+/// Written out a second time in `vmlord_core::display`, which reads these same
+/// phrases back out of the message this crate wrote. Two copies because
+/// `vmlord-agent` deliberately depends on no host crate -- the same trade as
+/// the mode bounds below. Change one and change the other.
+pub const SIGNATURE_REJECTION_PHRASES: [&str; 2] =
+    ["Key was rejected by service", "Required key not available"];
+
+#[must_use]
+pub fn was_rejected_for_its_signature(output: &str) -> bool {
+    SIGNATURE_REJECTION_PHRASES
+        .iter()
+        .any(|phrase| output.contains(phrase))
+}
+
+/// Whether Secure Boot is on, as `mokutil --sb-state` reports it.
+///
+/// `None` is a firmware with no Secure Boot to report on, which is every
+/// VMLord VM today and is not a failure.
+#[must_use]
+pub fn parse_secure_boot_state(mokutil: &str) -> Option<bool> {
+    if mokutil.contains("SecureBoot enabled") {
+        Some(true)
+    } else if mokutil.contains("SecureBoot disabled") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// A key identifier as both `openssl` and `modinfo` mean it, whichever
+/// separators and case they happened to print it with.
+fn hex_only(text: &str) -> String {
+    text.chars()
+        .filter(char::is_ascii_hexdigit)
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
 /// What the output comes up at when the host has not said, or has said
 /// something this module will not drive.
 pub const FALLBACK_MODE: (u32, u32) = (1920, 1080);
@@ -322,9 +442,11 @@ mod tests {
     use vmlord_agent_protocol::v1::{DisplayRecipeStageState, DisplayRecipeStep};
 
     use super::{
-        DKMS_PACKAGE, FALLBACK_MODE, InstalledVersions, Report, STEPS, applies_to,
+        DKMS_PACKAGE, FALLBACK_MODE, InstalledVersions, Report, STEPS, SigningKeyState, applies_to,
         dkms_reports_installed, dkms_versions, has_recipe, modprobe_options, module_is_loaded,
-        needs_build, needs_reload, parse_module_parameters, read_payload_facts, wanted_mode,
+        needs_build, needs_reload, parse_module_parameters, parse_module_signature_key,
+        parse_secure_boot_state, parse_subject_key_identifier, read_payload_facts,
+        signature_matches, signing_key_state, wanted_mode, was_rejected_for_its_signature,
     };
 
     #[test]
@@ -529,5 +651,108 @@ other-module/1.0, 6.8.0-137-generic, x86_64: installed";
             .find(|stage| stage.step() == DisplayRecipeStep::Device)
             .unwrap();
         assert_eq!(device.state(), DisplayRecipeStageState::Failed);
+    }
+
+    #[test]
+    fn a_key_without_its_certificate_is_a_broken_pair_and_not_half_a_good_one() {
+        assert_eq!(signing_key_state(true, true), SigningKeyState::Complete);
+        assert_eq!(signing_key_state(false, false), SigningKeyState::Absent);
+        assert_eq!(signing_key_state(true, false), SigningKeyState::HalfPresent);
+        assert_eq!(signing_key_state(false, true), SigningKeyState::HalfPresent);
+    }
+
+    #[test]
+    fn the_subject_key_identifier_is_read_out_of_what_openssl_prints() {
+        let printed = "X509v3 Subject Key Identifier: \n    \
+                       0A:1B:2C:3D:4E:5F:60:71:82:93:A4:B5:C6:D7:E8:F9:00:11:22:33\n";
+
+        assert_eq!(
+            parse_subject_key_identifier(printed).as_deref(),
+            Some("0a1b2c3d4e5f60718293a4b5c6d7e8f900112233")
+        );
+    }
+
+    #[test]
+    fn a_certificate_with_no_subject_key_identifier_yields_nothing_to_match_on() {
+        assert_eq!(parse_subject_key_identifier(""), None);
+        assert_eq!(
+            parse_subject_key_identifier("X509v3 Subject Key Identifier: \n"),
+            None
+        );
+        assert_eq!(
+            parse_subject_key_identifier("X509v3 Basic Constraints: critical\n    CA:FALSE\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_signed_module_names_the_key_that_signed_it() {
+        let modinfo = "filename:       /lib/modules/6.8.0-79-generic/updates/dkms/vmlord_drm.ko\n\
+                       version:        0.1.0\n\
+                       sig_id:         PKCS#7\n\
+                       signer:         DKMS module signing key\n\
+                       sig_key:        0A:1B:2C:3D:4E:5F\n\
+                       sig_hashalgo:   sha512\n";
+
+        assert_eq!(
+            parse_module_signature_key(modinfo).as_deref(),
+            Some("0a1b2c3d4e5f")
+        );
+        assert!(signature_matches(modinfo, "0a1b2c3d4e5f"));
+    }
+
+    #[test]
+    fn an_unsigned_module_matches_nothing() {
+        let modinfo = "filename:       /lib/modules/6.8.0-79-generic/updates/dkms/vmlord_drm.ko\n\
+                       version:        0.1.0\n";
+
+        assert_eq!(parse_module_signature_key(modinfo), None);
+        assert!(!signature_matches(modinfo, "0a1b2c3d4e5f"));
+    }
+
+    #[test]
+    fn a_module_signed_by_some_other_key_is_not_one_we_can_vouch_for() {
+        let modinfo = "sig_key:        FF:EE:DD\n";
+
+        assert!(!signature_matches(modinfo, "0a1b2c3d4e5f"));
+        assert!(
+            !signature_matches(modinfo, ""),
+            "an empty identifier matches nothing, or every module would pass"
+        );
+    }
+
+    #[test]
+    fn the_kernel_refusing_a_signature_reads_differently_from_every_other_refusal() {
+        assert!(was_rejected_for_its_signature(
+            "modprobe: ERROR: could not insert 'vmlord_drm': Key was rejected by service"
+        ));
+        assert!(was_rejected_for_its_signature(
+            "modprobe: ERROR: could not insert 'vmlord_drm': Required key not available"
+        ));
+    }
+
+    #[test]
+    fn every_other_way_a_module_fails_to_load_is_not_a_signature_problem() {
+        assert!(!was_rejected_for_its_signature(
+            "modprobe: ERROR: could not insert 'vmlord_drm': Invalid argument"
+        ));
+        assert!(!was_rejected_for_its_signature(
+            "modprobe: FATAL: Module vmlord_drm not found in directory /lib/modules/6.8.0-79-generic"
+        ));
+        assert!(!was_rejected_for_its_signature(""));
+    }
+
+    #[test]
+    fn secure_boot_is_read_out_of_mokutil_and_absent_when_it_says_nothing() {
+        assert_eq!(parse_secure_boot_state("SecureBoot enabled\n"), Some(true));
+        assert_eq!(
+            parse_secure_boot_state("SecureBoot disabled\n"),
+            Some(false)
+        );
+        assert_eq!(
+            parse_secure_boot_state("This system doesn't support Secure Boot\n"),
+            None
+        );
+        assert_eq!(parse_secure_boot_state(""), None);
     }
 }

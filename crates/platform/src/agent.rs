@@ -39,6 +39,7 @@ use crate::{
     display_runs::DisplayRuns,
     gpu_runs::GpuRuns,
     hvsocket::{ACCEPT_POLL, AgentListener, AgentStream},
+    layout,
     metadata::VmComputeSystemMapping,
 };
 
@@ -232,7 +233,10 @@ impl AgentConnection {
     pub(crate) fn start(
         mapping: &VmComputeSystemMapping,
         runtime_id: Uuid,
-        secret_path: &Path,
+        // `vm_directory` rather than one path per file: the agent's secret and
+        // the guest's signing certificate are two names in the same directory,
+        // and `layout` is what knows them.
+        vm_directory: &Path,
         shares: Option<GpuShareManifest>,
         display_share: Option<DisplayShare>,
         facts: GpuRuns,
@@ -241,7 +245,8 @@ impl AgentConnection {
         let vm_name = mapping.vm_name.clone();
         let vm_id = mapping.vm_id;
         let display_mode = mapping.display_mode;
-        let secret = read_secret(secret_path, &vm_name)?;
+        let secret = read_secret(&layout::agent_secret_path(vm_directory), &vm_name)?;
+        let mok_certificate_path = layout::display_mok_certificate_path(vm_directory);
         let listener = AgentListener::bind(&vm_name, runtime_id)?;
 
         let online = Arc::new(Mutex::new(false));
@@ -266,6 +271,9 @@ impl AgentConnection {
                         &running,
                         &|report| facts.record_guest(vm_id, report),
                         &|report| {
+                            if let Some(certificate) = &report.signing_certificate {
+                                write_mok_certificate(&mok_certificate_path, certificate, &vm_name);
+                            }
                             if let Some(guest) = report.guest {
                                 display_facts.record_guest_display(vm_id, guest);
                             }
@@ -519,6 +527,28 @@ fn report(vm_name: &str, error: &SessionError) {
 /// The text is held in `Zeroizing` on the way through: it is the secret in the
 /// form it is stored in, and a `String` dropped normally leaves it in the
 /// allocator.
+/// Keeps the guest's signing certificate where a person who has to enroll it
+/// can find it.
+///
+/// Overwritten on every run rather than written once: it is a copy of what the
+/// guest holds now, and a stale copy would send somebody to enroll a
+/// certificate the guest has since replaced.
+///
+/// Never fatal. A certificate nobody can enroll yet is not a reason to end a
+/// session that is otherwise bringing a desktop up.
+fn write_mok_certificate(path: &Path, certificate: &[u8], vm_name: &str) {
+    let written = path
+        .parent()
+        .map_or(Ok(()), fs::create_dir_all)
+        .and_then(|()| fs::write(path, certificate));
+    if let Err(error) = written {
+        tracing::warn!(
+            "the signing certificate of VM \"{vm_name}\" could not be written to {}: {error}",
+            path.display()
+        );
+    }
+}
+
 fn read_secret(path: &Path, vm_name: &str) -> Result<Secret, RepositoryError> {
     let text = Zeroizing::new(fs::read_to_string(path).map_err(|error| {
         let error = RepositoryError::new(format!(

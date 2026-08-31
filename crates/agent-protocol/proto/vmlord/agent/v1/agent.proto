@@ -514,6 +514,9 @@ message DisplayMode {
 message ApplyDisplayRecipeResponse {
   repeated DisplayRecipeStage stages = 1;
   DisplayPayloadVersions versions = 2;
+  // Absent when this guest has no signing key -- a kernel that cannot sign
+  // modules, or a `SigningKey` step that failed.
+  DisplaySigningCertificate signing_certificate = 3;
 }
 
 // Moves the guest to the version the mounted payload carries.
@@ -547,6 +550,20 @@ enum DisplayUpdateOutcome {
   DISPLAY_UPDATE_OUTCOME_REBOOT_REQUIRED = 4;
 }
 
+// The certificate the guest's modules are signed with, so the host can hand
+// it to whoever performs the MOK enrollment.
+//
+// The private half is never sent, never asked for and never logged. Both
+// identities travel because two readers need different ones: `sha256` is what
+// a person compares against the file on the host, and
+// `subject_key_identifier` is what `sign-file` writes into the module and
+// what the signature is matched on.
+message DisplaySigningCertificate {
+  bytes certificate = 1;
+  string sha256 = 2;
+  string subject_key_identifier = 3;
+}
+
 // Which versions of the display payload are in play inside the guest.
 //
 // An empty string is "not present": proto3 scalars have no absence, and a
@@ -576,6 +593,12 @@ enum DisplayRecipeStep {
   DISPLAY_RECIPE_STEP_SERVICES = 8;
   DISPLAY_RECIPE_STEP_SERVICES_START = 9;
   DISPLAY_RECIPE_STEP_INITRAMFS = 10;
+  // Ensuring the guest has a MOK to sign the module with. Never signs: the
+  // signing itself happens inside `dkms build`, which is what carries it
+  // through an unattended kernel upgrade with no host connected.
+  DISPLAY_RECIPE_STEP_SIGNING_KEY = 11;
+  // Confirming the built module carries a signature by that certificate.
+  DISPLAY_RECIPE_STEP_MODULE_SIGNATURE = 12;
 }
 
 enum DisplayRecipeStageState {

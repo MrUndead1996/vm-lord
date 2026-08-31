@@ -149,6 +149,9 @@ pub(crate) struct GuestDisplayPayloadReport {
     /// not mount, or an update, which changes versions and not readiness --
     /// and leaves whatever was last observed standing.
     pub(crate) guest: Option<GuestDisplayReport>,
+    /// The DER of the certificate the guest signs its modules with, when it
+    /// has one. The private half is never asked for and never sent.
+    pub(crate) signing_certificate: Option<Vec<u8>>,
 }
 
 /// Where a display report goes, for the same reason the GPU's has a sink.
@@ -753,6 +756,10 @@ fn report_display_update(
         previous: some_version(&versions.previous),
         loaded: some_version(&versions.loaded),
         failure,
+        // An update carries no certificate. The key is the VM's and does not
+        // change between a start and an update, and the next start's recipe
+        // reports it.
+        signing_certificate: None,
         // An update moves versions. Whether anything is listening is what the
         // recipe reported when the session opened, and is not this answer's
         // to change.
@@ -866,16 +873,26 @@ fn report_display_recipe(
     let failure = report
         .stages
         .iter()
-        .find(|stage| stage.state() == DisplayRecipeStageState::Failed)
+        .find(|stage| {
+            stage.state() == DisplayRecipeStageState::Failed
+                && !matches!(
+                    stage.step(),
+                    // Neither can degrade a display: Secure Boot is off, an
+                    // unsigned module loads, and a desktop that works is not
+                    // failed over a signature nothing checks yet.
+                    DisplayRecipeStep::SigningKey | DisplayRecipeStep::ModuleSignature
+                )
+        })
         .map(|broken| {
+            let message = format!(
+                "the guest's display recipe stopped at {:?}: {}",
+                broken.step(),
+                broken.message
+            );
             DisplayFailure::new(
                 DisplayStage::Payload,
-                code_for(broken.step()),
-                format!(
-                    "the guest's display recipe stopped at {:?}: {}",
-                    broken.step(),
-                    broken.message
-                ),
+                code_for(broken.step(), &message),
+                message,
             )
         });
 
@@ -915,6 +932,10 @@ fn report_display_recipe(
         loaded: some_version(&versions.loaded),
         failure,
         guest,
+        signing_certificate: report
+            .signing_certificate
+            .as_ref()
+            .map(|certificate| certificate.certificate.clone()),
     });
 }
 
@@ -923,15 +944,28 @@ fn report_display_recipe(
 /// One code per stage rather than one for all of them: "the headers would not
 /// install" and "the module built and no device appeared" are one word apart
 /// in a summary and are different problems.
-fn code_for(step: vmlord_agent_protocol::v1::DisplayRecipeStep) -> DisplayStatusCode {
+fn code_for(
+    step: vmlord_agent_protocol::v1::DisplayRecipeStep,
+    message: &str,
+) -> DisplayStatusCode {
     use vmlord_agent_protocol::v1::DisplayRecipeStep as Step;
 
     match step {
         Step::BuildDependencies => DisplayStatusCode::PayloadDependenciesFailed,
         Step::ModuleBuild | Step::ModuleSource => DisplayStatusCode::PayloadBuildFailed,
+        // A module the kernel refused over its signature is not a module that
+        // would not load: the fix is an enrollment, and no retry performs one.
+        Step::Initramfs | Step::ModuleLoad
+            if vmlord_core::display::was_rejected_for_its_signature(message) =>
+        {
+            DisplayStatusCode::PayloadModuleSignatureRejected
+        }
         Step::Initramfs | Step::ModuleLoad => DisplayStatusCode::PayloadModuleNotLoaded,
         Step::Device => DisplayStatusCode::PayloadNoDevice,
         Step::Services | Step::ServicesStart => DisplayStatusCode::GuestServicesFailed,
+        // Filtered out before they reach here, and matched so that a step
+        // added later cannot be swallowed by a catch-all.
+        Step::SigningKey | Step::ModuleSignature => DisplayStatusCode::PayloadInvalid,
         Step::Distribution | Step::Payload | Step::Unspecified => DisplayStatusCode::PayloadInvalid,
     }
 }
@@ -1396,11 +1430,11 @@ mod tests {
             ApplyDisplayRecipeResponse, ApplyGpuRecipeResponse, AttachDisplayPayloadResponse,
             AttachGpuSharesResponse, AuthenticateResponse, Capability, DisplayMountState,
             DisplayPayloadVersions, DisplayRecipeStage, DisplayRecipeStageState, DisplayRecipeStep,
-            DisplayUpdateOutcome, Envelope, ErrorCode, GpuMount, GpuMountState, GpuProbeCheck,
-            GpuProbeCheckState, GpuProbeStep, GpuProbeVerdict, GpuRecipeStage, GpuRecipeStageState,
-            GpuRecipeStep, GpuShareRole, HeartbeatRequest, HeartbeatResponse, HelloRequest,
-            ProbeGpuResponse, ProtocolVersion, UpdateDisplayPayloadResponse, envelope, request,
-            response,
+            DisplaySigningCertificate, DisplayUpdateOutcome, Envelope, ErrorCode, GpuMount,
+            GpuMountState, GpuProbeCheck, GpuProbeCheckState, GpuProbeStep, GpuProbeVerdict,
+            GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep, GpuShareRole, HeartbeatRequest,
+            HeartbeatResponse, HelloRequest, ProbeGpuResponse, ProtocolVersion,
+            UpdateDisplayPayloadResponse, envelope, request, response,
         },
     };
 
@@ -1422,6 +1456,7 @@ mod tests {
         let report = ApplyDisplayRecipeResponse {
             stages,
             versions: None,
+            signing_certificate: None,
         };
         let seen = Mutex::new(None);
 
@@ -2105,6 +2140,7 @@ mod tests {
                     previous: String::new(),
                     loaded: "0.1.0".to_owned(),
                 }),
+                signing_certificate: None,
             }),
         ));
 
@@ -2311,6 +2347,7 @@ mod tests {
                     message: "dkms build failed for kernel 6.8.0-137-generic".to_owned(),
                 }],
                 versions: None,
+                signing_certificate: None,
             }),
         ));
 
@@ -2961,5 +2998,104 @@ mod tests {
 
         assert_eq!(exit, SessionExit::Replaced);
         assert!(matches!(answered.recv(), Err(mpsc::RecvError)));
+    }
+
+    #[test]
+    fn a_signature_the_kernel_refused_is_not_the_failure_a_broken_build_is() {
+        let report = ApplyDisplayRecipeResponse {
+            stages: vec![DisplayRecipeStage {
+                step: i32::from(DisplayRecipeStep::ModuleLoad),
+                state: i32::from(DisplayRecipeStageState::Failed),
+                message: "modprobe vmlord_drm exited with 1: modprobe: ERROR: could not \
+                          insert 'vmlord_drm': Key was rejected by service -- Secure Boot \
+                          is on and enroll /var/lib/shim-signed/mok/MOK.der (key id 0a1b) \
+                          as a MOK"
+                    .to_owned(),
+            }],
+            versions: None,
+            signing_certificate: None,
+        };
+        let seen = Mutex::new(None);
+
+        report_display_recipe(&report, "dev", &|report| {
+            *seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(report);
+        });
+
+        let seen = seen
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let failure = seen
+            .expect("a failed recipe reports")
+            .failure
+            .expect("a failed stage is a failure");
+        assert_eq!(
+            failure.code,
+            DisplayStatusCode::PayloadModuleSignatureRejected
+        );
+    }
+
+    #[test]
+    fn a_signature_nobody_checks_yet_does_not_take_the_display_down() {
+        for step in [
+            DisplayRecipeStep::SigningKey,
+            DisplayRecipeStep::ModuleSignature,
+        ] {
+            let report = ApplyDisplayRecipeResponse {
+                stages: vec![
+                    DisplayRecipeStage {
+                        step: i32::from(step),
+                        state: i32::from(DisplayRecipeStageState::Failed),
+                        message: "vmlord_drm carries no signature".to_owned(),
+                    },
+                    stage(
+                        DisplayRecipeStep::ServicesStart,
+                        DisplayRecipeStageState::Ok,
+                    ),
+                ],
+                versions: None,
+                signing_certificate: None,
+            };
+            let seen = Mutex::new(None);
+
+            report_display_recipe(&report, "dev", &|report| {
+                *seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(report);
+            });
+
+            let seen = seen
+                .into_inner()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .expect("a recipe reports");
+            assert!(
+                seen.failure.is_none(),
+                "{step:?} must not degrade a display whose signature nothing checks"
+            );
+        }
+    }
+
+    #[test]
+    fn the_certificate_the_guest_signs_with_reaches_the_host() {
+        let report = ApplyDisplayRecipeResponse {
+            stages: vec![stage(
+                DisplayRecipeStep::ServicesStart,
+                DisplayRecipeStageState::Ok,
+            )],
+            versions: None,
+            signing_certificate: Some(DisplaySigningCertificate {
+                certificate: vec![0x30, 0x82, 0x01],
+                sha256: "ab".repeat(32),
+                subject_key_identifier: "0a1b".to_owned(),
+            }),
+        };
+        let seen = Mutex::new(None);
+
+        report_display_recipe(&report, "dev", &|report| {
+            *seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(report);
+        });
+
+        let seen = seen
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("a recipe reports");
+        assert_eq!(seen.signing_certificate, Some(vec![0x30, 0x82, 0x01]));
     }
 }
