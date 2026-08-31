@@ -225,11 +225,12 @@ fn connect_to_host(secret: &Secret) -> bool {
             probe_gpu: &mut || gpu_render::probe(&STOPPING),
             attach_display: &mut display_mounts::attach,
             apply_display_recipe: &mut |mode| {
-                let (stages, versions) = display_kernel::apply(&STOPPING, mode);
+                let (stages, versions, signing_certificate) =
+                    display_kernel::apply(&STOPPING, mode);
                 ApplyDisplayRecipeResponse {
                     stages,
                     versions: Some(versions),
-                    signing_certificate: None,
+                    signing_certificate,
                 }
             },
             update_display: &mut |target_version| {
