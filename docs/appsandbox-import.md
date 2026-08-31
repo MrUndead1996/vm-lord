@@ -91,11 +91,22 @@ for the VM's other files.
    way it read the source application's the first time. This is the first thing
    an import changes about the copy. It cannot reach the source: an hv_socket
    address names one partition, and the only one reachable here is the copy's.
+   On a retry this step is skipped once the conversion has handed the guest
+   its network back: from then on the guest asks for its own address, and the
+   agent that used to answer for it has been disabled by that same conversion.
 6. **Converting** -- over that one SSH session, VMLord deploys its own key,
    installs the VMLord agent and its unit, disables AppSandbox's units, proves
    every replacement is in place, removes what is now obsolete, and asks the
    guest to shut down. Every step is checked on every pass, so a resumed
    conversion re-verifies what it skips rather than trusting it.
+   The last thing the conversion does to the guest is hand its network back:
+   the source application's static address and its cloud-init drop-in are
+   removed and VMLord's own netplan, which asks for an address over DHCP, is
+   written in their place. Without it an imported VM answers at the address it
+   was handed once and at none afterwards, because HNS assigns a new one to the
+   VM's endpoint on every start. It is written last and applied by the next
+   boot: rewriting the network under the session issuing the commands would cut
+   it.
 7. **Restarting** -- the guest boots again, this time as an ordinary VMLord VM
    with the agent, the display share and the GPU share the import asked for.
 8. **Verifying** -- SSH answers with VMLord's key, the agent unit is active,

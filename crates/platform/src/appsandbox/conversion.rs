@@ -300,34 +300,46 @@ struct Stage {
     /// the shutdown, which is the one step whose success is the connection
     /// going away.
     check: Option<&'static str>,
+    /// Whether the actions run even when the journal already confirms the step.
+    ///
+    /// True only for the shutdown. Every other step has a check that says
+    /// whether the guest still holds it; that one has none, so a resumed pass
+    /// cannot see that the guest is up -- and it always is, because the pass
+    /// reached it over SSH to run the checks. Asking a guest to power off twice
+    /// is not a second thing done to it.
+    repeated: bool,
 }
 
 /// Every step after the observation, which the runner takes before this list
 /// because its answer is what the bundle is built from.
-const STAGES: [Stage; 7] = [
+const STAGES: [Stage; 8] = [
     Stage {
         step: ConversionStep::BundleUploaded,
         uploads_bundle: true,
         actions: &["install-bundle"],
         check: Some("verify-bundle"),
+        repeated: false,
     },
     Stage {
         step: ConversionStep::VmlordSshKeyDeployed,
         uploads_bundle: false,
         actions: &["deploy-vmlord-key"],
         check: Some("verify-vmlord-key"),
+        repeated: false,
     },
     Stage {
         step: ConversionStep::AgentInstalled,
         uploads_bundle: false,
         actions: &["install-agent"],
         check: Some("verify-agent-files"),
+        repeated: false,
     },
     Stage {
         step: ConversionStep::AppSandboxUnitsDisabled,
         uploads_bundle: false,
         actions: &["disable-appsandbox-units"],
         check: Some("verify-appsandbox-units-disabled"),
+        repeated: false,
     },
     // Nothing to do and everything to prove: this is the gate the removal
     // waits behind, so it is a check and only a check.
@@ -336,12 +348,23 @@ const STAGES: [Stage; 7] = [
         uploads_bundle: false,
         actions: &[],
         check: Some("validate-replacements"),
+        repeated: false,
     },
     Stage {
         step: ConversionStep::ObsoleteFilesRemoved,
         uploads_bundle: false,
         actions: &["remove-obsolete-files"],
         check: Some("verify-obsolete-files-removed"),
+        repeated: false,
+    },
+    // Last, because what it writes is read by the next boot and what it removes
+    // is what the current session is reaching the guest through.
+    Stage {
+        step: ConversionStep::GuestNetworkHandedOver,
+        uploads_bundle: false,
+        actions: &["hand-over-network"],
+        check: Some("verify-network-handover"),
+        repeated: false,
     },
     // The one step with no check: what would confirm it is the session ending,
     // and a guest that answered a question afterwards would not have taken it.
@@ -350,6 +373,7 @@ const STAGES: [Stage; 7] = [
         uploads_bundle: false,
         actions: &["request-shutdown"],
         check: None,
+        repeated: true,
     },
 ];
 
@@ -401,7 +425,7 @@ impl<'a> ConversionRunner<'a> {
                 .journal
                 .last_confirmed_conversion_step()
                 .is_some_and(|last| stage.step <= last);
-            if !confirmed {
+            if !confirmed || stage.repeated {
                 if stage.uploads_bundle {
                     self.deliver(&bundle)?;
                 }
@@ -719,7 +743,7 @@ mod tests {
                             PRETTY_NAME=\"Ubuntu 24.04.1 LTS\"\n";
 
     /// Every label one complete conversion asks of a guest, in order.
-    const EVERY_LABEL: [&str; 18] = [
+    const EVERY_LABEL: [&str; 20] = [
         "verify-guest-sudo",
         "verify-guest-python",
         "observe-guest",
@@ -737,6 +761,8 @@ mod tests {
         "validate-replacements",
         "remove-obsolete-files",
         "verify-obsolete-files-removed",
+        "hand-over-network",
+        "verify-network-handover",
         "request-shutdown",
     ];
 
@@ -1076,13 +1102,22 @@ mod tests {
                     "remove-obsolete-files",
                     ConversionStep::ObsoleteFilesRemoved,
                 ),
-                ("request-shutdown", ConversionStep::ShutdownRequested),
+                ("hand-over-network", ConversionStep::GuestNetworkHandedOver),
             ] {
                 assert!(
                     !seen.contains(&action) || step < action_step,
                     "{step:?} re-ran {action}, which it had already confirmed: {seen:?}"
                 );
             }
+            // The shutdown is the exception, and deliberately so: it is the one
+            // step with no check, so a resumed pass cannot see that the guest is
+            // up -- and it always is, because this pass reached it over SSH to
+            // run every check above. A pass that skipped it would leave a guest
+            // running for the second boot to take apart.
+            assert!(
+                seen.contains(&"request-shutdown"),
+                "{step:?} left the guest running: {seen:?}"
+            );
             assert_eq!(
                 report.last_confirmed_step,
                 Some(ConversionStep::ShutdownRequested)
@@ -1176,6 +1211,29 @@ mod tests {
                  {arguments:?}"
             );
         }
+    }
+
+    /// A resumed import reaches the guest through whatever network the guest
+    /// has, and the handover is what decides which that is: before it, the
+    /// source application's agent is asked to move the guest; after it, the
+    /// guest asks for its own address -- and that same conversion has disabled
+    /// the agent that used to answer, so a resumed pass must not go looking for
+    /// it. The order is therefore load-bearing beyond the conversion itself.
+    #[test]
+    fn the_network_handover_is_the_last_thing_done_to_the_guest_before_it_is_stopped() {
+        let steps = ConversionStep::ALL;
+        let handover = steps
+            .iter()
+            .position(|step| *step == ConversionStep::GuestNetworkHandedOver)
+            .expect("the handover is a step of every conversion");
+
+        assert_eq!(
+            steps[handover + 1],
+            ConversionStep::ShutdownRequested,
+            "nothing may come between the handover and the boot that applies it"
+        );
+        assert!(ConversionStep::ObsoleteFilesRemoved < ConversionStep::GuestNetworkHandedOver);
+        assert!(ConversionStep::GuestNetworkHandedOver < ConversionStep::ShutdownRequested);
     }
 
     /// `install-bundle` finishes by deleting the staged copy it installed from,

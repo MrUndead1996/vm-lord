@@ -107,12 +107,20 @@ pub(crate) enum ConversionStep {
     AppSandboxUnitsDisabled,
     ReplacementsValidated,
     ObsoleteFilesRemoved,
+    /// The guest asks for its address again, and the source application's
+    /// network configuration is gone.
+    ///
+    /// After the removal, because it is the last thing done to the guest before
+    /// it is asked to shut down: the configuration written here is applied by
+    /// the next boot, and rewriting the network under the session issuing the
+    /// commands would cut it.
+    GuestNetworkHandedOver,
     ShutdownRequested,
 }
 
 impl ConversionStep {
     /// Every step, in the order a conversion confirms them.
-    pub(crate) const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 9] = [
         Self::GuestObserved,
         Self::BundleUploaded,
         Self::VmlordSshKeyDeployed,
@@ -120,6 +128,7 @@ impl ConversionStep {
         Self::AppSandboxUnitsDisabled,
         Self::ReplacementsValidated,
         Self::ObsoleteFilesRemoved,
+        Self::GuestNetworkHandedOver,
         Self::ShutdownRequested,
     ];
 }

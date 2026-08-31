@@ -104,6 +104,45 @@ const OBSOLETE_APPSANDBOX_PATHS: [&str; 12] = [
     "/etc/modules-load.d/asb_drm.conf",
 ];
 
+/// Where VMLord's own network configuration goes in an imported guest.
+///
+/// A higher number than the source application's `99-appsandbox.yaml` would
+/// merge with it rather than replace it, so the handover removes that file
+/// instead of outranking it, and this one is numbered like any other.
+const GUEST_NETWORK_CONFIG_PATH: &str = "/etc/netplan/90-vmlord.yaml";
+
+/// What the source application's networking consists of, all of which goes.
+///
+/// The netplan file pins a static address on the subnet that application was
+/// serving, and the drop-in stops cloud-init from ever writing one of its own.
+/// Together they are why an imported guest would come up on an address nothing
+/// assigned it and answer at none that HNS did.
+const APPSANDBOX_NETWORK_PATHS: [&str; 2] = [
+    "/etc/netplan/99-appsandbox.yaml",
+    "/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg",
+];
+
+/// VMLord's network configuration for an imported guest, bar its renderer.
+///
+/// DHCP, because that is how every VMLord guest gets its address: HNS assigns
+/// one to the VM's endpoint and VMLord's DHCP server offers the guest that one
+/// and no other. A guest with an address written into its own configuration
+/// answers on whatever it was given once and on nothing afterwards.
+///
+/// `$RENDERER` is the one thing the guest fills in, because only the guest
+/// knows whether NetworkManager is running in it -- and a netplan naming the
+/// renderer that is not active makes the one that is stop managing the
+/// interface entirely.
+const GUEST_NETWORK_CONFIG: &str = "network:
+  version: 2
+  renderer: $RENDERER
+  ethernets:
+    vmlordnic:
+      match: { name: \"e*\" }
+      dhcp4: true
+      dhcp6: false
+";
+
 /// The document the guest program takes every outside value from.
 ///
 /// The agent's four names are here rather than in the program for the reason
@@ -121,6 +160,9 @@ struct GuestInput<'a> {
     agent_unit_text: &'a str,
     appsandbox_units: [&'a str; 5],
     obsolete_paths: [&'a str; 12],
+    network_config_path: &'a str,
+    network_config_template: &'a str,
+    appsandbox_network_paths: [&'a str; 2],
 }
 
 /// One file the bundle carries, as the guest checks it.
@@ -208,6 +250,9 @@ impl ConversionBundle {
                 agent_unit_text: AGENT_SERVICE,
                 appsandbox_units: APPSANDBOX_UNITS,
                 obsolete_paths: OBSOLETE_APPSANDBOX_PATHS,
+                network_config_path: GUEST_NETWORK_CONFIG_PATH,
+                network_config_template: GUEST_NETWORK_CONFIG,
+                appsandbox_network_paths: APPSANDBOX_NETWORK_PATHS,
             })
             .map_err(|error| {
                 RepositoryError::new(format!(
@@ -523,6 +568,38 @@ mod tests {
 
     /// The units to stop are data the guest program is handed rather than
     /// knowledge baked into it, and they are exactly AppSandbox's own: a unit
+    /// An imported guest that keeps the source application's networking is a VM
+    /// that answers at the address it was handed once and at none afterwards:
+    /// HNS assigns a new one to the VM's endpoint on every start, and VMLord
+    /// offers it over DHCP to a guest that has been told not to ask.
+    #[test]
+    fn the_input_document_puts_the_guest_back_on_dhcp_and_names_what_it_replaces() {
+        let root = temporary_root("network");
+        let bundle = build_in(&root.0, "first");
+
+        let input: serde_json::Value =
+            serde_json::from_slice(&fs::read(bundle.root().join("input.json")).unwrap()).unwrap();
+
+        let template = input["network_config_template"].as_str().unwrap();
+        assert!(template.contains("dhcp4: true"), "{template}");
+        assert!(
+            template.contains("$RENDERER"),
+            "only the guest knows which renderer is running in it: {template}"
+        );
+        assert_eq!(
+            input["network_config_path"],
+            json!("/etc/netplan/90-vmlord.yaml")
+        );
+        assert_eq!(
+            input["appsandbox_network_paths"],
+            json!([
+                "/etc/netplan/99-appsandbox.yaml",
+                "/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg",
+            ]),
+            "the static address and the drop-in that stops cloud-init both go"
+        );
+    }
+
     /// this list got wrong is either a daemon left running against VMLord or a
     /// guest service stopped for no reason.
     #[test]

@@ -207,6 +207,50 @@ def verify_obsolete_files_removed():
             fail("%s is still there" % path)
 
 
+def hand_over_network():
+    """Give the guest back to DHCP, and take the source application's away.
+
+    The source application wrote a static address for a subnet it was serving
+    and turned cloud-init's network module off, so the guest asks for nothing
+    and answers only at the address it was handed once. VMLord's guests get
+    their address from DHCP -- HNS assigns one to the VM's endpoint and VMLord's
+    server offers the guest that one -- so an imported guest has to be put back
+    on it or it is a VM that works until its next start.
+
+    Written now and applied by the next boot, which the conversion is about to
+    ask for: rewriting the network under the session that is issuing the
+    command would cut it.
+    """
+    values = load_input()
+    # Only the guest knows which renderer is running in it, and a netplan that
+    # names the wrong one makes the right one stop managing the interface.
+    renderer = "networkd"
+    if systemctl("is-active", "--quiet", "NetworkManager") == 0:
+        renderer = "NetworkManager"
+    text = values["network_config_template"].replace("$RENDERER", renderer)
+    # Ours first, theirs after: at no point is the guest left with neither.
+    write_root_file(values["network_config_path"], text, 0o600)
+    for path in values["appsandbox_network_paths"]:
+        if os.path.isfile(path) or os.path.islink(path):
+            os.remove(path)
+
+
+def verify_network_handover():
+    values = load_input()
+    path = values["network_config_path"]
+    if not os.path.isfile(path):
+        fail("%s is missing" % path)
+    with open(path, "r", encoding="utf-8") as handle:
+        text = handle.read()
+    if "dhcp4: true" not in text:
+        fail("%s does not ask for an address" % path)
+    if "$RENDERER" in text:
+        fail("%s never had its renderer filled in" % path)
+    for stale in values["appsandbox_network_paths"]:
+        if os.path.exists(stale):
+            fail("%s is still there" % stale)
+
+
 def request_shutdown():
     # A normal shutdown and not a reset: the guest has just written units,
     # keys and a secret, and the next boot is the one that has to find them.
@@ -226,6 +270,8 @@ STEPS = {
     "validate-replacements": validate_replacements,
     "remove-obsolete-files": remove_obsolete_files,
     "verify-obsolete-files-removed": verify_obsolete_files_removed,
+    "hand-over-network": hand_over_network,
+    "verify-network-handover": verify_network_handover,
     "request-shutdown": request_shutdown,
 }
 

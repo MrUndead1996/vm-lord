@@ -24,8 +24,8 @@ use vmlord_core::{GpuMode, RepositoryError, SshAuthentication, SshConfig, SshEnd
 
 use super::{
     BootstrapRequest, BootstrapSshFacts, BootstrapVm, ConversionCommand, ConversionRequest,
-    ConversionRunner, GUEST_SSH_PORT, ImportBootstrapPipeline, ImportJournal, ImportResources,
-    SecretText, ValidatedSource, Verification, VerificationRequest,
+    ConversionRunner, ConversionStep, GUEST_SSH_PORT, ImportBootstrapPipeline, ImportJournal,
+    ImportResources, SecretText, ValidatedSource, Verification, VerificationRequest,
     copy::{CopyRequest, copy_vhdx},
     source_agent::{AddressOutcome, SourceAgent},
     worker::ImportWorkerActions,
@@ -304,7 +304,18 @@ impl ImportPipeline {
                 let scp_client = scp_client.clone();
                 let bootstrap_ssh = bootstrap_ssh.clone();
                 Box::new(move |bootstrap| {
-                    let endpoint = wait_for_guest(bootstrap, &bootstrap_ssh, &timeouts)?;
+                    // Reloaded rather than shared: the runner advances the
+                    // confirmed conversion step through the same file the
+                    // worker writes its stages into, and the worker reloads it
+                    // afterwards. It is read before the guest is reached
+                    // because what it confirms decides how to reach it.
+                    let mut journal = ImportJournal::load(&storage_root, import_id)?;
+                    let endpoint = wait_for_guest(
+                        bootstrap,
+                        &bootstrap_ssh,
+                        journal.last_confirmed_conversion_step(),
+                        &timeouts,
+                    )?;
                     let secret = agent_secret(&destination)?;
                     let public_key = fs::read_to_string(layout::ssh_public_key_path(&destination))
                         .map_err(|error| {
@@ -312,10 +323,6 @@ impl ImportPipeline {
                                 "failed to read the imported VM's own public key: {error}"
                             ))
                         })?;
-                    // Reloaded rather than shared: the runner advances the
-                    // confirmed conversion step through the same file the
-                    // worker writes its stages into, and the worker reloads it
-                    // afterwards.
                     let Some(source_key) = source_key.as_ref() else {
                         return Err(RepositoryError::new(
                             "converting the copied guest needs the AppSandbox key of its source, \
@@ -323,7 +330,6 @@ impl ImportPipeline {
                              VMs again and retry",
                         ));
                     };
-                    let mut journal = ImportJournal::load(&storage_root, import_id)?;
                     let transcript = transcript.clone();
                     let report = ConversionRunner::new(
                         ConversionRequest {
@@ -585,31 +591,49 @@ fn forget_mapping(store: &MetadataStore, hcs_id: &str) -> Result<(), RepositoryE
 /// This is the first thing an import does that changes the copy. It cannot
 /// touch the source: an hv_socket address names one partition, and the only
 /// partition reachable here is the one the copy is running as.
+///
+/// All of that is for a guest the conversion has not reached yet. Once the
+/// conversion has handed the network over, the guest asks for its address like
+/// every other VMLord guest -- and the agent that used to answer for it has
+/// been disabled by that same conversion, so a resumed import must not go
+/// looking for it.
 fn wait_for_guest(
     bootstrap: &BootstrapVm,
     ssh: &BootstrapSshFacts,
+    confirmed: Option<ConversionStep>,
     timeouts: &ReadinessTimeouts,
 ) -> Result<SshEndpoint, RepositoryError> {
     let mapping = &bootstrap.mapping;
     let port = SshPort::new(GUEST_SSH_PORT)?;
     let (address, prefix_length) = wait_for_address(mapping, timeouts)?;
-    let gateway = Ipv4Subnet::new(address, prefix_length).gateway();
-    let runtime_id = partition_of(&bootstrap.hcs_compute_system_id, &mapping.vm_name)?;
 
-    // One deadline for the whole conversation: the guest is booting through the
-    // first half and has to answer within the second, and what the caller is
-    // waiting for is a guest it can talk to.
-    let deadline = Instant::now() + timeouts.ssh_port;
-    let mut agent = SourceAgent::connect(&mapping.vm_name, runtime_id, deadline)?;
-    if agent.move_onto(address, prefix_length, gateway, deadline)? == AddressOutcome::NeedsRestart {
-        agent.restart(deadline)?;
+    if confirmed.is_some_and(|step| step >= ConversionStep::GuestNetworkHandedOver) {
+        tracing::info!(
+            "the copied guest of VM \"{}\" has already been handed its network, so it asks for \
+             its own address",
+            mapping.vm_name
+        );
+    } else {
+        let gateway = Ipv4Subnet::new(address, prefix_length).gateway();
+        let runtime_id = partition_of(&bootstrap.hcs_compute_system_id, &mapping.vm_name)?;
+
+        // One deadline for the whole conversation: the guest is booting through
+        // the first half and has to answer within the second, and what the
+        // caller is waiting for is a guest it can talk to.
+        let deadline = Instant::now() + timeouts.ssh_port;
+        let mut agent = SourceAgent::connect(&mapping.vm_name, runtime_id, deadline)?;
+        if agent.move_onto(address, prefix_length, gateway, deadline)?
+            == AddressOutcome::NeedsRestart
+        {
+            agent.restart(deadline)?;
+        }
+        // The connection is finished either way, and a guest that was asked to
+        // restart is about to take it down.
+        drop(agent);
     }
-    // The connection is finished either way, and a guest that was asked to
-    // restart is about to take it down.
-    drop(agent);
 
-    // The port wait is what proves the address took, whether the guest was
-    // restarted or not: nothing answers at an address the guest does not hold.
+    // The port wait is what proves the address took, whichever way the guest
+    // got it: nothing answers at an address the guest does not hold.
     let address = IpAddr::V4(address);
     wait_for_port(address, port.get(), timeouts)?;
     SshEndpoint::new(
