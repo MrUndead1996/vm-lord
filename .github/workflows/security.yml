@@ -23,6 +23,16 @@ jobs:
     permissions:
       contents: read
       security-events: write
+    env:
+      # The extractor drives rust-analyzer with the `test` cfg enabled, so every
+      # `#[cfg(test)] mod tests` is read as if it shipped -- which is where all
+      # of this repository's hard-coded-password alerts came from. `-test` turns
+      # that cfg off for extraction; the brackets are not decoration, the option
+      # is a list and the extractor parses environment values as TOML.
+      #
+      # It belongs on the job rather than on a step because the extraction for
+      # `build-mode: none` runs inside `analyze`, not `init`.
+      CODEQL_EXTRACTOR_RUST_OPTION_CARGO_CFG_OVERRIDES: '["-test"]'
     steps:
       - name: Check out the source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -34,6 +44,7 @@ jobs:
           languages: rust
           build-mode: none
           queries: security-extended
+          config-file: .github/codeql/codeql-config.yml
 
       - name: Analyse Rust
         uses: github/codeql-action/analyze@6f5948dfacef28e207b48d0905cf90c03365536d # v3
