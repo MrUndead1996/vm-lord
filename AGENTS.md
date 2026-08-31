@@ -104,6 +104,10 @@ Use the Cargo aliases from `.cargo/config.toml` rather than spelling targets out
 * `cargo display-services` — build the guest display broker and capture process
   (the same target, for the same reason).
 * `cargo display-bench` — run the desktop codec's benchmark scenes.
+* `cargo display-pipeline-bench` — measure what a captured frame costs
+  between the mapping and the socket: the cursor composite, the payload's
+  copy into a record, and a mapped buffer against memory this process owns.
+  Linux only, because the mapped rows want a real descriptor.
 * `cargo dist` — Windows-only release build into `dist/`.
 
 Never add a dependency that forces the agent to link against system C

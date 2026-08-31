@@ -18,6 +18,7 @@ pub mod ipc;
 pub mod mutter;
 pub mod output;
 pub mod pipeline;
+pub mod pipeline_bench;
 pub mod seat;
 pub mod session_main;
 pub mod uinput;

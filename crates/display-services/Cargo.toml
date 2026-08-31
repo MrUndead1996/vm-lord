@@ -25,6 +25,15 @@ name = "vmlord-display-clipboard"
 path = "src/bin/clipboard.rs"
 bench = false
 
+# Not a guest program: it measures the pipeline on the host that built it, and
+# `payloads/display/prepare.sh` names the three above rather than collecting
+# whatever the target directory holds. Reached through `cargo
+# display-pipeline-bench`.
+[[bin]]
+name = "vmlord-display-pipeline-bench"
+path = "src/bin/pipeline_bench.rs"
+bench = false
+
 [dependencies]
 libc = { version = "0.2", default-features = false }
 prost = "0.14"
