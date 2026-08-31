@@ -6,7 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-eframe = "0.33"
+eframe = { version = "0.33", features = ["persistence"] }
 # The UI's message catalogues, embedded at compile time from `locales/`.
 # It stops here on purpose: no other crate has text a user reads.
 rust-i18n = "3"

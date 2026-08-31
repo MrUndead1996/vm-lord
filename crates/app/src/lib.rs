@@ -336,6 +336,15 @@ impl WorkspaceApp {
         self.settings.as_ref().map(|settings| &settings.current)
     }
 
+    /// Where the main window's place and size are remembered.
+    ///
+    /// `None` when this session has no profile to write to, which the UI
+    /// reads as a window that opens at its default size every time.
+    #[must_use]
+    pub fn window_state_path(&self) -> Option<PathBuf> {
+        vmlord_core::window_state_path()
+    }
+
     pub fn update_settings(&mut self, settings: AppSettings) -> Result<(), SettingsUpdateError> {
         if self.settings.is_none() {
             return Err(SettingsUpdateError::NotInitialized);

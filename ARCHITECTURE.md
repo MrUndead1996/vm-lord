@@ -701,6 +701,19 @@ created on first launch. `image_cache_path` carries `#[serde(default)]` and is
 filled in on load when absent, so a `settings.toml` written before the field
 existed keeps loading without a migration.
 
+The main window's own geometry is kept apart from the settings, in
+`%LOCALAPPDATA%\VMLord\window.ron`. `eframe` writes it and applies it before
+the window is shown -- the place, the size and whether the window was
+maximised, clamped to the monitors there are now -- which is why the only
+decision here is where the file goes: `core::settings::window_state_path`
+answers with VMLord's own directory rather than the roaming profile `eframe`
+would pick from the application name, and the application layer hands that
+path to the UI. It is a `NativeOptions` path and not a setting: nothing in it
+is a choice the user made in a form, and a session with no `%LOCALAPPDATA%`
+simply opens at 960x640 every time. Nothing else is persisted -- egui's own
+memory holds scroll offsets and half-filled forms, and restoring those is not
+what leaving the application and coming back means.
+
 Distribution profiles are installed under
 `{app}\distros\*.json` by the release build. Before loading the catalog, the
 composition root passes that directory (derived from `current_exe`) to
