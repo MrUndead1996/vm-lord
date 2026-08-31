@@ -406,7 +406,20 @@ impl<'a> ConversionRunner<'a> {
                     self.deliver(&bundle)?;
                 }
                 for action in stage.actions {
-                    self.run_command(action, self.staged_step(action))?;
+                    // Only the stage that uploads the bundle runs out of the
+                    // staged copy, and only because the installed one does not
+                    // exist yet. `install-bundle` ends by deleting what it
+                    // installed from -- deliberately, so that the agent secret
+                    // does not stay in the login's home -- so it is the last
+                    // command that can run from there. Everything after it runs
+                    // the root-owned copy, which is also the copy root ought to
+                    // be running.
+                    let command = if stage.uploads_bundle {
+                        self.staged_step(action)
+                    } else {
+                        self.installed_step(action)
+                    };
+                    self.run_command(action, command)?;
                 }
             }
             if let Some(check) = stage.check
@@ -691,7 +704,10 @@ mod tests {
     };
     use vmlord_payload::Sha256Digest;
 
-    use super::{ConversionReport, ConversionRequest, ConversionRunner, GuestIdentity, SecretText};
+    use super::{
+        ConversionReport, ConversionRequest, ConversionRunner, GUEST_BUNDLE_DIRECTORY,
+        GUEST_STAGED_PATH, GuestIdentity, SecretText,
+    };
     use crate::appsandbox::journal::{
         BootstrapSshFacts, ConversionStep, ImportJournal, ImportJournalDetails, ImportResources,
         SourceFingerprint,
@@ -1159,6 +1175,58 @@ mod tests {
                 "the VM's own key cannot open a session the conversion has not created yet: \
                  {arguments:?}"
             );
+        }
+    }
+
+    /// `install-bundle` finishes by deleting the staged copy it installed from,
+    /// so nothing after it can be run from there. A guest answers an attempt
+    /// with `python3: can't open file '~/.vmlord-convert/vmlord-convert'`, and
+    /// the conversion stops one step past the upload.
+    #[test]
+    fn only_the_upload_stage_runs_the_program_out_of_the_staged_copy() {
+        let fixture = Fixture::new("staged-once");
+
+        let report = run_resuming_from(&fixture, None).unwrap();
+
+        let staged: Vec<&str> = report
+            .commands
+            .iter()
+            .filter(|command| {
+                command
+                    .invocation
+                    .command_line()
+                    .contains(GUEST_STAGED_PATH)
+            })
+            .map(|command| command.label)
+            .collect();
+
+        assert_eq!(
+            staged,
+            vec![
+                "clear-staged-bundle",
+                "verify-staged-program",
+                "install-bundle"
+            ],
+            "only the delivery and the install itself may name the staged copy"
+        );
+
+        for command in &report.commands {
+            if command.label == "deploy-vmlord-key"
+                || command.label == "install-agent"
+                || command.label == "disable-appsandbox-units"
+                || command.label == "remove-obsolete-files"
+                || command.label == "request-shutdown"
+            {
+                assert!(
+                    command
+                        .invocation
+                        .command_line()
+                        .contains(GUEST_BUNDLE_DIRECTORY),
+                    "{} must run the installed, root-owned copy: {}",
+                    command.label,
+                    command.invocation.command_line()
+                );
+            }
         }
     }
 
