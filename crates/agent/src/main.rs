@@ -229,6 +229,7 @@ fn connect_to_host(secret: &Secret) -> bool {
                 ApplyDisplayRecipeResponse {
                     stages,
                     versions: Some(versions),
+                    signing_certificate: None,
                 }
             },
             update_display: &mut |target_version| {
