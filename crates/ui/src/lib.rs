@@ -52,10 +52,17 @@ pub fn run(application: WorkspaceApp) -> eframe::Result<()> {
     if let Some(settings) = application.settings() {
         rust_i18n::set_locale(settings.language.code());
     }
+    // Where the window was left. `eframe` writes the place, the size and
+    // whether it was maximised into this file and applies them before the
+    // window is shown; the inner size below is what a first run opens at,
+    // and what a session with no profile to write to opens at every time.
+    let window_state = application.window_state_path();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([960.0, 640.0])
             .with_icon(application_icon()),
+        persist_window: window_state.is_some(),
+        persistence_path: window_state,
         ..Default::default()
     };
     eframe::run_native(
@@ -380,6 +387,15 @@ enum InstallConfirmationAction {
 }
 
 impl eframe::App for VmlordUi {
+    /// What is remembered is the window, not what was on screen inside it.
+    ///
+    /// egui's own memory holds scroll offsets and the state of every widget
+    /// that has any, and a form restored halfway through is not what leaving
+    /// the application and coming back means here.
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
     fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
         context.request_repaint_after(AUTO_REFRESH_INTERVAL);
         // The update worker reports through a channel the application layer

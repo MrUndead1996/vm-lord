@@ -58,7 +58,7 @@ pub use provisioning::{
 pub use settings::{
     AppSettings, DataSize, DisplaySettings, DisplaySettingsError, FileClipboardSettings,
     FileClipboardSettingsError, GuestReadinessTimeouts, Language, LogLevel, Retention,
-    SettingsError, SettingsLoad, SettingsStore,
+    SettingsError, SettingsLoad, SettingsStore, window_state_path,
 };
 pub use ssh::{
     SshAuthentication, SshAvailability, SshConfig, SshEndpoint, SshPort, SshSessionOutcome,

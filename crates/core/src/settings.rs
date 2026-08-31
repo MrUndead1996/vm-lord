@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 const APPLICATION_DIRECTORY: &str = "VMLord";
 const SETTINGS_FILE_NAME: &str = "settings.toml";
+const WINDOW_STATE_FILE_NAME: &str = "window.ron";
 const DEFAULT_VM_DIRECTORY: &str = "vms";
 const DEFAULT_LOG_DIRECTORY: &str = "logs";
 const DEFAULT_LOG_FILE_NAME: &str = "vmlord.log";
@@ -479,6 +480,25 @@ impl SettingsStore {
     }
 }
 
+/// Where the main window's place and size are kept, beside the settings.
+///
+/// `%LOCALAPPDATA%\\VMLord\\window.ron`, written by `eframe` itself: the
+/// geometry of a window is the window framework's to read, and what this
+/// decides is only that it lands under VMLord's own directory rather than in
+/// the roaming profile `eframe` would choose on its own.
+///
+/// `None` when there is no `%LOCALAPPDATA%`, which is a session with no
+/// profile: the application runs, the window just opens at its default size
+/// every time.
+#[must_use]
+pub fn window_state_path() -> Option<PathBuf> {
+    Some(
+        PathBuf::from(env::var_os("LOCALAPPDATA")?)
+            .join(APPLICATION_DIRECTORY)
+            .join(WINDOW_STATE_FILE_NAME),
+    )
+}
+
 fn default_distro() -> String {
     DEFAULT_DISTRO.into()
 }
@@ -561,7 +581,7 @@ mod tests {
 
     use super::{
         AppSettings, DataSize, DisplaySettings, FileClipboardSettings, GuestReadinessTimeouts,
-        Language, LogLevel, Retention, SettingsError, SettingsStore,
+        Language, LogLevel, Retention, SettingsError, SettingsStore, window_state_path,
     };
 
     fn temporary_directory() -> std::path::PathBuf {
@@ -923,5 +943,18 @@ mod tests {
     fn each_language_names_its_locale() {
         assert_eq!(Language::EnUs.code(), "en-US");
         assert_eq!(Language::RuRu.code(), "ru-RU");
+    }
+
+    #[test]
+    fn the_window_is_remembered_beside_the_settings() {
+        let Some(path) = window_state_path() else {
+            // A session with no profile, which is not a machine this can be
+            // asserted on.
+            return;
+        };
+        let settings = SettingsStore::for_current_user().expect("a store for this user");
+
+        assert_eq!(path.parent(), settings.config_path().parent());
+        assert_eq!(path.file_name(), Some("window.ron".as_ref()));
     }
 }
