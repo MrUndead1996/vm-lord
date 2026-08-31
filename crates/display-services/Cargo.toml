@@ -34,6 +34,15 @@ name = "vmlord-display-pipeline-bench"
 path = "src/bin/pipeline_bench.rs"
 bench = false
 
+# A guest program, but not one the payload installs: it reads the desktop that
+# is on screen to measure what a real dma-buf's coherency call costs, which
+# only a running guest has. Built by `cargo display-services` and copied over
+# by hand.
+[[bin]]
+name = "vmlord-display-guest-probe"
+path = "src/bin/guest_probe.rs"
+bench = false
+
 [dependencies]
 libc = { version = "0.2", default-features = false }
 prost = "0.14"

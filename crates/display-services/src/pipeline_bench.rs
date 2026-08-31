@@ -42,8 +42,14 @@ use crate::{
 const WIDTH: u32 = 1920;
 const HEIGHT: u32 = 1080;
 
-/// The cursor plane's size. `vmlord_drm` offers one size and mutter uses it.
-const CURSOR: u32 = 64;
+/// The cursor plane's size.
+///
+/// Measured in a guest rather than assumed: mutter commits a 256x256 plane to
+/// `vmlord_drm`, not the 64x64 a cursor is usually pictured as. It matters
+/// here because the composite's cost is its area -- sixteen times what a 64x64
+/// pointer would cost -- and because a bitmap re-sent every frame is a quarter
+/// of a megabyte, not sixteen kilobytes.
+const CURSOR: u32 = 256;
 
 /// How many buffers the chain holds.
 ///

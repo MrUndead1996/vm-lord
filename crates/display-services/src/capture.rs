@@ -136,6 +136,18 @@ impl MappedBuffer {
         value
     }
 
+    /// Runs `body` over the mapped bytes with no coherency bracket at all.
+    ///
+    /// Diagnostics only -- `vmlord-display-guest-probe` measures what the
+    /// bracket costs by taking it off, and the difference is only meaningful
+    /// against the same read. Capture uses [`MappedBuffer::read`]: a stale
+    /// cache line is not something a desktop can be shipped with.
+    pub fn bytes<T>(&self, body: impl FnOnce(&[u8]) -> T) -> T {
+        // SAFETY: as in `read` -- the mapping is live for the life of `self`,
+        // covers `length` bytes, and is read-only.
+        body(unsafe { slice::from_raw_parts(self.address.as_ptr(), self.length) })
+    }
+
     /// One half of the coherency bracket, reported at most once.
     fn sync(&self, flags: u64) {
         if sync_buffer(self.descriptor.as_raw_fd(), flags).is_err()

@@ -14,6 +14,7 @@ pub mod clipboard_main;
 pub mod control;
 pub mod cursor;
 pub mod drm;
+pub mod guest_probe;
 pub mod ipc;
 pub mod mutter;
 pub mod output;
