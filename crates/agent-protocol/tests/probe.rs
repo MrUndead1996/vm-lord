@@ -14,6 +14,9 @@ use vmlord_agent_protocol::{
     },
 };
 
+// The version is a constant, so the floor below folds to `true`; what the
+// assertion guards is a future edit that lowers it.
+#[allow(clippy::assertions_on_constants)]
 #[test]
 fn a_probe_report_belongs_to_revision_one_five_or_later() {
     // Messages and enum values only, so an agent from 1.4 is simply never

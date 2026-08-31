@@ -268,7 +268,7 @@ pub(crate) fn driver_store_directory(inf_location: &str) -> Option<PathBuf> {
 /// the end of the buffer. An empty string is `None`: a property that is
 /// present and blank tells a reader nothing an absent one does not.
 pub(crate) fn decode_wide_property(bytes: &[u8]) -> Option<String> {
-    if bytes.len() < 2 || bytes.len() % 2 != 0 {
+    if bytes.len() < 2 || !bytes.len().is_multiple_of(2) {
         return None;
     }
 

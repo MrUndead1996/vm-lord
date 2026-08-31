@@ -298,6 +298,45 @@ pub(crate) fn test_entry(mut value: serde_json::Value) -> CatalogEntry {
         .expect("the test entry must be a valid entry document")
 }
 
+impl vmlord_payload::PayloadEntry for CatalogEntry {
+    type Manifest = crate::PayloadManifest;
+    type Sources = crate::SourceManifest;
+    /// The GPU payload's own directory, in the cache and in a release.
+    const NAMESPACE: &'static str = LOCAL_ARCHIVE_DIRECTORY;
+
+    fn from_json(bytes: &[u8]) -> Result<Self, PayloadError> {
+        Self::from_json(bytes)
+    }
+
+    fn payload_id(&self) -> &str {
+        self.payload_id()
+    }
+
+    fn archive_sha256(&self) -> &Sha256Digest {
+        self.archive_sha256()
+    }
+
+    fn payload_manifest_sha256(&self) -> &Sha256Digest {
+        self.payload_manifest_sha256()
+    }
+
+    fn expanded_size_limit(&self) -> u64 {
+        self.expanded_size_limit()
+    }
+
+    fn file_count_limit(&self) -> u64 {
+        self.file_count_limit()
+    }
+
+    fn parse_manifest(&self, bytes: &[u8]) -> Result<Self::Manifest, PayloadError> {
+        crate::PayloadManifest::parse_and_validate(bytes, self)
+    }
+
+    fn parse_sources(&self, bytes: &[u8]) -> Result<Self::Sources, PayloadError> {
+        crate::SourceManifest::parse_and_validate(bytes, self)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -574,44 +613,5 @@ mod tests {
             PayloadCatalog::from_release_directory(temporary.path()),
             Err(PayloadError::InvalidCatalog(_))
         ));
-    }
-}
-
-impl vmlord_payload::PayloadEntry for CatalogEntry {
-    type Manifest = crate::PayloadManifest;
-    type Sources = crate::SourceManifest;
-    /// The GPU payload's own directory, in the cache and in a release.
-    const NAMESPACE: &'static str = LOCAL_ARCHIVE_DIRECTORY;
-
-    fn from_json(bytes: &[u8]) -> Result<Self, PayloadError> {
-        Self::from_json(bytes)
-    }
-
-    fn payload_id(&self) -> &str {
-        self.payload_id()
-    }
-
-    fn archive_sha256(&self) -> &Sha256Digest {
-        self.archive_sha256()
-    }
-
-    fn payload_manifest_sha256(&self) -> &Sha256Digest {
-        self.payload_manifest_sha256()
-    }
-
-    fn expanded_size_limit(&self) -> u64 {
-        self.expanded_size_limit()
-    }
-
-    fn file_count_limit(&self) -> u64 {
-        self.file_count_limit()
-    }
-
-    fn parse_manifest(&self, bytes: &[u8]) -> Result<Self::Manifest, PayloadError> {
-        crate::PayloadManifest::parse_and_validate(bytes, self)
-    }
-
-    fn parse_sources(&self, bytes: &[u8]) -> Result<Self::Sources, PayloadError> {
-        crate::SourceManifest::parse_and_validate(bytes, self)
     }
 }

@@ -1029,10 +1029,7 @@ fn parse_rfc3339_utc(value: &str) -> Option<SystemTime> {
     let days_before_year = years
         .checked_mul(365)?
         .checked_add(leap_years(year - 1).checked_sub(leap_years(1969))?)?;
-    let days_before_month: u64 = month_days[..(month - 1) as usize]
-        .iter()
-        .map(|days| u64::from(*days))
-        .sum();
+    let days_before_month: u64 = month_days[..(month - 1) as usize].iter().copied().sum();
     let seconds = days_before_year
         .checked_add(days_before_month)?
         .checked_add(day - 1)?

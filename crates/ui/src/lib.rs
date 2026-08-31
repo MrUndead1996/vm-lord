@@ -275,7 +275,7 @@ impl EditVmForm {
             network_mode: vm.network_mode,
             ssh_port: ssh.as_ref().map_or(SshPort::DEFAULT, |ssh| ssh.port).get(),
             ssh,
-            state: vm.state.clone(),
+            state: vm.state,
             error: None,
         }
     }
@@ -358,7 +358,9 @@ enum SettingsDialogAction {
     /// is never started straight from this button.
     RequestInstall,
     Cancel,
-    Submit(AppSettings),
+    /// Boxed: the settings are wider than every other action put together,
+    /// and this enum is returned by value from each dialogue frame.
+    Submit(Box<AppSettings>),
 }
 
 /// The answer to "installing closes VMLord -- continue?".
@@ -629,7 +631,7 @@ impl eframe::App for VmlordUi {
             Some(SettingsDialogAction::Cancel) => self.settings_form = None,
             Some(SettingsDialogAction::Submit(settings)) => {
                 let language = settings.language;
-                if let Err(error) = self.application.update_settings(settings) {
+                if let Err(error) = self.application.update_settings(*settings) {
                     if let Some(form) = &mut self.settings_form {
                         form.error = Some(error.to_string());
                     }
@@ -1221,7 +1223,9 @@ fn render_settings_dialog(
                 );
                 if save.clicked() {
                     match form.settings() {
-                        Ok(settings) => action = Some(SettingsDialogAction::Submit(settings)),
+                        Ok(settings) => {
+                            action = Some(SettingsDialogAction::Submit(Box::new(settings)))
+                        }
                         Err(error) => form.error = Some(error),
                     }
                 }

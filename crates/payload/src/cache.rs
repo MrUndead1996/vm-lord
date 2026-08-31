@@ -165,10 +165,11 @@ pub fn prepare_verified_archive<E: PayloadEntry>(
             Ok(()) => {
                 temporary.disarm();
                 let ready = load_ready(entry, &final_directory, progress, cancel);
-                if ready.is_err() && path_exists(&final_directory) {
-                    if let Some(path) = quarantine(&final_directory, entry)? {
-                        quarantines.push(OperationPath::new(path));
-                    }
+                if ready.is_err()
+                    && path_exists(&final_directory)
+                    && let Some(path) = quarantine(&final_directory, entry)?
+                {
+                    quarantines.push(OperationPath::new(path));
                 }
                 return ready;
             }
@@ -228,11 +229,11 @@ fn load_ready<E: PayloadEntry>(
     )?;
     let actual = Sha256Digest::hash_reader(payload_bytes.as_slice())?;
     if actual != *entry.payload_manifest_sha256() {
-        return Err(PayloadError::DigestMismatch {
-            subject: "payload.json".into(),
-            expected: entry.payload_manifest_sha256().clone(),
+        return Err(PayloadError::digest_mismatch(
+            "payload.json".into(),
+            entry.payload_manifest_sha256().clone(),
             actual,
-        });
+        ));
     }
     let manifest = entry.parse_manifest(&payload_bytes)?;
     validate_manifest_limits(&manifest, entry)?;
@@ -391,11 +392,11 @@ fn verify_digest(
     }
     let actual = Sha256Digest::from_bytes(hash.finalize().into())?;
     if actual != *expected {
-        return Err(PayloadError::DigestMismatch {
+        return Err(PayloadError::digest_mismatch(
             subject,
-            expected: expected.clone(),
+            expected.clone(),
             actual,
-        });
+        ));
     }
     Ok(())
 }
@@ -746,17 +747,17 @@ impl OperationPath {
 
 impl Drop for OperationPath {
     fn drop(&mut self) {
-        if self.armed {
-            if let Ok(metadata) = fs::symlink_metadata(&self.path) {
-                if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
-                    if fs::remove_dir(&self.path).is_err() {
-                        let _ = fs::remove_file(&self.path);
-                    }
-                } else if metadata.is_dir() {
-                    let _ = fs::remove_dir_all(&self.path);
-                } else {
+        if self.armed
+            && let Ok(metadata) = fs::symlink_metadata(&self.path)
+        {
+            if metadata.file_type().is_symlink() || is_reparse_point(&metadata) {
+                if fs::remove_dir(&self.path).is_err() {
                     let _ = fs::remove_file(&self.path);
                 }
+            } else if metadata.is_dir() {
+                let _ = fs::remove_dir_all(&self.path);
+            } else {
+                let _ = fs::remove_file(&self.path);
             }
         }
     }
@@ -1072,6 +1073,7 @@ mod tests {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false)
             .open(&lock_path)
             .unwrap();
         lock.try_lock().unwrap();
@@ -1184,7 +1186,7 @@ mod tests {
             cancel: &AtomicBool::new(false),
         });
 
-        assert!(matches!(result, Err(PayloadError::DigestMismatch { .. })));
+        assert!(matches!(result, Err(PayloadError::DigestMismatch(_))));
     }
 
     #[test]
@@ -1201,7 +1203,7 @@ mod tests {
             cancel: &AtomicBool::new(false),
         });
 
-        assert!(matches!(result, Err(PayloadError::DigestMismatch { .. })));
+        assert!(matches!(result, Err(PayloadError::DigestMismatch(_))));
     }
 
     #[test]
@@ -1222,7 +1224,7 @@ mod tests {
             cancel: &AtomicBool::new(false),
         });
 
-        assert!(matches!(result, Err(PayloadError::DigestMismatch { .. })));
+        assert!(matches!(result, Err(PayloadError::DigestMismatch(_))));
         assert_no_operation_directories(&fixture);
     }
 

@@ -29,7 +29,7 @@ mod test_kind;
 pub use cache::{PrepareRequest, ReadyPayload, prepare, prepare_verified_archive};
 pub use digest::{Sha256Digest, Sha256Hasher};
 pub use entry::{PayloadEntry, PayloadFiles, PayloadSources};
-pub use error::PayloadError;
+pub use error::{DigestMismatch, PayloadError};
 pub use marker::{ReadyMarker, cache_provenance};
 pub use prepared::{PreparedFile, validate_path};
 pub use progress::PayloadProgress;
