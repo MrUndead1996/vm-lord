@@ -60,7 +60,10 @@ pub use settings::{
     FileClipboardSettingsError, GuestReadinessTimeouts, Language, LogLevel, Retention,
     SettingsError, SettingsLoad, SettingsStore,
 };
-pub use ssh::{SshAuthentication, SshAvailability, SshConfig, SshEndpoint, SshPort};
+pub use ssh::{
+    SshAuthentication, SshAvailability, SshConfig, SshEndpoint, SshPort, SshSessionOutcome,
+    SshSessionReport, classify_session,
+};
 pub use update::{
     InstallerAsset, RELEASE_DOWNLOAD_PREFIX, ReleaseManifest, UpdateManifestError, ValidatedUpdate,
 };

@@ -220,13 +220,123 @@ impl fmt::Display for SshEndpoint {
     }
 }
 
+/// How an interactive SSH session ended.
+///
+/// OpenSSH answers nearly every failure of its own with exit code 255, so the
+/// code alone cannot tell a refused key from a changed host key: the text it
+/// wrote is what separates them, and this is what that text is turned into
+/// before it reaches a person. Anything else the client exited with is the
+/// remote shell's own status -- the session happened, and what it ran decided
+/// the number.
+///
+/// Serializable because it crosses a process boundary: the helper that hosted
+/// the session classifies it and VMLord reads the answer, so the variant names
+/// are a file format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SshSessionOutcome {
+    /// The client ran, and exited with the status of what it ran.
+    Ended { code: i32 },
+    /// The guest refused the credential VMLord offered, or the one that was
+    /// typed.
+    AuthenticationFailed,
+    /// The guest's host key is not the one VMLord learned for this VM. Nothing
+    /// resets it automatically: a key that changed is a decision for a person.
+    HostKeyMismatch,
+    /// The client never got as far as authenticating.
+    TransportFailure,
+    /// OpenSSH failed in a way this does not recognise. The code and the log
+    /// travel with it rather than being guessed at.
+    Unrecognized { code: i32 },
+    /// The client died without an exit code.
+    Terminated,
+    /// The helper could not run the client at all.
+    NotStarted,
+    /// The session's window was closed, taking the helper with it before it
+    /// could report anything. How people end shells, not a failure.
+    WindowClosed,
+}
+
+/// OpenSSH's own exit code, meaning the session never ran.
+const SSH_CLIENT_FAILURE: i32 = 255;
+
+/// What a changed host key looks like in an OpenSSH log.
+const HOST_KEY_MARKERS: [&str; 3] = [
+    "REMOTE HOST IDENTIFICATION HAS CHANGED",
+    "Host key verification failed",
+    "differs from the key for the IP address",
+];
+
+/// What a refused credential looks like in an OpenSSH log.
+const AUTHENTICATION_MARKERS: [&str; 3] = [
+    "Permission denied",
+    "Too many authentication failures",
+    "No supported authentication methods",
+];
+
+/// What a connection that never reached authentication looks like.
+const TRANSPORT_MARKERS: [&str; 8] = [
+    "connect to host",
+    "Connection refused",
+    "Connection timed out",
+    "Connection reset",
+    "Could not resolve",
+    "kex_exchange_identification",
+    "Network is unreachable",
+    "No route to host",
+];
+
+/// Turns what `ssh.exe` left behind into what is known about the session.
+///
+/// The order of the questions is the order of what has to be acted on: a
+/// changed host key and a refused credential appear together in one log --
+/// OpenSSH refuses the key it was shown and then reports that nothing
+/// authenticated -- and the host key is the one that means something other
+/// than "try again".
+#[must_use]
+pub fn classify_session(exit_code: Option<i32>, log_tail: &str) -> SshSessionOutcome {
+    let Some(code) = exit_code else {
+        return SshSessionOutcome::Terminated;
+    };
+    if code != SSH_CLIENT_FAILURE {
+        return SshSessionOutcome::Ended { code };
+    }
+    let says = |markers: &[&str]| markers.iter().any(|marker| log_tail.contains(marker));
+
+    if says(&HOST_KEY_MARKERS) {
+        SshSessionOutcome::HostKeyMismatch
+    } else if says(&AUTHENTICATION_MARKERS) {
+        SshSessionOutcome::AuthenticationFailed
+    } else if says(&TRANSPORT_MARKERS) {
+        SshSessionOutcome::TransportFailure
+    } else {
+        SshSessionOutcome::Unrecognized { code }
+    }
+}
+
+/// What the helper that hosted a session leaves behind for VMLord to read.
+///
+/// Small on purpose: the outcome, and the tail of what OpenSSH wrote. The full
+/// log is deleted by the helper that wrote it -- what a session had to say
+/// belongs in the diagnostics panel, not in a directory that grows a file per
+/// shell.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshSessionReport {
+    pub outcome: SshSessionOutcome,
+    /// The tail of the session log, or empty when OpenSSH said nothing.
+    pub detail: String,
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use uuid::Uuid;
 
-    use super::{SshAuthentication, SshAvailability, SshConfig, SshEndpoint, SshPort};
+    use super::{
+        SshAuthentication, SshAvailability, SshConfig, SshEndpoint, SshPort, SshSessionOutcome,
+        SshSessionReport, classify_session,
+    };
 
     fn config() -> SshConfig {
         SshConfig {
@@ -365,5 +475,98 @@ mod tests {
         let endpoint = SshEndpoint::new(Uuid::from_u128(1), &config(), address()).unwrap();
 
         assert_eq!(endpoint.to_string(), "user@172.30.0.5:22 (key)");
+    }
+
+    #[test]
+    fn a_remote_shell_status_means_the_session_happened() {
+        assert_eq!(
+            classify_session(Some(0), ""),
+            SshSessionOutcome::Ended { code: 0 }
+        );
+        assert_eq!(
+            classify_session(Some(130), ""),
+            SshSessionOutcome::Ended { code: 130 }
+        );
+    }
+
+    #[test]
+    fn a_refused_credential_is_told_from_the_log() {
+        assert_eq!(
+            classify_session(Some(255), "machi@172.22.42.7: Permission denied (publickey)."),
+            SshSessionOutcome::AuthenticationFailed
+        );
+        assert_eq!(
+            classify_session(
+                Some(255),
+                "Received disconnect: Too many authentication failures"
+            ),
+            SshSessionOutcome::AuthenticationFailed
+        );
+    }
+
+    /// OpenSSH says both in one run: it refuses the key it was shown and then
+    /// reports that nothing authenticated. The host key is the one a person has
+    /// to act on.
+    #[test]
+    fn a_changed_host_key_is_decided_before_a_refused_credential() {
+        let log = "@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@\n\
+                   Host key verification failed.\n\
+                   Permission denied (publickey).";
+
+        assert_eq!(
+            classify_session(Some(255), log),
+            SshSessionOutcome::HostKeyMismatch
+        );
+    }
+
+    #[test]
+    fn a_guest_that_does_not_answer_is_a_transport_failure() {
+        assert_eq!(
+            classify_session(
+                Some(255),
+                "ssh: connect to host 172.22.42.7 port 22: Connection refused"
+            ),
+            SshSessionOutcome::TransportFailure
+        );
+        assert_eq!(
+            classify_session(
+                Some(255),
+                "kex_exchange_identification: Connection closed by remote host"
+            ),
+            SshSessionOutcome::TransportFailure
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_failure_keeps_its_code_rather_than_being_guessed_at() {
+        assert_eq!(
+            classify_session(Some(255), "something OpenSSH has never said before"),
+            SshSessionOutcome::Unrecognized { code: 255 }
+        );
+        assert_eq!(
+            classify_session(Some(255), ""),
+            SshSessionOutcome::Unrecognized { code: 255 }
+        );
+    }
+
+    #[test]
+    fn a_client_that_died_without_a_code_is_not_an_exit() {
+        assert_eq!(classify_session(None, ""), SshSessionOutcome::Terminated);
+    }
+
+    #[test]
+    fn a_report_survives_the_file_it_travels_in() {
+        let report = SshSessionReport {
+            outcome: SshSessionOutcome::HostKeyMismatch,
+            detail: "Host key verification failed.".to_owned(),
+        };
+
+        let document = serde_json::to_string(&report).unwrap();
+
+        assert!(document.contains("\"host_key_mismatch\""), "{document}");
+        assert_eq!(
+            serde_json::from_str::<SshSessionReport>(&document).unwrap(),
+            report
+        );
     }
 }
