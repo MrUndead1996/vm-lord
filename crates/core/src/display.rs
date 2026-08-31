@@ -378,6 +378,14 @@ pub enum DisplayStatusCode {
     /// The module built and would not load.
     #[serde(rename = "display-payload-module-not-loaded")]
     PayloadModuleNotLoaded,
+    /// The module built and the kernel refused its signature.
+    ///
+    /// Distinct from [`Self::PayloadModuleNotLoaded`] because the fix is a
+    /// different one and lives outside VMLord: the guest's certificate has to
+    /// be enrolled as a MOK. A build that broke and an enrollment nobody
+    /// performed read identically otherwise.
+    #[serde(rename = "display-payload-module-signature-rejected")]
+    PayloadModuleSignatureRejected,
     /// The module loaded and no display device appeared.
     #[serde(rename = "display-payload-no-device")]
     PayloadNoDevice,
@@ -412,6 +420,7 @@ impl DisplayStatusCode {
             Self::PayloadDependenciesFailed => "display-payload-dependencies-failed",
             Self::PayloadBuildFailed => "display-payload-build-failed",
             Self::PayloadModuleNotLoaded => "display-payload-module-not-loaded",
+            Self::PayloadModuleSignatureRejected => "display-payload-module-signature-rejected",
             Self::PayloadNoDevice => "display-payload-no-device",
             Self::PayloadUpdateRolledBack => "display-payload-update-rolled-back",
             Self::PayloadUpdateRebootRequired => "display-payload-update-reboot-required",
@@ -449,6 +458,18 @@ impl std::fmt::Display for DisplayStatusCode {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
     }
+}
+
+/// Whether a guest's failure text is the kernel refusing a module's signature.
+///
+/// Written out a second time from `vmlord_agent::display_recipe`, which is
+/// what produces this text: the guest crate deliberately depends on no host
+/// crate, so the two phrases live in both. Change one and change the other.
+#[must_use]
+pub fn was_rejected_for_its_signature(text: &str) -> bool {
+    ["Key was rejected by service", "Required key not available"]
+        .iter()
+        .any(|phrase| text.contains(phrase))
 }
 
 /// The name the display payload share is offered and mounted under.
@@ -837,4 +858,35 @@ mod tests {
             assert_eq!(stored, format!("\"{}\"", code.as_str()));
         }
     }
+
+    #[test]
+    fn a_module_the_kernel_refused_has_a_code_of_its_own() {
+        let code = DisplayStatusCode::PayloadModuleSignatureRejected;
+
+        assert_eq!(code.as_str(), "display-payload-module-signature-rejected");
+        assert_eq!(
+            serde_json::to_string(&code).unwrap(),
+            "\"display-payload-module-signature-rejected\""
+        );
+        assert_ne!(code, DisplayStatusCode::PayloadModuleNotLoaded);
+    }
+
+    #[test]
+    fn no_number_of_retries_enrolls_a_certificate() {
+        assert!(!DisplayStatusCode::PayloadModuleSignatureRejected.is_retryable());
+    }
+
+    #[test]
+    fn the_host_reads_the_same_refusal_the_guest_wrote_down() {
+        assert!(was_rejected_for_its_signature(
+            "the guest's display recipe stopped at ModuleLoad: modprobe vmlord_drm \
+             exited with 1: modprobe: ERROR: could not insert 'vmlord_drm': \
+             Key was rejected by service"
+        ));
+        assert!(was_rejected_for_its_signature("Required key not available"));
+        assert!(!was_rejected_for_its_signature(
+            "modprobe: ERROR: could not insert 'vmlord_drm': Invalid argument"
+        ));
+    }
+
 }
