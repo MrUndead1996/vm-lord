@@ -211,10 +211,8 @@ fn payload_stage(report: &mut Report, guest: &GuestFacts) -> Result<DkmsPackage,
         return Err(reason);
     }
 
-    let target = parse_payload_target(&sources).map_err(|error| {
-        report.failed(GpuRecipeStep::Payload, error.clone());
-        error
-    })?;
+    let target = parse_payload_target(&sources)
+        .inspect_err(|error| report.failed(GpuRecipeStep::Payload, error.clone()))?;
     let note = match applicability(&target, guest) {
         Applicability::NotApplicable(reason) => {
             report.skipped(GpuRecipeStep::Payload, reason.clone());
@@ -472,11 +470,8 @@ struct Userspace {
 
 /// Installs or stages the Mesa the payload's policy calls for.
 fn userspace_stage(report: &mut Report, guest: &GuestFacts) -> Result<Userspace, String> {
-    let policy =
-        parse_mesa_policy(&read(&Path::new(PAYLOAD).join("sources.json"))).map_err(|error| {
-            report.failed(GpuRecipeStep::Userspace, error.clone());
-            error
-        })?;
+    let policy = parse_mesa_policy(&read(&Path::new(PAYLOAD).join("sources.json")))
+        .inspect_err(|error| report.failed(GpuRecipeStep::Userspace, error.clone()))?;
     let Some(triplet) = library_triplet(&guest.architecture) else {
         let reason = format!(
             "vmlord-agent has no library path for architecture {}",

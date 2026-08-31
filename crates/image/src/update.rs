@@ -564,7 +564,7 @@ mod tests {
             for response in responses {
                 let (mut connection, _) = listener.accept().unwrap();
                 let mut request = [0u8; 4096];
-                connection.read(&mut request).unwrap();
+                let _request = connection.read(&mut request).unwrap();
                 connection.write_all(&response).unwrap();
                 connection.flush().unwrap();
             }

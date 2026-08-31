@@ -24,11 +24,10 @@ pub enum PayloadError {
         expected: u64,
         actual: u64,
     },
-    DigestMismatch {
-        subject: String,
-        expected: Sha256Digest,
-        actual: Sha256Digest,
-    },
+    /// Boxed, because it is the one variant wide enough to set the size of
+    /// every `Result<_, PayloadError>` in the crate: a subject and two
+    /// `Sha256Digest`s are 136 bytes, against 80 for the next widest.
+    DigestMismatch(Box<DigestMismatch>),
     UnsafeArchive(String),
     LimitExceeded {
         subject: &'static str,
@@ -60,6 +59,26 @@ impl PayloadError {
             source,
         }
     }
+
+    /// A digest that did not match, named by what was hashed.
+    ///
+    /// The detail lives behind a box; this is what spares every caller from
+    /// writing that out.
+    pub fn digest_mismatch(subject: String, expected: Sha256Digest, actual: Sha256Digest) -> Self {
+        Self::DigestMismatch(Box::new(DigestMismatch {
+            subject,
+            expected,
+            actual,
+        }))
+    }
+}
+
+/// What did not match, for [`PayloadError::DigestMismatch`].
+#[derive(Debug)]
+pub struct DigestMismatch {
+    pub subject: String,
+    pub expected: Sha256Digest,
+    pub actual: Sha256Digest,
 }
 
 impl fmt::Display for PayloadError {
@@ -91,13 +110,10 @@ impl fmt::Display for PayloadError {
                 formatter,
                 "archive size mismatch: expected {expected}, got {actual}"
             ),
-            Self::DigestMismatch {
-                subject,
-                expected,
-                actual,
-            } => write!(
+            Self::DigestMismatch(mismatch) => write!(
                 formatter,
-                "digest mismatch for {subject}: expected {expected}, got {actual}"
+                "digest mismatch for {}: expected {}, got {}",
+                mismatch.subject, mismatch.expected, mismatch.actual
             ),
             Self::LimitExceeded {
                 subject,

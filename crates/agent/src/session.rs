@@ -29,6 +29,10 @@ const FIRST_HEARTBEAT_REQUEST_ID: u32 = HELLO_REQUEST_ID + 1;
 /// manifest, and one on a headless VM is asked for no display payload.
 const AGENT_CAPABILITIES: &[Capability] = &[Capability::Gpu, Capability::Display];
 
+/// Mounts a GPU share manifest: the mounts it made, and whether the guest's
+/// library paths were refreshed along the way.
+pub type AttachGpu<'a> = &'a mut dyn FnMut(&[GpuShare]) -> (Vec<GpuMount>, bool);
+
 /// What the host may ask this agent to carry out.
 ///
 /// A struct rather than six parameters: they are parameters at all because the
@@ -38,7 +42,7 @@ const AGENT_CAPABILITIES: &[Capability] = &[Capability::Gpu, Capability::Display
 /// row is a call nobody can read.
 pub struct Handlers<'a> {
     /// Carries out a GPU share manifest.
-    pub attach_gpu: &'a mut dyn FnMut(&[GpuShare]) -> (Vec<GpuMount>, bool),
+    pub attach_gpu: AttachGpu<'a>,
     /// Runs the guest's GPU recipe.
     pub apply_gpu_recipe: &'a mut dyn FnMut() -> Vec<GpuRecipeStage>,
     /// Looks at whether any of it renders.
@@ -466,7 +470,7 @@ mod tests {
         },
     };
 
-    use super::{Handlers, make_display_update_compatible, run};
+    use super::{AttachGpu, Handlers, make_display_update_compatible, run};
 
     #[test]
     fn revision_seven_receives_only_the_update_answer_it_can_name() {
@@ -533,7 +537,7 @@ mod tests {
     /// answers immediately, because none of what they stand for can happen
     /// under a `cargo test`.
     fn handlers<'a>(
-        attach_gpu: &'a mut dyn FnMut(&[GpuShare]) -> (Vec<GpuMount>, bool),
+        attach_gpu: AttachGpu<'a>,
         apply_gpu_recipe: &'a mut dyn FnMut() -> Vec<GpuRecipeStage>,
         probe_gpu: &'a mut dyn FnMut() -> ProbeGpuResponse,
         attach_display: &'a mut dyn FnMut(&DisplayShare) -> DisplayMount,

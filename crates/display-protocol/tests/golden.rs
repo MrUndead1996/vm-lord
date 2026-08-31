@@ -129,8 +129,8 @@ fn one_record_of_each_carrying_type_is_the_bytes_it_has_always_been() {
         0,
         0,
         SetAvailableModes {
-            modes: vec![timing.clone()],
-            preferred: Some(timing.clone()),
+            modes: vec![timing],
+            preferred: Some(timing),
         }
         .encode_to_vec(),
     );

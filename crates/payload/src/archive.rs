@@ -54,11 +54,11 @@ pub fn extract<E: PayloadEntry>(
     let payload_bytes = read_payload_manifest(&mut zip, payload_index)?;
     let actual = Sha256Digest::hash_reader(payload_bytes.as_slice())?;
     if actual != *entry.payload_manifest_sha256() {
-        return Err(PayloadError::DigestMismatch {
-            subject: "payload.json".into(),
-            expected: entry.payload_manifest_sha256().clone(),
+        return Err(PayloadError::digest_mismatch(
+            "payload.json".into(),
+            entry.payload_manifest_sha256().clone(),
             actual,
-        });
+        ));
     }
     let manifest = entry.parse_manifest(&payload_bytes)?;
     validate_manifest_limits::<E>(&manifest, entry)?;
@@ -448,11 +448,11 @@ fn stream_member(
         .map_err(|error| PayloadError::io("flush extracted file", target.into(), error))?;
     let actual = Sha256Digest::from_bytes(hash.finalize().into())?;
     if actual != *expected_digest {
-        return Err(PayloadError::DigestMismatch {
-            subject: name.into(),
-            expected: expected_digest.clone(),
+        return Err(PayloadError::digest_mismatch(
+            name.into(),
+            expected_digest.clone(),
             actual,
-        });
+        ));
     }
     Ok(())
 }
@@ -1014,7 +1014,7 @@ mod tests {
                 &|_| {},
                 &AtomicBool::new(false)
             ),
-            Err(PayloadError::DigestMismatch { .. })
+            Err(PayloadError::DigestMismatch(_))
         ));
 
         let wrong_size_payload =

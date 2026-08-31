@@ -285,6 +285,11 @@ impl DistroCatalog {
         self.profiles.len()
     }
 
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.profiles.is_empty()
+    }
+
     pub fn select(&self, id: &str) -> Result<&DistroProfile, DistroCatalogError> {
         self.profiles
             .get(id)

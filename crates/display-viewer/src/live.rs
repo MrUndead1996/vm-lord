@@ -897,10 +897,7 @@ mod tests {
     }
 
     /// A live session with both channels bound, and the guest ends back.
-    fn established() -> (
-        Live<Duplex, Box<dyn FnMut(Channel) -> Result<Duplex, String>>>,
-        Harness,
-    ) {
+    fn established() -> Started {
         let (mut live, mut harness) = start(Instant::now());
         let mut signals = Vec::new();
 

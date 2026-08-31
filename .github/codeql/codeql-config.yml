@@ -1,0 +1,23 @@
+# What CodeQL is asked to look at.
+#
+# Two rules -- hard-coded cryptographic values and cleartext logging -- account
+# for 26 of the 28 open alerts in this tree, and every one of the 26 is inside a
+# test: fixture passwords such as `Password::new("hunter2")`, the golden vector
+# whose own comment says the key is nobody's, and an `assert!` message that
+# prints the document a test has just checked for secrets. A test's password has
+# to be written down for the test to test anything, so there is nothing to fix
+# in any of them. Left open they are not harmless: the next real finding arrives
+# in a list of 26 that nobody reads.
+#
+# So the filter is on the code, not on the rules. Both rules keep their full
+# reach over everything that ships. Two things are taken out of their way:
+#
+#   - `#[cfg(test)]` modules, which live in the same files as the code they
+#     test and so cannot be excluded by path. The `Security` workflow turns the
+#     `test` cfg off during extraction, which drops them.
+#   - the integration test directories, excluded below. Those are whole files,
+#     which is what a path filter can express.
+name: VMLord
+
+paths-ignore:
+  - crates/*/tests

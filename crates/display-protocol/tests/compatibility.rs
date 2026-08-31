@@ -75,8 +75,8 @@ fn display_timings_and_mode_updates_survive_the_wire() {
         refresh_hz: 144,
     };
     let available = SetAvailableModes {
-        modes: vec![timing.clone()],
-        preferred: Some(timing.clone()),
+        modes: vec![timing],
+        preferred: Some(timing),
     };
     let selected = SetDisplayMode { mode: Some(timing) };
 

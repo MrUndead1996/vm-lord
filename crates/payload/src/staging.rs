@@ -214,10 +214,12 @@ pub(crate) fn stage_with<E: PayloadEntry>(
     ensure_generation(
         payload,
         &expected,
-        &generation,
-        &generations_root,
-        &marker,
-        &ready_root,
+        GenerationPaths {
+            generation: &generation,
+            generations_root: &generations_root,
+            marker: &marker,
+            ready_root: &ready_root,
+        },
         hard_link,
         progress,
         cancel,
@@ -234,18 +236,31 @@ pub(crate) fn stage_with<E: PayloadEntry>(
     })
 }
 
+/// Where one generation lives: the directory it is published as, the root
+/// that holds every generation, and the ready marker with the root it sits in.
+#[derive(Clone, Copy)]
+struct GenerationPaths<'a> {
+    generation: &'a Path,
+    generations_root: &'a Path,
+    marker: &'a Path,
+    ready_root: &'a Path,
+}
+
 fn ensure_generation<E: PayloadEntry>(
     payload: &ReadyPayload<E>,
     expected: &[ExpectedFile],
-    generation: &Path,
-    generations_root: &Path,
-    marker: &Path,
-    ready_root: &Path,
+    paths: GenerationPaths<'_>,
     hard_link: &dyn Fn(&Path, &Path) -> io::Result<()>,
     progress: &dyn Fn(PayloadProgress),
     cancel: &AtomicBool,
     quarantines: &mut Vec<OperationPath>,
 ) -> Result<(), PayloadError> {
+    let GenerationPaths {
+        generation,
+        generations_root,
+        marker,
+        ready_root,
+    } = paths;
     'prepare: loop {
         match verify_generation(expected, generation, cancel) {
             Ok(()) => return Ok(()),
@@ -510,11 +525,11 @@ fn verify_staged_file(
         .map_err(|error| PayloadError::io("open staged GPU payload file", path.into(), error))?;
     let actual = hash_reader(&mut file, path, cancel)?;
     if actual != *expected_digest {
-        return Err(PayloadError::DigestMismatch {
-            subject: format!("staged {}", relative.display()),
-            expected: expected_digest.clone(),
+        return Err(PayloadError::digest_mismatch(
+            format!("staged {}", relative.display()),
+            expected_digest.clone(),
             actual,
-        });
+        ));
     }
     Ok(())
 }
@@ -1526,7 +1541,7 @@ mod tests {
 
         let result = fixture.stage_with_copy();
 
-        assert!(matches!(result, Err(PayloadError::DigestMismatch { .. })));
+        assert!(matches!(result, Err(PayloadError::DigestMismatch(_))));
         fixture.assert_generation_matches();
         assert_matching_marker(&fixture);
     }
