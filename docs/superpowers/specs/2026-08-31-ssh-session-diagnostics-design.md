@@ -99,10 +99,13 @@ in the diagnostics panel.
 
 Lifetimes are deliberate and dull: the helper deletes the log, VMLord deletes
 the report. The one file that can be orphaned is a report written after the
-VMLord that was waiting for it has exited; the `ssh-sessions` directory is
-emptied when the repository opens and when the VM is deleted -- including a
-delete with `delete_disks = false`, beside `keys/` and `known_hosts` -- so an
-orphan survives at most until the next run.
+VMLord that was waiting for it has exited. A launch sweeps the VM's
+`ssh-sessions` directory before it starts, removing every file that does not
+belong to a session in the registry -- the sessions this VMLord is still
+waiting for are exactly the ones it keeps -- so an orphan survives at most
+until the next session into that VM. The directory also goes with the VM when
+it is deleted, including a delete with `delete_disks = false`, beside `keys/`
+and `known_hosts`.
 
 ## Classification
 
