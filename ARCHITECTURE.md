@@ -1451,8 +1451,19 @@ The edit workflow follows these rules:
   rather than offering a change the backend will refuse.
 * Network mode accepts `None` and `Nat`; `External` and `Internal` are rejected
   with a message naming the task that will add them.
-* Disk size is read-only in the current backend contract and requires recreating
-  the VM to change.
+* The system disk may only grow, and only while the VM is stopped. The size is
+  the one part of an edit that changes a file rather than a document: the VHDX
+  is resized there and then, through `ResizeVirtualDisk`, so nothing about it
+  waits for the next start. Shrinking is refused because it would cut the disk
+  off underneath a filesystem that still believes in the old size, and a
+  running VM is refused because Hyper-V holds its VHDX open exclusively. The
+  new size is recorded in the mapping, which is what the summary reads back
+  once the VM is running and its disk can no longer be opened. The guest grows
+  its root filesystem onto the new space on its next boot, through the
+  `growpart`/`resize_rootfs` cloud-init already seeds every cloud-image VM
+  with; a guest installed from local media is left to its own tools.
+  The UI opens the field on the size the VM has, refuses to be dragged below
+  it, and is disabled with the reason while the VM is not stopped.
 * The VM name is treated as the guest hostname and also requires recreating the
   VM to change safely from VMLord.
 

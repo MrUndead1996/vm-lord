@@ -528,6 +528,9 @@ fn a_mode_changes_only_under_a_stopped_vm_and_applies_at_the_next_start() {
     let while_running = repository.update_vm(VmUpdateRequest {
         name: name.into(),
         ram_mb: 4096,
+        // The size the VM was built with: this test moves the GPU mode, and a
+        // disk field that disagreed would ask for a resize as well.
+        disk_gb: 16,
         cpu_cores: 2,
         gpu_mode: GpuMode::Default,
         network_mode: NetworkMode::None,
@@ -541,6 +544,7 @@ fn a_mode_changes_only_under_a_stopped_vm_and_applies_at_the_next_start() {
     let while_stopped = repository.update_vm(VmUpdateRequest {
         name: name.into(),
         ram_mb: 4096,
+        disk_gb: 16,
         cpu_cores: 2,
         gpu_mode: GpuMode::Default,
         network_mode: NetworkMode::None,

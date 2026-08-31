@@ -245,6 +245,14 @@ impl SettingsForm {
 struct EditVmForm {
     name: String,
     ram_mb: u32,
+    /// The size the system disk is being edited to, in GiB.
+    disk_gb: u32,
+    /// The size the disk had when the form opened.
+    ///
+    /// Kept beside the edited value because a disk only grows: it is the floor
+    /// the field may not be dragged below, and the edited value has already
+    /// moved away from it by the time anything asks.
+    stored_disk_gb: u32,
     cpu_cores: u32,
     gpu_mode: GpuMode,
     network_mode: NetworkMode,
@@ -270,6 +278,8 @@ impl EditVmForm {
         Self {
             name: vm.name.clone(),
             ram_mb: vm.ram_mb,
+            disk_gb: vm.disk_gb,
+            stored_disk_gb: vm.disk_gb,
             cpu_cores: vm.cpu_cores,
             gpu_mode: vm.gpu_mode,
             network_mode: vm.network_mode,
@@ -1382,6 +1392,29 @@ fn render_edit_vm_dialog(
                     });
                     ui.end_row();
 
+                    ui.label(t!("create_vm.hdd_size").to_string());
+                    let disk_locked = disk_size_locked(&form.state);
+                    ui.add_enabled_ui(disk_locked.is_none(), |ui| {
+                        ui.horizontal(|ui| {
+                            // The range starts at the size the VM has: a disk
+                            // only grows, and a field that can be dragged into
+                            // a refusal is a field that lies.
+                            let size = ui.add(
+                                egui::DragValue::new(&mut form.disk_gb)
+                                    .range(form.stored_disk_gb..=16_384),
+                            );
+                            if let Some(reason) = &disk_locked {
+                                size.on_disabled_hover_text(reason.clone());
+                            }
+                            ui.label("GiB");
+                        });
+                    });
+                    ui.end_row();
+
+                    ui.label("");
+                    ui.small(t!("edit_vm.disk_note").to_string());
+                    ui.end_row();
+
                     ui.label(t!("create_vm.cpu_cores").to_string());
                     ui.add(egui::DragValue::new(&mut form.cpu_cores).range(1..=256));
                     ui.end_row();
@@ -1666,6 +1699,7 @@ fn edit_vm_request(form: &EditVmForm) -> Result<VmUpdateRequest, String> {
     Ok(VmUpdateRequest {
         name: form.name.clone(),
         ram_mb: form.ram_mb,
+        disk_gb: form.disk_gb,
         cpu_cores: form.cpu_cores,
         gpu_mode: form.gpu_mode,
         network_mode: form.network_mode,
@@ -1774,6 +1808,18 @@ fn gpu_mode_locked(state: &VmState) -> Option<String> {
     match state {
         VmState::Stopped => None,
         _ => Some(t!("actions.gpu_mode_locked").to_string()),
+    }
+}
+
+/// Why the disk cannot be grown right now, when it cannot.
+///
+/// Unlike RAM and CPU, the disk is not a stored setting a later start reads:
+/// the VHDX itself is resized, and Hyper-V holds a running VM's disk open
+/// exclusively, so only a stopped VM has a disk anything may do to it.
+fn disk_size_locked(state: &VmState) -> Option<String> {
+    match state {
+        VmState::Stopped => None,
+        _ => Some(t!("actions.disk_size_locked").to_string()),
     }
 }
 
@@ -3789,6 +3835,8 @@ mod tests {
         EditVmForm {
             name: "dev".into(),
             ram_mb: 2048,
+            disk_gb: 20,
+            stored_disk_gb: 20,
             cpu_cores: 2,
             gpu_mode: GpuMode::Default,
             network_mode: NetworkMode::Nat,
@@ -4040,6 +4088,8 @@ mod tests {
         let request = edit_vm_request(&EditVmForm {
             name: "dev".into(),
             ram_mb: 8192,
+            disk_gb: 20,
+            stored_disk_gb: 20,
             cpu_cores: 8,
             gpu_mode: GpuMode::Mirror,
             network_mode: NetworkMode::Nat,
@@ -4138,11 +4188,52 @@ mod tests {
         assert!(reason.contains("password"), "got {reason}");
     }
 
+    /// The disk file is resized then and there, and Hyper-V holds a running
+    /// VM's VHDX open exclusively -- so the field is closed while the VM
+    /// lives, and says why before the drag rather than after the click.
+    #[test]
+    fn a_live_vm_says_why_its_disk_cannot_be_grown() {
+        let reason = disk_size_locked(&VmState::Running {
+            agent_status: AgentStatus::Online,
+        })
+        .expect("a running VM holds its own disk open");
+
+        assert!(reason.contains("Stop the VM"), "got {reason}");
+        assert_eq!(disk_size_locked(&VmState::Stopped), None);
+    }
+
+    #[test]
+    fn a_form_opens_on_the_size_the_disk_has() {
+        let form = EditVmForm::from_vm(&VmSummary {
+            disk_gb: 20,
+            ..vm_summary()
+        });
+
+        assert_eq!(form.disk_gb, 20);
+        assert_eq!(
+            form.stored_disk_gb, 20,
+            "the size it opened on is the floor the field may not go below"
+        );
+    }
+
+    #[test]
+    fn edit_vm_request_carries_the_disk_size() {
+        let request = edit_vm_request(&EditVmForm {
+            disk_gb: 40,
+            ..edit_form(None)
+        })
+        .unwrap();
+
+        assert_eq!(request.disk_gb, 40);
+    }
+
     #[test]
     fn edit_vm_request_rejects_odd_ram() {
         let error = edit_vm_request(&EditVmForm {
             name: "dev".into(),
             ram_mb: 513,
+            disk_gb: 20,
+            stored_disk_gb: 20,
             cpu_cores: 4,
             gpu_mode: GpuMode::Default,
             network_mode: NetworkMode::Nat,

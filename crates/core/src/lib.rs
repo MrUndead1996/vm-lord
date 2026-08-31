@@ -146,6 +146,18 @@ impl VmCreateRequest {
 pub struct VmUpdateRequest {
     pub name: String,
     pub ram_mb: u32,
+    /// The size the VM's system disk is to have, in GiB.
+    ///
+    /// Growth alone: the disk file itself is resized, so a smaller size would
+    /// cut the guest's filesystem off and is refused. A size equal to the
+    /// stored one asks for nothing and changes nothing -- an edit form submits
+    /// every field it shows, including the ones nobody touched.
+    ///
+    /// Unlike RAM and CPU, this one is not a document a later start reads: the
+    /// VHDX changes there and then, which is why it is applied to a stopped VM
+    /// or refused. The guest grows its root filesystem onto the new space on
+    /// its next boot, through the `growpart` cloud-init already seeds it with.
+    pub disk_gb: u32,
     pub cpu_cores: u32,
     pub gpu_mode: GpuMode,
     pub network_mode: NetworkMode,

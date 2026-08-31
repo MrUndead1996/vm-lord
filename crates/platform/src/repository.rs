@@ -1187,6 +1187,28 @@ fn record_gpu_mode(
     Ok(())
 }
 
+/// Records the size a VM's disk has just been grown to.
+///
+/// The mapping is what `disk_gb` answers from, and the VHDX cannot be read
+/// again once the VM starts, so a growth that is not recorded here would show
+/// as the old size for as long as the VM runs.
+fn record_disk_size(
+    store: &MetadataStore,
+    mapping: &VmComputeSystemMapping,
+    disk_gb: u32,
+) -> Result<(), RepositoryError> {
+    store.insert(VmComputeSystemMapping {
+        disk_gb,
+        ..mapping.clone()
+    })?;
+    tracing::info!(
+        "the disk of VM \"{}\" ({}) is now {disk_gb} GiB",
+        mapping.vm_name,
+        mapping.vm_id
+    );
+    Ok(())
+}
+
 /// Refuses a GPU mode change under a VM that is not stopped.
 ///
 /// The mode is applied while the compute system is prepared and started, so a
@@ -1214,6 +1236,48 @@ fn refuse_gpu_mode_change(
     ));
     tracing::error!("{error}");
     Err(error)
+}
+
+/// The size a disk is to be grown to, in bytes, or `None` when it keeps the
+/// size it has.
+///
+/// Growth alone, and only under a stopped VM. Shrinking would cut a disk off
+/// underneath a filesystem that still believes in the old size, and Hyper-V
+/// holds a running VM's VHDX open exclusively, so neither can be honoured.
+/// Unlike RAM and CPU, this is not a document a later start reads: the file
+/// itself changes, which is why the VM has to be stopped for it.
+///
+/// `stored` is the size the metadata store recorded, which is `0` for a VM
+/// whose size was never read; the disk's own header is what finally decides,
+/// and [`vhd::expand_vhdx`] refuses anything that is not growth against it.
+///
+/// `live` is how the VM is live, or `None` for one that is not.
+fn disk_growth(
+    vm_name: &str,
+    requested_gb: u32,
+    stored_gb: u32,
+    live: Option<&str>,
+) -> Result<Option<u64>, RepositoryError> {
+    if requested_gb == stored_gb {
+        return Ok(None);
+    }
+    if requested_gb < stored_gb {
+        let error = RepositoryError::new(format!(
+            "the disk of VM \"{vm_name}\" is {stored_gb} GiB and cannot be resized to \
+             {requested_gb} GiB: a disk may only grow"
+        ));
+        tracing::error!("{error}");
+        return Err(error);
+    }
+    if let Some(description) = live {
+        let error = RepositoryError::new(format!(
+            "VM \"{vm_name}\" is {description}; stop it before growing its disk"
+        ));
+        tracing::error!("{error}");
+        return Err(error);
+    }
+
+    Ok(Some(u64::from(requested_gb) * BYTES_PER_GIB))
 }
 
 impl VmRepository for HcsVmRepository {
@@ -1376,13 +1440,38 @@ impl VmRepository for HcsVmRepository {
         self.starts.refuse_if_starting(&request.name)?;
 
         let mapping = self.mapping(&request.name)?;
+        let live = self.live_description(&mapping)?;
         refuse_gpu_mode_change(
             &mapping.vm_name,
             request.gpu_mode,
             mapping.gpu_mode,
-            self.live_description(&mapping)?.as_deref(),
+            live.as_deref(),
+        )?;
+        let growth = disk_growth(
+            &mapping.vm_name,
+            request.disk_gb,
+            mapping.disk_gb,
+            live.as_deref(),
         )?;
         hcs_config::ensure_supported_network_mode(request.network_mode)?;
+
+        // The disk is the one part of an edit that changes a file rather than
+        // a document, so it goes after everything that can still be refused
+        // cheaply. The local mapping moves with it: what is recorded below
+        // writes the whole mapping back, and a stale size there would undo the
+        // growth that just happened.
+        let mapping = match growth {
+            Some(size_bytes) => {
+                let directory = layout::vm_directory(&self.storage_root, &request.name)?;
+                vhd::expand_vhdx(&layout::system_disk_path(&directory), size_bytes)?;
+                record_disk_size(&self.store, &mapping, request.disk_gb)?;
+                VmComputeSystemMapping {
+                    disk_gb: request.disk_gb,
+                    ..mapping
+                }
+            }
+            None => mapping,
+        };
 
         let document = self.read_configuration(&mapping.vm_name)?;
         let updated = hcs_config::apply_topology(
@@ -1999,9 +2088,9 @@ mod tests {
     };
 
     use super::{
-        GpuAssignment, HcsSystemState, HcsVmRepository, OS_TYPE, guest_ip, launch_running_consoles,
-        merge_with_builds, record_gpu_mode, record_network_mode, refuse_gpu_mode_change,
-        report_console_failures,
+        BYTES_PER_GIB, GpuAssignment, HcsSystemState, HcsVmRepository, OS_TYPE, disk_growth,
+        guest_ip, launch_running_consoles, merge_with_builds, record_disk_size, record_gpu_mode,
+        record_network_mode, refuse_gpu_mode_change, report_console_failures,
     };
 
     /// Installs a diagnostics sink for the duration of `body` and hands back
@@ -2253,6 +2342,7 @@ mod tests {
         VmUpdateRequest {
             name: "dev".into(),
             ram_mb: 2048,
+            disk_gb: 20,
             cpu_cores: 2,
             gpu_mode: GpuMode::None,
             network_mode: NetworkMode::None,
@@ -3321,6 +3411,58 @@ mod tests {
     fn a_running_vm_may_still_be_edited_as_long_as_its_gpu_mode_stands() {
         refuse_gpu_mode_change("dev", GpuMode::Mirror, GpuMode::Mirror, Some("running"))
             .expect("only the GPU mode is frozen while a VM runs, not the whole form");
+    }
+
+    #[test]
+    fn a_grown_disk_is_recorded_in_the_mapping() {
+        let (root, store) = temp_store("disk-grown");
+        let mapping = mapping(NetworkMode::None);
+        store.insert(mapping.clone()).unwrap();
+
+        record_disk_size(&store, &mapping, 40).unwrap();
+
+        let stored = store.find_by_vm_name("dev").unwrap().unwrap();
+        assert_eq!(stored.disk_gb, 40);
+        // Nothing else about the VM may move with its disk.
+        assert_eq!(stored.vm_id, mapping.vm_id);
+        assert_eq!(stored.network_mode, mapping.network_mode);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_disk_that_keeps_its_size_asks_for_no_growth() {
+        assert_eq!(
+            disk_growth("dev", 20, 20, Some("running")).expect("nothing is being resized"),
+            None,
+            "an edit form submits the disk field whether or not anybody touched it"
+        );
+    }
+
+    #[test]
+    fn a_stopped_vm_grows_its_disk_to_the_size_it_was_given() {
+        assert_eq!(
+            disk_growth("dev", 40, 20, None).expect("a stopped VM may grow its disk"),
+            Some(40 * BYTES_PER_GIB)
+        );
+    }
+
+    #[test]
+    fn a_running_vm_may_not_grow_its_disk() {
+        let error = disk_growth("dev", 40, 20, Some("running"))
+            .expect_err("Hyper-V holds a running VM's VHDX open exclusively");
+
+        assert!(
+            error.to_string().contains("stop it"),
+            "the refusal has to say what to do about it: {error}"
+        );
+    }
+
+    #[test]
+    fn a_disk_may_not_be_made_smaller() {
+        let error = disk_growth("dev", 10, 20, None)
+            .expect_err("cutting a disk off under its filesystem destroys it");
+
+        assert!(error.to_string().contains("grow"), "{error}");
     }
 
     #[test]
