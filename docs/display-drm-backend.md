@@ -105,9 +105,10 @@ Consequences for the module's design:
   on top of a VMLord VM, and the headers are already present in guests
   that got the desktop.
 - VMLord VMs boot with **Secure Boot disabled** and kernel lockdown
-  `[none]`, so an unsigned DKMS module loads. If Secure Boot is ever turned
-  on for VMLord VMs, the module needs a MOK-enrolled signature and this
-  decision needs revisiting.
+  `[none]`. The module is signed with the guest's own MOK -- see the
+  [module signing design](superpowers/specs/2026-08-31-display-module-signing-design.md)
+  -- so what an enabled Secure Boot still needs is the enrollment of that
+  certificate, which no VMLord VM can perform today.
 - `simpledrm` is builtin (`CONFIG_DRM_SIMPLEDRM=y`), so blacklisting it is
   a no-op; it has to be unbound from `simple-framebuffer` by a unit, the
   way `asb_drm`'s deploy does.

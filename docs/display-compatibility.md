@@ -46,8 +46,9 @@ the supported product boundary and the source revision that passed the gate.
 
 - GNOME on Wayland is the supported compositor/session. Xorg and other desktop
   environments are not in the compatibility matrix.
-- Secure Boot must be disabled. The guest DRM module is installed through DKMS
-  and is not signed for Secure Boot; signing is tracked separately.
+- Secure Boot must be disabled. The guest DRM module is signed with the guest's
+  own MOK, but nothing can enroll that certificate: MokManager needs a firmware
+  console, and VMLord's VMs have none.
 - The first desktop provisioning and DKMS build need guest access to Ubuntu's
   package repositories. After a successful installation, display frames and
   input use HvSocket and do not depend on the VM's IP network.

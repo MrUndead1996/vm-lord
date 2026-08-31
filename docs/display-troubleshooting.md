@@ -37,6 +37,7 @@ The corresponding stable status codes are `display-profile-headless`,
 | `display-payload-dependencies-failed` | Ubuntu could not install DKMS, build tools, or kernel headers. | Restore guest network/DNS access and verify `apt` can reach Ubuntu repositories. |
 | `display-payload-build-failed` | DKMS could not compile the module for the running kernel. | Inspect `dkms status`, the DKMS build log, and installed `linux-headers-$(uname -r)`. |
 | `display-payload-module-not-loaded` | The built module did not load. | Inspect `dmesg`; confirm Secure Boot and kernel lockdown are disabled. |
+| `display-payload-module-signature-rejected` | The module built and the kernel refused its signature. | Enroll the VM's certificate: it is written to `display/mok.der` beside the VM's state, and `mokutil --import` stages it for MokManager on the next boot. |
 | `display-payload-no-device` | `vmlord_drm` loaded but no usable DRM card appeared. | Inspect `dmesg`, `ls -l /dev/dri`, and the broker journal. |
 | `display-payload-update-rolled-back` | The update failed but the previous version was restored. | Keep using the VM and preserve both update and DKMS logs for the failed version. |
 | `display-payload-update-failed` | Neither the new nor previous payload became usable. | Repair dependencies/module loading, then retry with a known-good release payload. |
@@ -101,10 +102,22 @@ a running VM.
   the active graphical session on `seat0`, so a second user signed in over SSH
   cannot take it. The broker's journal names the uid it refused.
 
-## Secure Boot and networking
+## Secure Boot
 
-The MVP module is unsigned. With Secure Boot enabled, the kernel can reject it
-even when DKMS built successfully; disable Secure Boot for the VM. The display
-session itself uses HvSocket rather than TCP/IP, but first provisioning,
+The module is signed. Each guest generates its own MOK at
+`/var/lib/shim-signed/mok/`, DKMS signs every build with it -- including the
+rebuilds an unattended kernel upgrade triggers, with VMLord closed -- and
+VMLord copies the certificate to `display/mok.der` beside the VM's state.
+
+What is not done is the enrollment. `MokList` is written by MokManager alone,
+from the firmware console, and VMLord's VMs have none: they are created
+straight through HCS and do not appear in Hyper-V Manager. Secure Boot must
+therefore stay off for a VMLord VM. With it on and the certificate not
+enrolled, the display is `Degraded` with
+`display-payload-module-signature-rejected`, and the VM itself keeps running.
+
+## Networking
+
+The display session uses HvSocket rather than TCP/IP, but first provisioning,
 dependency repair, and some kernel updates still require guest network access
 to Ubuntu repositories.
