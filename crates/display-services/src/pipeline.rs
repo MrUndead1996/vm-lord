@@ -18,7 +18,7 @@ use vmlord_display_codec::{
     PixelFormat,
 };
 use vmlord_display_protocol::{
-    record::{self, Channel, Limits, Record, RecordError},
+    record::{self, Channel, Header, Limits, RecordError},
     v1::{self, FrameRecord, StreamConfig},
 };
 
@@ -61,9 +61,11 @@ impl From<RecordError> for PipelineError {
 
 /// A cursor the peer will not be sent, held to be drawn into the frame.
 struct DrawnCursor {
-    /// The bitmap, four bytes per pixel.
-    pixels: Vec<u32>,
-    /// Its width, which is what turns an index into a row.
+    /// The bitmap, four bytes per pixel, exactly as the plane carried it.
+    /// Bytes rather than words because that is what the frame is: a bitmap
+    /// converted on arrival would have to be converted back to be composited.
+    pixels: Vec<u8>,
+    /// Its width in pixels, which is what turns an index into a row.
     width: u32,
     /// Where it lands, already cropped to the frame.
     placement: Placement,
@@ -89,7 +91,7 @@ pub struct Pipeline {
     drawn_cursor: Option<DrawnCursor>,
     /// The composite's scratch frame, kept so a running stream allocates
     /// nothing per frame.
-    composite: Vec<u32>,
+    composite: Vec<u8>,
 }
 
 impl Pipeline {
@@ -153,38 +155,28 @@ impl Pipeline {
             return frame.read(|pixels| self.encoder.submit(Frame { pixels, stride }, None));
         };
 
-        // The composite needs words rather than bytes, and it must not write
-        // the captured buffer: it is a read-only mapping of the guest's own
-        // scanout.
-        let words = stride / 4 * frame.height as usize;
+        // The frame is copied because it must not be written: it is a
+        // read-only mapping of the guest's own scanout. One copy of the bytes
+        // as they are, and then a pointer's worth of blending over it -- the
+        // composite is the size of the cursor, not of the frame.
+        let length = stride * frame.height as usize;
         self.composite.clear();
-        self.composite.reserve(words);
         frame.read(|pixels| {
-            self.composite.extend(
-                pixels
-                    .chunks_exact(4)
-                    .take(words)
-                    .map(|word| u32::from_ne_bytes([word[0], word[1], word[2], word[3]])),
-            );
+            self.composite
+                .extend_from_slice(&pixels[..length.min(pixels.len())]);
         });
 
         cursor::composite(
             &mut self.composite,
-            frame.stride / 4,
+            frame.stride,
             &cursor.pixels,
             cursor.width,
             &cursor.placement,
         );
 
-        let bytes: Vec<u8> = self
-            .composite
-            .iter()
-            .flat_map(|word| word.to_ne_bytes())
-            .collect();
-
         self.encoder.submit(
             Frame {
-                pixels: &bytes,
+                pixels: &self.composite,
                 stride,
             },
             None,
@@ -229,14 +221,17 @@ impl Pipeline {
 
         match image {
             Some((pixels, width, _height)) => {
-                self.drawn_cursor = Some(DrawnCursor {
-                    pixels: pixels
-                        .chunks_exact(4)
-                        .map(|word| u32::from_ne_bytes([word[0], word[1], word[2], word[3]]))
-                        .collect(),
+                // Reused rather than replaced: a cursor arrives with every
+                // frame, and its bitmap is the same size every time.
+                let held = self.drawn_cursor.get_or_insert_with(|| DrawnCursor {
+                    pixels: Vec::new(),
                     width,
                     placement: *placement,
                 });
+                held.pixels.clear();
+                held.pixels.extend_from_slice(pixels);
+                held.width = width;
+                held.placement = *placement;
             }
             None => {
                 if let Some(cursor) = self.drawn_cursor.as_mut() {
@@ -281,13 +276,18 @@ impl Pipeline {
             pixel_format: wire_format(geometry.pixel_format()) as i32,
         };
 
-        self.write(
+        write_record(
             writer,
             limits,
+            self.generation,
+            self.sequence,
             FrameRecord::StreamConfig,
             0,
-            config.encode_to_vec(),
-        )
+            &config.encode_to_vec(),
+        )?;
+        self.sequence = self.sequence.wrapping_add(1);
+
+        Ok(())
     }
 
     /// Writes the next record, if the encoder has one.
@@ -308,10 +308,10 @@ impl Pipeline {
         };
 
         let (kind, is_frame, bytes) = match payload {
-            Payload::Keyframe(bytes) => (FrameRecord::Keyframe, true, bytes.to_vec()),
-            Payload::TileDelta(bytes) => (FrameRecord::TileDelta, true, bytes.to_vec()),
-            Payload::CursorImage(bytes) => (FrameRecord::CursorImage, false, bytes.to_vec()),
-            Payload::CursorPosition(bytes) => (FrameRecord::CursorPosition, false, bytes.to_vec()),
+            Payload::Keyframe(bytes) => (FrameRecord::Keyframe, true, bytes),
+            Payload::TileDelta(bytes) => (FrameRecord::TileDelta, true, bytes),
+            Payload::CursorImage(bytes) => (FrameRecord::CursorImage, false, bytes),
+            Payload::CursorPosition(bytes) => (FrameRecord::CursorPosition, false, bytes),
         };
 
         // A delta is applied to the record the peer last received, so its base
@@ -322,36 +322,44 @@ impl Pipeline {
             0
         };
         let sequence = self.sequence;
-        self.write(writer, limits, kind, base, bytes)?;
+        // Written straight out of the encoder's own buffer. A `Vec` made here
+        // would be a whole keyframe copied to reach a socket that is about to
+        // be handed the same bytes.
+        write_record(writer, limits, self.generation, sequence, kind, base, bytes)?;
+        self.sequence = self.sequence.wrapping_add(1);
         if is_frame {
             self.last_frame_sequence = sequence;
         }
 
         Ok(true)
     }
+}
 
-    /// One record, at the socket's own sequence and generation.
-    fn write<W: Write>(
-        &mut self,
-        writer: &mut W,
-        limits: &Limits,
-        kind: FrameRecord,
-        base: u32,
-        payload: Vec<u8>,
-    ) -> Result<(), PipelineError> {
-        let record = Record::new(
-            Channel::Frame,
-            kind as u16,
-            self.sequence,
-            base,
-            self.generation,
-            payload,
-        );
-        record::write(writer, &record, limits)?;
-        self.sequence = self.sequence.wrapping_add(1);
+/// Frames one payload onto the frame channel.
+///
+/// A free function rather than a method: the payload it writes is borrowed
+/// from the encoder, and the encoder is a field of the pipeline the caller
+/// would otherwise be holding mutably at the same time.
+fn write_record<W: Write>(
+    writer: &mut W,
+    limits: &Limits,
+    generation: u32,
+    sequence: u32,
+    kind: FrameRecord,
+    base: u32,
+    payload: &[u8],
+) -> Result<(), PipelineError> {
+    let header = Header::for_payload(
+        Channel::Frame,
+        kind as u16,
+        sequence,
+        base,
+        generation,
+        payload,
+    );
+    record::write_payload(writer, &header, payload, limits)?;
 
-        Ok(())
-    }
+    Ok(())
 }
 
 /// The codec's format as the wire spells it.
@@ -499,6 +507,84 @@ mod tests {
                 .iter()
                 .all(|(kind, _, _)| *kind != FrameRecord::CursorImage as u16),
             "a peer that declined the capability gets the cursor drawn into the frame instead"
+        );
+    }
+
+    #[test]
+    fn a_declined_cursor_stream_puts_the_pointer_in_the_frame_the_peer_decodes() {
+        // What the capability actually costs the peer, checked where it can be
+        // seen: the decoded frame. Every other test here reads record kinds,
+        // which a composite that silently stopped happening would still pass.
+        let limits = Limits::new(64, 64);
+        let mut pipeline = Pipeline::new(geometry(), 1, false);
+        let mut bytes = Vec::new();
+        pipeline.write_stream_config(&mut bytes, &limits).unwrap();
+
+        // Opaque red over a frame of one shade, with the alpha last, as a
+        // cursor plane carries it.
+        let cursor = [0x00u8, 0x00, 0xff, 0xff].repeat(4 * 4);
+        pipeline
+            .submit_cursor(
+                Some((&cursor, 4, 4)),
+                &crate::cursor::place(8, 8, 4, 4, 64, 64),
+            )
+            .unwrap();
+        pipeline.submit_frame(&frame(0x11)).unwrap();
+
+        bytes.clear();
+        while pipeline.write_next(&mut bytes, &limits).unwrap() {}
+
+        let mut reader = bytes.as_slice();
+        let mut payload = Vec::new();
+        let header = record::read(&mut reader, &limits, &mut payload).unwrap();
+        assert_eq!(header.message_type, FrameRecord::Keyframe as u16);
+
+        let mut decoder = vmlord_display_codec::Decoder::new(geometry());
+        decoder.apply_keyframe(&payload).unwrap();
+        let decoded = decoder.frame();
+
+        let pixel = |x: usize, y: usize| &decoded[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4];
+        assert_eq!(
+            pixel(8, 8),
+            [0x00, 0x00, 0xff, 0xff],
+            "the pointer is drawn where the plane put it"
+        );
+        assert_eq!(
+            pixel(11, 11),
+            [0x00, 0x00, 0xff, 0xff],
+            "and through to its far corner"
+        );
+        assert_eq!(
+            pixel(12, 8),
+            [0x11, 0x11, 0x11, 0x11],
+            "the pixel past its edge is the frame's own"
+        );
+        assert_eq!(pixel(0, 0), [0x11, 0x11, 0x11, 0x11]);
+    }
+
+    #[test]
+    fn a_transparent_cursor_leaves_the_frame_exactly_as_captured() {
+        // The blend's other end: a bitmap of nothing must not tint the desktop
+        // it was drawn over.
+        let limits = Limits::new(64, 64);
+        let mut drawn = Pipeline::new(geometry(), 1, false);
+        let mut streamed = Pipeline::new(geometry(), 1, true);
+        let (mut with_cursor, mut without) = (Vec::new(), Vec::new());
+
+        drawn
+            .submit_cursor(
+                Some((&[0u8; 4 * 4 * 4], 4, 4)),
+                &crate::cursor::place(8, 8, 4, 4, 64, 64),
+            )
+            .unwrap();
+        drawn.submit_frame(&frame(0x11)).unwrap();
+        streamed.submit_frame(&frame(0x11)).unwrap();
+        while drawn.write_next(&mut with_cursor, &limits).unwrap() {}
+        while streamed.write_next(&mut without, &limits).unwrap() {}
+
+        assert_eq!(
+            with_cursor, without,
+            "a fully transparent cursor changes no byte of the frame"
         );
     }
 

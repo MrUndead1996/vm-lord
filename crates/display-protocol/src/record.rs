@@ -93,6 +93,31 @@ pub struct Header {
 }
 
 impl Header {
+    /// The header for a payload, with the length and the checksum read off it.
+    ///
+    /// The arithmetic lives here rather than in a caller so that a record and a
+    /// payload written straight from a borrow cannot describe themselves
+    /// differently -- see [`write_payload`].
+    #[must_use]
+    pub fn for_payload(
+        channel: Channel,
+        message_type: u16,
+        sequence: u32,
+        base: u32,
+        generation: u32,
+        payload: &[u8],
+    ) -> Self {
+        Self {
+            channel,
+            message_type,
+            length: u32::try_from(payload.len()).unwrap_or(u32::MAX),
+            sequence,
+            base,
+            checksum: crc32c::crc32c(payload),
+            generation,
+        }
+    }
+
     /// The bytes that precede this record's payload.
     #[must_use]
     pub fn encode(&self) -> [u8; HEADER_LEN] {
@@ -310,15 +335,8 @@ impl Record {
         generation: u32,
         payload: Vec<u8>,
     ) -> Self {
-        let header = Header {
-            channel,
-            message_type,
-            length: u32::try_from(payload.len()).unwrap_or(u32::MAX),
-            sequence,
-            base,
-            checksum: crc32c::crc32c(&payload),
-            generation,
-        };
+        let header =
+            Header::for_payload(channel, message_type, sequence, base, generation, &payload);
 
         Self { header, payload }
     }
@@ -340,19 +358,44 @@ pub fn write<W: io::Write>(
     record: &Record,
     limits: &Limits,
 ) -> Result<(), RecordError> {
-    let cap = limits.for_channel(record.header.channel);
-    if record.header.length > cap {
+    write_payload(writer, &record.header, &record.payload, limits)
+}
+
+/// Writes a header and a payload it does not own.
+///
+/// What [`write`] is built on, and what a producer holding its payload inside
+/// something else calls directly: the frame channel's payloads are the
+/// encoder's own output buffer, and a `Vec` made to pass one to a socket is a
+/// whole frame copied for nothing.
+///
+/// `header` must be one [`Header::for_payload`] made from these same bytes.
+/// Nothing here re-derives the length or the checksum, so a header from another
+/// payload would be written as this one's.
+///
+/// # Errors
+///
+/// [`RecordError::TooLarge`] if the payload exceeds its channel's cap, in
+/// which case nothing is written, or [`RecordError::Io`] if the transport
+/// fails.
+pub fn write_payload<W: io::Write>(
+    writer: &mut W,
+    header: &Header,
+    payload: &[u8],
+    limits: &Limits,
+) -> Result<(), RecordError> {
+    let cap = limits.for_channel(header.channel);
+    if header.length > cap {
         return Err(RecordError::TooLarge {
-            channel: record.header.channel,
-            length: record.header.length,
+            channel: header.channel,
+            length: header.length,
             cap,
         });
     }
 
     writer
-        .write_all(&record.header.encode())
+        .write_all(&header.encode())
         .map_err(RecordError::Io)?;
-    writer.write_all(&record.payload).map_err(RecordError::Io)?;
+    writer.write_all(payload).map_err(RecordError::Io)?;
     writer.flush().map_err(RecordError::Io)
 }
 

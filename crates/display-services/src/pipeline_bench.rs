@@ -586,10 +586,13 @@ mod tests {
     }
 
     #[test]
-    fn a_drawn_cursor_costs_more_than_a_streamed_one() {
-        // The two whole-frame passes the composite adds are the finding this
-        // benchmark exists to put a number on. A build where they cost nothing
-        // is one where the composite stopped happening.
+    fn a_drawn_cursor_and_a_streamed_one_are_different_measurements() {
+        // Deliberately not an assertion about which is faster. The composite
+        // is one copy of the frame rather than three, and at a size a test can
+        // afford that difference is inside the noise -- a timing comparison
+        // here would fail on an idle machine and pass on a busy one. That the
+        // composite happens at all is proven where it can be seen:
+        // `pipeline::tests` decodes the frame and finds the pointer in it.
         let streamed = measure(
             Scene::StaticDesktop,
             small(),
@@ -607,9 +610,11 @@ mod tests {
         )
         .unwrap();
 
+        assert_eq!((streamed.cursor, drawn.cursor), ("stream", "drawn"));
+        assert!(streamed.mean_submit_ms > 0.0 && drawn.mean_submit_ms > 0.0);
         assert!(
-            drawn.mean_submit_ms > streamed.mean_submit_ms,
-            "compositing a cursor into the frame reads and writes it twice more"
+            (streamed.mean_bytes - drawn.mean_bytes).abs() > f64::EPSILON,
+            "a peer that declined the stream is sent a different frame, not the same one"
         );
     }
 
