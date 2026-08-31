@@ -31,6 +31,7 @@ use super::{
     worker::ImportWorkerActions,
 };
 use crate::{
+    build::StartedVm,
     cleanup,
     com1_terminal::Com1Session,
     create,
@@ -132,9 +133,14 @@ impl ImportPipeline {
     /// before the thread: an import that has no `ssh.exe` to run or no agent to
     /// install is not going to acquire one halfway through copying eighty
     /// gigabytes.
+    /// `adopt` is how a second boot reaches the application that owns running
+    /// VMs. It is called the moment that VM is up, because the verification
+    /// after it asks the guest about shares an agent mounts, and that agent has
+    /// nobody to connect to until the VM has been taken over.
     pub(crate) fn actions(
         &self,
         subject: ImportSubject,
+        adopt: impl Fn(StartedVm) + Send + Sync + 'static,
     ) -> Result<ImportWorkerActions, RepositoryError> {
         let ssh_client = ssh::client_path().ok_or_else(|| {
             RepositoryError::new(
@@ -371,14 +377,15 @@ impl ImportPipeline {
                     start.start_mapping(&store, &mapping, &destination)
                 })
             },
+            adopt: Box::new(adopt),
             verify: {
                 let destination = destination.clone();
                 let ssh_client = ssh_client.clone();
                 let transcript = verify_transcript.clone();
                 let desktop_profile = resources.desktop_profile;
-                Box::new(move |started| {
+                Box::new(move |mapping| {
                     let checks = GuestChecks {
-                        mapping: started.mapping.clone(),
+                        mapping: mapping.clone(),
                         vm_directory: destination.clone(),
                         client: ssh_client.clone(),
                         transcript: transcript.clone(),

@@ -311,15 +311,19 @@ impl HcsVmRepository {
         source: Option<ValidatedSource>,
         resumed: bool,
     ) -> Result<(), RepositoryError> {
-        let actions = self.import_pipeline.actions(ImportSubject {
-            vm_name: request.destination_name.clone(),
-            destination: journal.destination().to_path_buf(),
-            import_id: journal.import_id(),
-            source,
-            resources: journal.requested_resources().clone(),
-            ssh: journal.bootstrap_ssh().clone(),
-            desired_gpu: journal.desired_gpu(),
-        })?;
+        let imports = Arc::clone(&self.imports);
+        let actions = self.import_pipeline.actions(
+            ImportSubject {
+                vm_name: request.destination_name.clone(),
+                destination: journal.destination().to_path_buf(),
+                import_id: journal.import_id(),
+                source,
+                resources: journal.requested_resources().clone(),
+                ssh: journal.bootstrap_ssh().clone(),
+                desired_gpu: journal.desired_gpu(),
+            },
+            move |started| imports.hand_over(started),
+        )?;
         self.imports
             .start(request, listing, move |monitor, progress| {
                 let worker = ImportWorker::new(journal, progress.clone(), actions);

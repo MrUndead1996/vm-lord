@@ -109,6 +109,10 @@ for the VM's other files.
    it.
 7. **Restarting** -- the guest boots again, this time as an ordinary VMLord VM
    with the agent, the display share and the GPU share the import asked for.
+   It is handed over to VMLord the moment it is up rather than when the import
+   ends: the checks below ask the guest about shares its agent mounts, and that
+   agent has nobody to connect to until somebody owns the VM and is listening
+   for it.
 8. **Verifying** -- SSH answers with VMLord's key, the agent unit is active,
    and the display and GPU shares are mounted where the agent puts them. Each
    is asked until it is true rather than once: a guest answers SSH the moment

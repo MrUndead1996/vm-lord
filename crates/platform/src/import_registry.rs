@@ -290,12 +290,24 @@ impl ImportRegistry {
         )
     }
 
-    /// Reports what a finished import did and takes over whatever it left
-    /// running.
+    /// Takes over a second boot the moment it is running, before the import
+    /// that started it has finished.
     ///
-    /// A `NeedsAttention` import can be holding a started VM too: the second
-    /// boot may already be up when a later durable step fails, and dropping its
-    /// ownership here would close the console of a running guest.
+    /// The verification an import ends with asks the guest whether its agent
+    /// has mounted the display and GPU shares. That agent connects to the host,
+    /// and nothing on the host listens for it until the VM has been handed
+    /// over -- so an import that held its second boot until the end was
+    /// verifying a guest whose agent could not reach anybody. It is the same
+    /// handover, taken at the moment the VM starts rather than at the moment
+    /// the import stops.
+    pub(crate) fn hand_over(&self, started: StartedVm) {
+        self.started
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(started);
+    }
+
+    /// Reports what a finished import did.
     fn collect(&self, name: &str, import: &Import) {
         let outcome = import
             .outcome
@@ -304,45 +316,30 @@ impl ImportRegistry {
             .take();
         // An import runs on its own thread, which is inside no operation's
         // span, so every message names the VM.
-        let started = match outcome {
-            Some(ImportWorkerOutcome::Complete { started }) => {
-                vmlord_core::diagnostic!(
-                    Info,
-                    Subsystem::Hcs,
-                    vm = name,
-                    "Imported VM \"{name}\" from AppSandbox and verified it"
-                );
-                Some(started)
-            }
-            Some(ImportWorkerOutcome::NeedsAttention { error, started }) => {
-                vmlord_core::diagnostic!(
-                    Error,
-                    Subsystem::Hcs,
-                    vm = name,
-                    "Importing VM \"{name}\" stopped after the copied guest was changed, so its \
-                     copy was kept for you to retry or discard: {error}"
-                );
-                started
-            }
-            Some(ImportWorkerOutcome::RolledBack { error }) => {
-                vmlord_core::diagnostic!(
-                    Error,
-                    Subsystem::Hcs,
-                    vm = name,
-                    "Importing VM \"{name}\" failed before the copied guest was changed, so \
-                     everything it had made was removed: {error}"
-                );
-                None
-            }
+        match outcome {
+            Some(ImportWorkerOutcome::Complete) => vmlord_core::diagnostic!(
+                Info,
+                Subsystem::Hcs,
+                vm = name,
+                "Imported VM \"{name}\" from AppSandbox and verified it"
+            ),
+            Some(ImportWorkerOutcome::NeedsAttention { error }) => vmlord_core::diagnostic!(
+                Error,
+                Subsystem::Hcs,
+                vm = name,
+                "Importing VM \"{name}\" stopped after the copied guest was changed, so its \
+                 copy was kept for you to retry or discard: {error}"
+            ),
+            Some(ImportWorkerOutcome::RolledBack { error }) => vmlord_core::diagnostic!(
+                Error,
+                Subsystem::Hcs,
+                vm = name,
+                "Importing VM \"{name}\" failed before the copied guest was changed, so \
+                 everything it had made was removed: {error}"
+            ),
             // The worker panicked before it could store one. The join below
-            // reports the panic; there is nothing to hand over.
-            None => None,
-        };
-        if let Some(started) = started {
-            self.started
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(started);
+            // reports the panic.
+            None => {}
         }
     }
 
@@ -510,9 +507,7 @@ mod tests {
                 while !held.load(Ordering::Relaxed) {
                     std::thread::yield_now();
                 }
-                ImportWorkerOutcome::Complete {
-                    started: started("ubuntu-copy"),
-                }
+                ImportWorkerOutcome::Complete
             })
             .expect("the import should start");
 
@@ -643,17 +638,14 @@ mod tests {
     }
 
     #[test]
-    fn a_completed_import_hands_its_running_vm_to_whoever_reaps_it() {
+    fn a_second_boot_is_handed_over_while_the_import_that_started_it_runs() {
+        // Not when the import ends. What the import does next is ask the guest
+        // whether its agent has mounted the payload shares, and that agent has
+        // nobody to connect to until the VM has been taken over -- so an import
+        // that held on to its second boot could never pass its own checks.
         let registry = ImportRegistry::default();
 
-        registry
-            .start(request("ubuntu-copy"), listing(), |_, _| {
-                ImportWorkerOutcome::Complete {
-                    started: started("ubuntu-copy"),
-                }
-            })
-            .expect("the import should start");
-        drain(&registry, "ubuntu-copy");
+        registry.hand_over(started("ubuntu-copy"));
 
         let handed = registry.take_started();
 
@@ -661,30 +653,33 @@ mod tests {
         assert_eq!(handed[0].mapping.vm_name, "ubuntu-copy");
         assert!(
             registry.take_started().is_empty(),
-            "an outcome is handed over once"
+            "a VM is handed over once"
         );
     }
 
     #[test]
-    fn a_needs_attention_import_still_hands_over_the_vm_it_left_running() {
-        // The second boot can be up when a later durable step fails. Dropping
-        // its ownership here would close the console of a running guest.
+    fn a_needs_attention_import_leaves_the_vm_it_already_handed_over() {
+        // The handover happened when the second boot started, so a later
+        // failure has nothing left to give up -- and, in particular, does not
+        // close the console of a guest that is still running.
         let registry = ImportRegistry::default();
+        registry.hand_over(started("half-done"));
+        let handed = registry.take_started();
 
         registry
             .start(request("half-done"), listing(), |_, _| {
                 ImportWorkerOutcome::NeedsAttention {
                     error: RepositoryError::new("metadata could not be written"),
-                    started: Some(started("half-done")),
                 }
             })
             .expect("the import should start");
         drain(&registry, "half-done");
 
-        let handed = registry.take_started();
-
         assert_eq!(handed.len(), 1);
-        assert_eq!(handed[0].mapping.vm_name, "half-done");
+        assert!(
+            registry.take_started().is_empty(),
+            "the failure has nothing to hand over a second time"
+        );
     }
 
     #[test]

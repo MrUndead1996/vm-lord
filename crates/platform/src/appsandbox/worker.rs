@@ -28,7 +28,14 @@ type ConversionAction =
     Box<dyn Fn(&BootstrapVm) -> Result<GuestIdentity, RepositoryError> + Send + Sync>;
 type RestartAction =
     Box<dyn Fn(VmComputeSystemMapping) -> Result<StartedVm, RepositoryError> + Send + Sync>;
-type VerifyAction = Box<dyn Fn(&StartedVm) -> Result<(), RepositoryError> + Send + Sync>;
+type VerifyAction =
+    Box<dyn Fn(&VmComputeSystemMapping) -> Result<(), RepositoryError> + Send + Sync>;
+/// Hands a running second boot to the application that owns running VMs.
+///
+/// Called the moment the VM is up rather than when the import ends, because
+/// what the verification asks about -- the payload shares -- is mounted by an
+/// agent that has to reach a host which is listening for it.
+type AdoptAction = Box<dyn Fn(StartedVm) + Send + Sync>;
 type FinalizeAction =
     Box<dyn Fn(&VmComputeSystemMapping) -> Result<(), RepositoryError> + Send + Sync>;
 type RollbackAction = Box<dyn Fn(&Path, Option<&str>) -> Result<(), RepositoryError> + Send + Sync>;
@@ -44,23 +51,22 @@ pub(crate) struct ImportWorkerActions {
     pub(crate) start_bootstrap: BootstrapStartAction,
     pub(crate) convert: ConversionAction,
     pub(crate) restart: RestartAction,
+    pub(crate) adopt: AdoptAction,
     pub(crate) verify: VerifyAction,
     pub(crate) finalize: FinalizeAction,
     pub(crate) rollback: RollbackAction,
 }
 
 /// What a worker hands back to its registry.
+///
+/// No variant carries the second boot. It is handed over the moment it starts,
+/// through [`AdoptAction`], because the verification that follows depends on
+/// somebody already owning it.
 pub(crate) enum ImportWorkerOutcome {
-    /// The running VM and its console session are ready for repository
-    /// ownership; ordinary metadata is durable and the journal is gone.
-    Complete { started: StartedVm },
+    /// Ordinary metadata is durable and the journal is gone.
+    Complete,
     /// Conversion may have changed the guest, so the copy remains recoverable.
-    /// A second boot may already be running even though a later durable step
-    /// failed; hand it back rather than dropping its ownership on the worker.
-    NeedsAttention {
-        error: RepositoryError,
-        started: Option<StartedVm>,
-    },
+    NeedsAttention { error: RepositoryError },
     /// No guest mutation began, so all VMLord-owned destination state was
     /// removed. The AppSandbox source is never part of that cleanup request.
     RolledBack { error: RepositoryError },
@@ -118,7 +124,7 @@ impl ImportWorker {
             // An untrusted target must never reach recursive cleanup.
             let copied = Cell::new(0);
             let total = Cell::new(None);
-            return self.needs_attention(error, None, &copied, &total);
+            return self.needs_attention(error, &copied, &total);
         }
 
         if let Err(error) = self.transition(JournalStage::Validating) {
@@ -188,7 +194,7 @@ impl ImportWorker {
         }
         let identity = match converted {
             Ok(identity) => identity,
-            Err(error) => return self.needs_attention(error, None, &copied, &total),
+            Err(error) => return self.needs_attention(error, &copied, &total),
         };
 
         #[cfg(test)]
@@ -196,7 +202,7 @@ impl ImportWorker {
             hook();
         }
         if let Err(error) = check_cancelled(monitor) {
-            return self.needs_attention(error, None, &copied, &total);
+            return self.needs_attention(error, &copied, &total);
         }
 
         let resources = self.journal.requested_resources();
@@ -206,7 +212,7 @@ impl ImportWorker {
             ssh_username: &ssh.username,
             ssh_port: match vmlord_core::SshPort::new(super::GUEST_SSH_PORT) {
                 Ok(port) => port,
-                Err(error) => return self.needs_attention(error, None, &copied, &total),
+                Err(error) => return self.needs_attention(error, &copied, &total),
             },
             gpu_mode: self.journal.desired_gpu(),
             desktop_profile: resources.desktop_profile,
@@ -217,32 +223,39 @@ impl ImportWorker {
         });
 
         if let Err(error) = self.transition_with_bytes(JournalStage::Restarting, &copied, &total) {
-            return self.needs_attention(error, None, &copied, &total);
+            return self.needs_attention(error, &copied, &total);
         }
         let started = match (self.actions.restart)(mapping) {
             Ok(started) => started,
-            Err(error) => return self.needs_attention(error, None, &copied, &total),
+            Err(error) => return self.needs_attention(error, &copied, &total),
         };
+        // Handed over before it is verified, not after. The checks below ask
+        // the guest whether its agent has mounted the payload shares, and that
+        // agent connects to a host which only starts listening once somebody
+        // owns the VM. An import that kept its second boot to itself was asking
+        // a guest about work its agent had no way of doing.
+        let mapping = started.mapping.clone();
+        (self.actions.adopt)(started);
 
         if let Err(error) = self.transition_with_bytes(JournalStage::Verifying, &copied, &total) {
-            return self.needs_attention(error, Some(started), &copied, &total);
+            return self.needs_attention(error, &copied, &total);
         }
-        if let Err(error) = (self.actions.verify)(&started) {
-            return self.needs_attention(error, Some(started), &copied, &total);
+        if let Err(error) = (self.actions.verify)(&mapping) {
+            return self.needs_attention(error, &copied, &total);
         }
 
         // Ordinary metadata is the final published VM state. The journal is
         // removed only after that write is durable, so a crash can always find
         // either a recoverable import or a complete ordinary VM.
-        if let Err(error) = (self.actions.finalize)(&started.mapping) {
-            return self.needs_attention(error, Some(started), &copied, &total);
+        if let Err(error) = (self.actions.finalize)(&mapping) {
+            return self.needs_attention(error, &copied, &total);
         }
         if let Err(error) = self.journal_completion() {
-            return self.needs_attention(error, Some(started), &copied, &total);
+            return self.needs_attention(error, &copied, &total);
         }
 
         self.publish(AppSandboxImportStage::Complete, &copied, &total);
-        ImportWorkerOutcome::Complete { started }
+        ImportWorkerOutcome::Complete
     }
 
     fn transition(&mut self, stage: JournalStage) -> Result<(), RepositoryError> {
@@ -283,7 +296,7 @@ impl ImportWorker {
             // explicit discard may remove it.
             let copied = Cell::new(0);
             let total = Cell::new(None);
-            return self.needs_attention(error, None, &copied, &total);
+            return self.needs_attention(error, &copied, &total);
         }
         if let Err(cleanup_error) = (self.actions.rollback)(self.journal.destination(), hcs_id) {
             let error = cleanup::combine_failures(
@@ -292,7 +305,7 @@ impl ImportWorker {
             );
             let copied = Cell::new(0);
             let total = Cell::new(None);
-            return self.needs_attention(error, None, &copied, &total);
+            return self.needs_attention(error, &copied, &total);
         }
         if let Err(journal_error) = self.journal.remove() {
             let error = cleanup::combine_failures(
@@ -301,7 +314,7 @@ impl ImportWorker {
             );
             let copied = Cell::new(0);
             let total = Cell::new(None);
-            return self.needs_attention(error, None, &copied, &total);
+            return self.needs_attention(error, &copied, &total);
         }
         ImportWorkerOutcome::RolledBack { error }
     }
@@ -309,7 +322,6 @@ impl ImportWorker {
     fn needs_attention(
         &mut self,
         error: RepositoryError,
-        started: Option<StartedVm>,
         copied: &Cell<u64>,
         total: &Cell<Option<u64>>,
     ) -> ImportWorkerOutcome {
@@ -322,7 +334,7 @@ impl ImportWorker {
             ),
         };
         self.publish(AppSandboxImportStage::NeedsAttention, copied, total);
-        ImportWorkerOutcome::NeedsAttention { error, started }
+        ImportWorkerOutcome::NeedsAttention { error }
     }
 }
 
@@ -475,6 +487,10 @@ mod tests {
                 self.journal(),
                 self.progress.clone(),
                 ImportWorkerActions {
+                    adopt: Box::new({
+                        let calls = self.calls.clone();
+                        move |_started| calls.push("adopt")
+                    }),
                     copy: Box::new(move |cancel, publish| {
                         calls.push("copy");
                         if copy_failure {
@@ -799,7 +815,7 @@ mod tests {
 
         let outcome = worker.run(&fixture.monitor);
 
-        assert!(matches!(outcome, ImportWorkerOutcome::Complete { .. }));
+        assert!(matches!(outcome, ImportWorkerOutcome::Complete));
         let calls = fixture.calls.snapshot();
         assert_eq!(
             calls,
@@ -810,6 +826,11 @@ mod tests {
                 "bootstrap-start",
                 "convert",
                 "restart",
+                // Before the verification and not after it: the checks ask the
+                // guest about shares its agent mounts, and that agent reaches
+                // nobody until the VM has been handed to whoever owns running
+                // VMs and starts listening for it.
+                "adopt",
                 "verify",
                 "metadata"
             ]
