@@ -94,6 +94,7 @@ impl HcsVmConfigBuilder {
             },
             state,
             vm_id,
+            AgentServices::Vmlord,
         )
     }
 
@@ -133,8 +134,24 @@ impl HcsVmConfigBuilder {
             bootstrap.topology,
             &bootstrap.state,
             bootstrap.vm_id,
+            AgentServices::VmlordAndSource,
         )
     }
+}
+
+/// Whose guest agents a compute system's service table makes room for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgentServices {
+    /// VMLord's own, which is every VM it builds.
+    Vmlord,
+    /// VMLord's own and, in addition, the service the guest agent of the
+    /// application an import copies from listens on.
+    ///
+    /// Only the copied guest of an import gets this. That guest was given a
+    /// static address by that agent and will not ask for one, so the agent is
+    /// the only thing that can put it on VMLord's network -- and an entry here
+    /// is what makes the service exist for the partition at all.
+    VmlordAndSource,
 }
 
 /// Everything the copied guest's first compute system is built from.
@@ -186,6 +203,7 @@ fn configuration_document(
     topology: VmTopology,
     state: &StateFilePaths<'_>,
     vm_id: Uuid,
+    agents: AgentServices,
 ) -> Result<String, RepositoryError> {
     let configuration = HcsConfiguration {
         schema_version: SCHEMA_VERSION,
@@ -224,7 +242,7 @@ fn configuration_document(
                 )]),
                 hv_socket: HvSocket {
                     config: HvSocketConfig {
-                        service_table: service_table(),
+                        service_table: service_table(agents),
                     },
                 },
                 keyboard: EmptyObject {},
@@ -271,9 +289,13 @@ fn agent_service_key() -> String {
 /// claim that anything inside the guest is using it, and a headless guest
 /// simply never binds the display ports. Making them conditional would mean a
 /// VM that changes profile later has to have this document rewritten.
-fn service_table() -> BTreeMap<String, HvSocketService> {
+fn service_table(agents: AgentServices) -> BTreeMap<String, HvSocketService> {
     let mut table = BTreeMap::from([(agent_service_key(), HvSocketService::vmlord())]);
     for id in crate::hvsocket::display_service_ids() {
+        table.insert(format!("{id:?}"), HvSocketService::vmlord());
+    }
+    if agents == AgentServices::VmlordAndSource {
+        let id = crate::hvsocket::vsock_service_id(crate::hvsocket::SOURCE_AGENT_VSOCK_PORT);
         table.insert(format!("{id:?}"), HvSocketService::vmlord());
     }
 
@@ -1872,6 +1894,57 @@ mod tests {
             Some(&json!({
                 "0": { "Type": "VirtualDisk", "Path": r"C:\vms\imported\disks\system.vhdx" }
             }))
+        );
+    }
+
+    #[test]
+    fn an_import_bootstrap_lists_the_source_applications_agent_service() {
+        // The copied guest was given a static address by that agent and never
+        // asks for one, so the agent is the only way onto VMLord's network --
+        // and a service the partition does not list cannot be connected to at
+        // all. Without this entry every import stops at first contact.
+        let document = HcsVmConfigBuilder::build_import_bootstrap(&import_bootstrap()).unwrap();
+        let json: Value = serde_json::from_str(&document).unwrap();
+
+        let table = json
+            .pointer("/VirtualMachine/Devices/HvSocket/HvSocketConfig/ServiceTable")
+            .and_then(Value::as_object)
+            .expect("a bootstrap has a service table");
+
+        assert!(
+            table.contains_key("00000001-FACB-11E6-BD58-64006A7986D3"),
+            "got {table:?}"
+        );
+    }
+
+    #[test]
+    fn a_created_vm_lists_only_vmlords_own_services() {
+        // The addition above belongs to imports alone: a VM VMLord builds runs
+        // no agent of anyone else's, and an entry for one would be a channel
+        // into the guest that nothing on this side ever uses.
+        let document = HcsVmConfigBuilder::build(
+            &request(),
+            Path::new(r"C:\vms\test\disks\system.vhdx"),
+            Path::new(r"C:\vms\test\seed.iso"),
+            None,
+            &StateFilePaths {
+                guest_state: Path::new(r"C:\vms\test\vm.vmgs"),
+                runtime_state: Path::new(r"C:\vms\test\vm.vmrs"),
+            },
+            Uuid::nil(),
+        )
+        .unwrap();
+        let json: Value = serde_json::from_str(&document).unwrap();
+
+        let table = json
+            .pointer("/VirtualMachine/Devices/HvSocket/HvSocketConfig/ServiceTable")
+            .and_then(Value::as_object)
+            .expect("a VM has a service table");
+
+        assert_eq!(table.len(), 5, "got {table:?}");
+        assert!(
+            !table.contains_key("00000001-FACB-11E6-BD58-64006A7986D3"),
+            "got {table:?}"
         );
     }
 

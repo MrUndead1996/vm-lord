@@ -35,7 +35,7 @@ list is a VM VMLord could not see at all.
 | `SshDeployKey=1` | Without a deployed key there is no credential to connect with. |
 | Its disk file exists and is the one its configuration names | A mismatch means the configuration describes something else. |
 | Its network and GPU modes are ones VMLord can reproduce | An imported VM must be a VM VMLord can actually run. |
-| Its SSH port is a usable port | |
+| Its SSH port is a usable port | A VM with none was never given SSH, whatever `SshEnabled` says. The number itself is not used: it is a port on the *host*, where AppSandbox relays into the guest over hv_socket. The guest's own sshd is at 22. |
 | No other AppSandbox VM claims the same disk | Two VMs sharing one disk cannot both be copied safely. |
 
 Hyper-V VMs, Windows guests, AppSandbox templates and exporting a VMLord VM
@@ -76,16 +76,26 @@ for the VM's other files.
 4. **Starting the copied guest** -- the first boot runs on NAT with SSH and
    with VMLord's GPU and display integration switched off. Nothing is asked of
    the guest that a plain Linux system cannot answer.
-5. **Converting** -- over that one SSH session, VMLord deploys its own key,
+5. **Moving the copy onto VMLord's network** -- the copied guest does not
+   arrive there by itself. AppSandbox's agent gave it a static address, deleted
+   every other netplan file and turned cloud-init's network module off, so the
+   guest comes up on a subnet that no longer exists and will never ask for an
+   address. What it still runs is that agent, on an hv_socket service that
+   needs no network at all, and VMLord asks it -- in the one exchange it ever
+   has with another application's protocol -- to take the address HNS has
+   already reserved. This is the first thing an import changes about the copy.
+   It cannot reach the source: an hv_socket address names one partition, and
+   the only one reachable here is the copy's.
+6. **Converting** -- over that one SSH session, VMLord deploys its own key,
    installs the VMLord agent and its unit, disables AppSandbox's units, proves
    every replacement is in place, removes what is now obsolete, and asks the
    guest to shut down. Every step is checked on every pass, so a resumed
    conversion re-verifies what it skips rather than trusting it.
-6. **Restarting** -- the guest boots again, this time as an ordinary VMLord VM
+7. **Restarting** -- the guest boots again, this time as an ordinary VMLord VM
    with the agent, the display share and the GPU share the import asked for.
-7. **Verifying** -- SSH answers with VMLord's key, the agent unit is active,
+8. **Verifying** -- SSH answers with VMLord's key, the agent unit is active,
    and the display and GPU shares are mounted where the agent puts them.
-8. **Finished** -- ordinary VM metadata is written last, and the recovery
+9. **Finished** -- ordinary VM metadata is written last, and the recovery
    journal is removed only after that write is durable.
 
 The payloads a converted guest uses are **not** unpacked into its disk. They

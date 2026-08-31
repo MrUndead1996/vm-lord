@@ -16,7 +16,7 @@
 use std::{fs, path::Path};
 
 use uuid::Uuid;
-use vmlord_core::{RepositoryError, SshPort};
+use vmlord_core::RepositoryError;
 
 use crate::{
     cleanup::{self, SystemTeardown},
@@ -121,7 +121,6 @@ impl ImportBootstrapPipeline {
         store: &MetadataStore,
         request: &BootstrapRequest<'_>,
     ) -> Result<BootstrapVm, RepositoryError> {
-        SshPort::new(request.ssh.port)?;
         let system_disk_path = layout::system_disk_path(request.vm_directory);
         if !system_disk_path.is_file() {
             let error = RepositoryError::new(format!(
@@ -292,7 +291,6 @@ mod tests {
     fn ssh() -> BootstrapSshFacts {
         BootstrapSshFacts {
             username: "sandbox".to_owned(),
-            port: 2222,
         }
     }
 
@@ -547,32 +545,6 @@ mod tests {
 
         assert!(error.to_string().contains("already exists"), "{error}");
         assert_eq!(store.list().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn a_bootstrap_refuses_a_port_no_session_can_reach() {
-        let root = temporary_root("port");
-        let store = MetadataStore::new(root.0.join("metadata.json"));
-        let vm_directory = copied_destination(&root.0);
-        let calls = Calls::default();
-
-        let error = pipeline(&calls)
-            .create(
-                &store,
-                &BootstrapRequest {
-                    vm_name: "imported",
-                    vm_directory: &vm_directory,
-                    resources: &resources(),
-                    ssh: &BootstrapSshFacts {
-                        username: "sandbox".to_owned(),
-                        port: 0,
-                    },
-                },
-            )
-            .expect_err("port 0 means nothing to a client");
-
-        assert!(error.to_string().contains("SSH port"), "{error}");
-        assert!(calls.systems.lock().unwrap().is_empty());
     }
 
     #[test]

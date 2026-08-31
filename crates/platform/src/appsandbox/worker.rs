@@ -204,7 +204,7 @@ impl ImportWorker {
         let mapping = VmComputeSystemMapping::from_completed_import(&CompletedImport {
             bootstrap: &bootstrap.mapping,
             ssh_username: &ssh.username,
-            ssh_port: match vmlord_core::SshPort::new(ssh.port) {
+            ssh_port: match vmlord_core::SshPort::new(super::GUEST_SSH_PORT) {
                 Ok(port) => port,
                 Err(error) => return self.needs_attention(error, None, &copied, &total),
             },
@@ -445,7 +445,6 @@ mod tests {
                     desired_gpu: GpuMode::Default,
                     bootstrap_ssh: BootstrapSshFacts {
                         username: "sandbox".into(),
-                        port: 2222,
                     },
                 },
             )

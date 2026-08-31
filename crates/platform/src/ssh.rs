@@ -29,7 +29,11 @@ use std::{
 
 use vmlord_core::{RepositoryError, SshAuthentication, SshEndpoint};
 
-use crate::{hcn_endpoint::HcnEndpoint, layout, metadata::VmComputeSystemMapping};
+use crate::{
+    hcn_endpoint::{EndpointAddress, HcnEndpoint},
+    layout,
+    metadata::VmComputeSystemMapping,
+};
 
 /// Where Windows keeps its OpenSSH client.
 const SSH_CLIENT_RELATIVE_PATH: &str = r"System32\OpenSSH\ssh.exe";
@@ -87,13 +91,7 @@ pub(crate) enum SshCredential<'a> {
 pub(crate) fn guest_address(
     mapping: &VmComputeSystemMapping,
 ) -> Result<Option<IpAddr>, RepositoryError> {
-    let Some(endpoint_id) = mapping.endpoint_id else {
-        return Ok(None);
-    };
-    let Some(endpoint) = HcnEndpoint::open_if_present(endpoint_id)? else {
-        return Ok(None);
-    };
-    let Some(address) = endpoint.address()? else {
+    let Some(address) = guest_endpoint_address(mapping)? else {
         return Ok(None);
     };
     match address.ip_address.parse() {
@@ -108,6 +106,25 @@ pub(crate) fn guest_address(
             Ok(None)
         }
     }
+}
+
+/// The address HNS has given the VM's endpoint, with the prefix that came with
+/// it.
+///
+/// The same read [`guest_address`] does, kept whole. A caller that has to talk
+/// about the guest's *network* -- rather than just reach the guest -- needs the
+/// prefix too, and asking HNS twice for the two halves of one answer would let
+/// them disagree.
+pub(crate) fn guest_endpoint_address(
+    mapping: &VmComputeSystemMapping,
+) -> Result<Option<EndpointAddress>, RepositoryError> {
+    let Some(endpoint_id) = mapping.endpoint_id else {
+        return Ok(None);
+    };
+    let Some(endpoint) = HcnEndpoint::open_if_present(endpoint_id)? else {
+        return Ok(None);
+    };
+    endpoint.address()
 }
 
 /// The endpoint of a running VM: its stored SSH configuration at `address`.

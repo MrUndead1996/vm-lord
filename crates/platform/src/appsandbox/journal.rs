@@ -141,15 +141,24 @@ pub(crate) struct ImportResources {
     pub(crate) desktop_profile: DesktopProfile,
 }
 
+/// The port an imported guest's sshd listens on.
+///
+/// Always 22, and deliberately not the `SshPort` the source application's
+/// configuration carries: that number is a port on the *host*, where the source
+/// application listens and relays over hv_socket into the guest. A copied
+/// guest's own `sshd_config` has no `Port` directive at all, so its sshd is at
+/// the default -- which is why this is a constant and not a discovered fact.
+pub(crate) const GUEST_SSH_PORT: u16 = 22;
+
 /// Facts needed to establish the temporary AppSandbox-key SSH connection.
 ///
-/// The AppSandbox key itself remains at its protected source path and is never
-/// represented by this type, so neither its bytes nor an agent secret can be
-/// serialized with a journal.
+/// The username alone, because the port is [`GUEST_SSH_PORT`] for every
+/// imported guest. The AppSandbox key remains at its protected source path and
+/// is never represented by this type, so neither its bytes nor an agent secret
+/// can be serialized with a journal.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct BootstrapSshFacts {
     pub(crate) username: String,
-    pub(crate) port: u16,
 }
 
 /// Inputs captured when an import is first made durable.
@@ -527,7 +536,6 @@ mod tests {
             desired_gpu: GpuMode::Default,
             bootstrap_ssh: BootstrapSshFacts {
                 username: "ubuntu".to_owned(),
-                port: 2222,
             },
         }
     }

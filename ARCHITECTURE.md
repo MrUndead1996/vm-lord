@@ -131,6 +131,16 @@ moved, and AppSandbox goes on owning it. See
 [docs/appsandbox-import.md](docs/appsandbox-import.md) for what is imported,
 what is refused, and what happens when an import stops partway.
 
+That import is also the one place VMLord speaks another application's
+protocol, and it speaks one command of it. An AppSandbox guest was given a
+static address by AppSandbox's own agent, which deleted every other netplan
+file and disabled cloud-init's network module, so the copy boots onto a subnet
+that no longer exists and never asks for an address. The agent that did it is
+still there, on an hv_socket service that works before the guest has a network,
+and it is asked once to move the guest onto VMLord's. Reaching it needs an
+entry in the bootstrap compute system's service table, which is the only
+difference between that document and the one a VM VMLord builds gets.
+
 ## Implemented scaffold
 
 The initial executable is a Windows x64 Cargo workspace with these dependencies:

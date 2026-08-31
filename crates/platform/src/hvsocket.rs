@@ -37,9 +37,10 @@ use uuid::Uuid;
 use vmlord_core::RepositoryError;
 use windows::{
     Win32::Networking::WinSock::{
-        AF_HYPERV, FD_SET, SEND_RECV_FLAGS, SO_SNDTIMEO, SOCK_STREAM, SOCKADDR, SOCKET,
-        SOCKET_ERROR, SOL_SOCKET, SOMAXCONN, TIMEVAL, WSADATA, WSAGetLastError, WSAStartup, accept,
-        bind, closesocket, listen, recv, select, send, setsockopt, socket,
+        AF_HYPERV, FD_SET, FIONBIO, SEND_RECV_FLAGS, SO_SNDTIMEO, SOCK_STREAM, SOCKADDR, SOCKET,
+        SOCKET_ERROR, SOL_SOCKET, SOMAXCONN, TIMEVAL, WSADATA, WSAEWOULDBLOCK, WSAGetLastError,
+        WSAStartup, accept, bind, closesocket, connect, ioctlsocket, listen, recv, select, send,
+        setsockopt, socket,
     },
     core::GUID,
 };
@@ -73,6 +74,16 @@ pub(crate) const DISPLAY_INPUT_VSOCK_PORT: u32 = 0x564D_4C49;
 /// Bound in the guest by the clipboard daemon of whoever is logged in, rather
 /// than by either system service: a selection exists inside a compositor.
 pub(crate) const DISPLAY_CLIPBOARD_VSOCK_PORT: u32 = 0x564D_4C43;
+
+/// The vsock port the guest agent of the application VMLord imports from
+/// listens on.
+///
+/// Not VMLord's own agent and not a port VMLord chose: it is where AppSandbox's
+/// Linux agent binds, and the one number in this file that another application
+/// owns. It is here rather than in `appsandbox` because it belongs to the same
+/// map from vsock ports to services as the rest, and a second copy of that map
+/// is a second thing to get wrong.
+pub(crate) const SOURCE_AGENT_VSOCK_PORT: u32 = 1;
 
 /// The four services one display session runs over, in channel order.
 ///
@@ -118,6 +129,13 @@ const READ_POLL: Duration = ACCEPT_POLL;
 /// Everything this protocol sends is a few dozen bytes, so a guest that cannot
 /// take them within five seconds is not reading its socket at all.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long one attempt to reach a service inside a guest may take.
+///
+/// Short because it is attempted again: a guest that is still booting refuses
+/// or drops the connection, and the caller's deadline -- not this one -- is
+/// what decides that it has been long enough.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The service GUID a Linux guest's vsock `port` arrives on.
 ///
@@ -293,6 +311,134 @@ impl Drop for AgentListener {
     }
 }
 
+/// Opens a stream to a service a guest is already listening on.
+///
+/// The mirror image of [`AgentListener`], and the exception the module's rule
+/// is written against: VMLord's own agent connects out, so the host listens.
+/// A guest VMLord did not build listens instead, and the host has to knock --
+/// which is only safe because the caller owns a deadline. Every way this can
+/// fail is an ordinary "not yet" from a guest that has not finished booting, so
+/// nothing here is logged above debug; a run of them becomes a refusal in the
+/// caller, once, with the last reason attached.
+///
+/// # Errors
+///
+/// [`RepositoryError`] whenever the connection was not established, whatever
+/// the reason. Callers are expected to retry until their own deadline.
+pub(crate) fn connect_to_guest(
+    vm_name: &str,
+    runtime_id: Uuid,
+    service_id: GUID,
+    running: &Arc<AtomicBool>,
+) -> Result<AgentStream, RepositoryError> {
+    initialize_winsock()?;
+
+    // SAFETY: A plain socket creation; the returned handle is owned by the
+    // `AgentStream` built below, which closes it exactly once -- including on
+    // every early return from here.
+    let handle = unsafe { socket(AF_HYPERV.into(), SOCK_STREAM, HV_PROTOCOL_RAW) }
+        .map_err(|error| connect_failure(vm_name, "created", &error.to_string()))?;
+    let stream = AgentStream {
+        socket: handle,
+        vm_name: vm_name.to_owned(),
+        running: Arc::clone(running),
+    };
+
+    set_blocking(&stream, false)?;
+
+    let address = SockaddrHv {
+        family: AF_HYPERV,
+        reserved: 0,
+        vm_id: GUID::from_u128(runtime_id.as_u128()),
+        service_id,
+    };
+    // SAFETY: `address` is a valid `SOCKADDR_HV` living across the call, and
+    // its length is passed as Winsock expects for an `AF_HYPERV` address.
+    let connected = unsafe {
+        connect(
+            stream.socket,
+            (&raw const address).cast::<SOCKADDR>(),
+            i32::try_from(mem::size_of::<SockaddrHv>()).expect("an address is 36 bytes"),
+        )
+    };
+    if connected == SOCKET_ERROR {
+        if last_error_code() != WSAEWOULDBLOCK.0 {
+            return Err(connect_failure(vm_name, "connected", &last_error()));
+        }
+        wait_for_connect(&stream)?;
+    }
+
+    set_blocking(&stream, true)?;
+    stream.set_timeout(SO_SNDTIMEO, WRITE_TIMEOUT)?;
+
+    tracing::debug!("connected to service {service_id:?} inside VM \"{vm_name}\"");
+    Ok(stream)
+}
+
+/// Waits for a non-blocking connect to settle, either way.
+///
+/// A socket that becomes writable connected; one that lands in the exception
+/// set was refused, which is what a guest whose agent is not listening yet
+/// answers.
+fn wait_for_connect(stream: &AgentStream) -> Result<(), RepositoryError> {
+    let mut writable = FD_SET {
+        fd_count: 1,
+        ..Default::default()
+    };
+    writable.fd_array[0] = stream.socket;
+    let mut failed = writable;
+    let timeout = timeval(CONNECT_TIMEOUT);
+
+    // SAFETY: Both sets name this owned socket and outlive the call, as does
+    // `timeout`. Windows ignores the first argument to `select`.
+    let ready = unsafe {
+        select(
+            0,
+            None,
+            Some(&mut writable),
+            Some(&mut failed),
+            Some(&raw const timeout),
+        )
+    };
+    match ready {
+        0 => Err(connect_failure(
+            &stream.vm_name,
+            "connected",
+            "nothing answered within the connect timeout",
+        )),
+        SOCKET_ERROR => Err(connect_failure(&stream.vm_name, "waited on", &last_error())),
+        _ if failed.fd_count != 0 => Err(connect_failure(
+            &stream.vm_name,
+            "connected",
+            "the guest refused the connection",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Puts a socket into blocking or non-blocking mode.
+fn set_blocking(stream: &AgentStream, blocking: bool) -> Result<(), RepositoryError> {
+    let mut mode: u32 = u32::from(!blocking);
+    // SAFETY: `stream.socket` is owned and `mode` outlives the call.
+    if unsafe { ioctlsocket(stream.socket, FIONBIO, &raw mut mode) } == SOCKET_ERROR {
+        return Err(connect_failure(
+            &stream.vm_name,
+            "switched between blocking and non-blocking",
+            &last_error(),
+        ));
+    }
+    Ok(())
+}
+
+/// The one shape every failure to reach a guest service is reported in.
+fn connect_failure(vm_name: &str, what: &str, detail: &str) -> RepositoryError {
+    let error = RepositoryError::new(format!(
+        "the connection to the guest of VM \"{vm_name}\" could not be {what}: {detail}"
+    ));
+    tracing::debug!("{error}");
+    error
+}
+
 /// One accepted connection from a VM's agent.
 ///
 /// Reads and writes are bounded rather than blocking forever, so that a thread
@@ -463,8 +609,8 @@ mod tests {
 
     use super::{
         AGENT_VSOCK_PORT, DISPLAY_CLIPBOARD_VSOCK_PORT, DISPLAY_CONTROL_VSOCK_PORT,
-        DISPLAY_FRAME_VSOCK_PORT, DISPLAY_INPUT_VSOCK_PORT, agent_service_id, display_service_ids,
-        idle_read, vsock_service_id,
+        DISPLAY_FRAME_VSOCK_PORT, DISPLAY_INPUT_VSOCK_PORT, SOURCE_AGENT_VSOCK_PORT,
+        agent_service_id, display_service_ids, idle_read, vsock_service_id,
     };
 
     #[test]
@@ -498,6 +644,18 @@ mod tests {
         // connects to port 1 must arrive at exactly this service.
         assert_eq!(
             format!("{:?}", vsock_service_id(1)),
+            "00000001-FACB-11E6-BD58-64006A7986D3"
+        );
+    }
+
+    #[test]
+    fn the_source_agent_service_is_the_one_that_agent_binds() {
+        // The guest agent of the application an import copies from listens on
+        // `AF_VSOCK` port 1, so this is the service a copied guest can be
+        // reached on before it has a network. Getting the number wrong makes
+        // every import hang at first contact with nothing in the log.
+        assert_eq!(
+            format!("{:?}", vsock_service_id(SOURCE_AGENT_VSOCK_PORT)),
             "00000001-FACB-11E6-BD58-64006A7986D3"
         );
     }

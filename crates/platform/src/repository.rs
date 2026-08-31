@@ -1594,7 +1594,6 @@ impl VmRepository for HcsVmRepository {
                 desired_gpu: candidate.gpu_mode,
                 bootstrap_ssh: BootstrapSshFacts {
                     username: candidate.ssh_user.clone(),
-                    port: candidate.ssh_port,
                 },
             },
         )?;
@@ -2617,7 +2616,6 @@ mod tests {
                 desired_gpu: GpuMode::Default,
                 bootstrap_ssh: BootstrapSshFacts {
                     username: "sandbox".into(),
-                    port: 22,
                 },
             },
         )

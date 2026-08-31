@@ -11,7 +11,7 @@
 use std::{
     fs,
     io::Read,
-    net::{IpAddr, SocketAddr, TcpStream},
+    net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
@@ -23,10 +23,11 @@ use vmlord_agent_protocol::auth;
 use vmlord_core::{GpuMode, RepositoryError, SshAuthentication, SshConfig, SshEndpoint, SshPort};
 
 use super::{
-    BootstrapRequest, BootstrapSshFacts, ConversionCommand, ConversionRequest, ConversionRunner,
-    ImportBootstrapPipeline, ImportJournal, ImportResources, SecretText, ValidatedSource,
-    Verification, VerificationRequest,
+    BootstrapRequest, BootstrapSshFacts, BootstrapVm, ConversionCommand, ConversionRequest,
+    ConversionRunner, GUEST_SSH_PORT, ImportBootstrapPipeline, ImportJournal, ImportResources,
+    SecretText, ValidatedSource, Verification, VerificationRequest,
     copy::{CopyRequest, copy_vhdx},
+    source_agent::SourceAgent,
     worker::ImportWorkerActions,
 };
 use crate::{
@@ -34,11 +35,12 @@ use crate::{
     com1_terminal::Com1Session,
     create,
     guest_ready::ReadinessTimeouts,
-    hcs::HCS_ACCESS_ALL,
+    hcs::{HCS_ACCESS_ALL, HcsClient},
     layout,
     metadata::{MetadataStore, VmComputeSystemMapping},
     ssh::{self, SshInvocation},
     start::VmStartPipeline,
+    subnet::Ipv4Subnet,
 };
 
 /// How often the waits below ask again.
@@ -294,7 +296,7 @@ impl ImportPipeline {
                 let scp_client = scp_client.clone();
                 let bootstrap_ssh = bootstrap_ssh.clone();
                 Box::new(move |bootstrap| {
-                    let endpoint = wait_for_guest(&bootstrap.mapping, &bootstrap_ssh, &timeouts)?;
+                    let endpoint = wait_for_guest(bootstrap, &bootstrap_ssh, &timeouts)?;
                     let secret = agent_secret(&destination)?;
                     let public_key = fs::read_to_string(layout::ssh_public_key_path(&destination))
                         .map_err(|error| {
@@ -440,7 +442,8 @@ impl GuestChecks {
                     "the imported VM has no SSH configuration to verify it with",
                 ));
             };
-            let address = wait_for_address(&mapping, &timeouts)?;
+            let (address, _) = wait_for_address(&mapping, &timeouts)?;
+            let address = IpAddr::V4(address);
             wait_for_port(address, config.port.get(), &timeouts)?;
             let endpoint = SshEndpoint::new(mapping.vm_id, &config, address)?;
             let invocation = ssh::invocation(
@@ -522,13 +525,41 @@ fn forget_mapping(store: &MetadataStore, hcs_id: &str) -> Result<(), RepositoryE
 }
 
 /// The bootstrap session's endpoint, once the copied guest answers on it.
+///
+/// The copied guest does not arrive on VMLord's network by itself. Its source
+/// application gave it a static address, deleted every other netplan file and
+/// turned cloud-init's network module off, so it never asks for one -- it comes
+/// up on a subnet that no longer exists and waiting for an address would only
+/// ever time out. What it does still run is the agent that put it there, on an
+/// hv_socket service that needs no network, and that agent is asked to move the
+/// guest onto the address HNS has already reserved for it.
+///
+/// This is the first thing an import does that changes the copy. It cannot
+/// touch the source: an hv_socket address names one partition, and the only
+/// partition reachable here is the one the copy is running as.
 fn wait_for_guest(
-    mapping: &VmComputeSystemMapping,
+    bootstrap: &BootstrapVm,
     ssh: &BootstrapSshFacts,
     timeouts: &ReadinessTimeouts,
 ) -> Result<SshEndpoint, RepositoryError> {
-    let port = SshPort::new(ssh.port)?;
-    let address = wait_for_address(mapping, timeouts)?;
+    let mapping = &bootstrap.mapping;
+    let port = SshPort::new(GUEST_SSH_PORT)?;
+    let (address, prefix_length) = wait_for_address(mapping, timeouts)?;
+    let gateway = Ipv4Subnet::new(address, prefix_length).gateway();
+    let runtime_id = partition_of(&bootstrap.hcs_compute_system_id, &mapping.vm_name)?;
+
+    // One deadline for both halves: the guest is booting through the first and
+    // has to answer within the second, and what the caller is waiting for is a
+    // guest it can talk to.
+    let deadline = Instant::now() + timeouts.ssh_port;
+    SourceAgent::connect(&mapping.vm_name, runtime_id, deadline)?.move_onto(
+        address,
+        prefix_length,
+        gateway,
+        deadline,
+    )?;
+
+    let address = IpAddr::V4(address);
     wait_for_port(address, port.get(), timeouts)?;
     SshEndpoint::new(
         mapping.vm_id,
@@ -543,14 +574,48 @@ fn wait_for_guest(
     )
 }
 
+/// The partition a bootstrap VM is running as.
+///
+/// Asked of HCS rather than remembered: Hyper-V hands out a new runtime id on
+/// every start, and it is the only name an hv_socket address knows a VM by.
+fn partition_of(hcs_compute_system_id: &str, vm_name: &str) -> Result<Uuid, RepositoryError> {
+    let mut client = HcsClient::new();
+    client.initialize()?;
+    client
+        .enumerate_systems()?
+        .into_iter()
+        .find(|system| system.id == hcs_compute_system_id)
+        .and_then(|system| system.runtime_id)
+        .ok_or_else(|| {
+            let error = RepositoryError::new(format!(
+                "HCS does not say which partition the copied guest of VM \"{vm_name}\" is \
+                 running as, so its agent cannot be reached"
+            ));
+            tracing::error!("{error}");
+            error
+        })
+}
+
+/// The address and prefix HNS reserved for the guest, once it has one.
+///
+/// The prefix comes back with the address because the guest is about to be told
+/// what network it is on, not merely where to answer.
 fn wait_for_address(
     mapping: &VmComputeSystemMapping,
     timeouts: &ReadinessTimeouts,
-) -> Result<IpAddr, RepositoryError> {
+) -> Result<(Ipv4Addr, u8), RepositoryError> {
     let deadline = Instant::now() + timeouts.address;
     loop {
-        match ssh::guest_address(mapping) {
-            Ok(Some(address)) => return Ok(address),
+        match ssh::guest_endpoint_address(mapping) {
+            Ok(Some(address)) => match address.ip_address.parse() {
+                Ok(ip) => return Ok((ip, address.prefix_length)),
+                Err(error) => tracing::debug!(
+                    "HNS reported \"{}\" as the address of VM \"{}\", which is not an IPv4 \
+                     address: {error}",
+                    address.ip_address,
+                    mapping.vm_name
+                ),
+            },
             Ok(None) => {}
             Err(error) => tracing::debug!(
                 "the address of VM \"{}\" is not readable yet: {error}",

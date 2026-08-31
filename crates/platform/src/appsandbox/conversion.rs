@@ -778,7 +778,6 @@ mod tests {
             desired_gpu: GpuMode::Default,
             bootstrap_ssh: BootstrapSshFacts {
                 username: "sandbox".to_owned(),
-                port: 2222,
             },
         }
     }
