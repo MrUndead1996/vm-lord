@@ -83,9 +83,14 @@ for the VM's other files.
    address. What it still runs is that agent, on an hv_socket service that
    needs no network at all, and VMLord asks it -- in the one exchange it ever
    has with another application's protocol -- to take the address HNS has
-   already reserved. This is the first thing an import changes about the copy.
-   It cannot reach the source: an hv_socket address names one partition, and
-   the only one reachable here is the copy's.
+   already reserved, and then to restart if it did not take. It usually does
+   not: that agent finishes by restarting NetworkManager, and a NetworkManager
+   restarted over an interface that already carries an address assumes that
+   address instead of applying the profile it was just handed. The
+   configuration is written either way, so the guest reads it from cold, the
+   way it read the source application's the first time. This is the first thing
+   an import changes about the copy. It cannot reach the source: an hv_socket
+   address names one partition, and the only one reachable here is the copy's.
 6. **Converting** -- over that one SSH session, VMLord deploys its own key,
    installs the VMLord agent and its unit, disables AppSandbox's units, proves
    every replacement is in place, removes what is now obsolete, and asks the

@@ -27,7 +27,7 @@ use super::{
     ConversionRunner, GUEST_SSH_PORT, ImportBootstrapPipeline, ImportJournal, ImportResources,
     SecretText, ValidatedSource, Verification, VerificationRequest,
     copy::{CopyRequest, copy_vhdx},
-    source_agent::SourceAgent,
+    source_agent::{AddressOutcome, SourceAgent},
     worker::ImportWorkerActions,
 };
 use crate::{
@@ -534,6 +534,14 @@ fn forget_mapping(store: &MetadataStore, hcs_id: &str) -> Result<(), RepositoryE
 /// hv_socket service that needs no network, and that agent is asked to move the
 /// guest onto the address HNS has already reserved for it.
 ///
+/// A guest that is already up rarely takes the new address there and then: the
+/// agent finishes by restarting NetworkManager, and a NetworkManager restarted
+/// over an interface that already carries an address assumes that address
+/// instead of applying the profile it was just handed. The configuration is on
+/// disk either way, so the answer is to restart the guest and let it read the
+/// file from cold -- which is the same cold start the address took the first
+/// time, when the source application wrote it.
+///
 /// This is the first thing an import does that changes the copy. It cannot
 /// touch the source: an hv_socket address names one partition, and the only
 /// partition reachable here is the one the copy is running as.
@@ -548,17 +556,20 @@ fn wait_for_guest(
     let gateway = Ipv4Subnet::new(address, prefix_length).gateway();
     let runtime_id = partition_of(&bootstrap.hcs_compute_system_id, &mapping.vm_name)?;
 
-    // One deadline for both halves: the guest is booting through the first and
-    // has to answer within the second, and what the caller is waiting for is a
-    // guest it can talk to.
+    // One deadline for the whole conversation: the guest is booting through the
+    // first half and has to answer within the second, and what the caller is
+    // waiting for is a guest it can talk to.
     let deadline = Instant::now() + timeouts.ssh_port;
-    SourceAgent::connect(&mapping.vm_name, runtime_id, deadline)?.move_onto(
-        address,
-        prefix_length,
-        gateway,
-        deadline,
-    )?;
+    let mut agent = SourceAgent::connect(&mapping.vm_name, runtime_id, deadline)?;
+    if agent.move_onto(address, prefix_length, gateway, deadline)? == AddressOutcome::NeedsRestart {
+        agent.restart(deadline)?;
+    }
+    // The connection is finished either way, and a guest that was asked to
+    // restart is about to take it down.
+    drop(agent);
 
+    // The port wait is what proves the address took, whether the guest was
+    // restarted or not: nothing answers at an address the guest does not hold.
     let address = IpAddr::V4(address);
     wait_for_port(address, port.get(), timeouts)?;
     SshEndpoint::new(
