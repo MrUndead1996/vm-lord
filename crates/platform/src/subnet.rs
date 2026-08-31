@@ -4,7 +4,7 @@
 //! revisited: the guests' addresses come out of it, and re-picking it would
 //! move every address that anything already remembers.
 
-use std::{fmt, net::Ipv4Addr};
+use std::{fmt, net::Ipv4Addr, ptr::NonNull};
 
 use vmlord_core::RepositoryError;
 use windows::Win32::{
@@ -165,7 +165,11 @@ pub(crate) fn interface_index(address: Ipv4Addr) -> Result<u32, RepositoryError>
 }
 
 /// An owned unicast IP address table, freed with `FreeMibTable` on drop.
-struct UnicastAddressTable(*mut MIB_UNICASTIPADDRESS_TABLE);
+///
+/// `NonNull` rather than a raw pointer: everything below dereferences it, and
+/// the one place that can tell whether there is a table is the call that asked
+/// for one.
+struct UnicastAddressTable(NonNull<MIB_UNICASTIPADDRESS_TABLE>);
 
 impl UnicastAddressTable {
     /// Reads the host's unicast IPv4 addresses.
@@ -183,13 +187,25 @@ impl UnicastAddressTable {
             tracing::error!("{error}");
             return Err(error);
         }
+        // Success with no table is not an outcome the API documents, and a
+        // wrapper that takes it on trust dereferences null. Refusing it here is
+        // what makes the `SAFETY` notes below true rather than hopeful.
+        let Some(table) = NonNull::new(table) else {
+            let error = RepositoryError::new(
+                "the host's unicast address table was reported as read but came back empty, so \
+                 the subnets already in use could not be listed"
+                    .to_owned(),
+            );
+            tracing::error!("{error}");
+            return Err(error);
+        };
         Ok(Self(table))
     }
 
     /// The interface index of the row holding `address`.
     fn interface_index(&self, address: Ipv4Addr) -> Option<u32> {
         // SAFETY: `self.0` is a table Windows filled in and this wrapper owns.
-        let table = unsafe { &*self.0 };
+        let table = unsafe { self.0.as_ref() };
         // SAFETY: `Table` is a flexible array of `NumEntries` rows; the
         // declared length of 1 is the C convention, not the real count.
         let rows =
@@ -212,7 +228,7 @@ impl UnicastAddressTable {
 
     fn ipv4_subnets(&self) -> Vec<Ipv4Subnet> {
         // SAFETY: `self.0` is a table Windows filled in and this wrapper owns.
-        let table = unsafe { &*self.0 };
+        let table = unsafe { self.0.as_ref() };
         // SAFETY: `Table` is a flexible array of `NumEntries` rows; the
         // declared length of 1 is the C convention, not the real count.
         let rows =
@@ -244,7 +260,7 @@ impl Drop for UnicastAddressTable {
     fn drop(&mut self) {
         // SAFETY: This wrapper exclusively owns a table allocated by
         // `GetUnicastIpAddressTable` and frees it exactly once here.
-        unsafe { FreeMibTable(self.0.cast()) };
+        unsafe { FreeMibTable(self.0.as_ptr().cast()) };
     }
 }
 
