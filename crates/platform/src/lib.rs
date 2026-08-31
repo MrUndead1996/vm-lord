@@ -61,6 +61,7 @@ mod shutdown_workers;
 mod ssh;
 mod ssh_launches;
 mod ssh_session;
+mod ssh_sessions;
 mod ssh_port;
 mod ssh_terminal;
 mod start;
