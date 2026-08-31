@@ -117,7 +117,8 @@ application and a Linux guest agent. The commands are Cargo aliases, defined in
 | `cargo display-services` | the guest display services, `x86_64-unknown-linux-musl` | Windows, Linux |
 | `cargo check-windows` | compile-checks the application and the display viewer through `x86_64-pc-windows-gnu` | WSL |
 | `cargo test-windows` | builds and runs the Windows tests, the display viewer's included | WSL |
-| `cargo dist` | release build of everything -- `vmlord.exe`, `vmlord-com1.exe`, `vmlord-display.exe` and the agent -- collected into `target/dist/` | Windows |
+| `cargo dist` | release build of everything -- `vmlord.exe`, `vmlord-com1.exe`, `vmlord-ssh.exe`, `vmlord-display.exe` and the
+agent -- collected into `target/dist/` | Windows |
 | `cargo gpu-payload pack ...` | release tooling that packs a prepared GPU payload | Windows, Linux |
 | `cargo release-manifest ...` | writes `release-manifest.json` from a finished installer's own bytes | Windows, Linux |
 

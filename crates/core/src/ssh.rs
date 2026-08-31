@@ -492,7 +492,10 @@ mod tests {
     #[test]
     fn a_refused_credential_is_told_from_the_log() {
         assert_eq!(
-            classify_session(Some(255), "machi@172.22.42.7: Permission denied (publickey)."),
+            classify_session(
+                Some(255),
+                "machi@172.22.42.7: Permission denied (publickey)."
+            ),
             SshSessionOutcome::AuthenticationFailed
         );
         assert_eq!(

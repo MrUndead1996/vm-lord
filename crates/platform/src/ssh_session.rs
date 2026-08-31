@@ -424,7 +424,10 @@ mod tests {
             "{}",
             report.detail
         );
-        assert!(!log.exists(), "the helper owns the log and takes it with it");
+        assert!(
+            !log.exists(),
+            "the helper owns the log and takes it with it"
+        );
     }
 
     #[test]

@@ -252,17 +252,32 @@ impl SshLauncher {
         let log_path = layout::ssh_session_log_path(vm_directory, session_id);
         let report_path = layout::ssh_session_report_path(vm_directory, session_id);
         let events = SessionEventNames::of(session_id);
-        let finished = WindowsEvent::create_named(&events.finished, true, false).map_err(
-            |error| SshLaunchFailure::Unhostable {
-                detail: error.to_string(),
-            },
-        )?;
+        let finished =
+            WindowsEvent::create_named(&events.finished, true, false).map_err(|error| {
+                SshLaunchFailure::Unhostable {
+                    detail: error.to_string(),
+                }
+            })?;
 
         // No connect timeout: an interactive session is one a person is
         // watching, and a deadline VMLord invented would close their window
         // mid-handshake.
-        let invocation = ssh::invocation(&client, &endpoint, vm_directory, None, None, Some(&log_path));
-        let hosted = helper_invocation(&helper, &invocation, &report_path, &log_path, &events, &mapping.vm_name);
+        let invocation = ssh::invocation(
+            &client,
+            &endpoint,
+            vm_directory,
+            None,
+            None,
+            Some(&log_path),
+        );
+        let hosted = helper_invocation(
+            &helper,
+            &invocation,
+            &report_path,
+            &log_path,
+            &events,
+            &mapping.vm_name,
+        );
 
         // Inserted before the terminal starts: a session that fails the instant
         // it is hosted must find something waiting to hear it.
@@ -876,7 +891,9 @@ mod tests {
         let launcher = launcher(&attempts);
 
         for _ in 0..3 {
-            launcher.launch(&mapping(), vm_directory(), &SshSessions::default()).unwrap();
+            launcher
+                .launch(&mapping(), vm_directory(), &SshSessions::default())
+                .unwrap();
         }
 
         assert_eq!(attempts.count(), 3);
@@ -925,7 +942,11 @@ mod tests {
         );
 
         let failure = launcher
-            .launch(&mapping_with(Some(damaged)), vm_directory(), &SshSessions::default())
+            .launch(
+                &mapping_with(Some(damaged)),
+                vm_directory(),
+                &SshSessions::default(),
+            )
             .unwrap_err();
 
         let SshLaunchFailure::Unusable { detail } = &failure else {
@@ -945,7 +966,9 @@ mod tests {
                 |_| panic!("nor a session to open"),
             );
 
-            let failure = launcher.launch(&mapping(), vm_directory(), &SshSessions::default()).unwrap_err();
+            let failure = launcher
+                .launch(&mapping(), vm_directory(), &SshSessions::default())
+                .unwrap_err();
 
             assert_eq!(failure, SshLaunchFailure::NoAddress);
         }
@@ -974,7 +997,9 @@ mod tests {
             ..config()
         }));
 
-        let failure = launcher.launch(&mapping, vm_directory(), &SshSessions::default()).unwrap_err();
+        let failure = launcher
+            .launch(&mapping, vm_directory(), &SshSessions::default())
+            .unwrap_err();
 
         assert_eq!(
             *probed.lock().unwrap(),
@@ -1006,7 +1031,9 @@ mod tests {
             |_| panic!("a login with no key to offer must not be attempted"),
         );
 
-        let failure = launcher.launch(&mapping(), vm_directory(), &SshSessions::default()).unwrap_err();
+        let failure = launcher
+            .launch(&mapping(), vm_directory(), &SshSessions::default())
+            .unwrap_err();
 
         assert_eq!(
             *asked.lock().unwrap(),
@@ -1034,7 +1061,9 @@ mod tests {
             ..config()
         }));
 
-        launcher.launch(&mapping, vm_directory(), &SshSessions::default()).unwrap();
+        launcher
+            .launch(&mapping, vm_directory(), &SshSessions::default())
+            .unwrap();
 
         let arguments = attempts.arguments(0);
         assert!(

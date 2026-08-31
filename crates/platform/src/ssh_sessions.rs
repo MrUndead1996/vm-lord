@@ -399,7 +399,9 @@ mod tests {
     fn a_vm_with_no_session_directory_is_nothing_to_sweep() {
         let fixture = fixture("no-directory");
 
-        fixture.sessions.sweep(fixture.root.path().join("absent").as_path());
+        fixture
+            .sessions
+            .sweep(fixture.root.path().join("absent").as_path());
     }
 
     #[test]

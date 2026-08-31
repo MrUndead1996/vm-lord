@@ -94,6 +94,7 @@ if (-not (Test-Path -LiteralPath $DistDir -PathType Container)) {
 # The binaries the application launches by name from beside itself.
 Require-File 'vmlord.exe'
 Require-File 'vmlord-com1.exe'
+Require-File 'vmlord-ssh.exe'
 Require-File 'vmlord-display.exe'
 Require-PeSubsystem 'vmlord.exe' 2 'Windows GUI'
 # The guest agent, which is copied into the VM rather than run on the host.

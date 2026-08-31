@@ -719,7 +719,10 @@ mod tests {
             Some(r"C:\VMs\dev-linux\ssh-sessions\a.log")
         );
         assert!(
-            invocation_without_command().args.iter().all(|argument| argument != "-E"),
+            invocation_without_command()
+                .args
+                .iter()
+                .all(|argument| argument != "-E"),
             "no other caller writes a log: they read the client's output themselves"
         );
     }
