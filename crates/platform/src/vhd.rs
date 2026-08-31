@@ -11,8 +11,12 @@ use windows::{
             CREATE_VIRTUAL_DISK_PARAMETERS_0, CREATE_VIRTUAL_DISK_PARAMETERS_0_1,
             CREATE_VIRTUAL_DISK_VERSION_2, CreateVirtualDisk, GET_VIRTUAL_DISK_INFO,
             GET_VIRTUAL_DISK_INFO_SIZE, GetVirtualDiskInformation, OPEN_VIRTUAL_DISK_FLAG_NONE,
-            OpenVirtualDisk, VIRTUAL_DISK_ACCESS_GET_INFO, VIRTUAL_DISK_ACCESS_NONE,
-            VIRTUAL_STORAGE_TYPE, VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
+            OPEN_VIRTUAL_DISK_PARAMETERS, OPEN_VIRTUAL_DISK_PARAMETERS_0,
+            OPEN_VIRTUAL_DISK_PARAMETERS_0_1, OPEN_VIRTUAL_DISK_VERSION_2, OpenVirtualDisk,
+            RESIZE_VIRTUAL_DISK_FLAG_NONE, RESIZE_VIRTUAL_DISK_PARAMETERS,
+            RESIZE_VIRTUAL_DISK_PARAMETERS_0, RESIZE_VIRTUAL_DISK_PARAMETERS_0_0,
+            RESIZE_VIRTUAL_DISK_VERSION_1, ResizeVirtualDisk, VIRTUAL_DISK_ACCESS_GET_INFO,
+            VIRTUAL_DISK_ACCESS_NONE, VIRTUAL_STORAGE_TYPE, VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
             VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT,
         },
     },
@@ -107,6 +111,108 @@ pub(crate) fn create_dynamic_vhdx(path: &Path, size_bytes: u64) -> Result<(), Re
     Ok(())
 }
 
+/// Grows the VHDX at `path` until the guest sees `size_bytes`.
+///
+/// Growth only. `ResizeVirtualDisk` shrinks a disk just as willingly as it
+/// grows one, and cutting a disk off underneath a filesystem that still
+/// believes in the old size destroys it, so anything that is not larger than
+/// the disk already is refused here rather than passed on.
+///
+/// The VM has to be stopped: Hyper-V holds a running VM's VHDX open
+/// exclusively, and the open below fails while it does.
+pub(crate) fn expand_vhdx(path: &Path, size_bytes: u64) -> Result<(), RepositoryError> {
+    if !path.is_file() {
+        return Err(RepositoryError::new(format!(
+            "the VHDX to expand does not exist: {}",
+            path.display()
+        )));
+    }
+    let current = virtual_size_bytes(path)?;
+    if size_bytes <= current {
+        return Err(RepositoryError::new(format!(
+            "{} already presents {current} bytes, so it cannot be resized to \
+             {size_bytes}: a disk may only grow",
+            path.display()
+        )));
+    }
+
+    tracing::debug!(
+        "expanding VHDX disk at {} from {current} to {size_bytes} bytes",
+        path.display()
+    );
+
+    let storage_type = VIRTUAL_STORAGE_TYPE {
+        DeviceId: VIRTUAL_STORAGE_TYPE_DEVICE_VHDX,
+        VendorId: VIRTUAL_STORAGE_TYPE_VENDOR_MICROSOFT,
+    };
+    let wide_path = HSTRING::from(path.as_os_str().to_string_lossy().as_ref());
+    let mut handle = HANDLE::default();
+    // A VHDX is opened for writing through Version 2 parameters and an empty
+    // access mask; asking for `VIRTUAL_DISK_ACCESS_METAOPS` instead -- the mask
+    // the resize is documented to need -- fails with `ERROR_ACCESS_DENIED`,
+    // the same misleading error the version mismatch produces on creation.
+    let open_parameters = OPEN_VIRTUAL_DISK_PARAMETERS {
+        Version: OPEN_VIRTUAL_DISK_VERSION_2,
+        Anonymous: OPEN_VIRTUAL_DISK_PARAMETERS_0 {
+            Version2: OPEN_VIRTUAL_DISK_PARAMETERS_0_1 {
+                GetInfoOnly: false.into(),
+                ReadOnly: false.into(),
+                ..Default::default()
+            },
+        },
+    };
+    // SAFETY: `storage_type`, `wide_path` and `open_parameters` outlive the
+    // call, and `handle` is only read after the call reports success.
+    let result = unsafe {
+        OpenVirtualDisk(
+            &storage_type,
+            &wide_path,
+            VIRTUAL_DISK_ACCESS_NONE,
+            OPEN_VIRTUAL_DISK_FLAG_NONE,
+            Some(&open_parameters),
+            &mut handle,
+        )
+    };
+    result.ok().map_err(|error| {
+        let error = windows_error("open virtual disk", None, error);
+        tracing::error!("{} for {}", error, path.display());
+        error
+    })?;
+
+    let parameters = RESIZE_VIRTUAL_DISK_PARAMETERS {
+        Version: RESIZE_VIRTUAL_DISK_VERSION_1,
+        Anonymous: RESIZE_VIRTUAL_DISK_PARAMETERS_0 {
+            Version1: RESIZE_VIRTUAL_DISK_PARAMETERS_0_0 {
+                NewSize: size_bytes,
+            },
+        },
+    };
+    // SAFETY: `handle` is the disk opened above and `parameters` outlives the
+    // call, which runs to completion because no `OVERLAPPED` is passed.
+    let result =
+        unsafe { ResizeVirtualDisk(handle, RESIZE_VIRTUAL_DISK_FLAG_NONE, &parameters, None) };
+    // SAFETY: `handle` came from the successful `OpenVirtualDisk` above and is
+    // closed exactly once here, after its last use.
+    let closed = unsafe { CloseHandle(handle) };
+
+    result.ok().map_err(|error| {
+        let error = windows_error("resize virtual disk", None, error);
+        tracing::error!("{} for {}", error, path.display());
+        error
+    })?;
+    closed.map_err(|error| {
+        let error = windows_error("close virtual disk handle", None, error);
+        tracing::error!("{error}");
+        error
+    })?;
+
+    tracing::info!(
+        "expanded VHDX disk at {} to {size_bytes} bytes",
+        path.display()
+    );
+    Ok(())
+}
+
 /// Reads the size the guest sees for the VHDX at `path`, in bytes.
 ///
 /// A dynamically-expanding disk's file is far smaller than the disk it
@@ -177,7 +283,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::create_dynamic_vhdx;
+    use super::{create_dynamic_vhdx, expand_vhdx, virtual_size_bytes};
 
     struct TempRoot(PathBuf);
 
@@ -236,6 +342,45 @@ mod tests {
 
         assert!(error.to_string().contains("parent directory"));
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn refuses_to_expand_a_disk_that_is_not_there() {
+        let root = temp_root("absent");
+        let target = root.path().join("disk.vhdx");
+
+        let error = expand_vhdx(&target, 1 << 30).unwrap_err();
+
+        assert!(error.to_string().contains("does not exist"));
+    }
+
+    /// The guard clauses above need no disk; growth and the refusal to shrink
+    /// cannot be checked without one, so these two create a real VHDX. Run
+    /// them with:
+    /// `cargo test-windows -p vmlord-platform --lib vhd::tests::expands -- --ignored --nocapture`
+    #[test]
+    #[ignore = "touches the real filesystem"]
+    fn expands_a_real_disk_to_the_size_it_was_given() {
+        let root = temp_root("expand");
+        let target = root.path().join("disk.vhdx");
+        create_dynamic_vhdx(&target, 1 << 30).unwrap();
+
+        expand_vhdx(&target, 2 << 30).expect("a disk should grow");
+
+        assert_eq!(virtual_size_bytes(&target).unwrap(), 2 << 30);
+    }
+
+    #[test]
+    #[ignore = "touches the real filesystem"]
+    fn expands_nothing_when_asked_for_a_smaller_disk() {
+        let root = temp_root("shrink");
+        let target = root.path().join("disk.vhdx");
+        create_dynamic_vhdx(&target, 2 << 30).unwrap();
+
+        let error = expand_vhdx(&target, 1 << 30).unwrap_err();
+
+        assert!(error.to_string().contains("may only grow"));
+        assert_eq!(virtual_size_bytes(&target).unwrap(), 2 << 30);
     }
 
     /// Every other test here only exercises the guard clauses; none actually
