@@ -99,6 +99,21 @@ message PlaneLayout {
   // Signed: a cursor plane goes negative at the left and top edges.
   sint32 x = 7;
   sint32 y = 8;
+  // Whether `damage` is the whole truth about what this commit repainted.
+  // False means the answer is not known, which is what a compositor that set
+  // no damage means and what a commit nobody read means: the encoder has to
+  // compare the frame instead of trusting a smaller list. An empty `damage`
+  // with this set is the other answer -- a commit that repainted nothing.
+  bool damage_known = 9;
+  repeated DamageRect damage = 10;
+}
+
+// A repainted region, in framebuffer pixels.
+message DamageRect {
+  uint32 x = 1;
+  uint32 y = 2;
+  uint32 width = 3;
+  uint32 height = 4;
 }
 
 enum PlaneKind {

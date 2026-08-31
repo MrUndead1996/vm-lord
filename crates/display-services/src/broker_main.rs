@@ -25,6 +25,8 @@ use vmlord_display_protocol::{
     v1::{DisplayTiming, ErrorCode},
 };
 
+use vmlord_display_codec::Rect;
+
 use crate::{
     control::{Control, Outcome, support_from},
     drm::{DRM_CLASS, DRM_DEVICES, Device, PlaneState},
@@ -863,7 +865,21 @@ fn capture_frames(mut device: Device, shared: &Shared) {
             }
         }
 
-        if send_snapshot(&device, request, shared, &snapshot.planes) {
+        // Worked out here rather than in `send_snapshot`, which cannot see
+        // what the peer was sent last time.
+        let damage = snapshot
+            .planes
+            .iter()
+            .find(|plane| plane.kind == PlaneKind::Primary)
+            .and_then(|plane| generations.damage(plane));
+
+        if send_snapshot(
+            &device,
+            request,
+            shared,
+            &snapshot.planes,
+            damage.as_deref(),
+        ) {
             generations.observe(&snapshot.planes, snapshot.generation_supported);
         } else {
             generations = SnapshotGenerations::default();
@@ -910,6 +926,9 @@ struct SnapshotGenerations {
     initialized: bool,
     primary: Option<u64>,
     cursor: Option<u64>,
+    /// How many times the primary plane had been committed when the peer was
+    /// last sent a snapshot. What damage is worth anything against.
+    primary_commits: Option<u64>,
 }
 
 impl SnapshotGenerations {
@@ -926,7 +945,33 @@ impl SnapshotGenerations {
         !self.initialized || self.primary != current_primary || self.cursor != current_cursor
     }
 
+    /// The damage this snapshot may be sent with, if it is the whole truth.
+    ///
+    /// Two things have to hold at once. The compositor has to have said what
+    /// it repainted -- an absent `FB_DAMAGE_CLIPS` means the whole
+    /// framebuffer, not nothing. And this has to be the very next commit of
+    /// the plane after the one the peer was last sent: damage describes one
+    /// commit's change against the framebuffer before it, so a commit nobody
+    /// read is a change nothing recorded. Handing on a smaller list than the
+    /// truth would leave tiles the viewer never receives and nothing anywhere
+    /// would notice.
+    fn damage(&self, plane: &PlaneState) -> Option<Vec<Rect>> {
+        let (Some(previous), Some(current)) = (self.primary_commits, plane.commits) else {
+            return None;
+        };
+        if !self.initialized || current != previous + 1 {
+            return None;
+        }
+
+        plane.damage.clone()
+    }
+
     fn observe(&mut self, planes: &[PlaneState], generation_supported: bool) {
+        self.primary_commits = planes
+            .iter()
+            .find(|plane| plane.kind == PlaneKind::Primary)
+            .and_then(|plane| plane.commits);
+
         if !generation_supported {
             return;
         }
@@ -1016,6 +1061,7 @@ fn send_snapshot(
     request: &PendingRequest,
     shared: &Shared,
     planes: &[PlaneState],
+    damage: Option<&[Rect]>,
 ) -> bool {
     let (lock, _) = &**shared;
     let mut state = lock.lock().expect("the broker's lock is not poisoned");
@@ -1035,6 +1081,12 @@ fn send_snapshot(
     for plane in planes {
         layouts.push(PlaneLayout {
             kind: plane.kind,
+            // The cursor plane is composited whole when it is composited at
+            // all, so its damage would say nothing the placement does not.
+            damage: match plane.kind {
+                PlaneKind::Primary => damage.map(<[Rect]>::to_vec),
+                PlaneKind::Cursor => None,
+            },
             buffer: u64::from(plane.fb_id),
             width: plane.width,
             height: plane.height,
@@ -1258,11 +1310,73 @@ mod tests {
         time::Duration,
     };
 
-    use super::{SOCKET_PATH, wait_for_device};
+    use super::{Rect, SOCKET_PATH, SnapshotGenerations, wait_for_device};
 
     /// The unit that ships in the payload, as the guest will read it.
     const BROKER_UNIT: &str =
         include_str!("../../../payloads/display/services/vmlord-display-broker.service");
+
+    /// A primary plane at a commit count, with the damage it reported.
+    fn committed(commits: u64, damage: Option<Vec<Rect>>) -> super::PlaneState {
+        super::PlaneState {
+            commits: Some(commits),
+            damage,
+            ..plane(1, false)
+        }
+    }
+
+    #[test]
+    fn damage_is_trusted_only_for_the_commit_after_the_one_the_peer_was_sent() {
+        // Damage describes one commit's change against the framebuffer before
+        // it. A commit nobody read is a change nothing recorded, and passing
+        // on the newer commit's smaller list would leave tiles the viewer
+        // never receives -- with no error anywhere to say so.
+        let mut generations = SnapshotGenerations::default();
+        let corner = vec![Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        }];
+
+        assert_eq!(
+            generations.damage(&committed(4, Some(corner.clone()))),
+            None,
+            "nothing was sent yet, so there is no base to describe a change against"
+        );
+
+        generations.observe(&[committed(4, Some(corner.clone()))], true);
+        assert_eq!(
+            generations.damage(&committed(5, Some(corner.clone()))),
+            Some(corner.clone()),
+            "the very next commit of the plane is the one damage was written for"
+        );
+        assert_eq!(
+            generations.damage(&committed(6, Some(corner.clone()))),
+            None,
+            "a commit that was never read leaves a change this list does not mention"
+        );
+        assert_eq!(
+            generations.damage(&committed(5, None)),
+            None,
+            "a compositor that reported nothing means the whole framebuffer, not none of it"
+        );
+        assert_eq!(
+            generations.damage(&committed(5, Some(Vec::new()))),
+            Some(Vec::new()),
+            "and a commit that repainted nothing is a different answer from no answer"
+        );
+    }
+
+    #[test]
+    fn a_module_that_does_not_count_commits_never_yields_damage() {
+        // The counter and the damage arrived together. A guest running the
+        // older module reports neither, and capture has to compare.
+        let mut generations = SnapshotGenerations::default();
+        generations.observe(&[plane(1, false)], true);
+
+        assert_eq!(generations.damage(&plane(1, false)), None);
+    }
 
     /// A plane over a framebuffer id, with everything else out of the way.
     fn plane(fb_id: u32, fresh: bool) -> super::PlaneState {
@@ -1277,6 +1391,8 @@ mod tests {
             y: 0,
             fresh,
             generation: None,
+            commits: None,
+            damage: None,
         }
     }
 

@@ -15,7 +15,7 @@ use std::{fmt, io::Write};
 use prost::Message as _;
 use vmlord_display_codec::{
     CodecError, CursorImage, CursorPosition, Encoder, EncoderConfig, Frame, Geometry, Payload,
-    PixelFormat,
+    PixelFormat, Rect,
 };
 use vmlord_display_protocol::{
     record::{self, Channel, Header, Limits, RecordError},
@@ -71,6 +71,16 @@ struct DrawnCursor {
     placement: Placement,
 }
 
+/// The part of the frame a placed cursor covers.
+fn drawn_rect(placement: Placement) -> Rect {
+    Rect {
+        x: placement.x,
+        y: placement.y,
+        width: placement.crop.width,
+        height: placement.crop.height,
+    }
+}
+
 /// The frame channel's producer: one per bound socket.
 pub struct Pipeline {
     encoder: Encoder,
@@ -92,6 +102,12 @@ pub struct Pipeline {
     /// The composite's scratch frame, kept so a running stream allocates
     /// nothing per frame.
     composite: Vec<u8>,
+    /// The damage handed to the encoder, kept for the same reason.
+    damage: Vec<Rect>,
+    /// Where the pointer was drawn into the frame before this one, when it
+    /// was. What the composite wrote is a change the primary plane's damage
+    /// has never heard of.
+    pointer: Option<Rect>,
 }
 
 impl Pipeline {
@@ -106,6 +122,8 @@ impl Pipeline {
             last_frame_sequence: 0,
             drawn_cursor: None,
             composite: Vec::new(),
+            damage: Vec::new(),
+            pointer: None,
         }
     }
 
@@ -145,14 +163,36 @@ impl Pipeline {
     /// [`CodecError`] if the frame does not match the encoder's geometry.
     pub fn submit_frame(&mut self, frame: &CapturedFrame) -> Result<(), CodecError> {
         let stride = frame.stride as usize;
-        let drawn = if self.cursor_stream {
+        let pointer = if self.cursor_stream {
             None
         } else {
-            self.drawn_cursor.as_ref()
+            self.drawn_cursor
+                .as_ref()
+                .map(|cursor| cursor.placement)
+                .filter(|placement| placement.visible)
+                .map(drawn_rect)
         };
 
-        let Some(cursor) = drawn else {
-            return frame.read(|pixels| self.encoder.submit(Frame { pixels, stride }, None));
+        // Two rectangles the compositor's damage cannot know about: where the
+        // pointer is being drawn now, and where it was drawn into the frame
+        // before this one. The cursor is on its own plane, so nothing repaints
+        // the desktop under it, and a trail left behind would stay until the
+        // protective keyframe came round.
+        let known = frame.damage.is_some();
+        self.damage.clear();
+        if let Some(rects) = frame.damage.as_deref() {
+            self.damage.extend_from_slice(rects);
+        }
+        self.damage.extend(self.pointer);
+        self.damage.extend(pointer);
+        self.pointer = pointer;
+        let hint = known.then_some(self.damage.as_slice());
+
+        if pointer.is_none() {
+            return frame.read(|pixels| self.encoder.submit(Frame { pixels, stride }, hint));
+        }
+        let Some(cursor) = self.drawn_cursor.as_ref() else {
+            return frame.read(|pixels| self.encoder.submit(Frame { pixels, stride }, hint));
         };
 
         // The frame is copied because it must not be written: it is a
@@ -179,7 +219,7 @@ impl Pipeline {
                 pixels: &self.composite,
                 stride,
             },
-            None,
+            hint,
         )
     }
 
@@ -378,7 +418,7 @@ mod tests {
         v1::FrameRecord,
     };
 
-    use super::Pipeline;
+    use super::{Pipeline, Rect};
 
     fn geometry() -> Geometry {
         Geometry::new(64, 64, TileSize::ThirtyTwo, PixelFormat::Xrgb8888).unwrap()
@@ -586,6 +626,115 @@ mod tests {
             with_cursor, without,
             "a fully transparent cursor changes no byte of the frame"
         );
+    }
+
+    #[test]
+    fn a_pointer_that_moved_leaves_no_trail_when_the_compositor_reported_no_damage() {
+        // The composite writes pixels the primary plane's damage has never
+        // heard of: the cursor is on its own plane, so a compositor that
+        // repainted nothing reports nothing, and a delta that believed it
+        // would leave the old pointer on the viewer's screen until the
+        // protective keyframe came round.
+        let limits = Limits::new(64, 64);
+        let mut pipeline = Pipeline::new(geometry(), 1, false);
+        let mut bytes = Vec::new();
+        pipeline.write_stream_config(&mut bytes, &limits).unwrap();
+
+        let cursor = [0x00u8, 0x00, 0xff, 0xff].repeat(4 * 4);
+        let place = |x, y| crate::cursor::place(x, y, 4, 4, 64, 64);
+
+        pipeline
+            .submit_cursor(Some((&cursor, 4, 4)), &place(8, 8))
+            .unwrap();
+        pipeline.submit_frame(&damaged(0x11, Some(&[]))).unwrap();
+        bytes.clear();
+        while pipeline.write_next(&mut bytes, &limits).unwrap() {}
+
+        let mut decoder = vmlord_display_codec::Decoder::new(geometry());
+        apply(&mut decoder, &bytes, &limits);
+
+        pipeline
+            .submit_cursor(Some((&cursor, 4, 4)), &place(40, 40))
+            .unwrap();
+        pipeline.submit_frame(&damaged(0x11, Some(&[]))).unwrap();
+        bytes.clear();
+        while pipeline.write_next(&mut bytes, &limits).unwrap() {}
+        apply(&mut decoder, &bytes, &limits);
+
+        let decoded = decoder.frame();
+        let pixel = |x: usize, y: usize| &decoded[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4];
+        assert_eq!(
+            pixel(40, 40),
+            [0x00, 0x00, 0xff, 0xff],
+            "the pointer is drawn where it moved to"
+        );
+        assert_eq!(
+            pixel(8, 8),
+            [0x11, 0x11, 0x11, 0x11],
+            "and the desktop is back where it left"
+        );
+    }
+
+    #[test]
+    fn damage_the_compositor_reported_reaches_the_encoder() {
+        // Damage that names one tile and a frame that changed everywhere: what
+        // arrives is what was named, which is the whole point of trusting it.
+        let limits = Limits::new(64, 64);
+        let mut pipeline = Pipeline::new(geometry(), 1, true);
+        let mut bytes = Vec::new();
+        pipeline.write_stream_config(&mut bytes, &limits).unwrap();
+        pipeline.submit_frame(&damaged(0x11, None)).unwrap();
+        bytes.clear();
+        while pipeline.write_next(&mut bytes, &limits).unwrap() {}
+
+        let mut decoder = vmlord_display_codec::Decoder::new(geometry());
+        apply(&mut decoder, &bytes, &limits);
+
+        let corner = Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        pipeline
+            .submit_frame(&damaged(0x22, Some(&[corner])))
+            .unwrap();
+        bytes.clear();
+        while pipeline.write_next(&mut bytes, &limits).unwrap() {}
+        apply(&mut decoder, &bytes, &limits);
+
+        let decoded = decoder.frame();
+        let pixel = |x: usize, y: usize| &decoded[(y * 64 + x) * 4..(y * 64 + x) * 4 + 4];
+        assert_eq!(
+            pixel(0, 0),
+            [0x22, 0x22, 0x22, 0x22],
+            "the named tile moved"
+        );
+        assert_eq!(
+            pixel(63, 63),
+            [0x11, 0x11, 0x11, 0x11],
+            "and a tile the compositor did not name was not looked at"
+        );
+    }
+
+    /// Applies every frame record in `bytes` to a decoder.
+    fn apply(decoder: &mut vmlord_display_codec::Decoder, bytes: &[u8], limits: &Limits) {
+        let mut reader = bytes;
+        let mut payload = Vec::new();
+        while let Ok(header) = record::read(&mut reader, limits, &mut payload) {
+            if header.message_type == FrameRecord::Keyframe as u16 {
+                decoder.apply_keyframe(&payload).unwrap();
+            } else if header.message_type == FrameRecord::TileDelta as u16 {
+                decoder.apply_delta(&payload).unwrap();
+            }
+        }
+    }
+
+    /// A frame of one shade that says what changed in it.
+    fn damaged(shade: u8, damage: Option<&[Rect]>) -> crate::capture::CapturedFrame {
+        let mut captured = frame(shade);
+        captured.damage = damage.map(<[Rect]>::to_vec);
+        captured
     }
 
     fn frame(shade: u8) -> crate::capture::CapturedFrame {

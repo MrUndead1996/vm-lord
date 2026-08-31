@@ -197,9 +197,12 @@ pub struct CapturedFrame {
     pub format: PixelFormat,
     /// What changed since the last frame, when the source can say.
     ///
-    /// Always `None` here: this module has no damage source, and the encoder
-    /// treats `None` as "compare the tiles". A later task fills it from the
-    /// module's own damage reporting.
+    /// `None` is "nobody knows", and the encoder answers it by comparing every
+    /// tile against its reference. `Some` of an empty list is the other
+    /// answer: a commit that repainted nothing at all. What fills this in is
+    /// the primary plane's `FB_DAMAGE_CLIPS`, and only for the commit
+    /// immediately after the one already encoded -- the broker decides that,
+    /// because it is the side that knows which commits the session has seen.
     pub damage: Option<Vec<Rect>>,
     /// The pixels themselves.
     pub backing: Backing,

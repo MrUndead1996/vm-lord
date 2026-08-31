@@ -42,6 +42,7 @@
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_crtc.h>
+#include <drm/drm_damage_helper.h>
 #include <drm/drm_drv.h>
 /*
  * Every DRM header this file needs is included by name, and none is relied on
@@ -173,7 +174,18 @@ struct vmlord_device {
 	struct drm_plane primary;
 	struct drm_plane cursor;
 	struct drm_property *generation_property;
+	struct drm_property *commits_property;
 	atomic64_t generation;
+	/*
+	 * How many times each plane has been committed. The global generation
+	 * orders commits but cannot count the ones a single plane took: two
+	 * updates of the primary and one of each plane both move the primary's
+	 * generation by two. Capture needs the count to know whether the
+	 * damage blob it is about to read describes every change since it last
+	 * looked, so each plane keeps its own.
+	 */
+	atomic64_t primary_commits;
+	atomic64_t cursor_commits;
 	struct hrtimer vblank_timer;
 	/* How long one frame lasts at the enabled mode's refresh rate. */
 	ktime_t period;
@@ -250,6 +262,8 @@ static void vmlord_plane_atomic_update(struct drm_plane *plane,
 	struct vmlord_device *vmlord =
 		container_of(plane->dev, struct vmlord_device, drm);
 	u64 generation = atomic64_inc_return(&vmlord->generation);
+	atomic64_t *commits = plane->type == DRM_PLANE_TYPE_CURSOR ?
+		&vmlord->cursor_commits : &vmlord->primary_commits;
 
 	/*
 	 * Capture reads this immutable property with the rest of the plane state.
@@ -259,6 +273,9 @@ static void vmlord_plane_atomic_update(struct drm_plane *plane,
 	drm_object_property_set_value(&plane->base,
 				      vmlord->generation_property,
 				      generation);
+	drm_object_property_set_value(&plane->base,
+				      vmlord->commits_property,
+				      atomic64_inc_return(commits));
 }
 
 static const struct drm_plane_helper_funcs vmlord_plane_helper_funcs = {
@@ -562,6 +579,14 @@ static int vmlord_pipe_init(struct vmlord_device *vmlord)
 		return -ENOMEM;
 	atomic64_set(&vmlord->generation, 0);
 
+	vmlord->commits_property =
+		drm_property_create_range(drm, DRM_MODE_PROP_IMMUTABLE,
+					  "VMLORD_PLANE_COMMITS", 0, U64_MAX);
+	if (!vmlord->commits_property)
+		return -ENOMEM;
+	atomic64_set(&vmlord->primary_commits, 0);
+	atomic64_set(&vmlord->cursor_commits, 0);
+
 	error = drm_universal_plane_init(drm, &vmlord->primary, 1,
 					 &vmlord_plane_funcs, vmlord_formats,
 					 ARRAY_SIZE(vmlord_formats),
@@ -571,7 +596,22 @@ static int vmlord_pipe_init(struct vmlord_device *vmlord)
 		return error;
 	drm_object_attach_property(&vmlord->primary.base,
 				   vmlord->generation_property, 0);
+	drm_object_attach_property(&vmlord->primary.base,
+				   vmlord->commits_property, 0);
 	drm_plane_helper_add(&vmlord->primary, &vmlord_plane_helper_funcs);
+	/*
+	 * The primary plane's damage, which is what keeps capture from
+	 * comparing eight megabytes against the last frame to discover that a
+	 * clock changed. Only the primary: a cursor is small enough to re-encode
+	 * whole, and mutter reports damage for the plane it repaints.
+	 *
+	 * What a compositor puts here is damage against the framebuffer this
+	 * plane last showed, which is the frame capture last read -- the same
+	 * base the encoder's reference frame holds. A commit capture did not
+	 * see is a commit whose damage nothing recorded, which is why the
+	 * commit count above travels beside it.
+	 */
+	drm_plane_enable_fb_damage_clips(&vmlord->primary);
 
 	error = drm_universal_plane_init(drm, &vmlord->cursor, 1,
 					 &vmlord_plane_funcs,
@@ -583,6 +623,8 @@ static int vmlord_pipe_init(struct vmlord_device *vmlord)
 		return error;
 	drm_object_attach_property(&vmlord->cursor.base,
 				   vmlord->generation_property, 0);
+	drm_object_attach_property(&vmlord->cursor.base,
+				   vmlord->commits_property, 0);
 	drm_plane_helper_add(&vmlord->cursor, &vmlord_plane_helper_funcs);
 
 	error = drm_crtc_init_with_planes(drm, &vmlord->crtc, &vmlord->primary,

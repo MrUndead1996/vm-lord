@@ -19,9 +19,9 @@
 //! It needs the rights `DRM_IOCTL_MODE_GETFB2` needs, which in a guest means
 //! running it under `sudo`.
 
-use std::{io, path::Path, time::Instant};
+use std::{collections::HashMap, io, path::Path, time::Instant};
 
-use vmlord_display_codec::{Decoder, Geometry, PixelFormat, TileSize};
+use vmlord_display_codec::{Decoder, Geometry, PixelFormat, Rect, TileSize};
 use vmlord_display_protocol::{
     record::{self, Limits},
     v1,
@@ -42,6 +42,26 @@ const DRIVER: &str = "vmlord_drm";
 /// How many times each plane is read, unless `--reads` names another count.
 const READS: u32 = 200;
 
+/// How many commits the damage check watches, unless `--damage` names another
+/// count. Two hundred is a few seconds of a desktop that is doing something.
+const DAMAGE_FRAMES: u32 = 200;
+
+/// How many vblanks the damage check waits through with nothing committed
+/// before it gives up and reports what it has.
+///
+/// A guest with a still screen commits nothing at all, and a probe that waited
+/// for frames that are not coming is a probe that never returns.
+const DAMAGE_STALL: u32 = 600;
+
+/// What the probe was asked to do.
+struct Arguments {
+    reads: u32,
+    /// Commits to run the damage check over. Zero skips it, which is what a
+    /// guest with nothing moving on screen wants: the check waits for commits
+    /// that are not coming.
+    damage: u32,
+}
+
 /// What one plane's reads came to.
 struct Report {
     kind: &'static str,
@@ -57,29 +77,34 @@ struct Report {
     mean_sync_only_ms: f64,
 }
 
-/// Reads `--reads`.
-fn parse<I: IntoIterator<Item = String>>(arguments: I) -> Result<u32, String> {
+/// Reads `--reads` and `--damage`.
+fn parse<I: IntoIterator<Item = String>>(arguments: I) -> Result<Arguments, String> {
     let mut values = arguments.into_iter();
-    let mut reads = READS;
+    let mut parsed = Arguments {
+        reads: READS,
+        damage: DAMAGE_FRAMES,
+    };
 
     while let Some(flag) = values.next() {
+        let mut number = |name: &str| -> Result<u32, String> {
+            values
+                .next()
+                .ok_or_else(|| format!("missing value for {name}"))?
+                .parse()
+                .map_err(|_| format!("{name} wants a number"))
+        };
         match flag.as_str() {
-            "--reads" => {
-                reads = values
-                    .next()
-                    .ok_or_else(|| "missing value for --reads".to_owned())?
-                    .parse()
-                    .map_err(|_| "--reads wants a number".to_owned())?;
-            }
+            "--reads" => parsed.reads = number("--reads")?,
+            "--damage" => parsed.damage = number("--damage")?,
             _ => return Err(format!("unknown argument `{flag}`")),
         }
     }
 
-    if reads == 0 {
+    if parsed.reads == 0 {
         return Err("--reads wants at least one read".to_owned());
     }
 
-    Ok(reads)
+    Ok(parsed)
 }
 
 /// Sums a buffer's bytes.
@@ -308,6 +333,339 @@ fn through_pipeline(
     })
 }
 
+/// What running the live desktop past the encoder twice came to.
+struct DamageReport {
+    frames: u32,
+    /// Whether the desktop stopped committing before the asked-for count was
+    /// reached, which is a still screen rather than a fault.
+    stalled: bool,
+    /// Frames whose damage the driver and the compositor between them could
+    /// account for in full.
+    trusted: u32,
+    /// The mean share of the frame those rectangles covered.
+    mean_coverage: f64,
+    trusting_bytes: usize,
+    comparing_bytes: usize,
+    /// The mean time each pipeline spent encoding a frame. The hint spares no
+    /// bytes -- an honest one selects the same tiles the comparison would --
+    /// so what it saves is here, in the comparison it made unnecessary.
+    trusting_ms: f64,
+    comparing_ms: f64,
+    /// Whether the viewer that was told only about the damage ended up with
+    /// the same picture as the viewer that compared every tile.
+    ///
+    /// This is the question the whole scheme rests on. Damage that misses a
+    /// change is not an error anywhere -- the encoder is told a smaller truth
+    /// and believes it -- so the only way to find out is to encode the same
+    /// desktop both ways and compare what a decoder rebuilt.
+    identical: bool,
+    /// The frame the two first disagreed at, if they did.
+    diverged_at: Option<u32>,
+    /// The box that first differed, and what the compositor had said changed.
+    /// Together these say whether the damage was merely late or somewhere else
+    /// entirely.
+    diverged_box: Option<(u32, u32, u32, u32)>,
+    diverged_damage: Option<Vec<Rect>>,
+    /// The first frame where the pixels changed somewhere the compositor's
+    /// damage did not mention, with that box and what it did mention.
+    ///
+    /// Compared against the frame before rather than against an encoder's
+    /// reference, so this says what the compositor got wrong without any of
+    /// the codec in the way.
+    uncovered_at: Option<u32>,
+    uncovered_box: Option<(u32, u32, u32, u32)>,
+    uncovered_damage: Option<Vec<Rect>>,
+}
+
+/// The box of pixels that changed and that no rectangle in `damage` covers.
+fn uncovered(
+    previous: &[u8],
+    current: &[u8],
+    width: u32,
+    damage: &[Rect],
+) -> Option<(u32, u32, u32, u32)> {
+    let mut box_of: Option<(u32, u32, u32, u32)> = None;
+    for (index, (before, after)) in previous
+        .chunks_exact(4)
+        .zip(current.chunks_exact(4))
+        .enumerate()
+    {
+        if before == after {
+            continue;
+        }
+        let x = index as u32 % width;
+        let y = index as u32 / width;
+        if damage.iter().any(|rect| {
+            x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+        }) {
+            continue;
+        }
+        box_of = Some(match box_of {
+            None => (x, y, x + 1, y + 1),
+            Some((x1, y1, x2, y2)) => (x1.min(x), y1.min(y), x2.max(x + 1), y2.max(y + 1)),
+        });
+    }
+
+    box_of
+}
+
+/// The box two frames differ in, in pixels, or `None` if they do not.
+fn difference(left: &[u8], right: &[u8], width: u32) -> Option<(u32, u32, u32, u32)> {
+    let row = width as usize * 4;
+    let mut box_of: Option<(u32, u32, u32, u32)> = None;
+    for (index, (a, b)) in left.chunks_exact(4).zip(right.chunks_exact(4)).enumerate() {
+        if a == b {
+            continue;
+        }
+        let x = (index % (row / 4)) as u32;
+        let y = (index / (row / 4)) as u32;
+        box_of = Some(match box_of {
+            None => (x, y, x + 1, y + 1),
+            Some((x1, y1, x2, y2)) => (x1.min(x), y1.min(y), x2.max(x + 1), y2.max(y + 1)),
+        });
+    }
+
+    box_of
+}
+
+/// Encodes the live desktop twice at once: trusting damage, and comparing.
+///
+/// Both pipelines see the same captured frames in the same order, so what is
+/// left between them is the hint. A viewer is simulated for each, and the two
+/// pictures are compared after every frame.
+fn verify_damage(device: &mut Device, frames: u32) -> Result<DamageReport, String> {
+    let mut buffers: HashMap<u32, MappedBuffer> = HashMap::new();
+    let mut geometry: Option<Geometry> = None;
+    let mut limits = Limits::new(1, 1);
+    let mut trusting: Option<Pipeline> = None;
+    let mut comparing: Option<Pipeline> = None;
+    let mut trusting_view: Option<Decoder> = None;
+    let mut comparing_view: Option<Decoder> = None;
+
+    let mut previous_commits: Option<u64> = None;
+    let mut report = DamageReport {
+        frames: 0,
+        stalled: false,
+        trusted: 0,
+        mean_coverage: 0.0,
+        trusting_bytes: 0,
+        comparing_bytes: 0,
+        trusting_ms: 0.0,
+        comparing_ms: 0.0,
+        identical: true,
+        diverged_at: None,
+        diverged_box: None,
+        diverged_damage: None,
+        uncovered_at: None,
+        uncovered_box: None,
+        uncovered_damage: None,
+    };
+    let mut before: Option<Vec<u8>> = None;
+    let mut coverage = 0.0f64;
+    let (mut trusting_nanos, mut comparing_nanos) = (0u128, 0u128);
+
+    let mut tail = Vec::new();
+    let mut idle = 0u32;
+    while report.frames < frames {
+        if idle >= DAMAGE_STALL {
+            break;
+        }
+        if device.wait_vblank().is_err() {
+            // The output's clock is off, which is a blanked desktop rather
+            // than a fault. Waiting a frame's worth keeps this from spinning.
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            idle += 1;
+            continue;
+        }
+        let snapshot = device
+            .snapshot()
+            .map_err(|error| format!("the planes could not be read: {error} (try sudo)"))?;
+        let Some(primary) = snapshot
+            .planes
+            .iter()
+            .find(|plane| plane.kind == PlaneKind::Primary)
+        else {
+            continue;
+        };
+
+        // The session's rule, applied here so this measures what ships: damage
+        // counts only for the very next commit after the one already encoded.
+        let damage = match (previous_commits, primary.commits) {
+            (Some(previous), Some(current)) if current == previous + 1 => primary.damage.clone(),
+            _ => None,
+        };
+        if primary.commits == previous_commits {
+            idle += 1;
+            continue;
+        }
+        idle = 0;
+        previous_commits = primary.commits;
+
+        let shape = Geometry::new(
+            primary.width,
+            primary.height,
+            TileSize::ThirtyTwo,
+            PixelFormat::Xrgb8888,
+        )
+        .map_err(|error| format!("the desktop is not a geometry the codec accepts: {error}"))?;
+        if geometry != Some(shape) {
+            geometry = Some(shape);
+            limits = Limits::new(primary.width, primary.height);
+            trusting = Some(Pipeline::new(shape, 1, true));
+            comparing = Some(Pipeline::new(shape, 1, true));
+            trusting_view = Some(Decoder::new(shape));
+            comparing_view = Some(Decoder::new(shape));
+            buffers.clear();
+        }
+
+        // A framebuffer id the kernel handed to a different buffer is an id
+        // whose mapping means nothing any more. The session is told the same
+        // thing and remaps; a probe that did not would read one buffer while
+        // believing it was reading another.
+        if primary.fresh {
+            buffers.remove(&primary.fb_id);
+        }
+
+        // Taken out of the table for the length of the frame, as the session
+        // does it: a captured frame owns its backing, and this mapping
+        // outlives the frame.
+        let mapped = match buffers.remove(&primary.fb_id) {
+            Some(mapped) => mapped,
+            None => {
+                let length = primary.stride as usize * primary.height as usize;
+                let Some(descriptor) = device.buffer(primary.fb_id) else {
+                    continue;
+                };
+                MappedBuffer::map(descriptor, length)
+                    .map_err(|error| format!("the desktop would not map: {error}"))?
+            }
+        };
+
+        if let Some(rects) = damage.as_deref() {
+            report.trusted += 1;
+            let area: u64 = rects
+                .iter()
+                .map(|rect| u64::from(rect.width) * u64::from(rect.height))
+                .sum();
+            coverage += area as f64 / f64::from(primary.width * primary.height);
+        }
+
+        // Read once into a copy, because the two submissions must see the
+        // same pixels. The compositor goes on painting into the buffers it
+        // cycles through, so two reads of the same mapping a millisecond apart
+        // are not promised to agree -- and a difference from that would look
+        // exactly like damage that lied.
+        let pixels = mapped.read(<[u8]>::to_vec);
+        buffers.insert(primary.fb_id, mapped);
+
+        let mut frame = CapturedFrame {
+            sequence: u64::from(report.frames),
+            width: primary.width,
+            height: primary.height,
+            stride: primary.stride,
+            format: PixelFormat::Xrgb8888,
+            damage,
+            backing: Backing::Owned(pixels),
+        };
+
+        trusting
+            .as_mut()
+            .expect("a pipeline was built with the geometry")
+            .submit_frame(&frame)
+            .map_err(|error| format!("the desktop was refused: {error}"))?;
+
+        let reported = frame.damage.clone();
+        if report.uncovered_at.is_none()
+            && let (Some(previous), Some(rects), Backing::Owned(pixels)) =
+                (before.as_deref(), reported.as_deref(), &frame.backing)
+            && let Some(box_of) = uncovered(previous, pixels, primary.width, rects)
+        {
+            report.uncovered_at = Some(report.frames);
+            report.uncovered_box = Some(box_of);
+            report.uncovered_damage = reported.clone();
+        }
+        if let Backing::Owned(pixels) = &frame.backing {
+            before = Some(pixels.clone());
+        }
+
+        frame.damage = None;
+        comparing
+            .as_mut()
+            .expect("a pipeline was built with the geometry")
+            .submit_frame(&frame)
+            .map_err(|error| format!("the desktop was refused: {error}"))?;
+
+        let started = Instant::now();
+        report.trusting_bytes += drain(
+            trusting.as_mut().expect("built above"),
+            trusting_view.as_mut().expect("built above"),
+            &limits,
+            &mut tail,
+        )?;
+        trusting_nanos += started.elapsed().as_nanos();
+
+        let started = Instant::now();
+        report.comparing_bytes += drain(
+            comparing.as_mut().expect("built above"),
+            comparing_view.as_mut().expect("built above"),
+            &limits,
+            &mut tail,
+        )?;
+        comparing_nanos += started.elapsed().as_nanos();
+
+        if report.identical {
+            let left = trusting_view.as_ref().expect("built above").frame();
+            let right = comparing_view.as_ref().expect("built above").frame();
+            if let Some(box_of) = difference(left, right, primary.width) {
+                report.identical = false;
+                report.diverged_at = Some(report.frames);
+                report.diverged_box = Some(box_of);
+                report.diverged_damage = reported;
+            }
+        }
+
+        report.frames += 1;
+    }
+
+    report.stalled = report.frames < frames;
+    if report.trusted > 0 {
+        report.mean_coverage = coverage / f64::from(report.trusted);
+    }
+    report.trusting_ms = trusting_nanos as f64 / f64::from(report.frames.max(1)) / 1e6;
+    report.comparing_ms = comparing_nanos as f64 / f64::from(report.frames.max(1)) / 1e6;
+
+    Ok(report)
+}
+
+/// Drains one pipeline into its viewer, and says how many bytes it wrote.
+fn drain(
+    pipeline: &mut Pipeline,
+    view: &mut Decoder,
+    limits: &Limits,
+    tail: &mut Vec<u8>,
+) -> Result<usize, String> {
+    tail.clear();
+    while pipeline
+        .write_next(tail, limits)
+        .map_err(|error| format!("a record would not be written: {error}"))?
+    {}
+
+    let written = tail.len();
+    let mut reader = tail.as_slice();
+    let mut payload = Vec::new();
+    while let Ok(header) = record::read(&mut reader, limits, &mut payload) {
+        if header.message_type == v1::FrameRecord::Keyframe as u16 {
+            view.apply_keyframe(&payload)
+                .map_err(|error| format!("a keyframe would not decode: {error}"))?;
+        } else if header.message_type == v1::FrameRecord::TileDelta as u16 {
+            view.apply_delta(&payload)
+                .map_err(|error| format!("a delta would not decode: {error}"))?;
+        }
+    }
+
+    Ok(written)
+}
+
 /// Reads the desktop and reports what the coherency bracket costs.
 ///
 /// # Errors
@@ -316,7 +674,7 @@ fn through_pipeline(
 /// case where no `vmlord_drm` card exists -- which is every machine that is not
 /// a VMLord guest.
 pub fn run<I: IntoIterator<Item = String>>(arguments: I) -> Result<(), String> {
-    let reads = parse(arguments)?;
+    let Arguments { reads, damage } = parse(arguments)?;
 
     let mut device = Device::find(DRIVER, Path::new(DRM_CLASS), Path::new(DRM_DEVICES))
         .map_err(|error: io::Error| format!("the card could not be opened: {error}"))?
@@ -390,12 +748,62 @@ pub fn run<I: IntoIterator<Item = String>>(arguments: I) -> Result<(), String> {
         );
     }
 
+    if damage == 0 {
+        return Ok(());
+    }
+
+    println!("\n{damage} commits encoded twice: trusting the compositor's damage, and comparing\n");
+    let report = verify_damage(&mut device, damage)?;
+    println!(
+        "{:<9}{:>13}{:>11}{:>13}{:>12}{:>13}{:>12}{:>11}",
+        "damage",
+        "with damage",
+        "coverage",
+        "trusting ms",
+        "bytes",
+        "comparing ms",
+        "bytes",
+        "identical"
+    );
+    println!(
+        "{:<9}{:>13}{:>11}{:>13.3}{:>12}{:>13.3}{:>12}{:>11}",
+        format!("{} frames", report.frames),
+        report.trusted,
+        format!("{:.2}%", report.mean_coverage * 100.0),
+        report.trusting_ms,
+        report.trusting_bytes,
+        report.comparing_ms,
+        report.comparing_bytes,
+        report.identical,
+    );
+    if report.stalled {
+        println!(
+            "\nthe desktop stopped committing after {} frames: move something on screen, or ask \
+             for fewer with --damage",
+            report.frames
+        );
+    }
+    if let Some(frame) = report.uncovered_at {
+        println!(
+            "\nat frame {frame} the desktop changed over {:?}, which the compositor's reported \
+             {:?} does not cover",
+            report.uncovered_box, report.uncovered_damage
+        );
+    }
+    if let Some(frame) = report.diverged_at {
+        println!(
+            "\nthe two viewers first disagreed at frame {frame}, over {:?}, where the compositor \
+             had reported {:?}",
+            report.diverged_box, report.diverged_damage
+        );
+    }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{READS, parse};
+    use super::{DAMAGE_FRAMES, READS, parse};
 
     fn arguments(items: &[&str]) -> Vec<String> {
         items.iter().map(|item| (*item).to_owned()).collect()
@@ -403,8 +811,17 @@ mod tests {
 
     #[test]
     fn the_default_is_two_hundred_reads() {
-        assert_eq!(parse(arguments(&[])).unwrap(), READS);
-        assert_eq!(parse(arguments(&["--reads", "5"])).unwrap(), 5);
+        assert_eq!(parse(arguments(&[])).unwrap().reads, READS);
+        assert_eq!(parse(arguments(&["--reads", "5"])).unwrap().reads, 5);
+    }
+
+    #[test]
+    fn the_damage_check_can_be_asked_for_by_length_or_skipped() {
+        assert_eq!(parse(arguments(&[])).unwrap().damage, DAMAGE_FRAMES);
+        assert_eq!(parse(arguments(&["--damage", "40"])).unwrap().damage, 40);
+        // Zero is not an error here: a guest with a still screen has no
+        // commits to watch, and the read measurements are still worth having.
+        assert_eq!(parse(arguments(&["--damage", "0"])).unwrap().damage, 0);
     }
 
     #[test]

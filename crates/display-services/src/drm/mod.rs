@@ -21,18 +21,21 @@ use std::{
     ptr,
 };
 
+use vmlord_display_codec::Rect;
+
 use crate::ipc::PlaneKind;
 
 use uapi::{
-    DMA_BUF_IOCTL_SYNC, DRM_CLIENT_CAP_UNIVERSAL_PLANES, DRM_FORMAT_ARGB8888,
-    DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_XRGB8888, DRM_IOCTL_DROP_MASTER, DRM_IOCTL_GEM_CLOSE,
-    DRM_IOCTL_MODE_GETCRTC, DRM_IOCTL_MODE_GETFB2, DRM_IOCTL_MODE_GETPLANE,
-    DRM_IOCTL_MODE_GETPLANERESOURCES, DRM_IOCTL_MODE_GETPROPERTY, DRM_IOCTL_MODE_GETRESOURCES,
-    DRM_IOCTL_MODE_OBJ_GETPROPERTIES, DRM_IOCTL_PRIME_HANDLE_TO_FD, DRM_IOCTL_SET_CLIENT_CAP,
-    DRM_IOCTL_WAIT_VBLANK, DRM_MODE_FLAG_DBLSCAN, DRM_MODE_FLAG_INTERLACE, DRM_MODE_OBJECT_PLANE,
-    DRM_VBLANK_RELATIVE, DmaBufSync, DrmGemClose, DrmModeCardRes, DrmModeCrtc, DrmModeFbCmd2,
-    DrmModeGetPlane, DrmModeGetPlaneRes, DrmModeGetProperty, DrmModeModeInfo,
-    DrmModeObjGetProperties, DrmPrimeHandle, DrmSetClientCap, DrmWaitVblank,
+    DMA_BUF_IOCTL_SYNC, DRM_CLIENT_CAP_ATOMIC, DRM_CLIENT_CAP_UNIVERSAL_PLANES,
+    DRM_FORMAT_ARGB8888, DRM_FORMAT_MOD_LINEAR, DRM_FORMAT_XRGB8888, DRM_IOCTL_DROP_MASTER,
+    DRM_IOCTL_GEM_CLOSE, DRM_IOCTL_MODE_GETCRTC, DRM_IOCTL_MODE_GETFB2, DRM_IOCTL_MODE_GETPLANE,
+    DRM_IOCTL_MODE_GETPLANERESOURCES, DRM_IOCTL_MODE_GETPROPBLOB, DRM_IOCTL_MODE_GETPROPERTY,
+    DRM_IOCTL_MODE_GETRESOURCES, DRM_IOCTL_MODE_OBJ_GETPROPERTIES, DRM_IOCTL_PRIME_HANDLE_TO_FD,
+    DRM_IOCTL_SET_CLIENT_CAP, DRM_IOCTL_WAIT_VBLANK, DRM_MODE_FLAG_DBLSCAN,
+    DRM_MODE_FLAG_INTERLACE, DRM_MODE_OBJECT_PLANE, DRM_VBLANK_RELATIVE, DmaBufSync, DrmGemClose,
+    DrmModeCardRes, DrmModeCrtc, DrmModeFbCmd2, DrmModeGetBlob, DrmModeGetPlane,
+    DrmModeGetPlaneRes, DrmModeGetProperty, DrmModeModeInfo, DrmModeObjGetProperties, DrmModeRect,
+    DrmPrimeHandle, DrmSetClientCap, DrmWaitVblank,
 };
 
 /// Where the kernel lists the DRM devices a machine has.
@@ -48,8 +51,18 @@ const PLANE_TYPE_CURSOR: u64 = 2;
 /// Driver-owned property incremented whenever a plane is committed.
 const VMLORD_GENERATION: &str = "VMLORD_GENERATION";
 
+/// Driver-owned property counting the commits of one plane.
+///
+/// The generation orders commits across the device but cannot count one
+/// plane's: capture needs the count to know whether the damage it is about to
+/// read describes every change since it last looked.
+const VMLORD_PLANE_COMMITS: &str = "VMLORD_PLANE_COMMITS";
+
+/// The core's blob property naming what a commit repainted.
+const FB_DAMAGE_CLIPS: &str = "FB_DAMAGE_CLIPS";
+
 /// One plane's framebuffer and where it sits, at one vblank.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlaneState {
     /// Which plane this is.
     pub kind: PlaneKind,
@@ -78,6 +91,19 @@ pub struct PlaneState {
     /// The driver commit that last changed this plane. `None` keeps capture
     /// compatible with an older module that does not expose generations.
     pub generation: Option<u64>,
+    /// How many times this plane has been committed, or `None` for a module
+    /// that does not count.
+    pub commits: Option<u64>,
+    /// What the last commit of this plane repainted, in framebuffer
+    /// coordinates.
+    ///
+    /// `None` means "unknown", which is what the compositor saying nothing
+    /// means: the DRM property is optional per commit, and its absence is
+    /// defined as the whole framebuffer being damaged. An empty list is the
+    /// other answer -- a commit that repainted nothing -- and the two must not
+    /// be confused, because one costs a comparison and the other would skip
+    /// pixels that changed.
+    pub damage: Option<Vec<Rect>>,
 }
 
 /// A coherent view of every active plane at one driver commit.
@@ -209,15 +235,17 @@ impl Device {
             }
         }
 
-        let mut capability = DrmSetClientCap {
-            capability: DRM_CLIENT_CAP_UNIVERSAL_PLANES,
-            value: 1,
-        };
-        ioctl(
-            descriptor.as_raw_fd(),
-            DRM_IOCTL_SET_CLIENT_CAP,
-            &mut capability,
-        )?;
+        for capability in [DRM_CLIENT_CAP_UNIVERSAL_PLANES, DRM_CLIENT_CAP_ATOMIC] {
+            let mut request = DrmSetClientCap {
+                capability,
+                value: 1,
+            };
+            ioctl(
+                descriptor.as_raw_fd(),
+                DRM_IOCTL_SET_CLIENT_CAP,
+                &mut request,
+            )?;
+        }
 
         Ok(Some(Self {
             descriptor,
@@ -406,9 +434,12 @@ impl Device {
 
             let fresh = self.export(plane.fb_id, framebuffer.handles[0])?;
             seen.push(plane.fb_id);
+            let damage = self.damage(&properties, framebuffer.width, framebuffer.height)?;
             states.push(PlaneState {
                 fresh,
+                damage,
                 generation: properties.get(VMLORD_GENERATION).copied(),
+                commits: properties.get(VMLORD_PLANE_COMMITS).copied(),
                 kind,
                 fb_id: plane.fb_id,
                 width: framebuffer.width,
@@ -425,6 +456,91 @@ impl Device {
         self.buffers.retain(|fb_id, _| seen.contains(fb_id));
 
         Ok(states)
+    }
+
+    /// What the plane's last commit repainted, clipped to the framebuffer.
+    ///
+    /// `None` whenever the answer is not known to be complete: a compositor
+    /// that set no damage on this commit, a driver too old to carry the
+    /// property, or a blob that went away between being named and being read.
+    /// The blob is read inside the generation bracket of [`Device::snapshot`],
+    /// which is what rules out reading a blob id that was recycled: a commit
+    /// in the middle of the read makes the whole snapshot happen again.
+    fn damage(
+        &self,
+        properties: &HashMap<String, u64>,
+        width: u32,
+        height: u32,
+    ) -> io::Result<Option<Vec<Rect>>> {
+        let Some(&blob_id) = properties.get(FB_DAMAGE_CLIPS) else {
+            return Ok(None);
+        };
+        let Ok(blob_id) = u32::try_from(blob_id) else {
+            return Ok(None);
+        };
+        if blob_id == 0 {
+            return Ok(None);
+        }
+
+        let Some(bytes) = self.blob(blob_id)? else {
+            return Ok(None);
+        };
+
+        let mut rects = Vec::with_capacity(bytes.len() / size_of::<DrmModeRect>());
+        for chunk in bytes.chunks_exact(size_of::<DrmModeRect>()) {
+            let value = |at: usize| {
+                i32::from_ne_bytes([chunk[at], chunk[at + 1], chunk[at + 2], chunk[at + 3]])
+            };
+            let x1 = value(0).clamp(0, width as i32);
+            let y1 = value(4).clamp(0, height as i32);
+            let x2 = value(8).clamp(0, width as i32);
+            let y2 = value(12).clamp(0, height as i32);
+            if x2 <= x1 || y2 <= y1 {
+                continue;
+            }
+            rects.push(Rect {
+                x: x1 as u32,
+                y: y1 as u32,
+                width: (x2 - x1) as u32,
+                height: (y2 - y1) as u32,
+            });
+        }
+
+        Ok(Some(rects))
+    }
+
+    /// The bytes behind a blob property, or `None` if the blob is already gone.
+    fn blob(&self, blob_id: u32) -> io::Result<Option<Vec<u8>>> {
+        let mut request = DrmModeGetBlob {
+            blob_id,
+            ..DrmModeGetBlob::default()
+        };
+        match ioctl(
+            self.descriptor.as_raw_fd(),
+            DRM_IOCTL_MODE_GETPROPBLOB,
+            &mut request,
+        ) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
+
+        let length = request.length as usize;
+        if length == 0 {
+            return Ok(Some(Vec::new()));
+        }
+
+        let mut bytes = vec![0u8; length];
+        request.data = bytes.as_mut_ptr() as u64;
+        match ioctl(
+            self.descriptor.as_raw_fd(),
+            DRM_IOCTL_MODE_GETPROPBLOB,
+            &mut request,
+        ) {
+            Ok(()) => Ok(Some(bytes)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
     }
 
     /// Every plane's driver generation, or `None` for a legacy module.

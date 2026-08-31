@@ -8,6 +8,7 @@
 use std::{error::Error, fmt};
 
 use prost::Message as _;
+use vmlord_display_codec::Rect;
 
 use crate::broker::{self, envelope};
 
@@ -97,7 +98,7 @@ pub enum PlaneKind {
 }
 
 /// One plane at one vblank.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlaneLayout {
     /// Which plane this is.
     pub kind: PlaneKind,
@@ -115,6 +116,12 @@ pub struct PlaneLayout {
     pub x: i32,
     /// The plane's top edge on the CRTC. Negative at the top edge.
     pub y: i32,
+    /// What this commit repainted, when that is known in full.
+    ///
+    /// `None` is "unknown", and the encoder answers it by comparing the frame
+    /// against its reference. `Some` of an empty list is the other answer: a
+    /// commit that repainted nothing at all.
+    pub damage: Option<Vec<Rect>>,
 }
 
 /// A datagram this build cannot read.
@@ -253,6 +260,18 @@ fn from_wire(message: envelope::Message) -> Result<Message, IpcError> {
 
 fn plane_into_wire(plane: &PlaneLayout) -> broker::PlaneLayout {
     broker::PlaneLayout {
+        damage_known: plane.damage.is_some(),
+        damage: plane
+            .damage
+            .iter()
+            .flatten()
+            .map(|rect| broker::DamageRect {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+            })
+            .collect(),
         kind: i32::from(match plane.kind {
             PlaneKind::Primary => broker::PlaneKind::Primary,
             PlaneKind::Cursor => broker::PlaneKind::Cursor,
@@ -283,6 +302,18 @@ fn plane_from_wire(plane: &broker::PlaneLayout) -> Result<PlaneLayout, IpcError>
 
     Ok(PlaneLayout {
         kind,
+        damage: plane.damage_known.then(|| {
+            plane
+                .damage
+                .iter()
+                .map(|rect| Rect {
+                    x: rect.x,
+                    y: rect.y,
+                    width: rect.width,
+                    height: rect.height,
+                })
+                .collect()
+        }),
         buffer: plane.buffer,
         width: plane.width,
         height: plane.height,
@@ -295,7 +326,7 @@ fn plane_from_wire(plane: &broker::PlaneLayout) -> Result<PlaneLayout, IpcError>
 
 #[cfg(test)]
 mod tests {
-    use super::{Message, PlaneKind, PlaneLayout, SessionParameters, decode, encode};
+    use super::{Message, PlaneKind, PlaneLayout, Rect, SessionParameters, decode, encode};
 
     fn parameters() -> SessionParameters {
         SessionParameters {
@@ -332,6 +363,7 @@ mod tests {
                 sequence: 42,
                 planes: vec![PlaneLayout {
                     kind: PlaneKind::Primary,
+                    damage: None,
                     buffer: 3,
                     width: 1920,
                     height: 1080,
@@ -350,6 +382,46 @@ mod tests {
         for message in messages {
             let bytes = encode(&message);
             assert_eq!(decode(&bytes).expect("a message this build wrote"), message);
+        }
+    }
+
+    #[test]
+    fn a_commit_that_repainted_nothing_survives_the_wire_as_itself() {
+        // The distinction the whole scheme rests on: an empty list is "nothing
+        // changed" and absent is "nobody knows". Proto3 has no optional
+        // repeated field, so the flag beside it is what carries the
+        // difference, and a round trip that lost it would make an unknown
+        // frame look like an unchanged one -- and freeze the viewer's picture.
+        for damage in [
+            None,
+            Some(Vec::new()),
+            Some(vec![Rect {
+                x: 16,
+                y: 32,
+                width: 8,
+                height: 4,
+            }]),
+        ] {
+            let message = Message::Snapshot {
+                sequence: 1,
+                planes: vec![PlaneLayout {
+                    kind: PlaneKind::Primary,
+                    damage: damage.clone(),
+                    buffer: 3,
+                    width: 64,
+                    height: 64,
+                    stride: 256,
+                    format: crate::drm::uapi::DRM_FORMAT_XRGB8888,
+                    x: 0,
+                    y: 0,
+                }],
+                new_buffers: Vec::new(),
+            };
+
+            assert_eq!(
+                decode(&encode(&message)).expect("this build wrote it"),
+                message
+            );
         }
     }
 
@@ -388,6 +460,7 @@ mod tests {
             sequence: 1,
             planes: vec![PlaneLayout {
                 kind: PlaneKind::Cursor,
+                damage: None,
                 buffer: 9,
                 width: 64,
                 height: 64,

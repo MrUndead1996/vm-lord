@@ -620,7 +620,7 @@ impl<F: Acceptor, I: Acceptor> Loop<F, I> {
             height: primary.height,
             stride: primary.stride,
             format: pixel_format(primary.format),
-            damage: None,
+            damage: primary.damage.clone(),
             backing: Backing::Cpu(mapped),
         };
         let outcome = frame.pipeline.submit_frame(&captured);
@@ -1550,6 +1550,7 @@ mod tests {
             let planes = vec![
                 PlaneLayout {
                     kind: PlaneKind::Primary,
+                    damage: None,
                     buffer: primary_buffer,
                     width: WIDTH,
                     height: HEIGHT,
@@ -1560,6 +1561,7 @@ mod tests {
                 },
                 PlaneLayout {
                     kind: PlaneKind::Cursor,
+                    damage: None,
                     buffer: cursor_buffer,
                     width: 257,
                     height: 1,
@@ -1604,6 +1606,7 @@ mod tests {
             let buffer = crate::unix::memfd("frame", &pixels).expect("a framebuffer");
             let planes = vec![PlaneLayout {
                 kind: PlaneKind::Primary,
+                damage: None,
                 buffer: sequence,
                 width,
                 height,
