@@ -102,3 +102,30 @@ fn the_userspace_steps_travel_beside_the_kernel_ones() {
     assert_eq!(report.stages[1].step(), GpuRecipeStep::VulkanIcd);
     assert_eq!(report.stages[2].step(), GpuRecipeStep::Environment);
 }
+
+#[test]
+fn the_recipe_has_a_step_for_the_signing_key_and_one_for_the_signature() {
+    use vmlord_agent_protocol::v1::DisplayRecipeStep;
+
+    assert_eq!(i32::from(DisplayRecipeStep::SigningKey), 11);
+    assert_eq!(i32::from(DisplayRecipeStep::ModuleSignature), 12);
+}
+
+#[test]
+fn a_recipe_answer_can_carry_the_certificate_the_guest_signs_with() {
+    use vmlord_agent_protocol::v1::{ApplyDisplayRecipeResponse, DisplaySigningCertificate};
+
+    let answer = ApplyDisplayRecipeResponse {
+        stages: Vec::new(),
+        versions: None,
+        signing_certificate: Some(DisplaySigningCertificate {
+            certificate: vec![0x30, 0x82],
+            sha256: "ab".repeat(32),
+            subject_key_identifier: "0a1b2c".to_owned(),
+        }),
+    };
+
+    let certificate = answer.signing_certificate.expect("the field exists");
+    assert_eq!(certificate.certificate, vec![0x30, 0x82]);
+    assert_eq!(certificate.subject_key_identifier, "0a1b2c");
+}
