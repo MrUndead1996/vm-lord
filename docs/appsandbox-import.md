@@ -99,7 +99,10 @@ for the VM's other files.
 7. **Restarting** -- the guest boots again, this time as an ordinary VMLord VM
    with the agent, the display share and the GPU share the import asked for.
 8. **Verifying** -- SSH answers with VMLord's key, the agent unit is active,
-   and the display and GPU shares are mounted where the agent puts them.
+   and the display and GPU shares are mounted where the agent puts them. Each
+   is asked until it is true rather than once: a guest answers SSH the moment
+   sshd is up, which is before its agent has connected to the host and mounted
+   anything.
 9. **Finished** -- ordinary VM metadata is written last, and the recovery
    journal is removed only after that write is durable.
 

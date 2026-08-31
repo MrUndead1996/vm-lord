@@ -61,6 +61,14 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 /// question and expects an immediate answer.
 const CHECK_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How long to wait before asking a second-boot check again.
+///
+/// Longer than [`POLL_INTERVAL`] because every attempt is a whole SSH session,
+/// process and handshake included, and because what is being waited for moves
+/// in seconds: the guest answers SSH as soon as sshd is up, but the agent has
+/// still to connect to the host and mount the two payload shares.
+const CHECK_INTERVAL: Duration = Duration::from_secs(3);
+
 /// The file name the guest agent is shipped beside VMLord under.
 const AGENT_FILE_NAME: &str = "vmlord-agent";
 
@@ -453,14 +461,46 @@ impl GuestChecks {
                 Some(timeouts.connect),
                 Some(command),
             );
-            let answer = run_remote(&invocation, &transcript, CHECK_TIMEOUT);
-            answer.map(drop).map_err(|error| {
+            // Asked until it is true rather than once. A guest answers SSH the
+            // moment sshd is up, which is before its agent has connected to the
+            // host and mounted the payload shares -- so a single ask reports a
+            // guest that is merely early as a guest that is wrong.
+            let deadline = Instant::now() + timeouts.ssh_port;
+            keep_asking(deadline, CHECK_INTERVAL, || {
+                run_remote(&invocation, &transcript, CHECK_TIMEOUT).map(drop)
+            })
+            .map_err(|error| {
                 RepositoryError::new(format!(
                     "the imported VM \"{}\" did not answer for {what}: {error}",
                     mapping.vm_name
                 ))
             })
         }
+    }
+}
+
+/// Runs `attempt` until it succeeds or `deadline` passes.
+///
+/// The failure carried out is the last one, not the first: what a check was
+/// still refusing when the time ran out is what says why the guest is wrong,
+/// and an early refusal from a guest that was simply not ready yet says
+/// nothing.
+fn keep_asking(
+    deadline: Instant,
+    interval: Duration,
+    mut attempt: impl FnMut() -> Result<(), RepositoryError>,
+) -> Result<(), RepositoryError> {
+    loop {
+        match attempt() {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return Err(error);
+                }
+                tracing::debug!("a second-boot check is not true yet: {error}");
+            }
+        }
+        std::thread::sleep(interval);
     }
 }
 
@@ -816,4 +856,55 @@ fn read_transcript(transcript: &Path) -> String {
         let _ = file.read_to_string(&mut text);
     }
     text
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        cell::Cell,
+        time::{Duration, Instant},
+    };
+
+    use vmlord_core::RepositoryError;
+
+    use super::keep_asking;
+
+    #[test]
+    fn a_check_that_comes_true_stops_being_asked() {
+        // The guest answers SSH before its agent has mounted the payload
+        // shares, so the first refusals are a guest that is early rather than
+        // one that is wrong.
+        let attempts = Cell::new(0);
+
+        keep_asking(
+            Instant::now() + Duration::from_secs(60),
+            Duration::ZERO,
+            || {
+                attempts.set(attempts.get() + 1);
+                if attempts.get() < 3 {
+                    return Err(RepositoryError::new("not mounted yet"));
+                }
+                Ok(())
+            },
+        )
+        .expect("a check that comes true is a check that passed");
+
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[test]
+    fn a_check_that_never_comes_true_reports_its_last_refusal() {
+        // Not its first: a guest that was still refusing when the time ran out
+        // is what says why the import failed.
+        let attempts = Cell::new(0);
+
+        let error = keep_asking(Instant::now(), Duration::ZERO, || {
+            attempts.set(attempts.get() + 1);
+            Err(RepositoryError::new(format!("refusal {}", attempts.get())))
+        })
+        .expect_err("a check that never comes true is a failure");
+
+        assert_eq!(attempts.get(), 1);
+        assert!(error.to_string().contains("refusal 1"), "{error}");
+    }
 }
