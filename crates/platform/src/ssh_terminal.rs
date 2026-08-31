@@ -26,14 +26,22 @@ use std::{
     time::Duration,
 };
 
+use uuid::Uuid;
 use vmlord_core::{RepositoryError, SshAuthentication};
 
 use crate::{
     com1_terminal::{TerminalCommand, spawn_terminal},
+    event::WindowsEvent,
     layout,
     metadata::VmComputeSystemMapping,
     ssh::{self, SshInvocation},
+    ssh_sessions::{SshSessionHandle, SshSessions},
 };
+
+/// The helper a terminal hosts, which runs the client and reports how the
+/// session ended. It ships beside `vmlord.exe` because that is where this
+/// looks for it.
+const HELPER_FILE_NAME: &str = "vmlord-ssh.exe";
 
 /// How long the one preflight connection to the guest's SSH port waits.
 ///
@@ -74,6 +82,14 @@ pub(crate) enum SshLaunchFailure {
     NoTerminal {
         refusals: Vec<String>,
     },
+    /// The session could not be prepared: the helper that hosts one is not
+    /// beside `vmlord.exe`, or the events it reports through could not be
+    /// created. Refused rather than falling back to a bare client, because a
+    /// session nobody can hear the end of is what this path exists to stop
+    /// being normal.
+    Unhostable {
+        detail: String,
+    },
 }
 
 impl fmt::Display for SshLaunchFailure {
@@ -108,6 +124,9 @@ impl fmt::Display for SshLaunchFailure {
                 "no terminal could be started for the session ({})",
                 refusals.join("; ")
             ),
+            Self::Unhostable { detail } => {
+                write!(formatter, "the session could not be prepared: {detail}")
+            }
         }
     }
 }
@@ -130,6 +149,10 @@ pub(crate) struct SshLauncher {
     /// it for the next run of VMLord, and a launch that probed for it every
     /// time would still be answering the same question.
     client: Option<PathBuf>,
+    /// `None` when the helper is not beside `vmlord.exe`. Resolved once, for
+    /// the reason the client is: an installation does not grow a file between
+    /// two clicks.
+    helper: Option<PathBuf>,
     address: AddressSource,
     port: PortProbe,
     key: KeyProbe,
@@ -142,6 +165,7 @@ impl SshLauncher {
     pub(crate) fn production() -> Self {
         Self {
             client: ssh::client_path(),
+            helper: helper_path(),
             address: Box::new(ssh::guest_address),
             port: Box::new(probe_port_at),
             key: Box::new(|path: &Path| path.is_file()),
@@ -163,11 +187,21 @@ impl SshLauncher {
         &self,
         mapping: &VmComputeSystemMapping,
         vm_directory: &Path,
+        sessions: &SshSessions,
     ) -> Result<SshInvocation, SshLaunchFailure> {
         let client = self.client.clone().ok_or(SshLaunchFailure::NoSshClient)?;
         if mapping.ssh.is_none() {
             return Err(SshLaunchFailure::Disabled);
         }
+        // Asked before the guest is: a VMLord installed without its helper
+        // cannot host a session at all, and finding that out after a port
+        // probe would only make the same refusal slower.
+        let helper = self
+            .helper
+            .clone()
+            .ok_or_else(|| SshLaunchFailure::Unhostable {
+                detail: format!("{HELPER_FILE_NAME} is not beside vmlord.exe"),
+            })?;
 
         let address = match (self.address)(mapping) {
             Ok(Some(address)) => address,
@@ -209,11 +243,42 @@ impl SshLauncher {
             }
         }
 
+        // What earlier runs left behind, before anything is written into the
+        // same directory: the reports this VMLord waits for are the ones it
+        // holds, and nothing else in there will ever be read.
+        sessions.sweep(vm_directory);
+
+        let session_id = Uuid::new_v4();
+        let log_path = layout::ssh_session_log_path(vm_directory, session_id);
+        let report_path = layout::ssh_session_report_path(vm_directory, session_id);
+        let events = SessionEventNames::of(session_id);
+        let finished = WindowsEvent::create_named(&events.finished, true, false).map_err(
+            |error| SshLaunchFailure::Unhostable {
+                detail: error.to_string(),
+            },
+        )?;
+
         // No connect timeout: an interactive session is one a person is
         // watching, and a deadline VMLord invented would close their window
         // mid-handshake.
-        let invocation = ssh::invocation(&client, &endpoint, vm_directory, None, None);
-        self.spawn_somewhere(&invocation, &mapping.vm_name)?;
+        let invocation = ssh::invocation(&client, &endpoint, vm_directory, None, None, Some(&log_path));
+        let hosted = helper_invocation(&helper, &invocation, &report_path, &log_path, &events, &mapping.vm_name);
+
+        // Inserted before the terminal starts: a session that fails the instant
+        // it is hosted must find something waiting to hear it.
+        sessions.insert(SshSessionHandle {
+            id: session_id,
+            vm_name: mapping.vm_name.clone(),
+            report_path,
+            finished,
+            alive_name: events.alive.clone(),
+        });
+        if let Err(failure) = self.spawn_somewhere(&hosted, &mapping.vm_name) {
+            // Nothing will ever signal for this one: the helper that would have
+            // was never started.
+            sessions.forget(session_id);
+            return Err(failure);
+        }
 
         tracing::info!(
             "an SSH session to VM \"{}\" was opened at {endpoint}",
@@ -264,6 +329,7 @@ impl SshLauncher {
     ) -> Self {
         Self {
             client: Some(PathBuf::from(r"C:\Windows\System32\OpenSSH\ssh.exe")),
+            helper: Some(PathBuf::from(r"C:\Program Files\VMLord\vmlord-ssh.exe")),
             address: Box::new(address),
             port: Box::new(port),
             key: Box::new(key),
@@ -271,16 +337,97 @@ impl SshLauncher {
         }
     }
 
+    /// A VMLord installed without its session helper: everything else about
+    /// the launch is fine, and nothing may be asked of the guest anyway.
+    #[cfg(test)]
+    pub(crate) fn for_test_without_helper() -> Self {
+        Self {
+            client: Some(PathBuf::from(r"C:\Windows\System32\OpenSSH\ssh.exe")),
+            helper: None,
+            address: Box::new(|_| panic!("nothing may be asked without a helper")),
+            port: Box::new(|_, _, _| panic!("nothing may be probed without a helper")),
+            key: Box::new(|_| panic!("no key matters without a helper")),
+            spawn: Arc::new(|_| panic!("nothing may be spawned without a helper")),
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test_without_client() -> Self {
         Self {
             client: None,
+            helper: Some(PathBuf::from(r"C:\Program Files\VMLord\vmlord-ssh.exe")),
             address: Box::new(|_| panic!("nothing may be asked without an ssh client")),
             port: Box::new(|_, _, _| panic!("nothing may be probed without an ssh client")),
             key: Box::new(|_| panic!("no key matters without an ssh client")),
             spawn: Arc::new(|_| panic!("nothing may be spawned without an ssh client")),
         }
     }
+}
+
+/// The two events one session and its helper share.
+struct SessionEventNames {
+    finished: String,
+    alive: String,
+}
+
+impl SessionEventNames {
+    /// Derives the names from the session's own id: unguessable, and local to
+    /// this logon session, so that nothing else on the machine can claim a
+    /// session is over.
+    fn of(session_id: Uuid) -> Self {
+        let prefix = format!(r"Local\VMLord.Ssh.{}", session_id.as_simple());
+        Self {
+            finished: format!("{prefix}.finished"),
+            alive: format!("{prefix}.alive"),
+        }
+    }
+}
+
+/// Wraps the client's run in the helper's, which is what a terminal hosts.
+///
+/// The helper's own arguments come first and the client's follow a `--`, so
+/// that an `ssh` option is never read as one of the helper's -- and so that the
+/// helper does not have to know what any of them mean.
+fn helper_invocation(
+    helper: &Path,
+    client: &SshInvocation,
+    report_path: &Path,
+    log_path: &Path,
+    events: &SessionEventNames,
+    vm_name: &str,
+) -> SshInvocation {
+    let mut args = vec![
+        OsString::from("--report"),
+        report_path.as_os_str().to_owned(),
+        OsString::from("--log"),
+        log_path.as_os_str().to_owned(),
+        OsString::from("--finished-event"),
+        OsString::from(&events.finished),
+        OsString::from("--alive-event"),
+        OsString::from(&events.alive),
+        OsString::from("--vm-name"),
+        OsString::from(vm_name),
+        OsString::from("--"),
+        client.program.as_os_str().to_owned(),
+    ];
+    args.extend(client.args.iter().cloned());
+
+    SshInvocation {
+        program: helper.to_path_buf(),
+        args,
+    }
+}
+
+/// Finds the helper beside the running executable.
+///
+/// `None` rather than an error: a VMLord whose helper is missing is a broken
+/// installation to report at the moment somebody asks for a session, not a
+/// reason to fail earlier and elsewhere.
+fn helper_path() -> Option<PathBuf> {
+    let helper = std::env::current_exe()
+        .ok()?
+        .with_file_name(HELPER_FILE_NAME);
+    helper.is_file().then_some(helper)
 }
 
 /// The two ways an SSH session can be put on screen, best first.
@@ -351,7 +498,9 @@ mod tests {
     use vmlord_core::{NetworkMode, RepositoryError, SshAuthentication, SshConfig, SshPort};
 
     use super::{PORT_PROBE_TIMEOUT, SshLaunchFailure, SshLauncher, TerminalCommand};
-    use crate::metadata::VmComputeSystemMapping;
+    use crate::{metadata::VmComputeSystemMapping, ssh_sessions::SshSessions};
+
+    const HELPER: &str = r"C:\Program Files\VMLord\vmlord-ssh.exe";
 
     const CLIENT: &str = r"C:\Windows\System32\OpenSSH\ssh.exe";
 
@@ -451,7 +600,7 @@ mod tests {
         let attempts = Attempts::default();
 
         launcher(&attempts)
-            .launch(&mapping(), vm_directory())
+            .launch(&mapping(), vm_directory(), &SshSessions::default())
             .unwrap();
 
         assert_eq!(attempts.count(), 1, "the first host that starts is the one");
@@ -477,15 +626,16 @@ mod tests {
         );
     }
 
-    /// What the launch reports is what it spawned. The repository puts this
-    /// line in front of a person, and a log describing a run other than the one
-    /// that happened is worse than no log at all.
+    /// What the launch reports is the client's own run, not the helper's line
+    /// around it. The repository puts this in front of a person, and what they
+    /// need to read is which key, which known-hosts file and which port -- the
+    /// helper's paths and event names say nothing about the login.
     #[test]
-    fn the_launch_reports_the_command_it_spawned() {
+    fn the_launch_reports_the_clients_own_command() {
         let attempts = Attempts::default();
 
         let invocation = launcher(&attempts)
-            .launch(&mapping(), vm_directory())
+            .launch(&mapping(), vm_directory(), &SshSessions::default())
             .unwrap();
 
         assert_eq!(invocation.program, Path::new(CLIENT));
@@ -494,11 +644,13 @@ mod tests {
             .iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect();
-        assert_eq!(
-            reported,
-            attempts.arguments(0)[7..],
-            "the arguments after Windows Terminal's own are the ones reported back"
-        );
+        let hosted = attempts.arguments(0);
+        let client = hosted
+            .iter()
+            .rposition(|argument| argument == "--")
+            .expect("the client follows the helper's own separator");
+        assert_eq!(hosted[client + 1], CLIENT);
+        assert_eq!(reported, hosted[client + 2..]);
     }
 
     /// The exact argument vector, in order: what Windows Terminal is told about
@@ -509,7 +661,7 @@ mod tests {
         let attempts = Attempts::default();
 
         launcher(&attempts)
-            .launch(&mapping(), vm_directory())
+            .launch(&mapping(), vm_directory(), &SshSessions::default())
             .unwrap();
 
         let arguments = attempts.arguments(0);
@@ -524,9 +676,52 @@ mod tests {
                 "--"
             ]
         );
-        assert_eq!(arguments[6], CLIENT);
         assert_eq!(
-            arguments[7..],
+            arguments[6], HELPER,
+            "what Windows Terminal hosts is the helper, which waits for the client"
+        );
+        // The helper's own arguments, in the order it parses them, and each
+        // value belonging to the session rather than to the machine.
+        assert_eq!(
+            [
+                arguments[7].as_str(),
+                arguments[9].as_str(),
+                arguments[11].as_str(),
+                arguments[13].as_str(),
+                arguments[15].as_str(),
+                arguments[17].as_str(),
+            ],
+            [
+                "--report",
+                "--log",
+                "--finished-event",
+                "--alive-event",
+                "--vm-name",
+                "--",
+            ]
+        );
+        assert!(
+            arguments[8].starts_with(r"C:\VMs\dev-linux\ssh-sessions\")
+                && arguments[8].ends_with(".json"),
+            "{arguments:?}"
+        );
+        assert!(
+            arguments[10].starts_with(r"C:\VMs\dev-linux\ssh-sessions\")
+                && arguments[10].ends_with(".log"),
+            "{arguments:?}"
+        );
+        assert!(
+            arguments[12].starts_with(r"Local\VMLord.Ssh.") && arguments[12].ends_with(".finished"),
+            "{arguments:?}"
+        );
+        assert!(
+            arguments[14].starts_with(r"Local\VMLord.Ssh.") && arguments[14].ends_with(".alive"),
+            "{arguments:?}"
+        );
+        assert_eq!(arguments[16], "dev-linux");
+        assert_eq!(arguments[18], CLIENT);
+        assert_eq!(
+            arguments[19..],
             [
                 "-o",
                 r#"HostKeyAlias="01234567-89ab-cdef-0123-456789abcdef""#,
@@ -540,6 +735,8 @@ mod tests {
                 r#"BatchMode="yes""#,
                 "-i",
                 r"C:\VMs\dev-linux\keys\id_ed25519",
+                "-E",
+                arguments[10].as_str(),
                 "-p",
                 "22",
                 "-l",
@@ -557,7 +754,7 @@ mod tests {
         let attempts = Attempts::default();
 
         launcher(&attempts)
-            .launch(&mapping(), vm_directory())
+            .launch(&mapping(), vm_directory(), &SshSessions::default())
             .unwrap();
 
         let arguments = attempts.arguments(0);
@@ -584,12 +781,16 @@ mod tests {
         };
 
         launcher(&attempts)
-            .launch(&mapping(), vm_directory())
+            .launch(&mapping(), vm_directory(), &SshSessions::default())
             .unwrap();
 
         assert_eq!(attempts.count(), 2);
         let fallback = &attempts.commands()[1];
-        assert_eq!(fallback.program, Path::new(CLIENT));
+        assert_eq!(
+            fallback.program,
+            Path::new(HELPER),
+            "the session is hosted the same way on both paths, so it reports the same way"
+        );
         assert!(
             fallback.create_new_console,
             "VMLord is a windowed process with no console to inherit"
@@ -597,7 +798,7 @@ mod tests {
         assert_eq!(
             attempts.arguments(1),
             attempts.arguments(0)[7..],
-            "the fallback is the same connection, just without a host in front of it"
+            "the fallback is the same session, just without a host in front of it"
         );
     }
 
@@ -609,7 +810,7 @@ mod tests {
         let attempts = Attempts::default();
 
         launcher(&attempts)
-            .launch(&mapping(), vm_directory())
+            .launch(&mapping(), vm_directory(), &SshSessions::default())
             .unwrap();
 
         assert_eq!(attempts.count(), 1);
@@ -623,7 +824,7 @@ mod tests {
         };
 
         let failure = launcher(&attempts)
-            .launch(&mapping(), vm_directory())
+            .launch(&mapping(), vm_directory(), &SshSessions::default())
             .unwrap_err();
 
         let SshLaunchFailure::NoTerminal { refusals } = &failure else {
@@ -632,7 +833,7 @@ mod tests {
         assert_eq!(refusals.len(), 2, "{refusals:?}");
         let message = failure.to_string();
         assert!(message.contains("wt.exe"), "{message}");
-        assert!(message.contains(CLIENT), "{message}");
+        assert!(message.contains(HELPER), "{message}");
         assert_eq!(
             message.matches("injected terminal failure").count(),
             2,
@@ -650,7 +851,7 @@ mod tests {
         };
 
         launcher(&attempts)
-            .launch(&mapping(), vm_directory())
+            .launch(&mapping(), vm_directory(), &SshSessions::default())
             .unwrap_err();
 
         for command in attempts.commands() {
@@ -675,7 +876,7 @@ mod tests {
         let launcher = launcher(&attempts);
 
         for _ in 0..3 {
-            launcher.launch(&mapping(), vm_directory()).unwrap();
+            launcher.launch(&mapping(), vm_directory(), &SshSessions::default()).unwrap();
         }
 
         assert_eq!(attempts.count(), 3);
@@ -684,7 +885,7 @@ mod tests {
     #[test]
     fn a_host_without_an_openssh_client_says_which_feature_is_missing() {
         let failure = SshLauncher::for_test_without_client()
-            .launch(&mapping(), vm_directory())
+            .launch(&mapping(), vm_directory(), &SshSessions::default())
             .unwrap_err();
 
         assert_eq!(failure, SshLaunchFailure::NoSshClient);
@@ -701,7 +902,7 @@ mod tests {
         );
 
         let failure = launcher
-            .launch(&mapping_with(None), vm_directory())
+            .launch(&mapping_with(None), vm_directory(), &SshSessions::default())
             .unwrap_err();
 
         assert_eq!(failure, SshLaunchFailure::Disabled);
@@ -724,7 +925,7 @@ mod tests {
         );
 
         let failure = launcher
-            .launch(&mapping_with(Some(damaged)), vm_directory())
+            .launch(&mapping_with(Some(damaged)), vm_directory(), &SshSessions::default())
             .unwrap_err();
 
         let SshLaunchFailure::Unusable { detail } = &failure else {
@@ -744,7 +945,7 @@ mod tests {
                 |_| panic!("nor a session to open"),
             );
 
-            let failure = launcher.launch(&mapping(), vm_directory()).unwrap_err();
+            let failure = launcher.launch(&mapping(), vm_directory(), &SshSessions::default()).unwrap_err();
 
             assert_eq!(failure, SshLaunchFailure::NoAddress);
         }
@@ -773,7 +974,7 @@ mod tests {
             ..config()
         }));
 
-        let failure = launcher.launch(&mapping, vm_directory()).unwrap_err();
+        let failure = launcher.launch(&mapping, vm_directory(), &SshSessions::default()).unwrap_err();
 
         assert_eq!(
             *probed.lock().unwrap(),
@@ -805,7 +1006,7 @@ mod tests {
             |_| panic!("a login with no key to offer must not be attempted"),
         );
 
-        let failure = launcher.launch(&mapping(), vm_directory()).unwrap_err();
+        let failure = launcher.launch(&mapping(), vm_directory(), &SshSessions::default()).unwrap_err();
 
         assert_eq!(
             *asked.lock().unwrap(),
@@ -833,7 +1034,7 @@ mod tests {
             ..config()
         }));
 
-        launcher.launch(&mapping, vm_directory()).unwrap();
+        launcher.launch(&mapping, vm_directory(), &SshSessions::default()).unwrap();
 
         let arguments = attempts.arguments(0);
         assert!(
@@ -878,6 +1079,82 @@ mod tests {
         assert!(messages[4].contains("port 22"), "{}", messages[4]);
         assert!(messages[5].contains("id_ed25519"), "{}", messages[5]);
         assert!(messages[6].contains("wt.exe"), "{}", messages[6]);
+    }
+
+    /// A session that opened is one VMLord is waiting to hear the end of: the
+    /// helper it started is the only thing that can report one, and nothing
+    /// else in the process is watching that window.
+    #[test]
+    fn an_opened_session_is_one_vmlord_waits_for() {
+        let attempts = Attempts::default();
+        let sessions = SshSessions::default();
+
+        launcher(&attempts)
+            .launch(&mapping(), vm_directory(), &sessions)
+            .unwrap();
+
+        // No helper really ran here -- the terminal is a stand-in -- so nothing
+        // holds the name a live session would hold, and the registry says the
+        // window is gone. What this proves is that the session was registered
+        // at all: an unregistered one would report nothing, ever.
+        let ended = sessions.reap();
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].vm_name, "dev-linux");
+    }
+
+    /// Nothing hosted it, so nothing will ever signal for it: a session left in
+    /// the registry here would be reported as a closed window that never opened.
+    #[test]
+    fn a_session_no_terminal_would_host_is_not_waited_for() {
+        let attempts = Attempts {
+            failures: 2,
+            ..Attempts::default()
+        };
+        let sessions = SshSessions::default();
+
+        let failure = launcher(&attempts)
+            .launch(&mapping(), vm_directory(), &sessions)
+            .unwrap_err();
+
+        assert!(matches!(failure, SshLaunchFailure::NoTerminal { .. }));
+        assert!(sessions.reap().is_empty());
+    }
+
+    /// Two shells into one guest write two logs and two reports, or the second
+    /// one would overwrite what the first is still saying.
+    #[test]
+    fn two_sessions_into_one_guest_do_not_share_a_file() {
+        let attempts = Attempts::default();
+        let launcher = launcher(&attempts);
+        let sessions = SshSessions::default();
+
+        for _ in 0..2 {
+            launcher
+                .launch(&mapping(), vm_directory(), &sessions)
+                .unwrap();
+        }
+
+        let first = attempts.arguments(0);
+        let second = attempts.arguments(1);
+        assert_ne!(first[8], second[8], "one report each");
+        assert_ne!(first[10], second[10], "one log each");
+        assert_ne!(first[12], second[12], "one finished event each");
+    }
+
+    /// A VMLord whose helper is missing cannot host a session at all, and says
+    /// so before it probes anything.
+    #[test]
+    fn an_installation_without_the_helper_refuses_before_it_asks_the_guest() {
+        let launcher = SshLauncher::for_test_without_helper();
+
+        let failure = launcher
+            .launch(&mapping(), vm_directory(), &SshSessions::default())
+            .unwrap_err();
+
+        let SshLaunchFailure::Unhostable { detail } = &failure else {
+            panic!("a missing helper is its own failure: {failure:?}");
+        };
+        assert!(detail.contains("vmlord-ssh.exe"), "{detail}");
     }
 
     #[test]

@@ -137,6 +137,20 @@ pub fn run_ssh_helper(options: SshHelperOptions) -> Result<(), RepositoryError> 
     // it -- VMLord learns that the session is over.
     let _finish = SignalOnDrop(&finished);
 
+    // The client is told to write its log with `-E`, and `-E` does not create
+    // a directory: a client that cannot open its log writes nothing anybody
+    // could classify afterwards. The helper owns that file end to end, so it
+    // owns the directory too, and VMLord's launcher touches no disk at all.
+    if let Some(directory) = options.log_path.parent()
+        && let Err(error) = fs::create_dir_all(directory)
+    {
+        tracing::warn!(
+            "the SSH session directory {} of VM \"{}\" could not be created: {error}",
+            directory.display(),
+            options.vm_name
+        );
+    }
+
     tracing::debug!(
         "hosting an SSH session to VM \"{}\" with {}",
         options.vm_name,

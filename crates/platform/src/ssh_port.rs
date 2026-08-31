@@ -328,6 +328,10 @@ impl SshPortMover {
             vm_directory,
             Some(CONNECT_TIMEOUT),
             Some(command),
+            // A port move runs a command and reads what it printed: this
+            // caller keeps the client's output itself, so there is nothing for
+            // a log file to answer.
+            None,
         )
     }
 
