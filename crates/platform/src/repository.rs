@@ -833,6 +833,7 @@ impl HcsVmRepository {
             self.display_runs.share(mapping.vm_id),
             self.gpu_runs.clone(),
             self.display_runs.clone(),
+            layout::display_mok_certificate_path(&vm_directory),
         ) {
             Ok(connection) => self.agent_sessions.insert(connection),
             Err(error) => tracing::warn!(

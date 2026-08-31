@@ -84,6 +84,15 @@ pub(crate) fn display_payload_active_directory(vm_directory: &Path) -> PathBuf {
     display_payload_staging_directory(vm_directory).join("active")
 }
 
+/// Where a VM's guest MOK certificate is kept for whoever enrolls it.
+///
+/// Under `display/` and not under `display-payload/`: a payload's staging
+/// directory is emptied when a generation replaces another, and the
+/// certificate outlives every payload version the VM ever runs.
+pub(crate) fn display_mok_certificate_path(vm_directory: &Path) -> PathBuf {
+    vm_directory.join("display").join("mok.der")
+}
+
 /// Returns the path of the VM's serial-console capture.
 ///
 /// Beside `config.json` rather than under `disks/`: it describes what the VM
@@ -232,7 +241,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        cloud_init_status_log_path, com1_log_path, configuration_path, seed_path, ssh_key_path,
+        cloud_init_status_log_path, com1_log_path, configuration_path,
+        display_mok_certificate_path, display_payload_staging_directory, seed_path, ssh_key_path,
         ssh_keys_directory, ssh_known_hosts_path, ssh_public_key_path, ssh_session_log_path,
         ssh_session_report_path, ssh_sessions_directory, system_disk_path, tools_path,
         vm_directory,
@@ -391,4 +401,19 @@ mod tests {
             sessions.join("123456789abcdef0123456789abcdef0.json")
         );
     }
+
+    #[test]
+    fn a_vms_signing_certificate_sits_with_its_display_and_not_in_the_payload_it_mounts() {
+        let vm = Path::new("/vms/dev");
+
+        assert_eq!(
+            display_mok_certificate_path(vm),
+            vm.join("display").join("mok.der")
+        );
+        assert!(
+            !display_mok_certificate_path(vm).starts_with(display_payload_staging_directory(vm)),
+            "a payload cleanup must not take the certificate with it"
+        );
+    }
+
 }

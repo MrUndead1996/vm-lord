@@ -367,6 +367,7 @@ mod tests {
                 loaded: Some("0.2.0".into()),
                 failure: None,
                 guest: None,
+                signing_certificate: None,
             },
         };
 
@@ -392,6 +393,7 @@ mod tests {
                     "0.2.0 did not verify; 0.1.0 is running again",
                 )),
                 guest: None,
+                signing_certificate: None,
             },
         };
 
