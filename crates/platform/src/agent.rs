@@ -16,7 +16,7 @@
 use std::{
     collections::BTreeMap,
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -39,6 +39,7 @@ use crate::{
     display_runs::DisplayRuns,
     gpu_runs::GpuRuns,
     hvsocket::{ACCEPT_POLL, AgentListener, AgentStream},
+    layout,
     metadata::VmComputeSystemMapping,
 };
 
@@ -232,17 +233,20 @@ impl AgentConnection {
     pub(crate) fn start(
         mapping: &VmComputeSystemMapping,
         runtime_id: Uuid,
-        secret_path: &Path,
+        // `vm_directory` rather than one path per file: the agent's secret and
+        // the guest's signing certificate are two names in the same directory,
+        // and `layout` is what knows them.
+        vm_directory: &Path,
         shares: Option<GpuShareManifest>,
         display_share: Option<DisplayShare>,
         facts: GpuRuns,
         display_facts: DisplayRuns,
-        mok_certificate_path: PathBuf,
     ) -> Result<Self, RepositoryError> {
         let vm_name = mapping.vm_name.clone();
         let vm_id = mapping.vm_id;
         let display_mode = mapping.display_mode;
-        let secret = read_secret(secret_path, &vm_name)?;
+        let secret = read_secret(&layout::agent_secret_path(vm_directory), &vm_name)?;
+        let mok_certificate_path = layout::display_mok_certificate_path(vm_directory);
         let listener = AgentListener::bind(&vm_name, runtime_id)?;
 
         let online = Arc::new(Mutex::new(false));

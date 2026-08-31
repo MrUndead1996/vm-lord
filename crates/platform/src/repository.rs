@@ -825,7 +825,7 @@ impl HcsVmRepository {
         match AgentConnection::start(
             mapping,
             runtime_id,
-            &layout::agent_secret_path(&vm_directory),
+            &vm_directory,
             // What the start of this run prepared, if this process ran it. A
             // VM reclaimed from a previous process was prepared by nobody
             // here, and has nothing to be told to mount.
@@ -833,7 +833,6 @@ impl HcsVmRepository {
             self.display_runs.share(mapping.vm_id),
             self.gpu_runs.clone(),
             self.display_runs.clone(),
-            layout::display_mok_certificate_path(&vm_directory),
         ) {
             Ok(connection) => self.agent_sessions.insert(connection),
             Err(error) => tracing::warn!(
