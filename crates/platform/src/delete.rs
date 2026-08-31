@@ -142,7 +142,8 @@ impl Default for VmDeletionPipeline {
 /// learned for it -- belongs to a guest nobody can reach through VMLord any
 /// more: a private key with no owner is worth removing on its own, and a
 /// `known_hosts` file kept past its VM would only pin the keys of a host that no
-/// longer answers. The kept disks are the user's to attach elsewhere, and a
+/// longer answers. What its SSH sessions left behind goes with them: those
+/// files report on logging in, which is the one thing nobody can do any more. The kept disks are the user's to attach elsewhere, and a
 /// guest booted from them brings its own `authorized_keys` with it, so it is
 /// theirs to give a key of their own.
 ///
@@ -178,6 +179,12 @@ fn remove_files(vm_directory: &Path, delete_disks: bool) -> Result<(), Repositor
     if let Err(error) = remove_file_if_present(
         &layout::ssh_known_hosts_path(vm_directory),
         "the learned SSH host keys",
+    ) {
+        failures.push(error.to_string());
+    }
+    if let Err(error) = remove_directory_if_present(
+        &layout::ssh_sessions_directory(vm_directory),
+        "what its SSH sessions left behind",
     ) {
         failures.push(error.to_string());
     }
@@ -332,6 +339,13 @@ mod tests {
             .expect("public key should be written");
         fs::write(crate::layout::ssh_known_hosts_path(&vm_directory), b"host")
             .expect("known hosts should be written");
+        fs::create_dir_all(crate::layout::ssh_sessions_directory(&vm_directory))
+            .expect("session directory should be created");
+        fs::write(
+            crate::layout::ssh_sessions_directory(&vm_directory).join("a.json"),
+            b"{}",
+        )
+        .expect("session report should be written");
         fs::write(
             crate::layout::cloud_init_status_log_path(&vm_directory),
             b"status: done",
@@ -580,6 +594,10 @@ mod tests {
             "the learned host keys pin a guest that can no longer be reached"
         );
         assert!(
+            !crate::layout::ssh_sessions_directory(&fixture.vm_directory).exists(),
+            "a report about logging into a VM nobody can reach is nobody's"
+        );
+        assert!(
             crate::layout::cloud_init_status_log_path(&fixture.vm_directory).exists(),
             "the readiness transcript says what the VM did, not how to log into it"
         );
@@ -638,6 +656,7 @@ mod tests {
 
         assert!(!crate::layout::ssh_keys_directory(&fixture.vm_directory).exists());
         assert!(!crate::layout::ssh_known_hosts_path(&fixture.vm_directory).exists());
+        assert!(!crate::layout::ssh_sessions_directory(&fixture.vm_directory).exists());
         assert!(!fixture.vm_directory.exists());
     }
 

@@ -9,6 +9,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+use uuid::Uuid;
 use vmlord_core::RepositoryError;
 
 /// The HCS configuration document creation writes and start re-creates the
@@ -189,6 +190,32 @@ pub(crate) fn ssh_known_hosts_path(vm_directory: &Path) -> PathBuf {
     vm_directory.join("known_hosts")
 }
 
+/// Returns the directory holding what interactive SSH sessions leave behind.
+///
+/// A directory of its own, and one file per session rather than one per VM:
+/// two shells into one guest is an ordinary thing to want, and the second one
+/// must not overwrite what the first is still writing. Nothing in it outlives
+/// being read -- the helper deletes its log, VMLord deletes the report it
+/// reported -- so the directory is normally empty.
+pub(crate) fn ssh_sessions_directory(vm_directory: &Path) -> PathBuf {
+    vm_directory.join("ssh-sessions")
+}
+
+/// Returns the path of one session's OpenSSH log.
+///
+/// Named after the session rather than after the VM, because the client is
+/// told to write it with `-E` and two clients writing one file would interleave
+/// two accounts of two different logins.
+pub(crate) fn ssh_session_log_path(vm_directory: &Path, session_id: Uuid) -> PathBuf {
+    ssh_sessions_directory(vm_directory).join(format!("{}.log", session_id.as_simple()))
+}
+
+/// Returns the path of one session's report, which is how the helper that
+/// hosted it tells VMLord how it ended.
+pub(crate) fn ssh_session_report_path(vm_directory: &Path, session_id: Uuid) -> PathBuf {
+    ssh_sessions_directory(vm_directory).join(format!("{}.json", session_id.as_simple()))
+}
+
 /// Returns the path of the VM's own SSH public key.
 ///
 /// The public half is derivable from the private one in microseconds, so this
@@ -202,10 +229,13 @@ pub(crate) fn ssh_public_key_path(vm_directory: &Path) -> PathBuf {
 mod tests {
     use std::path::{Path, PathBuf};
 
+    use uuid::Uuid;
+
     use super::{
         cloud_init_status_log_path, com1_log_path, configuration_path, seed_path, ssh_key_path,
-        ssh_keys_directory, ssh_known_hosts_path, ssh_public_key_path, system_disk_path,
-        tools_path, vm_directory,
+        ssh_keys_directory, ssh_known_hosts_path, ssh_public_key_path, ssh_session_log_path,
+        ssh_session_report_path, ssh_sessions_directory, system_disk_path, tools_path,
+        vm_directory,
     };
 
     #[test]
@@ -343,5 +373,22 @@ mod tests {
                 "\"{name}\" must not be usable as a VM directory name"
             );
         }
+    }
+
+    #[test]
+    fn a_session_keeps_its_log_and_its_report_under_one_directory() {
+        let vm = vm_directory(Path::new("/vms"), "dev-linux").unwrap();
+        let id = Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0);
+        let sessions = ssh_sessions_directory(&vm);
+
+        assert_eq!(sessions, vm.join("ssh-sessions"));
+        assert_eq!(
+            ssh_session_log_path(&vm, id),
+            sessions.join("123456789abcdef0123456789abcdef0.log")
+        );
+        assert_eq!(
+            ssh_session_report_path(&vm, id),
+            sessions.join("123456789abcdef0123456789abcdef0.json")
+        );
     }
 }

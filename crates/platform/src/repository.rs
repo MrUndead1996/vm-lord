@@ -44,6 +44,7 @@ use crate::{
     shutdown_workers::ShutdownWorkers,
     ssh_launches::SshLaunches,
     ssh_port::{PortMove, SshPortMover},
+    ssh_sessions::{self, SshSessions},
     ssh_terminal::SshLauncher,
     start_registry::StartRegistry,
     vhd, watch,
@@ -105,6 +106,11 @@ pub struct HcsVmRepository {
     ssh_port_mover: Arc<SshPortMover>,
     /// The sessions being opened right now, each on a thread of its own.
     ssh_launches: SshLaunches,
+    /// The sessions whose end VMLord has not heard yet. Shared with the launch
+    /// workers, which insert on a thread of their own, and read by the refresh
+    /// tick, which is where a session that ended becomes something a person
+    /// reads.
+    ssh_sessions: Arc<SshSessions>,
     /// The display windows this process has opened, each with a thread on its
     /// launch pipes. Never joined at shutdown: a session outlives VMLord.
     display_launches: DisplayLaunches,
@@ -172,6 +178,7 @@ impl HcsVmRepository {
             ssh_launcher: Arc::new(SshLauncher::production()),
             ssh_port_mover: Arc::new(SshPortMover::production()),
             ssh_launches: SshLaunches::default(),
+            ssh_sessions: Arc::new(SshSessions::default()),
             display_launches: DisplayLaunches::default(),
             shutdown: Arc::new(VmShutdownPipeline::production()),
             shutdowns: ShutdownWorkers::default(),
@@ -541,10 +548,11 @@ impl HcsVmRepository {
 
         let vm_directory = layout::vm_directory(&self.storage_root, &mapping.vm_name)?;
         let launcher = Arc::clone(&self.ssh_launcher);
+        let sessions = Arc::clone(&self.ssh_sessions);
         let mapping = mapping.clone();
 
         self.ssh_launches.start(&mapping.vm_name.clone(), move || {
-            match launcher.launch(&mapping, &vm_directory) {
+            match launcher.launch(&mapping, &vm_directory, &sessions) {
                 // The command, not just the fact of it. Everything the session
                 // goes on to say lands in its own window, so this line is the
                 // only account VMLord can give of what it asked for -- which
@@ -1917,6 +1925,7 @@ impl VmRepository for HcsVmRepository {
         }
 
         report_console_failures(&mut self.com1_sessions, &self.storage_root);
+        report_ssh_sessions(&self.ssh_sessions);
     }
 }
 
@@ -2054,6 +2063,31 @@ fn read_display_secret(
             "the secret of VM \"{vm_name}\" is unusable: {error}"
         ))
     })
+}
+
+/// Says how each finished SSH session ended.
+///
+/// The launch says what was asked of `ssh.exe`; this says what came of it, and
+/// it is the answer a person has been waiting for since their window closed.
+/// The level and the wording are decided in `ssh_sessions`, where they can be
+/// tested without a session; all that happens here is that a record reaches the
+/// panel under the right level, which `diagnostic!` takes as a literal.
+fn report_ssh_sessions(sessions: &SshSessions) {
+    for end in sessions.reap() {
+        let (level, message) = ssh_sessions::session_diagnostic(&end);
+        let vm = end.vm_name.as_str();
+        match level {
+            vmlord_core::DiagnosticLevel::Info => {
+                vmlord_core::diagnostic!(Info, Subsystem::Network, vm = vm, "{message}");
+            }
+            vmlord_core::DiagnosticLevel::Warning => {
+                vmlord_core::diagnostic!(Warning, Subsystem::Network, vm = vm, "{message}");
+            }
+            vmlord_core::DiagnosticLevel::Error => {
+                vmlord_core::diagnostic!(Error, Subsystem::Network, vm = vm, "{message}");
+            }
+        }
+    }
 }
 
 /// Reports every reader that stopped for the wrong reason, and forgets every

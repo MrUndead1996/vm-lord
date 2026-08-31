@@ -1676,16 +1676,15 @@ is the key expected on 2222.
 
 ### Opening an interactive session
 
-`platform::ssh_terminal` puts a shell on screen. Once `ssh.exe` runs in a
-terminal of its own, everything it says goes into that window and nothing comes
-back to VMLord, so everything knowable in advance is established before the
-window opens: Windows has an OpenSSH client, the VM has SSH access at all, its
-stored configuration is one anything can connect with, HNS has given it an
-address, something answers on the port it was created with, and -- in key mode
--- the private key is still where VMLord keeps it. Each of those is its own
-failure with its own message, because each is a different thing for a person to
-do. What is deliberately left to OpenSSH is what only OpenSSH can decide: the
-host key, the credential and the transport.
+`platform::ssh_terminal` puts a shell on screen. Everything knowable in advance
+is established before the window opens: Windows has an OpenSSH client, VMLord
+has its session helper, the VM has SSH access at all, its stored configuration
+is one anything can connect with, HNS has given it an address, something answers
+on the port it was created with, and -- in key mode -- the private key is still
+where VMLord keeps it. Each of those is its own failure with its own message,
+because each is a different thing for a person to do. What is left to OpenSSH is
+what only OpenSSH can decide: the host key, the credential and the transport --
+and what it decided is now reported too, which is what the helper below is for.
 
 The port probe is one attempt with a three-second deadline, not the readiness
 wait's patient loop: the VM is running and someone is holding a mouse button
@@ -1697,12 +1696,12 @@ close a person's window mid-handshake -- and asks the guest to run nothing, so
 what they get is the guest's own shell.
 
 Two hosts are tried, in this order. Windows Terminal gets `-w new`, a titled
-tab, and the client and its argument vector after a `--`; `-w 0` is not used
+tab, and the helper and its argument vector after a `--`; `-w 0` is not used
 here for the reason it is not used for COM1, and `--` is what keeps an `ssh`
 option from being read as one of Windows Terminal's own. If that spawn fails
 *synchronously* -- no `wt.exe` on the machine, or Windows refusing to start it
--- the fallback is the absolute `ssh.exe` itself with `CREATE_NEW_CONSOLE`,
-because VMLord is a windowed process whose console the session cannot inherit.
+-- the fallback is the helper itself with `CREATE_NEW_CONSOLE`, because VMLord
+is a windowed process whose console the session cannot inherit.
 If both refuse, the failure quotes both. What the fallback does not promise is
 anything about a Windows Terminal that *started*: a broken profile or an
 unreadable settings file is reported in its own window, and there is nothing
@@ -1714,6 +1713,53 @@ repository is dropped, and no registry counts sessions per VM, so a guest may
 have as many shells as a person opens. That is the whole difference from the
 COM1 console, which owns exactly one reader per VM because two readers on one
 pipe would split the guest's output between two windows.
+
+#### Hearing how a session ended
+
+What a terminal hosts is `vmlord-ssh.exe`, not `ssh.exe`. The helper is the
+same shape as `vmlord-com1.exe` -- a console program that exists so a window has
+something to host, with all of its logic in `platform::ssh_session` -- and it
+does one thing: it runs the client with its own standard input, output and error,
+waits for it, and writes down how it ended. The session is interactive exactly as
+it was before; every prompt still appears in the window, and the helper is
+between the person and the guest only in the sense that it is the parent waiting
+for the child.
+
+Two facts make this necessary. A terminal owns what it hosts, so on the Windows
+Terminal path the client is not VMLord's child and its exit code is not VMLord's
+to read; and OpenSSH answers nearly every failure of its own with exit code
+`255`, so even the code would not say which failure it was. The text does, which
+is why the client is given `-E <vm>\ssh-sessions\<id>.log`. That moves OpenSSH's
+own messages out of the window and into a file -- which loses nothing a person
+could read, because the window closes with the session -- and gives the helper
+something to classify.
+
+`core::classify_session` does the classifying, as a pure function over the exit
+code and the tail of that log: a code other than 255 is the remote shell's own
+status and means the session happened; 255 is read as a changed host key, a
+refused credential or a transport failure, in that order, because a log can say
+two of those at once and the host key is the one that means something other than
+"try again"; anything else keeps its code and its text rather than being guessed
+at. Two outcomes never come from the client -- a helper that could not start it,
+and a helper that is simply gone.
+
+The answer crosses back as a small JSON report, `<vm>\ssh-sessions\<id>.json`,
+announced by two named events derived from the session's own id: `finished`,
+which the helper signals however it leaves, and `alive`, which it creates and
+holds -- a named object exists while a handle to it does, so a name that is gone
+is a helper that is gone, which is the one thing a report cannot say about a
+window someone closed. `platform::ssh_sessions` holds the sessions VMLord is
+waiting on, and the refresh tick reaps them beside the COM1 readers: a session
+that is over becomes one diagnostic, whose level and wording come from
+`session_diagnostic`, and whose report file is deleted as it is read.
+
+File lifetimes are deliberate and dull. The helper creates the session
+directory, and deletes its own log once it has taken the tail; VMLord deletes
+the report it reported. The only file that can be orphaned is a report written
+after the VMLord waiting for it exited, and the next launch into that VM sweeps
+the directory of everything no live session is waiting for. The directory goes
+with the VM when it is deleted, including a deletion that keeps the disks: it
+records logging in, which is the one thing nobody can do any more.
 
 `HcsVmRepository::open_ssh` is the way in. It asks HCS for the VM's state rather
 than trusting the list the user clicked in and refuses anything but `Running` --
@@ -1756,11 +1802,12 @@ HostKeyAlias="…" … -p 22 -l dev 172.30.0.5`. The launcher returns the
 rather than a reconstruction of it -- tokens holding white space are quoted for
 reading, and the `-o` values keep the quotes OpenSSH's own parser needs.
 
-Both exist for the same reason: the session is a process in a window of its own
-and says nothing back. What was asked of `ssh.exe` -- which key, which
+Both exist for the same reason: what was asked of `ssh.exe` -- which key, which
 known-hosts file, which port -- is knowable only at the moment of the spawn, and
-it is the first thing anyone needs when a guest refuses a login for a reason
-only the client saw. `command_line` is for reading, not for re-running: nothing
+it is the first thing anyone needs when a guest refuses a login. The reported
+line is the client's own, not the helper's around it: the helper's paths and
+event names say nothing about the login. What came of it arrives later, from the
+helper, as the diagnostic described above. `command_line` is for reading, not for re-running: nothing
 on this path goes through a shell, and this is the only place these arguments
 ever become a single string.
 

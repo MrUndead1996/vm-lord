@@ -20,6 +20,15 @@ path = "src/bin/vmlord-com1.rs"
 test = false
 bench = false
 
+# The host of an interactive SSH session, for the same reason and in the same
+# place: a terminal window needs a program to host, and this one waits for
+# ssh.exe so that VMLord can say how the session ended.
+[[bin]]
+name = "vmlord-ssh"
+path = "src/bin/vmlord-ssh.rs"
+test = false
+bench = false
+
 [dependencies]
 tracing.workspace = true
 # The Windows common file dialogs, behind the application layer's picker

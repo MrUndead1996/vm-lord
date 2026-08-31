@@ -163,12 +163,19 @@ fn quote_for_reading(token: &OsStr) -> String {
 /// * `StrictHostKeyChecking=accept-new` learns an unknown key and refuses a
 ///   changed one. Nothing here deletes or rewrites a key that changed: that is
 ///   a decision for a person who has been shown it.
+///
+/// `session_log` is where OpenSSH is told to write its own log with `-E`. Only
+/// the interactive launcher passes one: it is the sole caller that cannot read
+/// the client's standard error, because the client's window is not its own,
+/// and the text in that file is what tells a refused credential from a changed
+/// host key afterwards.
 pub(crate) fn invocation(
     client: &Path,
     endpoint: &SshEndpoint,
     vm_directory: &Path,
     connect_timeout: Option<Duration>,
     remote_command: Option<&str>,
+    session_log: Option<&Path>,
 ) -> SshInvocation {
     let mut args = Vec::new();
     let mut option = |value: OsString| {
@@ -217,6 +224,11 @@ pub(crate) fn invocation(
                 OsStr::new("keyboard-interactive,password"),
             ));
         }
+    }
+
+    if let Some(log) = session_log {
+        args.push(OsString::from("-E"));
+        args.push(log.as_os_str().to_owned());
     }
 
     args.push(OsString::from("-p"));
@@ -343,6 +355,7 @@ mod tests {
             &vm_directory(),
             Some(Duration::from_secs(10)),
             Some("cloud-init status --wait --long"),
+            None,
         )
     }
 
@@ -399,6 +412,7 @@ mod tests {
             Path::new(r"C:\Program Files\OpenSSH\ssh.exe"),
             &endpoint_with(config()),
             Path::new(r"C:\Virtual Machines\dev-linux"),
+            None,
             None,
             None,
         );
@@ -586,6 +600,7 @@ mod tests {
             &vm_directory(),
             None,
             None,
+            None,
         );
         let args = arguments(&invocation);
 
@@ -613,6 +628,7 @@ mod tests {
             Path::new(r"C:\Virtual Machines\dev linux"),
             None,
             None,
+            None,
         );
         let args = arguments(&invocation);
 
@@ -637,6 +653,7 @@ mod tests {
             &client(),
             &endpoint_with(config()),
             Path::new(r"C:\VMs\100%d"),
+            None,
             None,
             None,
         );
@@ -679,7 +696,35 @@ mod tests {
             &vm_directory(),
             None,
             None,
+            None,
         )
+    }
+
+    /// The interactive launcher cannot read the client's standard error -- the
+    /// window is not VMLord's -- so OpenSSH is told to write what only it knows
+    /// where the launcher can read it afterwards.
+    #[test]
+    fn a_session_log_is_where_openssh_writes_what_only_it_can_say() {
+        let invocation = invocation(
+            &client(),
+            &endpoint_with(config()),
+            &vm_directory(),
+            None,
+            None,
+            Some(Path::new(r"C:\VMs\dev-linux\ssh-sessions\a.log")),
+        );
+
+        assert_eq!(
+            value_after(&invocation, "-E").as_deref(),
+            Some(r"C:\VMs\dev-linux\ssh-sessions\a.log")
+        );
+        assert!(
+            invocation_without_command()
+                .args
+                .iter()
+                .all(|argument| argument != "-E"),
+            "no other caller writes a log: they read the client's output themselves"
+        );
     }
 
     /// The one property the whole module exists for: every value that came
@@ -693,6 +738,7 @@ mod tests {
             &vm_directory(),
             None,
             Some("echo one two"),
+            None,
         );
         let args = arguments(&invocation);
 

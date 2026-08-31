@@ -61,6 +61,8 @@ mod shutdown_workers;
 mod ssh;
 mod ssh_launches;
 mod ssh_port;
+mod ssh_session;
+mod ssh_sessions;
 mod ssh_terminal;
 mod start;
 mod start_registry;
@@ -98,6 +100,7 @@ pub use reconnect::{
 };
 pub use repository::HcsVmRepository;
 pub use shutdown::VmShutdownPipeline;
+pub use ssh_session::{SshHelperOptions, parse_ssh_helper_args, run_ssh_helper};
 pub use start::VmStartPipeline;
 pub use vm_key::{read_public_key, write_key_pair};
 pub use watch::{HcsEventKind, HcsVmEvent, SystemWatch, VmEventSink};

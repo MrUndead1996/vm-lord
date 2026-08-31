@@ -553,6 +553,9 @@ pub(crate) fn readiness_command(
             vm_directory,
             Some(connect_timeout),
             Some(READINESS_COMMAND),
+            // The readiness wait redirects the client's own output into its
+            // transcript, so it has no use for a log of OpenSSH's.
+            None,
         ),
         transcript: layout::cloud_init_status_log_path(vm_directory),
     }
