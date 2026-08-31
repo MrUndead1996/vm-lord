@@ -164,7 +164,20 @@ impl ImportBootstrapPipeline {
         // public half over the bootstrap session, and a VM whose key appeared
         // only after a successful login would have no identity to fall back on
         // when that login is what failed.
-        (self.key_generator)(request.vm_directory, request.vm_name)?;
+        //
+        // Minted once per destination and not once per attempt. A retry finds
+        // the pair its first attempt wrote, and re-keying there would be worse
+        // than useless: writing a key pair over an existing one is refused
+        // outright -- a guest may already trust the public half -- so a bootstrap
+        // that asked for one would fail every retry before it reached the guest.
+        if layout::ssh_key_path(request.vm_directory).exists() {
+            tracing::info!(
+                "the imported VM \"{}\" keeps the key pair a previous attempt gave it",
+                request.vm_name
+            );
+        } else {
+            (self.key_generator)(request.vm_directory, request.vm_name)?;
+        }
 
         fs::write(
             layout::configuration_path(request.vm_directory),
@@ -485,6 +498,43 @@ mod tests {
             *calls.keys.lock().unwrap(),
             vec![(vm_directory, "imported".to_owned())],
             "the key the conversion deploys exists before the first login is tried"
+        );
+    }
+
+    #[test]
+    fn a_retry_keeps_the_key_pair_the_first_attempt_wrote() {
+        // Writing a key pair over an existing one is refused outright, because
+        // the guest may already trust the public half. A bootstrap that asked
+        // for one anyway would fail every retry before it reached the guest --
+        // which is exactly what a real import did.
+        let root = temporary_root("existing-key");
+        let store = MetadataStore::new(root.0.join("metadata.json"));
+        let vm_directory = copied_destination(&root.0);
+        let key_path = layout::ssh_key_path(&vm_directory);
+        fs::create_dir_all(key_path.parent().unwrap()).unwrap();
+        fs::write(&key_path, "a key a previous attempt wrote").unwrap();
+        let calls = Calls::default();
+
+        pipeline(&calls)
+            .create(
+                &store,
+                &BootstrapRequest {
+                    vm_name: "imported",
+                    vm_directory: &vm_directory,
+                    resources: &resources(),
+                    ssh: &ssh(),
+                },
+            )
+            .expect("a retry over an existing key pair should bootstrap");
+
+        assert!(
+            calls.keys.lock().unwrap().is_empty(),
+            "a retry must not ask for a second key pair"
+        );
+        assert_eq!(
+            fs::read_to_string(&key_path).unwrap(),
+            "a key a previous attempt wrote",
+            "the existing key pair is left exactly as it was"
         );
     }
 
