@@ -341,7 +341,7 @@ struct DamageReport {
     stalled: bool,
     /// Frames whose damage the driver and the compositor between them could
     /// account for in full.
-    trusted: u32,
+    accounted: u32,
     /// The mean share of the frame those rectangles covered.
     mean_coverage: f64,
     trusting_bytes: usize,
@@ -446,7 +446,7 @@ fn verify_damage(device: &mut Device, frames: u32) -> Result<DamageReport, Strin
     let mut report = DamageReport {
         frames: 0,
         stalled: false,
-        trusted: 0,
+        accounted: 0,
         mean_coverage: 0.0,
         trusting_bytes: 0,
         comparing_bytes: 0,
@@ -542,7 +542,7 @@ fn verify_damage(device: &mut Device, frames: u32) -> Result<DamageReport, Strin
         };
 
         if let Some(rects) = damage.as_deref() {
-            report.trusted += 1;
+            report.accounted += 1;
             let area: u64 = rects
                 .iter()
                 .map(|rect| u64::from(rect.width) * u64::from(rect.height))
@@ -628,8 +628,8 @@ fn verify_damage(device: &mut Device, frames: u32) -> Result<DamageReport, Strin
     }
 
     report.stalled = report.frames < frames;
-    if report.trusted > 0 {
-        report.mean_coverage = coverage / f64::from(report.trusted);
+    if report.accounted > 0 {
+        report.mean_coverage = coverage / f64::from(report.accounted);
     }
     report.trusting_ms = trusting_nanos as f64 / f64::from(report.frames.max(1)) / 1e6;
     report.comparing_ms = comparing_nanos as f64 / f64::from(report.frames.max(1)) / 1e6;
@@ -768,7 +768,7 @@ pub fn run<I: IntoIterator<Item = String>>(arguments: I) -> Result<(), String> {
     println!(
         "{:<9}{:>13}{:>11}{:>13.3}{:>12}{:>13.3}{:>12}{:>11}",
         format!("{} frames", report.frames),
-        report.trusted,
+        report.accounted,
         format!("{:.2}%", report.mean_coverage * 100.0),
         report.trusting_ms,
         report.trusting_bytes,
