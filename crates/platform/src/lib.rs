@@ -60,6 +60,7 @@ mod shutdown;
 mod shutdown_workers;
 mod ssh;
 mod ssh_launches;
+mod ssh_session;
 mod ssh_port;
 mod ssh_terminal;
 mod start;
@@ -71,6 +72,7 @@ mod watch;
 
 pub use com1_reader::{Com1HelperOptions, Com1LogMode, parse_com1_helper_args, run_com1_helper};
 pub use com1_terminal::{Com1Launcher, Com1Session};
+pub use ssh_session::{SshHelperOptions, parse_ssh_helper_args, run_ssh_helper};
 pub use create::{CloudDiskImporter, VmCreationPipeline};
 pub use delete::VmDeletionPipeline;
 pub use display_staging::{
