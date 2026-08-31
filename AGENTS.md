@@ -104,6 +104,21 @@ Use the Cargo aliases from `.cargo/config.toml` rather than spelling targets out
 * `cargo display-services` — build the guest display broker and capture process
   (the same target, for the same reason).
 * `cargo display-bench` — run the desktop codec's benchmark scenes.
+* `cargo display-pipeline-bench` — measure what a captured frame costs
+  between the mapping and the socket: the cursor composite, the payload's
+  copy into a record, and a mapped buffer against memory this process owns.
+  Linux only, because the mapped rows want a real descriptor.
+* `vmlord-display-guest-probe` — built by `cargo display-services` and run
+  inside a guest under `sudo`. Reports what a real dma-buf's coherency call
+  costs and runs the desktop that is on screen through the pipeline, which
+  is the part `cargo display-pipeline-bench` cannot reach from a host. Its
+  `--damage` pass encodes the live desktop twice at once, trusting the
+  compositor's `FB_DAMAGE_CLIPS` and comparing every tile, and checks that the
+  two viewers end up with the same picture — the only way to find out whether
+  a compositor's damage can be believed, since damage that misses a change is
+  an error nothing reports. `--damage 0` skips it, which a guest with a still
+  screen wants. It is not installed by the display payload; copy it over by
+  hand.
 * `cargo dist` — Windows-only release build into `dist/`.
 
 Never add a dependency that forces the agent to link against system C

@@ -62,6 +62,23 @@ is owned by the driver and advances in `atomic_update`, allowing capture to
 distinguish a real compositor commit from the synthetic 60 Hz vblank clock
 without reading the full framebuffer.
 
+Beside it, each plane carries the immutable `VMLORD_PLANE_COMMITS` property:
+that plane's own commit count. The generation orders commits across the device
+but cannot count one plane's -- two updates of the primary and one update of
+each plane both move the primary's generation by two -- and capture needs the
+count to know whether the damage it is about to read describes every change
+since it last looked.
+
+The primary plane also enables the core's `FB_DAMAGE_CLIPS`, which is what a
+compositor uses to say what it repainted. Capture reads it as a blob and hands
+it to the encoder as a hint, so an idle desktop is not compared eight megabytes
+at a time. It is trusted only for the commit immediately after the one already
+encoded: damage describes one commit's change against the framebuffer before
+it, so a commit nobody read is a change nothing recorded. The property is
+`DRM_MODE_PROP_ATOMIC`, so a client sees it only after asking for
+`DRM_CLIENT_CAP_ATOMIC` -- as `CRTC_X` and `CRTC_Y` are, which is why capture
+asks for the capability even though it commits nothing.
+
 ## What is shipped beside it
 
 Two files that are configuration rather than code, both copied into a guest by

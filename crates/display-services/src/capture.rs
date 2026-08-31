@@ -136,6 +136,18 @@ impl MappedBuffer {
         value
     }
 
+    /// Runs `body` over the mapped bytes with no coherency bracket at all.
+    ///
+    /// Diagnostics only -- `vmlord-display-guest-probe` measures what the
+    /// bracket costs by taking it off, and the difference is only meaningful
+    /// against the same read. Capture uses [`MappedBuffer::read`]: a stale
+    /// cache line is not something a desktop can be shipped with.
+    pub fn bytes<T>(&self, body: impl FnOnce(&[u8]) -> T) -> T {
+        // SAFETY: as in `read` -- the mapping is live for the life of `self`,
+        // covers `length` bytes, and is read-only.
+        body(unsafe { slice::from_raw_parts(self.address.as_ptr(), self.length) })
+    }
+
     /// One half of the coherency bracket, reported at most once.
     fn sync(&self, flags: u64) {
         if sync_buffer(self.descriptor.as_raw_fd(), flags).is_err()
@@ -185,9 +197,12 @@ pub struct CapturedFrame {
     pub format: PixelFormat,
     /// What changed since the last frame, when the source can say.
     ///
-    /// Always `None` here: this module has no damage source, and the encoder
-    /// treats `None` as "compare the tiles". A later task fills it from the
-    /// module's own damage reporting.
+    /// `None` is "nobody knows", and the encoder answers it by comparing every
+    /// tile against its reference. `Some` of an empty list is the other
+    /// answer: a commit that repainted nothing at all. What fills this in is
+    /// the primary plane's `FB_DAMAGE_CLIPS`, and only for the commit
+    /// immediately after the one already encoded -- the broker decides that,
+    /// because it is the side that knows which commits the session has seen.
     pub damage: Option<Vec<Rect>>,
     /// The pixels themselves.
     pub backing: Backing,

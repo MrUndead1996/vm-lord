@@ -56,3 +56,17 @@ display-payload = ["run", "-p", "xtask", "--", "display-payload", "pack"]
 # The desktop codec's benchmark. Release, and in xtask's own process: a debug
 # build measures the wrong thing, and a nested `cargo run` would only hide that.
 display-bench = ["run", "--release", "-p", "xtask", "--", "display-bench"]
+
+# What a captured frame costs between the mapping and the socket: the cursor
+# composite, the payload's copy into a record and the mapping itself. Release,
+# for the same reason. Linux only -- the crate is a guest crate, and the mapped
+# rows want a real descriptor.
+display-pipeline-bench = [
+    "run",
+    "--release",
+    "-p",
+    "vmlord-display-services",
+    "--bin",
+    "vmlord-display-pipeline-bench",
+    "--",
+]

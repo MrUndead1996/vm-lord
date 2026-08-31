@@ -77,6 +77,10 @@ pub const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: libc::c_ulong =
 pub const DRM_IOCTL_MODE_GETPROPERTY: libc::c_ulong =
     io_write_read(DRM, 0xaa, size_of::<DrmModeGetProperty>() as u32);
 
+/// The bytes behind a blob property's value, which is how damage is read.
+pub const DRM_IOCTL_MODE_GETPROPBLOB: libc::c_ulong =
+    io_write_read(DRM, 0xac, size_of::<DrmModeGetBlob>() as u32);
+
 /// A framebuffer's layout and its GEM handles. Needs `CAP_SYS_ADMIN`.
 pub const DRM_IOCTL_MODE_GETFB2: libc::c_ulong =
     io_write_read(DRM, 0xce, size_of::<DrmModeFbCmd2>() as u32);
@@ -109,6 +113,15 @@ pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 
 /// Lets a client see the cursor and overlay planes, not just the primary.
 pub const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
+
+/// Lets a client see the properties the atomic API introduced.
+///
+/// A read-only client wants this for what it makes visible rather than for
+/// what it makes possible: `CRTC_X`, `CRTC_Y` and `FB_DAMAGE_CLIPS` all carry
+/// `DRM_MODE_PROP_ATOMIC`, and the kernel hides such a property from a client
+/// that has not asked for the capability. Without it a plane reports four
+/// properties and the cursor sits at the origin.
+pub const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
 
 /// `DRM_MODE_OBJECT_PLANE`, for the object whose properties are being read.
 pub const DRM_MODE_OBJECT_PLANE: u32 = 0xeeee_eeee;
@@ -270,6 +283,26 @@ pub struct DrmModeObjGetProperties {
     pub obj_id: u32,
     pub obj_type: u32,
     pub pad: u32,
+}
+
+/// `struct drm_mode_get_blob`, which reads a blob property's bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DrmModeGetBlob {
+    pub blob_id: u32,
+    pub length: u32,
+    pub data: u64,
+}
+
+/// One damage rectangle, as `struct drm_mode_rect`: an exclusive box in
+/// framebuffer coordinates, signed because the uapi says so.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DrmModeRect {
+    pub x1: i32,
+    pub y1: i32,
+    pub x2: i32,
+    pub y2: i32,
 }
 
 /// `struct drm_mode_get_property`.

@@ -65,16 +65,23 @@ fn axis(position: i32, size: u32, frame: u32) -> (u32, u32, u32) {
 
 /// Draws a cursor bitmap over a frame, blending by its alpha channel.
 ///
-/// `frame` and `cursor` are both `ARGB8888`-shaped words; the frame's alpha is
-/// left as it was, because an `XRGB8888` framebuffer has none to speak of and a
-/// viewer never reads it.
+/// Both are four bytes per pixel with the alpha last, which is what the plane
+/// and the framebuffer already hold: `ARGB8888` and `BGRA8888` are DRM's names
+/// for the channels' order in a word, and in memory the alpha is byte three of
+/// either. Bytes rather than words because the frame reaches this from a
+/// mapping and leaves it to the encoder, and both of those are bytes -- a
+/// conversion on each side would be two whole-frame passes to blend a pointer.
 ///
-/// The loop's bounds come from `placement.crop`, which [`place`] has already
-/// clipped to the frame, so no index here needs a guard of its own.
+/// The frame's alpha is left as it was: an `XRGB8888` framebuffer has none to
+/// speak of and a viewer never reads it.
+///
+/// `frame_stride` is in bytes and `cursor_width` in pixels, as their sources
+/// spell them. The loop's bounds come from `placement.crop`, which [`place`]
+/// has already clipped to the frame, so no index here needs a guard of its own.
 pub fn composite(
-    frame: &mut [u32],
-    frame_stride_pixels: u32,
-    cursor: &[u32],
+    frame: &mut [u8],
+    frame_stride: u32,
+    cursor: &[u8],
     cursor_width: u32,
     placement: &Placement,
 ) {
@@ -83,24 +90,31 @@ pub fn composite(
     }
 
     for row in 0..placement.crop.height {
-        let source_row = (placement.crop.y + row) * cursor_width + placement.crop.x;
-        let target_row = (placement.y + row) * frame_stride_pixels + placement.x;
+        let source_row = ((placement.crop.y + row) * cursor_width + placement.crop.x) as usize * 4;
+        let target_row =
+            (placement.y + row) as usize * frame_stride as usize + placement.x as usize * 4;
 
-        for column in 0..placement.crop.width {
-            let Some(source) = cursor.get((source_row + column) as usize) else {
+        for column in 0..placement.crop.width as usize {
+            let source_at = source_row + column * 4;
+            let target_at = target_row + column * 4;
+            let (Some(source), Some(target)) = (
+                cursor.get(source_at..source_at + 4),
+                frame.get(target_at..target_at + 4),
+            ) else {
                 return;
             };
-            let Some(target) = frame.get_mut((target_row + column) as usize) else {
-                return;
-            };
-            *target = blend(*source, *target);
+            let blended = blend(
+                [source[0], source[1], source[2], source[3]],
+                [target[0], target[1], target[2], target[3]],
+            );
+            frame[target_at..target_at + 4].copy_from_slice(&blended);
         }
     }
 }
 
-/// One pixel of source over one pixel of destination.
-fn blend(source: u32, destination: u32) -> u32 {
-    let alpha = source >> 24;
+/// One pixel of source over one pixel of destination, alpha last.
+fn blend(source: [u8; 4], destination: [u8; 4]) -> [u8; 4] {
+    let alpha = u32::from(source[3]);
     if alpha == 0 {
         return destination;
     }
@@ -109,14 +123,13 @@ fn blend(source: u32, destination: u32) -> u32 {
     }
 
     let inverse = 255 - alpha;
-    let mut result = destination & 0xff00_0000;
-    for shift in [0, 8, 16] {
-        let over = (source >> shift) & 0xff;
-        let under = (destination >> shift) & 0xff;
+    let mut result = destination;
+    for channel in 0..3 {
+        let over = u32::from(source[channel]);
+        let under = u32::from(destination[channel]);
         // Rounded rather than truncated: a cursor blended over a flat colour
         // repeatedly would otherwise drift darker with every frame.
-        let channel = (over * alpha + under * inverse + 127) / 255;
-        result |= (channel & 0xff) << shift;
+        result[channel] = ((over * alpha + under * inverse + 127) / 255) as u8;
     }
 
     result
@@ -168,56 +181,97 @@ mod tests {
         assert!(!place(0, -64, 64, 64, 1920, 1080).visible);
     }
 
+    /// One pixel of a four-by-four frame, so an assertion can name a position
+    /// rather than an offset.
+    fn pixel(frame: &[u8], x: usize, y: usize) -> [u8; 4] {
+        let at = y * 4 * 4 + x * 4;
+        frame[at..at + 4].try_into().unwrap()
+    }
+
+    /// Opaque black, which is what the frames below are painted with.
+    const BLACK: [u8; 4] = [0, 0, 0, 0xff];
+
     #[test]
     fn compositing_blends_by_alpha_and_leaves_the_rest_alone() {
-        let mut frame = vec![0xff00_0000u32; 4 * 4];
+        let mut frame = BLACK.repeat(4 * 4);
         // Opaque white, half-transparent white, and two fully transparent.
-        let cursor = [0xffff_ffffu32, 0x80ff_ffff, 0x0000_0000, 0x0000_0000];
+        let cursor = [
+            [0xff, 0xff, 0xff, 0xff],
+            [0xff, 0xff, 0xff, 0x80],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+        ]
+        .concat();
         let placement = place(1, 1, 2, 2, 4, 4);
 
-        composite(&mut frame, 4, &cursor, 2, &placement);
+        composite(&mut frame, 4 * 4, &cursor, 2, &placement);
 
-        assert_eq!(frame[4 + 1], 0xffff_ffff, "an opaque cursor pixel wins");
         assert_eq!(
-            frame[4 + 2] & 0x00ff_0000,
-            0x0080_0000,
+            pixel(&frame, 1, 1),
+            [0xff, 0xff, 0xff, 0xff],
+            "an opaque cursor pixel wins"
+        );
+        assert_eq!(
+            pixel(&frame, 2, 1)[0],
+            0x80,
             "a half-transparent pixel lands halfway between the two"
         );
         assert_eq!(
-            frame[2 * 4 + 1],
-            0xff00_0000,
-            "a transparent pixel changes nothing"
+            pixel(&frame, 2, 1)[3],
+            0xff,
+            "and the frame keeps the alpha it had"
         );
         assert_eq!(
-            frame[0], 0xff00_0000,
-            "and nothing outside the cursor moves"
+            pixel(&frame, 1, 2),
+            BLACK,
+            "a transparent pixel changes nothing"
         );
+        assert_eq!(pixel(&frame, 0, 0), BLACK, "and nothing outside it moves");
     }
 
     #[test]
     fn compositing_a_cropped_cursor_never_writes_outside_the_frame() {
         for x in -12i32..12 {
             for y in -12i32..12 {
-                let mut frame = vec![0u32; 8 * 8];
-                let cursor = vec![0xffff_ffffu32; 8 * 8];
+                let mut frame = vec![0u8; 8 * 8 * 4];
+                let cursor = vec![0xff; 8 * 8 * 4];
                 let placement = place(x, y, 8, 8, 8, 8);
 
                 // The property: every write lands inside the buffer. An index
                 // that escaped the crop would panic here rather than corrupt a
                 // neighbouring row.
-                composite(&mut frame, 8, &cursor, 8, &placement);
+                composite(&mut frame, 8 * 4, &cursor, 8, &placement);
             }
         }
     }
 
     #[test]
+    fn a_stride_wider_than_the_frame_writes_the_row_it_names() {
+        // A framebuffer's stride is not promised to be `width * 4`, and the
+        // rows a placement names are counted in it rather than in pixels.
+        let stride = 6 * 4;
+        let mut frame = vec![0u8; stride * 4];
+        let cursor = [0xff, 0xff, 0xff, 0xff];
+        let placement = place(1, 2, 1, 1, 4, 4);
+
+        composite(&mut frame, stride as u32, &cursor, 1, &placement);
+
+        let at = 2 * stride + 4;
+        assert_eq!(&frame[at..at + 4], &[0xff, 0xff, 0xff, 0xff]);
+        assert!(
+            frame[..at].iter().all(|byte| *byte == 0),
+            "nothing before that row was touched"
+        );
+    }
+
+    #[test]
     fn an_invisible_cursor_composites_nothing() {
-        let mut frame = vec![0xff00_0000u32; 4 * 4];
-        let cursor = vec![0xffff_ffffu32; 4];
+        let mut frame = BLACK.repeat(4 * 4);
+        let cursor = vec![0xff; 4 * 4];
         let placement = place(-8, 0, 2, 2, 4, 4);
 
-        composite(&mut frame, 4, &cursor, 2, &placement);
+        composite(&mut frame, 4 * 4, &cursor, 2, &placement);
 
-        assert!(frame.iter().all(|pixel| *pixel == 0xff00_0000));
+        assert!(frame.chunks_exact(4).all(|pixel| pixel == BLACK));
     }
 }
