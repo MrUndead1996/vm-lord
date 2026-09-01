@@ -10,7 +10,7 @@
 //!
 //! A session need not be run by the process that opened it.
 //! [`Session::established_host`] takes a [`HandedOver`] -- what the handshake
-//! settled on, the session id, three channel keys and the control sequence -- and
+//! settled on, the session id, four channel keys and the control sequence -- and
 //! produces the established host half without a secret. That is how VMLord
 //! keeps the VM's secret while the viewer keeps the sockets, and it is the
 //! host's mirror of what the guest's broker does for its capture process.
@@ -166,7 +166,7 @@ struct ChannelState {
 /// Everything the receiving process needs and nothing it does not: no secret,
 /// no session key, no transcript. See [`Session::established_host`].
 pub struct HandedOver {
-    /// The 16 bytes that name the session across its four sockets.
+    /// The 16 bytes that name the session across its five sockets.
     pub session_id: [u8; SESSION_ID_LEN],
     /// What the control handshake settled on.
     pub negotiated: Negotiated,
@@ -176,6 +176,8 @@ pub struct HandedOver {
     pub input_key: ChannelKey,
     /// The key the clipboard socket proves itself with.
     pub clipboard_key: ChannelKey,
+    /// The key the audio socket proves itself with.
+    pub audio_key: ChannelKey,
     /// The sequence the control channel carries on from.
     pub control_sequence: u32,
 }
@@ -326,10 +328,7 @@ impl Session {
                 Some(handed_over.frame_key),
                 Some(handed_over.input_key),
                 Some(handed_over.clipboard_key),
-                // The audio key does not cross a hand-over yet; the platform
-                // side that carries it is a later task, and until then the
-                // audio channel has no key on the host and cannot be bound.
-                None,
+                Some(handed_over.audio_key),
             ],
         }
     }
@@ -1675,6 +1674,9 @@ mod tests {
                 .expect("an established host"),
             clipboard_key: host
                 .derive_channel_key(Channel::Clipboard)
+                .expect("an established host"),
+            audio_key: host
+                .derive_channel_key(Channel::Audio)
                 .expect("an established host"),
             control_sequence: host.control_sequence(),
         };

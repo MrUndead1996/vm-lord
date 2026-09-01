@@ -892,6 +892,7 @@ fn session_of(handover: &Handover) -> Result<Session, String> {
         frame_key: channel_key(&handover.frame_key, "frame")?,
         input_key: channel_key(&handover.input_key, "input")?,
         clipboard_key: channel_key(&handover.clipboard_key, "clipboard")?,
+        audio_key: channel_key(&handover.audio_key, "audio")?,
         control_sequence: handover.control_sequence,
     }))
 }

@@ -131,6 +131,7 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
         let frame_key = channel_key(&handover.frame_key, "frame")?;
         let input_key = channel_key(&handover.input_key, "input")?;
         let clipboard_key = channel_key(&handover.clipboard_key, "clipboard")?;
+        let audio_key = channel_key(&handover.audio_key, "audio")?;
 
         let negotiated = Negotiated {
             version: ProtocolVersion {
@@ -165,6 +166,7 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
                 frame_key,
                 input_key,
                 clipboard_key,
+                audio_key,
                 control_sequence: handover.control_sequence,
             }),
             control,

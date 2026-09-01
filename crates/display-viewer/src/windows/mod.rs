@@ -1,4 +1,4 @@
-//! The seven modules that touch Win32, and the only `unsafe` in this crate.
+//! The eight modules that touch Win32, and the only `unsafe` in this crate.
 //!
 //! The workspace denies `unsafe_code`; each declaration below re-allows it for
 //! one module and says what crosses that door. Everything else in the crate is
@@ -39,3 +39,8 @@ pub mod files;
 /// The monitor the window is on, and the modes it drives.
 #[allow(unsafe_code)]
 pub mod display_modes;
+
+/// A WASAPI render endpoint for the guest's sound, and the notifications that
+/// say the host's default output has changed.
+#[allow(unsafe_code)]
+pub mod audio;
