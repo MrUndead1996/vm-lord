@@ -32,7 +32,8 @@ use crate::{
         has_recipe, modprobe_options, module_is_loaded, needs_build, needs_reload,
         parse_module_parameters, parse_module_signature_key, parse_module_version,
         parse_secure_boot_state, parse_subject_key_identifier, read_payload_facts,
-        signature_matches, signing_key_state, wanted_mode, was_rejected_for_its_signature,
+        signature_matches, signing_key_state, signing_key_unavailable, wanted_mode,
+        was_rejected_for_its_signature,
     },
     gpu_kernel::guest_facts,
     guest_files::{copy_tree, failure, read, write_if_different},
@@ -539,9 +540,16 @@ fn signing_key_stage(
         // is replaced whole rather than completed.
         let _ = fs::remove_file(SIGNING_KEY);
         let _ = fs::remove_file(SIGNING_CERTIFICATE);
-        if let Err(reason) = create_signing_key() {
-            report.failed(DisplayRecipeStep::SigningKey, reason);
-            return None;
+        match create_signing_key() {
+            Ok(()) => {}
+            Err(SigningKeyRefusal::Unavailable(reason)) => {
+                report.skipped(DisplayRecipeStep::SigningKey, reason);
+                return None;
+            }
+            Err(SigningKeyRefusal::Failed(reason)) => {
+                report.failed(DisplayRecipeStep::SigningKey, reason);
+                return None;
+            }
         }
     }
 
@@ -617,8 +625,20 @@ fn kernel_can_sign_modules(kernel_release: &str) -> bool {
     read(Path::new(&format!("/boot/config-{kernel_release}"))).contains("CONFIG_MODULE_SIG_HASH=")
 }
 
+/// Why a pair was not created.
+enum SigningKeyRefusal {
+    /// This guest has nothing to make one with. Not a failure: see
+    /// `signing_key_unavailable`.
+    Unavailable(&'static str),
+    /// It could have been made here, and the attempt did not work.
+    Failed(String),
+}
+
+/// Where `shim-signed` puts the configuration the fallback needs.
+const SHIM_OPENSSL_CONFIG: &str = "/usr/lib/shim/mok/openssl.cnf";
+
 /// Creates the guest's own pair, preferring the distribution's own way of it.
-fn create_signing_key() -> Result<(), String> {
+fn create_signing_key() -> Result<(), SigningKeyRefusal> {
     let policy = command::run(
         "update-secureboot-policy",
         &["--new-key"],
@@ -632,15 +652,21 @@ fn create_signing_key() -> Result<(), String> {
         return Ok(());
     }
 
-    // No `shim-signed` on this guest. The configuration file is the one thing
-    // that must not be substituted: without its `subjectKeyIdentifier = hash`
-    // the certificate carries nothing a signature can be matched on.
+    // The distribution's own way did not work. The configuration file is the
+    // one thing that must not be substituted: without its
+    // `subjectKeyIdentifier = hash` the certificate carries nothing a
+    // signature can be matched on -- so a guest that does not have it is a
+    // guest with no key to make rather than one whose key failed.
+    if let Some(reason) = signing_key_unavailable(Path::new(SHIM_OPENSSL_CONFIG).exists()) {
+        return Err(SigningKeyRefusal::Unavailable(reason));
+    }
+
     let openssl = command::run(
         "openssl",
         &[
             "req",
             "-config",
-            "/usr/lib/shim/mok/openssl.cnf",
+            SHIM_OPENSSL_CONFIG,
             "-new",
             "-x509",
             "-newkey",
@@ -661,7 +687,7 @@ fn create_signing_key() -> Result<(), String> {
         SHORT_BUDGET,
     );
     if !openssl.succeeded() {
-        return Err(failure("openssl req", &openssl));
+        return Err(SigningKeyRefusal::Failed(failure("openssl req", &openssl)));
     }
     Ok(())
 }

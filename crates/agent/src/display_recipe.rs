@@ -282,6 +282,24 @@ pub fn signing_key_state(private_key_exists: bool, certificate_exists: bool) -> 
     }
 }
 
+/// Why this guest cannot be given a MOK of its own, if it cannot.
+///
+/// A guest whose distribution installed `shim-signed` has both the program
+/// that makes a key the distribution's way and the configuration file the
+/// fallback needs. A guest that was given shim's binaries without its package
+/// -- which is what an imported AppSandbox guest is -- has neither, and no
+/// key can be made for it at all.
+///
+/// That is a stage this guest does not have rather than a stage that failed:
+/// signing exists so a module loads under Secure Boot, VMLord's VMs run with
+/// it off, and the module loads unsigned. Reporting it as a failure degrades
+/// a display that works.
+#[must_use]
+pub fn signing_key_unavailable(shim_configuration_exists: bool) -> Option<&'static str> {
+    (!shim_configuration_exists)
+        .then_some("this guest has no shim-signed, so there is no MOK to make it a key with")
+}
+
 /// The subject key identifier out of `openssl x509 -noout -text` output.
 ///
 /// Lower-case and without separators, which is the form [`signature_matches`]
@@ -659,6 +677,15 @@ other-module/1.0, 6.8.0-137-generic, x86_64: installed";
         assert_eq!(signing_key_state(false, false), SigningKeyState::Absent);
         assert_eq!(signing_key_state(true, false), SigningKeyState::HalfPresent);
         assert_eq!(signing_key_state(false, true), SigningKeyState::HalfPresent);
+    }
+
+    #[test]
+    fn a_guest_without_shim_signed_has_no_signing_stage_to_fail() {
+        assert_eq!(
+            super::signing_key_unavailable(false),
+            Some("this guest has no shim-signed, so there is no MOK to make it a key with")
+        );
+        assert_eq!(super::signing_key_unavailable(true), None);
     }
 
     #[test]
