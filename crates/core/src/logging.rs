@@ -1,5 +1,4 @@
 use std::{
-    ffi::{OsStr, OsString},
     fmt::{self, Write as _},
     fs::{self, File, OpenOptions},
     io::{self, Write},
@@ -92,20 +91,13 @@ fn record_layer(
     settings: &AppSettings,
     console: Console,
 ) -> Result<(RecordLayer, PathBuf), LoggingError> {
-    let log_directory =
-        settings
-            .log_file_path
-            .parent()
-            .ok_or_else(|| LoggingError::MissingParent {
-                path: settings.log_file_path.clone(),
-            })?;
-    fs::create_dir_all(log_directory).map_err(|source| LoggingError::Io {
+    fs::create_dir_all(&settings.log_directory).map_err(|source| LoggingError::Io {
         operation: "create log directory",
-        path: log_directory.to_path_buf(),
+        path: settings.log_directory.clone(),
         source,
     })?;
 
-    let path = run_log_path(&settings.log_file_path, SystemTime::now());
+    let path = run_log_path(&settings.log_directory, SystemTime::now());
     let file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -126,28 +118,20 @@ fn record_layer(
     ))
 }
 
-/// The file this run writes to, derived from the configured log path.
+/// The file this run writes to, inside the configured log directory.
 ///
-/// `log_file_path` names the log the way a person configures it --
-/// `logs\vmlord.log` -- but one file holds every run the application has ever
-/// made, and the run worth reading is almost always a single one. So the
-/// configured name is a template: each start opens
-/// `vmlord-20240229-010101-123.log` beside it, and a report carries the launch
-/// that went wrong rather than the months around it.
+/// The folder is the person's choice; the name is the application's. Each
+/// start opens `vmlord-20240229-010101-123.log` -- the stem every VMLord
+/// process shares and a stamp only that start owns -- so one launch's records
+/// can be read, or sent in, without the months around them, and `vmlord`,
+/// `vmlord-com1`, `vmlord-ssh` and `vmlord-display` stop interleaving into
+/// each other.
 ///
 /// Appending rather than truncating still, because the name already makes a
 /// second process's records a second file; append only matters if two of them
 /// land on the same millisecond.
-fn run_log_path(template: &Path, now: SystemTime) -> PathBuf {
-    let mut name = OsString::from(template.file_stem().unwrap_or(OsStr::new("vmlord")));
-    name.push("-");
-    name.push(file_stamp(now));
-    if let Some(extension) = template.extension() {
-        name.push(".");
-        name.push(extension);
-    }
-
-    template.with_file_name(name)
+fn run_log_path(directory: &Path, now: SystemTime) -> PathBuf {
+    directory.join(format!("vmlord-{}.log", file_stamp(now)))
 }
 
 /// Points the `log` crate at the subscriber.
@@ -414,9 +398,6 @@ impl Visit for RecordVisitor {
 
 #[derive(Debug)]
 pub enum LoggingError {
-    MissingParent {
-        path: PathBuf,
-    },
     Io {
         operation: &'static str,
         path: PathBuf,
@@ -429,13 +410,6 @@ pub enum LoggingError {
 impl fmt::Display for LoggingError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::MissingParent { path } => {
-                write!(
-                    formatter,
-                    "log file path has no parent directory: {}",
-                    path.display()
-                )
-            }
             Self::Io {
                 operation,
                 path,
@@ -466,7 +440,6 @@ impl std::error::Error for LoggingError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::AlreadyInitialized(_) | Self::LogBridge(_) => None,
-            Self::MissingParent { .. } => None,
         }
     }
 }
@@ -516,11 +489,11 @@ mod tests {
     }
 
     #[test]
-    fn each_run_opens_its_own_file_beside_the_configured_one() {
+    fn each_run_opens_its_own_file_in_the_configured_directory() {
         let moment = UNIX_EPOCH + Duration::from_millis(1_709_164_800_000 + 3_661_123);
 
         assert_eq!(
-            run_log_path(Path::new(r"C:\VMLord\logs\vmlord.log"), moment),
+            run_log_path(Path::new(r"C:\VMLord\logs"), moment),
             PathBuf::from(r"C:\VMLord\logs\vmlord-20240229-010101-123.log")
         );
     }
@@ -533,18 +506,8 @@ mod tests {
         let second = first + Duration::from_millis(1);
 
         assert_ne!(
-            run_log_path(Path::new("logs/vmlord.log"), first),
-            run_log_path(Path::new("logs/vmlord.log"), second)
-        );
-    }
-
-    #[test]
-    fn a_configured_name_without_an_extension_keeps_not_having_one() {
-        let moment = UNIX_EPOCH + Duration::from_millis(1_709_164_800_000);
-
-        assert_eq!(
-            run_log_path(Path::new("logs/vmlord"), moment),
-            PathBuf::from("logs/vmlord-20240229-000000-000")
+            run_log_path(Path::new("logs"), first),
+            run_log_path(Path::new("logs"), second)
         );
     }
 

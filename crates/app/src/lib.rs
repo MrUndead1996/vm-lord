@@ -105,7 +105,7 @@ pub trait ImagePicker {
 
 pub trait SettingsPathPicker {
     fn pick_vm_storage_directory(&mut self) -> Result<Option<String>, RepositoryError>;
-    fn pick_log_file(&mut self) -> Result<Option<String>, RepositoryError>;
+    fn pick_log_directory(&mut self) -> Result<Option<String>, RepositoryError>;
 }
 
 pub struct WorkspaceApp {
@@ -365,8 +365,8 @@ impl WorkspaceApp {
             .save(&settings)
             .map_err(SettingsUpdateError::Save)?;
         tracing::info!(
-            "application settings saved; log file is {} and level is {:?}",
-            settings.log_file_path.display(),
+            "application settings saved; log directory is {} and level is {:?}",
+            settings.log_directory.display(),
             settings.log_level
         );
         context.current = settings;
@@ -383,13 +383,13 @@ impl WorkspaceApp {
         picker.pick_vm_storage_directory()
     }
 
-    pub fn pick_log_file(&mut self) -> Result<Option<String>, RepositoryError> {
+    pub fn pick_log_directory(&mut self) -> Result<Option<String>, RepositoryError> {
         let Some(picker) = &mut self.settings_path_picker else {
             return Err(RepositoryError::new(
-                "the native log file picker is not available",
+                "the native log directory picker is not available",
             ));
         };
-        picker.pick_log_file()
+        picker.pick_log_directory()
     }
 
     pub fn pick_iso_image(&mut self) -> Result<Option<String>, RepositoryError> {
@@ -1146,7 +1146,7 @@ mod tests {
         let stale = AppSettings {
             vm_storage_path: directory.join("vms"),
             language: Language::EnUs,
-            log_file_path: directory.join("logs/vmlord.log"),
+            log_directory: directory.join("logs"),
             log_level: LogLevel::Info,
             image_cache_path: directory.join("images"),
             default_distro: "removed-profile".into(),
@@ -1182,7 +1182,7 @@ mod tests {
         let initial = AppSettings {
             vm_storage_path: directory.join("vms"),
             language: Language::EnUs,
-            log_file_path: directory.join("logs/vmlord.log"),
+            log_directory: directory.join("logs"),
             log_level: LogLevel::Info,
             image_cache_path: directory.join("images"),
             default_distro: "ubuntu".into(),
@@ -1214,7 +1214,7 @@ mod tests {
         let initial = AppSettings {
             vm_storage_path: directory.join("vms"),
             language: Language::EnUs,
-            log_file_path: directory.join("logs/vmlord.log"),
+            log_directory: directory.join("logs"),
             log_level: LogLevel::Info,
             image_cache_path: directory.join("images"),
             default_distro: "ubuntu".into(),
@@ -1867,7 +1867,7 @@ mod tests {
         let initial_settings = AppSettings {
             vm_storage_path: directory.join("vms"),
             language: Language::EnUs,
-            log_file_path: directory.join("logs").join("vmlord.log"),
+            log_directory: directory.join("logs"),
             log_level: LogLevel::Info,
             image_cache_path: directory.join("images"),
             default_distro: "ubuntu".into(),
@@ -1879,7 +1879,7 @@ mod tests {
         let updated_settings = AppSettings {
             vm_storage_path: directory.join("virtual-machines"),
             language: Language::EnUs,
-            log_file_path: directory.join("diagnostics").join("application.log"),
+            log_directory: directory.join("diagnostics"),
             log_level: LogLevel::Debug,
             image_cache_path: directory.join("cached-images"),
             default_distro: "fedora".into(),

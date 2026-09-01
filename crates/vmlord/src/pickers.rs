@@ -56,11 +56,10 @@ impl SettingsPathPicker for WindowsSettingsPathPicker {
             .map(|path| path.to_string_lossy().into_owned()))
     }
 
-    fn pick_log_file(&mut self) -> Result<Option<String>, RepositoryError> {
+    fn pick_log_directory(&mut self) -> Result<Option<String>, RepositoryError> {
         Ok(rfd::FileDialog::new()
-            .set_title("Select log file")
-            .set_file_name("vmlord.log")
-            .save_file()
+            .set_title("Select log directory")
+            .pick_folder()
             .map(|path| path.to_string_lossy().into_owned()))
     }
 }

@@ -735,8 +735,8 @@ the missing profile rather than silently falling back.
 `core::logging` installs the shared `log` backend after settings are loaded and
 before the backend starts. It writes records at the configured `log_level` to
 both standard output and a file; all Rust crates use the `log` facade to emit
-application records. `log_file_path` is the template for that file rather than
-the file itself -- see "One file per run" below.
+application records. `log_directory` names the folder those files land in
+rather than any one file -- see "One file per run" below.
 
 The current UI initializes the backend, shows availability and diagnostics,
 lists known VMs, can create Linux VMs from ISO images, and can edit them. The
@@ -4024,9 +4024,10 @@ would need the `time` crate to say the same thing. An event's fields are
 appended after its message, and a span's fields are appended before them, so a
 reader scanning a column finds the VM in the same place on every line.
 
-**One file per run.** The configured `log_file_path` names no file that is ever
-written. `core::logging::run_log_path` stamps it at startup -- `vmlord.log`
-becomes `vmlord-20240229-010101-123.log` in the same directory -- so every
+**One file per run.** The configured `log_directory` names no file that is ever
+written. The folder is the person's choice and the name is the application's:
+`core::logging::run_log_path` stamps it at startup, opening
+`vmlord-20240229-010101-123.log` in that folder, so every
 process start owns a transcript. One file held every launch VMLord had ever
 made, and the launch worth reading is almost always a single one: a report now
 carries the run that went wrong instead of the months around it, and `vmlord`,
