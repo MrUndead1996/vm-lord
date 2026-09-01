@@ -1,0 +1,21 @@
+[package]
+name = "vmlord-appsandbox-convert"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing.workspace = true
+# The two paths the host and an imported guest must spell the same way: where
+# the agent's secret lands, and where the agent and its unit do.
+vmlord-agent-protocol = { path = "../agent-protocol" }
+vmlord-seed = { path = "../seed" }
+
+[dev-dependencies]
+tempfile = "3.27"
+
+[lints]
+workspace = true

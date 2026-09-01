@@ -4806,6 +4806,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vmlord-appsandbox-convert"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "vmlord-agent-protocol",
+ "vmlord-seed",
+]
+
+[[package]]
 name = "vmlord-core"
 version = "0.1.0"
 dependencies = [

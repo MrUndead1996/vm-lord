@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/agent",
+    "crates/appsandbox-convert",
     "crates/agent-protocol",
     "crates/core",
     "crates/display-codec",
@@ -25,6 +26,10 @@ members = [
 #
 #     cargo agent
 #     cargo display-services
+#
+# `crates/appsandbox-convert` edits a Linux filesystem -- owners, modes and
+# symlinks -- so it builds for the host doing that and not for Windows. It is
+# reached through `cargo appsandbox-convert`.
 #
 # `crates/xtask` is build automation rather than product code, and is likewise
 # reached through an alias -- see `.cargo/config.toml`.
