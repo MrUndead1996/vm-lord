@@ -32,7 +32,11 @@ agent secret.
 * The copy is on the **same volume** as the VM storage directory. Adoption
   moves it into place; across volumes a move is a second full copy, which is
   refused rather than done silently.
-* WSL2, and an elevated prompt for the mount.
+* An **elevated** prompt. Both `adopt-disk` and `wsl --mount` need one: the
+  Host Compute Service refuses a caller that is not an administrator or a
+  member of the Hyper-V Administrators group, exactly as it does for ordinary
+  VM creation.
+* WSL2.
 * A built `vmlord-agent` for the guest: `cargo agent` leaves it at
   `target/x86_64-unknown-linux-musl/debug/vmlord-agent`.
 
@@ -74,10 +78,10 @@ the VM, and are the operator's to fill in:
 * `root` — where the guest's filesystem root will be mounted;
 * `agent_binary` — where `vmlord-agent` is on that machine.
 
-Then, from an elevated prompt:
+Then, from the same elevated prompt:
 
 ```
-wsl --mount --vhd <VM storage>\<name>\disk\system.vhdx --bare
+wsl --mount --vhd <VM storage>\<name>\disks\system.vhdx --bare
 ```
 
 and inside WSL, as root:
