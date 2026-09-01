@@ -35,10 +35,21 @@ pub(crate) struct GuestFacts {
 }
 
 /// The evidence that a guest is one this conversion can act on.
-const APPSANDBOX_EVIDENCE: [&str; 2] = [
+///
+/// Either it still carries the source application, or it carries what a
+/// previous conversion of it installed. The second is not a leftover to
+/// refuse: a guest imported twice -- because the VM built around it was
+/// replaced, and the new one has its own key and its own agent secret -- has
+/// nothing of the source application left to be recognised by, the first
+/// conversion having removed all of it.
+const EVIDENCE: [&str; 3] = [
     "/opt/appsandbox/appsandbox-gpu",
     "/etc/systemd/system/appsandbox-agent.service",
+    VMLORD_UNIT,
 ];
+
+/// What a previous conversion of this same root left behind.
+const VMLORD_UNIT: &str = "/etc/systemd/system/vmlord-agent.service";
 
 pub(crate) fn read(conversion: &Conversion) -> Result<GuestFacts, ConvertError> {
     let root = &conversion.root;
@@ -53,19 +64,24 @@ pub(crate) fn read(conversion: &Conversion) -> Result<GuestFacts, ConvertError> 
         ));
     }
 
-    if !APPSANDBOX_EVIDENCE
+    if !EVIDENCE
         .iter()
         .any(|path| guest_path(root, path).is_ok_and(|path| path.exists()))
     {
         return Err(ConvertError::new(
-            "the root holds nothing of AppSandbox's: it is not a guest this converts",
+            "the root holds nothing of AppSandbox's and nothing of VMLord's: it is not a guest \
+             this converts",
         ));
     }
 
-    if guest_path(root, "/etc/systemd/system/vmlord-agent.service")?.exists() {
-        return Err(ConvertError::new(
-            "the root already has a vmlord-agent unit: it has been converted before",
-        ));
+    if guest_path(root, VMLORD_UNIT)?.exists() {
+        // Not a refusal. Every step is idempotent, and the values that differ
+        // between one conversion and the next -- the key and the secret -- are
+        // written whole rather than added to.
+        tracing::info!(
+            "the root has been converted before; converting it again for this VM's own key and \
+             secret"
+        );
     }
 
     let (home, uid, gid) = account(conversion)?;
@@ -182,15 +198,34 @@ mod tests {
         assert!(error.to_string().contains("nobody-here"), "{error}");
     }
 
+    /// A root with nothing of either in it is still refused: it is neither a
+    /// guest this converts nor one it has converted.
     #[test]
-    fn a_guest_vmlord_has_already_converted_is_refused() {
+    fn a_root_with_neither_applications_traces_is_refused() {
+        let guest = AppSandboxGuest::new()
+            .without("/opt/appsandbox/appsandbox-gpu")
+            .without("/etc/systemd/system/appsandbox-agent.service");
+        let error = read(&guest.conversion()).expect_err("refused");
+        assert!(error.to_string().contains("AppSandbox"), "{error}");
+    }
+
+    #[test]
+    fn a_guest_vmlord_has_already_converted_is_accepted_and_converted_again() {
         let guest = AppSandboxGuest::new();
         std::fs::write(
             guest.root().join("etc/systemd/system/vmlord-agent.service"),
             "[Unit]\n",
         )
         .expect("write");
-        let error = read(&guest.conversion()).expect_err("refused");
-        assert!(error.to_string().contains("vmlord-agent"), "{error}");
+        // Nothing of AppSandbox's is left after a first conversion, so the
+        // only thing left to recognise the guest by is what VMLord installed.
+        for trace in [
+            "opt/appsandbox/appsandbox-gpu",
+            "etc/systemd/system/appsandbox-agent.service",
+        ] {
+            let _ = std::fs::remove_file(guest.root().join(trace));
+        }
+
+        read(&guest.conversion()).expect("a guest converted before is one this converts again");
     }
 }

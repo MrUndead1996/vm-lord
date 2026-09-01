@@ -82,6 +82,30 @@ mod tests {
         verify(&guest.conversion()).expect("verified");
     }
 
+    /// The case a second import of the same guest is made of: the first
+    /// conversion removed everything the second would recognise it by, and the
+    /// VM it was converted for has been replaced by one with its own key and
+    /// its own secret.
+    #[test]
+    fn a_guest_converted_once_can_be_converted_again_for_another_vm() {
+        let guest = AppSandboxGuest::new();
+        convert(&guest.conversion(), &quiet_ldconfig()).expect("converted");
+
+        let mut again = guest.conversion();
+        again.vmlord_public_key = "ssh-ed25519 AAAAsecond vmlord".to_owned();
+        again.agent_secret = "c2Vjb25k".to_owned();
+        convert(&again, &quiet_ldconfig()).expect("converted again");
+
+        let keys = std::fs::read_to_string(guest.root().join("home/agromov/.ssh/authorized_keys"))
+            .expect("read");
+        assert_eq!(keys.trim(), "ssh-ed25519 AAAAsecond vmlord");
+        assert_eq!(
+            std::fs::read_to_string(guest.root().join("etc/vmlord/agent.secret")).expect("read"),
+            "c2Vjb25k\n"
+        );
+        verify(&again).expect("verified");
+    }
+
     #[test]
     fn a_conversion_refused_by_the_preconditions_changes_nothing() {
         let guest = AppSandboxGuest::new().without("/etc/os-release");
