@@ -8,8 +8,8 @@
 use std::path::PathBuf;
 
 use vmlord_core::{
-    DesktopProfile, GpuMode, NetworkMode, Provisioning, SshAccess, SshDaemon, SshPort,
-    VmCreateRequest, VmSource,
+    CloudImage, DesktopProfile, DistroProfile, GpuMode, NetworkMode, Provisioning, SshAccess,
+    SshPort, VmCreateRequest, VmSource,
 };
 
 use crate::host_guest_defaults;
@@ -19,8 +19,8 @@ const DEFAULT_RAM_MB: u32 = 4096;
 const DEFAULT_CPU_CORES: u32 = 2;
 
 pub const ADOPT_USAGE: &str = "usage: vmlord adopt-disk --name <name> --disk <path> \
-     --username <user> --disk-gb <size> [--ram-mb <size>] [--cpu-cores <count>] \
-     [--ssh-port <port>]";
+     --username <user> --disk-gb <size> --release <release> [--ram-mb <size>] \
+     [--cpu-cores <count>] [--ssh-port <port>] [--headless]";
 
 /// One adoption, as a command line describes it.
 #[derive(Debug)]
@@ -35,6 +35,14 @@ pub struct AdoptArguments {
     disk_gb: u32,
     ram_mb: u32,
     cpu_cores: u32,
+    /// Which release the guest runs, which is what chooses the display and GPU
+    /// payloads built for it. Required: a VM that records no guest can be
+    /// given neither.
+    release: String,
+    /// Whether the guest has a desktop. It decides whether VMLord provisions
+    /// its display stack into the guest at all, so an imported desktop guest
+    /// recorded as headless is one whose display never arrives.
+    desktop: DesktopProfile,
     /// Absent leaves the guest's daemon on the port it already answers on.
     ssh_port: Option<u16>,
 }
@@ -53,6 +61,11 @@ impl AdoptArguments {
         let mut disk_gb = None;
         let mut ram_mb = DEFAULT_RAM_MB;
         let mut cpu_cores = DEFAULT_CPU_CORES;
+        let mut release = None;
+        // AppSandbox's own first boot installs `ubuntu-desktop-minimal` into
+        // every Linux guest it builds, so a desktop is what an imported one
+        // has unless its owner says otherwise.
+        let mut desktop = DesktopProfile::Gnome;
         let mut ssh_port = None;
         let mut arguments = arguments;
         while let Some(argument) = arguments.next() {
@@ -70,6 +83,8 @@ impl AdoptArguments {
                 }
                 "--ram-mb" => ram_mb = number(&value("--ram-mb")?, "--ram-mb")?,
                 "--cpu-cores" => cpu_cores = number(&value("--cpu-cores")?, "--cpu-cores")?,
+                "--release" => release = Some(value("--release")?),
+                "--headless" => desktop = DesktopProfile::Headless,
                 "--ssh-port" => ssh_port = Some(number(&value("--ssh-port")?, "--ssh-port")?),
                 other => return Err(format!("unknown argument `{other}`\n{ADOPT_USAGE}")),
             }
@@ -81,6 +96,8 @@ impl AdoptArguments {
             disk_gb: disk_gb.ok_or_else(|| format!("--disk-gb is required\n{ADOPT_USAGE}"))?,
             ram_mb,
             cpu_cores,
+            release: release.ok_or_else(|| format!("--release is required\n{ADOPT_USAGE}"))?,
+            desktop,
             ssh_port,
         })
     }
@@ -92,12 +109,12 @@ impl AdoptArguments {
     /// the VM -- so the request repeats the host's, and nothing of VMLord's
     /// writes them into the guest again.
     ///
-    /// `ssh_daemon` comes from the installed distribution profile rather than
+    /// The distribution profile comes from the installed catalog rather than
     /// from here: how a release carries its SSH daemon is what decides which
     /// two drop-ins move its port, and a copy of that here would be a copy
     /// that falls behind the profiles VMLord ships.
     #[must_use]
-    pub fn request(&self, ssh_daemon: SshDaemon) -> VmCreateRequest {
+    pub fn request(&self, profile: DistroProfile) -> VmCreateRequest {
         let host = host_guest_defaults();
         VmCreateRequest {
             name: self.name.clone(),
@@ -118,11 +135,12 @@ impl AdoptArguments {
                     locale: host.locale,
                     keyboard: host.keyboard,
                     timezone: host.timezone,
-                    // Whatever desktop the guest has, it has: nothing of
-                    // VMLord's installs one into an adopted disk.
-                    desktop: DesktopProfile::Headless,
+                    desktop: self.desktop,
                 },
-                ssh_daemon,
+                guest: CloudImage {
+                    profile,
+                    release: self.release.clone(),
+                },
             },
             ram_mb: self.ram_mb,
             disk_gb: self.disk_gb,
@@ -142,7 +160,7 @@ fn number<T: std::str::FromStr>(value: &str, argument: &str) -> Result<T, String
 #[cfg(test)]
 mod tests {
     use super::{AdoptArguments, DEFAULT_CPU_CORES, DEFAULT_RAM_MB};
-    use vmlord_core::{SshAccess, SshPort, VmSource};
+    use vmlord_core::{DesktopProfile, SshAccess, SshPort, VmSource};
 
     fn parse(arguments: &[&str]) -> Result<AdoptArguments, String> {
         AdoptArguments::parse(arguments.iter().copied().map(ToOwned::to_owned))
@@ -159,6 +177,8 @@ mod tests {
             "agromov",
             "--disk-gb",
             "200",
+            "--release",
+            "26.04",
             "--ram-mb",
             "32768",
             "--cpu-cores",
@@ -168,7 +188,7 @@ mod tests {
         ])
         .expect("parsed");
 
-        let request = arguments.request(vmlord_core::ubuntu().ssh);
+        let request = arguments.request(vmlord_core::ubuntu());
         assert_eq!(request.name, "imported");
         assert_eq!(request.disk_gb, 200);
         assert_eq!(request.ram_mb, 32768);
@@ -194,12 +214,14 @@ mod tests {
             "a",
             "--disk-gb",
             "64",
+            "--release",
+            "26.04",
         ])
         .expect("parsed");
 
         assert_eq!(arguments.ram_mb, DEFAULT_RAM_MB);
         assert_eq!(arguments.cpu_cores, DEFAULT_CPU_CORES);
-        let request = arguments.request(vmlord_core::ubuntu().ssh);
+        let request = arguments.request(vmlord_core::ubuntu());
         let VmSource::ExistingDisk { provisioning, .. } = &request.source else {
             panic!("an adoption is an existing disk");
         };
@@ -210,6 +232,70 @@ mod tests {
                 port: SshPort::DEFAULT,
             }
         );
+    }
+
+    /// The one that decides whether an imported guest ever gets a display:
+    /// a desktop guest recorded as headless is one VMLord never provisions.
+    #[test]
+    fn an_adopted_guest_has_a_desktop_unless_it_is_said_to_be_headless() {
+        let with = parse(&[
+            "--name",
+            "i",
+            "--disk",
+            "d.vhdx",
+            "--username",
+            "a",
+            "--disk-gb",
+            "64",
+            "--release",
+            "26.04",
+        ])
+        .expect("parsed")
+        .request(vmlord_core::ubuntu());
+        assert_eq!(with.desktop_profile(), DesktopProfile::Gnome);
+
+        let without = parse(&[
+            "--name",
+            "i",
+            "--disk",
+            "d.vhdx",
+            "--username",
+            "a",
+            "--disk-gb",
+            "64",
+            "--release",
+            "26.04",
+            "--headless",
+        ])
+        .expect("parsed")
+        .request(vmlord_core::ubuntu());
+        assert_eq!(without.desktop_profile(), DesktopProfile::Headless);
+    }
+
+    /// Without a release the VM records no guest, and the display and GPU
+    /// payloads have nothing to be chosen by.
+    #[test]
+    fn an_adopted_guest_names_the_release_its_payloads_are_chosen_by() {
+        let request = parse(&[
+            "--name",
+            "i",
+            "--disk",
+            "d.vhdx",
+            "--username",
+            "a",
+            "--disk-gb",
+            "64",
+            "--release",
+            "26.04",
+        ])
+        .expect("parsed")
+        .request(vmlord_core::ubuntu());
+
+        let VmSource::ExistingDisk { guest, .. } = &request.source else {
+            panic!("an adoption is an existing disk");
+        };
+        assert_eq!(guest.release, "26.04");
+        assert_eq!(guest.profile.name, "Ubuntu");
     }
 
     #[test]

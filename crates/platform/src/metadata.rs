@@ -213,18 +213,21 @@ const GUEST_ARCHITECTURE: &str = "amd64";
 /// What a source says about the guest it will produce.
 pub(crate) fn guest_target_key(source: &VmSource) -> Option<GuestTargetKey> {
     match source {
-        // An adopted guest's distribution, release and kernel are what its
-        // agent reports once it is running: nothing on the host chose them, so
-        // nothing on the host may claim to know them.
-        VmSource::LocalMedia { .. } | VmSource::ExistingDisk { .. } => None,
-        VmSource::CloudImage { image, .. } => Some(GuestTargetKey {
-            // The catalog spells a distribution the way the guest's
-            // `/etc/os-release` does, which is lowercase; the profile spells
-            // the name the way a person reads it.
-            distribution: image.profile.name.to_ascii_lowercase(),
-            release: image.release.clone(),
-            architecture: GUEST_ARCHITECTURE.to_owned(),
-        }),
+        VmSource::LocalMedia { .. } => None,
+        // An adopted guest's is named by the adoption rather than chosen by
+        // it: without one the VM records no guest, and everything keyed by a
+        // release -- the display payload, the GPU payload -- has nothing to
+        // choose from, so an imported VM could never be given either.
+        VmSource::CloudImage { image, .. } | VmSource::ExistingDisk { guest: image, .. } => {
+            Some(GuestTargetKey {
+                // The catalog spells a distribution the way the guest's
+                // `/etc/os-release` does, which is lowercase; the profile
+                // spells the name the way a person reads it.
+                distribution: image.profile.name.to_ascii_lowercase(),
+                release: image.release.clone(),
+                architecture: GUEST_ARCHITECTURE.to_owned(),
+            })
+        }
     }
 }
 

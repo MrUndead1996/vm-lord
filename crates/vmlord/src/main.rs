@@ -219,21 +219,20 @@ fn adopt_disk(arguments: impl Iterator<Item = String>) -> Result<PathBuf, String
         .settings;
     let _ = vmlord_core::initialize_with_diagnostics(&settings);
 
-    // The daemon description comes from the installed profile, which is where
-    // every other VM's comes from: an adopted guest runs a release VMLord
-    // ships a profile for, and how that release carries sshd decides which
-    // drop-ins move its port.
+    // The distribution profile comes from the installed catalog, which is
+    // where every other VM's comes from: an adopted guest runs a release
+    // VMLord ships a profile for, and that profile decides which drop-ins move
+    // its SSH port and which payloads its display and GPU are built from.
     let bundle = std::env::current_exe()
         .map_err(|error| error.to_string())?
         .parent()
         .ok_or("the VMLord executable has no directory")?
         .join("distros");
     vmlord_core::sync_bundled_profiles(&bundle, &store).map_err(|error| error.to_string())?;
-    let ssh_daemon = vmlord_core::DistroCatalog::load(&store)
+    let profile = vmlord_core::DistroCatalog::load(&store)
         .map_err(|error| error.to_string())?
         .select(&settings.default_distro)
         .map_err(|error| error.to_string())?
-        .ssh
         .clone();
 
     let mut repository = vmlord_platform::HcsVmRepository::new(
@@ -242,7 +241,7 @@ fn adopt_disk(arguments: impl Iterator<Item = String>) -> Result<PathBuf, String
     );
     repository.initialize().map_err(|error| error.to_string())?;
     repository
-        .adopt_disk(arguments.request(ssh_daemon))
+        .adopt_disk(arguments.request(profile))
         .map_err(|error| error.to_string())
 }
 

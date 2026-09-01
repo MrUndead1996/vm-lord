@@ -58,14 +58,25 @@ Nothing else from the AppSandbox VM directory is imported — not `vm.vmgs`, not
 
 ```
 vmlord adopt-disk --name <name> --disk <path to the copy> --username <user> \
-                  --disk-gb <size> [--ram-mb <size>] [--cpu-cores <count>] \
-                  [--ssh-port <port>]
+                  --disk-gb <size> --release <release> [--ram-mb <size>] \
+                  [--cpu-cores <count>] [--ssh-port <port>] [--headless]
 ```
 
 `--username`, `--disk-gb`, `--ram-mb` and `--cpu-cores` come from the source
 VM's own entry in `%ProgramData%\AppSandbox\vms.cfg` (`AdminUser`, `HddGB`,
-`RamMB`, `CpuCores`). `--disk-gb` is required: it is recorded as the VM's disk
-size and a later resize is checked against it.
+`RamMB`, `CpuCores`). `--release` is the Ubuntu release the guest runs, which
+`ImagePath` in the same file names.
+
+Two of those are required because getting them wrong is not a cosmetic
+mistake. `--disk-gb` is recorded as the VM's disk size and a later resize is
+checked against it. `--release` is what the VM records as its guest, and a VM
+that records no guest can be given neither a display payload nor a GPU one.
+
+An adopted guest is taken to have a desktop, because AppSandbox's own first
+boot installs one into every Linux VM it builds; `--headless` says otherwise.
+This is what decides whether VMLord provisions its display stack into the
+guest at all, so a desktop guest adopted as headless is one whose display
+never arrives.
 
 This builds the VM's own files around the copy — a new UUID, fresh firmware and
 runtime state, its own `config.json`, an SSH key pair, an agent secret — and

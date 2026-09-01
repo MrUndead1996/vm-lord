@@ -258,10 +258,8 @@ impl VmCreationPipeline {
             // guessing which distribution answered.
             ssh_daemon: match &request.source {
                 VmSource::LocalMedia { .. } => None,
-                VmSource::CloudImage { image, .. } => Some(image.profile.ssh.clone()),
-                // No profile was chosen for an adopted guest: the daemon it
-                // runs was observed, and the adoption names it.
-                VmSource::ExistingDisk { ssh_daemon, .. } => Some(ssh_daemon.clone()),
+                VmSource::CloudImage { image, .. }
+                | VmSource::ExistingDisk { guest: image, .. } => Some(image.profile.ssh.clone()),
             },
             gpu_mode: request.gpu_mode,
             // The desktop the seed below is asked to install, and the fact
@@ -308,7 +306,7 @@ impl VmCreationPipeline {
                 VmSource::ExistingDisk {
                     path,
                     provisioning,
-                    ssh_daemon,
+                    guest,
                 } => {
                     // Nothing is written *into* the disk here: it already holds
                     // a system, and what brings that system to VMLord's
@@ -320,7 +318,7 @@ impl VmCreationPipeline {
                         vm_directory,
                         &request.name,
                         provisioning,
-                        ssh_daemon,
+                        &guest.profile.ssh,
                         agent.as_deref(),
                     )?;
                 }
@@ -1429,7 +1427,10 @@ mod tests {
         request.source = VmSource::ExistingDisk {
             path: disk.to_string_lossy().into_owned(),
             provisioning,
-            ssh_daemon: vmlord_core::ubuntu().ssh,
+            guest: CloudImage {
+                profile: vmlord_core::ubuntu(),
+                release: "26.04".into(),
+            },
         };
         request
     }

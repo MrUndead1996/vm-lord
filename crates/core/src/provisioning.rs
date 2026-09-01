@@ -13,7 +13,7 @@ use std::fmt;
 use crate::{
     RepositoryError,
     display::DesktopProfile,
-    distro::{DistroProfile, SshDaemon},
+    distro::DistroProfile,
     ssh::{SshAuthentication, SshConfig, SshPort},
 };
 
@@ -46,12 +46,18 @@ pub enum VmSource {
     ///
     /// It carries a `Provisioning` because the record still has to say which
     /// account VMLord's key went into and on what port the daemon answers, and
-    /// an `SshDaemon` because no distribution profile was chosen for it: the
-    /// guest was observed rather than selected.
+    /// what desktop the guest has -- which is what decides whether VMLord
+    /// provisions its display stack into it.
+    ///
+    /// `guest` is the same pair of values a cloud image carries, and it means
+    /// the same thing to everything downstream: which distribution and release
+    /// this guest is. It describes what is already on the disk rather than
+    /// something to fetch, and it is what lets an imported VM be given the
+    /// display and GPU payloads built for its release.
     ExistingDisk {
         path: String,
         provisioning: Provisioning,
-        ssh_daemon: SshDaemon,
+        guest: CloudImage,
     },
 }
 
@@ -147,10 +153,18 @@ impl VmSource {
                 provisioning.validate()
             }
             Self::ExistingDisk {
-                path, provisioning, ..
+                path,
+                provisioning,
+                guest,
             } => {
                 if path.trim().is_empty() {
                     return Err(rejected("the disk to adopt must be named"));
+                }
+                if guest.release.trim().is_empty() {
+                    return Err(rejected(
+                        "the release the adopted guest runs must be named: it is what chooses \
+                         the display and GPU payloads built for it",
+                    ));
                 }
                 provisioning.validate()
             }
@@ -385,7 +399,10 @@ mod tests {
         let source = VmSource::ExistingDisk {
             path: "D:\\vms\\imported\\disk.vhdx".to_owned(),
             provisioning: provisioning(),
-            ssh_daemon: ubuntu().ssh,
+            guest: CloudImage {
+                profile: ubuntu(),
+                release: "26.04".into(),
+            },
         };
 
         source.validate().expect("a valid adoption");
@@ -400,11 +417,32 @@ mod tests {
         let source = VmSource::ExistingDisk {
             path: "   ".to_owned(),
             provisioning: provisioning(),
-            ssh_daemon: ubuntu().ssh,
+            guest: CloudImage {
+                profile: ubuntu(),
+                release: "26.04".into(),
+            },
         };
 
         let error = source.validate().expect_err("refused");
         assert!(error.to_string().contains("disk"), "{error}");
+    }
+
+    /// Without it the VM records no guest, and everything keyed by the
+    /// guest's release -- the display payload, the GPU payload -- has nothing
+    /// to choose from.
+    #[test]
+    fn an_adoption_that_names_no_release_is_refused() {
+        let source = VmSource::ExistingDisk {
+            path: "D:\\vms\\imported\\disk.vhdx".to_owned(),
+            provisioning: provisioning(),
+            guest: CloudImage {
+                profile: ubuntu(),
+                release: "  ".into(),
+            },
+        };
+
+        let error = source.validate().expect_err("refused");
+        assert!(error.to_string().contains("release"), "{error}");
     }
 
     fn cloud_source() -> VmSource {
