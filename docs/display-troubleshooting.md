@@ -123,9 +123,12 @@ Sound is a channel of its own, served by a system daemon that needs no login.
   holds it, or the daemon is not in the `audio` group -- `systemctl show
   vmlord-display-audio -p SupplementaryGroups` says whether the unit asks for
   it.
-- Check the guest's own output device. GNOME should show one output; if it
-  shows two, `/etc/modprobe.d/vmlord-audio.conf` did not take effect and the
-  desktop may be playing into the cable nobody is capturing.
+- Check the guest's own output device. GNOME should show one output, named
+  **VMLord audio**. If it shows *Dummy Output* instead, the desktop has no
+  device at all: `/etc/pipewire/pipewire.conf.d/51-vmlord-audio.conf` is
+  missing or was not read. PipeWire's ALSA monitor refuses the whole loopback
+  card while the daemon holds one of its devices, which is why the output is a
+  statically declared node rather than a discovered card.
 - Check that the viewer is not muted: **Mute audio** in the window's system
   menu, which is remembered per VM between sessions.
 - Check the host's output. If the viewer's log says the host has no audio

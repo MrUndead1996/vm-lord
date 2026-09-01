@@ -91,6 +91,10 @@ const LOOPBACK_MODULES_LOAD: &str = "/etc/modules-load.d/vmlord-audio.conf";
 /// What gives it one cable instead of the default two, so that GNOME shows one
 /// output rather than a duplicate that plays into nothing.
 const LOOPBACK_MODPROBE: &str = "/etc/modprobe.d/vmlord-audio.conf";
+/// Where PipeWire reads its own drop-ins.
+const PIPEWIRE_DROP_IN: &str = "/etc/pipewire/pipewire.conf.d/51-vmlord-audio.conf";
+/// The sink that binds the desktop's output straight to the loopback.
+const AUDIO_SINK: &str = "51-vmlord-audio.conf";
 /// The rule that hides the loopback's capture side, for WirePlumber 0.5.
 const LOOPBACK_RULE_JSON: &str = "51-vmlord-loopback.conf";
 /// The same rule for WirePlumber 0.4, which reads Lua instead.
@@ -1340,6 +1344,10 @@ fn install_audio(audio: &Path) -> Result<(), String> {
         Path::new(LOOPBACK_MODPROBE),
         0o644,
     )?;
+    // Without this the desktop has no output at all while the daemon holds the
+    // loopback: PipeWire's ALSA monitor drops a card whose every PCM device is
+    // not free, and the daemon holds one for the life of a session.
+    install_file(&audio.join(AUDIO_SINK), Path::new(PIPEWIRE_DROP_IN), 0o644)?;
     if let Some((rule, destination)) = wireplumber_rule(Path::new(WIREPLUMBER_SHARE)) {
         install_file(&audio.join(rule), &destination, 0o644)?;
     }
@@ -1662,6 +1670,16 @@ mod tests {
         // Sound belongs to the machine rather than to whoever is at the
         // screen, and the stream has to exist before anybody logs in.
         assert!(!super::USER_UNITS.contains(&"vmlord-display-audio.service"));
+    }
+
+    #[test]
+    fn the_desktops_output_is_a_static_node_rather_than_a_monitored_card() {
+        // The one that must not be forgotten: PipeWire's ALSA monitor refuses
+        // a card while any of its PCM devices is busy, and the audio daemon
+        // holds one for the life of a session. A guest without this file has
+        // a Dummy Output and no way to play anything at all.
+        assert_eq!(super::AUDIO_SINK, "51-vmlord-audio.conf");
+        assert!(super::PIPEWIRE_DROP_IN.starts_with("/etc/pipewire/pipewire.conf.d/"));
     }
 
     #[test]

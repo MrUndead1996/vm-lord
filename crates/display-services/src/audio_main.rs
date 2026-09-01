@@ -50,6 +50,13 @@ const BROKER_SOCKET: &str = "/run/vmlord/display-audio.sock";
 /// How long to wait before looking for the broker again.
 const RETRY: Duration = Duration::from_secs(2);
 
+/// How many dropped periods pass between two lines about them.
+///
+/// A hundred periods is a second at the pinned format: enough that a host
+/// which has stopped keeping up is visible in the journal, few enough that it
+/// cannot fill it.
+const DROPS_PER_REPORT: u64 = 100;
+
 /// How long a write waits before the period it carries is given up on.
 ///
 /// Two periods. A host that has not taken a period in twenty milliseconds is
@@ -239,6 +246,9 @@ fn pump<S: Write>(
         format.sample_rate, format.channels, format.sample_format, format.frames_per_period
     );
 
+    // The format is the one record the host cannot do without: a period that
+    // arrives before it has nothing to be played as. A host too slow to take
+    // it is therefore a channel to rebind rather than a record to drop.
     write_record(
         stream,
         &limits,
@@ -250,10 +260,16 @@ fn pump<S: Write>(
             generation,
             format_message(format).encode_to_vec(),
         ),
-    )?;
+    )
+    .map_err(|failure| match failure {
+        WriteFailure::TooSlow => "the host did not take the audio format".to_owned(),
+        WriteFailure::Lost(reason) => reason,
+    })?;
 
     let mut stream_state = Stream::new(format);
     let mut period = vec![0u8; format.period_bytes()];
+    // How many periods in a row the host has not taken.
+    let mut dropped = 0u64;
     loop {
         let frames = capture
             .read(&mut period)
@@ -275,19 +291,70 @@ fn pump<S: Write>(
         while let Some(sent) = stream_state.take() {
             let record = data_record(&sent, take(&mut sequence), generation);
 
-            // A period the host will not take in time is dropped rather than
-            // waited on: the position the next record carries is what tells it
-            // how much went missing.
-            if write_record(stream, &limits, &record).is_err() {
-                eprintln!("vmlord-display-audio: dropped {}", describe_period(&sent));
+            match write_record(stream, &limits, &record) {
+                Ok(()) => dropped = 0,
+                // A period the host did not take in time is dropped rather
+                // than waited on: the position the next record carries is what
+                // tells it how much went missing. Counted rather than written
+                // down one by one, because a host that has stopped taking
+                // anything would otherwise fill the journal at a line every
+                // ten milliseconds.
+                Err(WriteFailure::TooSlow) => {
+                    dropped += 1;
+                    if dropped % DROPS_PER_REPORT == 1 {
+                        eprintln!(
+                            "vmlord-display-audio: the host is not keeping up; dropped {dropped} period(s), last {}",
+                            describe_period(&sent)
+                        );
+                    }
+                }
+                // Anything else is a socket that is gone. Ending here is what
+                // takes the daemon back to waiting for a session, and it is
+                // the difference between a channel that reconnects and one
+                // that writes into a closed socket for ever.
+                Err(WriteFailure::Lost(reason)) => return Err(reason),
             }
         }
     }
 }
 
+/// Why one period did not reach the host.
+#[derive(Debug)]
+enum WriteFailure {
+    /// The socket would not take it inside the write timeout. The channel is
+    /// still there; this period is not.
+    TooSlow,
+    /// The socket is gone, for the reason given.
+    Lost(String),
+}
+
 /// Writes one record, and says whether the host took it.
-fn write_record<S: Write>(stream: &mut S, limits: &Limits, record: &Record) -> Result<(), String> {
-    record::write(stream, record, limits).map_err(|error| error.to_string())
+///
+/// The two failures are told apart by the errno the timeout raises, because
+/// they mean opposite things: one period lost is ordinary, and a lost socket
+/// is a channel to rebind.
+fn write_record<S: Write>(
+    stream: &mut S,
+    limits: &Limits,
+    record: &Record,
+) -> Result<(), WriteFailure> {
+    match record::write(stream, record, limits) {
+        Ok(()) => Ok(()),
+        Err(record::RecordError::Io(error)) if timed_out(&error) => Err(WriteFailure::TooSlow),
+        Err(error) => Err(WriteFailure::Lost(error.to_string())),
+    }
+}
+
+/// Whether an error is the write timeout expiring rather than a broken socket.
+///
+/// `SO_SNDTIMEO` reports as `EAGAIN` on Linux, which `std` maps to
+/// `WouldBlock`; `TimedOut` is accepted beside it so that a future transport
+/// which reports the other one is not mistaken for a lost connection.
+fn timed_out(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 /// Tells the host why there is no stream.
@@ -422,6 +489,51 @@ mod tests {
                 "no run of the payload reached a log line"
             );
         }
+    }
+
+    #[test]
+    fn a_write_that_timed_out_is_a_lost_period_and_not_a_lost_socket() {
+        // The two are told apart because they mean opposite things: a period
+        // the host was too slow for is dropped and the channel carries on,
+        // while a socket that has gone takes the daemon back to waiting for a
+        // session. Confusing them once meant writing into a closed socket for
+        // ever, one journal line every ten milliseconds.
+        assert!(timed_out(&std::io::Error::from(std::io::ErrorKind::WouldBlock)));
+        assert!(timed_out(&std::io::Error::from(std::io::ErrorKind::TimedOut)));
+        assert!(!timed_out(&std::io::Error::from(std::io::ErrorKind::BrokenPipe)));
+        assert!(!timed_out(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionReset
+        )));
+    }
+
+    #[test]
+    fn a_broken_socket_ends_the_session_rather_than_dropping_periods() {
+        struct Broken;
+
+        impl Write for Broken {
+            fn write(&mut self, _bytes: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let failure = write_record(
+            &mut Broken,
+            &Limits::new(0, 0),
+            &data_record(
+                &Sent {
+                    position: 0,
+                    bytes: vec![0u8; 1920],
+                },
+                0,
+                0,
+            ),
+        );
+
+        assert!(matches!(failure, Err(WriteFailure::Lost(_))));
     }
 
     #[test]

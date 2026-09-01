@@ -3310,6 +3310,16 @@ and three structures it needs are written out in `alsa/uapi.rs` the way the DRM
 ABI is in `drm/uapi.rs`. A layout test holds the structures to the kernel's,
 because a field that moved is an `EINVAL` with no explanation.
 
+The desktop's own output is a **statically declared PipeWire node** bound to
+`hw:Loopback,0,0`, not a card PipeWire discovered. That is not a preference:
+PipeWire's ALSA monitor refuses a whole card while any of its PCM devices is
+held by somebody else -- `card 0 pcm device pcm1c busy`, `ALSA card 0
+unavailable (Device or resource busy)` -- and the daemon holds exactly that
+device for the life of a session. A monitored card would therefore disappear
+from the desktop the moment sound began working, leaving a Dummy Output with
+nothing behind it. A declared node is opened by PipeWire itself, skips that
+check, and removes the race between a login and the daemon's first capture.
+
 **Whichever half of the loopback opens first fixes the other**, which is what
 decides the format. The daemon starts at boot, so in the ordinary case it opens
 first and pins S16_LE, 48 kHz, stereo, in 480-frame periods -- 192 KB/s on the
