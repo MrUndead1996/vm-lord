@@ -37,3 +37,7 @@ impl fmt::Debug for ConvertError {
 }
 
 impl std::error::Error for ConvertError {}
+
+mod facts;
+#[cfg(test)]
+mod fixture;
