@@ -175,6 +175,15 @@ pub(crate) fn agent_secret_path(vm_directory: &Path) -> PathBuf {
     vm_directory.join("agent.secret")
 }
 
+/// Returns the path of the document the offline conversion of an adopted disk
+/// consumes.
+///
+/// Written beside the VM rather than handed out: it names the VM's public key
+/// and its agent secret, and the conversion is the only other holder of those.
+pub(crate) fn import_input_path(vm_directory: &Path) -> PathBuf {
+    vm_directory.join("import-input.json")
+}
+
 /// Returns the directory holding the VM's own SSH key pair.
 ///
 /// A directory of its own rather than loose files beside `config.json`: it is

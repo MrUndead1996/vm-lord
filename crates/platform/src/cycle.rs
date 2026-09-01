@@ -68,7 +68,9 @@ pub(crate) struct CycleReport {
 /// configuration by the time it starts.
 fn has_a_guest_to_ask(request: &VmCreateRequest) -> bool {
     match &request.source {
-        VmSource::CloudImage { .. } => true,
+        // An adopted guest has one too: the offline conversion put VMLord's
+        // key and agent into it before it ever started.
+        VmSource::CloudImage { .. } | VmSource::ExistingDisk { .. } => true,
         VmSource::LocalMedia { .. } => false,
     }
 }

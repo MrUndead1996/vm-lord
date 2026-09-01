@@ -213,7 +213,10 @@ const GUEST_ARCHITECTURE: &str = "amd64";
 /// What a source says about the guest it will produce.
 pub(crate) fn guest_target_key(source: &VmSource) -> Option<GuestTargetKey> {
     match source {
-        VmSource::LocalMedia { .. } => None,
+        // An adopted guest's distribution, release and kernel are what its
+        // agent reports once it is running: nothing on the host chose them, so
+        // nothing on the host may claim to know them.
+        VmSource::LocalMedia { .. } | VmSource::ExistingDisk { .. } => None,
         VmSource::CloudImage { image, .. } => Some(GuestTargetKey {
             // The catalog spells a distribution the way the guest's
             // `/etc/os-release` does, which is lowercase; the profile spells

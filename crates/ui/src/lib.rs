@@ -3491,7 +3491,9 @@ mod tests {
     fn provisioning_of(request: &VmCreateRequest) -> &Provisioning {
         match &request.source {
             VmSource::CloudImage { provisioning, .. } => provisioning,
-            VmSource::LocalMedia { .. } => panic!("expected a cloud image request"),
+            VmSource::LocalMedia { .. } | VmSource::ExistingDisk { .. } => {
+                panic!("expected a cloud image request")
+            }
         }
     }
 

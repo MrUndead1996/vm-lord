@@ -13,7 +13,7 @@ use std::fmt;
 use crate::{
     RepositoryError,
     display::DesktopProfile,
-    distro::DistroProfile,
+    distro::{DistroProfile, SshDaemon},
     ssh::{SshAuthentication, SshConfig, SshPort},
 };
 
@@ -39,6 +39,19 @@ pub enum VmSource {
     CloudImage {
         image: CloudImage,
         provisioning: Provisioning,
+    },
+    /// A disk that already holds a system, brought to VMLord's contract by
+    /// something other than a seed -- the offline conversion of a guest
+    /// imported from AppSandbox.
+    ///
+    /// It carries a `Provisioning` because the record still has to say which
+    /// account VMLord's key went into and on what port the daemon answers, and
+    /// an `SshDaemon` because no distribution profile was chosen for it: the
+    /// guest was observed rather than selected.
+    ExistingDisk {
+        path: String,
+        provisioning: Provisioning,
+        ssh_daemon: SshDaemon,
     },
 }
 
@@ -130,6 +143,14 @@ impl VmSource {
             } => {
                 if image.release.trim().is_empty() {
                     return Err(rejected("distribution release must not be empty"));
+                }
+                provisioning.validate()
+            }
+            Self::ExistingDisk {
+                path, provisioning, ..
+            } => {
+                if path.trim().is_empty() {
+                    return Err(rejected("the disk to adopt must be named"));
                 }
                 provisioning.validate()
             }
@@ -354,6 +375,36 @@ mod tests {
             timezone: "Europe/Moscow".into(),
             desktop: DesktopProfile::Gnome,
         }
+    }
+
+    /// An adopted disk carries what a seed would otherwise have applied,
+    /// because the record still has to say which account holds VMLord's key
+    /// and on what port the guest's daemon answers.
+    #[test]
+    fn an_existing_disk_carries_the_provisioning_a_seed_would_have_applied() {
+        let source = VmSource::ExistingDisk {
+            path: "D:\\vms\\imported\\disk.vhdx".to_owned(),
+            provisioning: provisioning(),
+            ssh_daemon: ubuntu().ssh,
+        };
+
+        source.validate().expect("a valid adoption");
+        let VmSource::ExistingDisk { provisioning, .. } = &source else {
+            panic!("the variant just built");
+        };
+        assert_eq!(provisioning.username, "user");
+    }
+
+    #[test]
+    fn an_adoption_that_names_no_disk_is_refused() {
+        let source = VmSource::ExistingDisk {
+            path: "   ".to_owned(),
+            provisioning: provisioning(),
+            ssh_daemon: ubuntu().ssh,
+        };
+
+        let error = source.validate().expect_err("refused");
+        assert!(error.to_string().contains("disk"), "{error}");
     }
 
     fn cloud_source() -> VmSource {

@@ -60,22 +60,22 @@ impl HcsVmConfigBuilder {
         }
         ensure_supported_network_mode(request.network_mode)?;
 
-        let mut attachments = BTreeMap::from([
-            (
-                "0".to_string(),
-                Attachment {
-                    attachment_type: "VirtualDisk",
-                    path: system_disk_path.to_path_buf(),
-                },
-            ),
-            (
+        let mut attachments = BTreeMap::from([(
+            "0".to_string(),
+            Attachment {
+                attachment_type: "VirtualDisk",
+                path: system_disk_path.to_path_buf(),
+            },
+        )]);
+        if let Some(media) = media_path(request, seed_path) {
+            attachments.insert(
                 "1".to_string(),
                 Attachment {
                     attachment_type: "Iso",
-                    path: media_path(request, seed_path).to_path_buf(),
+                    path: media.to_path_buf(),
                 },
-            ),
-        ]);
+            );
+        }
         if let Some(tools_path) = tools_path {
             attachments.insert(
                 "2".to_string(),
@@ -194,10 +194,17 @@ pub(crate) fn com1_pipe_path(vm_id: Uuid) -> String {
 ///
 /// One place decides it, because two need it: the configuration document below
 /// and the pipeline, which grants the VM access to the same file.
-pub(crate) fn media_path<'a>(request: &'a VmCreateRequest, seed_path: &'a Path) -> &'a Path {
+pub(crate) fn media_path<'a>(
+    request: &'a VmCreateRequest,
+    seed_path: &'a Path,
+) -> Option<&'a Path> {
     match &request.source {
-        VmSource::LocalMedia { path } => Path::new(path),
-        VmSource::CloudImage { .. } => seed_path,
+        VmSource::LocalMedia { path } => Some(Path::new(path)),
+        VmSource::CloudImage { .. } => Some(seed_path),
+        // An adopted disk boots the system already on it. There is no
+        // installer to attach and no seed to read: what a created guest gets
+        // from cloud-init, an imported one got from the offline conversion.
+        VmSource::ExistingDisk { .. } => None,
     }
 }
 
@@ -858,9 +865,12 @@ mod tests {
 
         assert_eq!(
             media_path(&request(), &seed_path),
-            Path::new("C:\\images\\installer.iso")
+            Some(Path::new("C:\\images\\installer.iso"))
         );
-        assert_eq!(media_path(&cloud_request(), &seed_path), seed_path);
+        assert_eq!(
+            media_path(&cloud_request(), &seed_path),
+            Some(seed_path.as_path())
+        );
     }
 
     #[test]

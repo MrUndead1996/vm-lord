@@ -140,7 +140,10 @@ impl VmCreateRequest {
     pub fn desktop_profile(&self) -> DesktopProfile {
         match &self.source {
             VmSource::LocalMedia { .. } => DesktopProfile::Headless,
-            VmSource::CloudImage { provisioning, .. } => provisioning.desktop,
+            VmSource::CloudImage { provisioning, .. }
+            // An adopted guest already has whatever desktop it has: nothing of
+            // VMLord's installs one into it, and the field says which it is.
+            | VmSource::ExistingDisk { provisioning, .. } => provisioning.desktop,
         }
     }
 }

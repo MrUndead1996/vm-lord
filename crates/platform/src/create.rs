@@ -10,8 +10,8 @@ use std::{
 use uuid::Uuid;
 use vmlord_agent_protocol::auth;
 use vmlord_core::{
-    BuildMonitor, BuildStep, CloudImage, Provisioning, RepositoryError, SshAccess, VmCreateRequest,
-    VmSource,
+    BuildMonitor, BuildStep, CloudImage, Provisioning, RepositoryError, SshAccess, SshDaemon,
+    SshUnits, VmCreateRequest, VmSource,
 };
 
 use crate::{
@@ -188,10 +188,17 @@ impl VmCreationPipeline {
         let system_disk_path = layout::system_disk_path(vm_directory);
         let seed_path = layout::seed_path(vm_directory);
         let agent = match &request.source {
-            VmSource::CloudImage { .. } => (self.agent_reader)(),
+            VmSource::CloudImage { .. } | VmSource::ExistingDisk { .. } => (self.agent_reader)(),
             VmSource::LocalMedia { .. } => None,
         };
-        let tools_path = agent.as_ref().map(|_| layout::tools_path(vm_directory));
+        // An adopted guest gets no tools volume: the agent reaches it through
+        // the offline conversion, which copies the binary into the disk
+        // itself, and a volume nothing mounts is a volume to keep in step for
+        // nothing.
+        let tools_path = match &request.source {
+            VmSource::CloudImage { .. } => agent.as_ref().map(|_| layout::tools_path(vm_directory)),
+            VmSource::LocalMedia { .. } | VmSource::ExistingDisk { .. } => None,
+        };
         let guest_state_path = layout::guest_state_path(vm_directory);
         let runtime_state_path = layout::runtime_state_path(vm_directory);
         // Rejects an unsupported request (name, GPU/network mode, ...) before
@@ -207,7 +214,7 @@ impl VmCreationPipeline {
             },
             vm_id,
         )?;
-        let media_path = hcs_config::media_path(request, &seed_path).to_path_buf();
+        let media_path = hcs_config::media_path(request, &seed_path).map(Path::to_path_buf);
 
         tracing::info!(
             "creating VM \"{}\" ({vm_id}) as HCS compute system \"{hcs_compute_system_id}\"",
@@ -242,7 +249,8 @@ impl VmCreationPipeline {
             // system inside it.
             ssh: match &request.source {
                 VmSource::LocalMedia { .. } => None,
-                VmSource::CloudImage { provisioning, .. } => provisioning.ssh_config(),
+                VmSource::CloudImage { provisioning, .. }
+                | VmSource::ExistingDisk { provisioning, .. } => provisioning.ssh_config(),
             },
             // How that daemon is carried, taken from the same profile the seed
             // is printed from. Moving the port later writes the drop-ins named
@@ -251,6 +259,9 @@ impl VmCreationPipeline {
             ssh_daemon: match &request.source {
                 VmSource::LocalMedia { .. } => None,
                 VmSource::CloudImage { image, .. } => Some(image.profile.ssh.clone()),
+                // No profile was chosen for an adopted guest: the daemon it
+                // runs was observed, and the adoption names it.
+                VmSource::ExistingDisk { ssh_daemon, .. } => Some(ssh_daemon.clone()),
             },
             gpu_mode: request.gpu_mode,
             // The desktop the seed below is asked to install, and the fact
@@ -284,12 +295,34 @@ impl VmCreationPipeline {
                 VmSource::LocalMedia { .. } => {
                     monitor.report(BuildStep::WritingDisk);
                     (self.vhd_creator)(&system_disk_path, disk_size_bytes)?;
-                    if !media_path.is_file() {
+                    let media = media_path
+                        .as_deref()
+                        .expect("installation media always names an image");
+                    if !media.is_file() {
                         return Err(RepositoryError::new(format!(
                             "VM image no longer exists: {}",
-                            media_path.display()
+                            media.display()
                         )));
                     }
+                }
+                VmSource::ExistingDisk {
+                    path,
+                    provisioning,
+                    ssh_daemon,
+                } => {
+                    // Nothing is written *into* the disk here: it already holds
+                    // a system, and what brings that system to VMLord's
+                    // contract is the offline conversion, not this pipeline.
+                    monitor.report(BuildStep::WritingDisk);
+                    adopt_disk(Path::new(path), &system_disk_path)?;
+                    monitor.report(BuildStep::Provisioning);
+                    write_adoption(
+                        vm_directory,
+                        &request.name,
+                        provisioning,
+                        ssh_daemon,
+                        agent.as_deref(),
+                    )?;
                 }
                 VmSource::CloudImage {
                     image,
@@ -338,7 +371,9 @@ impl VmCreationPipeline {
             // fails with access denied even though both files exist and are
             // readable by this (elevated) process.
             (self.access_granter)(&hcs_compute_system_id, &system_disk_path)?;
-            (self.access_granter)(&hcs_compute_system_id, &media_path)?;
+            if let Some(media) = &media_path {
+                (self.access_granter)(&hcs_compute_system_id, media)?;
+            }
             if let Some(tools_path) = &tools_path {
                 (self.access_granter)(&hcs_compute_system_id, tools_path)?;
             }
@@ -534,6 +569,95 @@ fn write_provisioning(
         );
     }
     Ok(())
+}
+
+/// Moves the disk being adopted to where the VM's own disk lives.
+///
+/// A rename rather than a copy: the file is the whole VM, it is already a copy
+/// the operator made of a source VMLord never touches, and copying a hundred
+/// and fifty gigabytes a second time would be an hour spent to end up with the
+/// same bytes. A rename across volumes is not a rename at all, so that is
+/// refused with the one thing that fixes it rather than quietly turned into
+/// the copy this avoids.
+fn adopt_disk(disk: &Path, system_disk_path: &Path) -> Result<(), RepositoryError> {
+    if !disk.is_file() {
+        return Err(RepositoryError::new(format!(
+            "the disk to adopt does not exist: {}",
+            disk.display()
+        )));
+    }
+    fs::rename(disk, system_disk_path).map_err(|error| {
+        RepositoryError::new(format!(
+            "{} could not be moved to {}: {error}. A disk being adopted has to be on the same \
+             volume as the VM storage directory, so that it is moved rather than copied again",
+            disk.display(),
+            system_disk_path.display()
+        ))
+    })
+}
+
+/// The VM's own key and secret, and the document that carries them to the
+/// offline conversion.
+///
+/// The same two secrets a created VM gets, minted the same way -- but there is
+/// no seed to put them in, because an adopted guest has no cloud-init to read
+/// one. They reach the guest through the conversion instead, which is why the
+/// document naming them is written here and nowhere else.
+///
+/// `root` and `agent_binary` are the two values this host cannot know: where
+/// the copy will be mounted, and where the agent is on the machine doing the
+/// mounting. They are written as the defaults the documentation names, and the
+/// operator edits them.
+fn write_adoption(
+    vm_directory: &Path,
+    vm_name: &str,
+    provisioning: &Provisioning,
+    ssh_daemon: &SshDaemon,
+    agent: Option<&[u8]>,
+) -> Result<(), RepositoryError> {
+    let pair = vmlord_keys::generate(vm_name)?;
+    vm_key::write_key_pair(vm_directory, &pair)?;
+
+    let agent_secret = agent.map(|_| auth::Secret::generate().to_base64());
+    if let Some(agent_secret) = &agent_secret {
+        write_restricted(
+            &layout::agent_secret_path(vm_directory),
+            format!("{}\n", agent_secret.as_str()).as_bytes(),
+            "the agent secret",
+        )?;
+    }
+
+    let ssh = match provisioning.ssh {
+        SshAccess::Enabled { port, .. } => serde_json::json!({
+            "config_drop_in": ssh_daemon.config_drop_in,
+            "socket_drop_in": match &ssh_daemon.units {
+                SshUnits::SocketActivated { socket_drop_in, .. } => {
+                    serde_json::Value::String(socket_drop_in.clone())
+                }
+                SshUnits::Service { .. } => serde_json::Value::Null,
+            },
+            "port": port.get(),
+        }),
+        SshAccess::Disabled => serde_json::Value::Null,
+    };
+
+    let document = serde_json::json!({
+        "root": "/mnt/vmlord-import",
+        "guest_username": provisioning.username,
+        "vmlord_public_key": pair.public_openssh(),
+        "agent_secret": agent_secret.as_ref().map_or("", |secret| secret.as_str()),
+        "agent_binary": "./vmlord-agent",
+        "hostname": vm_name,
+        "ssh": ssh,
+    });
+    let document = serde_json::to_string_pretty(&document).map_err(|error| {
+        RepositoryError::new(format!("the import document could not be printed: {error}"))
+    })?;
+    write_restricted(
+        &layout::import_input_path(vm_directory),
+        document.as_bytes(),
+        "the import document",
+    )
 }
 
 /// Writes a file of the VM's under the same DACL the private key gets.
@@ -1294,6 +1418,119 @@ mod tests {
         );
 
         assert_eq!(fs::read(&fixture.image_path).unwrap(), b"iso");
+    }
+
+    /// A request that adopts `disk` as a VM named `name`.
+    fn adopt_request(name: &str, disk: &std::path::Path) -> VmCreateRequest {
+        let mut request = cloud_request(name);
+        let VmSource::CloudImage { provisioning, .. } = request.source.clone() else {
+            panic!("cloud_request builds a cloud image request");
+        };
+        request.source = VmSource::ExistingDisk {
+            path: disk.to_string_lossy().into_owned(),
+            provisioning,
+            ssh_daemon: vmlord_core::ubuntu().ssh,
+        };
+        request
+    }
+
+    /// Puts a copied disk beside the VM directory, where the operator leaves it.
+    fn placed_disk(vm_directory: &std::path::Path) -> PathBuf {
+        let disk = vm_directory
+            .parent()
+            .expect("a parent")
+            .join("copied-disk.vhdx");
+        fs::write(&disk, b"a disk that already exists").expect("write");
+        disk
+    }
+
+    #[test]
+    fn adopting_a_disk_downloads_no_image_and_writes_no_seed() {
+        let fixture = fixture("adopt-no-seed");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+        let disk = placed_disk(&fixture.vm_directory);
+        let request = adopt_request("adopted", &disk);
+
+        pipeline
+            .create(&fixture.store, &request, &fixture.vm_directory, &monitor())
+            .expect("the disk should be adopted");
+
+        assert!(
+            calls.cloud.lock().unwrap().is_empty(),
+            "an image was imported for a disk that already exists"
+        );
+        assert!(
+            calls.vhd.lock().unwrap().is_empty(),
+            "a disk was created over one that already exists"
+        );
+        assert!(
+            !crate::layout::seed_path(&fixture.vm_directory).exists(),
+            "a seed was written for a guest with no cloud-init to read it"
+        );
+        assert!(
+            !crate::layout::tools_path(&fixture.vm_directory).exists(),
+            "a tools volume was written for a guest that mounts none"
+        );
+        assert!(!disk.exists(), "the copy should have been moved, not left");
+        assert_eq!(
+            fs::read(crate::layout::system_disk_path(&fixture.vm_directory))
+                .expect("the adopted disk should be the VM's own"),
+            b"a disk that already exists"
+        );
+    }
+
+    #[test]
+    fn adopting_a_disk_writes_the_document_the_conversion_consumes() {
+        let fixture = fixture("adopt-document");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+        let disk = placed_disk(&fixture.vm_directory);
+
+        pipeline
+            .create(
+                &fixture.store,
+                &adopt_request("adopted", &disk),
+                &fixture.vm_directory,
+                &monitor(),
+            )
+            .expect("the disk should be adopted");
+
+        let document = fs::read_to_string(crate::layout::import_input_path(&fixture.vm_directory))
+            .expect("the import document should be written");
+        assert!(
+            document.contains("\"guest_username\": \"dev\""),
+            "{document}"
+        );
+        assert!(document.contains("\"hostname\": \"adopted\""), "{document}");
+        assert!(document.contains("ssh-"), "{document}");
+        assert!(
+            document.contains("/etc/ssh/sshd_config.d/10-vmlord.conf"),
+            "{document}"
+        );
+        assert!(
+            crate::layout::agent_secret_path(&fixture.vm_directory).exists(),
+            "the VM's agent secret should be minted"
+        );
+    }
+
+    #[test]
+    fn an_adopted_disk_that_is_not_there_is_refused() {
+        let fixture = fixture("adopt-missing");
+        let calls = fixture.calls.clone();
+        let pipeline = pipeline(&calls, false, false, false);
+        let disk = fixture.vm_directory.join("disk").join("system.vhdx");
+
+        let error = pipeline
+            .create(
+                &fixture.store,
+                &adopt_request("adopted", &disk),
+                &fixture.vm_directory,
+                &monitor(),
+            )
+            .expect_err("a disk that is not there should be refused");
+
+        assert!(error.to_string().contains("does not exist"), "{error}");
     }
 
     fn cloud_request(name: &str) -> VmCreateRequest {

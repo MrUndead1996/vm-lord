@@ -302,6 +302,9 @@ fn first_step(source: &VmSource) -> BuildStep {
     match source {
         VmSource::CloudImage { .. } => BuildStep::Downloading,
         VmSource::LocalMedia { .. } => BuildStep::WritingDisk,
+        // An adopted disk is already written: what is left is the VM's own
+        // files around it.
+        VmSource::ExistingDisk { .. } => BuildStep::Provisioning,
     }
 }
 
