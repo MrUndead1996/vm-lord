@@ -168,7 +168,7 @@ struct CreateVmForm {
 struct SettingsForm {
     vm_storage_path: String,
     language: Language,
-    log_file_path: String,
+    log_directory: String,
     log_level: LogLevel,
     /// Carried through the dialog unchanged: the settings form rebuilds the
     /// whole `AppSettings`, so a field it does not know about would be lost on
@@ -199,7 +199,7 @@ impl SettingsForm {
         Self {
             vm_storage_path: settings.vm_storage_path.display().to_string(),
             language: settings.language,
-            log_file_path: settings.log_file_path.display().to_string(),
+            log_directory: settings.log_directory.display().to_string(),
             log_level: settings.log_level,
             image_cache_path: settings.image_cache_path.clone(),
             default_distro: settings.default_distro.clone(),
@@ -225,9 +225,9 @@ impl SettingsForm {
         if vm_storage_path.is_empty() {
             return Err(t!("settings.vm_storage_required").to_string());
         }
-        let log_file_path = self.log_file_path.trim();
-        if log_file_path.is_empty() {
-            return Err(t!("settings.log_file_required").to_string());
+        let log_directory = self.log_directory.trim();
+        if log_directory.is_empty() {
+            return Err(t!("settings.log_directory_required").to_string());
         }
 
         self.display
@@ -237,7 +237,7 @@ impl SettingsForm {
         Ok(AppSettings {
             vm_storage_path: PathBuf::from(vm_storage_path),
             language: self.language,
-            log_file_path: PathBuf::from(log_file_path),
+            log_directory: PathBuf::from(log_directory),
             log_level: self.log_level,
             image_cache_path: self.image_cache_path.clone(),
             default_distro: self.default_distro.clone(),
@@ -366,7 +366,7 @@ enum DeleteVmDialogAction {
 
 enum SettingsDialogAction {
     BrowseVmStorage,
-    BrowseLogFile,
+    BrowseLogDirectory,
     /// Look for a newer release now, ignoring the daily throttle.
     CheckUpdates,
     DownloadUpdate,
@@ -614,20 +614,22 @@ impl eframe::App for VmlordUi {
                     }
                 }
             }
-            Some(SettingsDialogAction::BrowseLogFile) => match self.application.pick_log_file() {
-                Ok(Some(path)) => {
-                    if let Some(form) = &mut self.settings_form {
-                        form.log_file_path = path;
-                        form.error = None;
+            Some(SettingsDialogAction::BrowseLogDirectory) => {
+                match self.application.pick_log_directory() {
+                    Ok(Some(path)) => {
+                        if let Some(form) = &mut self.settings_form {
+                            form.log_directory = path;
+                            form.error = None;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        if let Some(form) = &mut self.settings_form {
+                            form.error = Some(error.to_string());
+                        }
                     }
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    if let Some(form) = &mut self.settings_form {
-                        form.error = Some(error.to_string());
-                    }
-                }
-            },
+            }
             Some(SettingsDialogAction::CheckUpdates) => {
                 if let Err(error) = self.application.check_for_updates()
                     && let Some(form) = &mut self.settings_form
@@ -1176,16 +1178,16 @@ fn render_settings_dialog(
 
                     ui.add_sized(
                         [110.0, 24.0],
-                        egui::Label::new(t!("settings.log_file").to_string()),
+                        egui::Label::new(t!("settings.log_directory").to_string()),
                     );
                     ui.horizontal(|ui| {
                         ui.add_sized(
                             [310.0, 24.0],
-                            egui::TextEdit::singleline(&mut form.log_file_path)
-                                .hint_text(t!("settings.log_file_hint").to_string()),
+                            egui::TextEdit::singleline(&mut form.log_directory)
+                                .hint_text(t!("settings.log_directory_hint").to_string()),
                         );
                         if ui.button(t!("common.browse").to_string()).clicked() {
-                            action = Some(SettingsDialogAction::BrowseLogFile);
+                            action = Some(SettingsDialogAction::BrowseLogDirectory);
                         }
                     });
                     ui.end_row();
@@ -4530,7 +4532,7 @@ mod tests {
         let settings = AppSettings {
             vm_storage_path: PathBuf::from(r"C:\VMLord\VMs"),
             language: Language::EnUs,
-            log_file_path: PathBuf::from(r"C:\VMLord\vmlord.log"),
+            log_directory: PathBuf::from(r"C:\VMLord\Logs"),
             log_level: LogLevel::Info,
             image_cache_path: PathBuf::from(r"C:\VMLord\Images"),
             default_distro: "ubuntu".into(),

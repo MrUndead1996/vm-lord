@@ -10,7 +10,6 @@ const SETTINGS_FILE_NAME: &str = "settings.toml";
 const WINDOW_STATE_FILE_NAME: &str = "window.ron";
 const DEFAULT_VM_DIRECTORY: &str = "vms";
 const DEFAULT_LOG_DIRECTORY: &str = "logs";
-const DEFAULT_LOG_FILE_NAME: &str = "vmlord.log";
 const DEFAULT_IMAGE_DIRECTORY: &str = "images";
 const DEFAULT_DISTRO: &str = "ubuntu";
 
@@ -21,13 +20,14 @@ pub struct AppSettings {
     pub vm_storage_path: PathBuf,
     /// UI language.
     pub language: Language,
-    /// Where application log records go, and under what name.
+    /// Directory the application writes its log files to.
     ///
-    /// A template rather than the file itself: every run writes to
-    /// `vmlord-<stamp>.log` beside this path, so one launch's records can be
-    /// read -- or sent in -- without the months around them. `core::logging`
-    /// stamps the name; the directory here is the one that gets created.
-    pub log_file_path: PathBuf,
+    /// One file per run: `core::logging` opens `vmlord-<stamp>.log` in this
+    /// directory every start, so one launch's records can be read -- or sent
+    /// in -- without the months around them. The file names are the
+    /// application's; the setting is only where they land.
+    #[serde(default)]
+    pub log_directory: PathBuf,
     pub log_level: LogLevel,
     /// Directory holding distribution images downloaded from the internet.
     ///
@@ -369,11 +369,7 @@ impl SettingsStore {
     pub fn load_or_create_with_status(&self) -> Result<SettingsLoad, SettingsError> {
         match fs::read_to_string(&self.config_path) {
             Ok(contents) => {
-                let mut settings: AppSettings =
-                    toml::from_str(&contents).map_err(|source| SettingsError::Parse {
-                        path: self.config_path.clone(),
-                        source: Box::new(source),
-                    })?;
+                let mut settings = self.parse(&contents)?;
                 settings
                     .clipboard_files
                     .validate()
@@ -388,6 +384,13 @@ impl SettingsStore {
                     tracing::debug!(
                         "settings carried no image cache path; defaulting to {}",
                         settings.image_cache_path.display()
+                    );
+                }
+                if settings.log_directory.as_os_str().is_empty() {
+                    settings.log_directory = self.config_directory()?.join(DEFAULT_LOG_DIRECTORY);
+                    tracing::debug!(
+                        "settings carried no log directory; defaulting to {}",
+                        settings.log_directory.display()
                     );
                 }
                 Ok(SettingsLoad {
@@ -409,6 +412,31 @@ impl SettingsStore {
                 source,
             }),
         }
+    }
+
+    /// Parses settings, carrying an old log-file setting over to its folder.
+    ///
+    /// A settings file written before the setting became a directory names the
+    /// log file itself; the folder that file sat in is what the field means
+    /// now, and the two never coexist in a file this application wrote. A
+    /// previous path without a parent directory falls through to the default,
+    /// the same way a file without the field at all does.
+    fn parse(&self, contents: &str) -> Result<AppSettings, SettingsError> {
+        let parse_error = |source: toml::de::Error| SettingsError::Parse {
+            path: self.config_path.clone(),
+            source: Box::new(source),
+        };
+        let mut document: toml::Table = toml::from_str(contents).map_err(parse_error)?;
+        if let Some(toml::Value::String(previous)) = document.get("log_file_path").cloned()
+            && let Some(directory) = Path::new(&previous)
+                .parent()
+                .filter(|directory| !directory.as_os_str().is_empty())
+        {
+            document
+                .entry("log_directory".to_owned())
+                .or_insert(toml::Value::String(directory.display().to_string()));
+        }
+        toml::Value::Table(document).try_into().map_err(parse_error)
     }
 
     /// Persists settings as TOML and creates their parent directories when needed.
@@ -437,16 +465,9 @@ impl SettingsStore {
             path: settings.image_cache_path.clone(),
             source,
         })?;
-        let log_directory =
-            settings
-                .log_file_path
-                .parent()
-                .ok_or_else(|| SettingsError::MissingParent {
-                    path: settings.log_file_path.clone(),
-                })?;
-        fs::create_dir_all(log_directory).map_err(|source| SettingsError::Io {
+        fs::create_dir_all(&settings.log_directory).map_err(|source| SettingsError::Io {
             operation: "create log directory",
-            path: log_directory.to_path_buf(),
+            path: settings.log_directory.clone(),
             source,
         })?;
 
@@ -463,9 +484,7 @@ impl SettingsStore {
         Ok(AppSettings {
             vm_storage_path: config_directory.join(DEFAULT_VM_DIRECTORY),
             language: Language::EnUs,
-            log_file_path: config_directory
-                .join(DEFAULT_LOG_DIRECTORY)
-                .join(DEFAULT_LOG_FILE_NAME),
+            log_directory: config_directory.join(DEFAULT_LOG_DIRECTORY),
             log_level: LogLevel::Info,
             image_cache_path: config_directory.join(DEFAULT_IMAGE_DIRECTORY),
             default_distro: default_distro(),
@@ -612,10 +631,7 @@ mod tests {
 
         assert_eq!(settings.vm_storage_path, directory.join("vms"));
         assert_eq!(settings.language, Language::EnUs);
-        assert_eq!(
-            settings.log_file_path,
-            directory.join("logs").join("vmlord.log")
-        );
+        assert_eq!(settings.log_directory, directory.join("logs"));
         assert_eq!(settings.log_level, LogLevel::Info);
         assert!(config_path.is_file());
         assert!(settings.vm_storage_path.is_dir());
@@ -691,13 +707,89 @@ mod tests {
     }
 
     #[test]
+    fn an_old_log_file_setting_names_the_folder_its_logs_go_to() {
+        let directory = temporary_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("settings.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "vm_storage_path = {vms:?}\n\
+                 language = \"en-US\"\n\
+                 log_file_path = {log:?}\n\
+                 log_level = \"info\"\n",
+                vms = directory.join("vms").display().to_string(),
+                log = directory
+                    .join("records")
+                    .join("vmlord.log")
+                    .display()
+                    .to_string(),
+            ),
+        )
+        .unwrap();
+
+        let settings = SettingsStore::new(&config_path).load_or_create().unwrap();
+
+        assert_eq!(settings.log_directory, directory.join("records"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn an_old_log_file_setting_without_a_folder_gets_the_default_one() {
+        let directory = temporary_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("settings.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "vm_storage_path = {vms:?}\n\
+                 language = \"en-US\"\n\
+                 log_file_path = \"vmlord.log\"\n\
+                 log_level = \"info\"\n",
+                vms = directory.join("vms").display().to_string(),
+            ),
+        )
+        .unwrap();
+
+        let settings = SettingsStore::new(&config_path).load_or_create().unwrap();
+
+        assert_eq!(settings.log_directory, directory.join("logs"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn settings_without_a_log_directory_get_the_default_one() {
+        let directory = temporary_directory();
+        fs::create_dir_all(&directory).unwrap();
+        let config_path = directory.join("settings.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "vm_storage_path = {vms:?}\n\
+                 language = \"en-US\"\n\
+                 log_level = \"info\"\n",
+                vms = directory.join("vms").display().to_string(),
+            ),
+        )
+        .unwrap();
+
+        let settings = SettingsStore::new(&config_path).load_or_create().unwrap();
+
+        assert_eq!(settings.log_directory, directory.join("logs"));
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn an_explicit_image_cache_path_is_preserved() {
         let directory = temporary_directory();
         let store = SettingsStore::new(directory.join("settings.toml"));
         let settings = AppSettings {
             vm_storage_path: directory.join("vms"),
             language: Language::EnUs,
-            log_file_path: directory.join("logs").join("vmlord.log"),
+            log_directory: directory.join("logs"),
             log_level: LogLevel::Info,
             image_cache_path: directory.join("elsewhere").join("images"),
             default_distro: "fedora".into(),
@@ -722,7 +814,7 @@ mod tests {
         let settings = AppSettings {
             vm_storage_path: directory.join("virtual-machines"),
             language: Language::EnUs,
-            log_file_path: directory.join("diagnostics").join("application.log"),
+            log_directory: directory.join("diagnostics"),
             log_level: LogLevel::Debug,
             image_cache_path: directory.join("images"),
             default_distro: "ubuntu".into(),
@@ -917,7 +1009,7 @@ mod tests {
         AppSettings {
             vm_storage_path: std::path::PathBuf::from("vms"),
             language: Language::RuRu,
-            log_file_path: std::path::PathBuf::from("vmlord.log"),
+            log_directory: std::path::PathBuf::from("logs"),
             log_level: LogLevel::Info,
             image_cache_path: std::path::PathBuf::from("images"),
             default_distro: "ubuntu".into(),

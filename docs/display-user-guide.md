@@ -99,8 +99,9 @@ and reports that result instead of silently leaving the desktop unusable.
 
 ## Logs and diagnostics
 
-Application and viewer logs are written to the configured VMLord log file
-(by default `%LOCALAPPDATA%\VMLord\logs\vmlord.log`). The VM's display status
+Application and viewer logs are written to the configured VMLord log folder
+(by default `%LOCALAPPDATA%\VMLord\logs`, one `vmlord-<timestamp>.log` file
+per run). The VM's display status
 is the first diagnostic to read: it distinguishes provisioning, payload,
 module, device, service, and connection failures. See
 [display troubleshooting](display-troubleshooting.md) for the corresponding
