@@ -465,8 +465,9 @@ fn attempt(session: &Session, hello: &[u8]) -> Attempt {
             Channel::Frame => frame_port,
             Channel::Input => input_port,
             // Control established the session and is not rebound; the
-            // clipboard is connected by the thread that owns that socket.
-            Channel::Control | Channel::Clipboard => {
+            // clipboard and audio channels are connected by the threads that
+            // own those sockets.
+            Channel::Control | Channel::Clipboard | Channel::Audio => {
                 return Err(format!(
                     "the {channel} channel is not this session's to open"
                 ));

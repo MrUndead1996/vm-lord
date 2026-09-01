@@ -894,12 +894,13 @@ mod tests {
     /// the way the code does would agree with any change to it.
     const AGENT_SERVICE_KEY: &str = "564D4C41-FACB-11E6-BD58-64006A7986D3";
 
-    /// The display's three, spelled out for the same reason: these are the
+    /// The display's five, spelled out for the same reason: these are the
     /// addresses a viewer's connects arrive at inside the partition.
     const DISPLAY_CONTROL_SERVICE_KEY: &str = "564D4C44-FACB-11E6-BD58-64006A7986D3";
     const DISPLAY_FRAME_SERVICE_KEY: &str = "564D4C46-FACB-11E6-BD58-64006A7986D3";
     const DISPLAY_INPUT_SERVICE_KEY: &str = "564D4C49-FACB-11E6-BD58-64006A7986D3";
     const DISPLAY_CLIPBOARD_SERVICE_KEY: &str = "564D4C43-FACB-11E6-BD58-64006A7986D3";
+    const DISPLAY_AUDIO_SERVICE_KEY: &str = "564D4C53-FACB-11E6-BD58-64006A7986D3";
 
     /// The service table of a VM built from a cloud image.
     fn service_table_of_a_built_vm() -> serde_json::Map<String, Value> {
@@ -936,6 +937,7 @@ mod tests {
             DISPLAY_FRAME_SERVICE_KEY,
             DISPLAY_INPUT_SERVICE_KEY,
             DISPLAY_CLIPBOARD_SERVICE_KEY,
+            DISPLAY_AUDIO_SERVICE_KEY,
         ] {
             assert_eq!(
                 table[key].pointer("/BindSecurityDescriptor"),
@@ -966,7 +968,7 @@ mod tests {
             .pointer("/VirtualMachine/Devices/HvSocket/HvSocketConfig/ServiceTable")
             .and_then(Value::as_object)
             .expect("the VM should have a service table");
-        assert_eq!(table.len(), 5, "the agent's service and the display's four");
+        assert_eq!(table.len(), 6, "the agent's service and the display's five");
         assert_eq!(
             table[AGENT_SERVICE_KEY].pointer("/BindSecurityDescriptor"),
             Some(&json!("D:P(A;;FA;;;SY)(A;;FA;;;BA)")),
@@ -1028,6 +1030,9 @@ mod tests {
                                 "BindSecurityDescriptor": "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
                             },
                             DISPLAY_CLIPBOARD_SERVICE_KEY: {
+                                "BindSecurityDescriptor": "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
+                            },
+                            DISPLAY_AUDIO_SERVICE_KEY: {
                                 "BindSecurityDescriptor": "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
                             }
                         }}},

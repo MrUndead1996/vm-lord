@@ -407,9 +407,10 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
         match channel {
             Channel::Frame => self.frame = Some(socket),
             Channel::Input => self.input = Some(socket),
-            // Neither is this session's to bind: control established it, and
-            // the clipboard is bound by the thread that owns that socket.
-            Channel::Control | Channel::Clipboard => {
+            // None of these is this session's to bind: control established it,
+            // and the clipboard and audio channels are bound by the threads
+            // that own those sockets.
+            Channel::Control | Channel::Clipboard | Channel::Audio => {
                 unreachable!("this session binds frame and input only")
             }
         }
@@ -595,7 +596,8 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
             Channel::Frame => self.frame.as_ref(),
             Channel::Input => self.input.as_ref(),
             Channel::Control => Some(&self.control),
-            Channel::Clipboard => None,
+            // Held by their own threads, not by this session.
+            Channel::Clipboard | Channel::Audio => None,
         }
     }
 
@@ -725,6 +727,7 @@ mod tests {
     const FRAME_KEY: [u8; 32] = [1; 32];
     const INPUT_KEY: [u8; 32] = [2; 32];
     const CLIPBOARD_KEY: [u8; 32] = [3; 32];
+    const AUDIO_KEY: [u8; 32] = [4; 32];
 
     fn handover() -> Handover {
         Handover {
@@ -732,6 +735,7 @@ mod tests {
             frame_key: FRAME_KEY.to_vec(),
             input_key: INPUT_KEY.to_vec(),
             clipboard_key: CLIPBOARD_KEY.to_vec(),
+            audio_key: AUDIO_KEY.to_vec(),
             version_major: 1,
             version_minor: 0,
             capabilities: vec![1],

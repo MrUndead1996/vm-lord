@@ -1697,6 +1697,7 @@ mod tests {
             frame_key: vec![1; 32],
             input_key: vec![2; 32],
             clipboard_key: vec![3; 32],
+            audio_key: vec![4; 32],
             version_major: 1,
             version_minor: 0,
             capabilities: vec![i32::from(Capability::Clipboard)],

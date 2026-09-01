@@ -42,3 +42,4 @@ payloads/display/module/*.mod*
 payloads/display/module/.*.cmd
 payloads/display/module/Module.symvers
 payloads/display/module/modules.order
+.veans.yml
