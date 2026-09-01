@@ -29,7 +29,7 @@ use vmlord_agent_protocol::{
         ApplyDisplayRecipeRequest, ApplyDisplayRecipeResponse, ApplyGpuRecipeRequest,
         ApplyGpuRecipeResponse, AttachDisplayPayloadRequest, AttachDisplayPayloadResponse,
         AttachGpuSharesRequest, AttachGpuSharesResponse, AuthenticateRequest, Capability,
-        DisplayMountState, DisplayRecipeStageState, DisplayRecipeStep,
+        DisplayMountState, DisplayRecipeStage, DisplayRecipeStageState, DisplayRecipeStep,
         DisplayShare as WireDisplayShare, DisplayUpdateOutcome, Envelope, ErrorCode, GpuMountState,
         GpuProbeCheckState, GpuProbeVerdict, GpuRecipeStageState, GpuShareRole, HeartbeatRequest,
         HeartbeatResponse, HelloResponse, ProbeGpuRequest, ProbeGpuResponse, ProtocolVersion,
@@ -698,6 +698,27 @@ fn start_update<S: Read + Write>(
     Ok(Some(update.answer.clone()))
 }
 
+/// Why an update did not end up where it was asked to go.
+///
+/// The stage that broke says it, when the guest got far enough to record one.
+/// When it did not -- a guest that is shutting down, or one that could not
+/// read its own facts -- the reason is written onto every stage that never
+/// ran, so the last stage of the report carries it just the same. Only a
+/// report with nothing in it leaves the host with nothing to say.
+fn update_reason(stages: &[DisplayRecipeStage]) -> String {
+    stages
+        .iter()
+        .find(|stage| stage.state() == DisplayRecipeStageState::Failed)
+        .or_else(|| {
+            stages
+                .iter()
+                .rev()
+                .find(|stage| stage.state() == DisplayRecipeStageState::Skipped)
+        })
+        .map(|stage| stage.message.clone())
+        .unwrap_or_else(|| "the guest did not say which stage failed".to_owned())
+}
+
 /// Says what an update came to, records the facts it produced, and hands the
 /// caller the outcome.
 ///
@@ -726,12 +747,7 @@ fn report_display_update(
 
     let versions = report.versions.clone().unwrap_or_default();
     let outcome = report.outcome();
-    let reason = report
-        .stages
-        .iter()
-        .find(|stage| stage.state() == DisplayRecipeStageState::Failed)
-        .map(|broken| broken.message.clone())
-        .unwrap_or_else(|| "the guest did not say which stage failed".to_owned());
+    let reason = update_reason(&report.stages);
     let failure = match outcome {
         DisplayUpdateOutcome::Updated => None,
         DisplayUpdateOutcome::RolledBack => Some(DisplayFailure::new(
@@ -1520,6 +1536,45 @@ mod tests {
             )]),
             None,
             "a guest that has not got there yet has not failed either"
+        );
+    }
+
+    #[test]
+    fn an_update_that_recorded_no_broken_stage_still_reports_the_guest_s_reason() {
+        let report = UpdateDisplayPayloadResponse {
+            stages: vec![
+                DisplayRecipeStage {
+                    step: DisplayRecipeStep::Distribution as i32,
+                    state: DisplayRecipeStageState::Ok as i32,
+                    message: "ubuntu 24.04 x86_64".to_owned(),
+                },
+                DisplayRecipeStage {
+                    step: DisplayRecipeStep::ModuleBuild as i32,
+                    state: DisplayRecipeStageState::Skipped as i32,
+                    message: "the guest is shutting down".to_owned(),
+                },
+                DisplayRecipeStage {
+                    step: DisplayRecipeStep::ServicesStart as i32,
+                    state: DisplayRecipeStageState::Skipped as i32,
+                    message: "the guest is shutting down".to_owned(),
+                },
+            ],
+            versions: None,
+            outcome: DisplayUpdateOutcome::Failed as i32,
+        };
+        let seen = Mutex::new(None);
+
+        report_display_update(&report, "dev", &|report| {
+            *seen.lock().expect("an uncontended lock") = report.failure;
+        });
+
+        assert_eq!(
+            seen.into_inner()
+                .expect("an uncontended lock")
+                .expect("an update that failed is actionable")
+                .message,
+            "the guest is shutting down",
+            "the guest said why; the host must not print a placeholder over it"
         );
     }
 
