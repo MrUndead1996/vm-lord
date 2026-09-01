@@ -6052,6 +6052,7 @@ dependencies = [
  "serde_json",
  "serde_yaml_ng",
  "sha2 0.11.0",
+ "vmlord-appsandbox-convert",
  "vmlord-core",
  "vmlord-display-codec",
  "vmlord-display-payload",

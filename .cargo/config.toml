@@ -50,6 +50,10 @@ dist = ["run", "-p", "xtask", "--", "dist"]
 #         --installer target/installer/VMLord-0.1.0-x86_64-setup.exe \
 #         --output target/installer/release-manifest.json
 release-manifest = ["run", "-p", "xtask", "--", "release-manifest"]
+# The offline AppSandbox conversion, run against a mounted guest root. Linux
+# only, and as root: it writes into another system's filesystem and sets the
+# owners of what it writes. See docs/appsandbox-import.md.
+appsandbox-convert = ["run", "-p", "xtask", "--", "appsandbox-convert"]
 gpu-payload = ["run", "-p", "xtask", "--", "gpu-payload", "pack"]
 display-payload = ["run", "-p", "xtask", "--", "display-payload", "pack"]
 

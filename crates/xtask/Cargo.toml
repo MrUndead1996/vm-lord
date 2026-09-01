@@ -15,6 +15,9 @@ bench = false
 workspace = true
 
 [dependencies]
+# The offline AppSandbox conversion, which this crate only gives a command
+# line to. Linux-only, like the conversion itself.
+vmlord-appsandbox-convert = { path = "../appsandbox-convert" }
 vmlord-display-codec = { path = "../display-codec" }
 vmlord-display-payload = { path = "../display-payload", features = ["builder"] }
 # For the one version this build actually speaks, so a recipe cannot claim a

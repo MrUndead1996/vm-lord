@@ -10,6 +10,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, ExitCode},
 };
+mod appsandbox_convert;
 mod display_bench;
 mod display_payload;
 mod dist_arguments;
@@ -46,6 +47,7 @@ fn main() -> ExitCode {
         Some("gpu-payload") => gpu_payload::run(env::args().skip(2)),
         Some("display-payload") => display_payload::run(env::args().skip(2)),
         Some("display-bench") => display_bench::run(env::args().skip(2)),
+        Some("appsandbox-convert") => appsandbox_convert::run(env::args().skip(2)),
         Some("release-manifest") => release::run(env::args().skip(2)),
         Some("workflow-check") => workspace_root().and_then(|workspace| workflow::run(&workspace)),
         Some(other) => Err(format!("unknown task `{other}`")),
