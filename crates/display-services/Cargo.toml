@@ -25,6 +25,11 @@ name = "vmlord-display-clipboard"
 path = "src/bin/clipboard.rs"
 bench = false
 
+[[bin]]
+name = "vmlord-display-audio"
+path = "src/bin/audio.rs"
+bench = false
+
 # Not a guest program: it measures the pipeline on the host that built it, and
 # `payloads/display/prepare.sh` names the three above rather than collecting
 # whatever the target directory holds. Reached through `cargo
