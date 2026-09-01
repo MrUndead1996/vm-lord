@@ -139,8 +139,8 @@ pub struct Session {
     pending: Option<Negotiated>,
     pending_auth: Option<Record>,
     control_sequence: u32,
-    /// Per channel, in `Channel` order: frame, input, then clipboard.
-    channels: [ChannelState; 3],
+    /// Per channel, in `Channel` order: frame, input, clipboard, then audio.
+    channels: [ChannelState; 4],
     /// The channel keys a hand-over carried, which outlive a reconnect.
     ///
     /// A session that handshook derives these from its session key and its
@@ -148,7 +148,7 @@ pub struct Session {
     /// neither, so it keeps what it was given: a channel key depends on the
     /// session and the channel, never on the generation, so replacing a socket
     /// does not replace it.
-    handover_keys: [Option<ChannelKey>; 3],
+    handover_keys: [Option<ChannelKey>; 4],
 }
 
 /// What one bound-or-binding frame or input socket holds.
@@ -241,8 +241,9 @@ impl Session {
                 ChannelState::default(),
                 ChannelState::default(),
                 ChannelState::default(),
+                ChannelState::default(),
             ],
-            handover_keys: [None, None, None],
+            handover_keys: [None, None, None, None],
         };
 
         let record = session.control_record(ControlRecord::ClientHello, payload);
@@ -278,8 +279,9 @@ impl Session {
                 ChannelState::default(),
                 ChannelState::default(),
                 ChannelState::default(),
+                ChannelState::default(),
             ],
-            handover_keys: [None, None, None],
+            handover_keys: [None, None, None, None],
         }
     }
 
@@ -318,11 +320,16 @@ impl Session {
                 ChannelState::default(),
                 ChannelState::default(),
                 ChannelState::default(),
+                ChannelState::default(),
             ],
             handover_keys: [
                 Some(handed_over.frame_key),
                 Some(handed_over.input_key),
                 Some(handed_over.clipboard_key),
+                // The audio key does not cross a hand-over yet; the platform
+                // side that carries it is a later task, and until then the
+                // audio channel has no key on the host and cannot be bound.
+                None,
             ],
         }
     }
@@ -882,6 +889,7 @@ impl Session {
             Channel::Frame => Ok(0),
             Channel::Input => Ok(1),
             Channel::Clipboard => Ok(2),
+            Channel::Audio => Ok(3),
             Channel::Control => Err(SessionError::Unexpected {
                 channel,
                 message_type: 0,

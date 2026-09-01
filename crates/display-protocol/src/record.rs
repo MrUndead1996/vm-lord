@@ -1,4 +1,4 @@
-//! How a record is delimited on any of the four channels.
+//! How a record is delimited on any of the five channels.
 //!
 //! A record is a fixed 24-byte little-endian header followed by `length`
 //! payload bytes. Little-endian because both ends of these sockets are x86-64;
@@ -20,7 +20,7 @@ use std::{
 /// The width of the header this build writes and understands.
 pub const HEADER_LEN: usize = 24;
 
-/// Which of a session's four sockets a record belongs to.
+/// Which of a session's five sockets a record belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Channel {
     /// Handshake, session control, liveness and errors.
@@ -31,6 +31,8 @@ pub enum Channel {
     Input = 3,
     /// Selections, in both directions.
     Clipboard = 4,
+    /// The desktop's sound, from the guest only.
+    Audio = 5,
 }
 
 impl Channel {
@@ -53,6 +55,7 @@ impl Channel {
             2 => Ok(Self::Frame),
             3 => Ok(Self::Input),
             4 => Ok(Self::Clipboard),
+            5 => Ok(Self::Audio),
             value => Err(RecordError::UnknownChannel { value }),
         }
     }
@@ -65,6 +68,7 @@ impl fmt::Display for Channel {
             Self::Frame => "frame",
             Self::Input => "input",
             Self::Clipboard => "clipboard",
+            Self::Audio => "audio",
         })
     }
 }
@@ -258,6 +262,13 @@ pub const INPUT_MAX_PAYLOAD: u32 = 4 * 1024;
 /// `clipboard::MAX_IMAGE_TRANSFER` are what a whole transfer may.
 pub const CLIPBOARD_MAX_PAYLOAD: u32 = 64 * 1024;
 
+/// The most an audio record may carry.
+///
+/// One record is one period. A 480-frame period of S32 stereo is 3840 bytes;
+/// the rest is room for a longer period the guest was pinned to rather than
+/// chose, since whichever half of the loopback opens first fixes the other.
+pub const AUDIO_MAX_PAYLOAD: u32 = 16 * 1024;
+
 /// The most a frame record may carry whatever the geometry says.
 ///
 /// A backstop against a geometry that is itself absurd, since the cap below is
@@ -307,6 +318,7 @@ impl Limits {
             Channel::Frame => self.frame,
             Channel::Input => INPUT_MAX_PAYLOAD,
             Channel::Clipboard => CLIPBOARD_MAX_PAYLOAD,
+            Channel::Audio => AUDIO_MAX_PAYLOAD,
         }
     }
 }
@@ -655,6 +667,33 @@ mod tests {
             CLIPBOARD_MAX_PAYLOAD
         );
         assert_eq!(CLIPBOARD_MAX_PAYLOAD, 64 * 1024);
+    }
+
+    #[test]
+    fn audio_is_the_fifth_channel() {
+        assert_eq!(Channel::Audio.as_wire(), 5);
+        assert_eq!(Channel::from_wire(5).expect("five is audio"), Channel::Audio);
+        assert_eq!(Channel::Audio.to_string(), "audio");
+
+        let limits = Limits::new(1920, 1080);
+
+        assert_eq!(limits.for_channel(Channel::Audio), AUDIO_MAX_PAYLOAD);
+        assert_eq!(AUDIO_MAX_PAYLOAD, 16 * 1024);
+    }
+
+    #[test]
+    fn an_audio_record_carries_its_stream_position_in_base() {
+        // `base` holds the number of frames captured before this record, the
+        // way a tile delta holds the sequence it builds on. It is what makes a
+        // gap -- suppressed silence, or dropped periods -- visible without a
+        // record of its own.
+        let record = Record::new(Channel::Audio, 5, 7, 48_000, 2, vec![3u8; 3840]);
+        let (header, extra) = Header::decode(&record.header.encode()).expect("a header we wrote");
+
+        assert_eq!(extra, 0);
+        assert_eq!(header.channel, Channel::Audio);
+        assert_eq!(header.base, 48_000);
+        assert_eq!(header.length, 3840);
     }
 
     #[test]
