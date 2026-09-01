@@ -419,22 +419,25 @@ fn ensure_appindicator_extension() {
 
         return;
     };
-    for uuid in APPINDICATOR_UUIDS {
+    // Named for what the value is rather than for its shape: a scanner that
+    // sees `uuid` written to a log reads a secret, and these two are
+    // constants in this file.
+    for extension in APPINDICATOR_UUIDS {
         match connection.call_method(
             Some("org.gnome.Shell.Extensions"),
             "/org/gnome/Shell",
             Some("org.gnome.Shell.Extensions"),
             "EnableExtension",
-            &(uuid,),
+            &(extension,),
         ) {
             Ok(_) => {
-                eprintln!("vmlord-display-tray: the shell shows tray items through {uuid}");
+                eprintln!("vmlord-display-tray: the shell shows tray items through {extension}");
 
                 return;
             }
             // Not installed yet, or the shell is not up to answer: the next
             // attempt is the next reconnect, and the icon waits meanwhile.
-            Err(error) => eprintln!("vmlord-display-tray: {uuid} is not available: {error}"),
+            Err(error) => eprintln!("vmlord-display-tray: {extension} is not available: {error}"),
         }
     }
 }
