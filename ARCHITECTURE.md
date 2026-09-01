@@ -2953,10 +2953,26 @@ The CRC32C in each header is a corruption check, not a signature.
 Nothing acknowledges a frame either. The guest regulates its own stream through
 the encoder's bounded queue -- a newer frame displaces an older one that has
 not been sent, so what is queued is always current state -- and a viewer that
-falls behind receives one fresh frame rather than a backlog. The only back
-edges are `RequestKeyframe`, which is recovery for a decoder that lost
-synchronisation, and `Ping`/`Pong`, which is how a slow viewer is told from a
-dead one.
+falls behind receives one fresh frame rather than a backlog. The frame flow's
+only back edges are `RequestKeyframe`, which is recovery for a decoder that
+lost synchronisation, and `Ping`/`Pong`, which is how a slow viewer is told
+from a dead one.
+
+The control channel carries one record in the other direction. A
+`CONTROL_RECORD_GUEST_COMMAND` is the guest's user raising one of the commands
+the viewer's system menu offers -- full screen, the Secure Attention Sequence,
+handing the keyboard back, mute, a quality, a mode from the host's list -- and
+the guest raises rather than acts, because every one of those is a property of
+the window on the host and there is nothing inside the guest for any of them
+to change. The viewer answers it where it answers the menu: `ui_event_of` in
+`crates/display-viewer/src/main.rs` turns a command into the `UiEvent` its
+menu counterpart would have raised, and `handle_ui_event` -- which is the one
+place any of them is answered from -- does the rest, the record having arrived
+from `live.rs` as `Signal::GuestCommand`. Menu and guest cannot grow apart
+that way: both halves of a session get the same answer to the same request
+because both are answered by the same code. A command this build has no name
+for is dropped the way an unknown record is, and so is a mode command whose
+timing does not parse.
 
 `MODE_AUTO`, `MODE_DESKTOP` and `MODE_MOTION` all exist in the contract, and
 the MVP guest announces `MODE_DESKTOP` alone. `MODE_AUTO` names a host-side
@@ -2964,7 +2980,7 @@ policy that resolves to `MODE_DESKTOP` until a motion codec exists; a request
 for `MODE_MOTION` is answered with `ERROR_CODE_UNSUPPORTED_MODE`.
 
 Connect opens this native stack. Every VM's compute system
-lists all three services beside the agent's -- an entry there is the
+lists all five services beside the agent's -- an entry there is the
 partition's permission for a service to exist, not a claim that the guest
 binds it, so a headless VM lists them too and a VM created before they existed
 has to be recreated rather than migrated. The repository refuses a session
@@ -2976,12 +2992,14 @@ display path is the native one described here, end to end.
 
 ### The guest display services
 
-Two programs, one crate (`crates/display-services`), both static musl binaries
-built by `cargo display-services`. They are two rather than one because exactly
-one thing on the guest side needs privilege: `DRM_IOCTL_MODE_GETFB2` will not
-hand a framebuffer's handles to anything without `CAP_SYS_ADMIN`. Everything
-that runs hot -- mapping, comparing tiles, encoding, writing sockets -- is the
-part most likely to hold a bug worth exploiting, so it runs as `vmlord-display`
+Five programs, one crate (`crates/display-services`), all static musl binaries
+built by `cargo display-services`. The two described here are the capture
+pair; the clipboard daemon, the audio daemon and the tray each have a section
+of their own below. The pair is two rather than one because exactly one thing
+on the guest side needs privilege: `DRM_IOCTL_MODE_GETFB2` will not hand a
+framebuffer's handles to anything without `CAP_SYS_ADMIN`. Everything that
+runs hot -- mapping, comparing tiles, encoding, writing sockets -- is the part
+most likely to hold a bug worth exploiting, so it runs as `vmlord-display`
 with `CapabilityBoundingSet=` and nothing to steal.
 
 `vmlord-display-broker` is root and small. It holds the DRM device, the VM's
@@ -3000,15 +3018,17 @@ framebuffer id afterwards, since a descriptor costs a syscall and a slot in the
 peer's table.
 
 The five vsock ports are the protocol's: `VMLD` control, `VMLF` frames, `VMLI`
-input, `VMLC` the clipboard, `VMLS` sound. The guest listens on all five and the
-host connects, and four processes divide them -- the broker owns control, the
-session process owns frames and input and never sees a device descriptor or an
-ioctl of its own, the clipboard daemon owns the fourth, and the audio daemon
-owns the fifth. What crosses the IPC
-socket after a handshake is a `SessionParameters`: the session id, one channel
-key per socket, the geometry, and whether the peer took the cursor stream. Not
-the secret. What a compromised capture process could take from those bytes is
-one session, and only while that session runs.
+input, `VMLC` the clipboard, `VMLS` sound. The guest listens on all five and
+the host connects, and four processes divide them -- the broker owns control,
+the session process owns frames and input and never sees a device descriptor or
+an ioctl of its own, the clipboard daemon owns the fourth, and the audio daemon
+owns the fifth. The tray is the fifth process and owns none of them: it binds
+no vsock and is never handed a channel key, because everything it has to say
+crosses its own socket to the broker. What crosses the IPC socket after a
+handshake is a `SessionParameters`: the session id, one channel key per socket,
+the geometry, and whether the peer took the cursor stream. Not the secret. What
+a compromised capture process could take from those bytes is one session, and
+only while that session runs.
 
 The three disconnect obligations are honoured where they are owed. A frame
 channel that binds sends `StreamConfig` and then a keyframe before any delta,
@@ -3022,18 +3042,20 @@ that is lost releases whatever the guest still holds before anything else,
 because a key left down is worse than a session left broken.
 
 Packaging runs from `cargo display-services` through `payloads/display/prepare.sh
---services`, which installs both binaries and both units into the payload's
-`content/services/`. They are built by the host toolchain and not in the
-payload container: a static musl binary is identical for 22.04, 24.04 and
+--services`, which installs the five binaries and the five units into the
+payload's `content/services/`. They are built by the host toolchain and not in
+the payload container: a static musl binary is identical for 22.04, 24.04 and
 26.04, and that container exists to prove the *module* compiles against a
 release's headers. `pack` then refuses a recipe whose declared protocol range
 does not contain the version this build speaks -- the range used to be a
 placeholder, and the services in the archive are what make it a claim. Inside
 the guest, `vmlord-agent`'s `SERVICES` and `SERVICES_START` recipe stages
-install them by content digest, create the `vmlord-display` account, enable both
-units and wait for the socket between them; a payload that carries no services
-is skipped rather than failed, because every payload built before this is one of
-those.
+install them by content digest, create the `vmlord-display` account, enable the
+three system units for the boot and the two user ones -- the clipboard daemon's
+and the tray's, which are wanted by a session rather than by the boot -- for
+whichever session starts next, and wait for the socket between the capture
+pair; a payload that carries no services is skipped rather than failed, because
+every payload built before this is one of those.
 
 ### The native display viewer
 
@@ -3147,11 +3169,12 @@ code is a position on the keyboard, and the layout stays entirely the guest's.
 Three keys are the exception -- `Pause`, `NumLock` and `PrtScn` -- whose scan
 codes Windows reports ambiguously and which carry no layout to get wrong.
 
-While the hook is installed the keyboard is the guest's, `Alt+F4` included, so
-**`Ctrl+Alt+Left Shift`** is reserved: it hands the keyboard back, and the guest
-is sent a release. `Ctrl+Alt+Del` is a system-menu action rather than a
-shortcut, because the Secure Attention Sequence is routed by the kernel and no
-documented hook sees it -- and undocumented ones are out of the question.
+While the hook is installed the keyboard is the guest's, `Alt+F4` and `F11`
+included, so **`Ctrl+Alt+Left Shift`** is reserved: it hands the keyboard back,
+and the guest is sent a release. `Ctrl+Alt+Del` is a system-menu action rather
+than a shortcut, because the Secure Attention Sequence is routed by the kernel
+and no documented hook sees it -- and undocumented ones are out of the
+question.
 
 ### The clipboard
 
@@ -3290,7 +3313,8 @@ things that must never be diagnosed from.
 
 What the guest's desktop plays is heard on the host, over `VMLS`, the fifth
 channel. It is one-directional after the bind: there is no microphone, and the
-one control a user has -- mute -- is answered entirely on the host.
+one control a user has -- mute -- is answered entirely on the host, whichever
+side raised it.
 
 The guest end is `vmlord-display-audio`, and it is a **system** unit, which is
 the opposite of the clipboard daemon and for the opposite reason. A selection
@@ -3370,6 +3394,68 @@ settled it.
 
 No sample is logged. A format, a frame count, a stream position and an outcome
 are what an audio problem is diagnosed from, on both sides.
+
+### The tray
+
+The person at the guest's screen has no window of their own -- the viewer's
+window is on the host -- so the commands they want are raised from a tray
+icon. `vmlord-display-tray` is a **user** unit that starts with the graphical
+session, like the clipboard daemon and for the same kind of reason: a tray
+icon belongs to whoever is at the screen, and StatusNotifierItem is answered
+on the session bus. Its SNI side is `ksni`, pure Rust on the same zbus the
+clipboard daemon speaks mutter through, so the musl build stays
+toolchain-free; the icon is a pixmap the binary carries rather than a theme
+name, because a guest has no icon theme VMLord can count on.
+
+GNOME shows a tray icon only through its AppIndicator extension. Installing
+that is the recipe's business: the `SERVICES` stage asks apt for the
+distribution's `gnome-shell-extension-appindicator` package, best effort and
+skipped where the desktop already has one on disk under either of the UUIDs
+the supported releases ship it under, because what a guest is missing without
+it is the icon and not the desktop. *Enabling* it is the session's business,
+and deliberately so: the tray calls `org.gnome.Shell.Extensions.EnableExtension`
+when it starts and on every reconnect to the broker, rather than the recipe
+writing gsettings as root. `EnableExtension` adds one UUID and keeps the rest
+of the user's own list, which no write from outside the session can do without
+clobbering either the desktop's defaults or the user's choices -- and the
+recipe runs as root before any session, where there is nothing to ask and no
+list worth owning. Until the call succeeds the icon is merely absent, and the
+next reconnect is the next attempt.
+
+The menu mirrors the viewer's system menu, in its order: full screen, the
+Secure Attention Sequence, release keyboard, the resolution list, mute, the
+two qualities. The tray decides nothing. Each of those is forwarded over a
+fourth broker socket, `/run/vmlord/display-tray.sock`, as a `UserCommand`
+datagram whose kinds are the wire's `GuestCommandKind` one for one, and the
+broker forwards the record whole rather than deciding it -- a test beside the
+mapping is what notices the two schemas drifting apart. The socket is
+authorised the way the clipboard daemon's is: the connecting uid must be the
+one logind reports for the active graphical session on `seat0`, looked up at
+every accept. The Resolution submenu is the one part that is an answer rather
+than a command: the tray asks which modes the host has offered and is told,
+the same list and the same selection the connector thread already holds --
+one fact read by a second reader, not a second authority on it.
+
+A command raised while no session is open is answered with a report rather
+than kept, because the tray asked for something on the host and is told there
+is nothing to ask; one that races a session's end is dropped by the epoch it
+was raised under. An action the broker cannot carry out comes back the same
+way and lands in the guest's journal, because a menu click that did nothing
+is at least one that says so.
+
+*Restart services* is the one item that is not a forwarded command, and it is
+a split. The broker restarts the system units -- the capture process and the
+audio daemon, over the system bus -- and never itself, because the process
+answering the restart has to live through it. The clipboard daemon's unit
+lives on the very bus the tray is already on, which the broker has no business
+on, so the tray puts that one back itself, in the same click.
+
+Nothing short of its own failure ends the tray. No StatusNotifierWatcher yet,
+no broker yet, a broker that went away: each is waited through with a
+backing-off reconnect rather than exited over, because a unit that restarts on
+the ordinary shape of a session starting up spends its crash-loop budget on
+nothing. The reconnects are also how a payload applied mid-session gets to
+install what its first try missed -- the AppIndicator extension among it.
 
 ### Resizing the desktop
 
@@ -3548,13 +3634,14 @@ client area to give. Whatever size the window ends up at is then taken as the
 size last asked for, so that the `WM_SIZE` the move raises does not settle into
 a request that asks the guest to undo what it just did.
 
-**Full screen** is `F11` or the system menu, borderless: a frame and a
-rectangle, both given back on the way out. Exclusive would take the display for
-this process, and a viewer that owns the screen is one the user cannot leave
-when the guest stops answering; nothing here touches the monitor's own mode.
-The key is swallowed in both directions by the keyboard hook -- a press the
-guest never saw must not be followed by a release it did -- which costs the
-guest its own `F11` while the viewer has focus.
+**Full screen** is a system-menu action, borderless: a frame and a rectangle,
+both given back on the way out. Exclusive would take the display for this
+process, and a viewer that owns the screen is one the user cannot leave when
+the guest stops answering; nothing here touches the monitor's own mode. It has
+no key of its own. `F11` reaches the guest like any other key -- it is a real
+key in a guest browser, and a hook that keeps the shell's hands off the
+keyboard has no business keeping one of its own -- so full screen is offered
+on the system menu, and the guest's tray offers the same from the far side.
 
 **The frame is two words, not one** (`viewer::fullscreen`). Taking
 `WS_OVERLAPPEDWINDOW` off `GWL_STYLE` is the caption and the sizing border;
@@ -3663,14 +3750,14 @@ for the detail. The shape is the GPU's on purpose: a backend reports facts and
 never names a state, the UI paints a state and never works one out.
 
 Readiness is the display recipe's last stage. The guest marks `SERVICES_START`
-`Ok` only once both units are active and the socket between them exists, which
-is exactly the fact a viewer needs, so the host reads it out of the report the
-agent already delivers rather than asking a second question over that channel.
-A recipe that skipped the stage -- a payload built before the services existed
--- is a display that will never arrive and is reported as failed rather than
-waited for. The recipe is applied once per agent session, so a guest that
-reconnects re-reports, and nothing survives the run: a readiness observed
-before a stop says nothing about a guest that is not running.
+`Ok` only once the system units are active and the socket between the capture
+pair exists, which is exactly the fact a viewer needs, so the host reads it out
+of the report the agent already delivers rather than asking a second question
+over that channel. A recipe that skipped the stage -- a payload built before
+the services existed -- is a display that will never arrive and is reported as
+failed rather than waited for. The recipe is applied once per agent session, so
+a guest that reconnects re-reports, and nothing survives the run: a readiness
+observed before a stop says nothing about a guest that is not running.
 
 That same report is what finally moves `DisplayProvisioning` off `Pending`.
 Nothing on the host can watch cloud-init install a desktop -- it happens on the

@@ -7,13 +7,10 @@
 //!
 //! It is installed on focus and removed on its loss, so a user who is not in
 //! the viewer has an ordinary keyboard. While it is installed every key goes
-//! to the guest and none to Windows -- `Alt+F4` included, which is why
-//! `Ctrl+Alt+Left Shift` exists to hand the keyboard back.
-//!
-//! One key is the viewer's rather than the guest's: `F11` toggles full
-//! screen, and is swallowed in both directions so the guest never sees half a
-//! key. It is a real key in a guest browser, and taking it is the cost of
-//! having a full-screen shortcut at all while the keyboard is the guest's.
+//! to the guest and none to Windows -- `Alt+F4` and `F11` included, which is
+//! why `Ctrl+Alt+Left Shift` exists to hand the keyboard back, and why full
+//! screen is a menu action: a key the shell would take is taken here, and a
+//! key the guest is owed is not kept from it.
 //!
 //! `Ctrl+Alt+Del` is not here and cannot be: the Secure Attention Sequence is
 //! routed by the kernel, no hook sees it, and reaching for undocumented means
@@ -28,7 +25,6 @@ use std::{cell::RefCell, sync::Arc};
 
 use windows::Win32::{
     Foundation::{LPARAM, LRESULT, WPARAM},
-    UI::Input::KeyboardAndMouse::VK_F11,
     UI::WindowsAndMessaging::{
         CallNextHookEx, HC_ACTION, HHOOK, KBDLLHOOKSTRUCT, KBDLLHOOKSTRUCT_FLAGS, LLKHF_EXTENDED,
         LLKHF_INJECTED, SetWindowsHookExW, UnhookWindowsHookEx, WH_KEYBOARD_LL, WM_KEYDOWN,
@@ -88,24 +84,13 @@ impl Drop for Hook {
 /// Reports one key and says whether Windows should be kept from it.
 ///
 /// Everything the hook sees is the guest's while it is installed, which is
-/// what makes `Alt+Tab` and `Super` reach GNOME. The exceptions are an
-/// injected event, which belongs to whatever injected it, and `F11`, which is
-/// the viewer's own.
+/// what makes `Alt+Tab` and `Super` reach GNOME. The one exception is an
+/// injected event, which belongs to whatever injected it.
 fn deliver(make: u16, virtual_key: u16, extended: bool, pressed: bool) -> bool {
     LISTENER.with(|listener| {
         let Some(shared) = listener.borrow().clone() else {
             return false;
         };
-
-        if virtual_key == VK_F11.0 {
-            // Both edges are swallowed: a guest sent a press with no release
-            // is a guest holding a key nobody is pressing.
-            if pressed {
-                shared.report(UiEvent::ToggleFullscreen);
-            }
-
-            return true;
-        }
 
         shared.report(UiEvent::Input(Report::Key {
             make,
@@ -192,20 +177,31 @@ mod tests {
     }
 
     #[test]
-    fn f11_is_the_viewers_own_key_and_never_the_guests() {
+    fn f11_reaches_the_guest_like_any_other_key() {
         let (events, receiver) = mpsc::channel();
         let shared = Arc::new(Shared::new(events));
         let hook = Hook::install(&shared).expect("a hook");
 
         assert!(super::deliver(0x57, 0x7a, false, true));
-        assert!(
-            super::deliver(0x57, 0x7a, false, false),
-            "a press the guest never saw must not be followed by a release it did"
-        );
+        assert!(super::deliver(0x57, 0x7a, false, false));
 
         assert_eq!(
             receiver.try_iter().collect::<Vec<_>>(),
-            vec![UiEvent::ToggleFullscreen]
+            vec![
+                UiEvent::Input(Report::Key {
+                    make: 0x57,
+                    extended: false,
+                    virtual_key: 0x7a,
+                    pressed: true,
+                }),
+                UiEvent::Input(Report::Key {
+                    make: 0x57,
+                    extended: false,
+                    virtual_key: 0x7a,
+                    pressed: false,
+                }),
+            ],
+            "both edges cross, or the guest holds a key nobody is pressing"
         );
         drop(hook);
     }

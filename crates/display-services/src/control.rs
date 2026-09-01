@@ -17,8 +17,8 @@ use vmlord_display_protocol::{
     record::{self, Channel, Limits, Record, RecordError},
     session::{Event, Session, Support},
     v1::{
-        Capability, ControlRecord, DisplayState, DisplayTiming, ErrorCode, Mode, Ping, Pong,
-        SetAvailableModes, SetDisplayMode, SetMode, SetResolution,
+        Capability, ControlRecord, DisplayState, DisplayTiming, ErrorCode, GuestCommand, Mode,
+        Ping, Pong, SetAvailableModes, SetDisplayMode, SetMode, SetResolution,
     },
 };
 
@@ -383,6 +383,20 @@ impl Control {
                     }
                 }
             }
+            Ok(ControlRecord::GuestCommand) => {
+                // Raised by the guest's own user interface for the host viewer
+                // to act on, which is not the broker's to do. Nothing is sent
+                // back, so the host is not told a record it sent is malformed
+                // -- and the catch-all below would say exactly that.
+                let kind = GuestCommand::decode(payload)
+                    .ok()
+                    .map(|command| command.kind());
+                eprintln!(
+                    "vmlord-display-broker: a guest command of kind {kind:?} is not forwarded by this build"
+                );
+
+                Outcome::Nothing
+            }
             Ok(ControlRecord::EndSession) => {
                 Outcome::Closed("the host ended the session".to_owned())
             }
@@ -433,6 +447,18 @@ impl Control {
             refresh_hz: self.refresh_hz,
         };
         self.write(stream, ControlRecord::DisplayState, state.encode_to_vec());
+    }
+
+    /// Writes a command the guest's own user raised, for the host viewer to
+    /// apply.
+    ///
+    /// The record is the one a host sends the other way, and the viewer
+    /// answers it by being what the command asked for, so nothing is written
+    /// back here. Public because the command is raised by a third party: the
+    /// tray hands it to another thread, and the control thread is the one
+    /// that owns this side's sequence.
+    pub fn guest_command<S: Read + Write>(&mut self, stream: &mut S, command: &GuestCommand) {
+        self.write(stream, ControlRecord::GuestCommand, command.encode_to_vec());
     }
 
     /// Writes an `Error` record, for a request refused or a fault to report.
@@ -493,8 +519,9 @@ mod tests {
         record::{self, Channel, Limits, Record},
         session::{Offer, Session},
         v1::{
-            Capability, ControlRecord, DisplayState, DisplayTiming, EndSession, ErrorCode, Mode,
-            Ping, RequestKeyframe, SetAvailableModes, SetDisplayMode, SetMode, SetResolution,
+            Capability, ControlRecord, DisplayState, DisplayTiming, EndSession, ErrorCode,
+            GuestCommand, GuestCommandKind, Mode, Ping, RequestKeyframe, SetAvailableModes,
+            SetDisplayMode, SetMode, SetResolution,
         },
     };
 
@@ -531,6 +558,20 @@ mod tests {
             }
 
             records
+        }
+
+        /// The sequence numbers of everything written since the last call.
+        fn taken_sequences(&mut self) -> Vec<u32> {
+            let bytes = std::mem::take(&mut self.outgoing);
+            let mut reader = bytes.as_slice();
+            let mut payload = Vec::new();
+            let mut sequences = Vec::new();
+            while !reader.is_empty() {
+                let header = record::read(&mut reader, &limits(), &mut payload).expect("a record");
+                sequences.push(header.sequence);
+            }
+
+            sequences
         }
     }
 
@@ -1012,6 +1053,58 @@ mod tests {
     fn a_ping_is_answered_without_waking_capture() {
         let outcome = drive(control_record_ping(9));
         assert!(matches!(outcome, Outcome::Nothing));
+    }
+
+    #[test]
+    fn a_command_from_the_guests_own_user_is_written_for_the_viewer() {
+        // The record the host sends the other way, on the same channel and
+        // through the same machinery: the tray's command arrives at the
+        // viewer as if the host's own menu had raised it.
+        let (_, _, mut control, mut wire) = opened();
+        control.guest_command(
+            &mut wire,
+            &GuestCommand {
+                kind: GuestCommandKind::ToggleMute as i32,
+                display_mode: None,
+            },
+        );
+
+        let record = wire
+            .taken()
+            .into_iter()
+            .find(|(message_type, _)| *message_type == ControlRecord::GuestCommand as u16)
+            .expect("a guest command on the wire");
+        let decoded = GuestCommand::decode(record.1.as_slice()).expect("a readable command");
+
+        assert_eq!(decoded.kind(), GuestCommandKind::ToggleMute);
+    }
+
+    #[test]
+    fn a_written_command_keeps_the_side_sequence_moving() {
+        // One side's sequence, one machinery: a command written between two
+        // reports must not reset or collide with what this side writes next.
+        let (_, _, mut control, mut wire) = opened();
+        control.guest_command(
+            &mut wire,
+            &GuestCommand {
+                kind: GuestCommandKind::QualityAuto as i32,
+                display_mode: None,
+            },
+        );
+        control.report(&mut wire, ErrorCode::MalformedRecord, "test");
+        control.guest_command(
+            &mut wire,
+            &GuestCommand {
+                kind: GuestCommandKind::ToggleMute as i32,
+                display_mode: None,
+            },
+        );
+
+        let sequences = wire.taken_sequences();
+
+        assert_eq!(sequences.len(), 3);
+        assert_eq!(sequences[1], sequences[0] + 1);
+        assert_eq!(sequences[2], sequences[1] + 1);
     }
 
     #[test]

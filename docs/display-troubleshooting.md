@@ -137,6 +137,30 @@ Sound is a channel of its own, served by a system daemon that needs no login.
 - An idle desktop sends nothing at all, so silence with nothing playing is the
   ordinary state rather than a fault.
 
+## The tray icon is not in the guest's panel
+
+The tray is a user service of the graphical session, like the clipboard
+daemon, and it shows through GNOME's AppIndicator extension.
+
+- Check the service inside the guest:
+
+  ```bash
+  systemctl --user status vmlord-display-tray.service
+  journalctl --user -u vmlord-display-tray -b
+  ```
+
+  Its journal carries every click it forwarded and every answer it could not
+  deliver; a missing broker or a missing watcher is waited through, not an
+  error that ends it.
+- Check that an AppIndicator extension is installed and enabled. On the
+  supported desktops Ubuntu's own ships with the desktop; if neither is
+  there, install `gnome-shell-extension-appindicator` and sign out and in
+  once -- the tray asks the running shell to enable it when it starts, and
+  again on every reconnect, usually the next **Restart services**.
+- Check the broker socket. The menu still builds with no broker attached,
+  but every click is dropped until the attach returns; the journal says
+  when it does.
+
 ## Secure Boot
 
 The module is signed. Each guest generates its own MOK at

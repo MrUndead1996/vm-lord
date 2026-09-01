@@ -30,6 +30,11 @@ name = "vmlord-display-audio"
 path = "src/bin/audio.rs"
 bench = false
 
+[[bin]]
+name = "vmlord-display-tray"
+path = "src/bin/tray.rs"
+bench = false
+
 # Not a guest program: it measures the pipeline on the host that built it, and
 # `payloads/display/prepare.sh` names the three above rather than collecting
 # whatever the target directory holds. Reached through `cargo
@@ -56,6 +61,15 @@ prost = "0.14"
 vmlord-agent-protocol = { path = "../agent-protocol" }
 vmlord-display-codec = { path = "../display-codec" }
 vmlord-display-protocol = { path = "../display-protocol" }
+# The tray's StatusNotifierItem side. Pure Rust on the same zbus as above, so
+# the musl build stays toolchain-free. No default features drops ksni's tokio;
+# `async-io` is the runtime the zbus above already uses, and `blocking` puts
+# the tray service on a plain thread, which is what a program of sockets and
+# menus wants.
+ksni = { version = "0.3", default-features = false, features = [
+    "async-io",
+    "blocking",
+] }
 # GNOME's clipboard lives inside the compositor, and
 # `org.gnome.Mutter.RemoteDesktop` is what reaches it from outside -- the same
 # interface gnome-remote-desktop uses. No default features, so nothing here

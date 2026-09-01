@@ -109,6 +109,8 @@ enum ControlRecord {
   CONTROL_RECORD_ERROR = 12;
   CONTROL_RECORD_SET_AVAILABLE_MODES = 13;
   CONTROL_RECORD_SET_DISPLAY_MODE = 14;
+  // A user command raised inside the guest, on its way to the host viewer.
+  CONTROL_RECORD_GUEST_COMMAND = 15;
 }
 
 // The `type` field of a record header on the frame channel.
@@ -364,6 +366,38 @@ message Error {
   ErrorCode code = 1;
   // For a log, not for a decision. Never parsed.
   string detail = 2;
+}
+
+// A user command raised inside the guest, for the host viewer to apply.
+//
+// The guest offers its user the same actions the host's system menu does, and
+// each one crosses here rather than being acted on locally: the host applies
+// it through the very code the menu runs, so the two halves of a session
+// cannot grow different answers to the same request. A command a host has no
+// name for is dropped, the way an unknown record is.
+enum GuestCommandKind {
+  GUEST_COMMAND_KIND_UNSPECIFIED = 0;
+  // Fill the host viewer's monitor, or stop filling it.
+  GUEST_COMMAND_KIND_TOGGLE_FULLSCREEN = 1;
+  // Hand the keyboard back from the guest to the host.
+  GUEST_COMMAND_KIND_RELEASE_KEYBOARD = 2;
+  // The Secure Attention Sequence, `Ctrl+Alt+Del`.
+  GUEST_COMMAND_KIND_SEND_SECURE_ATTENTION = 3;
+  // Silence the guest's sound, or let it play again.
+  GUEST_COMMAND_KIND_TOGGLE_MUTE = 4;
+  // Let the encoder trade bandwidth for fidelity as it sees fit.
+  GUEST_COMMAND_KIND_QUALITY_AUTO = 5;
+  // Encode a desktop, whatever the picture is doing.
+  GUEST_COMMAND_KIND_QUALITY_DESKTOP = 6;
+  // Put the guest's output on the host monitor mode carried alongside.
+  GUEST_COMMAND_KIND_SET_DISPLAY_MODE = 7;
+}
+
+message GuestCommand {
+  GuestCommandKind kind = 1;
+  // The host monitor mode to come up on. Set only when `kind` is
+  // `GUEST_COMMAND_KIND_SET_DISPLAY_MODE`, and then required.
+  DisplayTiming display_mode = 2;
 }
 
 message KeyEvent {

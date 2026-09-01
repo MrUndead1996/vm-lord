@@ -64,12 +64,13 @@ const SYSTEMD_UNITS: &str = "/etc/systemd/system";
 const SYSTEMD_USER_UNITS: &str = "/etc/systemd/user";
 /// The account the unprivileged half runs as.
 const SERVICE_USER: &str = "vmlord-display";
-/// The four programs, in the order they are started.
-const SERVICE_BINARIES: [&str; 4] = [
+/// The five programs, in the order they are started.
+const SERVICE_BINARIES: [&str; 5] = [
     "vmlord-display-broker",
     "vmlord-display-session",
     "vmlord-display-clipboard",
     "vmlord-display-audio",
+    "vmlord-display-tray",
 ];
 /// The units systemd starts at boot, which are those binaries' names with a
 /// suffix.
@@ -78,11 +79,28 @@ const SYSTEM_UNITS: [&str; 3] = [
     "vmlord-display-session.service",
     "vmlord-display-audio.service",
 ];
-/// The unit that starts inside a user's graphical session instead, because a
-/// selection exists only there.
-const USER_UNITS: [&str; 1] = ["vmlord-display-clipboard.service"];
+/// The units that start inside a user's graphical session instead, because
+/// what they serve does: a selection, and a tray icon, exist only there.
+const USER_UNITS: [&str; 2] = [
+    "vmlord-display-clipboard.service",
+    "vmlord-display-tray.service",
+];
 /// The socket the two halves meet on, which is how "started" is confirmed.
 const BROKER_SOCKET: &str = "/run/vmlord/display-broker.sock";
+
+/// The GNOME shell, whose extensions decide whether a tray icon is shown.
+const GNOME_SHELL: &str = "/usr/bin/gnome-shell";
+/// Where GNOME Shell's packaged extensions are installed.
+const SHELL_EXTENSIONS: &str = "/usr/share/gnome-shell/extensions";
+/// The distro package that ships a StatusNotifierItem extension. Under this
+/// name Ubuntu's own fork on every supported release; Debian ships the same
+/// source under the upstream UUID.
+const APPINDICATOR_PACKAGE: &str = "gnome-shell-extension-appindicator";
+/// The extension UUIDs that package ships, Ubuntu's own first.
+const APPINDICATOR_UUIDS: [&str; 2] = [
+    "ubuntu-appindicators@ubuntu.com",
+    "appindicatorsupport@rgcjonas.gmail.com",
+];
 
 /// The kernel module the audio daemon reads the desktop through.
 const LOOPBACK_MODULE: &str = "snd-aloop";
@@ -1308,12 +1326,14 @@ fn install_services(report: &mut Report, services: &Path, installed: &Path) -> R
     }
 
     install_audio(&payload_audio())?;
+    let appindicator = install_appindicator_extension();
 
     report.ok(
         DisplayRecipeStep::Services,
         format!(
-            "installed the display services in {} and asked for them on every boot",
-            installed.display()
+            "installed the display services in {} and asked for them on every boot{}",
+            installed.display(),
+            appindicator.map_or_else(String::new, |note| format!("; {note}")),
         ),
     );
 
@@ -1389,6 +1409,55 @@ fn wireplumber_rule(share: &Path) -> Option<(&'static str, PathBuf)> {
 /// Where the mounted payload keeps the loopback's configuration.
 fn payload_audio() -> PathBuf {
     Path::new(PAYLOAD_MOUNT).join("content").join("audio")
+}
+
+/// Installs a StatusNotifierItem extension for the tray icon to show
+/// through, as a distro package.
+///
+/// Best effort and never a failed stage: what a guest is missing without it
+/// is the tray icon, not the desktop. Skipped where there is no GNOME shell
+/// to extend, and where an extension -- Ubuntu's or the upstream one -- is
+/// already on disk, which is every supported guest with its desktop
+/// installed; the apt call exists for the guest whose desktop install
+/// predates the tray. Enabling the extension is left to the session: the
+/// tray, which lives there, asks the running shell when it starts, which is
+/// the one way to add a UUID to `org.gnome.shell enabled-extensions` without
+/// a root-side write clobbering the desktop's defaults or the user's own.
+///
+/// What comes back is the note the Services stage's line carries when the
+/// install failed -- a report, not a crash, because the stage that follows
+/// does not depend on the answer.
+fn install_appindicator_extension() -> Option<String> {
+    if !appindicator_is_needed(Path::new(GNOME_SHELL), Path::new(SHELL_EXTENSIONS)) {
+        return None;
+    }
+
+    let outcome = command::run(
+        "apt-get",
+        &[
+            "install",
+            "-y",
+            "--no-install-recommends",
+            APPINDICATOR_PACKAGE,
+        ],
+        &[("DEBIAN_FRONTEND", "noninteractive")],
+        APT_BUDGET,
+    );
+    (!outcome.succeeded()).then(|| {
+        format!(
+            "the {APPINDICATOR_PACKAGE} package could not be installed, and the guest's tray \
+             icon has nothing to show through: {}",
+            failure("apt-get install", &outcome)
+        )
+    })
+}
+
+/// Whether this guest is a GNOME desktop with no AppIndicator extension yet.
+fn appindicator_is_needed(shell: &Path, extensions: &Path) -> bool {
+    shell.exists()
+        && !APPINDICATOR_UUIDS
+            .iter()
+            .any(|uuid| extensions.join(uuid).is_dir())
 }
 
 /// Restarts both units and waits until they are actually up.
@@ -1652,15 +1721,65 @@ mod tests {
     }
 
     #[test]
-    fn the_payload_carries_four_programs_and_one_of_them_is_a_user_unit() {
-        assert_eq!(super::SERVICE_BINARIES.len(), 4);
+    fn the_payload_carries_five_programs_and_two_of_them_are_user_units() {
+        assert_eq!(super::SERVICE_BINARIES.len(), 5);
         assert!(
             super::SERVICE_BINARIES.contains(&"vmlord-display-clipboard"),
             "the clipboard daemon ships with the others"
         );
+        assert!(
+            super::SERVICE_BINARIES.contains(&"vmlord-display-tray"),
+            "the tray ships with the others"
+        );
         assert_eq!(super::SYSTEM_UNITS.len(), 3);
-        assert_eq!(super::USER_UNITS, ["vmlord-display-clipboard.service"]);
+        assert_eq!(
+            super::USER_UNITS,
+            [
+                "vmlord-display-clipboard.service",
+                "vmlord-display-tray.service",
+            ]
+        );
         assert_eq!(super::SYSTEMD_USER_UNITS, "/etc/systemd/user");
+    }
+
+    #[test]
+    fn the_tray_unit_starts_and_dies_with_the_session() {
+        // The tray is enabled the way the clipboard is -- for whichever
+        // session starts next -- and its unit says why it is a user unit.
+        let unit = include_str!("../../../payloads/display/services/vmlord-display-tray.service");
+
+        assert!(
+            unit.contains("WantedBy=graphical-session.target"),
+            "the tray is wanted by the session, not by the boot"
+        );
+        assert!(unit.contains("/usr/local/lib/vmlord/vmlord-display-tray"));
+    }
+
+    #[test]
+    fn an_appindicator_extension_is_asked_for_only_where_one_is_missing() {
+        let guest = temporary("appindicator-guest");
+        fs::create_dir_all(guest.join("ubuntu-appindicators@ubuntu.com")).unwrap();
+        let shell = guest.join("gnome-shell");
+        fs::write(&shell, b"binary").unwrap();
+
+        assert!(
+            !super::appindicator_is_needed(std::path::Path::new(&shell), &guest),
+            "Ubuntu's own fork on disk is every supported desktop guest"
+        );
+        assert!(
+            super::appindicator_is_needed(
+                std::path::Path::new(&shell),
+                &temporary("appindicator-none")
+            ),
+            "a GNOME shell with no extension on disk needs the package"
+        );
+        assert!(
+            !super::appindicator_is_needed(
+                std::path::Path::new(&guest.join("absent-shell")),
+                &temporary("appindicator-headless")
+            ),
+            "there is nothing to extend on a guest without a shell"
+        );
     }
 
     #[test]

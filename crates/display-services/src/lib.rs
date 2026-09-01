@@ -1,8 +1,10 @@
-//! The three programs a VMLord guest runs to put its desktop on the wire.
+//! The programs a VMLord guest runs to put its desktop on the wire.
 //!
 //! `vmlord-display-broker` is privileged and small; `vmlord-display-session`
 //! runs hot and holds nothing worth stealing; `vmlord-display-clipboard` lives
-//! in the user's graphical session, because that is where a selection exists. What crosses between them is
+//! in the user's graphical session, because that is where a selection exists;
+//! and `vmlord-display-tray` lives there too, because that is where a tray
+//! icon is. What crosses between them is
 //! [`ipc`], and it is typed operations only: no device descriptor and no ioctl
 //! passthrough leaves the broker.
 
@@ -24,6 +26,9 @@ pub mod pipeline;
 pub mod pipeline_bench;
 pub mod seat;
 pub mod session_main;
+pub mod systemd;
+pub mod tray_icon;
+pub mod tray_main;
 pub mod uinput;
 pub mod unix;
 pub mod vsock;
