@@ -121,8 +121,24 @@ This is the only layer allowed to interact with operating system APIs.
 The native Rust backend owns HCS integration, VM lifecycle, networking, GPU-PV
 and display, and it is the only backend: `vmlord-legacy-backend`,
 `appsandbox_core.dll` and the `VMLORD_BACKEND` switch that reached them are
-gone. VMs created by AppSandbox are not read, migrated or listed -- VMLord
-manages the VMs it created itself.
+gone. VMLord does not read, list or manage AppSandbox's VMs.
+
+A copy of one can be turned into a VM of VMLord's own, once, by `vmlord
+adopt-disk` and `cargo appsandbox-convert`. The conversion is offline: it edits
+the copied disk while nothing runs from it, so the guest it dismantles never
+starts. `vmlord-appsandbox-convert` is a function over a mounted filesystem
+root -- it knows nothing of VHDX, Windows or how the root came to be mounted --
+which is what lets it run under WSL today and inside a service VM when the
+import ships, and what lets every one of its tests run against a directory
+tree. `adopt-disk` builds the VM's own files around the copied disk, mints its
+key pair and agent secret, and writes the document the conversion consumes; it
+never starts the VM, because the disk is not converted yet.
+
+The conversion installs only VMLord's guest contract -- the key, the agent with
+its secret and unit, the netplan, the SSH drop-ins -- and removes only what
+AppSandbox's own stack collides with. Display and GPU provisioning are not part
+of it: they reach an imported guest through the agent at run time, from host
+shares, exactly as they reach a created one. See `docs/appsandbox-import.md`.
 
 ## Implemented scaffold
 
