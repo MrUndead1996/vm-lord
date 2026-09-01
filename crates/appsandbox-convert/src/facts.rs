@@ -186,9 +186,7 @@ mod tests {
     fn a_guest_vmlord_has_already_converted_is_refused() {
         let guest = AppSandboxGuest::new();
         std::fs::write(
-            guest
-                .root()
-                .join("etc/systemd/system/vmlord-agent.service"),
+            guest.root().join("etc/systemd/system/vmlord-agent.service"),
             "[Unit]\n",
         )
         .expect("write");

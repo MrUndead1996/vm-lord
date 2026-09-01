@@ -26,7 +26,10 @@ const FILES: [(&str, &str); 21] = [
     ),
     ("/etc/hostname", "ubuntu\n"),
     ("/etc/hosts", "127.0.0.1\tlocalhost\n127.0.1.1\tubuntu\n"),
-    ("/etc/netplan/99-appsandbox.yaml", "network:\n  version: 2\n"),
+    (
+        "/etc/netplan/99-appsandbox.yaml",
+        "network:\n  version: 2\n",
+    ),
     (
         "/etc/cloud/cloud.cfg.d/99-disable-network-config.cfg",
         "network: {config: disabled}\n",

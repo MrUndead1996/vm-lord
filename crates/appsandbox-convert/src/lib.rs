@@ -41,3 +41,4 @@ impl std::error::Error for ConvertError {}
 mod facts;
 #[cfg(test)]
 mod fixture;
+mod install;
