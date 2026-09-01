@@ -17,7 +17,7 @@
 ; Kept in step with the workspace version by hand at release time; the release
 ; workflow refuses a tag that disagrees with Cargo.toml, and the setup file
 ; name below is what the release manifest points at.
-#define AppVersion "0.1.0"
+#define AppVersion "0.2.0"
 #define DistDir "..\target\dist"
 
 [Setup]
