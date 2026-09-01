@@ -8,8 +8,8 @@
 use std::path::PathBuf;
 
 use vmlord_core::{
-    DesktopProfile, GpuMode, NetworkMode, Provisioning, SshAccess, SshPort, VmCreateRequest,
-    VmSource,
+    DesktopProfile, GpuMode, NetworkMode, Provisioning, SshAccess, SshDaemon, SshPort,
+    VmCreateRequest, VmSource,
 };
 
 use crate::host_guest_defaults;
@@ -91,8 +91,13 @@ impl AdoptArguments {
     /// it -- the source application set them from this same host when it built
     /// the VM -- so the request repeats the host's, and nothing of VMLord's
     /// writes them into the guest again.
+    ///
+    /// `ssh_daemon` comes from the installed distribution profile rather than
+    /// from here: how a release carries its SSH daemon is what decides which
+    /// two drop-ins move its port, and a copy of that here would be a copy
+    /// that falls behind the profiles VMLord ships.
     #[must_use]
-    pub fn request(&self) -> VmCreateRequest {
+    pub fn request(&self, ssh_daemon: SshDaemon) -> VmCreateRequest {
         let host = host_guest_defaults();
         VmCreateRequest {
             name: self.name.clone(),
@@ -117,7 +122,7 @@ impl AdoptArguments {
                     // VMLord's installs one into an adopted disk.
                     desktop: DesktopProfile::Headless,
                 },
-                ssh_daemon: vmlord_core::ubuntu().ssh,
+                ssh_daemon,
             },
             ram_mb: self.ram_mb,
             disk_gb: self.disk_gb,
@@ -163,7 +168,7 @@ mod tests {
         ])
         .expect("parsed");
 
-        let request = arguments.request();
+        let request = arguments.request(vmlord_core::ubuntu().ssh);
         assert_eq!(request.name, "imported");
         assert_eq!(request.disk_gb, 200);
         assert_eq!(request.ram_mb, 32768);
@@ -194,7 +199,8 @@ mod tests {
 
         assert_eq!(arguments.ram_mb, DEFAULT_RAM_MB);
         assert_eq!(arguments.cpu_cores, DEFAULT_CPU_CORES);
-        let VmSource::ExistingDisk { provisioning, .. } = &arguments.request().source else {
+        let request = arguments.request(vmlord_core::ubuntu().ssh);
+        let VmSource::ExistingDisk { provisioning, .. } = &request.source else {
             panic!("an adoption is an existing disk");
         };
         assert_eq!(
