@@ -22,6 +22,7 @@ message Envelope {
     InputDevices input_devices = 8;
     Geometry geometry = 9;
     ClipboardOpened clipboard_opened = 10;
+    AudioOpened audio_opened = 11;
   }
 }
 
@@ -51,6 +52,14 @@ message SessionOpened {
 message ClipboardOpened {
   bytes session_id = 1;
   bytes clipboard_key = 2;
+}
+
+// The same, as the audio daemon needs it: one session and the one channel key
+// that daemon may use. A compromised audio daemon must gain neither a picture,
+// a keyboard nor a selection.
+message AudioOpened {
+  bytes session_id = 1;
+  bytes audio_key = 2;
 }
 
 // Control was lost or the host sent EndSession. Stop capturing and release

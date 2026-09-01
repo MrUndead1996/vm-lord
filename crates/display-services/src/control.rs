@@ -27,16 +27,29 @@ use crate::{
     output,
 };
 
+/// The channel keys that belong to a daemon rather than to capture.
+///
+/// One structure rather than two positional vectors, because two keys of the
+/// same width and type are exactly what a caller can hand over the wrong way
+/// round without the compiler noticing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DaemonKeys {
+    /// The key the clipboard socket proves itself with.
+    pub clipboard: Vec<u8>,
+    /// The key the audio socket proves itself with.
+    pub audio: Vec<u8>,
+}
+
 /// What handling one control record means for the unprivileged process.
 #[derive(Debug)]
 pub enum Outcome {
     /// A session opened: what the capture process needs to bind its two
-    /// sockets, and the clipboard key its daemon needs to bind the fourth.
+    /// sockets, and the keys the two daemons need to bind theirs.
     ///
-    /// The two travel together because they are one fact, and they are separate
+    /// They travel together because they are one fact, and they are separate
     /// values because they go to separate processes: the capture process never
-    /// sees the clipboard key, and the clipboard daemon never sees the others.
-    Opened(SessionParameters, Vec<u8>),
+    /// sees a daemon's key, and neither daemon sees the other's.
+    Opened(SessionParameters, DaemonKeys),
     /// Something to pass straight on.
     Relay(Message),
     /// The host asked the output to change size, and the size is one this
@@ -203,10 +216,11 @@ impl Control {
     /// a compromised capture process could take from these bytes is one
     /// session, and only while that session runs.
     fn opened(&mut self) -> Outcome {
-        let (Some(frame), Some(input), Some(clipboard), Some(negotiated)) = (
+        let (Some(frame), Some(input), Some(clipboard), Some(audio), Some(negotiated)) = (
             self.session.derive_channel_key(Channel::Frame),
             self.session.derive_channel_key(Channel::Input),
             self.session.derive_channel_key(Channel::Clipboard),
+            self.session.derive_channel_key(Channel::Audio),
             self.session.negotiated(),
         ) else {
             return Outcome::Closed("an established session with no keys".to_owned());
@@ -231,7 +245,10 @@ impl Control {
                 tile_size: self.tile_size,
                 cursor_stream,
             },
-            clipboard.to_bytes().to_vec(),
+            DaemonKeys {
+                clipboard: clipboard.to_bytes().to_vec(),
+                audio: audio.to_bytes().to_vec(),
+            },
         )
     }
 
@@ -574,6 +591,42 @@ mod tests {
     }
 
     type SessionParametersOrNothing = Option<crate::ipc::SessionParameters>;
+
+    #[test]
+    fn an_opened_session_hands_each_daemon_its_own_key_and_nothing_else() {
+        let secret = Secret::generate();
+        let (mut host, client_hello) = Session::host(&secret, offer());
+        let mut control = Control::new(&secret, support_from(1920, 1080));
+        let mut wire = Duplex::default();
+        wire.offer(&client_hello);
+
+        let mut keys = None;
+        let mut parameters = None;
+        for _ in 0..2 {
+            if let Outcome::Opened(opened, daemons) = control.pump(&mut wire) {
+                parameters = Some(opened);
+                keys = Some(daemons);
+            }
+            for (message_type, payload) in wire.taken() {
+                let record = Record::new(Channel::Control, message_type, 0, 0, 0, payload);
+                if let Ok(outcome) = host.handle(&record.header, &record.payload)
+                    && let Some(reply) = outcome.reply
+                {
+                    wire.offer(&reply);
+                }
+            }
+        }
+
+        let keys = keys.expect("a session opened");
+        let parameters = parameters.expect("a session opened");
+
+        assert_eq!(keys.audio.len(), 32);
+        // Domain separation is the whole point: one daemon's key must not open
+        // another daemon's socket.
+        assert_ne!(keys.audio, keys.clipboard);
+        assert_ne!(keys.audio, parameters.frame_key);
+        assert_ne!(keys.audio, parameters.input_key);
+    }
 
     /// One record after the handshake, and what the broker made of it.
     fn drive(record: Record) -> Outcome {

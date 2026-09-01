@@ -25,6 +25,13 @@ pub const INPUT_PORT: u32 = 0x564D_4C49;
 /// capture loop.
 pub const CLIPBOARD_PORT: u32 = 0x564D_4C43;
 
+/// Where the desktop's sound goes. `"VMLS"`, for sound: `"VMLA"` is the
+/// agent's own service.
+///
+/// Bound by the audio daemon rather than by the capture process, which is what
+/// keeps a stalled ALSA read out of the frame path.
+pub const AUDIO_PORT: u32 = 0x564D_4C53;
+
 /// How many connections the kernel holds while this side is busy.
 ///
 /// Three channels and one racing reconnect. A viewer that needs more than that
@@ -161,6 +168,40 @@ impl Stream {
                 self.descriptor.as_raw_fd(),
                 libc::SOL_SOCKET,
                 libc::SO_RCVTIMEO,
+                (&raw const timeout).cast(),
+                size_of_val(&timeout) as libc::socklen_t,
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
+    }
+
+    /// Gives up on a write that the host is not draining.
+    ///
+    /// The audio daemon's promise is that capture never waits on the socket:
+    /// a period the host cannot take in time is dropped, and the gap is
+    /// reported by the stream position the next record carries. Without this
+    /// the promise would rest on the host always keeping up, which is the one
+    /// thing a guest cannot arrange.
+    ///
+    /// # Errors
+    ///
+    /// [`io::Error`] if the option cannot be set.
+    pub fn set_write_timeout(&self, patience: std::time::Duration) -> io::Result<()> {
+        let timeout = libc::timeval {
+            tv_sec: patience.as_secs() as _,
+            tv_usec: patience.subsec_micros() as _,
+        };
+        // SAFETY: `timeout` is a live, initialized `timeval` and the length is
+        // its exact size; the descriptor is this stream's own.
+        let result = unsafe {
+            libc::setsockopt(
+                self.descriptor.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDTIMEO,
                 (&raw const timeout).cast(),
                 size_of_val(&timeout) as libc::socklen_t,
             )
