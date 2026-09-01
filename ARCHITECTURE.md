@@ -694,7 +694,7 @@ is worse than reporting it incompletely.
 persistence. The composition root initializes it before the backend. Settings
 are stored per user at `%LOCALAPPDATA%\VMLord\settings.toml`; the initial file
 uses `%LOCALAPPDATA%\VMLord\vms` for VM data,
-`%LOCALAPPDATA%\VMLord\logs\vmlord.log` for logs and
+`%LOCALAPPDATA%\VMLord\logs\vmlord.log` as the log-name template and
 `%LOCALAPPDATA%\VMLord\images` for downloaded distribution images. The
 configuration directory and the default VM, log and image directories are
 created on first launch. `image_cache_path` carries `#[serde(default)]` and is
@@ -734,8 +734,9 @@ the missing profile rather than silently falling back.
 
 `core::logging` installs the shared `log` backend after settings are loaded and
 before the backend starts. It writes records at the configured `log_level` to
-both standard output and the append-only `log_file_path`; all Rust crates use
-the `log` facade to emit application records.
+both standard output and a file; all Rust crates use the `log` facade to emit
+application records. `log_file_path` is the template for that file rather than
+the file itself -- see "One file per run" below.
 
 The current UI initializes the backend, shows availability and diagnostics,
 lists known VMs, can create Linux VMs from ISO images, and can edit them. The
@@ -4022,6 +4023,19 @@ algorithm, written out because the leap rule is the whole difficulty. `fmt`
 would need the `time` crate to say the same thing. An event's fields are
 appended after its message, and a span's fields are appended before them, so a
 reader scanning a column finds the VM in the same place on every line.
+
+**One file per run.** The configured `log_file_path` names no file that is ever
+written. `core::logging::run_log_path` stamps it at startup -- `vmlord.log`
+becomes `vmlord-20240229-010101-123.log` in the same directory -- so every
+process start owns a transcript. One file held every launch VMLord had ever
+made, and the launch worth reading is almost always a single one: a report now
+carries the run that went wrong instead of the months around it, and `vmlord`,
+`vmlord-com1`, `vmlord-ssh` and `vmlord-display` stop interleaving into each
+other. The stamp is the same UTC instant `timestamp` writes, spelled
+`YYYYMMDD-HHMMSS-mmm`: a colon is not a legal character in a Windows file name,
+the two groups sort the directory into the order the runs happened, and the
+millisecond is there because two helper processes can start within one second.
+Nothing deletes an old file; retention is not implemented.
 
 The **diagnostics layer** collects what is addressed to a person. An event
 reaches the panel when it carries a `diagnostic` field, which

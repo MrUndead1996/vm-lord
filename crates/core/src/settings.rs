@@ -21,7 +21,12 @@ pub struct AppSettings {
     pub vm_storage_path: PathBuf,
     /// UI language.
     pub language: Language,
-    /// Destination for application log records.
+    /// Where application log records go, and under what name.
+    ///
+    /// A template rather than the file itself: every run writes to
+    /// `vmlord-<stamp>.log` beside this path, so one launch's records can be
+    /// read -- or sent in -- without the months around them. `core::logging`
+    /// stamps the name; the directory here is the one that gets created.
     pub log_file_path: PathBuf,
     pub log_level: LogLevel,
     /// Directory holding distribution images downloaded from the internet.

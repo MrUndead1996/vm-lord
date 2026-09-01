@@ -1,8 +1,9 @@
 use std::{
+    ffi::{OsStr, OsString},
     fmt::{self, Write as _},
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -22,8 +23,9 @@ use crate::{AppSettings, LogLevel};
 /// Initializes the application-wide logger using the configured output file and level.
 ///
 /// Records go to the log file and to standard output, which is what a program
-/// started from a console wants.
-pub fn initialize(settings: &AppSettings) -> Result<(), LoggingError> {
+/// started from a console wants. The path that comes back is the file this run
+/// opened, not the one configured: see [`run_log_path`].
+pub fn initialize(settings: &AppSettings) -> Result<PathBuf, LoggingError> {
     install(settings, Console::Echo)
 }
 
@@ -34,7 +36,7 @@ pub fn initialize(settings: &AppSettings) -> Result<(), LoggingError> {
 /// there is not a stray line in a terminal: it is bytes in the middle of a
 /// frame, and the reader on the other end takes the first four of them for a
 /// length. Anything that writes to a pipe it did not frame belongs here.
-pub fn initialize_without_console(settings: &AppSettings) -> Result<(), LoggingError> {
+pub fn initialize_without_console(settings: &AppSettings) -> Result<PathBuf, LoggingError> {
     install(settings, Console::Silent)
 }
 
@@ -45,18 +47,19 @@ pub(crate) enum Console {
     Silent,
 }
 
-fn install(settings: &AppSettings, console: Console) -> Result<(), LoggingError> {
-    let layer = record_layer(settings, console)?;
+fn install(settings: &AppSettings, console: Console) -> Result<PathBuf, LoggingError> {
+    let (layer, path) = record_layer(settings, console)?;
     install_bridge(settings)?;
     tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
         .map_err(LoggingError::AlreadyInitialized)?;
-    Ok(())
+    Ok(path)
 }
 
 /// Brings up logging and the diagnostics panel together.
 ///
 /// The panel is the reason a sink comes back: the caller hands it to the
-/// application, which reads it on every refresh. `vmlord-com1` and
+/// application, which reads it on every refresh. The path beside it is the file
+/// this run opened, which the composition root reports. `vmlord-com1` and
 /// `vmlord-display` call `initialize` instead -- neither has a panel to show a
 /// record in.
 ///
@@ -66,9 +69,9 @@ fn install(settings: &AppSettings, console: Console) -> Result<(), LoggingError>
 /// subscriber is already installed.
 pub fn initialize_with_diagnostics(
     settings: &AppSettings,
-) -> Result<crate::diagnostics::DiagnosticsSink, LoggingError> {
+) -> Result<(crate::diagnostics::DiagnosticsSink, PathBuf), LoggingError> {
     let sink = crate::diagnostics::DiagnosticsSink::new();
-    let layer = record_layer(settings, Console::Echo)?;
+    let (layer, path) = record_layer(settings, Console::Echo)?;
     install_bridge(settings)?;
     tracing::subscriber::set_global_default(
         tracing_subscriber::registry()
@@ -76,14 +79,19 @@ pub fn initialize_with_diagnostics(
             .with(crate::diagnostics::DiagnosticsLayer::new(sink.clone())),
     )
     .map_err(LoggingError::AlreadyInitialized)?;
-    Ok(sink)
+    Ok((sink, path))
 }
 
-/// Opens the log file and builds the layer that writes to it.
+/// Opens this run's log file and builds the layer that writes to it.
 ///
 /// Separate from installation so that a process which also wants diagnostics
-/// can compose the two layers rather than repeat the file handling.
-fn record_layer(settings: &AppSettings, console: Console) -> Result<RecordLayer, LoggingError> {
+/// can compose the two layers rather than repeat the file handling. The path
+/// that comes back beside the layer is the file that was opened, which is not
+/// the configured one -- see [`run_log_path`].
+fn record_layer(
+    settings: &AppSettings,
+    console: Console,
+) -> Result<(RecordLayer, PathBuf), LoggingError> {
     let log_directory =
         settings
             .log_file_path
@@ -97,21 +105,49 @@ fn record_layer(settings: &AppSettings, console: Console) -> Result<RecordLayer,
         source,
     })?;
 
+    let path = run_log_path(&settings.log_file_path, SystemTime::now());
     let file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&settings.log_file_path)
+        .open(&path)
         .map_err(|source| LoggingError::Io {
             operation: "open log file",
-            path: settings.log_file_path.clone(),
+            path: path.clone(),
             source,
         })?;
 
-    Ok(RecordLayer {
-        level: level_filter(settings.log_level),
-        console,
-        file: Mutex::new(file),
-    })
+    Ok((
+        RecordLayer {
+            level: level_filter(settings.log_level),
+            console,
+            file: Mutex::new(file),
+        },
+        path,
+    ))
+}
+
+/// The file this run writes to, derived from the configured log path.
+///
+/// `log_file_path` names the log the way a person configures it --
+/// `logs\vmlord.log` -- but one file holds every run the application has ever
+/// made, and the run worth reading is almost always a single one. So the
+/// configured name is a template: each start opens
+/// `vmlord-20240229-010101-123.log` beside it, and a report carries the launch
+/// that went wrong rather than the months around it.
+///
+/// Appending rather than truncating still, because the name already makes a
+/// second process's records a second file; append only matters if two of them
+/// land on the same millisecond.
+fn run_log_path(template: &Path, now: SystemTime) -> PathBuf {
+    let mut name = OsString::from(template.file_stem().unwrap_or(OsStr::new("vmlord")));
+    name.push("-");
+    name.push(file_stamp(now));
+    if let Some(extension) = template.extension() {
+        name.push(".");
+        name.push(extension);
+    }
+
+    template.with_file_name(name)
 }
 
 /// Points the `log` crate at the subscriber.
@@ -160,18 +196,58 @@ fn compose(stamp: &str, level: Level, target: &str, message: &str, fields: &str)
 /// Milliseconds, because the thresholds this log has to be able to settle are
 /// stated in them.
 pub(crate) fn timestamp(now: SystemTime) -> String {
-    let since = now.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let seconds = since.as_secs();
-    let (days, time) = (seconds / 86_400, seconds % 86_400);
-    let (year, month, day) = civil_from_days(days as i64);
+    let at = Utc::at(now);
 
     format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:03}Z",
-        time / 3_600,
-        (time % 3_600) / 60,
-        time % 60,
-        since.subsec_millis()
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        at.year, at.month, at.day, at.hour, at.minute, at.second, at.millisecond
     )
+}
+
+/// The same instant, spelled for a file name: `20240229-010101-123`.
+///
+/// The separators `timestamp` uses cannot be reused here. A colon is not a
+/// legal character in a Windows file name at all, and a name that reads as a
+/// date and a time in two groups sorts the directory into the order the runs
+/// happened. The millisecond stays because two helper processes can be started
+/// within the same second, and each of them wants its own file.
+fn file_stamp(now: SystemTime) -> String {
+    let at = Utc::at(now);
+
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}-{:03}",
+        at.year, at.month, at.day, at.hour, at.minute, at.second, at.millisecond
+    )
+}
+
+/// An instant broken into the fields a stamp is written from, in UTC.
+struct Utc {
+    year: i64,
+    month: u32,
+    day: u32,
+    hour: u64,
+    minute: u64,
+    second: u64,
+    millisecond: u32,
+}
+
+impl Utc {
+    fn at(now: SystemTime) -> Self {
+        let since = now.duration_since(UNIX_EPOCH).unwrap_or_default();
+        let seconds = since.as_secs();
+        let (days, time) = (seconds / 86_400, seconds % 86_400);
+        let (year, month, day) = civil_from_days(days as i64);
+
+        Self {
+            year,
+            month,
+            day,
+            hour: time / 3_600,
+            minute: (time % 3_600) / 60,
+            second: time % 60,
+            millisecond: since.subsec_millis(),
+        }
+    }
 }
 
 /// The civil date `days` after 1970-01-01, by Howard Hinnant's algorithm.
@@ -401,7 +477,9 @@ mod tests {
 
     use tracing::{Level, level_filters::LevelFilter};
 
-    use super::{Console, compose, emit, level_filter, timestamp};
+    use std::path::{Path, PathBuf};
+
+    use super::{Console, compose, emit, file_stamp, level_filter, run_log_path, timestamp};
     use crate::LogLevel;
 
     #[test]
@@ -426,6 +504,48 @@ mod tests {
         let moment = UNIX_EPOCH + Duration::from_millis(1_709_164_800_000 + 3_661_123);
 
         assert_eq!(timestamp(moment), "2024-02-29T01:01:01.123Z");
+    }
+
+    #[test]
+    fn a_file_name_stamp_spells_the_same_instant_without_illegal_separators() {
+        let moment = UNIX_EPOCH + Duration::from_millis(1_709_164_800_000 + 3_661_123);
+
+        // The colons of `2024-02-29T01:01:01.123Z` cannot appear in a Windows
+        // file name, and the groups still sort in the order the runs happened.
+        assert_eq!(file_stamp(moment), "20240229-010101-123");
+    }
+
+    #[test]
+    fn each_run_opens_its_own_file_beside_the_configured_one() {
+        let moment = UNIX_EPOCH + Duration::from_millis(1_709_164_800_000 + 3_661_123);
+
+        assert_eq!(
+            run_log_path(Path::new(r"C:\VMLord\logs\vmlord.log"), moment),
+            PathBuf::from(r"C:\VMLord\logs\vmlord-20240229-010101-123.log")
+        );
+    }
+
+    #[test]
+    fn two_runs_a_millisecond_apart_are_two_files() {
+        // What the split is for: the previous launch stays readable while the
+        // next one writes.
+        let first = UNIX_EPOCH + Duration::from_millis(1_709_164_800_000);
+        let second = first + Duration::from_millis(1);
+
+        assert_ne!(
+            run_log_path(Path::new("logs/vmlord.log"), first),
+            run_log_path(Path::new("logs/vmlord.log"), second)
+        );
+    }
+
+    #[test]
+    fn a_configured_name_without_an_extension_keeps_not_having_one() {
+        let moment = UNIX_EPOCH + Duration::from_millis(1_709_164_800_000);
+
+        assert_eq!(
+            run_log_path(Path::new("logs/vmlord"), moment),
+            PathBuf::from("logs/vmlord-20240229-000000-000")
+        );
     }
 
     #[test]
