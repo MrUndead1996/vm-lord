@@ -34,7 +34,7 @@ use crate::{
     launch::Handover,
     live::{BIND_BACKOFF, channel_key, read_awaited},
     windows::{
-        audio::Renderer,
+        audio::{Com, Renderer},
         hvsocket::{CONNECT_TIMEOUT, HvSocket},
     },
 };
@@ -86,6 +86,10 @@ pub fn spawn(parameters: Parameters) -> (JoinHandle<()>, Sender<Mute>) {
 
 /// The thread's body.
 fn serve(parameters: &Parameters, mute: &Receiver<Mute>) -> Result<(), String> {
+    // Before anything WASAPI: this thread is the only one that touches COM
+    // here, and a renderer built without it reports every failure as "this
+    // host has no audio output".
+    let _com = Com::initialize();
     let mut session = session_of(&parameters.handover)?;
     let limits = Limits::new(0, 0);
 

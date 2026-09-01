@@ -30,7 +30,9 @@ use windows::{
             IMMNotificationClient_Impl, MMDeviceEnumerator, WAVEFORMATEX, WAVE_FORMAT_PCM,
             eConsole, eRender,
         },
-        System::Com::{CLSCTX_ALL, CoCreateInstance},
+        System::Com::{
+            CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, CoUninitialize,
+        },
     },
     core::{PCWSTR, implement},
 };
@@ -91,6 +93,36 @@ pub fn wave_format(format: Format) -> WAVEFORMATEX {
         nBlockAlign: block_align,
         wBitsPerSample: bits,
         cbSize: 0,
+    }
+}
+
+/// COM, initialised for the thread that holds it.
+///
+/// WASAPI is COM, and a thread that has not called `CoInitializeEx` is answered
+/// `CO_E_NOTINITIALIZED` by every call -- which reads as "this host has no
+/// audio output" and is nothing of the kind. The audio thread is this crate's
+/// own, so nobody else initialises it.
+///
+/// Multithreaded, because this thread pumps no window messages: an apartment
+/// would need one.
+pub struct Com;
+
+impl Com {
+    /// Initialises COM for the calling thread.
+    #[must_use]
+    pub fn initialize() -> Self {
+        // SAFETY: called once on a thread this crate owns, and undone in
+        // `Drop` on that same thread.
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+
+        Self
+    }
+}
+
+impl Drop for Com {
+    fn drop(&mut self) {
+        // SAFETY: balances the call in `initialize`, on the same thread.
+        unsafe { CoUninitialize() };
     }
 }
 
@@ -207,8 +239,9 @@ impl Renderer {
     /// endpoint that cannot be initialised is not an error here: the renderer
     /// parks and revives on the next notification.
     pub fn new(format: Format) -> Result<Self, RendererError> {
-        // SAFETY: COM is initialised by the thread that builds this, and the
-        // class and interface are the ones this crate names.
+        // SAFETY: the caller holds a [`Com`] for this thread -- without one
+        // every call below answers `CO_E_NOTINITIALIZED` -- and the class and
+        // interface are the ones this crate names.
         let enumerator: IMMDeviceEnumerator =
             unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
                 .map_err(RendererError::NoEndpoint)?;
