@@ -112,7 +112,12 @@ fn a_session_never_yields_a_channel_key_to_input_that_did_not_authenticate() {
             let _ = host.handle(&header, &payload);
         }
 
-        for channel in [Channel::Frame, Channel::Input] {
+        for channel in [
+            Channel::Frame,
+            Channel::Input,
+            Channel::Clipboard,
+            Channel::Audio,
+        ] {
             assert!(
                 guest.channel_key(channel).is_none(),
                 "a guest bound a channel to mutated input"

@@ -23,8 +23,9 @@ use vmlord_display_protocol::{
     record::{self, Channel, Limits, Record},
     session::{Offer, Session, Support},
     v1::{
-        Capability, ControlRecord, DisplayTiming, FrameRecord, InputRecord, KeyEvent, Mode,
-        PixelFormat, PointerMotion, SetAvailableModes, SetDisplayMode, StreamConfig,
+        AudioFormat, AudioRecord, Capability, ControlRecord, DisplayTiming, FrameRecord,
+        InputRecord, KeyEvent, Mode, PixelFormat, PointerMotion, SampleFormat, SetAvailableModes,
+        SetDisplayMode, StreamConfig,
     },
 };
 
@@ -205,6 +206,35 @@ fn one_record_of_each_carrying_type_is_the_bytes_it_has_always_been() {
         PointerMotion { x: 640, y: 480 }.encode_to_vec(),
     );
     record::write(&mut wire, &motion, &limits).expect("a pointer motion");
+
+    let format = Record::new(
+        Channel::Audio,
+        AudioRecord::Format as u16,
+        0,
+        0,
+        0,
+        AudioFormat {
+            sample_rate: 48_000,
+            channels: 2,
+            sample_format: SampleFormat::S16Le as i32,
+            frames_per_period: 480,
+        }
+        .encode_to_vec(),
+    );
+    record::write(&mut wire, &format, &limits).expect("an audio format");
+
+    // `base` is the stream position: the frames captured before this period.
+    // It is held here because a gap the host reads out of it is the whole of
+    // how silence and dropped periods are reported.
+    let period = Record::new(
+        Channel::Audio,
+        AudioRecord::Data as u16,
+        1,
+        480,
+        0,
+        vec![0xEF; 1920],
+    );
+    record::write(&mut wire, &period, &limits).expect("an audio period");
 
     hold("records.bin", &wire);
 }

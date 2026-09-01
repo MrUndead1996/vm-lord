@@ -3,7 +3,7 @@
 //!
 //! Portable by construction: no Windows APIs, no Linux syscalls, no transport.
 //! It knows what a record is, how one is delimited, what proves a peer, and
-//! what a session's states are; opening the three HvSocket services that carry
+//! what a session's states are; opening the HvSocket services that carry
 //! the bytes belongs to the host viewer and to the guest services.
 //!
 //! The schema lives in `proto/vmlord/display/v1/display.proto` and is compiled
@@ -11,6 +11,7 @@
 //! tools read, checked in beside the `.proto` so that a change to the wire
 //! format shows up in a diff.
 
+pub mod audio;
 pub mod clipboard;
 pub mod handshake;
 pub mod keys;

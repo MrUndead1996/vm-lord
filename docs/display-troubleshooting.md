@@ -70,8 +70,8 @@ dmesg | grep -E 'vmlord_drm|Lockdown|verification'
 
 ## Nothing pastes between the host and the guest
 
-The clipboard is a fourth channel, and it needs a graphical session -- not just
-a running VM.
+The clipboard is a channel of its own, and it needs a graphical session -- not
+just a running VM.
 
 - Sign in through GDM first. Nothing crosses at the login screen, because the
   clipboard belongs to the compositor and the daemon that reaches it starts
@@ -101,6 +101,41 @@ a running VM.
   broker may have refused it: the clipboard socket is served only to the uid of
   the active graphical session on `seat0`, so a second user signed in over SSH
   cannot take it. The broker's journal names the uid it refused.
+
+## The guest has no sound
+
+Sound is a channel of its own, served by a system daemon that needs no login.
+
+- Check the daemon inside the guest:
+
+  ```bash
+  systemctl status vmlord-display-audio.service
+  journalctl -u vmlord-display-audio -b
+  ```
+
+  Its journal carries the format, frame counts, stream positions and outcomes,
+  and never a sample.
+- Check that the loopback is there. `cat /proc/asound/cards` should list
+  `Loopback`; if it does not, `modprobe snd-aloop` and look at whether
+  `/etc/modules-load.d/vmlord-audio.conf` survived. The module ships with every
+  supported release's kernel, so it is not something to install.
+- A journal line about the loopback not opening usually means something else
+  holds it, or the daemon is not in the `audio` group -- `systemctl show
+  vmlord-display-audio -p SupplementaryGroups` says whether the unit asks for
+  it.
+- Check the guest's own output device. GNOME should show one output, named
+  **VMLord audio**. If it shows *Dummy Output* instead, the desktop has no
+  device at all: `/etc/pipewire/pipewire.conf.d/51-vmlord-audio.conf` is
+  missing or was not read. PipeWire's ALSA monitor refuses the whole loopback
+  card while the daemon holds one of its devices, which is why the output is a
+  statically declared node rather than a discovered card.
+- Check that the viewer is not muted: **Mute audio** in the window's system
+  menu, which is remembered per VM between sessions.
+- Check the host's output. If the viewer's log says the host has no audio
+  output, the session is fine and Windows has no working endpoint; the sound
+  starts as soon as one appears.
+- An idle desktop sends nothing at all, so silence with nothing playing is the
+  ordinary state rather than a fault.
 
 ## Secure Boot
 

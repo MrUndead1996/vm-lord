@@ -6,6 +6,9 @@
 //! the session states, the decode path -- and `src/windows/` is the four
 //! modules that touch Win32.
 
+/// The guest's sound: the thread that binds the audio channel and the endpoint
+/// it plays through.
+pub mod audio;
 pub mod clipboard;
 pub mod display_modes;
 #[cfg(test)]

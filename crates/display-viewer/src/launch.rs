@@ -94,6 +94,8 @@ pub struct LaunchParameters {
     pub input_port: u32,
     /// The vsock port the clipboard service listens on.
     pub clipboard_port: u32,
+    /// The vsock port the audio service listens on.
+    pub audio_port: u32,
     /// The width VMLord offered, for the window before the handshake settles.
     pub width: u32,
     /// The height VMLord offered.
@@ -137,7 +139,7 @@ impl FilePolicy {
 /// not here and never crosses this pipe.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Handover {
-    /// The 16 bytes that name the session across its three sockets.
+    /// The 16 bytes that name the session across its five sockets.
     pub session_id: Vec<u8>,
     /// The key the frame socket proves itself with.
     pub frame_key: Vec<u8>,
@@ -161,6 +163,8 @@ pub struct Handover {
     pub control_sequence: u32,
     /// The key the clipboard socket proves itself with.
     pub clipboard_key: Vec<u8>,
+    /// The key the audio socket proves itself with.
+    pub audio_key: Vec<u8>,
 }
 
 /// Turns a message into the bytes an envelope carries, without the prefix.
@@ -174,6 +178,7 @@ pub fn encode(message: &Message) -> Vec<u8> {
             frame_port: parameters.frame_port,
             input_port: parameters.input_port,
             clipboard_port: parameters.clipboard_port,
+            audio_port: parameters.audio_port,
             width: parameters.width,
             height: parameters.height,
             tile_size: parameters.tile_size,
@@ -195,6 +200,7 @@ pub fn encode(message: &Message) -> Vec<u8> {
             frame_key: handover.frame_key.clone(),
             input_key: handover.input_key.clone(),
             clipboard_key: handover.clipboard_key.clone(),
+            audio_key: handover.audio_key.clone(),
             version_major: handover.version_major,
             version_minor: handover.version_minor,
             capabilities: handover.capabilities.clone(),
@@ -261,6 +267,7 @@ pub fn decode(bytes: &[u8]) -> Result<Message, LaunchError> {
             frame_port: parameters.frame_port,
             input_port: parameters.input_port,
             clipboard_port: parameters.clipboard_port,
+            audio_port: parameters.audio_port,
             width: parameters.width,
             height: parameters.height,
             tile_size: parameters.tile_size,
@@ -286,6 +293,7 @@ pub fn decode(bytes: &[u8]) -> Result<Message, LaunchError> {
             frame_key: handover.frame_key,
             input_key: handover.input_key,
             clipboard_key: handover.clipboard_key,
+            audio_key: handover.audio_key,
             version_major: handover.version_major,
             version_minor: handover.version_minor,
             capabilities: handover.capabilities,
@@ -521,6 +529,7 @@ mod tests {
             frame_port: 0x564D_4C46,
             input_port: 0x564D_4C49,
             clipboard_port: 0x564D_4C43,
+            audio_port: 0x564D_4C53,
             width: 1920,
             height: 1080,
             tile_size: 32,
@@ -541,6 +550,7 @@ mod tests {
             frame_key: vec![4; 32],
             input_key: vec![5; 32],
             clipboard_key: vec![6; 32],
+            audio_key: vec![7; 32],
             version_major: 1,
             version_minor: 0,
             capabilities: vec![1],

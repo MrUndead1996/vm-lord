@@ -1,6 +1,6 @@
 //! VMLord's half of one display session.
 //!
-//! The viewer owns the three sockets and VMLord owns the VM's secret, so
+//! The viewer owns the sockets and VMLord owns the VM's secret, so
 //! neither can run the control handshake alone: the viewer frames records off
 //! the wire and passes the bytes up a pipe without reading into them, and what
 //! is here drives the protocol's `Session` over those bytes and hands back the
@@ -27,8 +27,8 @@ use vmlord_display_viewer::launch::{
 };
 
 use crate::hvsocket::{
-    DISPLAY_CLIPBOARD_VSOCK_PORT, DISPLAY_CONTROL_VSOCK_PORT, DISPLAY_FRAME_VSOCK_PORT,
-    DISPLAY_INPUT_VSOCK_PORT,
+    DISPLAY_AUDIO_VSOCK_PORT, DISPLAY_CLIPBOARD_VSOCK_PORT, DISPLAY_CONTROL_VSOCK_PORT,
+    DISPLAY_FRAME_VSOCK_PORT, DISPLAY_INPUT_VSOCK_PORT,
 };
 
 /// The width a VM with no stored mode is offered.
@@ -117,6 +117,7 @@ impl Driver {
                 Capability::DynamicResolution,
                 Capability::Clipboard,
                 Capability::FileClipboard,
+                Capability::Audio,
                 // The viewer publishes the modes of the monitor its window is
                 // on. Asked for here because negotiation is an intersection: a
                 // capability only the guest announces is one the session does
@@ -142,6 +143,7 @@ impl Driver {
             frame_port: DISPLAY_FRAME_VSOCK_PORT,
             input_port: DISPLAY_INPUT_VSOCK_PORT,
             clipboard_port: DISPLAY_CLIPBOARD_VSOCK_PORT,
+            audio_port: DISPLAY_AUDIO_VSOCK_PORT,
             width: offer.width,
             height: offer.height,
             tile_size: offer.tile_size,
@@ -283,12 +285,16 @@ impl Driver {
         let clipboard = session
             .derive_channel_key(Channel::Clipboard)
             .ok_or_else(|| missing("clipboard key"))?;
+        let audio = session
+            .derive_channel_key(Channel::Audio)
+            .ok_or_else(|| missing("audio key"))?;
 
         Ok(Handover {
             session_id: session.session_id().to_vec(),
             frame_key: frame.to_bytes().to_vec(),
             input_key: input.to_bytes().to_vec(),
             clipboard_key: clipboard.to_bytes().to_vec(),
+            audio_key: audio.to_bytes().to_vec(),
             version_major: negotiated.version.major,
             version_minor: negotiated.version.minor,
             capabilities: negotiated
@@ -442,6 +448,7 @@ mod tests {
                 Capability::DynamicResolution,
                 Capability::Clipboard,
                 Capability::FileClipboard,
+                Capability::Audio,
                 Capability::HostDisplayModes,
             ],
             modes: vec![Mode::Desktop],
@@ -542,10 +549,13 @@ mod tests {
         assert_eq!(handover.frame_key.len(), 32);
         assert_eq!(handover.input_key.len(), 32);
         assert_eq!(handover.clipboard_key.len(), 32);
+        assert_eq!(handover.audio_key.len(), 32);
         assert_ne!(
             handover.clipboard_key, handover.frame_key,
             "one channel's key never opens another's socket"
         );
+        assert_ne!(handover.audio_key, handover.frame_key);
+        assert_ne!(handover.audio_key, handover.clipboard_key);
         assert_eq!((handover.width, handover.height), (1920, 1080));
         assert_eq!(
             handover.mode,
@@ -571,6 +581,7 @@ mod tests {
         assert_eq!(parameters.frame_port, 0x564D_4C46);
         assert_eq!(parameters.input_port, 0x564D_4C49);
         assert_eq!(parameters.clipboard_port, 0x564D_4C43);
+        assert_eq!(parameters.audio_port, 0x564D_4C53);
         assert_eq!(parameters.token.len(), 32);
     }
 

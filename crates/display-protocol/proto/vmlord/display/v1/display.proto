@@ -50,6 +50,12 @@ enum Capability {
   // The host can replace the guest connector's normalized resolution and
   // integer-refresh mode list while a session is running.
   CAPABILITY_HOST_DISPLAY_MODES = 5;
+  // The session carries the guest's audio output on a fifth channel.
+  // Announced by a guest whose payload ships the audio daemon, whether or not
+  // anything is playing and whether or not anyone has logged in: a session
+  // commonly opens at the login screen, and a capability cannot be
+  // renegotiated once the handshake has settled it.
+  CAPABILITY_AUDIO = 6;
 }
 
 // How the encoder trades bandwidth against fidelity.
@@ -155,6 +161,48 @@ enum ClipboardRecord {
   CLIPBOARD_RECORD_FILE_CHUNK = 13;
   CLIPBOARD_RECORD_FILE_COMPLETE = 14;
   CLIPBOARD_RECORD_FILE_CANCEL = 15;
+}
+
+// The `type` field of a record header on the audio channel.
+//
+// The first three match every other bound channel's, because a bind is the
+// same three records wherever it happens.
+enum AudioRecord {
+  AUDIO_RECORD_UNSPECIFIED = 0;
+  AUDIO_RECORD_CHANNEL_HELLO = 1;
+  AUDIO_RECORD_CHANNEL_ACK = 2;
+  AUDIO_RECORD_CHANNEL_AUTH = 3;
+  AUDIO_RECORD_FORMAT = 4;
+  // Carries interleaved PCM, not a message from this schema -- as the frame
+  // channel's pixel types carry codec bytes. Its position in the stream rides
+  // in the header's `base` field.
+  AUDIO_RECORD_DATA = 5;
+  AUDIO_RECORD_ERROR = 6;
+}
+
+// How one sample is laid out, named after ALSA's own spelling.
+enum SampleFormat {
+  SAMPLE_FORMAT_UNSPECIFIED = 0;
+  SAMPLE_FORMAT_S16_LE = 1;
+  SAMPLE_FORMAT_S32_LE = 2;
+  SAMPLE_FORMAT_FLOAT_LE = 3;
+}
+
+// What the guest pinned on the loopback.
+//
+// Sent once after the bind and again whenever the device is reopened with
+// different parameters. It is a statement rather than a proposal: whichever
+// half of the loopback opens first fixes the other, so this says what the
+// kernel allowed, and the host converts.
+message AudioFormat {
+  // Frames per second.
+  uint32 sample_rate = 1;
+  // Interleaved channels per frame.
+  uint32 channels = 2;
+  // How one sample is laid out.
+  SampleFormat sample_format = 3;
+  // How many frames one AUDIO_RECORD_DATA record carries.
+  uint32 frames_per_period = 4;
 }
 
 enum FileEntryKind {

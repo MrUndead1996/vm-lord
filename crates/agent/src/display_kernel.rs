@@ -64,23 +64,43 @@ const SYSTEMD_UNITS: &str = "/etc/systemd/system";
 const SYSTEMD_USER_UNITS: &str = "/etc/systemd/user";
 /// The account the unprivileged half runs as.
 const SERVICE_USER: &str = "vmlord-display";
-/// The three programs, in the order they are started.
-const SERVICE_BINARIES: [&str; 3] = [
+/// The four programs, in the order they are started.
+const SERVICE_BINARIES: [&str; 4] = [
     "vmlord-display-broker",
     "vmlord-display-session",
     "vmlord-display-clipboard",
+    "vmlord-display-audio",
 ];
 /// The units systemd starts at boot, which are those binaries' names with a
 /// suffix.
-const SYSTEM_UNITS: [&str; 2] = [
+const SYSTEM_UNITS: [&str; 3] = [
     "vmlord-display-broker.service",
     "vmlord-display-session.service",
+    "vmlord-display-audio.service",
 ];
 /// The unit that starts inside a user's graphical session instead, because a
 /// selection exists only there.
 const USER_UNITS: [&str; 1] = ["vmlord-display-clipboard.service"];
 /// The socket the two halves meet on, which is how "started" is confirmed.
 const BROKER_SOCKET: &str = "/run/vmlord/display-broker.sock";
+
+/// The kernel module the audio daemon reads the desktop through.
+const LOOPBACK_MODULE: &str = "snd-aloop";
+/// What asks for that module on every boot, and where it is shipped.
+const LOOPBACK_MODULES_LOAD: &str = "/etc/modules-load.d/vmlord-audio.conf";
+/// What gives it one cable instead of the default two, so that GNOME shows one
+/// output rather than a duplicate that plays into nothing.
+const LOOPBACK_MODPROBE: &str = "/etc/modprobe.d/vmlord-audio.conf";
+/// Where PipeWire reads its own drop-ins.
+const PIPEWIRE_DROP_IN: &str = "/etc/pipewire/pipewire.conf.d/51-vmlord-audio.conf";
+/// The sink that binds the desktop's output straight to the loopback.
+const AUDIO_SINK: &str = "51-vmlord-audio.conf";
+/// The rule that hides the loopback's capture side, for WirePlumber 0.5.
+const LOOPBACK_RULE_JSON: &str = "51-vmlord-loopback.conf";
+/// The same rule for WirePlumber 0.4, which reads Lua instead.
+const LOOPBACK_RULE_LUA: &str = "51-vmlord-loopback.lua";
+/// Where the guest's own WirePlumber says which of the two it reads.
+const WIREPLUMBER_SHARE: &str = "/usr/share/wireplumber";
 const MODULE_VERSION: &str = "/sys/module/vmlord_drm/version";
 const MODULE_PARAM_WIDTH: &str = "/sys/module/vmlord_drm/parameters/width";
 const MODULE_PARAM_HEIGHT: &str = "/sys/module/vmlord_drm/parameters/height";
@@ -1287,6 +1307,8 @@ fn install_services(report: &mut Report, services: &Path, installed: &Path) -> R
         }
     }
 
+    install_audio(&payload_audio())?;
+
     report.ok(
         DisplayRecipeStep::Services,
         format!(
@@ -1296,6 +1318,77 @@ fn install_services(report: &mut Report, services: &Path, installed: &Path) -> R
     );
 
     Ok(())
+}
+
+/// Puts the loopback's configuration where the kernel and WirePlumber read it.
+///
+/// Part of the services step rather than a step of its own: what it installs is
+/// what makes one of those services able to do anything, and a guest that has
+/// the audio daemon without the loopback is not in a different state worth
+/// reporting separately -- the daemon says so itself, on the channel.
+///
+/// A payload that carries no audio directory is an older one, and an older
+/// payload is allowed to carry fewer things than this build knows about.
+fn install_audio(audio: &Path) -> Result<(), String> {
+    if !audio.is_dir() {
+        return Ok(());
+    }
+
+    install_file(
+        &audio.join("vmlord-audio-modules.conf"),
+        Path::new(LOOPBACK_MODULES_LOAD),
+        0o644,
+    )?;
+    install_file(
+        &audio.join("vmlord-audio-modprobe.conf"),
+        Path::new(LOOPBACK_MODPROBE),
+        0o644,
+    )?;
+    // Without this the desktop has no output at all while the daemon holds the
+    // loopback: PipeWire's ALSA monitor drops a card whose every PCM device is
+    // not free, and the daemon holds one for the life of a session.
+    install_file(&audio.join(AUDIO_SINK), Path::new(PIPEWIRE_DROP_IN), 0o644)?;
+    if let Some((rule, destination)) = wireplumber_rule(Path::new(WIREPLUMBER_SHARE)) {
+        install_file(&audio.join(rule), &destination, 0o644)?;
+    }
+
+    // Loaded now as well as asked for on every boot: the first session after
+    // provisioning should have sound without the guest being rebooted for it.
+    // A failure here is not fatal -- `modules-load.d` will do it next boot --
+    // so it is not reported as one.
+    let _ = command::run("modprobe", &[LOOPBACK_MODULE], &[], SHORT_BUDGET);
+
+    Ok(())
+}
+
+/// Which form of the WirePlumber rule this guest reads, and where it goes.
+///
+/// WirePlumber 0.5 reads SPA-JSON drop-ins and 0.4 reads Lua, and the two
+/// releases in the compatibility matrix straddle that change. Deciding by the
+/// directory the guest's own WirePlumber ships means the answer comes from the
+/// guest rather than from a version string this recipe would have to parse.
+/// A guest with neither directory has no WirePlumber, and gets no file: a rule
+/// nothing reads is a file somebody will one day have to explain.
+fn wireplumber_rule(share: &Path) -> Option<(&'static str, PathBuf)> {
+    if share.join("wireplumber.conf.d").is_dir() {
+        return Some((
+            LOOPBACK_RULE_JSON,
+            Path::new("/etc/wireplumber/wireplumber.conf.d").join(LOOPBACK_RULE_JSON),
+        ));
+    }
+    if share.join("main.lua.d").is_dir() {
+        return Some((
+            LOOPBACK_RULE_LUA,
+            Path::new("/etc/wireplumber/main.lua.d").join(LOOPBACK_RULE_LUA),
+        ));
+    }
+
+    None
+}
+
+/// Where the mounted payload keeps the loopback's configuration.
+fn payload_audio() -> PathBuf {
+    Path::new(PAYLOAD_MOUNT).join("content").join("audio")
 }
 
 /// Restarts both units and waits until they are actually up.
@@ -1559,15 +1652,78 @@ mod tests {
     }
 
     #[test]
-    fn the_payload_carries_three_programs_and_one_of_them_is_a_user_unit() {
-        assert_eq!(super::SERVICE_BINARIES.len(), 3);
+    fn the_payload_carries_four_programs_and_one_of_them_is_a_user_unit() {
+        assert_eq!(super::SERVICE_BINARIES.len(), 4);
         assert!(
             super::SERVICE_BINARIES.contains(&"vmlord-display-clipboard"),
-            "the clipboard daemon ships with the other two"
+            "the clipboard daemon ships with the others"
         );
-        assert_eq!(super::SYSTEM_UNITS.len(), 2);
+        assert_eq!(super::SYSTEM_UNITS.len(), 3);
         assert_eq!(super::USER_UNITS, ["vmlord-display-clipboard.service"]);
         assert_eq!(super::SYSTEMD_USER_UNITS, "/etc/systemd/user");
+    }
+
+    #[test]
+    fn the_audio_daemon_is_a_system_unit_and_not_a_user_one() {
+        assert!(super::SERVICE_BINARIES.contains(&"vmlord-display-audio"));
+        assert!(super::SYSTEM_UNITS.contains(&"vmlord-display-audio.service"));
+        // Sound belongs to the machine rather than to whoever is at the
+        // screen, and the stream has to exist before anybody logs in.
+        assert!(!super::USER_UNITS.contains(&"vmlord-display-audio.service"));
+    }
+
+    #[test]
+    fn the_desktops_output_is_a_static_node_rather_than_a_monitored_card() {
+        // The one that must not be forgotten: PipeWire's ALSA monitor refuses
+        // a card while any of its PCM devices is busy, and the audio daemon
+        // holds one for the life of a session. A guest without this file has
+        // a Dummy Output and no way to play anything at all.
+        assert_eq!(super::AUDIO_SINK, "51-vmlord-audio.conf");
+        assert!(super::PIPEWIRE_DROP_IN.starts_with("/etc/pipewire/pipewire.conf.d/"));
+    }
+
+    #[test]
+    fn the_wireplumber_rule_is_installed_in_whichever_form_the_guest_reads() {
+        // 0.5 reads SPA-JSON drop-ins and 0.4 reads Lua. The payload carries
+        // both, and which one is installed is decided by which directory the
+        // guest's own WirePlumber ships.
+        let guest = temporary("wireplumber-guest");
+        fs::create_dir_all(guest.join("wireplumber.conf.d")).unwrap();
+
+        let chosen = super::wireplumber_rule(&guest);
+
+        assert_eq!(
+            chosen,
+            Some((
+                super::LOOPBACK_RULE_JSON,
+                std::path::PathBuf::from("/etc/wireplumber/wireplumber.conf.d")
+                    .join(super::LOOPBACK_RULE_JSON)
+            ))
+        );
+    }
+
+    #[test]
+    fn an_older_wireplumber_gets_the_lua_rule_instead() {
+        let guest = temporary("wireplumber-old-guest");
+        fs::create_dir_all(guest.join("main.lua.d")).unwrap();
+
+        let chosen = super::wireplumber_rule(&guest);
+
+        assert_eq!(
+            chosen,
+            Some((
+                super::LOOPBACK_RULE_LUA,
+                std::path::PathBuf::from("/etc/wireplumber/main.lua.d")
+                    .join(super::LOOPBACK_RULE_LUA)
+            ))
+        );
+    }
+
+    #[test]
+    fn a_guest_without_wireplumber_gets_no_rule_rather_than_a_stray_file() {
+        let guest = temporary("wireplumber-absent-guest");
+
+        assert_eq!(super::wireplumber_rule(&guest), None);
     }
 
     #[test]

@@ -892,6 +892,7 @@ fn session_of(handover: &Handover) -> Result<Session, String> {
         frame_key: channel_key(&handover.frame_key, "frame")?,
         input_key: channel_key(&handover.input_key, "input")?,
         clipboard_key: channel_key(&handover.clipboard_key, "clipboard")?,
+        audio_key: channel_key(&handover.audio_key, "audio")?,
         control_sequence: handover.control_sequence,
     }))
 }
@@ -1697,6 +1698,7 @@ mod tests {
             frame_key: vec![1; 32],
             input_key: vec![2; 32],
             clipboard_key: vec![3; 32],
+            audio_key: vec![4; 32],
             version_major: 1,
             version_minor: 0,
             capabilities: vec![i32::from(Capability::Clipboard)],

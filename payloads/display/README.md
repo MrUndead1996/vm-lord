@@ -47,12 +47,17 @@ prepared/payload.json     written by `pack`, not by the build
 prepared/sources.json     this repository at the commit that was built
 prepared/licenses/        GPL-2.0, the module's licence
 prepared/content/drm/     dkms.conf, Kbuild, the sources, modprobe.d, the unit
-prepared/content/services/  the three guest programs and their units:
+prepared/content/services/  the four guest programs and their units:
                             vmlord-display-broker, vmlord-display-session,
-                            vmlord-display-clipboard,
+                            vmlord-display-clipboard, vmlord-display-audio,
                             vmlord-display-broker.service,
                             vmlord-display-session.service,
+                            vmlord-display-audio.service,
                             vmlord-display-clipboard.service (a user unit)
+prepared/content/audio/     what the loopback needs: the modules-load.d and
+                            modprobe.d files, and the WirePlumber rule in both
+                            the 0.5 (SPA-JSON) and 0.4 (Lua) forms -- the guest
+                            decides which one it reads
 ```
 
 The services are built by the host toolchain rather than in the image. A static

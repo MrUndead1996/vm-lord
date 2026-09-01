@@ -52,7 +52,7 @@ pub(crate) struct LaunchRequest<'a> {
     /// The VM's secret, from which this session's keys are derived. It stays
     /// on this side of the pipes.
     pub(crate) secret: Secret,
-    /// The partition the viewer's three sockets address.
+    /// The partition the viewer's five sockets address.
     pub(crate) runtime_id: Uuid,
     /// The mode stored for this VM, if one has been.
     pub(crate) mode: Option<DisplayMode>,

@@ -28,7 +28,7 @@ use vmlord_display_protocol::{
 use vmlord_display_codec::Rect;
 
 use crate::{
-    control::{Control, Outcome, support_from},
+    control::{Control, DaemonKeys, Outcome, support_from},
     drm::{DRM_CLASS, DRM_DEVICES, Device, PlaneState},
     ipc::{Message, PlaneKind, PlaneLayout, SessionParameters},
     output::Output,
@@ -48,6 +48,14 @@ const SOCKET_PATH: &str = "/run/vmlord/display-broker.sock";
 /// peers are different accounts, hold different keys and are authorised by
 /// different rules.
 const CLIPBOARD_SOCKET_PATH: &str = "/run/vmlord/display-clipboard.sock";
+
+/// Where the audio daemon connects.
+///
+/// A third socket for the same reason the second exists, with one difference:
+/// this peer is a system service under the display account rather than
+/// whoever is at the screen, so the socket's own permissions authorise it and
+/// no logind lookup is involved. Sound does not belong to a seat.
+const AUDIO_SOCKET_PATH: &str = "/run/vmlord/display-audio.sock";
 
 /// The unprivileged user the session process runs as.
 const SERVICE_USER: &str = "vmlord-display";
@@ -80,6 +88,8 @@ pub struct Options {
     pub socket: PathBuf,
     /// The socket the clipboard daemon connects to.
     pub clipboard_socket: PathBuf,
+    /// The socket the audio daemon connects to.
+    pub audio_socket: PathBuf,
     /// Where the kernel's uinput device is.
     pub uinput: PathBuf,
     /// Where the module publishes the mode it drives.
@@ -108,6 +118,7 @@ impl Options {
             .into(),
             socket: text("VMLORD_DISPLAY_SOCKET", SOCKET_PATH).into(),
             clipboard_socket: text("VMLORD_DISPLAY_CLIPBOARD_SOCKET", CLIPBOARD_SOCKET_PATH).into(),
+            audio_socket: text("VMLORD_DISPLAY_AUDIO_SOCKET", AUDIO_SOCKET_PATH).into(),
             uinput: text("VMLORD_DISPLAY_UINPUT", crate::uinput::DEVICE_PATH).into(),
             mode: text("VMLORD_DISPLAY_MODE", crate::output::MODE_PARAMETER).into(),
             user: text("VMLORD_DISPLAY_USER", SERVICE_USER),
@@ -175,6 +186,11 @@ struct BrokerState {
     /// What that daemon needs of the session that is open: the session id and
     /// the clipboard key, and neither of the other two keys.
     clipboard: Option<(Vec<u8>, Vec<u8>)>,
+    /// The audio daemon, if one is connected. One at a time, like the others:
+    /// there is one loopback and one stream off it.
+    audio_peer: Option<Arc<Connection>>,
+    /// What that daemon needs: the session id and the audio key alone.
+    audio: Option<(Vec<u8>, Vec<u8>)>,
     /// Changes whenever the host session opens or closes, even though the
     /// long-lived session process remains the same peer.
     session_epoch: u64,
@@ -304,6 +320,13 @@ fn serve(options: &Options) -> io::Result<()> {
         "binding the socket to the clipboard daemon",
         Listener::bind_open(&options.clipboard_socket),
     )?;
+    // Group-owned like the session socket, not open like the clipboard's: the
+    // audio daemon is a system service running as the display account, so the
+    // socket's permissions are the whole authorisation.
+    let audio_listener = at(
+        "binding the socket to the audio daemon",
+        Listener::bind(&options.audio_socket, gid),
+    )?;
     let control = at(
         "binding the control service",
         vsock::Listener::bind(CONTROL_PORT),
@@ -333,6 +356,10 @@ fn serve(options: &Options) -> io::Result<()> {
             let shared = Arc::clone(&shared);
             scope.spawn(move || serve_clipboard_peers(&clipboard_listener, &shared))
         };
+        let audio = {
+            let shared = Arc::clone(&shared);
+            scope.spawn(move || serve_audio_peers(&audio_listener, uid, &shared))
+        };
         let capture = {
             let shared = Arc::clone(&shared);
             scope.spawn(move || capture_frames(device, &shared))
@@ -344,6 +371,7 @@ fn serve(options: &Options) -> io::Result<()> {
         stop(&shared);
         let _ = ipc.join();
         let _ = clipboard.join();
+        let _ = audio.join();
         let _ = capture.join();
     });
 
@@ -605,15 +633,16 @@ fn run_session(
     }
 }
 
-/// Records the session and hands its keys to the peer.
-fn open_session(shared: &Shared, parameters: SessionParameters, clipboard_key: Vec<u8>) {
+/// Records the session and hands each peer the one key that is its own.
+fn open_session(shared: &Shared, parameters: SessionParameters, daemons: DaemonKeys) {
     let (lock, signal) = &**shared;
     let mut state = lock.lock().expect("the broker's lock is not poisoned");
 
     state.session_epoch = state.session_epoch.wrapping_add(1);
     let session_id = parameters.session_id.clone();
     state.session = Some(parameters.clone());
-    state.clipboard = Some((session_id.clone(), clipboard_key.clone()));
+    state.clipboard = Some((session_id.clone(), daemons.clipboard.clone()));
+    state.audio = Some((session_id.clone(), daemons.audio.clone()));
     state.sent.clear();
     state.wants_frame = false;
     if let Some(peer) = state.peer.clone() {
@@ -622,8 +651,17 @@ fn open_session(shared: &Shared, parameters: SessionParameters, clipboard_key: V
     if let Some(peer) = state.clipboard_peer.clone() {
         let _ = peer.send(
             &Message::ClipboardOpened {
+                session_id: session_id.clone(),
+                clipboard_key: daemons.clipboard,
+            },
+            &[],
+        );
+    }
+    if let Some(peer) = state.audio_peer.clone() {
+        let _ = peer.send(
+            &Message::AudioOpened {
                 session_id,
-                clipboard_key,
+                audio_key: daemons.audio,
             },
             &[],
         );
@@ -643,9 +681,14 @@ fn close_session(shared: &Shared, reason: &str) {
     state.wants_frame = false;
     state.sent.clear();
     state.clipboard = None;
-    for peer in [state.peer.clone(), state.clipboard_peer.clone()]
-        .into_iter()
-        .flatten()
+    state.audio = None;
+    for peer in [
+        state.peer.clone(),
+        state.clipboard_peer.clone(),
+        state.audio_peer.clone(),
+    ]
+    .into_iter()
+    .flatten()
     {
         let _ = peer.send(
             &Message::SessionClosed {
@@ -734,6 +777,83 @@ fn send_clipboard_session(connection: &Arc<Connection>, clipboard: Option<&(Vec<
             &Message::ClipboardOpened {
                 session_id: session_id.clone(),
                 clipboard_key: clipboard_key.clone(),
+            },
+            &[],
+        );
+    }
+}
+
+/// Accepts the audio daemon, which is one system service and no other.
+///
+/// The uid is fixed rather than looked up: this peer runs as the display
+/// account whether or not anybody is logged in, which is the point of it being
+/// a system unit -- a stream that starts at boot needs no seat.
+fn serve_audio_peers(listener: &Listener, uid: libc::uid_t, shared: &Shared) {
+    loop {
+        if stopping(shared) {
+            return;
+        }
+
+        let connection = match listener.accept(uid) {
+            Ok(connection) => Arc::new(connection),
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+                eprintln!("vmlord-display-broker: refused an audio peer: {error}");
+                continue;
+            }
+            Err(error) => {
+                eprintln!("vmlord-display-broker: the audio socket failed: {error}");
+                return;
+            }
+        };
+
+        adopt_audio_peer(shared, &connection);
+        read_audio_peer(&connection, shared);
+    }
+}
+
+/// Makes a new connection the audio peer, and tells it what it missed.
+fn adopt_audio_peer(shared: &Shared, connection: &Arc<Connection>) {
+    let (lock, _) = &**shared;
+    let mut state = lock.lock().expect("the broker's lock is not poisoned");
+
+    state.audio_peer = Some(Arc::clone(connection));
+    send_audio_session(connection, state.audio.as_ref());
+}
+
+/// Reads the audio peer until it goes away.
+fn read_audio_peer(connection: &Arc<Connection>, shared: &Shared) {
+    loop {
+        let Ok((message, _)) = connection.receive() else {
+            return;
+        };
+
+        let (lock, _) = &**shared;
+        let state = lock.lock().expect("the broker's lock is not poisoned");
+        if !state
+            .audio_peer
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, connection))
+        {
+            return;
+        }
+
+        match message {
+            Message::Attach => send_audio_session(connection, state.audio.as_ref()),
+            // Never a sample: what the daemon reports is a format, a count and
+            // a reason.
+            Message::Report { detail } => eprintln!("vmlord-display-audio: {detail}"),
+            other => eprintln!("vmlord-display-broker: ignoring {other:?} from the audio peer"),
+        }
+    }
+}
+
+/// Sends the session an audio daemon needs, if there is one open.
+fn send_audio_session(connection: &Arc<Connection>, audio: Option<&(Vec<u8>, Vec<u8>)>) {
+    if let Some((session_id, audio_key)) = audio {
+        let _ = connection.send(
+            &Message::AudioOpened {
+                session_id: session_id.clone(),
+                audio_key: audio_key.clone(),
             },
             &[],
         );
@@ -1534,10 +1654,15 @@ mod tests {
             cursor_stream: true,
         };
 
-        super::open_session(&shared, parameters.clone(), vec![4; 32]);
+        let daemons = crate::control::DaemonKeys {
+            clipboard: vec![4; 32],
+            audio: vec![5; 32],
+        };
+
+        super::open_session(&shared, parameters.clone(), daemons.clone());
         let first = shared.0.lock().unwrap().session_epoch;
         super::close_session(&shared, "test transition");
-        super::open_session(&shared, parameters, vec![4; 32]);
+        super::open_session(&shared, parameters, daemons);
         let second = shared.0.lock().unwrap().session_epoch;
 
         assert_ne!(first, second);

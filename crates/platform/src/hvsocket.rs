@@ -74,19 +74,28 @@ pub(crate) const DISPLAY_INPUT_VSOCK_PORT: u32 = 0x564D_4C49;
 /// than by either system service: a selection exists inside a compositor.
 pub(crate) const DISPLAY_CLIPBOARD_VSOCK_PORT: u32 = 0x564D_4C43;
 
-/// The four services one display session runs over, in channel order.
+/// The vsock port a guest's display audio service listens on -- `VMLS`.
+///
+/// `S` for sound: `VMLA` is the agent's own service. Bound in the guest by the
+/// audio daemon, which is a system service rather than a session's, because
+/// what it reads belongs to the machine and not to whoever is logged in.
+pub(crate) const DISPLAY_AUDIO_VSOCK_PORT: u32 = 0x564D_4C53;
+
+/// The five services one display session runs over, in channel order.
 ///
 /// Listed in a VM's configuration so that the partition has them; whether
 /// anything inside the guest binds them is the guest's business. The clipboard
-/// is listed like the rest and for the same reason -- a guest where nobody has
-/// logged in simply never binds it.
+/// and audio services are listed like the rest and for the same reason -- a
+/// guest where nobody has logged in simply never binds the clipboard, and one
+/// whose payload predates audio never binds that.
 #[must_use]
-pub(crate) fn display_service_ids() -> [GUID; 4] {
+pub(crate) fn display_service_ids() -> [GUID; 5] {
     [
         vsock_service_id(DISPLAY_CONTROL_VSOCK_PORT),
         vsock_service_id(DISPLAY_FRAME_VSOCK_PORT),
         vsock_service_id(DISPLAY_INPUT_VSOCK_PORT),
         vsock_service_id(DISPLAY_CLIPBOARD_VSOCK_PORT),
+        vsock_service_id(DISPLAY_AUDIO_VSOCK_PORT),
     ]
 }
 
@@ -462,9 +471,9 @@ mod tests {
     use std::io;
 
     use super::{
-        AGENT_VSOCK_PORT, DISPLAY_CLIPBOARD_VSOCK_PORT, DISPLAY_CONTROL_VSOCK_PORT,
-        DISPLAY_FRAME_VSOCK_PORT, DISPLAY_INPUT_VSOCK_PORT, agent_service_id, display_service_ids,
-        idle_read, vsock_service_id,
+        AGENT_VSOCK_PORT, DISPLAY_AUDIO_VSOCK_PORT, DISPLAY_CLIPBOARD_VSOCK_PORT,
+        DISPLAY_CONTROL_VSOCK_PORT, DISPLAY_FRAME_VSOCK_PORT, DISPLAY_INPUT_VSOCK_PORT,
+        agent_service_id, display_service_ids, idle_read, vsock_service_id,
     };
 
     #[test]
@@ -476,7 +485,8 @@ mod tests {
         assert_eq!(DISPLAY_FRAME_VSOCK_PORT, 0x564D_4C46);
         assert_eq!(DISPLAY_INPUT_VSOCK_PORT, 0x564D_4C49);
         assert_eq!(DISPLAY_CLIPBOARD_VSOCK_PORT, 0x564D_4C43);
-        assert_eq!(display_service_ids().len(), 4);
+        assert_eq!(DISPLAY_AUDIO_VSOCK_PORT, 0x564D_4C53);
+        assert_eq!(display_service_ids().len(), 5);
     }
 
     #[test]
@@ -489,7 +499,10 @@ mod tests {
         ids.sort();
         ids.dedup();
 
-        assert_eq!(ids.len(), 5, "five services, five distinct GUIDs");
+        // Six rather than five since audio joined, and the count is what
+        // catches the near miss it was named around: `VMLA` is the agent's
+        // service, which is why sound is `VMLS`.
+        assert_eq!(ids.len(), 6, "six services, six distinct GUIDs");
     }
 
     #[test]

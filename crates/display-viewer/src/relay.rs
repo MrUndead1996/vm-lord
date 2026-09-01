@@ -335,6 +335,11 @@ mod tests {
                             .expect("established")
                             .to_bytes()
                             .to_vec(),
+                        audio_key: session
+                            .derive_channel_key(Channel::Audio)
+                            .expect("established")
+                            .to_bytes()
+                            .to_vec(),
                         input_key: session
                             .derive_channel_key(Channel::Input)
                             .expect("established")

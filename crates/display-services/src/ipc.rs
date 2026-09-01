@@ -23,10 +23,17 @@ pub enum Message {
     SessionOpened(SessionParameters),
     /// A control handshake completed, as the clipboard daemon needs it.
     ClipboardOpened {
-        /// The 16 bytes that name the session across its four sockets.
+        /// The 16 bytes that name the session across its five sockets.
         session_id: Vec<u8>,
         /// The key the clipboard socket proves itself with.
         clipboard_key: Vec<u8>,
+    },
+    /// A control handshake completed, as the audio daemon needs it.
+    AudioOpened {
+        /// The 16 bytes that name the session across its five sockets.
+        session_id: Vec<u8>,
+        /// The key the audio socket proves itself with.
+        audio_key: Vec<u8>,
     },
     /// Control was lost, or the host is finished.
     SessionClosed {
@@ -72,7 +79,7 @@ pub enum Message {
 /// that session runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionParameters {
-    /// The 16 bytes that name the session across its three sockets.
+    /// The 16 bytes that name the session across its five sockets.
     pub session_id: Vec<u8>,
     /// The key the frame socket proves itself with.
     pub frame_key: Vec<u8>,
@@ -183,6 +190,13 @@ fn into_wire(message: &Message) -> envelope::Message {
             session_id: session_id.clone(),
             clipboard_key: clipboard_key.clone(),
         }),
+        Message::AudioOpened {
+            session_id,
+            audio_key,
+        } => envelope::Message::AudioOpened(broker::AudioOpened {
+            session_id: session_id.clone(),
+            audio_key: audio_key.clone(),
+        }),
         Message::SessionClosed { reason } => {
             envelope::Message::SessionClosed(broker::SessionClosed {
                 reason: reason.clone(),
@@ -232,6 +246,10 @@ fn from_wire(message: envelope::Message) -> Result<Message, IpcError> {
         envelope::Message::ClipboardOpened(opened) => Message::ClipboardOpened {
             session_id: opened.session_id,
             clipboard_key: opened.clipboard_key,
+        },
+        envelope::Message::AudioOpened(opened) => Message::AudioOpened {
+            session_id: opened.session_id,
+            audio_key: opened.audio_key,
         },
         envelope::Message::SessionClosed(closed) => Message::SessionClosed {
             reason: closed.reason,
@@ -349,6 +367,10 @@ mod tests {
             Message::ClipboardOpened {
                 session_id: vec![7; 16],
                 clipboard_key: vec![9; 32],
+            },
+            Message::AudioOpened {
+                session_id: vec![7; 16],
+                audio_key: vec![4; 32],
             },
             Message::SessionClosed {
                 reason: "control was lost".into(),

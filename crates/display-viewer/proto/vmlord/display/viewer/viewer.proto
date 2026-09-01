@@ -53,6 +53,7 @@ message LaunchParameters {
   // Percentage of committed DRM refresh below which sustained delivered FPS
   // is reported as a user-visible warning.
   uint32 fps_gap_threshold_percent = 15;
+  uint32 audio_port = 16;
 }
 
 // Handshake bytes, verbatim. The viewer parses none of them.
@@ -80,6 +81,10 @@ message Handover {
   // thread binds that socket by itself, so it holds this one and the session
   // id and nothing else of the handshake.
   bytes clipboard_key = 12;
+  // The key the audio socket proves itself with, held by the viewer's audio
+  // thread for the same reason: that thread binds its own socket, and holds
+  // this key, the session id and nothing else of the handshake.
+  bytes audio_key = 13;
 }
 
 // The viewer asking for a new session after control was lost. The token is

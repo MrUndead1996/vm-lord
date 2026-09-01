@@ -76,6 +76,8 @@ pub struct WindowState {
     pub quality: Quality,
     /// Explicit resolution and refresh chosen from the host monitor.
     pub display_mode: Option<DisplayMode>,
+    /// Whether the guest's sound was muted when the window was closed.
+    pub muted: bool,
 }
 
 impl Default for WindowState {
@@ -86,6 +88,7 @@ impl Default for WindowState {
             fullscreen: false,
             quality: Quality::default(),
             display_mode: None,
+            muted: false,
         }
     }
 }
@@ -120,6 +123,7 @@ impl WindowState {
                     }
                 }
                 "fullscreen" => state.fullscreen = value == "true",
+                "muted" => state.muted = value == "true",
                 "display_width" => display_width = value.parse().ok(),
                 "display_height" => display_height = value.parse().ok(),
                 "display_refresh_hz" => display_refresh_hz = value.parse().ok(),
@@ -159,6 +163,7 @@ impl WindowState {
         let _ = writeln!(text, "height = {}", self.size.1);
         let _ = writeln!(text, "fullscreen = {}", self.fullscreen);
         let _ = writeln!(text, "quality = {}", self.quality.as_str());
+        let _ = writeln!(text, "muted = {}", self.muted);
         if let Some(mode) = self.display_mode {
             let _ = writeln!(text, "display_width = {}", mode.width);
             let _ = writeln!(text, "display_height = {}", mode.height);
@@ -267,9 +272,19 @@ mod tests {
             fullscreen: true,
             quality: Quality::Desktop,
             display_mode: DisplayMode::new(2560, 1440, 144),
+            muted: true,
         };
 
         assert_eq!(WindowState::parse(&state.render()), state);
+    }
+
+    #[test]
+    fn a_state_file_written_before_audio_existed_opens_unmuted() {
+        // An older file has no `muted` key, and the window it describes was
+        // one whose sound nobody had ever turned off.
+        let earlier = "width = 1920\nheight = 1080\nfullscreen = false\nquality = desktop\n";
+
+        assert!(!WindowState::parse(earlier).muted);
     }
 
     #[test]
@@ -335,6 +350,7 @@ mod tests {
             fullscreen: false,
             quality: Quality::Desktop,
             display_mode: None,
+            muted: false,
         };
 
         store.save(&state).expect("a written state");

@@ -320,6 +320,51 @@ mod tests {
     }
 
     #[test]
+    fn an_audio_channel_binds_against_the_host_state_machine() {
+        // The positive control the test below needs to mean anything: without
+        // it, "the frame key does not bind" passes just as well on a build
+        // where no audio key binds either.
+        let (mut host, guest) = established();
+        let hello = host.open_channel(Channel::Audio).unwrap();
+        let key = guest.derive_channel_key(Channel::Audio).unwrap();
+        let mut wire = Wire::new(host, hello);
+
+        let generation = bind(&mut wire, Channel::Audio, &key, guest.session_id(), None).unwrap();
+
+        assert_eq!(generation, 0);
+        assert!(
+            wire.host().channel_key(Channel::Audio).is_some(),
+            "the host bound the channel too"
+        );
+    }
+
+    #[test]
+    fn an_audio_socket_that_offers_a_frame_key_does_not_bind() {
+        // What `keys::channel_key`'s domain separation is for: a daemon that
+        // has one channel's key must not be able to prove itself on another's
+        // socket, so a compromised audio daemon gains no picture.
+        let (mut host, guest) = established();
+        let hello = host.open_channel(Channel::Audio).unwrap();
+        let frame = guest.derive_channel_key(Channel::Frame).unwrap();
+        let audio = guest.derive_channel_key(Channel::Audio).unwrap();
+        let mut wire = Wire::new(host, hello);
+
+        assert_ne!(frame.to_bytes(), audio.to_bytes());
+        // The host refuses the proof and answers nothing, so what the guest
+        // sees is a socket that stopped. Which error it reports matters less
+        // than the two things asserted here: the bind did not succeed, and the
+        // host did not bind the channel on its side either.
+        assert!(
+            bind(&mut wire, Channel::Audio, &frame, guest.session_id(), None).is_err(),
+            "a frame key bound the audio channel"
+        );
+        assert!(
+            wire.host().channel_key(Channel::Audio).is_none(),
+            "the host bound a channel whose proof did not check out"
+        );
+    }
+
+    #[test]
     fn a_hello_for_another_session_is_refused() {
         let (mut host, guest) = established();
         let hello = host.open_channel(Channel::Frame).unwrap();

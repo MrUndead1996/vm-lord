@@ -10,7 +10,7 @@
 //!
 //! A session need not be run by the process that opened it.
 //! [`Session::established_host`] takes a [`HandedOver`] -- what the handshake
-//! settled on, the session id, three channel keys and the control sequence -- and
+//! settled on, the session id, four channel keys and the control sequence -- and
 //! produces the established host half without a secret. That is how VMLord
 //! keeps the VM's secret while the viewer keeps the sockets, and it is the
 //! host's mirror of what the guest's broker does for its capture process.
@@ -139,8 +139,8 @@ pub struct Session {
     pending: Option<Negotiated>,
     pending_auth: Option<Record>,
     control_sequence: u32,
-    /// Per channel, in `Channel` order: frame, input, then clipboard.
-    channels: [ChannelState; 3],
+    /// Per channel, in `Channel` order: frame, input, clipboard, then audio.
+    channels: [ChannelState; 4],
     /// The channel keys a hand-over carried, which outlive a reconnect.
     ///
     /// A session that handshook derives these from its session key and its
@@ -148,7 +148,7 @@ pub struct Session {
     /// neither, so it keeps what it was given: a channel key depends on the
     /// session and the channel, never on the generation, so replacing a socket
     /// does not replace it.
-    handover_keys: [Option<ChannelKey>; 3],
+    handover_keys: [Option<ChannelKey>; 4],
 }
 
 /// What one bound-or-binding frame or input socket holds.
@@ -166,7 +166,7 @@ struct ChannelState {
 /// Everything the receiving process needs and nothing it does not: no secret,
 /// no session key, no transcript. See [`Session::established_host`].
 pub struct HandedOver {
-    /// The 16 bytes that name the session across its four sockets.
+    /// The 16 bytes that name the session across its five sockets.
     pub session_id: [u8; SESSION_ID_LEN],
     /// What the control handshake settled on.
     pub negotiated: Negotiated,
@@ -176,6 +176,8 @@ pub struct HandedOver {
     pub input_key: ChannelKey,
     /// The key the clipboard socket proves itself with.
     pub clipboard_key: ChannelKey,
+    /// The key the audio socket proves itself with.
+    pub audio_key: ChannelKey,
     /// The sequence the control channel carries on from.
     pub control_sequence: u32,
 }
@@ -241,8 +243,9 @@ impl Session {
                 ChannelState::default(),
                 ChannelState::default(),
                 ChannelState::default(),
+                ChannelState::default(),
             ],
-            handover_keys: [None, None, None],
+            handover_keys: [None, None, None, None],
         };
 
         let record = session.control_record(ControlRecord::ClientHello, payload);
@@ -278,8 +281,9 @@ impl Session {
                 ChannelState::default(),
                 ChannelState::default(),
                 ChannelState::default(),
+                ChannelState::default(),
             ],
-            handover_keys: [None, None, None],
+            handover_keys: [None, None, None, None],
         }
     }
 
@@ -318,11 +322,13 @@ impl Session {
                 ChannelState::default(),
                 ChannelState::default(),
                 ChannelState::default(),
+                ChannelState::default(),
             ],
             handover_keys: [
                 Some(handed_over.frame_key),
                 Some(handed_over.input_key),
                 Some(handed_over.clipboard_key),
+                Some(handed_over.audio_key),
             ],
         }
     }
@@ -372,7 +378,7 @@ impl Session {
         self.negotiated.as_ref()
     }
 
-    /// The identifier that names this session across its three sockets.
+    /// The identifier that names this session across its five sockets.
     #[must_use]
     pub fn session_id(&self) -> &[u8; SESSION_ID_LEN] {
         &self.session_id
@@ -417,26 +423,29 @@ impl Session {
             {
                 self.on_client_auth(payload)
             }
-            // The clipboard's bind records carry the same three numbers the
-            // frame and input channels' do -- a bind is one exchange on every
-            // bound channel -- so one arm reads the frame enum for all three.
+            // Every bound channel's bind records carry the same three numbers
+            // the frame channel's do -- a bind is one exchange wherever it
+            // happens -- so one arm reads the frame enum for all of them. A
+            // channel missing from these lists is one this machine can key and
+            // cannot answer, which is a socket that connects and binds
+            // nowhere.
             (
                 State::Established,
-                Channel::Frame | Channel::Input | Channel::Clipboard,
+                Channel::Frame | Channel::Input | Channel::Clipboard | Channel::Audio,
                 message_type,
             ) if message_type == FrameRecord::ChannelHello as u16 => {
                 self.on_channel_hello(header.channel, payload)
             }
             (
                 State::Established,
-                Channel::Frame | Channel::Input | Channel::Clipboard,
+                Channel::Frame | Channel::Input | Channel::Clipboard | Channel::Audio,
                 message_type,
             ) if message_type == FrameRecord::ChannelAck as u16 => {
                 self.on_channel_ack(header.channel, payload)
             }
             (
                 State::Established,
-                Channel::Frame | Channel::Input | Channel::Clipboard,
+                Channel::Frame | Channel::Input | Channel::Clipboard | Channel::Audio,
                 message_type,
             ) if message_type == FrameRecord::ChannelAuth as u16 => {
                 self.on_channel_auth(header.channel, payload)
@@ -882,6 +891,7 @@ impl Session {
             Channel::Frame => Ok(0),
             Channel::Input => Ok(1),
             Channel::Clipboard => Ok(2),
+            Channel::Audio => Ok(3),
             Channel::Control => Err(SessionError::Unexpected {
                 channel,
                 message_type: 0,
@@ -1193,6 +1203,33 @@ mod tests {
             .expect("the guest checks the host's proof");
 
         assert_eq!(outcome.event, Event::ChannelBound(Channel::Clipboard));
+    }
+
+    #[test]
+    fn an_audio_channel_binds_like_any_other() {
+        // The bind is one exchange on every bound channel, and every one of
+        // its three records has to be dispatched. A channel this machine knows
+        // how to key but not how to answer binds nowhere.
+        let (mut host, mut guest) = handshake(&Secret::generate(), offer(), support());
+
+        let hello = host.open_channel(Channel::Audio).expect("an audio hello");
+        let ack = guest
+            .handle(&hello.header, &hello.payload)
+            .expect("the guest answers an audio hello")
+            .reply
+            .expect("an ack");
+        let auth = host
+            .handle(&ack.header, &ack.payload)
+            .expect("the host answers an ack")
+            .reply
+            .expect("an auth");
+        let outcome = guest
+            .handle(&auth.header, &auth.payload)
+            .expect("the guest checks the host's proof");
+
+        assert_eq!(outcome.event, Event::ChannelBound(Channel::Audio));
+        assert!(host.channel_key(Channel::Audio).is_some());
+        assert!(guest.channel_key(Channel::Audio).is_some());
     }
 
     #[test]
@@ -1667,6 +1704,9 @@ mod tests {
                 .expect("an established host"),
             clipboard_key: host
                 .derive_channel_key(Channel::Clipboard)
+                .expect("an established host"),
+            audio_key: host
+                .derive_channel_key(Channel::Audio)
                 .expect("an established host"),
             control_sequence: host.control_sequence(),
         };

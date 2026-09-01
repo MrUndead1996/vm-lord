@@ -6,6 +6,8 @@
 //! [`ipc`], and it is typed operations only: no device descriptor and no ioctl
 //! passthrough leaves the broker.
 
+pub mod alsa;
+pub mod audio_main;
 pub mod broker_main;
 pub mod capture;
 pub mod channel;

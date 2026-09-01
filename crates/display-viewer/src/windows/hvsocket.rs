@@ -1,4 +1,4 @@
-//! The host end of the three sockets a guest's display services listen on.
+//! The host end of the sockets a guest's display services listen on.
 //!
 //! The mirror of `vmlord-platform`'s agent socket: there the guest connects and
 //! the host listens, here the host connects and the guest listens, which is

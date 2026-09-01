@@ -57,8 +57,12 @@ the supported product boundary and the source revision that passed the gate.
   crosses at the GDM login screen or on a guest where nobody has signed in.
 - File transfer is not part of the clipboard. Copied files are never offered
   and an offer of them is ignored.
-- Audio, multi-monitor, Motion codec, and zero-copy capture are not part of the
-  MVP display contract.
+- Audio plays what the guest's desktop plays, over a channel of its own. It
+  needs the payload's loopback configuration, which the display recipe installs
+  and which every supported release's kernel already carries the module for; it
+  does not need a logged-in session, and there is no microphone.
+- Multi-monitor, Motion codec, and zero-copy capture are not part of the MVP
+  display contract.
 
 See [the display user guide](display-user-guide.md) to start a session and
 [display troubleshooting](display-troubleshooting.md) when Connect is not
