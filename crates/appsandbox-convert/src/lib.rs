@@ -43,3 +43,6 @@ mod facts;
 mod fixture;
 mod install;
 mod remove;
+mod verify;
+
+pub use verify::verify;
