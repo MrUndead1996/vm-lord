@@ -10,7 +10,7 @@
 //! guest agent makes.
 
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     env,
     io::{self, ErrorKind},
     os::fd::{AsFd, OwnedFd},
@@ -22,7 +22,7 @@ use std::{
 
 use vmlord_display_protocol::{
     keys::Secret,
-    v1::{DisplayTiming, ErrorCode},
+    v1::{DisplayTiming, ErrorCode, GuestCommand, GuestCommandKind},
 };
 
 use vmlord_display_codec::Rect;
@@ -57,6 +57,13 @@ const CLIPBOARD_SOCKET_PATH: &str = "/run/vmlord/display-clipboard.sock";
 /// no logind lookup is involved. Sound does not belong to a seat.
 const AUDIO_SOCKET_PATH: &str = "/run/vmlord/display-audio.sock";
 
+/// Where the tray process of whoever is logged in connects.
+///
+/// A fourth socket, because that peer holds no keys and is authorised by no
+/// account this process can name at start-up: it runs as the desktop session
+/// user, and what lets it in is the same lookup the clipboard's accept makes.
+const TRAY_SOCKET_PATH: &str = "/run/vmlord/display-tray.sock";
+
 /// The unprivileged user the session process runs as.
 const SERVICE_USER: &str = "vmlord-display";
 
@@ -90,6 +97,8 @@ pub struct Options {
     pub clipboard_socket: PathBuf,
     /// The socket the audio daemon connects to.
     pub audio_socket: PathBuf,
+    /// The socket the tray process connects to.
+    pub tray_socket: PathBuf,
     /// Where the kernel's uinput device is.
     pub uinput: PathBuf,
     /// Where the module publishes the mode it drives.
@@ -119,6 +128,7 @@ impl Options {
             socket: text("VMLORD_DISPLAY_SOCKET", SOCKET_PATH).into(),
             clipboard_socket: text("VMLORD_DISPLAY_CLIPBOARD_SOCKET", CLIPBOARD_SOCKET_PATH).into(),
             audio_socket: text("VMLORD_DISPLAY_AUDIO_SOCKET", AUDIO_SOCKET_PATH).into(),
+            tray_socket: text("VMLORD_DISPLAY_TRAY_SOCKET", TRAY_SOCKET_PATH).into(),
             uinput: text("VMLORD_DISPLAY_UINPUT", crate::uinput::DEVICE_PATH).into(),
             mode: text("VMLORD_DISPLAY_MODE", crate::output::MODE_PARAMETER).into(),
             user: text("VMLORD_DISPLAY_USER", SERVICE_USER),
@@ -191,6 +201,19 @@ struct BrokerState {
     audio_peer: Option<Arc<Connection>>,
     /// What that daemon needs: the session id and the audio key alone.
     audio: Option<(Vec<u8>, Vec<u8>)>,
+    /// The tray process, if one is connected. One at a time, like the other
+    /// peers: the tray of the session that is on the screen is the only one
+    /// whose commands are this guest's own user's.
+    tray_peer: Option<Arc<Connection>>,
+    /// The modes the host has published, for the tray to show. Kept here
+    /// rather than only beside the connector writes: a tray that connects
+    /// after the host offered its list is answered from this, the way a
+    /// reconnecting capture process is put back where the connector was.
+    published_modes: Vec<DisplayTiming>,
+    /// The one of the published modes the host chose, if it has.
+    selected_mode: Option<DisplayTiming>,
+    /// Commands the tray raised that the control thread still owes the host.
+    pending_commands: VecDeque<PendingCommand>,
     /// Changes whenever the host session opens or closes, even though the
     /// long-lived session process remains the same peer.
     session_epoch: u64,
@@ -213,6 +236,16 @@ struct BrokerState {
 
 /// The shared state and the signal that it changed.
 type Shared = Arc<(Mutex<BrokerState>, Condvar)>;
+
+/// A command the tray raised, on its way to the host.
+///
+/// The epoch is what keeps a command from outliving the session it was raised
+/// in: a session that closed between the tray's ask and the control thread's
+/// turn would otherwise hand the next viewer a request nobody made of it.
+struct PendingCommand {
+    command: GuestCommand,
+    session_epoch: u64,
+}
 
 /// One write to the module's mode parameters.
 #[derive(Clone, Debug, PartialEq)]
@@ -327,6 +360,12 @@ fn serve(options: &Options) -> io::Result<()> {
         "binding the socket to the audio daemon",
         Listener::bind(&options.audio_socket, gid),
     )?;
+    // Open like the clipboard's, for the same reason: the tray runs as
+    // whoever is logged in, and the accept is where that is checked.
+    let tray_listener = at(
+        "binding the socket to the tray",
+        Listener::bind_open(&options.tray_socket),
+    )?;
     let control = at(
         "binding the control service",
         vsock::Listener::bind(CONTROL_PORT),
@@ -360,6 +399,10 @@ fn serve(options: &Options) -> io::Result<()> {
             let shared = Arc::clone(&shared);
             scope.spawn(move || serve_audio_peers(&audio_listener, uid, &shared))
         };
+        let tray = {
+            let shared = Arc::clone(&shared);
+            scope.spawn(move || serve_tray_peers(&tray_listener, &shared))
+        };
         let capture = {
             let shared = Arc::clone(&shared);
             scope.spawn(move || capture_frames(device, &shared))
@@ -372,6 +415,7 @@ fn serve(options: &Options) -> io::Result<()> {
         let _ = ipc.join();
         let _ = clipboard.join();
         let _ = audio.join();
+        let _ = tray.join();
         let _ = capture.join();
     });
 
@@ -605,6 +649,13 @@ fn run_session(
             return detail;
         }
 
+        // What the guest's own user asked for while the control thread was
+        // reading. The queue is empty unless a session is open, which is
+        // also the only state in which writing one makes sense.
+        for command in take_pending_commands(shared) {
+            control.guest_command(stream, &command);
+        }
+
         match control.pump(stream) {
             Outcome::Opened(parameters, clipboard_key) => {
                 open_session(shared, parameters, clipboard_key);
@@ -617,10 +668,12 @@ fn run_session(
             }
             Outcome::AvailableModes { modes, preferred } => {
                 host_modes.publish(modes, preferred);
+                publish_host_modes(shared, host_modes);
                 apply_modes(output, control, stream, &host_modes.writes());
             }
             Outcome::DisplayMode(mode) => {
                 host_modes.select(mode);
+                publish_host_modes(shared, host_modes);
                 apply_modes(output, control, stream, &[ModeWrite::Preferred(mode)]);
             }
             Outcome::Relay(message) => send_to_peer(shared, &message),
@@ -682,10 +735,14 @@ fn close_session(shared: &Shared, reason: &str) {
     state.sent.clear();
     state.clipboard = None;
     state.audio = None;
+    // Commands raised for the session that just ended are nobody's to answer
+    // now; a command that arrives later is checked against the epoch anyway.
+    state.pending_commands.clear();
     for peer in [
         state.peer.clone(),
         state.clipboard_peer.clone(),
         state.audio_peer.clone(),
+        state.tray_peer.clone(),
     ]
     .into_iter()
     .flatten()
@@ -857,6 +914,190 @@ fn send_audio_session(connection: &Arc<Connection>, audio: Option<&(Vec<u8>, Vec
             },
             &[],
         );
+    }
+}
+
+/// Accepts the tray of the session that is on the screen, and no other.
+///
+/// The clipboard socket's pattern exactly: a socket any account may reach,
+/// because the peer runs as whichever human logged in, and an accept that
+/// checks the uid against the session logind says is at the screen. The tray
+/// is re-admitted at every accept for the same reason the clipboard daemon
+/// is -- a user who has been switched away stops being authorised without
+/// anything having to notice and evict it.
+fn serve_tray_peers(listener: &Listener, shared: &Shared) {
+    loop {
+        if stopping(shared) {
+            return;
+        }
+
+        let connection = match listener.accept_where(
+            |uid| crate::seat::active_graphical_uid() == Some(uid),
+            "the graphical session on seat0",
+        ) {
+            Ok(connection) => Arc::new(connection),
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+                eprintln!("vmlord-display-broker: refused a tray peer: {error}");
+                continue;
+            }
+            Err(error) => {
+                eprintln!("vmlord-display-broker: the tray socket failed: {error}");
+                return;
+            }
+        };
+
+        adopt_tray_peer(shared, &connection);
+        read_tray_peer(&connection, shared);
+    }
+}
+
+/// Makes a new connection the tray peer, and tells it what it missed.
+fn adopt_tray_peer(shared: &Shared, connection: &Arc<Connection>) {
+    let (lock, _) = &**shared;
+    let mut state = lock.lock().expect("the broker's lock is not poisoned");
+
+    state.tray_peer = Some(Arc::clone(connection));
+    send_tray_modes(
+        connection,
+        &state.published_modes,
+        state.selected_mode.as_ref(),
+    );
+}
+
+/// Reads the tray peer until it goes away.
+///
+/// A peer whose datagram cannot be read is dropped with its connection --
+/// the same answer every socket here gives a peer that sends garbage, and
+/// the accept is what decides who may try again.
+fn read_tray_peer(connection: &Arc<Connection>, shared: &Shared) {
+    loop {
+        let Ok((message, _)) = connection.receive() else {
+            return;
+        };
+
+        let (lock, _) = &**shared;
+        let state = lock.lock().expect("the broker's lock is not poisoned");
+        if !state
+            .tray_peer
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, connection))
+        {
+            return;
+        }
+
+        match message {
+            Message::Attach => {
+                send_tray_modes(
+                    connection,
+                    &state.published_modes,
+                    state.selected_mode.as_ref(),
+                );
+            }
+            Message::DisplayModesRequested => {
+                send_tray_modes(
+                    connection,
+                    &state.published_modes,
+                    state.selected_mode.as_ref(),
+                );
+            }
+            Message::UserCommand { kind, display_mode } => {
+                drop(state);
+                queue_user_command(shared, connection, kind, display_mode);
+            }
+            Message::RestartSession => {
+                drop(state);
+                restart_display_session(connection);
+            }
+            // What the tray reports is a menu action's failure, for the log.
+            Message::Report { detail } => eprintln!("vmlord-display-tray: {detail}"),
+            other => eprintln!("vmlord-display-broker: ignoring {other:?} from the tray peer"),
+        }
+    }
+}
+
+/// Sends the tray what the host offers, and what it chose of it.
+fn send_tray_modes(
+    connection: &Arc<Connection>,
+    modes: &[DisplayTiming],
+    selected: Option<&DisplayTiming>,
+) {
+    let _ = connection.send(
+        &Message::DisplayModes {
+            modes: modes.to_vec(),
+            selected: selected.cloned(),
+        },
+        &[],
+    );
+}
+
+/// Puts a command the tray raised where the control thread will write it.
+///
+/// A command with no session to receive it is answered with a report rather
+/// than kept: the tray asked for something on the host and is told there is
+/// nothing to ask. One that races a session's end is dropped when the
+/// control thread takes the queue, by the epoch it was raised under.
+fn queue_user_command(
+    shared: &Shared,
+    connection: &Arc<Connection>,
+    kind: GuestCommandKind,
+    display_mode: Option<DisplayTiming>,
+) {
+    let (lock, _) = &**shared;
+    let mut state = lock.lock().expect("the broker's lock is not poisoned");
+
+    if state.session.is_none() {
+        let _ = connection.send(
+            &Message::Report {
+                detail: "no host session is open to receive a command".to_owned(),
+            },
+            &[],
+        );
+
+        return;
+    }
+
+    let session_epoch = state.session_epoch;
+    state.pending_commands.push_back(PendingCommand {
+        command: GuestCommand {
+            kind: kind as i32,
+            display_mode,
+        },
+        session_epoch,
+    });
+}
+
+/// Takes the tray commands owed to the session that is open.
+fn take_pending_commands(shared: &Shared) -> Vec<GuestCommand> {
+    let (lock, _) = &**shared;
+    let mut state = lock.lock().expect("the broker's lock is not poisoned");
+    let epoch = state.session_epoch;
+    let pending = std::mem::take(&mut state.pending_commands);
+
+    pending
+        .into_iter()
+        .filter(|pending| {
+            let current = pending.session_epoch == epoch;
+            if !current {
+                eprintln!(
+                    "vmlord-display-broker: a tray command arrived for a session that is gone"
+                );
+            }
+
+            current
+        })
+        .map(|pending| pending.command)
+        .collect()
+}
+
+/// Puts the guest display session back, as the tray asked.
+///
+/// A failure is answered on the tray's own socket: a menu action that did
+/// nothing is one the user is told about, not one to swallow.
+fn restart_display_session(connection: &Arc<Connection>) {
+    eprintln!("vmlord-display-broker: the tray asked for a display session restart");
+    if let Err(detail) = crate::systemd::restart_guest_services() {
+        eprintln!("vmlord-display-broker: the display session did not restart: {detail}");
+        let _ = connection.send(&Message::Report { detail }, &[]);
     }
 }
 
@@ -1403,6 +1644,18 @@ fn take_fault(shared: &Shared) -> Option<String> {
         .take()
 }
 
+/// Hands the tray the list the host published and its choice from it.
+///
+/// The connector's own copy stays where it was: this is the same fact read
+/// by a second reader, not a second authority on it.
+fn publish_host_modes(shared: &Shared, host_modes: &HostModes) {
+    let (lock, _) = &**shared;
+    let mut state = lock.lock().expect("the broker's lock is not poisoned");
+
+    state.published_modes = host_modes.modes.clone();
+    state.selected_mode = host_modes.selected;
+}
+
 /// Whether the broker is on its way out.
 fn stopping(shared: &Shared) -> bool {
     let (lock, _) = &**shared;
@@ -1827,5 +2080,63 @@ mod tests {
         let devices = super::open_devices(std::path::Path::new("/nonexistent/uinput"));
 
         assert!(devices.is_none());
+    }
+
+    #[test]
+    fn a_tray_command_for_the_open_session_is_taken_and_a_stale_one_is_dropped() {
+        // A session that closed between the tray's ask and the control
+        // thread's turn must not hand the next viewer a request nobody made
+        // of it. The epoch the command was raised under is what tells them
+        // apart.
+        let shared: super::Shared =
+            Arc::new((Mutex::new(super::BrokerState::default()), Condvar::new()));
+        let mute = super::GuestCommand {
+            kind: super::GuestCommandKind::ToggleMute as i32,
+            display_mode: None,
+        };
+
+        {
+            let (lock, _) = &*shared;
+            let mut state = lock.lock().unwrap();
+            state.session_epoch = 7;
+            state.pending_commands.push_back(super::PendingCommand {
+                command: mute,
+                session_epoch: 7,
+            });
+            state.pending_commands.push_back(super::PendingCommand {
+                command: mute,
+                session_epoch: 6,
+            });
+        }
+
+        let taken = super::take_pending_commands(&shared);
+
+        assert_eq!(taken, vec![mute]);
+        assert!(shared.0.lock().unwrap().pending_commands.is_empty());
+    }
+
+    #[test]
+    fn the_tray_is_shown_the_list_the_host_published_and_its_choice() {
+        // One fact, two readers: the connector's writes come from the
+        // control thread's own cache, and this is the copy the tray reads.
+        // Nothing the tray reads may change what the connector is told.
+        let shared: super::Shared =
+            Arc::new((Mutex::new(super::BrokerState::default()), Condvar::new()));
+        let mut host_modes = super::HostModes::default();
+        host_modes.publish(
+            vec![timing(1280, 720, 60), timing(1920, 1080, 144)],
+            Some(timing(1920, 1080, 144)),
+        );
+
+        super::publish_host_modes(&shared, &host_modes);
+        host_modes.select(timing(1280, 720, 60));
+        super::publish_host_modes(&shared, &host_modes);
+
+        let state = shared.0.lock().unwrap();
+        assert_eq!(
+            state.published_modes,
+            vec![timing(1280, 720, 60), timing(1920, 1080, 144)]
+        );
+        assert_eq!(state.selected_mode, Some(timing(1280, 720, 60)));
     }
 }

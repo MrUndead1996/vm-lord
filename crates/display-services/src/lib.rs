@@ -24,6 +24,7 @@ pub mod pipeline;
 pub mod pipeline_bench;
 pub mod seat;
 pub mod session_main;
+pub mod systemd;
 pub mod uinput;
 pub mod unix;
 pub mod vsock;

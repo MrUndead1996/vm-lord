@@ -9,6 +9,7 @@ use std::{error::Error, fmt};
 
 use prost::Message as _;
 use vmlord_display_codec::Rect;
+use vmlord_display_protocol::v1::{DisplayTiming, GuestCommandKind};
 
 use crate::broker::{self, envelope};
 
@@ -69,6 +70,27 @@ pub enum Message {
     Report {
         /// What to put in the `Error` record's detail.
         detail: String,
+    },
+    /// A command the guest's own user raised, for the host viewer to apply.
+    ///
+    /// The kinds are the wire's [`GuestCommandKind`] one for one, which is
+    /// what lets the broker forward the command without deciding it.
+    UserCommand {
+        /// What the user asked for.
+        kind: GuestCommandKind,
+        /// The host monitor mode to come up on, when the command names one.
+        display_mode: Option<DisplayTiming>,
+    },
+    /// The tray asks for the guest display session to be put back.
+    RestartSession,
+    /// The tray asks which modes the host has offered.
+    DisplayModesRequested,
+    /// What the host offered, in answer to [`Message::DisplayModesRequested`].
+    DisplayModes {
+        /// Every mode the host published, never empty while one has.
+        modes: Vec<DisplayTiming>,
+        /// The one the host chose, when it has chosen.
+        selected: Option<DisplayTiming>,
     },
 }
 
@@ -227,6 +249,22 @@ fn into_wire(message: &Message) -> envelope::Message {
         Message::Report { detail } => envelope::Message::Report(broker::Report {
             detail: detail.clone(),
         }),
+        Message::UserCommand { kind, display_mode } => {
+            envelope::Message::UserCommand(broker::UserCommand {
+                kind: i32::from(user_kind_into_wire(*kind)),
+                display_mode: display_mode.map(|mode| timing_into_wire(&mode)),
+            })
+        }
+        Message::RestartSession => envelope::Message::RestartSession(broker::RestartSession {}),
+        Message::DisplayModesRequested => {
+            envelope::Message::DisplayModesRequested(broker::DisplayModesRequested {})
+        }
+        Message::DisplayModes { modes, selected } => {
+            envelope::Message::DisplayModes(broker::DisplayModes {
+                modes: modes.iter().map(timing_into_wire).collect(),
+                selected: selected.map(|mode| timing_into_wire(&mode)),
+            })
+        }
     }
 }
 
@@ -273,6 +311,73 @@ fn from_wire(message: envelope::Message) -> Result<Message, IpcError> {
         envelope::Message::Report(report) => Message::Report {
             detail: report.detail,
         },
+        envelope::Message::UserCommand(command) => Message::UserCommand {
+            kind: user_kind_from_wire(command.kind())?,
+            display_mode: command
+                .display_mode
+                .as_ref()
+                .map(timing_from_wire)
+                .transpose()?,
+        },
+        envelope::Message::RestartSession(_) => Message::RestartSession,
+        envelope::Message::DisplayModesRequested(_) => Message::DisplayModesRequested,
+        envelope::Message::DisplayModes(modes) => Message::DisplayModes {
+            modes: modes
+                .modes
+                .iter()
+                .map(timing_from_wire)
+                .collect::<Result<_, _>>()?,
+            selected: modes.selected.as_ref().map(timing_from_wire).transpose()?,
+        },
+    })
+}
+
+/// The tray command kind as the schema carries it.
+///
+/// A command with no kind is not a command: like a plane that names no kind,
+/// it is refused rather than guessed at.
+fn user_kind_into_wire(kind: GuestCommandKind) -> broker::UserCommandKind {
+    match kind {
+        GuestCommandKind::ToggleFullscreen => broker::UserCommandKind::ToggleFullscreen,
+        GuestCommandKind::ReleaseKeyboard => broker::UserCommandKind::ReleaseKeyboard,
+        GuestCommandKind::SendSecureAttention => broker::UserCommandKind::SendSecureAttention,
+        GuestCommandKind::ToggleMute => broker::UserCommandKind::ToggleMute,
+        GuestCommandKind::QualityAuto => broker::UserCommandKind::QualityAuto,
+        GuestCommandKind::QualityDesktop => broker::UserCommandKind::QualityDesktop,
+        GuestCommandKind::SetDisplayMode => broker::UserCommandKind::SetDisplayMode,
+        GuestCommandKind::Unspecified => broker::UserCommandKind::Unspecified,
+    }
+}
+
+/// The tray command kind this build named, or an error for one it cannot.
+fn user_kind_from_wire(kind: broker::UserCommandKind) -> Result<GuestCommandKind, IpcError> {
+    Ok(match kind {
+        broker::UserCommandKind::ToggleFullscreen => GuestCommandKind::ToggleFullscreen,
+        broker::UserCommandKind::ReleaseKeyboard => GuestCommandKind::ReleaseKeyboard,
+        broker::UserCommandKind::SendSecureAttention => GuestCommandKind::SendSecureAttention,
+        broker::UserCommandKind::ToggleMute => GuestCommandKind::ToggleMute,
+        broker::UserCommandKind::QualityAuto => GuestCommandKind::QualityAuto,
+        broker::UserCommandKind::QualityDesktop => GuestCommandKind::QualityDesktop,
+        broker::UserCommandKind::SetDisplayMode => GuestCommandKind::SetDisplayMode,
+        broker::UserCommandKind::Unspecified => {
+            return Err(IpcError("a user command that names no kind".to_owned()));
+        }
+    })
+}
+
+fn timing_into_wire(timing: &DisplayTiming) -> broker::DisplayTiming {
+    broker::DisplayTiming {
+        width: timing.width,
+        height: timing.height,
+        refresh_hz: timing.refresh_hz,
+    }
+}
+
+fn timing_from_wire(timing: &broker::DisplayTiming) -> Result<DisplayTiming, IpcError> {
+    Ok(DisplayTiming {
+        width: timing.width,
+        height: timing.height,
+        refresh_hz: timing.refresh_hz,
     })
 }
 
@@ -345,6 +450,8 @@ fn plane_from_wire(plane: &broker::PlaneLayout) -> Result<PlaneLayout, IpcError>
 #[cfg(test)]
 mod tests {
     use super::{Message, PlaneKind, PlaneLayout, Rect, SessionParameters, decode, encode};
+    use crate::broker::UserCommandKind;
+    use vmlord_display_protocol::v1::{DisplayTiming, GuestCommand, GuestCommandKind};
 
     fn parameters() -> SessionParameters {
         SessionParameters {
@@ -398,6 +505,43 @@ mod tests {
             },
             Message::Report {
                 detail: "capture failed".into(),
+            },
+            Message::UserCommand {
+                kind: GuestCommandKind::ToggleFullscreen,
+                display_mode: None,
+            },
+            Message::UserCommand {
+                kind: GuestCommandKind::SetDisplayMode,
+                display_mode: Some(DisplayTiming {
+                    width: 2560,
+                    height: 1440,
+                    refresh_hz: 144,
+                }),
+            },
+            Message::RestartSession,
+            Message::DisplayModesRequested,
+            Message::DisplayModes {
+                modes: vec![
+                    DisplayTiming {
+                        width: 1280,
+                        height: 720,
+                        refresh_hz: 60,
+                    },
+                    DisplayTiming {
+                        width: 1920,
+                        height: 1080,
+                        refresh_hz: 144,
+                    },
+                ],
+                selected: Some(DisplayTiming {
+                    width: 1920,
+                    height: 1080,
+                    refresh_hz: 144,
+                }),
+            },
+            Message::DisplayModes {
+                modes: Vec::new(),
+                selected: None,
             },
         ];
 
@@ -507,5 +651,89 @@ mod tests {
         let message = Message::InputDevices;
 
         assert_eq!(decode(&encode(&message)).expect("a message"), message);
+    }
+
+    #[test]
+    fn the_tray_command_kinds_are_the_viewer_ones_by_number() {
+        // The broker forwards a tray command whole, so the schema's kind and
+        // the wire's have to stay the same list. A reordering on either side
+        // would make one command arrive as another; this is what notices.
+        let pairs = [
+            (
+                UserCommandKind::ToggleFullscreen,
+                GuestCommandKind::ToggleFullscreen,
+            ),
+            (
+                UserCommandKind::ReleaseKeyboard,
+                GuestCommandKind::ReleaseKeyboard,
+            ),
+            (
+                UserCommandKind::SendSecureAttention,
+                GuestCommandKind::SendSecureAttention,
+            ),
+            (UserCommandKind::ToggleMute, GuestCommandKind::ToggleMute),
+            (UserCommandKind::QualityAuto, GuestCommandKind::QualityAuto),
+            (
+                UserCommandKind::QualityDesktop,
+                GuestCommandKind::QualityDesktop,
+            ),
+            (
+                UserCommandKind::SetDisplayMode,
+                GuestCommandKind::SetDisplayMode,
+            ),
+        ];
+
+        for (tray, viewer) in pairs {
+            assert_eq!(i32::from(tray), i32::from(viewer));
+        }
+    }
+
+    #[test]
+    fn a_tray_command_that_names_no_kind_is_refused() {
+        // Proto3 cannot tell "absent" from the first variant, and a command
+        // with no kind is nothing to forward. Like a plane that names no
+        // plane, it is an error rather than a guess.
+        use prost::Message as _;
+
+        let envelope = crate::broker::Envelope {
+            message: Some(crate::broker::envelope::Message::UserCommand(
+                crate::broker::UserCommand {
+                    kind: 0,
+                    display_mode: None,
+                },
+            )),
+        };
+
+        assert!(decode(&envelope.encode_to_vec()).is_err());
+    }
+
+    #[test]
+    fn a_tray_command_decodes_as_the_wire_command_it_forwards() {
+        // The whole point of the 1:1 kinds: what a tray raised and what the
+        // host is sent are one command, not a translation.
+        let encoded = encode(&Message::UserCommand {
+            kind: GuestCommandKind::SetDisplayMode,
+            display_mode: Some(DisplayTiming {
+                width: 1920,
+                height: 1080,
+                refresh_hz: 60,
+            }),
+        });
+        let Message::UserCommand { kind, display_mode } =
+            decode(&encoded).expect("a message this build wrote")
+        else {
+            panic!("a user command decodes as a user command");
+        };
+
+        let forwarded = GuestCommand {
+            kind: i32::from(kind),
+            display_mode: display_mode.map(|mode| vmlord_display_protocol::v1::DisplayTiming {
+                width: mode.width,
+                height: mode.height,
+                refresh_hz: mode.refresh_hz,
+            }),
+        };
+        assert_eq!(forwarded.kind(), GuestCommandKind::SetDisplayMode);
+        assert_eq!(forwarded.display_mode.map(|mode| mode.width), Some(1920));
     }
 }

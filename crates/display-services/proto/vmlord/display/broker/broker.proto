@@ -23,6 +23,10 @@ message Envelope {
     Geometry geometry = 9;
     ClipboardOpened clipboard_opened = 10;
     AudioOpened audio_opened = 11;
+    UserCommand user_command = 12;
+    RestartSession restart_session = 13;
+    DisplayModesRequested display_modes_requested = 14;
+    DisplayModes display_modes = 15;
   }
 }
 
@@ -134,4 +138,53 @@ enum PlaneKind {
 // What the unprivileged process wants the host told.
 message Report {
   string detail = 1;
+}
+
+// A display mode as the host carries it. The same shape as the display
+// protocol's `DisplayTiming`, restated here because this schema never imports
+// the wire's: what the numbers mean is a contract between the two, and the
+// test that the tray command kinds match the viewer's is what holds them
+// together.
+message DisplayTiming {
+  uint32 width = 1;
+  uint32 height = 2;
+  uint32 refresh_hz = 3;
+}
+
+// A command the guest's own user raised, on its way to the host viewer.
+//
+// The kinds are the display protocol's `GuestCommandKind` by number, one for
+// one: the broker forwards the record whole rather than deciding it, so a
+// command here and a command on the wire have to stay the same list. The test
+// beside the mapping is what notices drift between the two schemas.
+enum UserCommandKind {
+  USER_COMMAND_KIND_UNSPECIFIED = 0;
+  USER_COMMAND_KIND_TOGGLE_FULLSCREEN = 1;
+  USER_COMMAND_KIND_RELEASE_KEYBOARD = 2;
+  USER_COMMAND_KIND_SEND_SECURE_ATTENTION = 3;
+  USER_COMMAND_KIND_TOGGLE_MUTE = 4;
+  USER_COMMAND_KIND_QUALITY_AUTO = 5;
+  USER_COMMAND_KIND_QUALITY_DESKTOP = 6;
+  USER_COMMAND_KIND_SET_DISPLAY_MODE = 7;
+}
+
+message UserCommand {
+  UserCommandKind kind = 1;
+  // The host monitor mode to come up on. Set only when `kind` is
+  // `USER_COMMAND_KIND_SET_DISPLAY_MODE`, and then required -- exactly as the
+  // wire's own `GuestCommand` requires it.
+  DisplayTiming display_mode = 2;
+}
+
+// The tray asks for the guest display session to be put back.
+message RestartSession {}
+
+// The tray asks which modes the host has offered.
+message DisplayModesRequested {}
+
+// What the host offered, and the one of them it chose. Both empty until a
+// host has published a list: a guest no viewer has met has no modes to show.
+message DisplayModes {
+  repeated DisplayTiming modes = 1;
+  DisplayTiming selected = 2;
 }
