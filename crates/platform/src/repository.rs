@@ -14,10 +14,11 @@ use std::{
 
 use uuid::Uuid;
 use vmlord_core::{
-    AgentStatus, DiagnosticLevel, DisplayProvisioning, DisplaySettings, FileClipboardSettings,
-    GpuAssignment, GpuMode, GuestDisplayReport, GuestReadinessTimeouts, HostGpuCapabilities,
-    NetworkMode, RepositoryError, SshAvailability, SshPort, Subsystem, VmCreateRequest,
-    VmDeleteRequest, VmDisplayFacts, VmRepository, VmState, VmSummary, VmUpdateRequest,
+    AgentStatus, BuildMonitor, BuildStep, DiagnosticLevel, DisplayProvisioning, DisplaySettings,
+    FileClipboardSettings, GpuAssignment, GpuMode, GuestDisplayReport, GuestReadinessTimeouts,
+    HostGpuCapabilities, NetworkMode, RepositoryError, SshAvailability, SshPort, Subsystem,
+    VmCreateRequest, VmDeleteRequest, VmDisplayFacts, VmRepository, VmState, VmSummary,
+    VmUpdateRequest,
 };
 
 use crate::{
@@ -1286,6 +1287,50 @@ fn disk_growth(
     }
 
     Ok(Some(u64::from(requested_gb) * BYTES_PER_GIB))
+}
+
+/// Adopting a disk that already holds a system.
+///
+/// Deliberately not `create_vm`: that runs the creation cycle, which starts
+/// the VM and waits for its guest. A disk being adopted has not been converted
+/// yet -- the conversion runs against it while nothing is running from it --
+/// so starting it here would boot exactly the guest this import exists to take
+/// apart.
+impl HcsVmRepository {
+    /// Builds the VM's own files around `request`'s disk and stops there.
+    ///
+    /// Returns where the document the offline conversion consumes was written.
+    ///
+    /// # Errors
+    ///
+    /// [`RepositoryError`] when a VM of that name exists, when its directory
+    /// is already there, when the disk is not, or when any step of the
+    /// creation pipeline fails. A failure rolls the VM's own files back; the
+    /// disk is left wherever the failure left it.
+    pub fn adopt_disk(&mut self, request: VmCreateRequest) -> Result<PathBuf, RepositoryError> {
+        let _span = tracing::info_span!("adopt_disk", vm = request.name.as_str()).entered();
+        self.require_initialized()?;
+        request.validate()?;
+
+        if self.store.find_by_vm_name(&request.name)?.is_some() {
+            return Err(RepositoryError::new(format!(
+                "VM \"{}\" already exists",
+                request.name
+            )));
+        }
+        let vm_directory = layout::vm_directory(&self.storage_root, &request.name)?;
+        if vm_directory.exists() {
+            return Err(RepositoryError::new(format!(
+                "VM directory already exists: {}",
+                vm_directory.display()
+            )));
+        }
+
+        let monitor = BuildMonitor::new(BuildStep::WritingDisk);
+        self.cycle
+            .create_only(&self.store, &request, &vm_directory, &monitor)?;
+        Ok(layout::import_input_path(&vm_directory))
+    }
 }
 
 impl VmRepository for HcsVmRepository {

@@ -16,6 +16,17 @@ use vmlord_core::{
 mod pickers;
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("adopt-disk") {
+        match adopt_disk(std::env::args().skip(2)) {
+            Ok(document) => println!("{}", document.display()),
+            Err(error) => {
+                eprintln!("vmlord: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     let settings = vmlord_core::SettingsStore::for_current_user().and_then(|store| {
         store
             .load_or_create_with_status()
@@ -184,6 +195,38 @@ fn load_backend(settings: &AppSettings) -> Box<dyn VmRepository> {
         .with_file_clipboard_settings(settings.clipboard_files)
         .with_display_settings(settings.display),
     )
+}
+
+/// Builds a VM around a disk that already holds a system, and reports where
+/// the document the offline conversion consumes was written.
+///
+/// A subcommand rather than a screen: adopting a disk is the second step of an
+/// import whose first is a copy made outside VMLord and whose third is the
+/// offline conversion run under WSL. When the import ships as a feature it
+/// gets a screen; until then this is the seam that does not pretend the flow
+/// is finished.
+///
+/// A release build has no console of its own (`windows_subsystem = "windows"`),
+/// so run this from a console that already exists, or read the document where
+/// it always is: `<VM storage>\\<name>\\import-input.json`.
+fn adopt_disk(arguments: impl Iterator<Item = String>) -> Result<PathBuf, String> {
+    let arguments = vmlord_platform::AdoptArguments::parse(arguments)?;
+    let store =
+        vmlord_core::SettingsStore::for_current_user().map_err(|error| error.to_string())?;
+    let settings = store
+        .load_or_create_with_status()
+        .map_err(|error| error.to_string())?
+        .settings;
+    let _ = vmlord_core::initialize_with_diagnostics(&settings);
+
+    let mut repository = vmlord_platform::HcsVmRepository::new(
+        settings.vm_storage_path.clone(),
+        cloud_disk_importer(settings.image_cache_path.clone()),
+    );
+    repository.initialize().map_err(|error| error.to_string())?;
+    repository
+        .adopt_disk(arguments.request())
+        .map_err(|error| error.to_string())
 }
 
 /// Joins the two halves of getting a cloud image onto a VM's disk: fetching it,

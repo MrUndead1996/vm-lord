@@ -68,10 +68,11 @@ pub(crate) struct CycleReport {
 /// configuration by the time it starts.
 fn has_a_guest_to_ask(request: &VmCreateRequest) -> bool {
     match &request.source {
-        // An adopted guest has one too: the offline conversion put VMLord's
-        // key and agent into it before it ever started.
-        VmSource::CloudImage { .. } | VmSource::ExistingDisk { .. } => true,
-        VmSource::LocalMedia { .. } => false,
+        VmSource::CloudImage { .. } => true,
+        // An adopted disk never reaches this cycle: adoption builds the VM's
+        // files and stops, because the disk is converted afterwards, while
+        // nothing is running from it. `create_only` is that path.
+        VmSource::LocalMedia { .. } | VmSource::ExistingDisk { .. } => false,
     }
 }
 
@@ -158,6 +159,26 @@ impl VmBuildCycle {
 
     /// Runs the whole cycle for `request`, reporting each step through
     /// `monitor`.
+    /// Builds the VM's own files and stops there, without starting it.
+    ///
+    /// What adoption needs: the disk it is given is not converted yet, so a
+    /// start would boot the guest the conversion has still to take apart.
+    pub(crate) fn create_only(
+        &self,
+        store: &MetadataStore,
+        request: &VmCreateRequest,
+        vm_directory: &Path,
+        monitor: &BuildMonitor,
+    ) -> Result<(), RepositoryError> {
+        (self.create)(store, request, vm_directory, monitor).map(|mapping| {
+            tracing::info!(
+                "VM \"{}\" ({}) was built around a disk it did not create, and is not started",
+                mapping.vm_name,
+                mapping.vm_id
+            );
+        })
+    }
+
     pub(crate) fn run(
         &self,
         store: &MetadataStore,

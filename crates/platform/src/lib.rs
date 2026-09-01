@@ -9,6 +9,7 @@
 #[cfg(not(windows))]
 compile_error!("vmlord-platform supports Windows only");
 
+mod adopt;
 mod agent;
 mod agent_session;
 mod build;
@@ -71,6 +72,7 @@ mod vhd;
 mod vm_key;
 mod watch;
 
+pub use adopt::{ADOPT_USAGE, AdoptArguments};
 pub use com1_reader::{Com1HelperOptions, Com1LogMode, parse_com1_helper_args, run_com1_helper};
 pub use com1_terminal::{Com1Launcher, Com1Session};
 pub use create::{CloudDiskImporter, VmCreationPipeline};
