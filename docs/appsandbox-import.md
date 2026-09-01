@@ -94,10 +94,12 @@ cargo appsandbox-convert --input /mnt/c/.../import-input.json
 umount /mnt/vmlord-import
 ```
 
-and back on Windows:
+and back on Windows, naming the VHD rather than a disk number -- a VHD
+attached with `--bare` is taken by WSL whole and never becomes a disk Windows
+lists, so it has no `PHYSICALDRIVE` number to give:
 
 ```
-wsl --unmount \\.\PHYSICALDRIVE<n>
+wsl --unmount <VM storage>\<name>\disks\system.vhdx
 ```
 
 The conversion runs its own verification before it returns. `--verify-only`
