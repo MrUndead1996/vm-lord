@@ -38,7 +38,7 @@ COPY licenses /src/licenses
 RUN set -eu; \
     proven_on="$(cat /src/proven_on)"; \
     mkdir -p /output/prepared/content/drm /output/prepared/content/services \
-             /output/prepared/licenses; \
+             /output/prepared/content/audio /output/prepared/licenses; \
     cp /src/module/vmlord_drm.c /src/module/vmlord_compat.h \
        /src/module/vmlord-display-unbind-simpledrm.service \
        /src/module/vmlord-display-compositor-mesa.conf \

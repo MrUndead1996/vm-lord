@@ -1,0 +1,39 @@
+[Unit]
+Description=VMLord display audio
+Documentation=https://github.com/mrundead/vmlord
+# After, and deliberately not BindsTo: a broker restart must not take the
+# capture down, and the daemon reconnects to the socket on its own.
+After=vmlord-display-broker.service
+
+# The crash-loop budget. It belongs to the unit and not to the service:
+# systemd reads these two here, and answers them under [Service] with
+# `Unknown key ... ignoring` -- a rate limit that silently is not one.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+ExecStart=/usr/local/lib/vmlord/vmlord-display-audio
+User=vmlord-display
+# /dev/snd/* is root:audio 0660, plus an ACL for the user of the active seat.
+# The group is what lets a system daemon read the loopback without belonging to
+# anybody's session -- which is the whole reason audio is a system unit and the
+# clipboard is not. Sound belongs to the machine, not to whoever is at the
+# screen, and it has to work before anyone logs in.
+SupplementaryGroups=audio
+Restart=on-failure
+RestartSec=2
+# It holds one channel key and one PCM device, and needs no privilege at all.
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+# No PrivateDevices: that would give this unit a private /dev with no sound
+# nodes in it, which is a daemon that can never open the loopback.
+RestrictAddressFamilies=AF_VSOCK AF_UNIX
+RestrictNamespaces=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

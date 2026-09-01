@@ -136,7 +136,7 @@ DOCKER_BUILDKIT=1 docker build \
 # identical for 22.04, 24.04 and 26.04, and the container exists to prove the *module*
 # compiles against a release's headers. A Rust toolchain in there would be a third
 # toolchain for no gain.
-for binary in vmlord-display-broker vmlord-display-session vmlord-display-clipboard; do
+for binary in vmlord-display-broker vmlord-display-session vmlord-display-clipboard vmlord-display-audio; do
 	[[ -x "$services/$binary" ]] || {
 		echo "$services does not hold $binary; run 'cargo display-services' first" >&2
 		exit 1
@@ -144,5 +144,11 @@ for binary in vmlord-display-broker vmlord-display-session vmlord-display-clipbo
 	install -m 0755 "$services/$binary" "$output/prepared/content/services/$binary"
 done
 install -m 0644 "$HERE/services/"*.service "$output/prepared/content/services/"
+
+# The loopback's configuration: what loads the module, what gives it one cable,
+# and the WirePlumber rule in both of the forms the supported releases read.
+# Which of the two is installed is decided inside the guest, by the directory
+# its own WirePlumber ships.
+install -m 0644 "$HERE/audio/"* "$output/prepared/content/audio/"
 
 echo "prepared tree and recipe.json written to $output"
