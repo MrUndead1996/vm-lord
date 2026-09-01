@@ -320,6 +320,25 @@ mod tests {
     }
 
     #[test]
+    fn an_audio_channel_binds_against_the_host_state_machine() {
+        // The positive control the test below needs to mean anything: without
+        // it, "the frame key does not bind" passes just as well on a build
+        // where no audio key binds either.
+        let (mut host, guest) = established();
+        let hello = host.open_channel(Channel::Audio).unwrap();
+        let key = guest.derive_channel_key(Channel::Audio).unwrap();
+        let mut wire = Wire::new(host, hello);
+
+        let generation = bind(&mut wire, Channel::Audio, &key, guest.session_id(), None).unwrap();
+
+        assert_eq!(generation, 0);
+        assert!(
+            wire.host().channel_key(Channel::Audio).is_some(),
+            "the host bound the channel too"
+        );
+    }
+
+    #[test]
     fn an_audio_socket_that_offers_a_frame_key_does_not_bind() {
         // What `keys::channel_key`'s domain separation is for: a daemon that
         // has one channel's key must not be able to prove itself on another's

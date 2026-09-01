@@ -423,26 +423,29 @@ impl Session {
             {
                 self.on_client_auth(payload)
             }
-            // The clipboard's bind records carry the same three numbers the
-            // frame and input channels' do -- a bind is one exchange on every
-            // bound channel -- so one arm reads the frame enum for all three.
+            // Every bound channel's bind records carry the same three numbers
+            // the frame channel's do -- a bind is one exchange wherever it
+            // happens -- so one arm reads the frame enum for all of them. A
+            // channel missing from these lists is one this machine can key and
+            // cannot answer, which is a socket that connects and binds
+            // nowhere.
             (
                 State::Established,
-                Channel::Frame | Channel::Input | Channel::Clipboard,
+                Channel::Frame | Channel::Input | Channel::Clipboard | Channel::Audio,
                 message_type,
             ) if message_type == FrameRecord::ChannelHello as u16 => {
                 self.on_channel_hello(header.channel, payload)
             }
             (
                 State::Established,
-                Channel::Frame | Channel::Input | Channel::Clipboard,
+                Channel::Frame | Channel::Input | Channel::Clipboard | Channel::Audio,
                 message_type,
             ) if message_type == FrameRecord::ChannelAck as u16 => {
                 self.on_channel_ack(header.channel, payload)
             }
             (
                 State::Established,
-                Channel::Frame | Channel::Input | Channel::Clipboard,
+                Channel::Frame | Channel::Input | Channel::Clipboard | Channel::Audio,
                 message_type,
             ) if message_type == FrameRecord::ChannelAuth as u16 => {
                 self.on_channel_auth(header.channel, payload)
@@ -1200,6 +1203,33 @@ mod tests {
             .expect("the guest checks the host's proof");
 
         assert_eq!(outcome.event, Event::ChannelBound(Channel::Clipboard));
+    }
+
+    #[test]
+    fn an_audio_channel_binds_like_any_other() {
+        // The bind is one exchange on every bound channel, and every one of
+        // its three records has to be dispatched. A channel this machine knows
+        // how to key but not how to answer binds nowhere.
+        let (mut host, mut guest) = handshake(&Secret::generate(), offer(), support());
+
+        let hello = host.open_channel(Channel::Audio).expect("an audio hello");
+        let ack = guest
+            .handle(&hello.header, &hello.payload)
+            .expect("the guest answers an audio hello")
+            .reply
+            .expect("an ack");
+        let auth = host
+            .handle(&ack.header, &ack.payload)
+            .expect("the host answers an ack")
+            .reply
+            .expect("an auth");
+        let outcome = guest
+            .handle(&auth.header, &auth.payload)
+            .expect("the guest checks the host's proof");
+
+        assert_eq!(outcome.event, Event::ChannelBound(Channel::Audio));
+        assert!(host.channel_key(Channel::Audio).is_some());
+        assert!(guest.channel_key(Channel::Audio).is_some());
     }
 
     #[test]
