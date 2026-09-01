@@ -134,6 +134,20 @@ const TOOLS_VOLUME_ID: &str = "VMLTOOLS";
 /// that copies out of it cannot disagree.
 pub(crate) const AGENT_FILE: &str = "vmlord-agent";
 
+/// Where the agent is installed in a guest.
+///
+/// Public, unlike the name above, because a guest VMLord did not create -- one
+/// imported from AppSandbox -- is brought to the same contract by a different
+/// program. A second copy of these four names is a copy that falls behind this
+/// one, so there is one.
+pub const AGENT_BINARY_PATH: &str = "/usr/local/lib/vmlord/vmlord-agent";
+/// The unit that runs it, by name.
+pub const AGENT_UNIT_NAME: &str = "vmlord-agent.service";
+/// And where that unit is installed.
+pub const AGENT_UNIT_PATH: &str = "/etc/systemd/system/vmlord-agent.service";
+/// What the unit says.
+pub const AGENT_UNIT: &str = "[Unit]\nDescription=VMLord guest agent\nConditionPathExists=/etc/vmlord/agent.secret\n\n[Service]\nExecStart=/usr/local/lib/vmlord/vmlord-agent\nUser=root\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n";
+
 /// Packs the guest agent into the read-only volume the first boot installs it
 /// from.
 ///
@@ -205,6 +219,39 @@ mod tests {
 
         assert!(seed.user_data.starts_with("#cloud-config\n"));
         assert!(seed.meta_data.contains("instance-id: 'vmlord-4f1c0e5a'"));
+    }
+
+    /// The four names an agent is installed under, checked through the seed
+    /// that installs them.
+    ///
+    /// They are public because a guest VMLord did not create is brought to the
+    /// same contract by another program, and this is what keeps that program
+    /// from holding a second copy of them.
+    #[test]
+    fn the_agent_contract_the_seed_writes_is_the_one_it_publishes() {
+        let seed = build(&SeedRequest {
+            vm_name: "my-vm",
+            instance_id: "vmlord-4f1c0e5a",
+            username: "dev",
+            password_hash: None,
+            authorized_key: None,
+            ssh: SshAccess::Enabled {
+                deploy_key: false,
+                port: SshPort::DEFAULT,
+            },
+            locale: "en_US.UTF-8",
+            keyboard: "us",
+            timezone: "Europe/Moscow",
+            admin_group: "sudo",
+            ssh_daemon: &UBUNTU_SSH,
+            agent_secret: Some("Zm9ydHktdHdvIGJ5dGVzIG9mIHNlY3JldCBoZXJlIQ=="),
+            desktop_packages: &[],
+        });
+
+        assert!(seed.user_data.contains(super::AGENT_UNIT_PATH));
+        assert!(seed.user_data.contains(super::AGENT_BINARY_PATH));
+        assert!(seed.user_data.contains(super::AGENT_UNIT_NAME));
+        assert_eq!(super::AGENT_UNIT_NAME, "vmlord-agent.service");
     }
 
     /// The three constants cloud-init actually depends on, checked through the

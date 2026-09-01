@@ -7,7 +7,10 @@
 use vmlord_agent_protocol::auth::GUEST_SECRET_PATH;
 use vmlord_core::{SshAccess, SshPort, SshUnits};
 
-use crate::{AGENT_FILE, SeedRequest, scalar};
+use crate::{
+    AGENT_BINARY_PATH, AGENT_FILE, AGENT_UNIT, AGENT_UNIT_NAME, AGENT_UNIT_PATH, SeedRequest,
+    scalar,
+};
 
 /// The indentation a block scalar's content sits at inside `write_files`.
 const FILE_INDENT: &str = "      ";
@@ -103,7 +106,7 @@ fn write_files(request: &SeedRequest<'_>) -> String {
             &format!("{secret}\n"),
             "root:root",
         ));
-        files.push_str(&file(AGENT_SERVICE_PATH, AGENT_SERVICE));
+        files.push_str(&file(AGENT_UNIT_PATH, AGENT_UNIT));
     }
     files
 }
@@ -160,7 +163,7 @@ fn agent_install_commands() -> Vec<Vec<String>> {
             "-g".into(),
             "root".into(),
             format!("/run/vmlord-tools/{AGENT_FILE}"),
-            "/usr/local/lib/vmlord/vmlord-agent".into(),
+            AGENT_BINARY_PATH.into(),
         ],
         vec!["umount".into(), "/run/vmlord-tools".into()],
         vec!["systemctl".into(), "daemon-reload".into()],
@@ -168,7 +171,7 @@ fn agent_install_commands() -> Vec<Vec<String>> {
             "systemctl".into(),
             "enable".into(),
             "--now".into(),
-            "vmlord-agent.service".into(),
+            AGENT_UNIT_NAME.into(),
         ],
     ]
 }
@@ -309,9 +312,6 @@ fn entry(path: &str, content: &str, permissions: &str, owner: Option<&str>) -> S
 /// different keys, which is a different mechanism rather than a different
 /// value, so it waits for a second distribution.
 const KEYBOARD_PATH: &str = "/etc/default/keyboard";
-
-const AGENT_SERVICE_PATH: &str = "/etc/systemd/system/vmlord-agent.service";
-const AGENT_SERVICE: &str = "[Unit]\nDescription=VMLord guest agent\nConditionPathExists=/etc/vmlord/agent.secret\n\n[Service]\nExecStart=/usr/local/lib/vmlord/vmlord-agent\nUser=root\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n";
 
 /// The content of that file.
 ///
