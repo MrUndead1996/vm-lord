@@ -11,7 +11,7 @@ use vmlord_seed::{AGENT_BINARY_PATH, AGENT_UNIT_NAME, AGENT_UNIT_PATH};
 
 use crate::{
     Conversion, ConvertError,
-    install::NETPLAN_PATH,
+    install::{NETPLAN_PATH, REPAIR_MARKER, REPAIR_UNIT_NAME, REPAIR_UNIT_PATH},
     remove::{FILES, TREES, UNITS},
     root::guest_path,
 };
@@ -112,6 +112,22 @@ pub fn verify(conversion: &Conversion) -> Result<(), ConvertError> {
         return Err(ConvertError::new(format!(
             "VMLord's key is not in {}",
             keys.display()
+        )));
+    }
+
+    // The one-shot that regenerates the initramfs and the boot configuration
+    // is either still waiting for its boot or has had it: it disables itself
+    // and leaves the marker behind, so a root read back after the guest has
+    // run is as correct as one read back before it.
+    let repair_pending = guest_path(root, REPAIR_UNIT_PATH)?.exists()
+        && guest_path(root, "/etc/systemd/system/multi-user.target.wants")?
+            .join(REPAIR_UNIT_NAME)
+            .symlink_metadata()
+            .is_ok();
+    let repair_done = guest_path(root, REPAIR_MARKER)?.exists();
+    if !repair_pending && !repair_done {
+        return Err(ConvertError::new(format!(
+            "{REPAIR_UNIT_NAME} is neither installed and enabled nor recorded as having run"
         )));
     }
 
@@ -225,6 +241,39 @@ mod tests {
         .expect("write");
         let error = verify(&guest.conversion()).expect_err("not VMLord's key");
         assert!(error.to_string().contains("authorized_keys"), "{error}");
+    }
+
+    #[test]
+    fn a_root_whose_first_boot_repair_never_ran_and_is_not_installed_fails() {
+        let guest = fully_converted();
+        fs::remove_file(
+            guest
+                .root()
+                .join("etc/systemd/system/multi-user.target.wants/vmlord-import-repair.service"),
+        )
+        .expect("unlink");
+        let error = verify(&guest.conversion()).expect_err("not repaired");
+        assert!(
+            error.to_string().contains("vmlord-import-repair.service"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_root_whose_first_boot_repair_has_already_run_passes() {
+        let guest = fully_converted();
+        // What the unit leaves behind: it disables itself, so the symlink is
+        // gone and the marker is there.
+        fs::remove_file(
+            guest
+                .root()
+                .join("etc/systemd/system/multi-user.target.wants/vmlord-import-repair.service"),
+        )
+        .expect("unlink");
+        fs::create_dir_all(guest.root().join("var/lib/vmlord")).expect("mkdir");
+        fs::write(guest.root().join("var/lib/vmlord/import-repaired"), "").expect("write");
+
+        verify(&guest.conversion()).expect("a guest that has finished its repair");
     }
 
     #[test]
