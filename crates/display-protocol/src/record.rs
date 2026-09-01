@@ -672,7 +672,10 @@ mod tests {
     #[test]
     fn audio_is_the_fifth_channel() {
         assert_eq!(Channel::Audio.as_wire(), 5);
-        assert_eq!(Channel::from_wire(5).expect("five is audio"), Channel::Audio);
+        assert_eq!(
+            Channel::from_wire(5).expect("five is audio"),
+            Channel::Audio
+        );
         assert_eq!(Channel::Audio.to_string(), "audio");
 
         let limits = Limits::new(1920, 1080);

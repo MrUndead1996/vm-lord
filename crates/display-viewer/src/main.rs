@@ -48,6 +48,7 @@ use vmlord_display_protocol::{
     v1::{Capability, Mode},
 };
 use vmlord_display_viewer::{
+    audio::{self, Mute},
     display_modes::{self, DisplayMode, select_mode},
     fps_gap::{self, FpsGap},
     input::{self, Report},
@@ -59,7 +60,6 @@ use vmlord_display_viewer::{
     resize::Resize,
     state::{Quality, Store, WindowState},
     status::{self, Button, Event, Progress, Status},
-    audio::{self, Mute},
     windows::{
         clipboard::{self, Focus},
         d3d::Renderer,
@@ -512,7 +512,10 @@ fn attempt(session: &Session, hello: &[u8]) -> Attempt {
 /// reason the clipboard's does not: the guest either ships the daemon or it
 /// does not, and a capability cannot be renegotiated.
 fn start_audio(session: &Session, handover: &Handover) -> Option<JoinHandle<()>> {
-    if !handover.capabilities.contains(&i32::from(Capability::Audio)) {
+    if !handover
+        .capabilities
+        .contains(&i32::from(Capability::Audio))
+    {
         tracing::info!("this guest has no audio");
 
         return None;
@@ -524,14 +527,20 @@ fn start_audio(session: &Session, handover: &Handover) -> Option<JoinHandle<()>>
         handover: handover.clone(),
         muted: session.muted,
     });
-    *session.audio.lock().expect("the mute sender is not poisoned") = Some(sender);
+    *session
+        .audio
+        .lock()
+        .expect("the mute sender is not poisoned") = Some(sender);
 
     Some(handle)
 }
 
 /// Ends this session's audio thread by taking the sender it listens on.
 fn stop_audio(session: &Session, handle: Option<JoinHandle<()>>) {
-    *session.audio.lock().expect("the mute sender is not poisoned") = None;
+    *session
+        .audio
+        .lock()
+        .expect("the mute sender is not poisoned") = None;
 
     // Not joined, for the reason the clipboard thread is not: it ends on its
     // own once its sender is gone, and a session's end is not worth waiting on

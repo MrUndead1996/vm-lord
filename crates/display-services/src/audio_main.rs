@@ -20,13 +20,7 @@
 //! from, and every line about a period goes through [`describe_period`] so that
 //! there is one place where that is true.
 
-use std::{
-    env,
-    io::Write,
-    path::PathBuf,
-    process::ExitCode,
-    time::Duration,
-};
+use std::{env, io::Write, path::PathBuf, process::ExitCode, time::Duration};
 
 use prost::Message as _;
 use vmlord_display_protocol::{
@@ -498,9 +492,15 @@ mod tests {
         // while a socket that has gone takes the daemon back to waiting for a
         // session. Confusing them once meant writing into a closed socket for
         // ever, one journal line every ten milliseconds.
-        assert!(timed_out(&std::io::Error::from(std::io::ErrorKind::WouldBlock)));
-        assert!(timed_out(&std::io::Error::from(std::io::ErrorKind::TimedOut)));
-        assert!(!timed_out(&std::io::Error::from(std::io::ErrorKind::BrokenPipe)));
+        assert!(timed_out(&std::io::Error::from(
+            std::io::ErrorKind::WouldBlock
+        )));
+        assert!(timed_out(&std::io::Error::from(
+            std::io::ErrorKind::TimedOut
+        )));
+        assert!(!timed_out(&std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe
+        )));
         assert!(!timed_out(&std::io::Error::from(
             std::io::ErrorKind::ConnectionReset
         )));

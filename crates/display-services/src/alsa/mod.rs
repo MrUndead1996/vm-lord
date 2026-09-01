@@ -12,9 +12,9 @@ use std::{error::Error, ffi::CString, fmt, io, os::fd::RawFd};
 use vmlord_display_protocol::audio::{Format, SampleFormat};
 
 use uapi::{
-    SndPcmHwParams, SndPcmSwParams, SndXferi, SNDRV_PCM_IOCTL_HW_PARAMS, SNDRV_PCM_IOCTL_HW_REFINE,
-    SNDRV_PCM_IOCTL_PREPARE, SNDRV_PCM_IOCTL_PVERSION, SNDRV_PCM_IOCTL_READI_FRAMES,
-    SNDRV_PCM_IOCTL_START, SNDRV_PCM_IOCTL_SW_PARAMS,
+    SNDRV_PCM_IOCTL_HW_PARAMS, SNDRV_PCM_IOCTL_HW_REFINE, SNDRV_PCM_IOCTL_PREPARE,
+    SNDRV_PCM_IOCTL_PVERSION, SNDRV_PCM_IOCTL_READI_FRAMES, SNDRV_PCM_IOCTL_START,
+    SNDRV_PCM_IOCTL_SW_PARAMS, SndPcmHwParams, SndPcmSwParams, SndXferi,
 };
 
 /// The capture half of the first loopback cable.
@@ -63,12 +63,18 @@ impl fmt::Display for CaptureError {
                 write!(formatter, "the loopback refused every format: {error}")
             }
             Self::Params(error) => {
-                write!(formatter, "the loopback refused its own parameters: {error}")
+                write!(
+                    formatter,
+                    "the loopback refused its own parameters: {error}"
+                )
             }
             Self::Start(error) => write!(formatter, "the capture would not start: {error}"),
             Self::Read(error) => write!(formatter, "the capture failed: {error}"),
             Self::Unsupported(what) => {
-                write!(formatter, "the loopback is pinned to {what}, which this build cannot carry")
+                write!(
+                    formatter,
+                    "the loopback is pinned to {what}, which this build cannot carry"
+                )
             }
         }
     }
@@ -282,8 +288,9 @@ impl Capture {
         )
         .map_err(CaptureError::Refine)?;
 
-        let sample_format = format_from_mask(&open.masks[uapi::FORMAT].bits)
-            .ok_or_else(|| CaptureError::Unsupported("a sample format no record names".to_owned()))?;
+        let sample_format = format_from_mask(&open.masks[uapi::FORMAT].bits).ok_or_else(|| {
+            CaptureError::Unsupported("a sample format no record names".to_owned())
+        })?;
         let (channels, _) = uapi::interval(&open, uapi::CHANNELS);
         let (rate, _) = uapi::interval(&open, uapi::RATE);
         let pinned = Format {

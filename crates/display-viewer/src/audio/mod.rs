@@ -110,7 +110,10 @@ fn serve(parameters: &Parameters, mute: &Receiver<Mute>) -> Result<(), String> {
                 if let Some(renderer) = renderer.as_mut() {
                     renderer.set_muted(muted);
                 }
-                tracing::info!("the guest's audio is {}", if muted { "muted" } else { "playing" });
+                tracing::info!(
+                    "the guest's audio is {}",
+                    if muted { "muted" } else { "playing" }
+                );
             }
             Err(TryRecvError::Disconnected) => return Ok(()),
             Err(TryRecvError::Empty) => {}

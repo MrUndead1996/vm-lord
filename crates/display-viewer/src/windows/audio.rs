@@ -27,7 +27,7 @@ use windows::{
             AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
             AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, DEVICE_STATE, EDataFlow, ERole, IAudioClient,
             IAudioRenderClient, IMMDevice, IMMDeviceEnumerator, IMMNotificationClient,
-            IMMNotificationClient_Impl, MMDeviceEnumerator, WAVEFORMATEX, WAVE_FORMAT_PCM,
+            IMMNotificationClient_Impl, MMDeviceEnumerator, WAVE_FORMAT_PCM, WAVEFORMATEX,
             eConsole, eRender,
         },
         System::Com::{
@@ -332,9 +332,10 @@ impl Renderer {
         {
             tracing::debug!("{gap} frames of audio were not sent");
         }
-        self.last_position = Some(position.wrapping_add(
-            u32::try_from(pcm.len() / self.format.bytes_per_frame()).unwrap_or(0),
-        ));
+        self.last_position =
+            Some(position.wrapping_add(
+                u32::try_from(pcm.len() / self.format.bytes_per_frame()).unwrap_or(0),
+            ));
 
         if self.muted {
             return;
@@ -418,7 +419,8 @@ impl Renderer {
                     None,
                 )
                 .map_err(RendererError::Endpoint)?;
-            let render: IAudioRenderClient = client.GetService().map_err(RendererError::Endpoint)?;
+            let render: IAudioRenderClient =
+                client.GetService().map_err(RendererError::Endpoint)?;
             client.Start().map_err(RendererError::Endpoint)?;
 
             Ok((client, render))

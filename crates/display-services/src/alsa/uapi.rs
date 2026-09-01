@@ -159,8 +159,7 @@ pub const SNDRV_PCM_IOCTL_DROP: libc::c_ulong = io_none(0x43);
 ///
 /// `_IOR`, not `_IOW`: the kernel writes `result` back into the structure.
 /// Encoding it as a write costs an `ENOTTY` that says nothing about why.
-pub const SNDRV_PCM_IOCTL_READI_FRAMES: libc::c_ulong =
-    io_read(0x51, size_of::<SndXferi>() as u32);
+pub const SNDRV_PCM_IOCTL_READI_FRAMES: libc::c_ulong = io_read(0x51, size_of::<SndXferi>() as u32);
 
 /// Where the access mask lives in [`SndPcmHwParams::masks`].
 pub const ACCESS: usize = 0;
