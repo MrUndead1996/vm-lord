@@ -99,6 +99,12 @@ pub fn support_from(width: u32, height: u32) -> Support {
             // daemon attached the guest simply offers nothing.
             Capability::Clipboard,
             Capability::FileClipboard,
+            // The same reasoning as the clipboard's, and the same trap: what is
+            // announced here is what this build ships, not what is attached.
+            // Negotiation is an intersection, so a capability the host offers
+            // and this list omits is one the session does not have -- and the
+            // daemon that serves it then waits for a connection nobody makes.
+            Capability::Audio,
             // The connector's mode list is the host monitor's, and this build
             // is the one that replaces it. Announced here so that a host on an
             // older protocol revision never sends a record this cannot apply.
@@ -898,6 +904,45 @@ mod tests {
         assert!(
             support.capabilities.contains(&Capability::Clipboard),
             "a build that ships the clipboard daemon says so, whether or not one is attached"
+        );
+        assert!(
+            support.capabilities.contains(&Capability::Audio),
+            "and a build that ships the audio daemon says so, for the same reason"
+        );
+    }
+
+    #[test]
+    fn a_capability_the_guest_does_not_announce_is_not_in_the_session() {
+        // Negotiation is an intersection, so a capability the host offers and
+        // the guest omits is one the session does not have -- and the daemon
+        // that serves it then waits for a connection that never comes.
+        let secret = Secret::generate();
+        let asking_for_audio = Offer {
+            capabilities: vec![Capability::CursorStream, Capability::Audio],
+            ..offer()
+        };
+        let (mut host, client_hello) = Session::host(&secret, asking_for_audio);
+        let mut control = Control::new(&secret, support_from(1920, 1080));
+        let mut wire = Duplex::default();
+        wire.offer(&client_hello);
+
+        for _ in 0..2 {
+            let _ = control.pump(&mut wire);
+            for (message_type, payload) in wire.taken() {
+                let record = Record::new(Channel::Control, message_type, 0, 0, 0, payload);
+                if let Ok(outcome) = host.handle(&record.header, &record.payload)
+                    && let Some(reply) = outcome.reply
+                {
+                    wire.offer(&reply);
+                }
+            }
+        }
+
+        let negotiated = host.negotiated().expect("an established host");
+
+        assert!(
+            negotiated.capabilities.contains(&Capability::Audio),
+            "the host offers audio and this guest ships the daemon, so the session has it"
         );
     }
 
