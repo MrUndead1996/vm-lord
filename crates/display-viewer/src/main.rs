@@ -59,6 +59,7 @@ use vmlord_display_viewer::{
     resize::Resize,
     state::{Quality, Store, WindowState},
     status::{self, Button, Event, Progress, Status},
+    audio::{self, Mute},
     windows::{
         clipboard::{self, Focus},
         d3d::Renderer,
@@ -187,6 +188,7 @@ fn run(parameters: LaunchParameters, claim: SingleInstance) -> ExitCode {
     let (orders_out, orders) = mpsc::channel();
 
     let clipboard: Arc<Mutex<Option<Sender<Focus>>>> = Arc::default();
+    let audio: Arc<Mutex<Option<Sender<Mute>>>> = Arc::default();
     let reader = spawn_reader(to_session, window.poster());
     let writer = spawn_writer(outgoing);
     let session = spawn_session(Session {
@@ -198,6 +200,8 @@ fn run(parameters: LaunchParameters, claim: SingleInstance) -> ExitCode {
         frame: Arc::clone(&frame),
         poster: window.poster(),
         clipboard: Arc::clone(&clipboard),
+        audio: Arc::clone(&audio),
+        muted: state.muted,
     });
 
     let exit = pump(
@@ -212,6 +216,7 @@ fn run(parameters: LaunchParameters, claim: SingleInstance) -> ExitCode {
             ui: &ui,
             commands: &commands_in,
             clipboard: &clipboard,
+            audio: &audio,
             outbox: &to_parent_from_window,
         },
         &mut state,
@@ -337,6 +342,11 @@ struct Session {
     /// and the session knows when a clipboard channel is worth having, and the
     /// thread that carries selections is made and dropped once per session.
     clipboard: Arc<Mutex<Option<Sender<Focus>>>>,
+    /// Where the window's mute commands are sent, once an audio thread exists
+    /// to hear them. Shared for the reason the clipboard's sender is.
+    audio: Arc<Mutex<Option<Sender<Mute>>>>,
+    /// Whether this VM's sound was muted when its window was last closed.
+    muted: bool,
 }
 
 /// Everything the main loop borrows.
@@ -351,6 +361,7 @@ struct Loop<'a> {
     ui: &'a Receiver<UiEvent>,
     commands: &'a Receiver<Command>,
     clipboard: &'a Arc<Mutex<Option<Sender<Focus>>>>,
+    audio: &'a Arc<Mutex<Option<Sender<Mute>>>>,
     /// Straight to VMLord, for what the window itself finds.
     outbox: &'a Sender<Message>,
 }
@@ -456,6 +467,9 @@ fn attempt(session: &Session, hello: &[u8]) -> Attempt {
     // the Windows clipboard cannot delay a frame. It ends when the sender the
     // holder keeps is dropped, which is at the end of this session.
     let clipboard = start_clipboard(session, &handover);
+    // The same shape, and for the same reason: an endpoint that has to be
+    // rebuilt must not hold a frame up while it is.
+    let audio = start_audio(session, &handover);
 
     let runtime_id = session.parameters.runtime_id;
     let frame_port = session.parameters.frame_port;
@@ -487,8 +501,42 @@ fn attempt(session: &Session, hello: &[u8]) -> Attempt {
 
     let outcome = drive(session, &mut live);
     stop_clipboard(session, clipboard);
+    stop_audio(session, audio);
 
     outcome
+}
+
+/// Starts this session's audio thread, if the session has sound.
+///
+/// A session without the capability gets no thread and no socket, for the
+/// reason the clipboard's does not: the guest either ships the daemon or it
+/// does not, and a capability cannot be renegotiated.
+fn start_audio(session: &Session, handover: &Handover) -> Option<JoinHandle<()>> {
+    if !handover.capabilities.contains(&i32::from(Capability::Audio)) {
+        tracing::info!("this guest has no audio");
+
+        return None;
+    }
+
+    let (handle, sender) = audio::spawn(audio::Parameters {
+        runtime_id: session.parameters.runtime_id,
+        port: session.parameters.audio_port,
+        handover: handover.clone(),
+        muted: session.muted,
+    });
+    *session.audio.lock().expect("the mute sender is not poisoned") = Some(sender);
+
+    Some(handle)
+}
+
+/// Ends this session's audio thread by taking the sender it listens on.
+fn stop_audio(session: &Session, handle: Option<JoinHandle<()>>) {
+    *session.audio.lock().expect("the mute sender is not poisoned") = None;
+
+    // Not joined, for the reason the clipboard thread is not: it ends on its
+    // own once its sender is gone, and a session's end is not worth waiting on
+    // a socket for.
+    drop(handle);
 }
 
 /// Starts this session's clipboard thread, if the session has a clipboard.
@@ -835,6 +883,21 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState, fps_gap_threshold_percen
                     state.quality = quality;
                     context.window.check_quality(quality);
                     let _ = context.orders.send(Order::Mode(mode_of(quality)));
+                }
+                UiEvent::ToggleMute => {
+                    state.muted = !state.muted;
+                    context.window.check_muted(state.muted);
+                    // Nothing to tell if this guest has no audio thread: the
+                    // menu still remembers what the user asked for, and a
+                    // session that does have one starts muted accordingly.
+                    if let Some(sender) = context
+                        .audio
+                        .lock()
+                        .expect("the mute sender is not poisoned")
+                        .as_ref()
+                    {
+                        let _ = sender.send(if state.muted { Mute::On } else { Mute::Off });
+                    }
                 }
             }
         }

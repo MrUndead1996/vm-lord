@@ -44,12 +44,14 @@ use windows::{
             },
             Shell::{ITaskbarList2, TaskbarList},
             WindowsAndMessaging::{
-                AdjustWindowRect, AppendMenuW, CW_USEDEFAULT, CheckMenuRadioItem, CreatePopupMenu,
+                AdjustWindowRect, AppendMenuW, CW_USEDEFAULT, CheckMenuItem, CheckMenuRadioItem,
+                CreatePopupMenu,
                 CreateWindowExW, DefWindowProcW, DeleteMenu, DestroyMenu, DestroyWindow,
                 DispatchMessageW, GWL_EXSTYLE, GWL_STYLE, GWLP_USERDATA, GetClientRect,
                 GetSystemMenu, GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, HMENU,
                 HWND_TOP, IDC_ARROW, IsIconic, LoadCursorW, MB_ICONERROR, MB_OK, MF_BYCOMMAND,
-                MF_BYPOSITION, MF_POPUP, MF_SEPARATOR, MF_STRING, MONITORINFOF_PRIMARY, MSG,
+                MF_BYPOSITION, MF_CHECKED, MF_POPUP, MF_SEPARATOR, MF_STRING, MF_UNCHECKED,
+                MONITORINFOF_PRIMARY, MSG,
                 MessageBoxW, PM_REMOVE, PeekMessageW, PostMessageW, PostQuitMessage,
                 RegisterClassW, SW_RESTORE, SW_SHOW, SW_SHOWNORMAL, SWP_FRAMECHANGED, SWP_NOMOVE,
                 SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow,
@@ -101,6 +103,9 @@ pub const SC_QUALITY_AUTO: usize = 0x9040;
 
 /// Encode a desktop, whatever the picture is doing.
 pub const SC_QUALITY_DESKTOP: usize = 0x9050;
+
+/// Silences the guest's sound, or lets it play again.
+pub const SC_MUTE_AUDIO: usize = 0x9060;
 
 /// The submenu the host monitor's modes are offered in.
 ///
@@ -182,6 +187,8 @@ pub enum UiEvent {
     ToggleFullscreen,
     /// The user picked an encoding mode from the system menu.
     Quality(Quality),
+    /// The user turned the guest's sound off, or back on.
+    ToggleMute,
     /// The user picked a resolution from the system menu.
     DisplayMode(DisplayMode),
     /// The monitor the window is on may not be the one it was on.
@@ -311,6 +318,12 @@ impl Window {
                     }
                 }
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+                // Listed whether or not this session negotiated audio: a menu
+                // item that appears halfway through a session is worse than
+                // one that does nothing on a guest with no daemon.
+                let mute = HSTRING::from("Mute audio");
+                let _ = AppendMenuW(menu, MF_STRING, SC_MUTE_AUDIO, PCWSTR(mute.as_ptr()));
+                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
                 // Two modes and not three: Motion is task #123's, and a menu
                 // offering a mode the guest refuses is a menu that lies.
                 let auto = HSTRING::from("Quality: Auto");
@@ -346,6 +359,7 @@ impl Window {
             window.shared.report(UiEvent::Moved(x, y));
         }
         window.check_quality(state.quality);
+        window.check_muted(state.muted);
         if state.fullscreen {
             let mut window = window;
             window.set_fullscreen(true);
@@ -432,6 +446,19 @@ impl Window {
                     chosen as u32,
                     MF_BYCOMMAND.0,
                 );
+            }
+        }
+    }
+
+    /// Marks whether the guest's sound is muted.
+    pub fn check_muted(&self, muted: bool) {
+        // SAFETY: the window's own menu, which belongs to it until it is
+        // destroyed.
+        unsafe {
+            let menu = GetSystemMenu(self.hwnd, false);
+            if !menu.is_invalid() {
+                let state = if muted { MF_CHECKED } else { MF_UNCHECKED };
+                CheckMenuItem(menu, SC_MUTE_AUDIO as u32, (MF_BYCOMMAND | state).0);
             }
         }
     }
@@ -1100,6 +1127,11 @@ extern "system" fn wnd_proc(hwnd: HWND, message: u32, wparam: WPARAM, lparam: LP
                 }
                 SC_FULLSCREEN => {
                     shared.report(UiEvent::ToggleFullscreen);
+
+                    return LRESULT(0);
+                }
+                SC_MUTE_AUDIO => {
+                    shared.report(UiEvent::ToggleMute);
 
                     return LRESULT(0);
                 }
