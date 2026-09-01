@@ -53,7 +53,7 @@ use vmlord_display_viewer::{
     fps_gap::{self, FpsGap},
     input::{self, Report},
     launch::{self, Command, DiagnosticLevel, Handover, LaunchParameters, Link, Message},
-    live::{Live, Signal},
+    live::{GuestCommand, Live, Signal},
     log as viewer_log,
     placement::place,
     relay::{Relay, RelayError},
@@ -793,6 +793,23 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState, fps_gap_threshold_percen
                     // arrived at the mode before are not this one's.
                     fps_gap.reset();
                 }
+                Signal::GuestCommand(command) => {
+                    if handle_ui_event(
+                        &mut context,
+                        state,
+                        &mut progress,
+                        &mut hook,
+                        &mut policy,
+                        stream,
+                        &mut resize,
+                        &mut monitors,
+                        native,
+                        &offered,
+                        ui_event_of(*command),
+                    ) {
+                        closing = true;
+                    }
+                }
                 Signal::Ended(_) => {
                     policy.report(Report::ChannelLost);
                     // The guest that was told the window's size is not the
@@ -819,95 +836,20 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState, fps_gap_threshold_percen
 
         while let Ok(event) = context.ui.try_recv() {
             worked = true;
-            match event {
-                UiEvent::Pressed(Button::Retry) => {
-                    progress.on(Event::Retry, Instant::now());
-                    let _ = context.orders.send(Order::Retry);
-                }
-                UiEvent::Pressed(Button::Cancel) | UiEvent::Closing => closing = true,
-                UiEvent::Input(report) => {
-                    match report {
-                        Report::FocusGained => {
-                            tell_clipboard(context.clipboard, Focus::Gained);
-                            match Hook::install(context.shared) {
-                                Ok(installed) => hook = Some(installed),
-                                // A viewer without the hook still types; it only
-                                // loses the keys the shell takes first.
-                                Err(error) => tracing::warn!("{error}"),
-                            }
-                        }
-                        Report::FocusLost | Report::ReleaseKeyboard => {
-                            // The clipboard follows the keyboard: a VM in the
-                            // background neither reads what its user copies
-                            // elsewhere nor replaces what is on their clipboard.
-                            tell_clipboard(context.clipboard, Focus::Lost);
-                            hook = None;
-                        }
-                        _ => {}
-                    }
-                    policy.report(report);
-                }
-                UiEvent::Resized(width, height) => {
-                    let (width, height) = (width.max(0) as u32, height.max(0) as u32);
-                    if let Err(error) = context.renderer.resize_swapchain(width, height) {
-                        tracing::warn!("the swapchain could not follow the window: {error}");
-                    }
-                    reposition(&mut policy, stream, context.window);
-                    // Held rather than sent: a drag is hundreds of these, and
-                    // each one taken at face value is a mode set in the guest.
-                    resize.observe(width, height, Instant::now());
-                    // What is remembered is the window, not the monitor a
-                    // full-screen one is covering.
-                    if !context.window.is_fullscreen() && width > 0 && height > 0 {
-                        state.size = (width, height);
-                    }
-                }
-                UiEvent::MonitorChanged => monitors.observe(Instant::now()),
-                UiEvent::DisplayMode(mode) => {
-                    // Remembered because the user said so: a mode chosen by
-                    // policy is one the next monitor may not have, and a mode
-                    // chosen from the menu is what this VM opens at.
-                    state.display_mode = Some(mode);
-                    context.window.set_modes(&offered, Some(mode));
-                    let _ = context.orders.send(Order::DisplayMode(mode));
-                }
-                UiEvent::Moved(x, y) => {
-                    // Only a restored window reports this, so what is kept is
-                    // the place the user left the window rather than the
-                    // monitor a full-screen one is covering.
-                    state.position = Some((x, y));
-                }
-                UiEvent::ToggleFullscreen => {
-                    let wanted = !context.window.is_fullscreen();
-                    context.window.set_fullscreen(wanted);
-                    state.fullscreen = context.window.is_fullscreen();
-                    // A window filling a monitor wants that monitor's own
-                    // timing, which is not always the one the desktop is on.
-                    if wanted && let Some(mode) = native.filter(|mode| offered.contains(mode)) {
-                        context.window.set_modes(&offered, Some(mode));
-                        let _ = context.orders.send(Order::DisplayMode(mode));
-                    }
-                }
-                UiEvent::Quality(quality) => {
-                    state.quality = quality;
-                    context.window.check_quality(quality);
-                    let _ = context.orders.send(Order::Mode(mode_of(quality)));
-                }
-                UiEvent::ToggleMute => {
-                    state.muted = !state.muted;
-                    context.window.check_muted(state.muted);
-                    // Nothing to tell if this guest has no audio thread: the
-                    // menu still remembers what the user asked for, and a
-                    // session that does have one starts muted accordingly.
-                    if let Some(sender) = context
-                        .audio
-                        .lock()
-                        .expect("the mute sender is not poisoned")
-                        .as_ref()
-                    {
-                        let _ = sender.send(if state.muted { Mute::On } else { Mute::Off });
-                    }
-                }
+            if handle_ui_event(
+                &mut context,
+                state,
+                &mut progress,
+                &mut hook,
+                &mut policy,
+                stream,
+                &mut resize,
+                &mut monitors,
+                native,
+                &offered,
+                event,
+            ) {
+                closing = true;
             }
         }
 
@@ -1009,6 +951,138 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState, fps_gap_threshold_percen
     ExitCode::SUCCESS
 }
 
+/// Acts on one event the window raised.
+///
+/// Guest commands arrive as the event their system-menu counterpart would
+/// have raised -- see [`ui_event_of`] -- so this is the one place any of them
+/// is answered from, and the menu and the guest cannot grow apart.
+///
+/// Answers whether the event asked for the window to close.
+fn handle_ui_event(
+    context: &mut Loop<'_>,
+    state: &mut WindowState,
+    progress: &mut Progress,
+    hook: &mut Option<Hook>,
+    policy: &mut input::Policy,
+    stream: Option<Geometry>,
+    resize: &mut Resize,
+    monitors: &mut MonitorWatch,
+    native: Option<DisplayMode>,
+    offered: &[DisplayMode],
+    event: UiEvent,
+) -> bool {
+    let mut closing = false;
+    match event {
+        UiEvent::Pressed(Button::Retry) => {
+            progress.on(Event::Retry, Instant::now());
+            let _ = context.orders.send(Order::Retry);
+        }
+        UiEvent::Pressed(Button::Cancel) | UiEvent::Closing => closing = true,
+        UiEvent::Input(report) => {
+            match report {
+                Report::FocusGained => {
+                    tell_clipboard(context.clipboard, Focus::Gained);
+                    match Hook::install(context.shared) {
+                        Ok(installed) => *hook = Some(installed),
+                        // A viewer without the hook still types; it only
+                        // loses the keys the shell takes first.
+                        Err(error) => tracing::warn!("{error}"),
+                    }
+                }
+                Report::FocusLost | Report::ReleaseKeyboard => {
+                    // The clipboard follows the keyboard: a VM in the
+                    // background neither reads what its user copies
+                    // elsewhere nor replaces what is on their clipboard.
+                    tell_clipboard(context.clipboard, Focus::Lost);
+                    *hook = None;
+                }
+                _ => {}
+            }
+            policy.report(report);
+        }
+        UiEvent::Resized(width, height) => {
+            let (width, height) = (width.max(0) as u32, height.max(0) as u32);
+            if let Err(error) = context.renderer.resize_swapchain(width, height) {
+                tracing::warn!("the swapchain could not follow the window: {error}");
+            }
+            reposition(policy, stream, context.window);
+            // Held rather than sent: a drag is hundreds of these, and
+            // each one taken at face value is a mode set in the guest.
+            resize.observe(width, height, Instant::now());
+            // What is remembered is the window, not the monitor a
+            // full-screen one is covering.
+            if !context.window.is_fullscreen() && width > 0 && height > 0 {
+                state.size = (width, height);
+            }
+        }
+        UiEvent::MonitorChanged => monitors.observe(Instant::now()),
+        UiEvent::DisplayMode(mode) => {
+            // Remembered because the user said so: a mode chosen by
+            // policy is one the next monitor may not have, and a mode
+            // chosen from the menu is what this VM opens at.
+            state.display_mode = Some(mode);
+            context.window.set_modes(offered, Some(mode));
+            let _ = context.orders.send(Order::DisplayMode(mode));
+        }
+        UiEvent::Moved(x, y) => {
+            // Only a restored window reports this, so what is kept is
+            // the place the user left the window rather than the
+            // monitor a full-screen one is covering.
+            state.position = Some((x, y));
+        }
+        UiEvent::ToggleFullscreen => {
+            let wanted = !context.window.is_fullscreen();
+            context.window.set_fullscreen(wanted);
+            state.fullscreen = context.window.is_fullscreen();
+            // A window filling a monitor wants that monitor's own
+            // timing, which is not always the one the desktop is on.
+            if wanted && let Some(mode) = native.filter(|mode| offered.contains(mode)) {
+                context.window.set_modes(offered, Some(mode));
+                let _ = context.orders.send(Order::DisplayMode(mode));
+            }
+        }
+        UiEvent::Quality(quality) => {
+            state.quality = quality;
+            context.window.check_quality(quality);
+            let _ = context.orders.send(Order::Mode(mode_of(quality)));
+        }
+        UiEvent::ToggleMute => {
+            state.muted = !state.muted;
+            context.window.check_muted(state.muted);
+            // Nothing to tell if this guest has no audio thread: the
+            // menu still remembers what the user asked for, and a
+            // session that does have one starts muted accordingly.
+            if let Some(sender) = context
+                .audio
+                .lock()
+                .expect("the mute sender is not poisoned")
+                .as_ref()
+            {
+                let _ = sender.send(if state.muted { Mute::On } else { Mute::Off });
+            }
+        }
+    }
+
+    closing
+}
+
+/// The window event the same command from the system menu would have raised.
+///
+/// This is the whole of the guest-command dispatch: a command that crosses the
+/// control channel joins the queue its menu counterpart reports to, and one
+/// behaviour stays behind one path.
+fn ui_event_of(command: GuestCommand) -> UiEvent {
+    match command {
+        GuestCommand::ToggleFullscreen => UiEvent::ToggleFullscreen,
+        GuestCommand::ReleaseKeyboard => UiEvent::Input(Report::ReleaseKeyboard),
+        GuestCommand::SecureAttention => UiEvent::Input(Report::SecureAttention),
+        GuestCommand::ToggleMute => UiEvent::ToggleMute,
+        GuestCommand::QualityAuto => UiEvent::Quality(Quality::Auto),
+        GuestCommand::QualityDesktop => UiEvent::Quality(Quality::Desktop),
+        GuestCommand::DisplayMode(mode) => UiEvent::DisplayMode(mode),
+    }
+}
+
 /// The wire mode a menu choice means.
 ///
 /// `Auto` is a host-side policy, and until task #123 there is one mode to
@@ -1070,8 +1144,9 @@ fn apply(context: &mut Loop<'_>, progress: &mut Progress, signal: Signal) {
         // Where the guest thinks its pointer is. The host's own cursor is what
         // the user sees until #119 wires input up.
         // Both are the main loop's own business rather than the renderer's:
-        // where the guest thinks its pointer is, and what mode it came up on.
-        Signal::Moved(_) | Signal::Damage(_) | Signal::Committed(_) => {}
+        // where the guest thinks its pointer is, what mode it came up on, and
+        // a command the pump has already answered.
+        Signal::Moved(_) | Signal::Damage(_) | Signal::Committed(_) | Signal::GuestCommand(_) => {}
         Signal::Status(event) => progress.on(event, Instant::now()),
         Signal::Ended(reason) => tracing::info!("the session is over: {reason}"),
     }

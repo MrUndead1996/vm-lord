@@ -301,7 +301,7 @@ impl Window {
                     PCWSTR(release.as_ptr()),
                 );
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-                let full = HSTRING::from("Full screen\tF11");
+                let full = HSTRING::from("Full screen");
                 let _ = AppendMenuW(menu, MF_STRING, SC_FULLSCREEN, PCWSTR(full.as_ptr()));
                 // Empty until the host has published a monitor's modes, which
                 // is a submenu the user finds greyed rather than one that
@@ -1287,7 +1287,7 @@ thread_local! {
     /// The shell's taskbar object, asked for once per thread that needs it.
     ///
     /// Once, because a shell that has no answer has no answer, and a warning
-    /// per `F11` is a log nobody reads.
+    /// per full-screen toggle is a log nobody reads.
     static TASKBAR: OnceCell<Option<ITaskbarList2>> = const { OnceCell::new() };
 }
 

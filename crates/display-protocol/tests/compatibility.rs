@@ -10,8 +10,8 @@ use vmlord_display_protocol::{
     record::{Channel, Record},
     session::{Offer, Session, SessionError, Support},
     v1::{
-        Capability, ClientHello, ControlRecord, DisplayTiming, Mode, ProtocolVersion, ServerHello,
-        SetAvailableModes, SetDisplayMode,
+        Capability, ClientHello, ControlRecord, DisplayTiming, GuestCommand, GuestCommandKind,
+        Mode, ProtocolVersion, ServerHello, SetAvailableModes, SetDisplayMode,
     },
 };
 
@@ -88,6 +88,49 @@ fn display_timings_and_mode_updates_survive_the_wire() {
         SetDisplayMode::decode(selected.encode_to_vec().as_slice()).unwrap(),
         selected
     );
+}
+
+#[test]
+fn a_guest_command_survives_the_wire() {
+    let fullscreen = GuestCommand {
+        kind: GuestCommandKind::ToggleFullscreen as i32,
+        display_mode: None,
+    };
+
+    assert_eq!(
+        GuestCommand::decode(fullscreen.encode_to_vec().as_slice()).unwrap(),
+        fullscreen
+    );
+
+    let mode = GuestCommand {
+        kind: GuestCommandKind::SetDisplayMode as i32,
+        display_mode: Some(DisplayTiming {
+            width: 1920,
+            height: 1080,
+            refresh_hz: 60,
+        }),
+    };
+
+    assert_eq!(
+        GuestCommand::decode(mode.encode_to_vec().as_slice()).unwrap(),
+        mode
+    );
+    assert_eq!(
+        GuestCommand::decode(mode.encode_to_vec().as_slice())
+            .unwrap()
+            .kind(),
+        GuestCommandKind::SetDisplayMode
+    );
+}
+
+#[test]
+fn an_empty_guest_command_reads_as_an_unspecified_one() {
+    // A peer from before guest commands, or one that had nothing to say, sends
+    // a zero rather than a kind: what arrives must name no action at all.
+    let empty = GuestCommand::decode(Vec::new().as_slice()).unwrap();
+
+    assert_eq!(empty.kind(), GuestCommandKind::Unspecified);
+    assert!(empty.display_mode.is_none());
 }
 
 #[test]

@@ -17,8 +17,8 @@ use vmlord_display_protocol::{
     record::{self, Channel, Limits, Record, RecordError},
     session::{Event, Session, Support},
     v1::{
-        Capability, ControlRecord, DisplayState, DisplayTiming, ErrorCode, Mode, Ping, Pong,
-        SetAvailableModes, SetDisplayMode, SetMode, SetResolution,
+        Capability, ControlRecord, DisplayState, DisplayTiming, ErrorCode, GuestCommand, Mode,
+        Ping, Pong, SetAvailableModes, SetDisplayMode, SetMode, SetResolution,
     },
 };
 
@@ -382,6 +382,20 @@ impl Control {
                         Outcome::Nothing
                     }
                 }
+            }
+            Ok(ControlRecord::GuestCommand) => {
+                // Raised by the guest's own user interface for the host viewer
+                // to act on, which is not the broker's to do. Nothing is sent
+                // back, so the host is not told a record it sent is malformed
+                // -- and the catch-all below would say exactly that.
+                let kind = GuestCommand::decode(payload)
+                    .ok()
+                    .map(|command| command.kind());
+                eprintln!(
+                    "vmlord-display-broker: a guest command of kind {kind:?} is not forwarded by this build"
+                );
+
+                Outcome::Nothing
             }
             Ok(ControlRecord::EndSession) => {
                 Outcome::Closed("the host ended the session".to_owned())

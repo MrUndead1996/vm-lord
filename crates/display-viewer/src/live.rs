@@ -21,9 +21,10 @@ use vmlord_display_protocol::{
     record::{self, Channel, Limits, Record, RecordError},
     session::{Event as SessionEvent, HandedOver, Negotiated, Session, SessionError},
     v1::{
-        Capability, ControlRecord, DisplayState, DisplayTiming, Error as ErrorRecord, InputRecord,
-        KeyEvent, Mode, Ping, PointerButton, PointerMotion, PointerScroll, Pong, ProtocolVersion,
-        SetAvailableModes, SetDisplayMode, SetMode, SetResolution,
+        Capability, ControlRecord, DisplayState, DisplayTiming, Error as ErrorRecord,
+        GuestCommand as GuestCommandRecord, GuestCommandKind, InputRecord, KeyEvent, Mode, Ping,
+        PointerButton, PointerMotion, PointerScroll, Pong, ProtocolVersion, SetAvailableModes,
+        SetDisplayMode, SetMode, SetResolution,
     },
 };
 
@@ -81,10 +82,38 @@ pub enum Signal {
     /// a compositor that has committed nothing yet: there is then no rate to
     /// measure a delivered one against.
     Committed(Option<DisplayMode>),
+    /// A command the guest's user raised, for the same handlers the window's
+    /// own menu reports to.
+    GuestCommand(GuestCommand),
     /// Something the status machine has to know.
     Status(Event),
     /// The session is over, for the reason given. Fit for a log.
     Ended(String),
+}
+
+/// A user command raised inside the guest, on its way to the window's
+/// handlers.
+///
+/// The guest offers its user what the host's system menu offers theirs, and
+/// each command crosses the control channel rather than being acted on in the
+/// guest: the host answers it through the code the menu runs, so both halves
+/// of a session give the same answer to the same request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestCommand {
+    /// Fill the host's monitor, or stop filling it.
+    ToggleFullscreen,
+    /// Hand the keyboard back to the host.
+    ReleaseKeyboard,
+    /// `Ctrl+Alt+Del`, for the guest to decide what it means.
+    SecureAttention,
+    /// Silence the guest's sound, or let it play again.
+    ToggleMute,
+    /// Let the guest trade bandwidth for fidelity as it sees fit.
+    QualityAuto,
+    /// Encode a desktop, whatever the picture is doing.
+    QualityDesktop,
+    /// Put the guest's output on this host monitor mode.
+    DisplayMode(DisplayMode),
 }
 
 /// One session, driven by the window's message loop.
@@ -476,6 +505,16 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
                         );
                     }
                 }
+                Ok(ControlRecord::GuestCommand) => {
+                    match GuestCommandRecord::decode(payload.as_slice())
+                        .ok()
+                        .as_ref()
+                        .and_then(guest_command)
+                    {
+                        Some(command) => signals.push(Signal::GuestCommand(command)),
+                        None => tracing::debug!("a guest command this build does not read"),
+                    }
+                }
                 Ok(ControlRecord::EndSession) => {
                     signals.push(Signal::Ended("the guest ended the session".to_owned()));
                     self.payload = payload;
@@ -694,6 +733,28 @@ fn timing(mode: DisplayMode) -> DisplayTiming {
     }
 }
 
+/// Reads one guest command, or `None` for one this build has no name for.
+///
+/// A mode the host's own policy would refuse is read all the same: what the
+/// guest's user asked for is answered by the same handlers the menu answers
+/// to, and no rule of the wire's is broken by a request they turn down.
+fn guest_command(record: &GuestCommandRecord) -> Option<GuestCommand> {
+    Some(match record.kind() {
+        GuestCommandKind::ToggleFullscreen => GuestCommand::ToggleFullscreen,
+        GuestCommandKind::ReleaseKeyboard => GuestCommand::ReleaseKeyboard,
+        GuestCommandKind::SendSecureAttention => GuestCommand::SecureAttention,
+        GuestCommandKind::ToggleMute => GuestCommand::ToggleMute,
+        GuestCommandKind::QualityAuto => GuestCommand::QualityAuto,
+        GuestCommandKind::QualityDesktop => GuestCommand::QualityDesktop,
+        GuestCommandKind::SetDisplayMode => GuestCommand::DisplayMode(DisplayMode::new(
+            record.display_mode.as_ref()?.width,
+            record.display_mode.as_ref()?.height,
+            record.display_mode.as_ref()?.refresh_hz,
+        )?),
+        GuestCommandKind::Unspecified => return None,
+    })
+}
+
 /// Reads a channel key out of a hand-over.
 pub(crate) fn channel_key(bytes: &[u8], what: &str) -> Result<ChannelKey, String> {
     let bytes: [u8; 32] = bytes
@@ -713,13 +774,14 @@ mod tests {
         keys::{self, ChannelKey, Role, Tag},
         record::{self, Channel, Limits, Record},
         v1::{
-            ChannelAck, ChannelAuth, ChannelHello, ControlRecord, FrameRecord, InputRecord, Mode,
-            Ping, PixelFormat as WireFormat, Pong, SetAvailableModes, SetDisplayMode, SetMode,
+            ChannelAck, ChannelAuth, ChannelHello, ControlRecord, DisplayTiming, FrameRecord,
+            GuestCommand as GuestCommandRecord, GuestCommandKind, InputRecord, Mode, Ping,
+            PixelFormat as WireFormat, Pong, SetAvailableModes, SetDisplayMode, SetMode,
             SetResolution, StreamConfig,
         },
     };
 
-    use super::{Live, PONG_TIMEOUT, Signal};
+    use super::{GuestCommand, Live, PONG_TIMEOUT, Signal};
     use crate::{
         duplex::{self, Duplex},
         launch::Handover,
@@ -1237,6 +1299,116 @@ mod tests {
             signals
                 .iter()
                 .any(|signal| matches!(signal, Signal::Ended(_)))
+        );
+    }
+
+    #[test]
+    fn a_guest_command_reaches_the_window_as_a_signal() {
+        let now = Instant::now();
+        let (mut live, mut harness) = start(now);
+        let limits = Limits::new(0, 0);
+
+        record::write(
+            &mut harness.control,
+            &Record::new(
+                Channel::Control,
+                ControlRecord::GuestCommand as u16,
+                0,
+                0,
+                0,
+                GuestCommandRecord {
+                    kind: GuestCommandKind::ToggleFullscreen as i32,
+                    display_mode: None,
+                }
+                .encode_to_vec(),
+            ),
+            &limits,
+        )
+        .expect("an in-memory socket");
+
+        let mut signals = Vec::new();
+        live.pump(now, &mut signals);
+
+        assert!(
+            signals.iter().any(|signal| matches!(
+                signal,
+                Signal::GuestCommand(GuestCommand::ToggleFullscreen)
+            ))
+        );
+    }
+
+    #[test]
+    fn a_guest_chosen_mode_reaches_the_window_with_its_timing() {
+        let now = Instant::now();
+        let (mut live, mut harness) = start(now);
+        let limits = Limits::new(0, 0);
+
+        record::write(
+            &mut harness.control,
+            &Record::new(
+                Channel::Control,
+                ControlRecord::GuestCommand as u16,
+                0,
+                0,
+                0,
+                GuestCommandRecord {
+                    kind: GuestCommandKind::SetDisplayMode as i32,
+                    display_mode: Some(DisplayTiming {
+                        width: 1280,
+                        height: 720,
+                        refresh_hz: 60,
+                    }),
+                }
+                .encode_to_vec(),
+            ),
+            &limits,
+        )
+        .expect("an in-memory socket");
+
+        let mut signals = Vec::new();
+        live.pump(now, &mut signals);
+
+        let chosen = signals
+            .iter()
+            .filter_map(|signal| match signal {
+                Signal::GuestCommand(GuestCommand::DisplayMode(mode)) => Some(*mode),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            chosen,
+            vec![super::DisplayMode::new(1280, 720, 60).expect("a valid fixture")]
+        );
+    }
+
+    #[test]
+    fn a_guest_command_this_build_does_not_read_is_dropped() {
+        let now = Instant::now();
+        let (mut live, mut harness) = start(now);
+        let limits = Limits::new(0, 0);
+
+        record::write(
+            &mut harness.control,
+            &Record::new(
+                Channel::Control,
+                ControlRecord::GuestCommand as u16,
+                0,
+                0,
+                0,
+                GuestCommandRecord::default().encode_to_vec(),
+            ),
+            &limits,
+        )
+        .expect("an in-memory socket");
+
+        let mut signals = Vec::new();
+        live.pump(now, &mut signals);
+
+        assert!(
+            !signals
+                .iter()
+                .any(|signal| matches!(signal, Signal::GuestCommand(_)))
         );
     }
 

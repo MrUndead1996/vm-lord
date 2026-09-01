@@ -95,9 +95,9 @@ pub enum Report {
     },
     /// The input channel is gone; the guest has already released everything.
     ChannelLost,
-    /// The user asked for the keyboard back, from the menu.
+    /// The user asked for the keyboard back, from the menu or the guest.
     ReleaseKeyboard,
-    /// The user asked for `Ctrl+Alt+Del`, from the menu.
+    /// The user asked for `Ctrl+Alt+Del`, from the menu or the guest.
     SecureAttention,
 }
 
