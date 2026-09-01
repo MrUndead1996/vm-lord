@@ -25,11 +25,13 @@ fn main() {
     let repository = match &settings {
         Ok((_, settings_load)) => {
             match vmlord_core::initialize_with_diagnostics(&settings_load.settings) {
-                Ok(sink) => {
+                Ok((sink, log_path)) => {
                     diagnostics = Some(sink);
+                    // The file this launch opened, not the configured name: the
+                    // configured name is the template every run is stamped from.
                     tracing::info!(
                         "logging initialized at {} with {:?} level",
-                        settings_load.settings.log_file_path.display(),
+                        log_path.display(),
                         settings_load.settings.log_level
                     );
                     load_backend(&settings_load.settings)
