@@ -1,0 +1,34 @@
+[Unit]
+Description=VMLord display tray
+Documentation=https://github.com/mrundead/vmlord
+# A user unit, like the clipboard daemon's and for the same kind of reason:
+# a tray icon is part of a session. The icon is answered on the session's
+# bus, and it is the tray -- not the broker, which has no business on that
+# bus -- that restarts the clipboard unit there.
+After=graphical-session.target
+PartOf=graphical-session.target
+
+# The crash-loop budget. It belongs to the unit and not to the service:
+# systemd reads these two here, and answers them under [Service] with
+# `Unknown key ... ignoring` -- a rate limit that silently is not one.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+ExecStart=/usr/local/lib/vmlord/vmlord-display-tray
+# No watcher yet, no broker yet, a broker that went away: waiting for all of
+# these is the tray's own job, so a restart here means it actually failed.
+Restart=on-failure
+RestartSec=3
+# It holds no key and no device. A user unit inherits no privilege to give
+# away, and these keep it from acquiring any.
+NoNewPrivileges=yes
+# The broker's socket and the session's bus, both over AF_UNIX. No vsock,
+# which is what keeps this unit narrower than the clipboard's.
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+MemoryDenyWriteExecute=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=graphical-session.target
