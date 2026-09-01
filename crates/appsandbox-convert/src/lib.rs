@@ -42,3 +42,4 @@ mod facts;
 #[cfg(test)]
 mod fixture;
 mod install;
+mod remove;

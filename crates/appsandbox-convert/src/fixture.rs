@@ -15,7 +15,7 @@ use tempfile::TempDir;
 use crate::Conversion;
 
 /// The files an AppSandbox guest is recognised and converted by.
-const FILES: [(&str, &str); 21] = [
+const FILES: [(&str, &str); 47] = [
     (
         "/etc/os-release",
         "NAME=\"Ubuntu\"\nVERSION_ID=\"26.04\"\nID=ubuntu\n",
@@ -55,6 +55,66 @@ const FILES: [(&str, &str); 21] = [
     ),
     ("/opt/appsandbox/appsandbox-gpu", "#!/bin/sh\n"),
     ("/var/lib/appsandbox-firstboot.done", ""),
+    ("/etc/systemd/system/appsandbox-audio.service", "[Unit]\n"),
+    ("/etc/systemd/system/appsandbox-display.service", "[Unit]\n"),
+    ("/etc/systemd/system/appsandbox-input.service", "[Unit]\n"),
+    (
+        "/etc/systemd/system/asb-evict-simpledrm.service",
+        "[Unit]\n",
+    ),
+    (
+        "/etc/systemd/system/appsandbox-firstboot.service",
+        "[Unit]\n",
+    ),
+    (
+        "/etc/systemd/user/org.gnome.Shell@.service.d/no-gpu.conf",
+        "[Service]\nUnsetEnvironment=LD_LIBRARY_PATH\n",
+    ),
+    ("/etc/modules-load.d/dxgkrnl.conf", "dxgkrnl\n"),
+    ("/etc/modules-load.d/snd-aloop.conf", "snd-aloop\n"),
+    ("/etc/ld.so.conf.d/wsl-mesa.conf", "/opt/wsl-mesa/lib\n"),
+    (
+        "/etc/ld.so.conf.d/appsandbox-wsl-deps.conf",
+        "/opt/appsandbox/wsl-deps\n",
+    ),
+    ("/etc/ld.so.conf.d/wsl.conf", "/usr/lib/wsl/lib\n"),
+    ("/etc/vulkan/icd.d/dzn_icd.x86_64.json", "{}"),
+    (
+        "/etc/apt/appsandbox-sources.list.d/appsandbox-local.list",
+        "deb [trusted=yes] file:/opt/appsandbox/local-apt noble main\n",
+    ),
+    (
+        "/etc/default/grub.d/99-appsandbox-no-efifb.cfg",
+        "GRUB_CMDLINE_LINUX_DEFAULT=\"$GRUB_CMDLINE_LINUX_DEFAULT video=efifb:off\"\n",
+    ),
+    ("/etc/appsandbox-admin-user", "agromov"),
+    ("/etc/appsandbox-ssh-enabled", ""),
+    ("/opt/appsandbox/local-apt/pool/main/dkms.deb", "deb"),
+    ("/opt/wsl-mesa/lib/x86_64-linux-gnu/libGL.so", "ELF"),
+    ("/usr/src/asb_drm-1.0.0/dkms.conf", "PACKAGE_NAME=asb_drm\n"),
+    ("/usr/src/dxgkrnl-1.0.0/dkms.conf", "PACKAGE_NAME=dxgkrnl\n"),
+    ("/var/lib/dkms/asb_drm/1.0.0/source", ""),
+    ("/var/lib/dkms/dxgkrnl/1.0.0/source", ""),
+    (
+        "/lib/modules/6.14.0-24-generic/updates/dkms/asb_drm.ko",
+        "ELF",
+    ),
+    (
+        "/lib/modules/6.14.0-24-generic/updates/dkms/dxgkrnl.ko",
+        "ELF",
+    ),
+    ("/usr/local/bin/nvidia-smi", "ELF"),
+    ("/etc/fstab", "UUID=abc / ext4 rw,relatime 0 1\n"),
+];
+
+/// The units the first-boot script enabled, whose symlinks the fixture has for
+/// the same reason it has the files: the symlink is the enablement.
+const ENABLED: [&str; 5] = [
+    "appsandbox-agent.service",
+    "appsandbox-audio.service",
+    "appsandbox-display.service",
+    "appsandbox-input.service",
+    "asb-evict-simpledrm.service",
 ];
 
 pub(crate) struct AppSandboxGuest {
@@ -75,9 +135,13 @@ impl AppSandboxGuest {
         // converted guest has to be rid of.
         let wants = root.join("etc/systemd/system/multi-user.target.wants");
         fs::create_dir_all(&wants).expect("mkdir");
+        for unit in ENABLED {
+            unix_fs::symlink(format!("/etc/systemd/system/{unit}"), wants.join(unit))
+                .expect("symlink");
+        }
         unix_fs::symlink(
-            "/etc/systemd/system/appsandbox-agent.service",
-            wants.join("appsandbox-agent.service"),
+            "/etc/systemd/system/appsandbox-firstboot.service",
+            wants.join("appsandbox-firstboot.service"),
         )
         .expect("symlink");
         let agent = root.join("vmlord-agent-source");
