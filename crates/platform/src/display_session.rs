@@ -1,6 +1,6 @@
 //! VMLord's half of one display session.
 //!
-//! The viewer owns the three sockets and VMLord owns the VM's secret, so
+//! The viewer owns the sockets and VMLord owns the VM's secret, so
 //! neither can run the control handshake alone: the viewer frames records off
 //! the wire and passes the bytes up a pipe without reading into them, and what
 //! is here drives the protocol's `Session` over those bytes and hands back the

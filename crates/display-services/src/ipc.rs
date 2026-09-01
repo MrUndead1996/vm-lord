@@ -23,7 +23,7 @@ pub enum Message {
     SessionOpened(SessionParameters),
     /// A control handshake completed, as the clipboard daemon needs it.
     ClipboardOpened {
-        /// The 16 bytes that name the session across its four sockets.
+        /// The 16 bytes that name the session across its five sockets.
         session_id: Vec<u8>,
         /// The key the clipboard socket proves itself with.
         clipboard_key: Vec<u8>,
@@ -79,7 +79,7 @@ pub enum Message {
 /// that session runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionParameters {
-    /// The 16 bytes that name the session across its three sockets.
+    /// The 16 bytes that name the session across its five sockets.
     pub session_id: Vec<u8>,
     /// The key the frame socket proves itself with.
     pub frame_key: Vec<u8>,

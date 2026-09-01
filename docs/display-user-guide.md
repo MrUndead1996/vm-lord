@@ -17,7 +17,7 @@
 Select the running VM and press **Connect**. VMLord launches
 `vmlord-display.exe`; pressing Connect again focuses the existing window. The
 viewer authenticates the guest over the per-VM secret, then binds separate
-control, frame, input, and clipboard HvSocket channels.
+control, frame, input, clipboard and audio HvSocket channels.
 
 - Sign in through GDM with the account created for the VM.
 - Resize the window to request a matching guest mode. Modes are limited to one
@@ -65,6 +65,26 @@ text, HTML and images.
   closed. Move what you want to keep somewhere of your own.
 - A copy that is cancelled, times out, or is interrupted by the window losing
   focus leaves nothing half-written behind.
+
+## Sound
+
+What the guest plays comes out of your host's speakers, with no setup inside
+the VM: the display payload configures its audio for you.
+
+- **Mute audio** in the window's system menu (the icon at the top left, or
+  right-clicking the title bar) silences the VM without stopping it. The
+  setting is remembered per VM.
+- Muting is instant in both directions, and it silences only that VM: whatever
+  else is playing on your host is untouched.
+- Changing your host's output device -- plugging in headphones, switching to
+  another speaker -- moves the VM's sound with it within a second. The display
+  session is not interrupted.
+- If your host has no working output at the time, the VM keeps running and the
+  sound starts playing as soon as one is available again.
+- Sound needs the desktop to be playing something: an idle guest sends nothing
+  at all, which is why the channel costs no bandwidth while nothing is on.
+- There is no microphone. Nothing on your host is recorded, and the VM cannot
+  hear you.
 
 Display traffic does not traverse the VM's IP network. Removing network access
 after provisioning does not disconnect an existing display, but future package

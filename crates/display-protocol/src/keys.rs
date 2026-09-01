@@ -28,7 +28,7 @@ pub const SECRET_LEN: usize = 32;
 /// The width of each side's handshake nonce.
 pub const NONCE_LEN: usize = 32;
 
-/// The width of the identifier that names a session across its three sockets.
+/// The width of the identifier that names a session across its five sockets.
 pub const SESSION_ID_LEN: usize = 16;
 
 /// The width of a tag, which is HMAC-SHA-256's output.

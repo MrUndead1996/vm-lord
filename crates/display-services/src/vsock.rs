@@ -1,4 +1,4 @@
-//! The four sockets the host connects to.
+//! The five sockets the host connects to.
 //!
 //! The guest listens and the host connects, which is the opposite of the agent
 //! protocol: a session lives as long as a viewer window, so no viewer means no
@@ -34,8 +34,9 @@ pub const AUDIO_PORT: u32 = 0x564D_4C53;
 
 /// How many connections the kernel holds while this side is busy.
 ///
-/// Three channels and one racing reconnect. A viewer that needs more than that
-/// queued is one that is already broken.
+/// Per port, and every port here carries one channel: this is that channel plus
+/// the reconnects that can race it. A viewer that needs more than that queued is
+/// one that is already broken.
 const BACKLOG: libc::c_int = 4;
 
 /// A bound, listening vsock. Closes on drop.

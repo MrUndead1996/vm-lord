@@ -139,7 +139,7 @@ impl FilePolicy {
 /// not here and never crosses this pipe.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Handover {
-    /// The 16 bytes that name the session across its three sockets.
+    /// The 16 bytes that name the session across its five sockets.
     pub session_id: Vec<u8>,
     /// The key the frame socket proves itself with.
     pub frame_key: Vec<u8>,

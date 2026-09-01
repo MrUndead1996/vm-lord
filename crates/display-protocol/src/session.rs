@@ -378,7 +378,7 @@ impl Session {
         self.negotiated.as_ref()
     }
 
-    /// The identifier that names this session across its three sockets.
+    /// The identifier that names this session across its five sockets.
     #[must_use]
     pub fn session_id(&self) -> &[u8; SESSION_ID_LEN] {
         &self.session_id

@@ -2862,9 +2862,10 @@ against the same wire. Like the agent's contract it is portable by
 construction -- no Windows APIs, no Linux syscalls, no sockets -- and it knows
 nothing about what a frame's bytes mean.
 
-A session is four HvSocket services rather than one: `VMLD` for control,
-`VMLF` for frames, `VMLI` for input, `VMLC` for the clipboard, named the way
-`VMLA` is. **The guest
+A session is five HvSocket services rather than one: `VMLD` for control,
+`VMLF` for frames, `VMLI` for input, `VMLC` for the clipboard and `VMLS` for
+sound, named the way `VMLA` is -- `S` rather than `A` for audio, because `VMLA`
+is the agent's own service. **The guest
 listens and the host connects**, which is the opposite of the agent socket and
 is deliberate. The agent's connection is a standing report that lives as long
 as the VM; a display session begins when a user presses Connect and ends when
@@ -2923,7 +2924,7 @@ info. Nothing new is minted and nothing new is delivered. The unprivileged
 capture process never holds the secret: the privileged broker, which is root
 anyway because it needs DRM and uinput, derives the session key and hands only
 that on, so compromising the capture process costs one session rather than the
-VM's identity. The frame, input and clipboard channels then get a key of their own
+VM's identity. The frame, input, clipboard and audio channels then get a key of their own
 from that session key and the transcript hash, and prove it in a three-record
 exchange of their own; because the channel key depends on the transcript, a socket cannot
 be carried in from another session or offered by a process that took no part in
@@ -2998,11 +2999,12 @@ and root never copies a frame. Each buffer crosses once and is named by its
 framebuffer id afterwards, since a descriptor costs a syscall and a slot in the
 peer's table.
 
-The four vsock ports are the protocol's: `VMLD` control, `VMLF` frames, `VMLI`
-input, `VMLC` the clipboard. The guest listens on all four and the host
-connects, and three processes divide them -- the broker owns control, the
+The five vsock ports are the protocol's: `VMLD` control, `VMLF` frames, `VMLI`
+input, `VMLC` the clipboard, `VMLS` sound. The guest listens on all five and the
+host connects, and four processes divide them -- the broker owns control, the
 session process owns frames and input and never sees a device descriptor or an
-ioctl of its own, and the clipboard daemon owns the fourth. What crosses the IPC
+ioctl of its own, the clipboard daemon owns the fourth, and the audio daemon
+owns the fifth. What crosses the IPC
 socket after a handshake is a `SessionParameters`: the session id, one channel
 key per socket, the geometry, and whether the peer took the cursor stream. Not
 the secret. What a compromised capture process could take from those bytes is
@@ -3283,6 +3285,81 @@ Nothing about a selection is logged, files included. A mime type, a byte count,
 an entry count, a transfer id and an outcome are what a clipboard problem is
 diagnosed from, on both sides; a file name and a file's contents are the two
 things that must never be diagnosed from.
+
+### Sound
+
+What the guest's desktop plays is heard on the host, over `VMLS`, the fifth
+channel. It is one-directional after the bind: there is no microphone, and the
+one control a user has -- mute -- is answered entirely on the host.
+
+The guest end is `vmlord-display-audio`, and it is a **system** unit, which is
+the opposite of the clipboard daemon and for the opposite reason. A selection
+belongs to whoever is at the screen; sound belongs to the machine. What it
+reads is an ALSA loopback: `snd-aloop` is loaded from `modules-load.d`, the
+desktop's PipeWire plays into the loopback's playback half because it is the
+only card a VM has, and the daemon reads the capture half. PipeWire is
+therefore not in the hot path at all, and the daemon needs no session, no bus
+and no login -- only membership of the `audio` group, which is what `/dev/snd`
+is owned by. It takes its channel key from a third broker socket,
+`/run/vmlord/display-audio.sock`, authorised by the socket's own permissions
+rather than by a logind lookup.
+
+It speaks to the kernel directly. `libasound` would be a system C library, and
+the guest side is built for musl with no C toolchain, so the eight PCM ioctls
+and three structures it needs are written out in `alsa/uapi.rs` the way the DRM
+ABI is in `drm/uapi.rs`. A layout test holds the structures to the kernel's,
+because a field that moved is an `EINVAL` with no explanation.
+
+**Whichever half of the loopback opens first fixes the other**, which is what
+decides the format. The daemon starts at boot, so in the ordinary case it opens
+first and pins S16_LE, 48 kHz, stereo, in 480-frame periods -- 192 KB/s on the
+wire, one record every ten milliseconds, and a capture latency equal to the
+period and nothing more. A daemon restarted into a desktop that is already
+playing arrives second and is handed whatever PipeWire pinned; it does not
+argue, it announces what it got in an `AudioFormat` record and the host
+converts. That is the whole of the format negotiation: a statement of what the
+kernel allowed rather than a conversation.
+
+A period of pure silence is not sent, after ten consecutive ones. An idle
+desktop therefore costs nothing rather than a megabit and a half, and neither
+end needs a record to say so: a period's position in the stream travels in the
+header's `base` field, the way a tile delta carries the sequence it builds on,
+so a gap -- suppressed silence, or periods dropped under load -- is arithmetic
+the host does rather than something it is told.
+
+Nothing waits. The guest holds a 200-millisecond ring and drops its oldest
+periods rather than blocking the ALSA reader on the socket; the host drops a
+period that does not fit the endpoint's buffer rather than queueing it. Late
+audio is worse than absent audio, and "audio does not delay a frame" is a
+structural property this way rather than a promise about scheduling: a separate
+process in the guest, a separate socket, a separate thread in the viewer.
+
+On the host the viewer plays through WASAPI in shared mode, initialised with
+the guest's format and `AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM` so that the
+endpoint converts rather than the guest. **A change of output device rebuilds
+the endpoint and not the channel.** `IMMNotificationClient` reports a new
+default, a disabled endpoint or a first endpoint appearing; the audio thread
+tears down the client and activates the new one between periods, and the
+channel stays bound throughout -- what a person plugged into their host is not
+a fact the guest knows or should, and a rebind would cost a round trip that can
+fail. AppSandbox restarted the whole socket here because its renderer and its
+socket shared a loop; that was a consequence of its shape, not a decision.
+If there is no endpoint at all the renderer parks, keeps draining the channel,
+says so once rather than once a period, and revives on the next notification.
+
+Mute is a system-menu item, remembered per VM beside the window's size. A muted
+renderer keeps taking periods and discards them instead of stopping the stream,
+which is what makes unmuting immediate and leaves the guest's pacing and the
+pinned format alone.
+
+`CAPABILITY_AUDIO` is announced by a guest whose payload ships the daemon,
+whether or not anything is playing and whether or not anyone has logged in --
+the clipboard's reasoning, for the same reason: a session commonly opens at the
+login screen, and a capability cannot be renegotiated once the handshake has
+settled it.
+
+No sample is logged. A format, a frame count, a stream position and an outcome
+are what an audio problem is diagnosed from, on both sides.
 
 ### Resizing the desktop
 
