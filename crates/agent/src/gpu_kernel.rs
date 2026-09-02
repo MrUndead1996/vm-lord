@@ -19,7 +19,7 @@ use std::{
 use vmlord_agent_protocol::v1::{GpuRecipeStage, GpuRecipeStep};
 
 use crate::{
-    command::{self, Outcome},
+    command,
     gpu_recipe::{
         Applicability, DkmsPackage, Environment, MesaPolicy, Report, Shell, applicability,
         dkms_reports_installed, environment_document, icd_documents, module_is_loaded,
@@ -27,6 +27,7 @@ use crate::{
     },
     gpu_targets::{PAYLOAD, WSL_LIB},
     guest_files::{copy_tree, failure, read, write_if_different},
+    guest_packages::{self, Package},
     guest_platform::{GuestFacts, guest_facts, library_triplet},
 };
 
@@ -74,7 +75,13 @@ const DKMS_TREE: &str = "/var/lib/dkms";
 /// How many lines of a failed build's log reach the host.
 const KEPT_LOG_LINES: usize = 20;
 
-const APT_BUDGET: Duration = Duration::from_secs(300);
+/// What a DKMS build needs, whatever this guest calls those packages.
+const BUILD_DEPENDENCIES: &[Package] =
+    &[Package::Dkms, Package::BuildTools, Package::KernelHeaders];
+
+/// The distribution's own Mesa.
+const MESA: &[Package] = &[Package::Mesa];
+
 const BUILD_BUDGET: Duration = Duration::from_secs(900);
 const SHORT_BUDGET: Duration = Duration::from_secs(30);
 
@@ -203,49 +210,34 @@ fn payload_stage(report: &mut Report, guest: &GuestFacts) -> Result<DkmsPackage,
 /// never reaches apt, which is what makes the second start of a VM work with
 /// no network at all.
 fn dependencies_stage(report: &mut Report, guest: &GuestFacts) -> Result<(), String> {
-    let headers = format!("linux-headers-{}", guest.kernel_release);
+    let Some(manager) = guest.package_manager else {
+        let reason = guest_packages::no_manager(BUILD_DEPENDENCIES);
+        report.failed(GpuRecipeStep::BuildDependencies, reason.clone());
+        return Err(reason);
+    };
+    let wanted = guest_packages::describe(BUILD_DEPENDENCIES, manager, &guest.kernel_release);
+
     if dependencies_are_present(&guest.kernel_release) {
         report.skipped(
             GpuRecipeStep::BuildDependencies,
-            format!("dkms, a compiler and {headers} are already installed"),
+            format!("{wanted} are already installed"),
         );
         return Ok(());
     }
 
-    let mut outcome = apt_install(&headers);
-    if !outcome.succeeded() {
-        // A cloud image's package lists are as old as the image, and a stale
-        // list is the ordinary reason an install of a kernel-specific package
-        // fails on a VM's first boot.
-        let _ = command::run(
-            "apt-get",
-            &["update"],
-            &[("DEBIAN_FRONTEND", "noninteractive")],
-            APT_BUDGET,
-        );
-        outcome = apt_install(&headers);
-    }
-
+    let (outcome, installed) =
+        guest_packages::install(manager, BUILD_DEPENDENCIES, &guest.kernel_release);
     if outcome.succeeded() {
         report.ok(
             GpuRecipeStep::BuildDependencies,
-            format!("installed dkms, build-essential and {headers}"),
+            format!("installed {installed}"),
         );
         Ok(())
     } else {
-        let reason = failure("apt-get install", &outcome);
+        let reason = failure(&guest_packages::install_command(manager), &outcome);
         report.failed(GpuRecipeStep::BuildDependencies, reason.clone());
         Err(reason)
     }
-}
-
-fn apt_install(headers: &str) -> Outcome {
-    command::run(
-        "apt-get",
-        &["install", "-y", "dkms", "build-essential", headers],
-        &[("DEBIAN_FRONTEND", "noninteractive")],
-        APT_BUDGET,
-    )
 }
 
 /// Whether the guest can already build a module for its own kernel.
@@ -443,7 +435,7 @@ fn userspace_stage(report: &mut Report, guest: &GuestFacts) -> Result<Userspace,
 
     match policy {
         MesaPolicy::Distro => {
-            distribution_mesa(report, triplet)?;
+            distribution_mesa(report, guest, triplet)?;
             Ok(Userspace {
                 policy,
                 prefix: None,
@@ -467,7 +459,7 @@ fn userspace_stage(report: &mut Report, guest: &GuestFacts) -> Result<Userspace,
 /// `microsoft-experimental`, so Vulkan under this policy is lavapipe. That is
 /// a fact for the host's log and not a refusal: the payload's author chose the
 /// policy, and whether GL alone is enough is the probe's question.
-fn distribution_mesa(report: &mut Report, triplet: &str) -> Result<(), String> {
+fn distribution_mesa(report: &mut Report, guest: &GuestFacts, triplet: &str) -> Result<(), String> {
     let driver = PathBuf::from(format!("/usr/lib/{triplet}/dri/d3d12_dri.so"));
     let loader = PathBuf::from(format!("/usr/lib/{triplet}/libvulkan.so.1"));
     if driver.exists() && loader.exists() {
@@ -481,46 +473,28 @@ fn distribution_mesa(report: &mut Report, triplet: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let mut outcome = apt_mesa();
-    if !outcome.succeeded() {
-        // A cloud image's package lists are as old as the image.
-        let _ = command::run(
-            "apt-get",
-            &["update"],
-            &[("DEBIAN_FRONTEND", "noninteractive")],
-            APT_BUDGET,
-        );
-        outcome = apt_mesa();
-    }
+    let Some(manager) = guest.package_manager else {
+        let reason = guest_packages::no_manager(MESA);
+        report.failed(GpuRecipeStep::Userspace, reason.clone());
+        return Err(reason);
+    };
 
+    let (outcome, installed) = guest_packages::install(manager, MESA, &guest.kernel_release);
     if outcome.succeeded() {
         report.ok(
             GpuRecipeStep::Userspace,
-            "installed the distribution's Mesa: d3d12 gallium for GL, and lavapipe for Vulkan, \
-             because Ubuntu does not build the dzn driver"
-                .to_owned(),
+            format!(
+                "installed the distribution's Mesa ({installed}): d3d12 gallium for GL, and \
+                 lavapipe for Vulkan, because the distributions in the matrix do not build the \
+                 dzn driver"
+            ),
         );
         Ok(())
     } else {
-        let reason = failure("apt-get install", &outcome);
+        let reason = failure(&guest_packages::install_command(manager), &outcome);
         report.failed(GpuRecipeStep::Userspace, reason.clone());
         Err(reason)
     }
-}
-
-fn apt_mesa() -> Outcome {
-    command::run(
-        "apt-get",
-        &[
-            "install",
-            "-y",
-            "libgl1-mesa-dri",
-            "mesa-vulkan-drivers",
-            "libvulkan1",
-        ],
-        &[("DEBIAN_FRONTEND", "noninteractive")],
-        APT_BUDGET,
-    )
 }
 
 /// Stages the Mesa tree the payload carries, and tells the linker about it.

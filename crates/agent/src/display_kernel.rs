@@ -35,7 +35,8 @@ use crate::{
         signature_matches, signing_key_state, wanted_mode, was_rejected_for_its_signature,
     },
     guest_files::{copy_tree, failure, read, write_if_different},
-    guest_platform::guest_facts,
+    guest_packages::{self, Package},
+    guest_platform::{GuestFacts, guest_facts},
 };
 
 /// Where the guest mounts the display payload share.
@@ -95,7 +96,12 @@ const SHELL_EXTENSIONS: &str = "/usr/share/gnome-shell/extensions";
 /// The distro package that ships a StatusNotifierItem extension. Under this
 /// name Ubuntu's own fork on every supported release; Debian ships the same
 /// source under the upstream UUID.
-const APPINDICATOR_PACKAGE: &str = "gnome-shell-extension-appindicator";
+/// The packages a DKMS build needs, whatever this guest calls them.
+const BUILD_DEPENDENCIES: &[Package] =
+    &[Package::Dkms, Package::BuildTools, Package::KernelHeaders];
+
+/// The GNOME extension the tray icon shows through.
+const APPINDICATOR: &[Package] = &[Package::AppIndicator];
 /// The extension UUIDs that package ships, Ubuntu's own first.
 const APPINDICATOR_UUIDS: [&str; 2] = [
     "ubuntu-appindicators@ubuntu.com",
@@ -123,10 +129,10 @@ const MODULE_VERSION: &str = "/sys/module/vmlord_drm/version";
 const MODULE_PARAM_WIDTH: &str = "/sys/module/vmlord_drm/parameters/width";
 const MODULE_PARAM_HEIGHT: &str = "/sys/module/vmlord_drm/parameters/height";
 
-/// The budgets the recipe's three kinds of program get, as the GPU recipe's do:
-/// apt talks to the network, a build compiles a kernel module, and everything
-/// else is a few syscalls.
-const APT_BUDGET: Duration = Duration::from_secs(300);
+/// The budgets the recipe's programs get, as the GPU recipe's do: a build
+/// compiles a kernel module and everything else is a few syscalls. What an
+/// install gets is `guest_packages`' own budget, because that is where the
+/// installing happens.
 const BUILD_BUDGET: Duration = Duration::from_secs(900);
 const SHORT_BUDGET: Duration = Duration::from_secs(30);
 
@@ -288,7 +294,7 @@ fn run_stages(
     let installed = installed_versions();
     let built = needs_build(&installed, &payload.version, device_is_present());
     if built {
-        dependencies_stage(report, &guest.kernel_release)?;
+        dependencies_stage(report, &guest)?;
         halted(stopping)?;
         source_stage(report, &payload)?;
         halted(stopping)?;
@@ -318,7 +324,12 @@ fn run_stages(
         certificate.as_ref(),
     )?;
     device_stage(report)?;
-    services_stages(report, &payload_services(), Path::new(SERVICES_INSTALL))?;
+    services_stages(
+        report,
+        &guest,
+        &payload_services(),
+        Path::new(SERVICES_INSTALL),
+    )?;
     Ok(())
 }
 
@@ -356,7 +367,7 @@ fn run_update(
     halted(stopping).map_err(failed)?;
 
     let attempt = (|| -> Result<(), UpdateAttemptFailure> {
-        dependencies_stage(report, &guest.kernel_release).map_err(UpdateAttemptFailure::Failed)?;
+        dependencies_stage(report, &guest).map_err(UpdateAttemptFailure::Failed)?;
         source_stage(report, &payload).map_err(UpdateAttemptFailure::Failed)?;
         build_stage(report, &payload.version, &guest.kernel_release)
             .map_err(UpdateAttemptFailure::Failed)?;
@@ -369,8 +380,13 @@ fn run_update(
 
     match attempt {
         Ok(()) => {
-            services_stages(report, &payload_services(), Path::new(SERVICES_INSTALL))
-                .map_err(failed)?;
+            services_stages(
+                report,
+                &guest,
+                &payload_services(),
+                Path::new(SERVICES_INSTALL),
+            )
+            .map_err(failed)?;
             Ok(())
         }
         Err(UpdateAttemptFailure::RebootRequired(reason)) => Err(UpdateFailure {
@@ -834,41 +850,35 @@ fn load_failure(
     )
 }
 
-fn dependencies_stage(report: &mut Report, kernel_release: &str) -> Result<(), String> {
-    if dependencies_are_present(kernel_release) {
+fn dependencies_stage(report: &mut Report, guest: &GuestFacts) -> Result<(), String> {
+    if dependencies_are_present(&guest.kernel_release) {
         report.skipped(
             DisplayRecipeStep::BuildDependencies,
-            "dkms, build-essential and the running kernel's headers are installed",
+            "dkms, a compiler and the running kernel's headers are installed",
         );
         return Ok(());
     }
 
-    let headers = format!("linux-headers-{kernel_release}");
-    let outcome = command::run(
-        "apt-get",
-        &[
-            "install",
-            "-y",
-            "--no-install-recommends",
-            "dkms",
-            "build-essential",
-            &headers,
-        ],
-        &[("DEBIAN_FRONTEND", "noninteractive")],
-        APT_BUDGET,
-    );
+    let Some(manager) = guest.package_manager else {
+        let reason = guest_packages::no_manager(BUILD_DEPENDENCIES);
+        report.failed(DisplayRecipeStep::BuildDependencies, reason.clone());
+        return Err(reason);
+    };
+
+    let (outcome, installed) =
+        guest_packages::install(manager, BUILD_DEPENDENCIES, &guest.kernel_release);
     if !outcome.succeeded() {
         // A guest with no network is a guest whose display is degraded and
         // whose VM is fine: cloud-init provisioned it over the same NAT, so
         // this is a failure worth naming rather than one worth hiding.
-        let reason = failure("apt-get install", &outcome);
+        let reason = failure(&guest_packages::install_command(manager), &outcome);
         report.failed(DisplayRecipeStep::BuildDependencies, reason.clone());
         return Err(reason);
     }
 
     report.ok(
         DisplayRecipeStep::BuildDependencies,
-        format!("installed dkms, build-essential and {headers}"),
+        format!("installed {installed}"),
     );
     Ok(())
 }
@@ -1232,7 +1242,12 @@ fn verify_services() -> Result<(), String> {
 ///
 /// The reason the stage failed, which ends the recipe and leaves the display
 /// degraded while the VM keeps running.
-fn services_stages(report: &mut Report, services: &Path, installed: &Path) -> Result<(), String> {
+fn services_stages(
+    report: &mut Report,
+    guest: &GuestFacts,
+    services: &Path,
+    installed: &Path,
+) -> Result<(), String> {
     let carried: Vec<String> = fs::read_dir(services)
         .map(|entries| {
             entries
@@ -1249,7 +1264,7 @@ fn services_stages(report: &mut Report, services: &Path, installed: &Path) -> Re
         return Ok(());
     }
 
-    if let Err(reason) = install_services(report, services, installed) {
+    if let Err(reason) = install_services(report, guest, services, installed) {
         report.failed(DisplayRecipeStep::Services, reason.clone());
 
         return Err(reason);
@@ -1265,7 +1280,12 @@ fn services_stages(report: &mut Report, services: &Path, installed: &Path) -> Re
 }
 
 /// Puts the binaries and the units where systemd will find them.
-fn install_services(report: &mut Report, services: &Path, installed: &Path) -> Result<(), String> {
+fn install_services(
+    report: &mut Report,
+    guest: &GuestFacts,
+    services: &Path,
+    installed: &Path,
+) -> Result<(), String> {
     ensure_service_user()?;
 
     if !services_need_install(services, installed) {
@@ -1330,7 +1350,7 @@ fn install_services(report: &mut Report, services: &Path, installed: &Path) -> R
     }
 
     install_audio(&payload_audio())?;
-    let appindicator = install_appindicator_extension();
+    let appindicator = install_appindicator_extension(guest);
 
     report.ok(
         DisplayRecipeStep::Services,
@@ -1431,27 +1451,21 @@ fn payload_audio() -> PathBuf {
 /// What comes back is the note the Services stage's line carries when the
 /// install failed -- a report, not a crash, because the stage that follows
 /// does not depend on the answer.
-fn install_appindicator_extension() -> Option<String> {
+fn install_appindicator_extension(guest: &GuestFacts) -> Option<String> {
     if !appindicator_is_needed(Path::new(GNOME_SHELL), Path::new(SHELL_EXTENSIONS)) {
         return None;
     }
 
-    let outcome = command::run(
-        "apt-get",
-        &[
-            "install",
-            "-y",
-            "--no-install-recommends",
-            APPINDICATOR_PACKAGE,
-        ],
-        &[("DEBIAN_FRONTEND", "noninteractive")],
-        APT_BUDGET,
-    );
+    let Some(manager) = guest.package_manager else {
+        return Some(guest_packages::no_manager(APPINDICATOR));
+    };
+
+    let (outcome, package) = guest_packages::install(manager, APPINDICATOR, &guest.kernel_release);
     (!outcome.succeeded()).then(|| {
         format!(
-            "the {APPINDICATOR_PACKAGE} package could not be installed, and the guest's tray \
+            "the {package} package could not be installed, and the guest's tray \
              icon has nothing to show through: {}",
-            failure("apt-get install", &outcome)
+            failure(&guest_packages::install_command(manager), &outcome)
         )
     })
 }
@@ -1648,6 +1662,20 @@ mod tests {
 
     use super::{apply, load_failure_message, sha256_hex, update, verify_declared_files};
     use crate::display_recipe::{PayloadFacts, STEPS};
+    use crate::guest_platform::{DesktopFacts, GuestFacts, LibraryLayout, PackageManager};
+
+    /// An ordinary Ubuntu guest, for the stages that now ask what it is.
+    fn guest() -> GuestFacts {
+        GuestFacts {
+            distribution: "ubuntu".to_owned(),
+            release: "26.04".to_owned(),
+            architecture: "amd64".to_owned(),
+            kernel_release: "7.0.0-14-generic".to_owned(),
+            package_manager: Some(PackageManager::Apt),
+            library_layout: LibraryLayout::Multiarch("x86_64-linux-gnu".to_owned()),
+            desktop: DesktopFacts::default(),
+        }
+    }
 
     static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
@@ -1889,7 +1917,7 @@ mod tests {
         let installed = temporary("services-empty-installed");
         let mut report = crate::display_recipe::Report::new();
 
-        assert!(super::services_stages(&mut report, &payload, &installed).is_ok());
+        assert!(super::services_stages(&mut report, &guest(), &payload, &installed).is_ok());
         let stages = report.finish("the recipe did not need this stage");
 
         assert!(
