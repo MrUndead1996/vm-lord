@@ -395,11 +395,15 @@ mod tests {
     const COMMIT: &str = "14794180686c2fb6307fbe359c359bec765249f3";
 
     fn entry() -> CatalogEntry {
+        entry_for_release("26.04")
+    }
+
+    fn entry_for_release(release: &str) -> CatalogEntry {
         let entry_document = json!({
                 "payload_id": "p",
                 "target": {
                     "distribution": "ubuntu",
-                    "release": "26.04",
+                    "release": release,
                     "architecture": "amd64",
                     "kernel_release": "k",
                     "payload_abi": 1
@@ -431,12 +435,16 @@ mod tests {
     }
 
     fn payload(files: Vec<Value>) -> Vec<u8> {
+        payload_for_release("26.04", files)
+    }
+
+    fn payload_for_release(release: &str, files: Vec<Value>) -> Vec<u8> {
         serde_json::to_vec(&json!({
             "schema_version": 1,
             "payload_id": "p",
             "target": {
                 "distribution": "ubuntu",
-                "release": "26.04",
+                "release": release,
                 "architecture": "amd64",
                 "kernel_release": "k",
                 "payload_abi": 1
@@ -658,6 +666,28 @@ mod tests {
             PayloadManifest::parse_and_validate(&data, &entry()),
             Err(PayloadError::InvalidManifest(_))
         ));
+    }
+
+    #[test]
+    fn a_release_that_is_not_a_version_number_keys_a_payload_like_any_other() {
+        let document = payload_for_release(
+            "rolling",
+            vec![
+                file("licenses/GPL-2.0.txt"),
+                file("licenses/Linux-syscall-note.txt"),
+                file("sources.json"),
+            ],
+        );
+
+        PayloadManifest::parse_and_validate(&document, &entry_for_release("rolling"))
+            .expect("the key is a string the guest and the catalog spell alike, not a version");
+        assert!(
+            matches!(
+                PayloadManifest::parse_and_validate(&document, &entry()),
+                Err(PayloadError::InvalidManifest(_))
+            ),
+            "a rolling manifest still has to be the one the catalog entry names"
+        );
     }
 
     #[test]

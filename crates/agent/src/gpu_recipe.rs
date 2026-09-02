@@ -85,7 +85,8 @@ impl Report {
 pub struct GuestFacts {
     /// `ID` from `/etc/os-release`, lowercase by that file's own convention.
     pub distribution: String,
-    /// `VERSION_ID` from `/etc/os-release`.
+    /// `VERSION_ID` from `/etc/os-release`, or `BUILD_ID` where the
+    /// distribution publishes no version number.
     pub release: String,
     /// The Debian architecture name, not the machine name `uname` gives.
     pub architecture: String,
@@ -112,10 +113,19 @@ pub fn recipe_for(distribution: &str) -> Option<GpuRecipe> {
     }
 }
 
-/// Reads `ID` and `VERSION_ID` out of an `/etc/os-release`.
+/// Reads `ID` and the release out of an `/etc/os-release`.
+///
+/// The release is `VERSION_ID` where the distribution numbers its releases and
+/// `BUILD_ID` where it does not: Arch's file carries `ID=arch` and
+/// `BUILD_ID=rolling` and no `VERSION_ID` at all, and without the fallback no
+/// guest facts assemble and every recipe stops before its first stage.
+/// `VERSION_ID` wins when both are present, because that is the number the
+/// payload catalogs are keyed by; a `BUILD_ID` beside it stamps one image
+/// rather than naming the release.
 pub fn parse_os_release(text: &str) -> Option<(String, String)> {
     let mut id = None;
     let mut version = None;
+    let mut build = None;
     for line in text.lines() {
         let Some((name, value)) = line.split_once('=') else {
             continue;
@@ -124,11 +134,12 @@ pub fn parse_os_release(text: &str) -> Option<(String, String)> {
         match name.trim() {
             "ID" => id = Some(value),
             "VERSION_ID" => version = Some(value),
+            "BUILD_ID" => build = Some(value),
             _ => {}
         }
     }
 
-    Some((id?, version?))
+    Some((id?, version.or(build)?))
 }
 
 /// What a payload says it was built for.
@@ -498,6 +509,31 @@ mod tests {
     fn an_os_release_without_an_id_names_nothing() {
         assert_eq!(parse_os_release("VERSION_ID=\"26.04\"\n"), None);
         assert_eq!(parse_os_release(""), None);
+    }
+
+    #[test]
+    fn a_distribution_without_a_version_names_its_release_with_its_build_id() {
+        let text = "PRETTY_NAME=\"Arch Linux\"\nID=arch\nBUILD_ID=rolling\n";
+
+        assert_eq!(
+            parse_os_release(text),
+            Some(("arch".to_owned(), "rolling".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_build_id_beside_a_version_id_does_not_displace_the_release() {
+        let text = "ID=ubuntu\nVERSION_ID=\"26.04\"\nBUILD_ID=20260901\n";
+
+        assert_eq!(
+            parse_os_release(text),
+            Some(("ubuntu".to_owned(), "26.04".to_owned()))
+        );
+    }
+
+    #[test]
+    fn an_os_release_with_neither_a_version_nor_a_build_names_nothing() {
+        assert_eq!(parse_os_release("ID=arch\n"), None);
     }
 
     #[test]

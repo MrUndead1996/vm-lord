@@ -30,7 +30,7 @@ mod qcow2;
 mod resolve;
 mod update;
 
-pub use distro::validated_release;
+pub use distro::{ROLLING_RELEASE, validated_release};
 pub use download::{ImageDownloadRequest, fetch_image};
 pub use error::{DownloadError, Qcow2Error, ResolveError, UpdateDownloadError};
 pub use open::open_cloud_image;
