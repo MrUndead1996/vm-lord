@@ -2604,6 +2604,46 @@ agent binary is absent, creation warns and follows that same no-agent path;
 it does not create a tools ISO or agent secret. The installed agent is what
 mounts a VM's GPU shares once the host hands it a manifest.
 
+### Keeping the guest agent current
+
+The agent is the one part of VMLord that lives inside the guest, and first-boot
+installation alone would freeze it at the VM's creation date: every release
+after that would ship a host talking to an older agent, and a feature whose
+guest half lives in the agent would never reach a VM that already existed. Two
+have been shipped that way -- the display audio daemon and the guest tray, both
+carried by a display payload the agent that reads it had never heard of.
+
+The tools volume is what answers it, because it is already what "the host hands
+the guest to install" means and it stays attached for the life of the VM rather
+than for its first boot. `tools_volume::refresh` runs in the start pipeline
+while the VM is still down -- the only moment a volume attached to it can be
+written -- and rewrites `tools.iso` when the agent beside the executable is not
+the one already on it. The image build is deterministic and carries no
+timestamps, so "does this volume already carry this agent" is a comparison of
+the bytes that would be written rather than a version somebody has to maintain.
+A VM with no `tools.iso` is left without one: the volume is an attachment
+written into the compute system at creation, and a file nothing is attached to
+is a file nobody would read.
+
+`self_update::apply` is the guest half, and it runs before anything else the
+agent does -- before it reads its secret, because none of that is the old
+agent's work if a newer one is on the volume. It mounts `VMLTOOLS` read-only
+where cloud-init mounts it, compares the file with the installed
+`/usr/local/lib/vmlord/vmlord-agent`, and on a difference unlinks that binary,
+writes the new one, makes it executable and exits. `Restart=always` starts the
+replacement: the arrangement that recovers from a crash, used for a change that
+is deliberate. Unlinking rather than overwriting is what `install_file` does for
+the display services and for the same reason -- an open executable cannot be
+written through, but it can be replaced, and the running process keeps the
+inode it started with. Nothing loops: after the replacement the bytes match, so
+the next start walks straight through the comparison. A volume that cannot be
+mounted or read leaves the guest running the agent it has, which is what it
+would have done anyway.
+
+What this does not do is rescue a VM whose agent predates the mechanism: an
+agent that never learned to look at the volume will not start looking. Those
+guests are updated by hand, or recreated.
+
 ### Reconnecting
 
 The agent outlives any one connection, and the reconnect is its own rather than

@@ -27,6 +27,7 @@ use crate::{
     hcs_config::{self, Plan9Export},
     layout,
     metadata::{MetadataStore, VmComputeSystemMapping},
+    tools_volume,
 };
 
 /// A start operation completes once HCS has handed the VM to its worker
@@ -289,6 +290,11 @@ impl VmStartPipeline {
         // After reading the configuration, so that a VM whose stored state is
         // unusable never opens a window for a start that cannot happen.
         let stored = self.read_configuration(&mapping, vm_directory)?;
+
+        // While the VM is still down, which is the only time a volume attached
+        // to it can be written. What the guest does with it happens on the
+        // boot this start is about to begin.
+        tools_volume::refresh(&mapping.vm_name, vm_directory);
 
         // Before anything is granted or built: the shares below become part of
         // the compute system, and a system's Plan9 section is fixed for the
