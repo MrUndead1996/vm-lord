@@ -1,11 +1,6 @@
 //! Transactional creation of an HCS-backed virtual machine.
 
-use std::{
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
-    time::Duration,
-};
+use std::{fs, io::Write, path::Path, time::Duration};
 
 use uuid::Uuid;
 use vmlord_agent_protocol::auth;
@@ -20,7 +15,7 @@ use crate::{
     hcs_config::{self, HcsVmConfigBuilder},
     layout,
     metadata::{MetadataStore, VmComputeSystemMapping, guest_target_key},
-    password_hash,
+    password_hash, tools_volume,
     vhd::create_dynamic_vhdx,
     vm_key,
 };
@@ -33,8 +28,6 @@ type AccessGranter = Box<dyn Fn(&str, &Path) -> Result<(), RepositoryError> + Se
 type SystemCreator = Box<dyn Fn(&str, &str) -> Result<(), RepositoryError> + Send + Sync>;
 type StateFileCreator = Box<dyn Fn(&Path, &Path) -> Result<(), RepositoryError> + Send + Sync>;
 type AgentReader = Box<dyn Fn() -> Option<Vec<u8>> + Send + Sync>;
-
-const AGENT_FILE_NAME: &str = "vmlord-agent";
 
 /// Makes the VM's system disk out of a cloud image: fetch the image the release
 /// means, then write it into a VHDX at the given path, sized for the VM rather
@@ -132,7 +125,7 @@ impl VmCreationPipeline {
             state_file_creator: Box::new(create_state_files),
             system_creator: Box::new(create_hcs_system),
             system_teardown: Box::new(cleanup::teardown_compute_system),
-            agent_reader: Box::new(read_agent_beside_executable),
+            agent_reader: Box::new(tools_volume::agent_beside_executable),
         }
     }
 
@@ -421,34 +414,6 @@ fn create_hcs_system(id: &str, configuration: &str) -> Result<(), RepositoryErro
                 ));
             }
             Err(RepositoryError::new(message))
-        }
-    }
-}
-
-/// Reads the guest agent bundled beside the running VMLord executable.
-///
-/// A missing binary is a packaging problem but not a reason to reject a cloud
-/// VM: its normal cloud-init provisioning can still complete without the
-/// optional agent service.
-fn read_agent_beside_executable() -> Option<Vec<u8>> {
-    let executable = match std::env::current_exe() {
-        Ok(executable) => executable,
-        Err(error) => {
-            tracing::warn!(
-                "cannot locate the VMLord executable to find {AGENT_FILE_NAME}: {error}"
-            );
-            return None;
-        }
-    };
-    let agent_path: PathBuf = executable.with_file_name(AGENT_FILE_NAME);
-    match fs::read(&agent_path) {
-        Ok(agent) => Some(agent),
-        Err(error) => {
-            tracing::warn!(
-                "cannot read the guest agent at {}: {error}; cloud VMs will not include a tools volume",
-                agent_path.display()
-            );
-            None
         }
     }
 }

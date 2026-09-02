@@ -67,6 +67,7 @@ mod ssh_terminal;
 mod start;
 mod start_registry;
 mod subnet;
+mod tools_volume;
 mod vhd;
 mod vm_key;
 mod watch;

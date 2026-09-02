@@ -54,6 +54,7 @@ mod gpu_recipe;
 mod gpu_render;
 mod gpu_targets;
 mod guest_files;
+mod self_update;
 mod session;
 mod vsock;
 
@@ -90,6 +91,14 @@ const NO_DESCRIPTOR: RawFd = -1;
 const AGENT_VERSION: &str = env!("VMLORD_AGENT_BUILD");
 
 fn main() {
+    // Before anything else this process does, and before it needs anything to
+    // be true of itself: what the host put on the tools volume is this
+    // release's agent, and if it is not the one running, the one running gets
+    // out of the way. Nothing below this line would be the new agent's work.
+    if self_update::apply() == self_update::Replacement::Installed {
+        process::exit(0);
+    }
+
     let secret = match read_secret() {
         Ok(secret) => secret,
         // The one failure that ends the agent: a VM's secret is minted when the
