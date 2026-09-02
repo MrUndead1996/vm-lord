@@ -113,6 +113,9 @@ fn check_release(document: &Value) -> Vec<String> {
         problems.push("a pull request must not be able to start a release".to_owned());
     }
 
+    problems.extend(installer_version_passed_in(document));
+    problems.extend(distribution_carries_payloads(document));
+
     for (name, job) in jobs(document) {
         let contents = permission(job.get("permissions"), "contents");
         match (name.as_str(), contents.as_deref()) {
@@ -128,6 +131,79 @@ fn check_release(document: &Value) -> Vec<String> {
     }
 
     problems
+}
+
+/// That the step which compiles the installer hands it the workspace version.
+///
+/// The Inno Setup script states no version of its own; it takes one through
+/// `/DAppVersion=`. A step that drops the flag does not build the wrong
+/// installer -- the script refuses to compile at all -- but it refuses after
+/// the tests, the distribution and the licence notices have already been
+/// built. Read here, that is a failed pull request instead.
+fn installer_version_passed_in(document: &Value) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (name, job) in jobs(document) {
+        for script in run_scripts(job) {
+            if !script.to_ascii_lowercase().contains("iscc") {
+                continue;
+            }
+            if !script.contains("/DAppVersion=") {
+                problems.push(format!(
+                    "job `{name}` compiles the installer without `/DAppVersion=`; the version \
+                     has to come from the workspace"
+                ));
+            }
+        }
+    }
+    problems
+}
+
+/// That the step which builds the distribution asks for both payloads.
+///
+/// `cargo dist` with neither flag is not an error: it prints one line saying
+/// no payload was included and builds a release that starts VMs with no GPU
+/// support and no guest display. That is what 0.2.0 shipped. The flags are the
+/// difference, so their absence is read here rather than discovered by
+/// somebody installing the result.
+fn distribution_carries_payloads(document: &Value) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (name, job) in jobs(document) {
+        for script in run_scripts(job) {
+            if !script.contains("cargo dist") {
+                continue;
+            }
+            for flag in ["--gpu-payload", "--display-payload"] {
+                if !script.contains(flag) {
+                    problems.push(format!(
+                        "job `{name}` builds the distribution without `{flag}`; a release \
+                         without it has no such payload at all"
+                    ));
+                }
+            }
+        }
+    }
+    problems
+}
+
+/// The `run:` scripts of one job, with their comments removed.
+///
+/// Comments go first because both checks over these scripts look for a flag
+/// that is also named in the comment beside the command: read whole, a script
+/// would go on passing after the command itself had lost the flag.
+fn run_scripts(job: &Value) -> Vec<String> {
+    let Some(steps) = job.get("steps").and_then(Value::as_sequence) else {
+        return Vec::new();
+    };
+    steps
+        .iter()
+        .filter_map(|step| step.get("run").and_then(Value::as_str))
+        .map(|run| {
+            run.lines()
+                .filter(|line| !line.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect()
 }
 
 /// Every action reference that is not pinned to a full commit SHA.
@@ -206,7 +282,10 @@ fn permission(permissions: Option<&Value>, name: &str) -> Option<String> {
 mod tests {
     use serde_yaml_ng::Value;
 
-    use super::{check_release, every_workflow, unpinned_actions};
+    use super::{
+        check_release, distribution_carries_payloads, every_workflow, installer_version_passed_in,
+        unpinned_actions,
+    };
 
     fn parse(text: &str) -> Value {
         serde_yaml_ng::from_str(text).expect("the fixture is valid YAML")
@@ -276,6 +355,81 @@ mod tests {
                 .any(|problem| problem.contains("security-events")),
             "{problems:?}"
         );
+    }
+
+    /// The installer script states no version, so the step that compiles it
+    /// has to hand one over. Without the flag the release fails only after
+    /// everything before it has been built.
+    #[test]
+    fn the_installer_is_compiled_with_the_workspace_version() {
+        let compile = |run: &str| {
+            parse(&format!(
+                "jobs:\n  release:\n    steps:\n      - run: |\n          {run}\n"
+            ))
+        };
+
+        assert_eq!(
+            installer_version_passed_in(&compile(
+                "& $iscc \"/DAppVersion=$env:VMLORD_VERSION\" installer/vmlord.iss"
+            )),
+            Vec::<String>::new()
+        );
+
+        let problems = installer_version_passed_in(&compile("& $iscc installer/vmlord.iss"));
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("/DAppVersion=")),
+            "{problems:?}"
+        );
+
+        // The flag is explained in a comment beside the command; finding it
+        // there is not finding it in the command.
+        let problems = installer_version_passed_in(&parse(
+            "jobs:\n  release:\n    steps:\n      - run: |\n          # pass /DAppVersion= \
+             here\n          & $iscc installer/vmlord.iss\n",
+        ));
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("/DAppVersion=")),
+            "{problems:?}"
+        );
+
+        // A step that does not compile the installer is not asked about it.
+        assert_eq!(
+            installer_version_passed_in(&compile("cargo dist")),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A release without the payload flags is not a failed release: it is a
+    /// quieter one, with no GPU support and no guest display.
+    #[test]
+    fn the_distribution_is_built_with_both_payloads() {
+        let build = |run: &str| {
+            parse(&format!(
+                "jobs:\n  release:\n    steps:\n      - run: |\n          {run}\n"
+            ))
+        };
+
+        assert_eq!(
+            distribution_carries_payloads(&build(
+                "cargo dist --gpu-payload gpu --display-payload display"
+            )),
+            Vec::<String>::new()
+        );
+
+        let problems = distribution_carries_payloads(&build("cargo dist --gpu-payload gpu"));
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("--display-payload")),
+            "{problems:?}"
+        );
+
+        let problems = distribution_carries_payloads(&build("cargo dist"));
+        assert_eq!(problems.len(), 2, "{problems:?}");
     }
 
     /// Only the job that creates the release may write to the repository.

@@ -164,13 +164,29 @@ uninstaller. Settings, distribution profiles and updates belong to the
 application. From the repository root on Windows:
 
 ```powershell
+$version = (cargo metadata --locked --format-version 1 --no-deps |
+    ConvertFrom-Json).packages |
+    Where-Object { $_.name -eq 'vmlord' } |
+    Select-Object -ExpandProperty version
 cargo dist --gpu-payload <dir> --display-payload <dir>
 powershell -File installer\check.ps1 target\dist
-iscc installer\vmlord.iss
-cargo release-manifest --tag v0.1.0 `
-    --installer target\installer\VMLord-0.1.0-x86_64-setup.exe `
+iscc /DAppVersion=$version installer\vmlord.iss
+cargo release-manifest --tag "v$version" `
+    --installer "target\installer\VMLord-$version-x86_64-setup.exe" `
     --output target\installer\release-manifest.json
 ```
+
+The version is read from `Cargo.toml` and passed in rather than written into
+`vmlord.iss`, which states none of its own and refuses to compile without one.
+It used to keep a copy in step by hand, and the copy drifted: 0.2.0 was tagged
+and built as `VMLord-0.1.0-x86_64-setup.exe`, a file `cargo release-manifest`
+then could not find. Releasing therefore means editing one version, in
+`[workspace.package]`, and tagging it.
+
+Locally the payloads are the one part that is not built for you: run
+`./rebuild_payload.sh` and `payloads/ubuntu-26.04-amd64/prepare.sh` first, or
+leave the flags off and build a distribution without them -- `check.ps1` only
+insists on payloads when it is given `-RequirePayloads`, as the release does.
 
 `check.ps1` runs first because the installer copies whatever was staged: a
 binary that failed to build would otherwise ship as a file missing from
@@ -223,13 +239,21 @@ SHA-256 equals the manifest's, and install it in both scope modes before
 publishing. Until it is published, no VMLord in the world can discover it: the
 update check reads the latest published release.
 
-A release built by CI carries no GPU or display payload. Not because they
-cannot be built there -- `./rebuild_payload.sh` and
-`payloads/ubuntu-26.04-amd64/prepare.sh` reproduce both from sources pinned by
-commit -- but because nothing in the workflow builds them yet: they need Docker
-and a Linux runner, so it would take a second job and an artifact handed to the
-Windows one. Until then, build them locally and pass them to `cargo dist`.
-VMLord runs without them, with no GPU-PV and no guest display.
+Both payloads are built by the release itself. They come from a `docker build`
+on Linux and the release has to run on Windows, so a `payloads` job on
+`ubuntu-24.04` runs `./rebuild_payload.sh` and
+`payloads/ubuntu-26.04-amd64/prepare.sh`, uploads the packed pairs, and the
+Windows job downloads them and passes every one to `cargo dist`. The Windows
+job needs them, so a payload that fails to build fails the release rather than
+shrinking it.
+
+That is a correction. `cargo dist` with no payload flags is not an error -- it
+prints one line and builds a distribution without them -- and 0.2.0 shipped
+that way: no GPU-PV, no guest display, and nothing in the run that looked
+wrong. Three things now have to agree before a release can be that quiet again:
+`workflow-check` refuses a release workflow whose `cargo dist` has lost either
+flag, the build step refuses to run when the artifact arrives without them, and
+`check.ps1 -RequirePayloads` refuses a staged tree that holds no payload pair.
 
 **The mirror.** Forgejo pulls; GitHub does not push. The mirror is configured
 on the Forgejo repository itself (Settings -> Mirror Settings) as a pull mirror

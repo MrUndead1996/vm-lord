@@ -13,13 +13,25 @@
     drops one of them is otherwise invisible until someone without
     administrator rights tries to install.
 
+    `-RequirePayloads` adds what a release, and only a release, has to carry:
+    a GPU payload and at least one display payload. `cargo dist` builds a
+    distribution without either quite happily -- it says so in one line and
+    goes on -- which is how 0.2.0 shipped with no GPU support and no guest
+    display. A local build has every reason to skip them, so this is a switch
+    and not a rule.
+
 .EXAMPLE
     powershell -File installer\check.ps1 target\dist
+
+.EXAMPLE
+    powershell -File installer\check.ps1 target\dist -RequirePayloads
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [string] $DistDir = (Join-Path $PSScriptRoot '..\target\dist')
+    [string] $DistDir = (Join-Path $PSScriptRoot '..\target\dist'),
+
+    [switch] $RequirePayloads
 )
 
 Set-StrictMode -Version Latest
@@ -110,6 +122,38 @@ Require-File 'THIRD-PARTY-LICENSES.txt'
 # usable without.
 Require-File 'distros\ubuntu.json'
 
+# A payload is a pair -- `<payload_id>.zip` beside `<payload_id>.json` -- and
+# the application assembles its catalog from whichever pairs it finds. The
+# names are payload ids, so they are counted rather than named here.
+function Require-Payload {
+    param(
+        [string] $Directory,
+        [string] $What
+    )
+
+    $path = Join-Path $DistDir $Directory
+    if (-not (Test-Path -LiteralPath $path -PathType Container)) {
+        $problems.Add("no $What in the distribution: $Directory is missing")
+        return
+    }
+    $archives = @(Get-ChildItem -LiteralPath $path -Filter *.zip -File)
+    if ($archives.Count -eq 0) {
+        $problems.Add("no $What in the distribution: $Directory holds no payload archive")
+        return
+    }
+    foreach ($archive in $archives) {
+        $entry = Join-Path $path "$([System.IO.Path]::GetFileNameWithoutExtension($archive.Name)).json"
+        if (-not (Test-Path -LiteralPath $entry -PathType Leaf)) {
+            $problems.Add("$Directory\$($archive.Name) has no catalog entry beside it")
+        }
+    }
+}
+
+if ($RequirePayloads) {
+    Require-Payload 'gpu-payload' 'GPU payload'
+    Require-Payload 'display-payload' 'display payload'
+}
+
 $script = Join-Path $PSScriptRoot 'vmlord.iss'
 if (-not (Test-Path -LiteralPath $script -PathType Leaf)) {
     $problems.Add("missing installer script: $script")
@@ -124,6 +168,14 @@ if (-not (Test-Path -LiteralPath $script -PathType Leaf)) {
     if ($text -notmatch '(?m)^\s*PrivilegesRequiredOverridesAllowed\s*=\s*dialog\s*$') {
         $problems.Add('vmlord.iss does not set PrivilegesRequiredOverridesAllowed=dialog')
     }
+    # The version comes in through `/DAppVersion=`. A `#define AppVersion`
+    # here would be a second statement of it, kept in step by hand -- which is
+    # exactly how 0.2.0 was built as `VMLord-0.1.0-x86_64-setup.exe`, a name
+    # `cargo release-manifest` then could not find.
+    if ($text -match '(?m)^\s*#define\s+AppVersion\b') {
+        $problems.Add('vmlord.iss defines AppVersion itself; it must come from /DAppVersion=')
+    }
+
     # `{autopf}` is what makes the chosen mode decide the directory; a literal
     # `{pf}` would install every per-user copy into Program Files. The name
     # after it may be the preprocessor variable the script actually uses.
