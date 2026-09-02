@@ -8,6 +8,8 @@
 
 use vmlord_agent_protocol::v1::{GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep};
 
+use crate::guest_platform::GuestFacts;
+
 /// Every step of the recipe, in the order it is attempted.
 ///
 /// The order is the report's order, and the report is what the host logs, so
@@ -80,21 +82,6 @@ impl Report {
     }
 }
 
-/// What the guest says it is.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GuestFacts {
-    /// `ID` from `/etc/os-release`, lowercase by that file's own convention.
-    pub distribution: String,
-    /// `VERSION_ID` from `/etc/os-release`, or `BUILD_ID` where the
-    /// distribution publishes no version number.
-    pub release: String,
-    /// The Debian architecture name, not the machine name `uname` gives.
-    pub architecture: String,
-    /// `uname -r`: the kernel that is running now, which is the one DKMS
-    /// builds against.
-    pub kernel_release: String,
-}
-
 /// A distribution this build knows how to bring a GPU up on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GpuRecipe {
@@ -111,35 +98,6 @@ pub fn recipe_for(distribution: &str) -> Option<GpuRecipe> {
         "ubuntu" => Some(GpuRecipe::Ubuntu),
         _ => None,
     }
-}
-
-/// Reads `ID` and the release out of an `/etc/os-release`.
-///
-/// The release is `VERSION_ID` where the distribution numbers its releases and
-/// `BUILD_ID` where it does not: Arch's file carries `ID=arch` and
-/// `BUILD_ID=rolling` and no `VERSION_ID` at all, and without the fallback no
-/// guest facts assemble and every recipe stops before its first stage.
-/// `VERSION_ID` wins when both are present, because that is the number the
-/// payload catalogs are keyed by; a `BUILD_ID` beside it stamps one image
-/// rather than naming the release.
-pub fn parse_os_release(text: &str) -> Option<(String, String)> {
-    let mut id = None;
-    let mut version = None;
-    let mut build = None;
-    for line in text.lines() {
-        let Some((name, value)) = line.split_once('=') else {
-            continue;
-        };
-        let value = value.trim().trim_matches('"').to_owned();
-        match name.trim() {
-            "ID" => id = Some(value),
-            "VERSION_ID" => version = Some(value),
-            "BUILD_ID" => build = Some(value),
-            _ => {}
-        }
-    }
-
-    Some((id?, version.or(build)?))
 }
 
 /// What a payload says it was built for.
@@ -288,19 +246,6 @@ pub fn parse_mesa_policy(json: &str) -> Result<MesaPolicy, String> {
     }
 }
 
-/// The multiarch directory a Debian architecture's libraries live under.
-///
-/// Derived from the guest rather than written as a constant: an agent that
-/// hard-codes one architecture's library path is one that silently installs
-/// nothing on the other.
-pub fn library_triplet(architecture: &str) -> Option<&'static str> {
-    match architecture {
-        "amd64" => Some("x86_64-linux-gnu"),
-        "arm64" => Some("aarch64-linux-gnu"),
-        _ => None,
-    }
-}
-
 /// The Vulkan ICD documents among the names of a directory's entries.
 ///
 /// Names from the payload and never a constant: AppSandbox's own notes record
@@ -419,11 +364,13 @@ pub fn dkms_reports_installed(status: &str, package: &DkmsPackage, kernel: &str)
 mod tests {
     use vmlord_agent_protocol::v1::{GpuRecipeStageState, GpuRecipeStep};
 
+    use crate::guest_platform::{DesktopFacts, LibraryLayout, PackageManager};
+
     use super::{
         Applicability, DkmsPackage, Environment, GpuRecipe, GuestFacts, MesaPolicy, PayloadTarget,
         Report, STEPS, Shell, applicability, dkms_reports_installed, environment_document,
-        icd_documents, library_triplet, module_is_loaded, parse_dkms_conf, parse_mesa_policy,
-        parse_os_release, parse_payload_target, recipe_for,
+        icd_documents, module_is_loaded, parse_dkms_conf, parse_mesa_policy, parse_payload_target,
+        recipe_for,
     };
 
     fn ubuntu_guest() -> GuestFacts {
@@ -432,6 +379,9 @@ mod tests {
             release: "26.04".to_owned(),
             architecture: "amd64".to_owned(),
             kernel_release: "7.0.0-14-generic".to_owned(),
+            package_manager: Some(PackageManager::Apt),
+            library_layout: LibraryLayout::Multiarch("x86_64-linux-gnu".to_owned()),
+            desktop: DesktopFacts::default(),
         }
     }
 
@@ -493,47 +443,6 @@ mod tests {
             .collect();
         assert_eq!(device.len(), 1);
         assert_eq!(device[0].state(), GpuRecipeStageState::Ok);
-    }
-
-    #[test]
-    fn os_release_values_are_read_with_or_without_quotes() {
-        let text = "PRETTY_NAME=\"Ubuntu 26.04 LTS\"\nID=ubuntu\nVERSION_ID=\"26.04\"\n";
-
-        assert_eq!(
-            parse_os_release(text),
-            Some(("ubuntu".to_owned(), "26.04".to_owned()))
-        );
-    }
-
-    #[test]
-    fn an_os_release_without_an_id_names_nothing() {
-        assert_eq!(parse_os_release("VERSION_ID=\"26.04\"\n"), None);
-        assert_eq!(parse_os_release(""), None);
-    }
-
-    #[test]
-    fn a_distribution_without_a_version_names_its_release_with_its_build_id() {
-        let text = "PRETTY_NAME=\"Arch Linux\"\nID=arch\nBUILD_ID=rolling\n";
-
-        assert_eq!(
-            parse_os_release(text),
-            Some(("arch".to_owned(), "rolling".to_owned()))
-        );
-    }
-
-    #[test]
-    fn a_build_id_beside_a_version_id_does_not_displace_the_release() {
-        let text = "ID=ubuntu\nVERSION_ID=\"26.04\"\nBUILD_ID=20260901\n";
-
-        assert_eq!(
-            parse_os_release(text),
-            Some(("ubuntu".to_owned(), "26.04".to_owned()))
-        );
-    }
-
-    #[test]
-    fn an_os_release_with_neither_a_version_nor_a_build_names_nothing() {
-        assert_eq!(parse_os_release("ID=arch\n"), None);
     }
 
     #[test]
@@ -681,14 +590,6 @@ mod tests {
         for document in [r#"{"mesa_policy": "flatpak"}"#, "{}", "not json"] {
             assert!(parse_mesa_policy(document).is_err(), "{document}");
         }
-    }
-
-    #[test]
-    fn every_architecture_with_a_recipe_has_a_library_path() {
-        assert_eq!(library_triplet("amd64"), Some("x86_64-linux-gnu"));
-        assert_eq!(library_triplet("arm64"), Some("aarch64-linux-gnu"));
-        assert_eq!(library_triplet("riscv64"), None);
-        assert_eq!(library_triplet(""), None);
     }
 
     #[test]

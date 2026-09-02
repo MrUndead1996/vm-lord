@@ -24,14 +24,15 @@ use vmlord_agent_protocol::v1::{GpuProbeStep, ProbeGpuResponse};
 
 use crate::{
     command::{self, Outcome},
-    gpu_kernel::{device_is_usable, guest_facts},
+    gpu_kernel::device_is_usable,
     gpu_probe::{
         Checks, Renderer, classify, eglinfo_renderers, hardware_renderer, required_libraries,
         shell_command, verdict, vulkaninfo_devices,
     },
-    gpu_recipe::{MesaPolicy, library_triplet, module_is_loaded, parse_mesa_policy},
+    gpu_recipe::{MesaPolicy, module_is_loaded, parse_mesa_policy},
     gpu_targets::{PAYLOAD, WSL_LIB},
     guest_files::{failure, read},
+    guest_platform::{guest_facts, library_triplet},
 };
 
 /// The kernel module behind the device.

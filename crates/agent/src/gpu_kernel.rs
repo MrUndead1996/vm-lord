@@ -21,13 +21,13 @@ use vmlord_agent_protocol::v1::{GpuRecipeStage, GpuRecipeStep};
 use crate::{
     command::{self, Outcome},
     gpu_recipe::{
-        Applicability, DkmsPackage, Environment, GuestFacts, MesaPolicy, Report, Shell,
-        applicability, dkms_reports_installed, environment_document, icd_documents,
-        library_triplet, module_is_loaded, parse_dkms_conf, parse_mesa_policy, parse_os_release,
-        parse_payload_target, recipe_for,
+        Applicability, DkmsPackage, Environment, MesaPolicy, Report, Shell, applicability,
+        dkms_reports_installed, environment_document, icd_documents, module_is_loaded,
+        parse_dkms_conf, parse_mesa_policy, parse_payload_target, recipe_for,
     },
     gpu_targets::{PAYLOAD, WSL_LIB},
     guest_files::{copy_tree, failure, read, write_if_different},
+    guest_platform::{GuestFacts, guest_facts, library_triplet},
 };
 
 /// The kernel module this recipe exists to deliver.
@@ -109,8 +109,12 @@ fn run_stages(report: &mut Report, stopping: &AtomicBool) -> Result<(), String> 
     report.ok(
         GpuRecipeStep::Distribution,
         format!(
-            "{} {} {} on kernel {}",
-            guest.distribution, guest.release, guest.architecture, guest.kernel_release
+            "{} {} {} on kernel {}; {}",
+            guest.distribution,
+            guest.release,
+            guest.architecture,
+            guest.kernel_release,
+            guest.platform()
         ),
     );
 
@@ -155,50 +159,6 @@ fn halted(stopping: &AtomicBool) -> Result<(), String> {
         return Err("the guest is shutting down".to_owned());
     }
     Ok(())
-}
-
-/// What this guest is, from its own files.
-pub fn guest_facts() -> Result<GuestFacts, String> {
-    let (distribution, release) = parse_os_release(&read(Path::new("/etc/os-release")))
-        .ok_or_else(|| "/etc/os-release names no distribution".to_owned())?;
-    let (kernel_release, machine) = uname()?;
-
-    Ok(GuestFacts {
-        distribution,
-        release,
-        // Debian's name for the machine, because that is what a payload target
-        // and an apt package name are written in.
-        architecture: match machine.as_str() {
-            "x86_64" => "amd64".to_owned(),
-            "aarch64" => "arm64".to_owned(),
-            other => other.to_owned(),
-        },
-        kernel_release,
-    })
-}
-
-/// The running kernel's release and machine.
-fn uname() -> Result<(String, String), String> {
-    let mut information = std::mem::MaybeUninit::<libc::utsname>::uninit();
-    // SAFETY: `uname` fills the `utsname` it is given and touches nothing
-    // else; the pointer is to a live, correctly sized allocation.
-    let result = unsafe { libc::uname(information.as_mut_ptr()) };
-    if result != 0 {
-        return Err(format!("uname failed: {}", io::Error::last_os_error()));
-    }
-    // SAFETY: `uname` returned success, so the structure is initialized.
-    let information = unsafe { information.assume_init() };
-
-    Ok((field(&information.release), field(&information.machine)))
-}
-
-/// One NUL-terminated C string out of a `utsname`.
-fn field(bytes: &[libc::c_char]) -> String {
-    bytes
-        .iter()
-        .take_while(|byte| **byte != 0)
-        .map(|byte| *byte as u8 as char)
-        .collect()
 }
 
 /// Checks the mounted payload and reads what module it carries.

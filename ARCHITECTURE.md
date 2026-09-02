@@ -2581,6 +2581,39 @@ which is what keeps them from disagreeing about what is being signed. The
 crypto is RustCrypto and `getrandom`: pure Rust, so the agent stays a static
 musl binary built without a C toolchain.
 
+### What the agent detects about its guest
+
+The host has to declare what it cannot see: a cloud image is found and verified
+before anything boots, and cloud-init runs before there is a system to ask, so
+the image templates, the checksum file, the default user, the admin group, the
+SSH units, the keyboard files and the packages that install a desktop are
+profile data in `distros/*.json`. Everything else the agent asks the guest
+itself, at the moment it acts, in `crates/agent/src/guest_platform.rs`.
+
+Detection there is not merely cheaper than a profile field, it is truthful. A
+profile records what VMLord *asked for* when the VM was created; a guest months
+later is whatever it has *become* -- a kernel upgraded, a desktop replaced,
+packages installed by hand. So `GuestFacts` carries identity -- the `ID` and
+release of `/etc/os-release`, the Debian name of the machine, the running
+kernel -- and beside it the platform: which package manager answers `--version`
+(`apt-get`, `pacman`, `dnf` or `zypper`, in that fixed order), whether the
+architecture's multiarch directory is there or the libraries are in `/usr/lib`,
+and what logind says is on the screen -- the session's own `DESKTOP` and type,
+and the unit `display-manager.service` is linked to.
+
+Nothing in that module branches on the name of a distribution, which is the
+point: a guest is what it answers, not what its `ID` implies. The identity half
+still fails the call, because a guest that will not say what it is has no
+recipe at all; the platform half never does -- a guest with no package manager
+and no desktop is one whose stages skip themselves with a reason. Both recipes
+report the detected platform in their `DISTRIBUTION` stage, since detection is
+invisible when it works and undiagnosable from a host when it does not.
+
+Every decision is a function of text or of a directory a test can point
+elsewhere -- the shape `display-services`' `seat` module already uses -- so the
+detection is covered by fixtures rather than by a live guest, and only the thin
+gathering at the bottom of the module needs one.
+
 ### Installing the guest agent
 
 A cloud-image VM gets the agent on its first boot. At creation VMLord looks for
