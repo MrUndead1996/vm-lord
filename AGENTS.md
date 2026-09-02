@@ -69,7 +69,7 @@ Update **ARCHITECTURE.md** whenever architectural decisions change.
 * Complete each task in a dedicated branch.
 * Commit the completed work before pushing the branch to the remote repository.
 * Open a merge request only after receiving explicit user approval.
-* Assign every merge request to `mrundead` and request a review from `mrundead`.
+* Assign every merge request to `mrundead`.
 
 ## Commits
 
