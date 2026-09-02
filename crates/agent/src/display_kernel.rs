@@ -36,7 +36,7 @@ use crate::{
     },
     guest_files::{copy_tree, failure, read, write_if_different},
     guest_packages::{self, Package},
-    guest_platform::{GuestFacts, guest_facts},
+    guest_platform::{GuestFacts, LibraryLayout, guest_facts},
 };
 
 /// Where the guest mounts the display payload share.
@@ -322,6 +322,7 @@ fn run_stages(
         mode,
         built.then_some(guest.kernel_release.as_str()),
         certificate.as_ref(),
+        &guest.library_layout,
     )?;
     device_stage(report)?;
     services_stages(
@@ -1005,6 +1006,30 @@ fn update_initramfs_stage(report: &mut Report, kernel_release: &str) -> Result<(
     Ok(())
 }
 
+/// The compositor's drop-in as it is installed: what the payload ships, plus
+/// the one line only the guest can answer.
+///
+/// The library path is not a shipped constant because it is not one: a
+/// multiarch guest keeps the distribution's Mesa in `/usr/lib/<triplet>` and a
+/// guest without a multiarch directory keeps it in `/usr/lib`, and a drop-in
+/// naming the wrong one leaves the loader on the payload's Mesa -- which is
+/// the failure this file exists to prevent, arriving silently.
+///
+/// Appended rather than substituted, so that an older payload still carrying
+/// the line installs correctly: systemd reads a repeated `Environment=` for
+/// the same variable last-wins, and the last one is this one.
+fn compositor_drop_in(shipped: &str, layout: &LibraryLayout) -> String {
+    let mut content = shipped.to_owned();
+    if !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(&format!(
+        "Environment=LD_LIBRARY_PATH={}\n",
+        layout.directory()
+    ));
+    content
+}
+
 fn update_initramfs(kernel_release: &str) -> command::Outcome {
     command::run(
         "update-initramfs",
@@ -1030,19 +1055,21 @@ fn load_stage(
     mode: Option<(u32, u32)>,
     refresh_initramfs_for: Option<&str>,
     certificate: Option<&DisplaySigningCertificate>,
+    layout: &LibraryLayout,
 ) -> Result<(), String> {
     let wanted = wanted_mode(mode);
     let payload_drm = Path::new(PAYLOAD_MOUNT).join("content").join("drm");
-    let copy = |from: &str, to: &str| -> Result<(), String> {
+    let install = |from: &str, to: &str, finish: &dyn Fn(String) -> String| -> Result<(), String> {
         let source = payload_drm.join(from);
         if !source.exists() {
             return Ok(());
         }
         let content = fs::read_to_string(&source)
             .map_err(|error| format!("{} could not be read: {error}", source.display()))?;
-        write_if_different(Path::new(to), &content)
+        write_if_different(Path::new(to), &finish(content))
             .map_err(|error| format!("{to} could not be written: {error}"))
     };
+    let copy = |from: &str, to: &str| install(from, to, &|content| content);
 
     let prepared = write_if_different(Path::new(MODULES_LOAD), &format!("{MODULE}\n"))
         .map_err(|error| format!("{MODULES_LOAD} could not be written: {error}"))
@@ -1054,7 +1081,13 @@ fn load_stage(
             .map_err(|error| format!("{MODPROBE_OPTIONS} could not be written: {error}"))
         })
         .and_then(|()| copy("vmlord-display-unbind-simpledrm.service", UNBIND_UNIT))
-        .and_then(|()| copy("vmlord-display-compositor-mesa.conf", COMPOSITOR_DROP_IN))
+        .and_then(|()| {
+            install(
+                "vmlord-display-compositor-mesa.conf",
+                COMPOSITOR_DROP_IN,
+                &|content| compositor_drop_in(&content, layout),
+            )
+        })
         .and_then(|()| copy("62-vmlord-display.rules", UDEV_RULES));
     if let Err(reason) = prepared {
         report.failed(DisplayRecipeStep::ModuleLoad, reason.clone());
@@ -1660,7 +1693,9 @@ mod tests {
 
     use vmlord_agent_protocol::v1::{DisplayRecipeStageState, DisplayRecipeStep};
 
-    use super::{apply, load_failure_message, sha256_hex, update, verify_declared_files};
+    use super::{
+        apply, compositor_drop_in, load_failure_message, sha256_hex, update, verify_declared_files,
+    };
     use crate::display_recipe::{PayloadFacts, STEPS};
     use crate::guest_platform::{DesktopFacts, GuestFacts, LibraryLayout, PackageManager};
 
@@ -1714,10 +1749,41 @@ mod tests {
             );
         }
         assert!(
-            drop_in
+            !drop_in.lines().any(|line| line.starts_with("Environment=")),
+            "the path is the guest's answer, not the payload's: it is appended on install"
+        );
+
+        let installed = compositor_drop_in(drop_in, &guest().library_layout);
+
+        assert!(
+            installed
                 .lines()
                 .any(|line| line == "Environment=LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu"),
-            "unsetting LD_LIBRARY_PATH is not enough: the cache has to be outranked"
+            "unsetting LD_LIBRARY_PATH is not enough: the cache has to be outranked\n{installed}"
+        );
+        assert!(
+            installed
+                .lines()
+                .any(|line| line.starts_with("UnsetEnvironment=")),
+            "the shipped half has to survive the append\n{installed}"
+        );
+    }
+
+    #[test]
+    fn the_compositor_drop_in_names_the_library_directory_this_guest_turned_out_to_have() {
+        // Arch has no multiarch directory, and a drop-in naming one would put
+        // the loader on a path that does not exist -- which is the payload's
+        // Mesa winning again, silently, on the guest this file is meant to
+        // protect.
+        let drop_in =
+            include_str!("../../../payloads/display/module/vmlord-display-compositor-mesa.conf");
+        let installed = compositor_drop_in(drop_in, &LibraryLayout::Flat);
+
+        assert!(
+            installed
+                .lines()
+                .any(|line| line == "Environment=LD_LIBRARY_PATH=/usr/lib"),
+            "{installed}"
         );
     }
 

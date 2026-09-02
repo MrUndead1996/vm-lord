@@ -28,7 +28,7 @@ use crate::{
     gpu_targets::{PAYLOAD, WSL_LIB},
     guest_files::{copy_tree, failure, read, write_if_different},
     guest_packages::{self, Package},
-    guest_platform::{GuestFacts, guest_facts, library_triplet},
+    guest_platform::{GuestFacts, LibraryLayout, guest_facts},
 };
 
 /// The kernel module this recipe exists to deliver.
@@ -424,18 +424,10 @@ struct Userspace {
 fn userspace_stage(report: &mut Report, guest: &GuestFacts) -> Result<Userspace, String> {
     let policy = parse_mesa_policy(&read(&Path::new(PAYLOAD).join("sources.json")))
         .inspect_err(|error| report.failed(GpuRecipeStep::Userspace, error.clone()))?;
-    let Some(triplet) = library_triplet(&guest.architecture) else {
-        let reason = format!(
-            "vmlord-agent has no library path for architecture {}",
-            guest.architecture
-        );
-        report.failed(GpuRecipeStep::Userspace, reason.clone());
-        return Err(reason);
-    };
 
     match policy {
         MesaPolicy::Distro => {
-            distribution_mesa(report, guest, triplet)?;
+            distribution_mesa(report, guest)?;
             Ok(Userspace {
                 policy,
                 prefix: None,
@@ -443,10 +435,13 @@ fn userspace_stage(report: &mut Report, guest: &GuestFacts) -> Result<Userspace,
             })
         }
         MesaPolicy::Bundled => {
-            let prefix = bundled_mesa(report, triplet)?;
+            let prefix = bundled_mesa(report, &guest.library_layout)?;
             Ok(Userspace {
                 policy,
-                library_paths: vec![format!("{MESA_PREFIX}/lib/{triplet}"), WSL_LIB.to_owned()],
+                library_paths: vec![
+                    guest.library_layout.directory_under(MESA_PREFIX),
+                    WSL_LIB.to_owned(),
+                ],
                 prefix: Some(prefix),
             })
         }
@@ -459,9 +454,10 @@ fn userspace_stage(report: &mut Report, guest: &GuestFacts) -> Result<Userspace,
 /// `microsoft-experimental`, so Vulkan under this policy is lavapipe. That is
 /// a fact for the host's log and not a refusal: the payload's author chose the
 /// policy, and whether GL alone is enough is the probe's question.
-fn distribution_mesa(report: &mut Report, guest: &GuestFacts, triplet: &str) -> Result<(), String> {
-    let driver = PathBuf::from(format!("/usr/lib/{triplet}/dri/d3d12_dri.so"));
-    let loader = PathBuf::from(format!("/usr/lib/{triplet}/libvulkan.so.1"));
+fn distribution_mesa(report: &mut Report, guest: &GuestFacts) -> Result<(), String> {
+    let libraries = guest.library_layout.directory();
+    let driver = PathBuf::from(format!("{libraries}/dri/d3d12_dri.so"));
+    let loader = PathBuf::from(format!("{libraries}/libvulkan.so.1"));
     if driver.exists() && loader.exists() {
         report.skipped(
             GpuRecipeStep::Userspace,
@@ -498,7 +494,7 @@ fn distribution_mesa(report: &mut Report, guest: &GuestFacts, triplet: &str) -> 
 }
 
 /// Stages the Mesa tree the payload carries, and tells the linker about it.
-fn bundled_mesa(report: &mut Report, triplet: &str) -> Result<PathBuf, String> {
+fn bundled_mesa(report: &mut Report, layout: &LibraryLayout) -> Result<PathBuf, String> {
     let source = Path::new(PAYLOAD).join("content").join("mesa");
     let prefix = PathBuf::from(MESA_PREFIX);
     if !source.is_dir() {
@@ -516,7 +512,7 @@ fn bundled_mesa(report: &mut Report, triplet: &str) -> Result<PathBuf, String> {
         reason
     })?;
 
-    let libraries = format!("{MESA_PREFIX}/lib/{triplet}");
+    let libraries = layout.directory_under(MESA_PREFIX);
     let line = format!("# Written by vmlord-agent. Do not edit.\n{libraries}\n");
     if let Err(error) = write_if_different(Path::new(MESA_LD_CONF), &line) {
         let reason = format!("{MESA_LD_CONF} could not be written: {error}");

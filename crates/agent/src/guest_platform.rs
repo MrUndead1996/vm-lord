@@ -188,8 +188,12 @@ impl LibraryLayout {
 /// Derived from the guest rather than written as a constant: an agent that
 /// hard-codes one architecture's library path is one that silently installs
 /// nothing on the other.
+///
+/// Not public: a triplet is a guess until a directory confirms it, so
+/// `library_layout` is what the recipes ask, and this is the half of that
+/// question the architecture answers.
 #[must_use]
-pub fn library_triplet(architecture: &str) -> Option<&'static str> {
+fn library_triplet(architecture: &str) -> Option<&'static str> {
     match architecture {
         "amd64" => Some("x86_64-linux-gnu"),
         "arm64" => Some("aarch64-linux-gnu"),

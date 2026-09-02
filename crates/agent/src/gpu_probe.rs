@@ -8,7 +8,7 @@
 
 use vmlord_agent_protocol::v1::{GpuProbeCheck, GpuProbeCheckState, GpuProbeStep, GpuProbeVerdict};
 
-use crate::gpu_targets::WSL_LIB;
+use crate::{gpu_targets::WSL_LIB, guest_platform::LibraryLayout};
 
 /// Every check, in the order it is attempted.
 ///
@@ -223,15 +223,21 @@ pub fn verdict(device: bool, hardware: Option<&str>) -> GpuProbeVerdict {
 /// `distro` policy -- the two policies put the same driver in different
 /// places, and a probe that looked in one of them would report a missing
 /// library on a guest that renders.
-pub fn required_libraries(triplet: &str, mesa_prefix: Option<&str>) -> Vec<String> {
+///
+/// The layout is what the guest turned out to have rather than what its
+/// architecture implies: a guest whose libraries are in `/usr/lib` has its
+/// driver there, and a probe reading a multiarch path would report every
+/// library missing on a guest that renders perfectly well.
+pub fn required_libraries(layout: &LibraryLayout, mesa_prefix: Option<&str>) -> Vec<String> {
+    let distribution = layout.directory();
     let mesa = match mesa_prefix {
-        Some(prefix) => format!("{prefix}/lib/{triplet}"),
-        None => format!("/usr/lib/{triplet}"),
+        Some(prefix) => layout.directory_under(prefix),
+        None => distribution.clone(),
     };
 
     vec![
         format!("{mesa}/dri/d3d12_dri.so"),
-        format!("/usr/lib/{triplet}/libvulkan.so.1"),
+        format!("{distribution}/libvulkan.so.1"),
         // `d3d12_dri.so` opens these itself, out of the host's mounted WSL
         // userspace: without them the GL path loads and then falls back.
         format!("{WSL_LIB}/libd3d12.so"),
@@ -254,9 +260,14 @@ mod tests {
     use vmlord_agent_protocol::v1::{GpuProbeCheckState, GpuProbeStep, GpuProbeVerdict};
 
     use super::{
-        CHECKS, Checks, Renderer, classify, eglinfo_renderers, hardware_renderer,
+        CHECKS, Checks, LibraryLayout, Renderer, classify, eglinfo_renderers, hardware_renderer,
         required_libraries, shell_command, verdict, vulkaninfo_devices,
     };
+
+    /// The layout a multiarch guest was detected to have.
+    fn multiarch() -> LibraryLayout {
+        LibraryLayout::Multiarch("x86_64-linux-gnu".to_owned())
+    }
 
     #[test]
     fn a_software_rasteriser_is_never_hardware_whatever_it_is_called() {
@@ -419,7 +430,7 @@ GPU0:
 
     #[test]
     fn a_bundled_userspace_is_looked_for_where_it_was_staged() {
-        let required = required_libraries("x86_64-linux-gnu", Some("/opt/vmlord/wsl-mesa"));
+        let required = required_libraries(&multiarch(), Some("/opt/vmlord/wsl-mesa"));
 
         assert!(
             required
@@ -439,7 +450,7 @@ GPU0:
 
     #[test]
     fn a_distribution_userspace_is_looked_for_in_the_distributions_own_path() {
-        let required = required_libraries("x86_64-linux-gnu", None);
+        let required = required_libraries(&multiarch(), None);
 
         assert!(
             required.contains(&"/usr/lib/x86_64-linux-gnu/dri/d3d12_dri.so".to_owned()),
@@ -452,6 +463,34 @@ GPU0:
         assert!(
             !required.iter().any(|path| path.contains("wsl-mesa")),
             "nothing is staged under this policy: {required:?}"
+        );
+    }
+
+    #[test]
+    fn a_guest_without_a_multiarch_directory_is_looked_at_in_lib_itself() {
+        // Arch keeps its libraries in /usr/lib, and a probe that read a
+        // multiarch path there would report every library missing on a guest
+        // whose renderer is fine.
+        let required = required_libraries(&LibraryLayout::Flat, None);
+
+        assert!(
+            required.contains(&"/usr/lib/dri/d3d12_dri.so".to_owned()),
+            "{required:?}"
+        );
+        assert!(
+            required.contains(&"/usr/lib/libvulkan.so.1".to_owned()),
+            "{required:?}"
+        );
+
+        let staged = required_libraries(&LibraryLayout::Flat, Some("/opt/vmlord/wsl-mesa"));
+
+        assert!(
+            staged.contains(&"/opt/vmlord/wsl-mesa/lib/dri/d3d12_dri.so".to_owned()),
+            "a payload staged on this guest is laid out the way this guest is: {staged:?}"
+        );
+        assert!(
+            staged.contains(&"/usr/lib/libvulkan.so.1".to_owned()),
+            "the loader is the distribution's whatever the Mesa policy is: {staged:?}"
         );
     }
 

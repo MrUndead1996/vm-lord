@@ -4032,11 +4032,15 @@ under a module already loaded costs a `modprobe -r` and a `modprobe`, because a
 module parameter is read once; a module that does not say what it was loaded
 with is left alone, because a reload on a guess drops a working desktop.
 
-The drop-in is the opposite kind of file: identical for every VM, so it is
-copied out of the payload. It lands on `org.gnome.Shell@.service`, which is a
-template, so it reaches the greeter's compositor and a logged-in user's both,
-and it says two things -- the GPU recipe's Mesa overrides unset, and
-`LD_LIBRARY_PATH` pointed at the distribution's libraries. Both, because the
+The drop-in sits between the two: the same file for every VM, so it is copied
+out of the payload, with one line the payload cannot write. It lands on
+`org.gnome.Shell@.service`, which is a template, so it reaches the greeter's
+compositor and a logged-in user's both, and it says two things -- the GPU
+recipe's Mesa overrides unset, and `LD_LIBRARY_PATH` pointed at the
+distribution's libraries. The second is appended on install, out of the library
+layout the agent detected in the guest: a multiarch guest keeps that Mesa in
+`/usr/lib/<triplet>` and a guest without a multiarch directory keeps it in
+`/usr/lib`, and a shipped constant would be right on one of them. Both, because the
 GPU recipe reaches a process by two paths: the environment it exports, and
 `/etc/ld.so.conf.d/vmlord-wsl-mesa.conf`, which no environment can undo. A
 compositor left on the payload's Mesa binds our device, fails to allocate a
