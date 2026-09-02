@@ -3149,7 +3149,16 @@ The absolute axes are declared `0..32767` once and never again. Deriving them
 from the resolution would mean recreating the device on every change of it,
 which #120 makes an ordinary event, and the desktop would watch its pointer
 disappear and come back; the session scales guest pixels onto the fixed range
-instead. The wheel travels at both resolutions: `REL_WHEEL_HI_RES` in the
+instead.
+
+That scale aims **inside** the pixel rather than at its edge, because the value
+makes a round trip: libinput reads an absolute axis back as `value * size /
+32768`, so each pixel owns an interval of the range, and a value on the
+interval's boundary comes back as the pixel next door -- at 1920 wide, pixel 1
+was arriving as pixel 0. Three eighths of the way in is far enough from either
+edge that no rounding leaves the pixel, and short enough of a half that the
+cursor plane's position, which the host measures the hotspot from, rounds down
+whichever rule a compositor rounds by. The wheel travels at both resolutions: `REL_WHEEL_HI_RES` in the
 hundred-and-twentieths the wire uses, and the whole detents they add up to, with
 the remainder carried so slow scrolling is not lost.
 
