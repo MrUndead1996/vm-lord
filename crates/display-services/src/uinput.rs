@@ -581,8 +581,7 @@ mod tests {
     ///
     /// `value * size / (maximum + 1)`, which is what a compositor is handed.
     fn read_back(value: i32, size: u32) -> u32 {
-        u32::try_from(i64::from(value) * i64::from(size) / (ABS_RANGE as i64 + 1))
-            .expect("a pixel")
+        u32::try_from(i64::from(value) * i64::from(size) / (ABS_RANGE as i64 + 1)).expect("a pixel")
     }
 
     #[test]
