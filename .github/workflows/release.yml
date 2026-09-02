@@ -57,6 +57,10 @@ jobs:
           if ($tag -ne "v$version") {
             throw "tag $tag does not match the workspace version $version"
           }
+          # Published for every later step, so the tag, the compiled
+          # installer's name and the release manifest all read one value that
+          # was checked here rather than each deriving its own.
+          "VMLORD_VERSION=$version" | Add-Content -Path $env:GITHUB_ENV
 
       - name: Install the guest agent's target
         shell: pwsh
@@ -118,13 +122,16 @@ jobs:
           if (-not (Test-Path -LiteralPath $iscc)) {
             throw "Inno Setup 6 is not on this image at $iscc"
           }
-          & $iscc installer/vmlord.iss
+          # `/DAppVersion=` is how the workspace version reaches the
+          # installer. The script has no version of its own to disagree with
+          # this one, and refuses to compile without it.
+          & $iscc "/DAppVersion=$env:VMLORD_VERSION" installer/vmlord.iss
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
 
       - name: Write and re-verify the release manifest
         shell: pwsh
         run: |
-          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $version = $env:VMLORD_VERSION
           $installer = "target/installer/VMLord-$version-x86_64-setup.exe"
           cargo release-manifest `
             --tag $env:GITHUB_REF_NAME `
@@ -154,7 +161,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          $version = $env:VMLORD_VERSION
           gh release create $env:GITHUB_REF_NAME `
             --draft `
             --title "VMLord $version" `

@@ -164,13 +164,24 @@ uninstaller. Settings, distribution profiles and updates belong to the
 application. From the repository root on Windows:
 
 ```powershell
+$version = (cargo metadata --locked --format-version 1 --no-deps |
+    ConvertFrom-Json).packages |
+    Where-Object { $_.name -eq 'vmlord' } |
+    Select-Object -ExpandProperty version
 cargo dist --gpu-payload <dir> --display-payload <dir>
 powershell -File installer\check.ps1 target\dist
-iscc installer\vmlord.iss
-cargo release-manifest --tag v0.1.0 `
-    --installer target\installer\VMLord-0.1.0-x86_64-setup.exe `
+iscc /DAppVersion=$version installer\vmlord.iss
+cargo release-manifest --tag "v$version" `
+    --installer "target\installer\VMLord-$version-x86_64-setup.exe" `
     --output target\installer\release-manifest.json
 ```
+
+The version is read from `Cargo.toml` and passed in rather than written into
+`vmlord.iss`, which states none of its own and refuses to compile without one.
+It used to keep a copy in step by hand, and the copy drifted: 0.2.0 was tagged
+and built as `VMLord-0.1.0-x86_64-setup.exe`, a file `cargo release-manifest`
+then could not find. Releasing therefore means editing one version, in
+`[workspace.package]`, and tagging it.
 
 `check.ps1` runs first because the installer copies whatever was staged: a
 binary that failed to build would otherwise ship as a file missing from

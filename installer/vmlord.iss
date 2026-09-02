@@ -5,19 +5,31 @@
 ; profiles and updates belongs to the application, which is why nothing here
 ; writes or reads settings.toml.
 ;
-; Compile from the repository root, after `cargo dist` has staged the payload:
+; Compile from the repository root, after `cargo dist` has staged the payload.
+; The version is not written here: it is passed in, and it comes from the one
+; place that states it, `[workspace.package] version` in Cargo.toml.
 ;
 ;     powershell -File installer\check.ps1 target\dist
-;     iscc installer\vmlord.iss
+;     $v = (cargo metadata --locked --format-version 1 --no-deps |
+;         ConvertFrom-Json).packages |
+;         Where-Object { $_.name -eq 'vmlord' } |
+;         Select-Object -ExpandProperty version
+;     iscc /DAppVersion=$v installer\vmlord.iss
 
 #define AppName "VMLord"
 #define AppPublisher "VMLord contributors"
 #define AppUrl "https://github.com/MrUndead1996/vm-lord"
 #define AppExe "vmlord.exe"
-; Kept in step with the workspace version by hand at release time; the release
-; workflow refuses a tag that disagrees with Cargo.toml, and the setup file
-; name below is what the release manifest points at.
-#define AppVersion "0.2.0"
+; The version is the caller's to supply, because there is exactly one place
+; that states it -- `[workspace.package] version` in Cargo.toml -- and a copy
+; here would be a second. It used to be a copy, kept in step by hand, and it
+; drifted: 0.2.0 was tagged and built as `VMLord-0.1.0-x86_64-setup.exe`, which
+; `cargo release-manifest` then could not find. Refusing to compile is the
+; cheap failure; the expensive one is an installer named after the wrong
+; release, found after the whole distribution has been built.
+#ifndef AppVersion
+  #error "AppVersion was not passed in. Compile with /DAppVersion=<workspace version>; see the header of this file."
+#endif
 #define DistDir "..\target\dist"
 
 [Setup]

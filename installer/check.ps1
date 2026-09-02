@@ -124,6 +124,14 @@ if (-not (Test-Path -LiteralPath $script -PathType Leaf)) {
     if ($text -notmatch '(?m)^\s*PrivilegesRequiredOverridesAllowed\s*=\s*dialog\s*$') {
         $problems.Add('vmlord.iss does not set PrivilegesRequiredOverridesAllowed=dialog')
     }
+    # The version comes in through `/DAppVersion=`. A `#define AppVersion`
+    # here would be a second statement of it, kept in step by hand -- which is
+    # exactly how 0.2.0 was built as `VMLord-0.1.0-x86_64-setup.exe`, a name
+    # `cargo release-manifest` then could not find.
+    if ($text -match '(?m)^\s*#define\s+AppVersion\b') {
+        $problems.Add('vmlord.iss defines AppVersion itself; it must come from /DAppVersion=')
+    }
+
     # `{autopf}` is what makes the chosen mode decide the directory; a literal
     # `{pf}` would install every per-user copy into Program Files. The name
     # after it may be the preprocessor variable the script actually uses.

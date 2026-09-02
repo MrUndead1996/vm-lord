@@ -113,6 +113,8 @@ fn check_release(document: &Value) -> Vec<String> {
         problems.push("a pull request must not be able to start a release".to_owned());
     }
 
+    problems.extend(installer_version_passed_in(document));
+
     for (name, job) in jobs(document) {
         let contents = permission(job.get("permissions"), "contents");
         match (name.as_str(), contents.as_deref()) {
@@ -127,6 +129,45 @@ fn check_release(document: &Value) -> Vec<String> {
         }
     }
 
+    problems
+}
+
+/// That the step which compiles the installer hands it the workspace version.
+///
+/// The Inno Setup script states no version of its own; it takes one through
+/// `/DAppVersion=`. A step that drops the flag does not build the wrong
+/// installer -- the script refuses to compile at all -- but it refuses after
+/// the tests, the distribution and the licence notices have already been
+/// built. Read here, that is a failed pull request instead.
+fn installer_version_passed_in(document: &Value) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (name, job) in jobs(document) {
+        let Some(steps) = job.get("steps").and_then(Value::as_sequence) else {
+            continue;
+        };
+        for step in steps {
+            let Some(run) = step.get("run").and_then(Value::as_str) else {
+                continue;
+            };
+            // Comments are dropped first, because the flag is explained in one
+            // beside the command: a check that read them would go on passing
+            // after the command itself had lost the flag.
+            let script: String = run
+                .lines()
+                .filter(|line| !line.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if !script.to_ascii_lowercase().contains("iscc") {
+                continue;
+            }
+            if !script.contains("/DAppVersion=") {
+                problems.push(format!(
+                    "job `{name}` compiles the installer without `/DAppVersion=`; the version \
+                     has to come from the workspace"
+                ));
+            }
+        }
+    }
     problems
 }
 
@@ -206,7 +247,7 @@ fn permission(permissions: Option<&Value>, name: &str) -> Option<String> {
 mod tests {
     use serde_yaml_ng::Value;
 
-    use super::{check_release, every_workflow, unpinned_actions};
+    use super::{check_release, every_workflow, installer_version_passed_in, unpinned_actions};
 
     fn parse(text: &str) -> Value {
         serde_yaml_ng::from_str(text).expect("the fixture is valid YAML")
@@ -275,6 +316,52 @@ mod tests {
                 .iter()
                 .any(|problem| problem.contains("security-events")),
             "{problems:?}"
+        );
+    }
+
+    /// The installer script states no version, so the step that compiles it
+    /// has to hand one over. Without the flag the release fails only after
+    /// everything before it has been built.
+    #[test]
+    fn the_installer_is_compiled_with_the_workspace_version() {
+        let compile = |run: &str| {
+            parse(&format!(
+                "jobs:\n  release:\n    steps:\n      - run: |\n          {run}\n"
+            ))
+        };
+
+        assert_eq!(
+            installer_version_passed_in(&compile(
+                "& $iscc \"/DAppVersion=$env:VMLORD_VERSION\" installer/vmlord.iss"
+            )),
+            Vec::<String>::new()
+        );
+
+        let problems = installer_version_passed_in(&compile("& $iscc installer/vmlord.iss"));
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("/DAppVersion=")),
+            "{problems:?}"
+        );
+
+        // The flag is explained in a comment beside the command; finding it
+        // there is not finding it in the command.
+        let problems = installer_version_passed_in(&parse(
+            "jobs:\n  release:\n    steps:\n      - run: |\n          # pass /DAppVersion= \
+             here\n          & $iscc installer/vmlord.iss\n",
+        ));
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("/DAppVersion=")),
+            "{problems:?}"
+        );
+
+        // A step that does not compile the installer is not asked about it.
+        assert_eq!(
+            installer_version_passed_in(&compile("cargo dist")),
+            Vec::<String>::new()
         );
     }
 

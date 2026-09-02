@@ -4432,6 +4432,16 @@ that can write to this repository. `cargo run -p xtask -- workflow-check` reads
 the file back as data and asserts exactly those properties, so a later edit
 that loosens one fails the branch rather than the release.
 
+The release states its version once, in `[workspace.package] version`. The tag
+is checked against it in the workflow's first step, and the Inno Setup script
+holds no version at all: it takes one through `/DAppVersion=` and refuses to
+compile without it. This is a correction, not a preference -- the script used
+to carry a copy synchronized by hand, and cutting 0.2.0 built
+`VMLord-0.1.0-x86_64-setup.exe`, a name `cargo release-manifest` then could not
+find, sixteen minutes into the run. `workflow-check` asserts the flag is still
+passed and `installer/check.ps1` asserts the script has not grown a version of
+its own again, so the copy cannot come back unnoticed.
+
 The Forgejo mirror at `git.mrundead.org` is a pull mirror configured on Forgejo
 itself, not a push from Actions. Forgejo's SSH is not reachable from GitHub's
 runners, and rather than exposing it, the direction was inverted: Forgejo
