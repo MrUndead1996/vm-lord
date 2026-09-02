@@ -3173,8 +3173,20 @@ I-beam. `cursor.rs` recovers it by subtraction: the position last sent to the
 guest, minus the corner the guest reports, is the hotspot. The two are only the
 same instant while the pointer stands still, so the subtraction is trusted on a
 record with no motion sent since the previous one and the same corner as the
-previous one, and a difference that lands outside the bitmap is refused. A
-moving pointer names nothing and keeps what was worked out before.
+previous one, and a difference landing outside what the bitmap actually draws
+is refused -- a cursor plane is 64x64 whatever sits on it, and the padding
+points at nothing.
+
+A hotspot belongs to a bitmap and is measured **once**, because a hotspot that
+moves is a cursor that jumps. The subtraction is exact only in principle: this
+end sends a guest pixel, the guest's pointer is a float that came back through
+the absolute axes' fixed range, and the plane's corner is rounded, so the same
+shape measures a pixel apart at two ends of the screen. The guest sends its
+cursor with every frame whether or not it changed, so the bitmap is compared
+with the one on the window: an identical one is neither a measurement nor an
+icon rebuilt sixty times a second. Shapes already measured are remembered,
+which keeps the arrow and the I-beam of an afternoon's editing to one movement
+each.
 
 Keys are carried as **scan codes**, not virtual keys. A virtual key has already
 had the host's layout applied to it and the guest then applies its own, so a

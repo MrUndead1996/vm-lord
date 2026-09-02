@@ -1147,8 +1147,12 @@ fn apply(
                 tracing::error!("the stream could not be shown: {error}");
             }
         }
+        // A bitmap with every frame, and the same one nearly every time: only
+        // a shape the window is not already showing reaches the renderer.
         Signal::Cursor(image) => {
-            if let Err(error) = context.renderer.set_cursor(cursor.bitmap(image)) {
+            if let Some(image) = cursor.bitmap(image)
+                && let Err(error) = context.renderer.set_cursor(image)
+            {
                 tracing::warn!("the guest's cursor could not be shown: {error}");
             }
         }
