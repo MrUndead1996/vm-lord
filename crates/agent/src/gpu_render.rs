@@ -32,7 +32,8 @@ use crate::{
     gpu_recipe::{MesaPolicy, module_is_loaded, parse_mesa_policy},
     gpu_targets::{PAYLOAD, WSL_LIB},
     guest_files::{failure, read},
-    guest_platform::{guest_facts, library_triplet},
+    guest_packages::{self, Package},
+    guest_platform::{GuestFacts, guest_facts, library_triplet},
 };
 
 /// The kernel module behind the device.
@@ -55,7 +56,8 @@ const VULKAN_TOOL: &str = "/usr/bin/vulkaninfo";
 /// Mesa's and Khronos's own, never a vendor's: that is what makes the probe
 /// read the same on a host with an NVIDIA, an AMD or an Intel adapter behind
 /// `/dev/dxg`.
-const TOOL_PACKAGES: [&str; 2] = ["mesa-utils", "vulkan-tools"];
+/// The two programs the probe runs, whatever this guest calls their packages.
+const TOOLS: &[Package] = &[Package::RenderTools];
 
 /// The vendor tools that are worth quoting when they happen to be there.
 ///
@@ -64,7 +66,6 @@ const TOOL_PACKAGES: [&str; 2] = ["mesa-utils", "vulkan-tools"];
 /// all that draws through d3d12 is.
 const VENDOR_TOOLS: [&str; 2] = ["nvidia-smi", "rocm-smi"];
 
-const APT_BUDGET: Duration = Duration::from_secs(300);
 const PROBE_BUDGET: Duration = Duration::from_secs(60);
 const VENDOR_BUDGET: Duration = Duration::from_secs(15);
 
@@ -92,6 +93,11 @@ pub fn probe(stopping: &AtomicBool) -> ProbeGpuResponse {
     }
     checks.ok(GpuProbeStep::Device, "/dev/dxg is a usable device");
 
+    // Asked once, after the check that can end the probe, and shared by the
+    // two that need it: what libraries a renderer opens, and what installs the
+    // programs that open them.
+    let guest = guest_facts().ok();
+
     if halted(stopping) {
         return report(
             checks,
@@ -103,13 +109,13 @@ pub fn probe(stopping: &AtomicBool) -> ProbeGpuResponse {
     }
 
     let driver = module_check(&mut checks);
-    libraries_check(&mut checks);
+    libraries_check(&mut checks, guest.as_ref());
 
     if halted(stopping) {
         return report(checks, "the guest is shutting down", device, &found, driver);
     }
 
-    if tools_check(&mut checks) {
+    if tools_check(&mut checks, guest.as_ref()) {
         found.extend(opengl_check(&mut checks));
         found.extend(vulkan_check(&mut checks));
     } else {
@@ -176,8 +182,8 @@ fn module_check(checks: &mut Checks) -> String {
 ///
 /// Never ends the probe: the renderers are what decide, and a library check
 /// that was wrong about a path must not veto a guest that draws.
-fn libraries_check(checks: &mut Checks) {
-    let Ok(guest) = guest_facts() else {
+fn libraries_check(checks: &mut Checks, guest: Option<&GuestFacts>) {
+    let Some(guest) = guest else {
         checks.skipped(
             GpuProbeStep::Libraries,
             "this guest does not say what it is, so there is no library path to look in",
@@ -225,9 +231,18 @@ fn libraries_check(checks: &mut Checks) {
 
 /// Makes sure the two programs the renderer checks run are installed.
 ///
-/// Present-first, as every apt stage in this recipe is: the second start of a
+/// Present-first, as every install in this recipe is: the second start of a
 /// VM installs nothing and needs no network.
-fn tools_check(checks: &mut Checks) -> bool {
+fn tools_check(checks: &mut Checks, guest: Option<&GuestFacts>) -> bool {
+    let Some(guest) = guest else {
+        checks.skipped(
+            GpuProbeStep::Tools,
+            "this guest does not say what it is, so there is nothing to install the probe \
+             programs with",
+        );
+        return false;
+    };
+
     if tools_are_present() {
         checks.skipped(
             GpuProbeStep::Tools,
@@ -236,43 +251,26 @@ fn tools_check(checks: &mut Checks) -> bool {
         return true;
     }
 
-    let mut outcome = apt_tools();
-    if !outcome.succeeded() {
-        // A cloud image's package lists are as old as the image.
-        let _ = command::run(
-            "apt-get",
-            &["update"],
-            &[("DEBIAN_FRONTEND", "noninteractive")],
-            APT_BUDGET,
-        );
-        outcome = apt_tools();
-    }
+    let Some(manager) = guest.package_manager else {
+        checks.failed(GpuProbeStep::Tools, guest_packages::no_manager(TOOLS));
+        return false;
+    };
 
+    let (outcome, installed) = guest_packages::install(manager, TOOLS, &guest.kernel_release);
     if tools_are_present() {
-        checks.ok(
-            GpuProbeStep::Tools,
-            format!("installed {}", TOOL_PACKAGES.join(" and ")),
-        );
+        checks.ok(GpuProbeStep::Tools, format!("installed {installed}"));
         true
     } else {
-        checks.failed(GpuProbeStep::Tools, failure("apt-get install", &outcome));
+        checks.failed(
+            GpuProbeStep::Tools,
+            failure(&guest_packages::install_command(manager), &outcome),
+        );
         false
     }
 }
 
 fn tools_are_present() -> bool {
     Path::new(OPENGL_TOOL).exists() && Path::new(VULKAN_TOOL).exists()
-}
-
-fn apt_tools() -> Outcome {
-    let mut arguments = vec!["install", "-y"];
-    arguments.extend(TOOL_PACKAGES);
-    command::run(
-        "apt-get",
-        &arguments,
-        &[("DEBIAN_FRONTEND", "noninteractive")],
-        APT_BUDGET,
-    )
 }
 
 /// A bounded OpenGL operation, and what rendered it.

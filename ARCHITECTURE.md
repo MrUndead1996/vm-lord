@@ -1307,12 +1307,12 @@ values to `GpuRecipeStep` rather than messages of their own; the probe that
 follows them is a message of its own, because it answers a different question
 -- what was done, against what works.
 
-The build dependencies -- `dkms`, `build-essential` and
-`linux-headers-$(uname -r)` -- come from the guest's own apt, not from the
-payload. AppSandbox did the opposite, staging an apt closure per (release,
-kernel) pair into the rootfs, and it cost an apt resolver on a Windows host,
-hundreds of megabytes per kernel, and a payload that goes stale the moment the
-guest upgrades its kernel. VMLord provisions its Ubuntu guests through
+The build dependencies -- DKMS, a compiler and the running kernel's headers,
+whatever the guest's own manager calls them -- come from the guest's own
+package manager, not from the payload. AppSandbox did the opposite, staging an
+apt closure per (release, kernel) pair into the rootfs, and it cost an apt
+resolver on a Windows host, hundreds of megabytes per kernel, and a payload
+that goes stale the moment the guest upgrades its kernel. VMLord provisions its Ubuntu guests through
 cloud-init over NAT, so a guest that cannot reach `archive.ubuntu.com` is
 already a guest that did not finish provisioning. The consequence is stated
 rather than hidden: no network means a failed `BUILD_DEPENDENCIES` stage and a
@@ -1337,10 +1337,10 @@ and `DEVICE`. A guest that already has the module loaded and a `/dev/dxg` that
 opens short-circuits the three build stages, which is what makes every start
 after the first cost nothing and need no network.
 
-`apt-get`, `dkms` and `modprobe` are the three programs the agent runs beside
-`ldconfig`, all distribution-owned operations with no library form. Each runs
-through one helper with a wall-clock budget -- 300 s for apt, 900 s for a
-build, 30 s for the rest -- in a process group of its own, so a budget that
+The guest's package manager, `dkms` and `modprobe` are the three programs the
+agent runs beside `ldconfig`, all distribution-owned operations with no library
+form. Each runs through one helper with a wall-clock budget -- 300 s for an
+install, 900 s for a build, 30 s for the rest -- in a process group of its own, so a budget that
 runs out takes the whole tree with it rather than waiting on a child holding
 the pipe. Between stages the recipe checks the shutdown flag and abandons the
 rest as skipped: systemd is holding the guest open for this process to exit.
@@ -1353,9 +1353,11 @@ The userspace half is three more stages of the same report. `USERSPACE` honours
 the payload's own `mesa_policy`, which it reads itself rather than through the
 payload stage: a policy from a payload built newer than the agent must fail the
 stage it belongs to, not one after which a kernel module would have built.
-Under `distro` it installs `libgl1-mesa-dri`, `mesa-vulkan-drivers` and
-`libvulkan1` from the guest's apt, and only when the d3d12 DRI module and the
-Vulkan loader are not already there; Ubuntu does not build Mesa with
+Under `distro` it installs the `Mesa` package set -- `libgl1-mesa-dri`,
+`mesa-vulkan-drivers` and `libvulkan1` under apt, and whatever the guest's own
+manager calls them otherwise -- and only when the d3d12 DRI module and the
+Vulkan loader are not already there; the distributions in the matrix do not
+build Mesa with
 `microsoft-experimental`, so Vulkan under that policy is lavapipe, which the
 stage says rather than hides. Under `bundled` it copies the payload's Mesa to
 `/opt/vmlord/wsl-mesa` and names it in `/etc/ld.so.conf.d/vmlord-wsl-mesa.conf`
@@ -2614,6 +2616,35 @@ elsewhere -- the shape `display-services`' `seat` module already uses -- so the
 detection is covered by fixtures rather than by a live guest, and only the thin
 gathering at the bottom of the module needs one.
 
+### Installing a package
+
+Detecting the manager is half the answer; the other half is what the thing is
+called once it is found, and both live in
+`crates/agent/src/guest_packages.rs`. Every stage in both recipes that needs
+something installed -- the DKMS build dependencies of the display and GPU
+recipes, the distribution's Mesa, the AppIndicator extension, the two render
+probe programs -- goes through the one `install` there, and no recipe writes
+the name of a package manager or of a package again.
+
+A caller asks for a `Package`: what the thing is *for* -- `Dkms`,
+`BuildTools`, `KernelHeaders`, `AppIndicator`, `Mesa`, `RenderTools`. The
+program, the arguments that make it non-interactive and the environment it
+needs come from the `PackageManager` that answered; the names come from a table
+keyed by that manager rather than by a distribution. That key is the point:
+`linux-headers-$(uname -r)` and `linux-headers` are apt's and pacman's
+conventions, not Ubuntu's and Arch's, so Debian and Ubuntu share every name for
+free and a second apt distribution adds no row. `DEBIAN_FRONTEND` is one such
+row -- apt's way of being unattended, where the other three take a flag.
+
+The install refreshes the package lists and tries once more when the first
+attempt fails, because a cloud image's lists are as old as the image and a
+stale list is the ordinary way an install of a kernel-specific package fails on
+a VM's first boot. It costs nothing on the second start of a VM, since every
+caller looks before it installs and a guest that has what it needs never
+reaches the manager at all. A guest carrying no manager this build knows fails
+the stage with that as the reason, rather than running a program that is not
+there.
+
 ### Installing the guest agent
 
 A cloud-image VM gets the agent on its first boot. At creation VMLord looks for
@@ -3516,8 +3547,9 @@ toolchain-free; the icon is a pixmap the binary carries rather than a theme
 name, because a guest has no icon theme VMLord can count on.
 
 GNOME shows a tray icon only through its AppIndicator extension. Installing
-that is the recipe's business: the `SERVICES` stage asks apt for the
-distribution's `gnome-shell-extension-appindicator` package, best effort and
+that is the recipe's business: the `SERVICES` stage asks the guest's own
+package manager for the `gnome-shell-extension-appindicator` package, best
+effort and
 skipped where the desktop already has one on disk under either of the UUIDs
 the supported releases ship it under, because what a guest is missing without
 it is the icon and not the desktop. *Enabling* it is the session's business,
@@ -3931,7 +3963,7 @@ kind may be privileged by the mechanism that serves both.
 ### Display: the guest payload
 
 A display payload carries the whole guest side of the display that a guest's
-own apt cannot provide: today the DKMS sources of `vmlord_drm`, and from task
+own package manager cannot provide: today the DKMS sources of `vmlord_drm`, and from task
 #115 the guest display services. One artifact, one version and one declared
 range of display protocol revisions, so that what the host talks to and what
 the guest runs cannot drift apart unnoticed.
@@ -3981,8 +4013,8 @@ as entries in one Plan9 device.
 
 Stages, in order, reported as a list and never as a verdict:
 `DISTRIBUTION`, `PAYLOAD` (the mount, its manifest, and every declared file's
-digest -- before anything is copied), `BUILD_DEPENDENCIES` (`dkms`,
-`build-essential` and the running kernel's headers, from the guest's own apt),
+digest -- before anything is copied), `BUILD_DEPENDENCIES` (DKMS, a compiler
+and the running kernel's headers, from the guest's own package manager),
 `MODULE_SOURCE` (copied to `/usr/src/vmlord-display-<version>`, because 9p is
 read-only and DKMS writes beside its sources), `MODULE_BUILD`, `INITRAMFS`
 (`update-initramfs -u -k` for the running kernel after a successful DKMS
