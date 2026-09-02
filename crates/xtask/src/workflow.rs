@@ -114,6 +114,7 @@ fn check_release(document: &Value) -> Vec<String> {
     }
 
     problems.extend(installer_version_passed_in(document));
+    problems.extend(distribution_carries_payloads(document));
 
     for (name, job) in jobs(document) {
         let contents = permission(job.get("permissions"), "contents");
@@ -142,21 +143,7 @@ fn check_release(document: &Value) -> Vec<String> {
 fn installer_version_passed_in(document: &Value) -> Vec<String> {
     let mut problems = Vec::new();
     for (name, job) in jobs(document) {
-        let Some(steps) = job.get("steps").and_then(Value::as_sequence) else {
-            continue;
-        };
-        for step in steps {
-            let Some(run) = step.get("run").and_then(Value::as_str) else {
-                continue;
-            };
-            // Comments are dropped first, because the flag is explained in one
-            // beside the command: a check that read them would go on passing
-            // after the command itself had lost the flag.
-            let script: String = run
-                .lines()
-                .filter(|line| !line.trim_start().starts_with('#'))
-                .collect::<Vec<_>>()
-                .join("\n");
+        for script in run_scripts(job) {
             if !script.to_ascii_lowercase().contains("iscc") {
                 continue;
             }
@@ -169,6 +156,54 @@ fn installer_version_passed_in(document: &Value) -> Vec<String> {
         }
     }
     problems
+}
+
+/// That the step which builds the distribution asks for both payloads.
+///
+/// `cargo dist` with neither flag is not an error: it prints one line saying
+/// no payload was included and builds a release that starts VMs with no GPU
+/// support and no guest display. That is what 0.2.0 shipped. The flags are the
+/// difference, so their absence is read here rather than discovered by
+/// somebody installing the result.
+fn distribution_carries_payloads(document: &Value) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (name, job) in jobs(document) {
+        for script in run_scripts(job) {
+            if !script.contains("cargo dist") {
+                continue;
+            }
+            for flag in ["--gpu-payload", "--display-payload"] {
+                if !script.contains(flag) {
+                    problems.push(format!(
+                        "job `{name}` builds the distribution without `{flag}`; a release \
+                         without it has no such payload at all"
+                    ));
+                }
+            }
+        }
+    }
+    problems
+}
+
+/// The `run:` scripts of one job, with their comments removed.
+///
+/// Comments go first because both checks over these scripts look for a flag
+/// that is also named in the comment beside the command: read whole, a script
+/// would go on passing after the command itself had lost the flag.
+fn run_scripts(job: &Value) -> Vec<String> {
+    let Some(steps) = job.get("steps").and_then(Value::as_sequence) else {
+        return Vec::new();
+    };
+    steps
+        .iter()
+        .filter_map(|step| step.get("run").and_then(Value::as_str))
+        .map(|run| {
+            run.lines()
+                .filter(|line| !line.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect()
 }
 
 /// Every action reference that is not pinned to a full commit SHA.
@@ -247,7 +282,10 @@ fn permission(permissions: Option<&Value>, name: &str) -> Option<String> {
 mod tests {
     use serde_yaml_ng::Value;
 
-    use super::{check_release, every_workflow, installer_version_passed_in, unpinned_actions};
+    use super::{
+        check_release, distribution_carries_payloads, every_workflow, installer_version_passed_in,
+        unpinned_actions,
+    };
 
     fn parse(text: &str) -> Value {
         serde_yaml_ng::from_str(text).expect("the fixture is valid YAML")
@@ -363,6 +401,35 @@ mod tests {
             installer_version_passed_in(&compile("cargo dist")),
             Vec::<String>::new()
         );
+    }
+
+    /// A release without the payload flags is not a failed release: it is a
+    /// quieter one, with no GPU support and no guest display.
+    #[test]
+    fn the_distribution_is_built_with_both_payloads() {
+        let build = |run: &str| {
+            parse(&format!(
+                "jobs:\n  release:\n    steps:\n      - run: |\n          {run}\n"
+            ))
+        };
+
+        assert_eq!(
+            distribution_carries_payloads(&build(
+                "cargo dist --gpu-payload gpu --display-payload display"
+            )),
+            Vec::<String>::new()
+        );
+
+        let problems = distribution_carries_payloads(&build("cargo dist --gpu-payload gpu"));
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.contains("--display-payload")),
+            "{problems:?}"
+        );
+
+        let problems = distribution_carries_payloads(&build("cargo dist"));
+        assert_eq!(problems.len(), 2, "{problems:?}");
     }
 
     /// Only the job that creates the release may write to the repository.

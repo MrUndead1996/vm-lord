@@ -20,7 +20,72 @@ permissions:
   contents: read
 
 jobs:
+  # The two payloads, built where they can be built. Both are produced by a
+  # `docker build` on Linux, and the release itself has to run on Windows, so
+  # they cannot come from the same job -- which is why releases used to ship
+  # without them: `cargo dist` was called with neither directory, said so in
+  # one line, and built a release with no GPU support and no guest display.
+  #
+  # Nothing here holds a token: this job only builds files and hands them over.
+  payloads:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      # The guest display services are part of the display payload and are
+      # built for musl, like the agent.
+      - name: Install the guest target
+        run: rustup target add x86_64-unknown-linux-musl
+
+      # The container build is the test: the module is compiled against each
+      # release's own headers, so one that does not build for 22.04, 24.04 or
+      # 26.04 is an artifact that never exists rather than a guest that cannot
+      # start a display.
+      - name: Build the display payloads
+        run: ./rebuild_payload.sh
+
+      # Mesa, the kernel headers and the closure check, all inside the pinned
+      # image beside the spec. `pack` re-reads the provenance and refuses a
+      # tree that disagrees with it.
+      - name: Build the GPU payload
+        run: |
+          payloads/ubuntu-26.04-amd64/prepare.sh --output target/gpu-payload
+          cargo gpu-payload \
+            --recipe        target/gpu-payload/recipe.json \
+            --input         target/gpu-payload/prepared \
+            --archive       target/gpu-payload/payload.zip \
+            --catalog-entry target/gpu-payload/catalog-entry.json
+
+      # Collected into one tree rather than uploaded as the paths they were
+      # built at, so what the release job unpacks is a layout this step chose
+      # and not whichever common ancestor the upload action inferred.
+      - name: Collect the payloads
+        run: |
+          set -euo pipefail
+          for pair in target/gpu-payload target/display-payload/*; do
+            case "$pair" in
+              target/gpu-payload) destination=target/payloads/gpu ;;
+              *) destination="target/payloads/display/$(basename "$pair")" ;;
+            esac
+            mkdir -p "$destination"
+            # Only these two: the prepared tree and the recipe are inputs to
+            # `pack`, and `cargo dist` reads the packed pair alone.
+            cp "$pair/payload.zip" "$pair/catalog-entry.json" "$destination"
+          done
+          find target/payloads -type f -printf '%P\t%s bytes\n' | sort
+
+      - name: Hand the payloads to the release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: payloads
+          path: target/payloads
+          # A payload that failed to build must fail the release, not shrink
+          # it: the upload is the last chance to notice an empty tree.
+          if-no-files-found: error
+
   release:
+    needs: payloads
     # The only job allowed to write, and it writes exactly one thing: the draft
     # release it creates at the end.
     permissions:
@@ -99,21 +164,50 @@ jobs:
           cargo test --locked
           cargo test --locked -p xtask
 
-      # No `--gpu-payload` or `--display-payload`. Not because they cannot be
-      # built here -- `./rebuild_payload.sh` and
-      # `payloads/ubuntu-26.04-amd64/prepare.sh` reproduce both from pinned
-      # public sources -- but because nothing in this workflow builds them yet.
-      # They need Docker and a Linux runner, so it would take a second job and
-      # an artifact handed to this one. A release that needs them has them
-      # attached by the operator; VMLord runs without them, with no GPU-PV and
-      # no guest display.
+      - name: Take the payloads from the Linux job
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: payloads
+          path: target/payloads
+
+      # The display directories are read rather than listed, because the list
+      # already exists -- `rebuild_payload.sh` decides which releases are
+      # supported, and a copy of that decision here would be one more thing to
+      # keep in step. What this step does insist on is that both kinds arrived:
+      # `cargo dist` builds a payload-less release quite happily and says so in
+      # one line, which is exactly how 0.2.0 shipped without either.
+      #
+      # `dist` then re-reads each catalog entry through the payload crates' own
+      # validation and hashes the archive against the digest that entry claims,
+      # so a pair damaged in transit does not reach the installer.
       - name: Build the distribution
         shell: pwsh
-        run: cargo dist
+        run: |
+          $gpu = 'target/payloads/gpu'
+          $displayRoot = 'target/payloads/display'
+          if (-not (Test-Path -LiteralPath "$gpu/payload.zip")) {
+            throw "no GPU payload at $gpu; the payloads job did not produce one"
+          }
+          if (-not (Test-Path -LiteralPath $displayRoot -PathType Container)) {
+            throw "no display payloads at $displayRoot; the payloads job did not produce any"
+          }
+          # Wrapped, because one directory is not a collection and none is not
+          # an empty one: unwrapped, a single release would have no `Count` to
+          # read and none would have no object to read it from.
+          $display = @(Get-ChildItem -LiteralPath $displayRoot -Directory)
+          if ($display.Count -eq 0) {
+            throw "no display payloads at $displayRoot; the payloads job did not produce any"
+          }
+          $arguments = @('--gpu-payload', $gpu)
+          foreach ($release in $display) {
+            $arguments += '--display-payload'
+            $arguments += (Join-Path $displayRoot $release.Name)
+          }
+          cargo dist @arguments
 
       - name: Check the staged distribution
         shell: pwsh
-        run: pwsh -File installer/check.ps1 target/dist
+        run: pwsh -File installer/check.ps1 target/dist -RequirePayloads
 
       - name: Compile the installer
         shell: pwsh
