@@ -517,6 +517,26 @@ mod tests {
     }
 
     #[test]
+    fn a_release_that_is_not_a_version_number_keys_an_entry_like_any_other() {
+        let catalog = catalog_with(&[entry_document("rolling", "0.1.0")]);
+
+        assert_eq!(
+            catalog
+                .select_for_guest(
+                    &GuestSelector {
+                        release: "rolling",
+                        ..ubuntu_2404()
+                    },
+                    SPEAKS_1_0
+                )
+                .unwrap()
+                .payload_id(),
+            "display-ubuntu-rolling-amd64-0.1.0",
+            "the key is a string the guest and the catalog spell the same way, not a version"
+        );
+    }
+
+    #[test]
     fn a_guest_with_no_entry_is_told_which_guest_had_none() {
         let catalog = catalog_with(&[entry_document("24.04", "0.1.0")]);
 
