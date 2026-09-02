@@ -33,7 +33,7 @@ use crate::{
     gpu_targets::{PAYLOAD, WSL_LIB},
     guest_files::{failure, read},
     guest_packages::{self, Package},
-    guest_platform::{GuestFacts, guest_facts, library_triplet},
+    guest_platform::{GuestFacts, guest_facts},
 };
 
 /// The kernel module behind the device.
@@ -190,17 +190,6 @@ fn libraries_check(checks: &mut Checks, guest: Option<&GuestFacts>) {
         );
         return;
     };
-    let Some(triplet) = library_triplet(&guest.architecture) else {
-        checks.skipped(
-            GpuProbeStep::Libraries,
-            format!(
-                "vmlord-agent has no library path for architecture {}",
-                guest.architecture
-            ),
-        );
-        return;
-    };
-
     let prefix = match parse_mesa_policy(&read(&Path::new(PAYLOAD).join("sources.json"))) {
         Ok(MesaPolicy::Bundled) => Some(MESA_PREFIX),
         // A payload that is not mounted, or one whose policy this build cannot
@@ -209,7 +198,7 @@ fn libraries_check(checks: &mut Checks, guest: Option<&GuestFacts>) {
         Ok(MesaPolicy::Distro) | Err(_) => None,
     };
 
-    let required = required_libraries(triplet, prefix);
+    let required = required_libraries(&guest.library_layout, prefix);
     let missing: Vec<&str> = required
         .iter()
         .filter(|path| !Path::new(path).exists())

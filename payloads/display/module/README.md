@@ -91,7 +91,10 @@ Two files that are configuration rather than code, both copied into a guest by
   Mesa. Under GPU-PV the payload's Mesa renders through `/dev/dxg` and cannot
   hand a buffer to a foreign KMS device, so a compositor left on it binds this
   device and then cannot draw on it. Applications keep the GPU; only the
-  compositor is moved off it.
+  compositor is moved off it. The file ships without its
+  `Environment=LD_LIBRARY_PATH=` line: which directory holds the
+  distribution's Mesa is what the agent detected in the guest, and it appends
+  that line when it installs the drop-in.
 
 ## What it is not
 
