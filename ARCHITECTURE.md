@@ -3162,6 +3162,20 @@ system menu; `windows/hook.rs` is a `WH_KEYBOARD_LL` hook, installed on focus
 and removed on its loss, which is the only way `Super`, `Alt+Tab` and `Ctrl+Esc`
 reach GNOME rather than the Windows shell.
 
+The cursor's **hotspot** is worked out on the host, because the host is the
+only end that has it. Mutter subtracts the hotspot before capture sees
+anything: the cursor plane sits at the pointer's position minus it, the plane
+carries no hotspot property to read it back from, and the position record
+therefore names the bitmap's corner. Windows anchors a cursor by its hotspot,
+so a bitmap handed to it with zeros lands with its corner on the pointer and
+every click goes a few pixels up and left of the arrow -- half a bitmap for the
+I-beam. `cursor.rs` recovers it by subtraction: the position last sent to the
+guest, minus the corner the guest reports, is the hotspot. The two are only the
+same instant while the pointer stands still, so the subtraction is trusted on a
+record with no motion sent since the previous one and the same corner as the
+previous one, and a difference that lands outside the bitmap is refused. A
+moving pointer names nothing and keeps what was worked out before.
+
 Keys are carried as **scan codes**, not virtual keys. A virtual key has already
 had the host's layout applied to it and the guest then applies its own, so a
 host on a non-US layout sends the wrong keys and breaks `Ctrl`+letter; a scan
