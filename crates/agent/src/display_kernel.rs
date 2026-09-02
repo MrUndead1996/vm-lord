@@ -34,8 +34,8 @@ use crate::{
         parse_secure_boot_state, parse_subject_key_identifier, read_payload_facts,
         signature_matches, signing_key_state, wanted_mode, was_rejected_for_its_signature,
     },
-    gpu_kernel::guest_facts,
     guest_files::{copy_tree, failure, read, write_if_different},
+    guest_platform::guest_facts,
 };
 
 /// Where the guest mounts the display payload share.
@@ -264,8 +264,12 @@ fn run_stages(
     report.ok(
         DisplayRecipeStep::Distribution,
         format!(
-            "{} {} {} on kernel {}",
-            guest.distribution, guest.release, guest.architecture, guest.kernel_release
+            "{} {} {} on kernel {}; {}",
+            guest.distribution,
+            guest.release,
+            guest.architecture,
+            guest.kernel_release,
+            guest.platform()
         ),
     );
 
