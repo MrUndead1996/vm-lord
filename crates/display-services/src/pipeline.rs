@@ -243,9 +243,13 @@ impl Pipeline {
                     pixels,
                     width,
                     height,
-                    // Task #114's module does not set DRIVER_CURSOR_HOTSPOT, so
-                    // there is no hotspot to read and none to send: mutter puts
-                    // the plane where the image is drawn.
+                    // Zeros because nothing here knows better: task #114's
+                    // module does not set DRIVER_CURSOR_HOTSPOT, so the plane
+                    // carries no hotspot to read, and mutter has already
+                    // subtracted it -- the position below is the bitmap's
+                    // corner, not the pointer. The one end that can work the
+                    // hotspot out is the host, which is what moves the
+                    // pointer; #170 does it there.
                     hotspot_x: 0,
                     hotspot_y: 0,
                 })?;

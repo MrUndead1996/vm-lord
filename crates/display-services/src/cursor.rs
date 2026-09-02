@@ -1,11 +1,16 @@
 //! Where the pointer is, and what to do with it.
 //!
 //! Task #114's module deliberately does not set `DRIVER_CURSOR_HOTSPOT`, so no
-//! hotspot is readable -- and none is needed: mutter places the plane where the
-//! image is drawn, so the hotspot is `(0, 0)` and the position is the plane's
-//! `CRTC_X`/`CRTC_Y`. Those are signed and go negative at the left and top
-//! edges, while the protocol's coordinates are not, which is why an offscreen
-//! cursor is cropped here rather than clamped and misdrawn there.
+//! hotspot is readable -- and none is needed to draw the pointer: mutter has
+//! already subtracted it, and the plane's `CRTC_X`/`CRTC_Y` are where the
+//! bitmap's corner belongs. Those are signed and go negative at the left and
+//! top edges -- which is the hotspot showing, and the reason an offscreen
+//! cursor is cropped here rather than clamped and misdrawn there, the
+//! protocol's coordinates being unsigned.
+//!
+//! Compositing wants a corner and gets one. A viewer that draws the cursor
+//! itself wants the hotspot, and nothing in this guest has it; the host works
+//! it out from the pointer positions it sent -- see the viewer's `cursor.rs`.
 
 use vmlord_display_codec::Rect;
 

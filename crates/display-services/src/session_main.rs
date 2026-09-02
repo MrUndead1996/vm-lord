@@ -2096,9 +2096,12 @@ mod tests {
         world.host_sends_motion(WIDTH - 1, HEIGHT - 1);
         world.run_until_idle();
 
+        // The last pixel of the screen, at its centre: libinput reads an
+        // absolute axis as `value * size / 32768`, and the pixel that comes
+        // back is the one the host named.
         let events = world.pointer_events();
-        assert_eq!(events[0], (3, 0, 32767));
-        assert_eq!(events[1], (3, 1, 32767));
+        assert_eq!(events[0].2 * WIDTH as i32 / 32768, WIDTH as i32 - 1);
+        assert_eq!(events[1].2 * HEIGHT as i32 / 32768, HEIGHT as i32 - 1);
     }
 
     #[test]

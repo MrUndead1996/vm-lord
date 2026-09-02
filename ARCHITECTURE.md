@@ -3149,7 +3149,16 @@ The absolute axes are declared `0..32767` once and never again. Deriving them
 from the resolution would mean recreating the device on every change of it,
 which #120 makes an ordinary event, and the desktop would watch its pointer
 disappear and come back; the session scales guest pixels onto the fixed range
-instead. The wheel travels at both resolutions: `REL_WHEEL_HI_RES` in the
+instead.
+
+That scale aims **inside** the pixel rather than at its edge, because the value
+makes a round trip: libinput reads an absolute axis back as `value * size /
+32768`, so each pixel owns an interval of the range, and a value on the
+interval's boundary comes back as the pixel next door -- at 1920 wide, pixel 1
+was arriving as pixel 0. Three eighths of the way in is far enough from either
+edge that no rounding leaves the pixel, and short enough of a half that the
+cursor plane's position, which the host measures the hotspot from, rounds down
+whichever rule a compositor rounds by. The wheel travels at both resolutions: `REL_WHEEL_HI_RES` in the
 hundred-and-twentieths the wire uses, and the whole detents they add up to, with
 the remainder carried so slow scrolling is not lost.
 
@@ -3161,6 +3170,32 @@ are tested anywhere. `windows/window.rs` catches the mouse, the focus and the
 system menu; `windows/hook.rs` is a `WH_KEYBOARD_LL` hook, installed on focus
 and removed on its loss, which is the only way `Super`, `Alt+Tab` and `Ctrl+Esc`
 reach GNOME rather than the Windows shell.
+
+The cursor's **hotspot** is worked out on the host, because the host is the
+only end that has it. Mutter subtracts the hotspot before capture sees
+anything: the cursor plane sits at the pointer's position minus it, the plane
+carries no hotspot property to read it back from, and the position record
+therefore names the bitmap's corner. Windows anchors a cursor by its hotspot,
+so a bitmap handed to it with zeros lands with its corner on the pointer and
+every click goes a few pixels up and left of the arrow -- half a bitmap for the
+I-beam. `cursor.rs` recovers it by subtraction: the position last sent to the
+guest, minus the corner the guest reports, is the hotspot. The two are only the
+same instant while the pointer stands still, so the subtraction is trusted on a
+record with no motion sent since the previous one and the same corner as the
+previous one, and a difference landing outside what the bitmap actually draws
+is refused -- a cursor plane is 64x64 whatever sits on it, and the padding
+points at nothing.
+
+A hotspot belongs to a bitmap and is measured **once**, because a hotspot that
+moves is a cursor that jumps. The subtraction is exact only in principle: this
+end sends a guest pixel, the guest's pointer is a float that came back through
+the absolute axes' fixed range, and the plane's corner is rounded, so the same
+shape measures a pixel apart at two ends of the screen. The guest sends its
+cursor with every frame whether or not it changed, so the bitmap is compared
+with the one on the window: an identical one is neither a measurement nor an
+icon rebuilt sixty times a second. Shapes already measured are remembered,
+which keeps the arrow and the I-beam of an afternoon's editing to one movement
+each.
 
 Keys are carried as **scan codes**, not virtual keys. A virtual key has already
 had the host's layout applied to it and the guest then applies its own, so a

@@ -49,6 +49,7 @@ use vmlord_display_protocol::{
 };
 use vmlord_display_viewer::{
     audio::{self, Mute},
+    cursor::GuestCursor,
     display_modes::{self, DisplayMode, select_mode},
     fps_gap::{self, FpsGap},
     input::{self, Report},
@@ -751,6 +752,8 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState, fps_gap_threshold_percen
     let mut progress = Progress::new(Instant::now());
     let mut closing = false;
     let mut policy = input::Policy::new();
+    // Where the guest's cursor is anchored, which only this end can work out.
+    let mut cursor = GuestCursor::new();
     let mut stream: Option<Geometry> = None;
     let mut resize = Resize::new();
     // The monitor the window is on, enumerated once a rearrangement settles,
@@ -831,7 +834,7 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState, fps_gap_threshold_percen
                 }
                 _ => {}
             }
-            apply(&mut context, &mut progress, signal);
+            apply(&mut context, &mut progress, &mut cursor, signal);
         }
 
         while let Ok(event) = context.ui.try_recv() {
@@ -902,6 +905,9 @@ fn pump(mut context: Loop<'_>, state: &mut WindowState, fps_gap_threshold_percen
 
         for event in policy.drain() {
             worked = true;
+            if let input::Event::Motion { x, y } = event {
+                cursor.motion(x, y);
+            }
             let _ = context.orders.send(Order::Input(event));
         }
         if policy.keyboard_release_requested() {
@@ -1129,24 +1135,42 @@ fn follow(window: &Window, resize: &mut Resize, geometry: Geometry) {
 }
 
 /// Moves one signal into the status machine and the renderer.
-fn apply(context: &mut Loop<'_>, progress: &mut Progress, signal: Signal) {
+fn apply(
+    context: &mut Loop<'_>,
+    progress: &mut Progress,
+    cursor: &mut GuestCursor,
+    signal: Signal,
+) {
     match signal {
         Signal::Configured(geometry) => {
             if let Err(error) = context.renderer.configure(geometry) {
                 tracing::error!("the stream could not be shown: {error}");
             }
         }
+        // A bitmap with every frame, and the same one nearly every time: only
+        // a shape the window is not already showing reaches the renderer.
         Signal::Cursor(image) => {
-            if let Err(error) = context.renderer.set_cursor(&image) {
+            if let Some(image) = cursor.bitmap(image)
+                && let Err(error) = context.renderer.set_cursor(image)
+            {
                 tracing::warn!("the guest's cursor could not be shown: {error}");
             }
         }
-        // Where the guest thinks its pointer is. The host's own cursor is what
-        // the user sees until #119 wires input up.
-        // Both are the main loop's own business rather than the renderer's:
-        // where the guest thinks its pointer is, what mode it came up on, and
-        // a command the pump has already answered.
-        Signal::Moved(_) | Signal::Damage(_) | Signal::Committed(_) | Signal::GuestCommand(_) => {}
+        // Where the guest thinks its pointer is: the corner its bitmap sits
+        // at, which against the position this end last sent is the hotspot
+        // Windows anchors that bitmap by. Only a changed one is put on the
+        // window again -- see `cursor.rs`.
+        Signal::Moved(position) => {
+            if let Some(image) = cursor.anchor(position)
+                && let Err(error) = context.renderer.set_cursor(image)
+            {
+                tracing::warn!("the guest's cursor could not be anchored: {error}");
+            }
+        }
+        // The main loop's own business rather than the renderer's: the pixels
+        // the session thread has already copied in, what mode the guest came
+        // up on, and a command the pump has already answered.
+        Signal::Damage(_) | Signal::Committed(_) | Signal::GuestCommand(_) => {}
         Signal::Status(event) => progress.on(event, Instant::now()),
         Signal::Ended(reason) => tracing::info!("the session is over: {reason}"),
     }

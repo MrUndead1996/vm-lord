@@ -10,6 +10,7 @@
 /// it plays through.
 pub mod audio;
 pub mod clipboard;
+pub mod cursor;
 pub mod display_modes;
 #[cfg(test)]
 pub(crate) mod duplex;

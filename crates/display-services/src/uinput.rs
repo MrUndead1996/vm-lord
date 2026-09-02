@@ -59,6 +59,12 @@ pub const BTN_EXTRA: u16 = 0x114;
 /// device recreated to follow it would disconnect the guest's pointer.
 pub const ABS_RANGE: i32 = 32767;
 
+/// How many steps that range is, which is one more than its maximum.
+///
+/// The unit libinput divides a screen into: an axis reading `value` on a
+/// screen `size` wide is at `value * size / ABS_STEPS` pixels across it.
+const ABS_STEPS: u64 = ABS_RANGE as u64 + 1;
+
 /// One wheel detent, in the hundred-and-twentieths both the wire and the
 /// kernel's high-resolution axes count in.
 pub const DETENT: i32 = 120;
@@ -280,14 +286,42 @@ impl<W: Write> Pointer<W> {
     }
 }
 
-/// One guest pixel onto the fixed absolute range.
+/// One guest pixel onto the fixed absolute range, inside the pixel.
+///
+/// Inside it rather than on its edge, because the value makes a round trip and
+/// has to come back as the pixel it left as. libinput reads an absolute axis
+/// as `value * size / (maximum + 1)`, so the range is [`ABS_STEPS`] steps
+/// across the screen and pixel `p` owns the steps in `[p * steps / size,
+/// (p + 1) * steps / size)`. An edge-anchored value sits on the boundary of
+/// that interval and the arithmetic on the way back drops it into the pixel
+/// next door: at 1920 wide, pixel 1 used to arrive as `17`, which reads back
+/// as `0.996` -- pixel 0. Aiming well inside the interval leaves a third of a
+/// pixel of slack either way, and every pixel of every mode this build offers
+/// comes back as itself.
+///
+/// [`OFFSET`] is a little short of the middle rather than the middle itself,
+/// because the pointer's position is also what the compositor places the
+/// cursor plane by, and the viewer measures the cursor's hotspot from that
+/// plane -- see the viewer's `cursor.rs`. A pointer sitting on exactly half a
+/// pixel is a plane position a compositor may round either way, and the
+/// measurement would come back a pixel short as often as not.
 fn scale(value: u32, size: u32) -> i32 {
-    let last = u64::from(size.saturating_sub(1)).max(1);
-    let value = u64::from(value).min(last);
-    let scaled = value * u64::try_from(ABS_RANGE).unwrap_or(0) / last;
+    let size = u64::from(size.max(1));
+    let value = u64::from(value).min(size - 1);
+    // (value + OFFSET) * steps / size, rounded, in whole numbers throughout.
+    let numerator = (value * OFFSET.1 + OFFSET.0) * ABS_STEPS;
+    let denominator = size * OFFSET.1;
+    let scaled = (numerator + denominator / 2) / denominator;
 
     i32::try_from(scaled).unwrap_or(ABS_RANGE).min(ABS_RANGE)
 }
+
+/// Where in a pixel the pointer is put, as a fraction of one.
+///
+/// Three eighths: far enough from either edge that no rounding on the way back
+/// leaves the pixel, and short enough of a half that the position rounds down
+/// whichever rule does the rounding.
+const OFFSET: (u64, u64) = (3, 8);
 
 /// Where the kernel's uinput device is.
 pub const DEVICE_PATH: &str = "/dev/uinput";
@@ -487,7 +521,7 @@ fn create_device(fd: libc::c_int) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ABS_RANGE, BTN_LEFT, EV_ABS, EV_KEY, EV_REL, EV_SYN, Keyboard, Pointer};
+    use super::{ABS_RANGE, BTN_LEFT, EV_KEY, EV_REL, EV_SYN, Keyboard, Pointer, scale};
 
     /// The `(type, code, value)` triples one write put on the wire.
     fn events(bytes: &[u8]) -> Vec<(u16, u16, i32)> {
@@ -543,6 +577,13 @@ mod tests {
         assert_eq!(keyboard.device().len(), released);
     }
 
+    /// Where libinput reads an axis of this value as being, in pixels.
+    ///
+    /// `value * size / (maximum + 1)`, which is what a compositor is handed.
+    fn read_back(value: i32, size: u32) -> u32 {
+        u32::try_from(i64::from(value) * i64::from(size) / (ABS_RANGE as i64 + 1)).expect("a pixel")
+    }
+
     #[test]
     fn motion_is_scaled_onto_the_fixed_absolute_range() {
         let mut pointer = Pointer::new(Vec::new());
@@ -553,15 +594,49 @@ mod tests {
         pointer.motion(960, 540, 1920, 1080).expect("the middle");
 
         let events = events(pointer.device());
-        assert_eq!(events[0], (EV_ABS, 0, 0));
-        assert_eq!(events[1], (EV_ABS, 1, 0));
-        assert_eq!(events[3], (EV_ABS, 0, ABS_RANGE));
-        assert_eq!(events[4], (EV_ABS, 1, ABS_RANGE));
+        // Inside the range at both ends, because a pixel's centre is half a
+        // pixel in from the screen's edge.
+        assert!((0..ABS_RANGE).contains(&events[0].2), "{events:?}");
+        assert!((0..ABS_RANGE).contains(&events[3].2), "{events:?}");
+        assert_eq!(read_back(events[0].2, 1920), 0);
+        assert_eq!(read_back(events[1].2, 1080), 0);
+        assert_eq!(read_back(events[3].2, 1920), 1919);
+        assert_eq!(read_back(events[4].2, 1080), 1079);
+        assert_eq!(read_back(events[6].2, 1920), 960);
+        assert_eq!(read_back(events[7].2, 1080), 540);
+    }
 
-        // The range spans pixel centres 0..=1919, so pixel 960 sits just past
-        // the middle rather than on it -- within one pixel's worth of steps.
-        let step = ABS_RANGE / 1919;
-        assert!((events[6].2 - ABS_RANGE / 2).abs() <= step, "{events:?}");
+    #[test]
+    fn every_pixel_of_every_mode_comes_back_as_itself() {
+        // The whole point of the scale: what the host names, the guest's
+        // pointer stands on. A pixel out is a click on the button next door.
+        for size in [640, 800, 1024, 1280, 1366, 1600, 1920, 2560] {
+            for pixel in 0..size {
+                assert_eq!(
+                    read_back(scale(pixel, size), size),
+                    pixel,
+                    "pixel {pixel} of {size}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_pointer_sits_short_of_the_middle_of_its_pixel() {
+        // What the cursor plane is placed by, and so what the viewer measures
+        // a hotspot from: a position on exactly half a pixel is one a
+        // compositor may round either way.
+        for size in [640, 1280, 1920, 2560] {
+            for pixel in [0, 1, size / 2, size - 2, size - 1] {
+                let thousandths = i64::from(scale(pixel, size)) * i64::from(size) * 1000
+                    / (ABS_RANGE as i64 + 1)
+                    % 1000;
+                assert!(
+                    (250..500).contains(&thousandths),
+                    "pixel {pixel} of {size} sits at .{thousandths}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -570,8 +645,13 @@ mod tests {
         pointer.motion(4000, 4000, 1920, 1080).expect("motion");
 
         let events = events(pointer.device());
-        assert_eq!(events[0], (EV_ABS, 0, ABS_RANGE));
-        assert_eq!(events[1], (EV_ABS, 1, ABS_RANGE));
+        assert_eq!(read_back(events[0].2, 1920), 1919);
+        assert_eq!(read_back(events[1].2, 1080), 1079);
+    }
+
+    #[test]
+    fn a_screen_with_no_pixels_is_not_divided_by_it() {
+        assert_eq!(scale(0, 0), scale(0, 1));
     }
 
     #[test]
