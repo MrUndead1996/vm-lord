@@ -524,12 +524,9 @@ impl eframe::App for VmlordUi {
         if let Some(action) = action.inner {
             match action {
                 VmAction::Create => {
-                    self.create_vm_form = self
-                        .application
-                        .distro_profile()
-                        .map(|(id, profile)| {
-                            CreateVmForm::new(id, profile, self.application.guest_defaults())
-                        });
+                    self.create_vm_form = self.application.distro_profile().map(|(id, profile)| {
+                        CreateVmForm::new(id, profile, self.application.guest_defaults())
+                    });
                     self.edit_vm_form = None;
                 }
                 VmAction::Edit => {
