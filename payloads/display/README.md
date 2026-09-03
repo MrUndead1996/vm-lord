@@ -33,6 +33,13 @@ One `Dockerfile` and one `prepare.sh` serve all three supported releases: they
 differ by base image and by nothing else, and three copies would drift. Which
 release is built is the `--spec` that is passed.
 
+The `target` in a spec is provenance: it records the release a build was proven
+on, and the host does not require a guest to match it. Nothing in the archive
+knows what a package manager is, so a guest nobody built a target for -- Arch,
+say -- is served by one of these. The architecture is the one dimension that
+stays a condition. See **ARCHITECTURE.md**, "Display: the guest payload", for
+how selection ranks what is left, and for why the GPU payload cannot do this.
+
 **The container build is the test.** It installs that release's
 `linux-headers-generic` and builds `vmlord_drm` against them, so a module that
 does not compile for 22.04, 24.04 or 26.04 is an artifact that never exists
