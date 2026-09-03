@@ -128,6 +128,12 @@ enum SourceKind {
 /// reads only the fields the chosen source has.
 struct CreateVmForm {
     profile: DistroProfile,
+    /// The catalogue identifier `profile` was loaded under.
+    ///
+    /// A name the form generated is the previous identifier, so a switch of
+    /// distribution can tell a field nobody touched from one someone typed
+    /// over -- see `select_distro`.
+    distro_id: String,
     name: String,
     source_kind: SourceKind,
     /// Installation media: the path to the ISO the guest is installed from.
@@ -318,12 +324,14 @@ impl DeleteVmForm {
 
 impl CreateVmForm {
     /// A form filled with what VMLord would do if nobody changed anything:
-    /// the newest supported release, the distribution's own account name, and
-    /// the host's locale, keyboard layout and timezone.
-    fn new(profile: &DistroProfile, guest_defaults: &GuestDefaults) -> Self {
+    /// a VM named after the distribution, the newest supported release, the
+    /// distribution's own account name, and the host's locale, keyboard layout
+    /// and timezone.
+    fn new(distro_id: &str, profile: &DistroProfile, guest_defaults: &GuestDefaults) -> Self {
         Self {
             profile: profile.clone(),
-            name: "ubuntu".into(),
+            distro_id: distro_id.to_owned(),
+            name: distro_id.to_owned(),
             source_kind: SourceKind::CloudImage,
             image_path: String::new(),
             release: profile.releases.first().cloned().unwrap_or_default(),
@@ -345,6 +353,27 @@ impl CreateVmForm {
             network_mode: NetworkMode::Nat,
             error: None,
         }
+    }
+
+    /// Switches distribution to the profile the catalogue holds under
+    /// `distro_id`.
+    ///
+    /// A field nobody touched is recognised by still holding what the form
+    /// generated -- the previous identifier as the VM name, the previous
+    /// profile's own account -- and is replaced; something typed over it is
+    /// kept. The release is the one field that always restarts: releases of
+    /// two distributions never overlap, so the new profile's first is the
+    /// only release that can be right.
+    fn select_distro(&mut self, distro_id: &str, profile: &DistroProfile) {
+        if self.username == self.profile.default_user {
+            self.username = profile.default_user.clone();
+        }
+        if self.name == self.distro_id {
+            self.name = distro_id.to_owned();
+        }
+        self.release = profile.releases.first().cloned().unwrap_or_default();
+        self.profile = profile.clone();
+        self.distro_id = distro_id.to_owned();
     }
 }
 
@@ -495,8 +524,8 @@ impl eframe::App for VmlordUi {
         if let Some(action) = action.inner {
             match action {
                 VmAction::Create => {
-                    self.create_vm_form = self.application.distro_profile().map(|profile| {
-                        CreateVmForm::new(profile, self.application.guest_defaults())
+                    self.create_vm_form = self.application.distro_profile().map(|(id, profile)| {
+                        CreateVmForm::new(id, profile, self.application.guest_defaults())
                     });
                     self.edit_vm_form = None;
                 }
@@ -553,11 +582,13 @@ impl eframe::App for VmlordUi {
             .as_ref()
             .and_then(|form| self.application.ssh_key_path(form.name.trim()));
         let host_gpu = self.application.host_gpu_capabilities();
+        let distro_profiles = self.application.distro_profiles().collect::<Vec<_>>();
         let create_dialog_action = self.create_vm_form.as_mut().and_then(|form| {
             render_create_vm_dialog(
                 context,
                 form,
                 self.application.vms(),
+                &distro_profiles,
                 ssh_key_path.as_deref(),
                 host_gpu,
             )
@@ -753,6 +784,7 @@ fn render_create_vm_dialog(
     context: &egui::Context,
     form: &mut CreateVmForm,
     existing_vms: &[VmSummary],
+    distros: &[(&str, &DistroProfile)],
     ssh_key_path: Option<&Path>,
     host_gpu: Option<&HostGpuCapabilities>,
 ) -> Option<CreateVmDialogAction> {
@@ -810,11 +842,26 @@ fn render_create_vm_dialog(
                             match form.source_kind {
                                 SourceKind::CloudImage => {
                                     ui.label(t!("create_vm.distribution").to_string());
+                                    let mut selected = form.distro_id.clone();
                                     egui::ComboBox::from_id_salt("create-vm-distribution")
                                         .selected_text(&form.profile.name)
                                         .show_ui(ui, |ui| {
-                                            ui.label(&form.profile.name);
+                                            for (id, profile) in distros {
+                                                ui.selectable_value(
+                                                    &mut selected,
+                                                    (*id).to_owned(),
+                                                    &profile.name,
+                                                );
+                                            }
                                         });
+                                    if selected != form.distro_id
+                                        && let Some((id, profile)) = distros
+                                            .iter()
+                                            .find(|(distro_id, _)| **distro_id == selected)
+                                            .copied()
+                                    {
+                                        form.select_distro(id, profile);
+                                    }
                                     ui.end_row();
 
                                     ui.label(t!("create_vm.release").to_string());
@@ -3481,6 +3528,7 @@ mod tests {
 
     fn cloud_form() -> CreateVmForm {
         CreateVmForm::new(
+            "ubuntu",
             &ubuntu(),
             &GuestDefaults {
                 locale: "ru_RU.UTF-8".into(),
@@ -3488,6 +3536,15 @@ mod tests {
                 timezone: "Europe/Moscow".into(),
             },
         )
+    }
+
+    /// The second shipped profile, the way the catalogue would load it.
+    fn arch() -> DistroProfile {
+        let mut profile = ubuntu();
+        profile.name = "Arch Linux".into();
+        profile.releases = vec!["rolling".into()];
+        profile.default_user = "arch".into();
+        profile
     }
 
     fn provisioning_of(request: &VmCreateRequest) -> &Provisioning {
@@ -3531,10 +3588,54 @@ mod tests {
         profile.releases = vec!["42".into(), "41".into()];
         profile.default_user = "fedora".into();
 
-        let form = CreateVmForm::new(&profile, &GuestDefaults::default());
+        let form = CreateVmForm::new("fedora", &profile, &GuestDefaults::default());
 
         assert_eq!(form.release, "42");
         assert_eq!(form.username, "fedora");
+        assert_eq!(form.name, "fedora");
+    }
+
+    /// A field nobody touched follows the distribution out; the release is the
+    /// one field that restarts even when it was chosen, because releases of
+    /// two distributions never overlap.
+    #[test]
+    fn a_distro_switch_resets_the_fields_the_form_generated() {
+        let mut form = cloud_form();
+        form.select_distro("arch", &arch());
+
+        assert_eq!(form.distro_id, "arch");
+        assert_eq!(form.release, "rolling");
+        assert_eq!(form.username, "arch");
+        assert_eq!(form.name, "arch");
+    }
+
+    #[test]
+    fn a_distro_switch_keeps_the_fields_someone_edited() {
+        let mut form = CreateVmForm {
+            name: "my-vm".into(),
+            username: "custom".into(),
+            ..cloud_form()
+        };
+        form.select_distro("arch", &arch());
+
+        assert_eq!(form.name, "my-vm");
+        assert_eq!(form.username, "custom");
+        assert_eq!(form.release, "rolling");
+    }
+
+    #[test]
+    fn a_switched_form_builds_a_request_with_the_new_profile() {
+        let mut form = cloud_form();
+        form.select_distro("arch", &arch());
+
+        let request = create_vm_request(&form, &[]).unwrap();
+
+        let VmSource::CloudImage { image, .. } = &request.source else {
+            panic!("expected a cloud image request");
+        };
+        assert_eq!(image.profile, arch());
+        assert_eq!(image.release, "rolling");
+        assert_eq!(provisioning_of(&request).username, "arch");
     }
 
     #[test]

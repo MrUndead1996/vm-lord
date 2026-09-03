@@ -729,7 +729,12 @@ the complete catalog. Two profiles are shipped: `ubuntu.json` and
 `arch.json`. `default_distro` in `settings.toml` selects the profile
 used for new cloud-image VMs and defaults to `ubuntu` when an older settings
 file has no such field. The settings dialog lists every loaded profile and
-applies a new default immediately to subsequent VM creation. Directory, file
+applies a new default immediately to subsequent VM creation. The creation
+dialog lists the same catalog and opens on the profile `default_distro` names,
+with that identifier prefilled as the VM name; choosing another distribution
+there restarts the release from the new profile's first and replaces the
+account name and the VM name too, unless either has been typed over, in which
+case what someone wrote survives. Directory, file
 and JSON errors retain the failing path; an unknown configured identifier names
 the missing profile rather than silently falling back.
 

@@ -293,13 +293,18 @@ impl WorkspaceApp {
     }
 
     #[must_use]
-    pub fn distro_profile(&self) -> Option<&DistroProfile> {
+    pub fn distro_profile(&self) -> Option<(&str, &DistroProfile)> {
         let id = &self.settings.as_ref()?.current.default_distro;
-        self.distro_catalog.as_ref()?.select(id).ok()
+        let profile = self.distro_catalog.as_ref()?.select(id).ok()?;
+        Some((id.as_str(), profile))
     }
 
     pub fn distro_options(&self) -> impl Iterator<Item = (&str, &str)> {
         self.distro_catalog.iter().flat_map(DistroCatalog::options)
+    }
+
+    pub fn distro_profiles(&self) -> impl Iterator<Item = (&str, &DistroProfile)> {
+        self.distro_catalog.iter().flat_map(DistroCatalog::profiles)
     }
 
     /// Sets what a new VM's locale, keyboard layout and timezone start out as.
@@ -1170,7 +1175,24 @@ mod tests {
         repaired.default_distro = "fedora".into();
         app.update_settings(repaired).unwrap();
 
-        assert_eq!(app.distro_profile().unwrap().name, "Fedora");
+        let (_, profile) = app.distro_profile().unwrap();
+        assert_eq!(profile.name, "Fedora");
+
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn distro_profiles_lists_every_profile_in_the_loaded_catalog() {
+        let directory = temporary_directory();
+        let app = WorkspaceApp::new(Box::new(FakeRepository::default()))
+            .with_distro_catalog(distro_catalog(&directory));
+
+        let profiles: Vec<_> = app
+            .distro_profiles()
+            .map(|(id, profile)| (id, profile.name.as_str()))
+            .collect();
+
+        assert_eq!(profiles, [("fedora", "Fedora"), ("ubuntu", "Ubuntu")]);
 
         fs::remove_dir_all(directory).unwrap();
     }
@@ -1896,7 +1918,8 @@ mod tests {
         app.update_settings(updated_settings.clone()).unwrap();
 
         assert_eq!(app.settings(), Some(&updated_settings));
-        assert_eq!(app.distro_profile().unwrap().name, "Fedora");
+        let (_, profile) = app.distro_profile().unwrap();
+        assert_eq!(profile.name, "Fedora");
         assert_eq!(store.load_or_create().unwrap(), updated_settings);
         assert!(
             app.diagnostics()
