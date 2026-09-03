@@ -89,8 +89,6 @@ const USER_UNITS: [&str; 2] = [
 /// The socket the two halves meet on, which is how "started" is confirmed.
 const BROKER_SOCKET: &str = "/run/vmlord/display-broker.sock";
 
-/// The GNOME shell, whose extensions decide whether a tray icon is shown.
-const GNOME_SHELL: &str = "/usr/bin/gnome-shell";
 /// Where GNOME Shell's packaged extensions are installed.
 const SHELL_EXTENSIONS: &str = "/usr/share/gnome-shell/extensions";
 /// The distro package that ships a StatusNotifierItem extension. Under this
@@ -1534,7 +1532,7 @@ fn payload_audio() -> PathBuf {
 /// install failed -- a report, not a crash, because the stage that follows
 /// does not depend on the answer.
 fn install_appindicator_extension(guest: &GuestFacts) -> Option<String> {
-    if !appindicator_is_needed(Path::new(GNOME_SHELL), Path::new(SHELL_EXTENSIONS)) {
+    if !appindicator_is_needed(&guest.desktop, Path::new(SHELL_EXTENSIONS)) {
         return None;
     }
 
@@ -1552,9 +1550,17 @@ fn install_appindicator_extension(guest: &GuestFacts) -> Option<String> {
     })
 }
 
-/// Whether this guest is a GNOME desktop with no AppIndicator extension yet.
-fn appindicator_is_needed(shell: &Path, extensions: &Path) -> bool {
-    shell.exists()
+/// Whether the desktop found here needs an AppIndicator extension it has not
+/// got.
+///
+/// The desktop that was *found*, never the one the VM was created asking for:
+/// a session that shows StatusNotifierItems itself pays nothing for this
+/// stage, and a guest whose desktop was replaced after creation is asked about
+/// as it is now. A guest with no desktop at all -- headless, or one whose
+/// desktop install has not landed yet -- is the same answer for the same
+/// reason: there is nothing on screen for an extension to show through.
+fn appindicator_is_needed(desktop: &DesktopFacts, extensions: &Path) -> bool {
+    desktop.is_gnome()
         && !APPINDICATOR_UUIDS
             .iter()
             .any(|uuid| extensions.join(uuid).is_dir())
@@ -1944,28 +1950,38 @@ mod tests {
 
     #[test]
     fn an_appindicator_extension_is_asked_for_only_where_one_is_missing() {
-        let guest = temporary("appindicator-guest");
-        fs::create_dir_all(guest.join("ubuntu-appindicators@ubuntu.com")).unwrap();
-        let shell = guest.join("gnome-shell");
-        fs::write(&shell, b"binary").unwrap();
+        let installed = temporary("appindicator-guest");
+        fs::create_dir_all(installed.join("ubuntu-appindicators@ubuntu.com")).unwrap();
+        let missing = temporary("appindicator-none");
+        let gnome = DesktopFacts {
+            session: Some("ubuntu".to_owned()),
+            session_type: Some("wayland".to_owned()),
+            display_manager: Some("gdm3.service".to_owned()),
+        };
 
         assert!(
-            !super::appindicator_is_needed(std::path::Path::new(&shell), &guest),
+            !super::appindicator_is_needed(&gnome, &installed),
             "Ubuntu's own fork on disk is every supported desktop guest"
         );
         assert!(
-            super::appindicator_is_needed(
-                std::path::Path::new(&shell),
-                &temporary("appindicator-none")
-            ),
-            "a GNOME shell with no extension on disk needs the package"
+            super::appindicator_is_needed(&gnome, &missing),
+            "a GNOME desktop with no extension on disk needs the package"
         );
         assert!(
             !super::appindicator_is_needed(
-                std::path::Path::new(&guest.join("absent-shell")),
-                &temporary("appindicator-headless")
+                &DesktopFacts {
+                    session: Some("Hyprland".to_owned()),
+                    session_type: Some("wayland".to_owned()),
+                    display_manager: None,
+                },
+                &missing
             ),
-            "there is nothing to extend on a guest without a shell"
+            "a session that shows StatusNotifierItems itself pays nothing for \
+             GNOME's extension"
+        );
+        assert!(
+            !super::appindicator_is_needed(&DesktopFacts::default(), &missing),
+            "there is nothing to extend on a guest with no desktop"
         );
     }
 

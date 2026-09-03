@@ -52,6 +52,14 @@ const REPLY_TICK: Duration = Duration::from_millis(25);
 /// What the menu says while no modes are known.
 const NO_MODES_LABEL: &str = "No modes offered yet";
 
+/// The bus name a StatusNotifierItem host takes, whatever desktop it belongs
+/// to. Owned here means this session already shows tray icons.
+const STATUS_NOTIFIER_WATCHER: &str = "org.kde.StatusNotifierWatcher";
+
+/// The shell that hides tray items until an extension is enabled, and the one
+/// desktop there is anything to ask.
+const GNOME_SHELL: &str = "org.gnome.Shell";
+
 /// The AppIndicator extensions the supported guests ship, Ubuntu's own fork
 /// first: its UUID is the one the `gnome-shell-extension-appindicator`
 /// package installs on every supported release, where Debian ships the same
@@ -404,11 +412,19 @@ fn restart_clipboard(connection: &Connection) {
     }
 }
 
-/// Asks the running shell to enable one of the AppIndicator extensions.
+/// Gets this session a tray host, where it has not got one already.
 ///
-/// This is `gsettings set org.gnome.shell enabled-extensions ...` with the
-/// merging left to the shell: `EnableExtension` adds one UUID and keeps the
-/// rest of the user's list, which no process outside the session can do
+/// The question is asked of the bus rather than of a desktop's name: a
+/// StatusNotifierItem is shown by whoever has taken
+/// `org.kde.StatusNotifierWatcher`, and a session where somebody has -- a
+/// panel of its own, or GNOME with the extension already enabled -- needs
+/// nothing done to it and is left alone. Only a session with no host at all
+/// is asked further, and the one thing there is to ask is GNOME's shell,
+/// which hides tray items until an AppIndicator extension is enabled.
+///
+/// Enabling it is `gsettings set org.gnome.shell enabled-extensions ...` with
+/// the merging left to the shell: `EnableExtension` adds one UUID and keeps
+/// the rest of the user's list, which no process outside the session can do
 /// without clobbering either the desktop's own defaults or the user's own
 /// choices. Tried at startup and on every reconnect, so the icon recovers on
 /// the next reconnect -- usually the next Restart services -- rather than at
@@ -419,6 +435,20 @@ fn ensure_appindicator_extension() {
 
         return;
     };
+    if name_has_owner(&connection, STATUS_NOTIFIER_WATCHER) {
+        return;
+    }
+    if !name_has_owner(&connection, GNOME_SHELL) {
+        // Nothing hosts tray items here and there is no shell to ask for one.
+        // A desktop whose panel starts after this unit is the ordinary way to
+        // land here, and the next reconnect asks again.
+        eprintln!(
+            "vmlord-display-tray: nothing on this session bus shows tray items yet, \
+             and it is not a GNOME shell that could be asked to"
+        );
+
+        return;
+    }
     // Named for what the value is rather than for its shape: a scanner that
     // sees `uuid` written to a log reads a secret, and these two are
     // constants in this file.
@@ -440,6 +470,27 @@ fn ensure_appindicator_extension() {
             Err(error) => eprintln!("vmlord-display-tray: {extension} is not available: {error}"),
         }
     }
+}
+
+/// Whether anybody on this bus answers to a name.
+///
+/// The bus's own question, asked of the bus daemon: a name with an owner is a
+/// program that has claimed it and is running now, which is what both callers
+/// above want to know. Anything that goes wrong -- a daemon that will not
+/// answer, a reply that is not a boolean -- reads as "nobody", because the
+/// caller's next move on nobody is to try, and trying is safe.
+fn name_has_owner(connection: &zbus::blocking::Connection, name: &str) -> bool {
+    connection
+        .call_method(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            Some("org.freedesktop.DBus"),
+            "NameHasOwner",
+            &(name,),
+        )
+        .ok()
+        .and_then(|reply| reply.body().deserialize::<bool>().ok())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

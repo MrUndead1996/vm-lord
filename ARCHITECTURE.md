@@ -3587,21 +3587,38 @@ clipboard daemon speaks mutter through, so the musl build stays
 toolchain-free; the icon is a pixmap the binary carries rather than a theme
 name, because a guest has no icon theme VMLord can count on.
 
-GNOME shows a tray icon only through its AppIndicator extension. Installing
-that is the recipe's business: the `SERVICES` stage asks the guest's own
-package manager for the `gnome-shell-extension-appindicator` package, best
-effort and
-skipped where the desktop already has one on disk under either of the UUIDs
-the supported releases ship it under, because what a guest is missing without
-it is the icon and not the desktop. *Enabling* it is the session's business,
-and deliberately so: the tray calls `org.gnome.Shell.Extensions.EnableExtension`
-when it starts and on every reconnect to the broker, rather than the recipe
-writing gsettings as root. `EnableExtension` adds one UUID and keeps the rest
-of the user's own list, which no write from outside the session can do without
-clobbering either the desktop's defaults or the user's choices -- and the
-recipe runs as root before any session, where there is nothing to ask and no
-list worth owning. Until the call succeeds the icon is merely absent, and the
-next reconnect is the next attempt.
+GNOME shows a tray icon only through its AppIndicator extension, and both
+halves of getting one follow the desktop that is *found* rather than the one
+the VM was created asking for. Installing it is the recipe's business: the
+`SERVICES` stage asks the guest's own package manager for the
+`gnome-shell-extension-appindicator` package where `DesktopFacts::is_gnome`
+says this guest's desktop is GNOME -- the session on the screen where there is
+one, and the unit `display-manager.service` is linked to where there is not,
+which is what a recipe running as root before anybody has logged in sees. Best
+effort, and skipped where the desktop already has an extension on disk under
+either of the UUIDs the supported releases ship it under, because what a guest
+is missing without it is the icon and not the desktop. A session that hosts
+StatusNotifierItems itself, and a guest with no desktop at all, pay nothing:
+the stage is not run for them.
+
+*Enabling* it is the session's business, and deliberately so: the tray calls
+`org.gnome.Shell.Extensions.EnableExtension` when it starts and on every
+reconnect to the broker, rather than the recipe writing gsettings as root.
+`EnableExtension` adds one UUID and keeps the rest of the user's own list,
+which no write from outside the session can do without clobbering either the
+desktop's defaults or the user's choices -- and the recipe runs as root before
+any session, where there is nothing to ask and no list worth owning. Until the
+call succeeds the icon is merely absent, and the next reconnect is the next
+attempt.
+
+The tray asks the *bus* rather than a desktop's name whether any of that is
+needed at all: `org.kde.StatusNotifierWatcher` having an owner means this
+session already shows tray icons -- a panel of its own, or GNOME with the
+extension already enabled -- and the tray does nothing more. Only where
+nothing owns it is `org.gnome.Shell` looked for, and only where that answers
+is an extension asked for. A session with neither says so once in its journal
+and is asked again at the next reconnect, which is what a desktop whose panel
+starts after this unit needs.
 
 The menu mirrors the viewer's system menu, in its order: full screen, the
 Secure Attention Sequence, release keyboard, the resolution list, mute, the
