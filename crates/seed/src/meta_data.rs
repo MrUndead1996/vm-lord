@@ -21,7 +21,7 @@ mod tests {
     use super::render;
     use crate::{SeedRequest, UBUNTU_KEYBOARD, UBUNTU_SSH};
     use serde_yaml_ng::Value;
-    use vmlord_core::{SshAccess, SshPort};
+    use vmlord_core::{PackageRefresh, SshAccess, SshPort};
 
     fn request() -> SeedRequest<'static> {
         SeedRequest {
@@ -42,6 +42,7 @@ mod tests {
             ssh_daemon: &UBUNTU_SSH,
             agent_secret: None,
             desktop_packages: &[],
+            package_refresh: PackageRefresh::Lists,
         }
     }
 

@@ -293,9 +293,9 @@ executable directly. The build stages nothing beside the executable: VMLord
 ships no third-party runtime.
 
 The shell targets `x86_64-pc-windows-msvc` and creates Linux workspaces either
-from a local ISO, which boots to the distribution's own installer, or from an
-Ubuntu cloud image, which needs no one at the keyboard: there the image is
-downloaded and imported into a VHDX, and the guest is provisioned
+from a local ISO, which boots to the distribution's own installer, or from a
+cloud image -- Ubuntu or Arch -- which needs no one at the keyboard: there the
+image is downloaded and imported into a VHDX, and the guest is provisioned
 by cloud-init from a NoCloud seed VMLord writes itself, with COM1 available as a
 diagnostic console.
 

@@ -725,7 +725,8 @@ only a recorded bundled copy. Files not recorded there are user profiles and
 are never replaced or deleted; profiles removed from a later bundle stay in
 place. `core::distro::DistroCatalog` enumerates the per-user directory once at
 startup, derives each profile identifier from its file name and deserializes
-the complete catalog. `default_distro` in `settings.toml` selects the profile
+the complete catalog. Two profiles are shipped: `ubuntu.json` and
+`arch.json`. `default_distro` in `settings.toml` selects the profile
 used for new cloud-image VMs and defaults to `ubuntu` when an older settings
 file has no such field. The settings dialog lists every loaded profile and
 applies a new default immediately to subsequent VM creation. Directory, file
@@ -1982,6 +1983,29 @@ decide where the guest listens.
 A `runcmd` command that names a unit a release does not have makes `systemctl`
 return non-zero, which cloud-init does not treat as fatal -- which is why the
 restarts are one command per unit rather than one command listing all of them.
+
+Arch is the second shipped profile and the first one to take the other branch
+of every choice above (#158). Its `openssh` prepends
+`Include /etc/ssh/sshd_config.d/*.conf` to `sshd_config` and ships no
+`sshd.socket` at all, and the image `arch-boxes` builds enables `sshd`, so the
+profile is `Service { unit: "sshd.service" }` and the daemon's own drop-in is
+the whole story; `10-vmlord.conf` also sorts ahead of the package's own
+`99-archlinux.conf`, which is what a first-value-wins parser needs. The keyboard
+is two files rather than one, `/etc/vconsole.conf` as a shell assignment and
+`/etc/X11/xorg.conf.d/00-keyboard.conf` as an Xorg string. The account is `arch`
+in `wheel`. And it releases nothing of the form `NN.NN`: the one release it
+offers is `rolling` (#154), and both URL templates spell no `{release}` at all,
+because the image and its `.SHA256` sit together in a `latest` directory that
+names none. Substituting a release into a template that carries no placeholder
+is a no-op, so the resolver asks for the pair by release exactly as it does for
+Ubuntu. The checksum file is one line of `<sha256>  <name>`, which is the
+format `parse_sha256sums` already reads.
+
+Nothing in the host or the agent branches on any of that. The profile is the
+whole of what VMLord knows about Arch before the guest boots, and what the guest
+turns out to be afterwards -- its package manager, its library layout, its
+desktop -- is detected rather than declared, which is why adding this profile
+added no line naming Arch outside `distros/arch.json`.
 
 `meta-data` carries `instance-id`, formatted from the VM's id, and
 `local-hostname`, the VM name. The identifier never changes, which is what makes
@@ -3931,8 +3955,26 @@ carries a `DesktopSetup` -- the packages and the display manager unit -- and
 the seed prints them as cloud-init's `packages` block with `package_update`,
 so Ubuntu installs `ubuntu-desktop-minimal` (GNOME Shell, GDM and the Wayland
 session, without the office suite) from the archives the guest is already
-configured with. VMLord adds no repository, downloads no desktop binary of its
-own and signs nothing. A failure there does not stop the boot: cloud-init
+configured with. Arch names the same session package by package --
+`gnome-shell`, `gdm`, `gnome-control-center`, `gnome-console`, `nautilus` --
+because it publishes no one metapackage for it. VMLord adds no repository,
+downloads no desktop binary of its own and signs nothing.
+
+What has to happen before those packages are installed is
+`DistroProfile::package_refresh`, and it is a field because it is not a
+preference. Debian and its family resolve a new package against refreshed lists
+and leave everything installed where it is, which is `Lists` and prints
+`package_update` alone. Arch resolves against one moving repository, so
+installing into an image a month old pulls in libraries built for packages the
+guest has not upgraded to -- the partial upgrade Arch documents as unsupported
+and does not test. That is `FullUpgrade`, and it prints `package_upgrade`
+beside `package_update`: on Arch cloud-init runs `pacman -Sy` for the first and
+adds the `-u` for the second, so the guest is a full `-Syu` before a desktop
+package is resolved against it. Neither key is printed for a headless VM --
+nothing is being installed, so there is no partial upgrade to avoid and no
+reason to touch a guest that asked for none. The field carries `#[serde(default)]`
+at `Lists`, so a profile written before it existed keeps loading and keeps
+meaning what it meant. A failure there does not stop the boot: cloud-init
 reports it and carries on, which is exactly the outcome the stored `Degraded`
 is for.
 

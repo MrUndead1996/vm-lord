@@ -1,0 +1,40 @@
+{
+  "name": "Arch Linux",
+  "releases": ["rolling"],
+  "directory_template": "https://geo.mirror.pkgbuild.com/images/latest/",
+  "file_name_template": "Arch-Linux-x86_64-cloudimg.qcow2",
+  "checksum_file": "Arch-Linux-x86_64-cloudimg.qcow2.SHA256",
+  "default_user": "arch",
+  "admin_group": "wheel",
+  "package_refresh": "FullUpgrade",
+  "ssh": {
+    "units": {
+      "Service": {
+        "unit": "sshd.service"
+      }
+    },
+    "config_drop_in": "/etc/ssh/sshd_config.d/10-vmlord.conf"
+  },
+  "keyboard": [
+    {
+      "path": "/etc/vconsole.conf",
+      "form": "ShellAssignment",
+      "template": "KEYMAP=\"{layout}\"\n"
+    },
+    {
+      "path": "/etc/X11/xorg.conf.d/00-keyboard.conf",
+      "form": "XorgString",
+      "template": "Section \"InputClass\"\n        Identifier \"system-keyboard\"\n        MatchIsKeyboard \"on\"\n        Option \"XkbLayout\" \"{layout}\"\n        Option \"XkbModel\" \"pc105\"\nEndSection\n"
+    }
+  ],
+  "desktop": {
+    "packages": [
+      "gnome-shell",
+      "gdm",
+      "gnome-control-center",
+      "gnome-console",
+      "nautilus"
+    ],
+    "display_manager": "gdm.service"
+  }
+}

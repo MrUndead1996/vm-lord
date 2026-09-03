@@ -12,7 +12,7 @@ mod meta_data;
 mod scalar;
 mod user_data;
 
-use vmlord_core::{KeyboardFile, SshAccess, SshDaemon};
+use vmlord_core::{KeyboardFile, PackageRefresh, SshAccess, SshDaemon};
 
 /// Everything the two documents are printed from.
 pub struct SeedRequest<'a> {
@@ -60,6 +60,14 @@ pub struct SeedRequest<'a> {
     /// rather than a profile, because this crate prints documents and has no
     /// business knowing what GNOME is.
     pub desktop_packages: &'a [String],
+    /// What the distribution needs done to its packages before those are
+    /// installed.
+    ///
+    /// Read only when there is something to install: a headless VM adds no
+    /// package, so there is nothing an upgrade would be making room for, and
+    /// upgrading a guest it was never asked to touch is not this seed's
+    /// business.
+    pub package_refresh: PackageRefresh,
 }
 
 /// The two documents that go into the seed volume.
@@ -172,7 +180,7 @@ pub(crate) static UBUNTU_KEYBOARD: std::sync::LazyLock<Vec<KeyboardFile>> =
 #[cfg(test)]
 mod tests {
     use super::{SeedRequest, UBUNTU_KEYBOARD, UBUNTU_SSH, build};
-    use vmlord_core::{SshAccess, SshPort};
+    use vmlord_core::{PackageRefresh, SshAccess, SshPort};
 
     /// The two constants the guest finds the agent by: the label `runcmd`
     /// mounts and the name it copies from.
@@ -217,6 +225,7 @@ mod tests {
             ssh_daemon: &UBUNTU_SSH,
             agent_secret: None,
             desktop_packages: &[],
+            package_refresh: PackageRefresh::Lists,
         });
 
         assert!(seed.user_data.starts_with("#cloud-config\n"));
@@ -245,6 +254,7 @@ mod tests {
             ssh_daemon: &UBUNTU_SSH,
             agent_secret: None,
             desktop_packages: &[],
+            package_refresh: PackageRefresh::Lists,
         });
 
         let bytes = super::image(&seed);
