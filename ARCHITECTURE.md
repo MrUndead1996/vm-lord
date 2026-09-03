@@ -4036,6 +4036,16 @@ what the entry claims; the guest, before it copies anything, checks
 `payload.json` and hashes every file it declares. Both, because a 9p export is
 a filesystem the host can rewrite between its own check and the guest's.
 
+Twice means the *same* claim twice, and the guest's `PAYLOAD` stage therefore
+gates on the architecture alone, exactly as selection does (`serves`,
+`crates/agent/src/display_recipe.rs`). A stricter rule there would not be a
+second opinion but a different one: it would move the refusal from selection,
+which is allowed to fall back, to the mount, which is not -- which is what a
+26.04 guest hit after #169 freed the host but not the guest. The distribution
+and release the mount reports are appended to the stage's own line when they
+are not this guest's, so a payload proven elsewhere says so where a person
+reading the recipe will see it.
+
 A VM exports one path, `<vm>/display-payload/active`, and versions are
 *published into* it. That follows from HCS: a compute system's `Devices/Plan9`
 section is written before the system is built and is immutable for the lifetime

@@ -28,11 +28,11 @@ use crate::{
     command,
     display_recipe::{
         DKMS_PACKAGE, InstalledVersions, MODULE, PayloadFacts, Report, SIGNING_CERTIFICATE,
-        SIGNING_KEY, SigningKeyState, applies_to, dkms_reports_installed, dkms_versions,
-        has_recipe, modprobe_options, module_is_loaded, needs_build, needs_reload,
-        parse_module_parameters, parse_module_signature_key, parse_module_version,
-        parse_secure_boot_state, parse_subject_key_identifier, read_payload_facts,
-        signature_matches, signing_key_state, wanted_mode, was_rejected_for_its_signature,
+        SIGNING_KEY, SigningKeyState, dkms_reports_installed, dkms_versions, has_recipe,
+        modprobe_options, module_is_loaded, needs_build, needs_reload, parse_module_parameters,
+        parse_module_signature_key, parse_module_version, parse_secure_boot_state,
+        parse_subject_key_identifier, read_payload_facts, serves, signature_matches,
+        signing_key_state, wanted_mode, was_built_for, was_rejected_for_its_signature,
     },
     guest_files::{copy_tree, failure, read, write_if_different},
     guest_packages::{self, Package},
@@ -491,11 +491,10 @@ fn payload_stage(
             return Err(reason);
         }
     };
-    if !applies_to(&facts, distribution, release, architecture) {
+    if !serves(&facts, architecture) {
         let reason = format!(
-            "the mounted payload is for {} {} {}, and this guest is {distribution} {release} \
-             {architecture}",
-            facts.distribution, facts.release, facts.architecture
+            "the mounted payload is built for {} and this guest is {architecture}",
+            facts.architecture
         );
         report.failed(DisplayRecipeStep::Payload, reason.clone());
         return Err(reason);
@@ -515,9 +514,23 @@ fn payload_stage(
         return Err(reason);
     }
 
+    // Provenance is said out loud when it is not this guest's. The payload
+    // applies either way, but a person reading the recipe should not have to
+    // decode a payload ID to find out that the build was proven elsewhere.
+    let provenance = if was_built_for(&facts, distribution, release, architecture) {
+        String::new()
+    } else {
+        format!(
+            ", built for {} {} and serving {distribution} {release}",
+            facts.distribution, facts.release
+        )
+    };
     report.ok(
         DisplayRecipeStep::Payload,
-        format!("{} verified at {PAYLOAD_MOUNT}", facts.payload_id),
+        format!(
+            "{} verified at {PAYLOAD_MOUNT}{provenance}",
+            facts.payload_id
+        ),
     );
     Ok(facts)
 }
