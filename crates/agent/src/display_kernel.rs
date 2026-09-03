@@ -36,7 +36,9 @@ use crate::{
     },
     guest_files::{copy_tree, failure, read, write_if_different},
     guest_packages::{self, Package},
-    guest_platform::{DesktopFacts, GuestFacts, LibraryLayout, guest_facts},
+    guest_platform::{
+        self, CompositorLaunch, DesktopFacts, GuestFacts, LibraryLayout, guest_facts,
+    },
 };
 
 /// Where the guest mounts the display payload share.
@@ -46,11 +48,13 @@ const DKMS_TREE: &str = "/var/lib/dkms";
 const MODULES_LOAD: &str = "/etc/modules-load.d/vmlord-display.conf";
 const MODPROBE_OPTIONS: &str = "/etc/modprobe.d/vmlord-display.conf";
 const UNBIND_UNIT: &str = "/etc/systemd/system/vmlord-display-unbind-simpledrm.service";
-/// Where a drop-in reaches the compositor of the greeter and of a logged-in
-/// user both: `org.gnome.Shell@.service` is a template, and a drop-in on the
-/// template applies to every instance of it.
-const COMPOSITOR_DROP_IN: &str =
-    "/etc/systemd/user/org.gnome.Shell@.service.d/vmlord-display-compositor-mesa.conf";
+/// The drop-in that keeps a compositor off the payload's Mesa, by the name it
+/// is installed under.
+///
+/// Which unit's drop-in directory it goes in is not written here, because it
+/// is not a constant: it is the unit the compositor of this guest turned out
+/// to be started by.
+const COMPOSITOR_DROP_IN: &str = "vmlord-display-compositor-mesa.conf";
 /// Where the rule that keeps the desktop on this output goes. The number puts
 /// it after mutter's own `61-mutter.rules`, whose tag it adds to.
 const UDEV_RULES: &str = "/etc/udev/rules.d/62-vmlord-display.rules";
@@ -356,8 +360,8 @@ fn run_stages(
         mode,
         built.then_some(guest.kernel_release.as_str()),
         certificate.as_ref(),
-        &guest.library_layout,
     )?;
+    compositor_isolation_stage(report, &guest)?;
     device_stage(report)?;
     services_stages(
         report,
@@ -1077,6 +1081,166 @@ fn compositor_drop_in(shipped: &str, layout: &LibraryLayout) -> String {
     content
 }
 
+/// Keeps the compositor of this guest off the payload's Mesa.
+///
+/// The drop-in itself is old; what is decided here is where it goes. A
+/// compositor systemd started has a unit, and a drop-in on that unit's
+/// template reaches it -- the greeter's instance and every logged-in user's
+/// alike. A compositor a login shell started has no unit, and there is nothing
+/// for a drop-in to attach to; that guest is told so rather than having a file
+/// written at a path nothing reads.
+///
+/// Written rather than applied: a drop-in is read when the unit next starts,
+/// which is the start after this one.
+///
+/// The way that suits a session with no unit is a wrapper, and it belongs to
+/// whoever brings that desktop up (#166): the greeter launches a compositor
+/// through the `Exec=` of an entry in `/usr/share/wayland-sessions`, and an
+/// entry of the same name under `/usr/local/share/wayland-sessions` -- earlier
+/// in `XDG_DATA_DIRS` on every guest this runs on -- can exec that command
+/// through a script that sets the same two things this drop-in does. What it
+/// must not do is set them for the session rather than for the compositor:
+/// everything launched from the session is meant to keep the whole GPU
+/// environment, which is where the acceleration was asked for.
+fn compositor_isolation_stage(report: &mut Report, guest: &GuestFacts) -> Result<(), String> {
+    let step = DisplayRecipeStep::CompositorIsolation;
+    let shipped = Path::new(PAYLOAD_MOUNT)
+        .join("content")
+        .join("drm")
+        .join(COMPOSITOR_DROP_IN);
+    if !shipped.exists() {
+        report.skipped(step, "this display payload carries no compositor drop-in");
+        return Ok(());
+    }
+    let content = fs::read_to_string(&shipped)
+        .map(|shipped| compositor_drop_in(&shipped, &guest.library_layout))
+        .map_err(|error| {
+            let reason = format!("{} could not be read: {error}", shipped.display());
+            report.failed(step, reason.clone());
+            reason
+        })?;
+    let write = |report: &mut Report, path: &Path| -> Result<(), String> {
+        write_if_different(path, &content).map_err(|error| {
+            let reason = format!("{} could not be written: {error}", path.display());
+            report.failed(step, reason.clone());
+            reason
+        })
+    };
+
+    let user_units = Path::new(SYSTEMD_USER_UNITS);
+    let installed = installed_drop_ins(user_units);
+    // Only when nothing is installed yet, because that is the only run whose
+    // answer cannot wait: on every later boot the drop-in is already on disk
+    // and correct before the greeter reads it.
+    let launch = match installed.is_empty() {
+        true => compositor_when_one_starts(&guest.desktop),
+        false => guest.desktop.compositor.clone(),
+    };
+
+    match launch
+        .as_ref()
+        .map(|launch| (launch, launch.drop_in_directory()))
+    {
+        Some((launch, Some(directory))) => {
+            let path = user_units.join(directory).join(COMPOSITOR_DROP_IN);
+            write(report, &path)?;
+            report.ok(
+                step,
+                format!(
+                    "the compositor is {}, and {} keeps it on this guest's own Mesa",
+                    launch.describe(),
+                    path.display()
+                ),
+            );
+        }
+        Some((launch, None)) => report.skipped(
+            step,
+            format!(
+                "the compositor is {}, so there is no unit for a drop-in to attach to; \
+                 this guest's compositor is isolated by whatever starts it, not from here",
+                launch.describe()
+            ),
+        ),
+        // Nothing on the screen and a drop-in already there: the guest that
+        // boots this recipe ahead of its own greeter, which is the ordinary
+        // case after the first. What is there is refreshed, because a payload
+        // may have changed what it ships.
+        None if !installed.is_empty() => {
+            for path in &installed {
+                write(report, path)?;
+            }
+            report.ok(
+                step,
+                format!(
+                    "no compositor is running to be asked how it starts; refreshed the \
+                     drop-in already installed at {}",
+                    installed
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
+        }
+        None => report.skipped(
+            step,
+            "no compositor has started on this guest yet, so how one is started is not \
+             known and nothing was written; the next run that finds one installs it",
+        ),
+    }
+
+    Ok(())
+}
+
+/// The drop-ins of ours that are already installed under the user units.
+///
+/// Our own file name in somebody's `.d` directory, which is the only record
+/// there is of what an earlier run decided: nothing else remembers which unit
+/// this guest's compositor turned out to be.
+fn installed_drop_ins(user_units: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(user_units) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path().join(COMPOSITOR_DROP_IN))
+        .filter(|path| path.is_file())
+        .collect();
+    found.sort();
+    found
+}
+
+/// How the compositor is started, waiting for one where one is coming.
+///
+/// A recipe that runs before the greeter has nothing to look at, and a greeter
+/// that a display manager is about to start is worth the wait: the alternative
+/// is a first session that comes up on the payload's Mesa and stays black
+/// until it is started again. Bounded, and only ever waited for on a guest
+/// with a display manager already running.
+fn compositor_when_one_starts(facts: &DesktopFacts) -> Option<CompositorLaunch> {
+    if let Some(launch) = facts.compositor.clone() {
+        return Some(launch);
+    }
+    let manager = facts.display_manager.as_deref()?;
+    if !unit_is_active(manager) {
+        return None;
+    }
+
+    let deadline = std::time::Instant::now() + SHORT_BUDGET;
+    loop {
+        // A second between looks rather than the quarter the services wait:
+        // what is being waited for is a greeter starting, and each look walks
+        // every process on the guest.
+        std::thread::sleep(Duration::from_secs(1));
+        if let Some(launch) = guest_platform::desktop_now().compositor {
+            return Some(launch);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+    }
+}
+
 fn update_initramfs(kernel_release: &str) -> command::Outcome {
     command::run(
         "update-initramfs",
@@ -1092,17 +1256,16 @@ fn update_initramfs(kernel_release: &str) -> command::Outcome {
 /// is builtin, so it cannot be blacklisted, and until it lets go of the console
 /// a compositor has two devices to choose between.
 ///
-/// So is the drop-in that keeps the compositor on the distribution's Mesa,
-/// which is the other half of the same job: a device a compositor binds and
-/// then cannot allocate a buffer on is a device it will not light. It is
-/// written rather than applied -- a drop-in is read when the unit next starts,
-/// and on a normal boot this recipe runs before the greeter does.
+/// Keeping the compositor off the payload's Mesa is the other half of the same
+/// job -- a device a compositor binds and then cannot allocate a buffer on is a
+/// device it will not light -- and it is its own stage, because how it is
+/// delivered depends on something this one never asks: how the compositor of
+/// this guest is started.
 fn load_stage(
     report: &mut Report,
     mode: Option<(u32, u32)>,
     refresh_initramfs_for: Option<&str>,
     certificate: Option<&DisplaySigningCertificate>,
-    layout: &LibraryLayout,
 ) -> Result<(), String> {
     let wanted = wanted_mode(mode);
     let payload_drm = Path::new(PAYLOAD_MOUNT).join("content").join("drm");
@@ -1128,13 +1291,6 @@ fn load_stage(
             .map_err(|error| format!("{MODPROBE_OPTIONS} could not be written: {error}"))
         })
         .and_then(|()| copy("vmlord-display-unbind-simpledrm.service", UNBIND_UNIT))
-        .and_then(|()| {
-            install(
-                "vmlord-display-compositor-mesa.conf",
-                COMPOSITOR_DROP_IN,
-                &|content| compositor_drop_in(&content, layout),
-            )
-        })
         .and_then(|()| copy("62-vmlord-display.rules", UDEV_RULES));
     if let Err(reason) = prepared {
         report.failed(DisplayRecipeStep::ModuleLoad, reason.clone());
@@ -1742,17 +1898,20 @@ fn halted(stopping: &AtomicBool) -> Result<(), String> {
 mod tests {
     use std::{
         fs,
-        path::PathBuf,
+        path::{Path, PathBuf},
         sync::atomic::{AtomicBool, AtomicU64, Ordering},
     };
 
     use vmlord_agent_protocol::v1::{DisplayRecipeStageState, DisplayRecipeStep};
 
     use super::{
-        apply, compositor_drop_in, load_failure_message, sha256_hex, update, verify_declared_files,
+        COMPOSITOR_DROP_IN, SYSTEMD_USER_UNITS, apply, compositor_drop_in, installed_drop_ins,
+        load_failure_message, sha256_hex, update, verify_declared_files,
     };
     use crate::display_recipe::{PayloadFacts, STEPS};
-    use crate::guest_platform::{DesktopFacts, GuestFacts, LibraryLayout, PackageManager};
+    use crate::guest_platform::{
+        CompositorLaunch, DesktopFacts, GuestFacts, LibraryLayout, PackageManager,
+    };
 
     use super::reported_desktop;
 
@@ -1790,6 +1949,7 @@ mod tests {
             session: Some("gnome".to_owned()),
             session_type: Some("wayland".to_owned()),
             display_manager: Some("gdm.service".to_owned()),
+            ..DesktopFacts::default()
         })
         .expect("a guest with a desktop reports one");
 
@@ -1883,6 +2043,55 @@ mod tests {
     }
 
     #[test]
+    fn the_drop_in_goes_where_this_guests_compositor_would_read_it() {
+        // The path this used to be a constant for, arrived at from what the
+        // guest turned out to be running rather than from the name GNOME.
+        let gnome = CompositorLaunch::Unit("org.gnome.Shell@wayland.service".to_owned());
+        let directory = gnome
+            .drop_in_directory()
+            .expect("a unit has a drop-in directory");
+
+        assert_eq!(
+            Path::new(SYSTEMD_USER_UNITS)
+                .join(directory)
+                .join(COMPOSITOR_DROP_IN),
+            Path::new(
+                "/etc/systemd/user/org.gnome.Shell@.service.d/\
+                 vmlord-display-compositor-mesa.conf"
+            ),
+            "GNOME's guests keep the file they already have, at the path they already have it"
+        );
+    }
+
+    #[test]
+    fn what_an_earlier_run_decided_is_read_back_off_the_disk() {
+        // Nothing stores which unit this guest's compositor turned out to be.
+        // The drop-in itself is the record, which is what lets a recipe that
+        // runs before the greeter refresh the right file without a session to
+        // look at.
+        let directory =
+            std::env::temp_dir().join(format!("vmlord-display-drop-ins-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        let installed = directory
+            .join("org.gnome.Shell@.service.d")
+            .join(COMPOSITOR_DROP_IN);
+        fs::create_dir_all(installed.parent().unwrap()).unwrap();
+        fs::write(&installed, "[Service]\n").unwrap();
+        // A drop-in directory of somebody else's, with nothing of ours in it.
+        fs::create_dir_all(directory.join("pipewire.service.d")).unwrap();
+        fs::write(directory.join("pipewire.service.d/99-other.conf"), "").unwrap();
+
+        let found = installed_drop_ins(&directory);
+
+        let _ = fs::remove_dir_all(&directory);
+        assert_eq!(found, vec![installed]);
+        assert!(
+            installed_drop_ins(Path::new("/nonexistent-user-units")).is_empty(),
+            "a guest with no user unit directory has no drop-in of ours, and no error either"
+        );
+    }
+
+    #[test]
     fn the_udev_rule_hides_the_synthetic_display_only_where_this_one_exists() {
         // A Hyper-V guest has a display of its own, and a compositor that finds
         // two cards lights both. The second monitor is drawn on the Hyper-V
@@ -1957,6 +2166,7 @@ mod tests {
             session: Some("ubuntu".to_owned()),
             session_type: Some("wayland".to_owned()),
             display_manager: Some("gdm3.service".to_owned()),
+            ..DesktopFacts::default()
         };
 
         assert!(
@@ -1973,6 +2183,7 @@ mod tests {
                     session: Some("Hyprland".to_owned()),
                     session_type: Some("wayland".to_owned()),
                     display_manager: None,
+                    ..DesktopFacts::default()
                 },
                 &missing
             ),
@@ -2260,7 +2471,7 @@ mod tests {
                 .expect("every step is in STEPS")
         };
 
-        assert_eq!(STEPS.len(), 12);
+        assert_eq!(STEPS.len(), 13);
         assert!(
             position(DisplayRecipeStep::BuildDependencies)
                 < position(DisplayRecipeStep::SigningKey)
@@ -2273,6 +2484,15 @@ mod tests {
         );
         assert!(
             position(DisplayRecipeStep::ModuleSignature) < position(DisplayRecipeStep::Initramfs)
+        );
+        assert!(
+            position(DisplayRecipeStep::ModuleLoad)
+                < position(DisplayRecipeStep::CompositorIsolation),
+            "the compositor is kept off the payload's Mesa for the device the module \
+             just made, so the module comes first"
+        );
+        assert!(
+            position(DisplayRecipeStep::CompositorIsolation) < position(DisplayRecipeStep::Device)
         );
     }
 

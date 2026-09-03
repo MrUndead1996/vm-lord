@@ -622,6 +622,9 @@ enum DisplayRecipeStep {
   DISPLAY_RECIPE_STEP_SIGNING_KEY = 11;
   // Confirming the built module carries a signature by that certificate.
   DISPLAY_RECIPE_STEP_MODULE_SIGNATURE = 12;
+  // Keeping the guest's compositor off the payload's Mesa, by whichever way
+  // reaches the compositor this guest turned out to start.
+  DISPLAY_RECIPE_STEP_COMPOSITOR_ISOLATION = 13;
 }
 
 enum DisplayRecipeStageState {

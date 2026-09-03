@@ -1001,6 +1001,10 @@ fn code_for(
         }
         Step::Initramfs | Step::ModuleLoad => DisplayStatusCode::PayloadModuleNotLoaded,
         Step::Device => DisplayStatusCode::PayloadNoDevice,
+        // The module is loaded and the desktop is black: a compositor that
+        // was left on the payload's Mesa never finishes its modeset, which
+        // from the outside is the same nothing as a module that never loaded.
+        Step::CompositorIsolation => DisplayStatusCode::PayloadModuleNotLoaded,
         Step::Services | Step::ServicesStart => DisplayStatusCode::GuestServicesFailed,
         // Filtered out before they reach here, and matched so that a step
         // added later cannot be swallowed by a catch-all.
