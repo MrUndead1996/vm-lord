@@ -2890,7 +2890,9 @@ mod tests {
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].level, DiagnosticLevel::Error);
         assert!(
-            diagnostics[0].message.contains("injected termination failure")
+            diagnostics[0]
+                .message
+                .contains("injected termination failure")
                 && diagnostics[0].message.contains("dev"),
             "{}",
             diagnostics[0].message

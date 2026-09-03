@@ -73,8 +73,9 @@ impl ForceStopWorkers {
     {
         let mut workers = self.lock();
         if workers.iter().any(|worker| worker.vm_id == vm_id) {
-            let error =
-                RepositoryError::new(format!("VM \"{vm_name}\" is already being forcibly stopped"));
+            let error = RepositoryError::new(format!(
+                "VM \"{vm_name}\" is already being forcibly stopped"
+            ));
             tracing::error!("{error}");
             return Err(error);
         }
