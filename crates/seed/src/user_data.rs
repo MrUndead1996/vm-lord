@@ -80,10 +80,14 @@ fn packages(request: &SeedRequest<'_>) -> String {
 /// One block because YAML has one: a second `write_files` key later in the
 /// document would not add to the first, it would replace it.
 fn write_files(request: &SeedRequest<'_>) -> String {
-    let mut files = format!(
-        "write_files:\n{}",
-        file(KEYBOARD_PATH, &keyboard_settings(request.keyboard))
-    );
+    let mut files = String::from("write_files:\n");
+    // Where the layout goes and what the file around it looks like are the
+    // profile's to say: Debian keeps the whole answer in one shell file, and a
+    // distribution that splits the console from the graphical session names
+    // both files here.
+    for keyboard in request.keyboard_files {
+        files.push_str(&file(&keyboard.path, &keyboard.content(request.keyboard)));
+    }
 
     if let SshAccess::Enabled { port, .. } = request.ssh {
         files.push_str(&file(
@@ -303,37 +307,15 @@ fn entry(path: &str, content: &str, permissions: &str, owner: Option<&str>) -> S
     )
 }
 
-/// Where the console keyboard layout is configured.
-///
-/// Debian-family: Fedora keeps the same setting in `/etc/vconsole.conf` under
-/// different keys, which is a different mechanism rather than a different
-/// value, so it waits for a second distribution.
-const KEYBOARD_PATH: &str = "/etc/default/keyboard";
-
 const AGENT_SERVICE_PATH: &str = "/etc/systemd/system/vmlord-agent.service";
 const AGENT_SERVICE: &str = "[Unit]\nDescription=VMLord guest agent\nConditionPathExists=/etc/vmlord/agent.secret\n\n[Service]\nExecStart=/usr/local/lib/vmlord/vmlord-agent\nUser=root\nRestart=always\nRestartSec=5\n\n[Install]\nWantedBy=multi-user.target\n";
-
-/// The content of that file.
-///
-/// The layout is escaped for the shell, not for YAML: this file is read with
-/// `source`, where an unescaped `$` or quote is code.
-fn keyboard_settings(layout: &str) -> String {
-    let layout = scalar::shell(layout);
-    format!(
-        "XKBMODEL=\"pc105\"\n\
-         XKBLAYOUT=\"{layout}\"\n\
-         XKBVARIANT=\"\"\n\
-         XKBOPTIONS=\"\"\n\
-         BACKSPACE=\"guess\"\n"
-    )
-}
 
 #[cfg(test)]
 mod tests {
     use super::{GUEST_SECRET_PATH, render};
-    use crate::{SeedRequest, UBUNTU_SSH};
+    use crate::{SeedRequest, UBUNTU_KEYBOARD, UBUNTU_SSH};
     use serde_yaml_ng::Value;
-    use vmlord_core::{SshAccess, SshDaemon, SshPort, SshUnits};
+    use vmlord_core::{KeyboardFile, KeyboardForm, SshAccess, SshDaemon, SshPort, SshUnits};
 
     const HASH: &str = "$6$rounds=4096$salt$hash";
     const KEY: &str = "ssh-ed25519 AAAAC3Nz vmlord";
@@ -433,6 +415,7 @@ mod tests {
             },
             locale: "en_US.UTF-8",
             keyboard: "us",
+            keyboard_files: &UBUNTU_KEYBOARD,
             timezone: "Europe/Moscow",
             admin_group: "sudo",
             ssh_daemon: &UBUNTU_SSH,
@@ -458,6 +441,16 @@ mod tests {
             .find(|file| file["path"].as_str() == Some(path))
             .unwrap_or_else(|| panic!("no file written at {path}"))
             .clone()
+    }
+
+    /// Every path `write_files` writes, in the order it writes them.
+    fn paths(document: &Value) -> Vec<String> {
+        document["write_files"]
+            .as_sequence()
+            .expect("write_files is a list")
+            .iter()
+            .map(|file| file["path"].as_str().unwrap_or_default().to_owned())
+            .collect()
     }
 
     fn commands(document: &Value) -> Vec<Vec<String>> {
@@ -543,8 +536,10 @@ mod tests {
         assert_eq!(document["timezone"], Value::from("Europe/Moscow"));
     }
 
+    /// The shipped Ubuntu profile, so the assertion is about the seed a real
+    /// VM gets rather than about a fixture invented here.
     #[test]
-    fn the_keyboard_layout_is_written_into_the_debian_configuration_file() {
+    fn the_keyboard_layout_is_written_into_the_file_the_profile_names() {
         let document = parsed(&render(&SeedRequest {
             keyboard: "ru",
             ..request()
@@ -559,6 +554,60 @@ mod tests {
                  XKBOPTIONS=\"\"\nBACKSPACE=\"guess\"\n"
             )
         );
+    }
+
+    /// An Xorg keyboard section, the shape Arch's `00-keyboard.conf` has.
+    const XORG_SECTION: &str =
+        "Section \"InputClass\"\n    Option \"XkbLayout\" \"{layout}\"\nEndSection\n";
+
+    /// A distribution that keeps the console and the graphical session apart
+    /// gets both files, each in its own syntax. The seed knows neither path nor
+    /// key: it writes what the profile names.
+    #[test]
+    fn every_file_the_profile_names_is_written_in_the_form_it_names() {
+        let files = [
+            KeyboardFile {
+                path: "/etc/vconsole.conf".into(),
+                form: KeyboardForm::ShellAssignment,
+                template: "KEYMAP=\"{layout}\"\n".into(),
+            },
+            KeyboardFile {
+                path: "/etc/X11/xorg.conf.d/00-keyboard.conf".into(),
+                form: KeyboardForm::XorgString,
+                template: XORG_SECTION.into(),
+            },
+        ];
+        let document = parsed(&render(&SeedRequest {
+            keyboard: "ru",
+            keyboard_files: &files,
+            ..request()
+        }));
+
+        assert_eq!(
+            file(&document, "/etc/vconsole.conf")["content"],
+            Value::from("KEYMAP=\"ru\"\n")
+        );
+        assert_eq!(
+            file(&document, "/etc/X11/xorg.conf.d/00-keyboard.conf")["content"],
+            Value::from(XORG_SECTION.replace("{layout}", "ru"))
+        );
+    }
+
+    /// A profile that names no keyboard file leaves the guest's layout alone,
+    /// and takes nothing else with it.
+    #[test]
+    fn a_profile_naming_no_keyboard_file_writes_none() {
+        let document = parsed(&render(&SeedRequest {
+            keyboard_files: &[],
+            ..request()
+        }));
+        let paths = paths(&document);
+
+        assert!(
+            !paths.iter().any(|path| path.contains("keyboard")),
+            "no keyboard file should be written: {paths:?}"
+        );
+        assert!(!paths.is_empty(), "the SSH files are still there");
     }
 
     /// The file is read with `source`, so the layout is escaped for the shell
@@ -639,14 +688,7 @@ mod tests {
             authorized_key: None,
             ..request()
         }));
-        let paths = document["write_files"]
-            .as_sequence()
-            .expect("write_files is a list")
-            .iter()
-            .map(|file| file["path"].as_str().unwrap_or_default().to_owned())
-            .collect::<Vec<_>>();
-
-        assert_eq!(paths, ["/etc/default/keyboard"]);
+        assert_eq!(paths(&document), ["/etc/default/keyboard"]);
     }
 
     /// The port a VM was created with is the port its guest has to answer on --

@@ -16,6 +16,13 @@
     },
     "config_drop_in": "/etc/ssh/sshd_config.d/10-vmlord.conf"
   },
+  "keyboard": [
+    {
+      "path": "/etc/default/keyboard",
+      "form": "ShellAssignment",
+      "template": "XKBMODEL=\"pc105\"\nXKBLAYOUT=\"{layout}\"\nXKBVARIANT=\"\"\nXKBOPTIONS=\"\"\nBACKSPACE=\"guess\"\n"
+    }
+  ],
   "desktop": {
     "packages": ["ubuntu-desktop-minimal"],
     "display_manager": "gdm3.service"

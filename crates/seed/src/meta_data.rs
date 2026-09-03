@@ -19,7 +19,7 @@ pub(crate) fn render(request: &SeedRequest<'_>) -> String {
 #[cfg(test)]
 mod tests {
     use super::render;
-    use crate::{SeedRequest, UBUNTU_SSH};
+    use crate::{SeedRequest, UBUNTU_KEYBOARD, UBUNTU_SSH};
     use serde_yaml_ng::Value;
     use vmlord_core::{SshAccess, SshPort};
 
@@ -36,6 +36,7 @@ mod tests {
             },
             locale: "en_US.UTF-8",
             keyboard: "us",
+            keyboard_files: &UBUNTU_KEYBOARD,
             timezone: "Europe/Moscow",
             admin_group: "sudo",
             ssh_daemon: &UBUNTU_SSH,

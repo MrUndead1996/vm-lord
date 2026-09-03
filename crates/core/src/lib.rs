@@ -35,8 +35,8 @@ pub use display::{
 #[cfg(any(test, feature = "test-profile"))]
 pub use distro::ubuntu;
 pub use distro::{
-    DesktopSetup, DistroCatalog, DistroCatalogError, DistroProfile, SshDaemon, SshUnits,
-    sync_bundled_profiles,
+    DesktopSetup, DistroCatalog, DistroCatalogError, DistroProfile, KeyboardFile, KeyboardForm,
+    SshDaemon, SshUnits, sync_bundled_profiles,
 };
 pub use gpu::{
     GPU_PAYLOAD_SHARE, GpuAssignment, GpuAvailability, GpuFailure, GpuMode, GpuShare,

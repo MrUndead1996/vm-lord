@@ -25,6 +25,8 @@ use crate::{SettingsStore, display::DesktopProfile};
 
 /// The placeholder both templates carry.
 const RELEASE_PLACEHOLDER: &str = "{release}";
+/// The placeholder a keyboard file's template carries.
+const LAYOUT_PLACEHOLDER: &str = "{layout}";
 const BUNDLED_PROFILES_FILE_NAME: &str = ".bundled-profiles.json";
 
 /// Copies installed profiles into the current user's catalogue without taking
@@ -213,6 +215,87 @@ pub struct DistroProfile {
     /// desktop -- a VM built from it can only be headless, which is a fact
     /// about the profile rather than a failure to be reported later.
     pub desktop: Option<DesktopSetup>,
+    /// The files that tell this distribution's guest what keyboard layout it
+    /// has.
+    ///
+    /// A list rather than one path: Debian keeps the whole answer in
+    /// `/etc/default/keyboard`, while Arch configures the console through
+    /// `/etc/vconsole.conf` and the graphical session through
+    /// `/etc/X11/xorg.conf.d/00-keyboard.conf`. That is not one setting
+    /// written twice but two files, in two syntaxes, that a guest needs both
+    /// of.
+    pub keyboard: Vec<KeyboardFile>,
+}
+
+/// One file the seed writes to set the guest's keyboard layout.
+///
+/// The content is a template rather than keys this crate knows, for the reason
+/// [`SshDaemon`] is data: the difference between distributions here is a path,
+/// a syntax and a handful of lines, and whatever writes the seed has no
+/// business knowing what `XKBMODEL` is.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct KeyboardFile {
+    /// Where in the guest the file goes.
+    pub path: String,
+    /// The syntax the layout sits in, which is what decides how it is escaped.
+    pub form: KeyboardForm,
+    /// The whole file, with [`LAYOUT_PLACEHOLDER`] where the layout goes.
+    pub template: String,
+}
+
+impl KeyboardFile {
+    /// The file's content for `layout`, escaped for the form it is written in.
+    #[must_use]
+    pub fn content(&self, layout: &str) -> String {
+        self.template
+            .replace(LAYOUT_PLACEHOLDER, &self.form.escape(layout))
+    }
+}
+
+/// The syntax a keyboard file is written in.
+///
+/// A form rather than a path pattern, because the escaping is what differs:
+/// a value safe inside a shell assignment is not thereby safe inside an Xorg
+/// option, and neither escaping stands in for the other.
+///
+/// The variant names are an on-disk format: they are what a profile's JSON
+/// spells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+pub enum KeyboardForm {
+    /// `KEY="value"` lines. Debian's `/etc/default/keyboard` is read with
+    /// `source`, where an unescaped `$` or backtick is code and a quote ends
+    /// the assignment; systemd reads `/etc/vconsole.conf` itself and runs
+    /// nothing, so escaping for the stricter of the two is safe for both.
+    ShellAssignment,
+    /// `Option "XkbLayout" "value"` inside an Xorg configuration section.
+    ///
+    /// Xorg's parser reads a quoted string up to the next quote and knows no
+    /// escape sequences at all, so a quote cannot be written into one: it is
+    /// dropped rather than passed through, since passing it through would end
+    /// the string and leave the rest of the value as configuration.
+    XorgString,
+}
+
+impl KeyboardForm {
+    /// `layout`, safe to substitute into a file of this form.
+    ///
+    /// Neither escaping handles control characters, and neither has to:
+    /// `Provisioning::validate` refuses them before a seed is ever built.
+    fn escape(self, layout: &str) -> String {
+        match self {
+            Self::ShellAssignment => {
+                let mut escaped = String::with_capacity(layout.len());
+                for character in layout.chars() {
+                    if matches!(character, '\\' | '"' | '`' | '$') {
+                        escaped.push('\\');
+                    }
+                    escaped.push(character);
+                }
+                escaped
+            }
+            Self::XorgString => layout.replace('"', ""),
+        }
+    }
 }
 
 /// What installing a desktop into a guest of this distribution takes.
@@ -510,7 +593,8 @@ mod tests {
     };
 
     use super::{
-        DesktopProfile, DistroCatalog, DistroProfile, SshUnits, sync_bundled_profiles, ubuntu,
+        DesktopProfile, DistroCatalog, DistroProfile, KeyboardFile, KeyboardForm, SshUnits,
+        sync_bundled_profiles, ubuntu,
     };
     use crate::SettingsStore;
 
@@ -536,7 +620,14 @@ mod tests {
                     "units": {{ "Service": {{ "unit": "sshd.service" }} }},
                     "config_drop_in": "/etc/ssh/sshd_config.d/10-vmlord.conf"
                 }},
-                "desktop": null
+                "desktop": null,
+                "keyboard": [
+                    {{
+                        "path": "/etc/vconsole.conf",
+                        "form": "ShellAssignment",
+                        "template": "KEYMAP=\"{{layout}}\"\n"
+                    }}
+                ]
             }}"#
         )
     }
@@ -740,6 +831,64 @@ mod tests {
         assert_eq!(
             profile.desktop.unwrap().packages,
             ["ubuntu-desktop-minimal"]
+        );
+    }
+
+    /// The file the shipped profile names is the one the seed used to carry as
+    /// a constant, spelled the same way: an Ubuntu guest's layout has to end up
+    /// where `console-setup` reads it, not merely somewhere.
+    #[test]
+    fn the_shipped_ubuntu_profile_writes_the_debian_keyboard_file() {
+        let profile: DistroProfile =
+            serde_json::from_str(include_str!("../../../distros/ubuntu.json")).unwrap();
+
+        let [keyboard] = profile.keyboard.as_slice() else {
+            panic!("Ubuntu names one keyboard file");
+        };
+        assert_eq!(keyboard.path, "/etc/default/keyboard");
+        assert_eq!(keyboard.form, KeyboardForm::ShellAssignment);
+        assert_eq!(
+            keyboard.content("ru"),
+            "XKBMODEL=\"pc105\"\nXKBLAYOUT=\"ru\"\nXKBVARIANT=\"\"\n\
+             XKBOPTIONS=\"\"\nBACKSPACE=\"guess\"\n"
+        );
+    }
+
+    /// A file read with `source` treats an unescaped `$` or backtick as code
+    /// and a quote as the end of the assignment.
+    #[test]
+    fn a_shell_assignment_cannot_run_a_command_or_end_itself() {
+        let file = KeyboardFile {
+            path: "/etc/vconsole.conf".into(),
+            form: KeyboardForm::ShellAssignment,
+            template: "KEYMAP=\"{layout}\"\n".into(),
+        };
+
+        assert_eq!(file.content("us"), "KEYMAP=\"us\"\n");
+        assert_eq!(file.content("us$(id)"), "KEYMAP=\"us\\$(id)\"\n");
+        assert_eq!(file.content("us`id`"), "KEYMAP=\"us\\`id\\`\"\n");
+        assert_eq!(
+            file.content("us\"; reboot #"),
+            "KEYMAP=\"us\\\"; reboot #\"\n"
+        );
+        assert_eq!(file.content("us\\"), "KEYMAP=\"us\\\\\"\n");
+    }
+
+    /// Xorg knows no escape sequences inside a quoted string, so the same
+    /// backslash that saves the shell file would be a literal character here
+    /// and the quote would still end the string. It goes instead.
+    #[test]
+    fn an_xorg_string_keeps_a_quote_out_rather_than_escaping_it() {
+        let file = KeyboardFile {
+            path: "/etc/X11/xorg.conf.d/00-keyboard.conf".into(),
+            form: KeyboardForm::XorgString,
+            template: "    Option \"XkbLayout\" \"{layout}\"\n".into(),
+        };
+
+        assert_eq!(file.content("us"), "    Option \"XkbLayout\" \"us\"\n");
+        assert_eq!(
+            file.content("us\"\n    Option \"XkbOptions\" \"terminate"),
+            "    Option \"XkbLayout\" \"us\n    Option XkbOptions terminate\"\n"
         );
     }
 
