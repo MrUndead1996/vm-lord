@@ -4022,6 +4022,14 @@ what an update is made of -- so what a release may not do is carry the same
 version twice, which would make selection depend on the order a directory
 listed two identical candidates.
 
+A release therefore carries *one* display payload, not one per Ubuntu release.
+`rebuild_payload.sh` still builds inside all three containers, because each
+build is the compile gate for that release's headers, and packs the 24.04 tree
+alone: the three prepared trees differ in `recipe.json` and in nothing else, so
+three archives would be one payload's content three times under three IDs. The
+entry that ships says it was proven on 24.04, and every guest on `amd64` reads
+it.
+
 Verification happens twice, on both sides of the share. The host checks the
 archive against the entry, the expansion limits, and `payload.json` against
 what the entry claims; the guest, before it copies anything, checks

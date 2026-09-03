@@ -41,8 +41,8 @@ jobs:
       # The container build is the test: the module is compiled against each
       # release's own headers, so one that does not build for 22.04, 24.04 or
       # 26.04 is an artifact that never exists rather than a guest that cannot
-      # start a display.
-      - name: Build the display payloads
+      # start a display. All three are built; one is packed.
+      - name: Build the display payload
         run: ./rebuild_payload.sh
 
       # Mesa, the kernel headers and the closure check, all inside the pinned
@@ -60,19 +60,24 @@ jobs:
       # Collected into one tree rather than uploaded as the paths they were
       # built at, so what the release job unpacks is a layout this step chose
       # and not whichever common ancestor the upload action inferred.
+      #
+      # One display pair and not one per Ubuntu release: the step above builds
+      # in all three containers because each is a compile gate, and
+      # `rebuild_payload.sh` packs one of them into `release/`. Three archives
+      # would be the same content three times -- since task #169 a payload's
+      # distribution and release are provenance rather than a catalogue key.
       - name: Collect the payloads
         run: |
           set -euo pipefail
-          for pair in target/gpu-payload target/display-payload/*; do
-            case "$pair" in
-              target/gpu-payload) destination=target/payloads/gpu ;;
-              *) destination="target/payloads/display/$(basename "$pair")" ;;
-            esac
-            mkdir -p "$destination"
-            # Only these two: the prepared tree and the recipe are inputs to
-            # `pack`, and `cargo dist` reads the packed pair alone.
-            cp "$pair/payload.zip" "$pair/catalog-entry.json" "$destination"
-          done
+          mkdir -p target/payloads/gpu target/payloads/display
+          # Only these two: the prepared tree and the recipe are inputs to
+          # `pack`, and `cargo dist` reads the packed pair alone.
+          cp target/gpu-payload/payload.zip \
+             target/gpu-payload/catalog-entry.json \
+             target/payloads/gpu
+          cp target/display-payload/release/payload.zip \
+             target/display-payload/release/catalog-entry.json \
+             target/payloads/display
           find target/payloads -type f -printf '%P\t%s bytes\n' | sort
 
       - name: Hand the payloads to the release
@@ -170,12 +175,10 @@ jobs:
           name: payloads
           path: target/payloads
 
-      # The display directories are read rather than listed, because the list
-      # already exists -- `rebuild_payload.sh` decides which releases are
-      # supported, and a copy of that decision here would be one more thing to
-      # keep in step. What this step does insist on is that both kinds arrived:
-      # `cargo dist` builds a payload-less release quite happily and says so in
-      # one line, which is exactly how 0.2.0 shipped without either.
+      # What this step insists on is that both kinds arrived: `cargo dist`
+      # builds a payload-less release quite happily and says so in one line,
+      # which is exactly how 0.2.0 shipped without either. One pair each, in
+      # the layout the collecting step chose.
       #
       # `dist` then re-reads each catalog entry through the payload crates' own
       # validation and hashes the archive against the digest that entry claims,
@@ -184,26 +187,14 @@ jobs:
         shell: pwsh
         run: |
           $gpu = 'target/payloads/gpu'
-          $displayRoot = 'target/payloads/display'
+          $display = 'target/payloads/display'
           if (-not (Test-Path -LiteralPath "$gpu/payload.zip")) {
             throw "no GPU payload at $gpu; the payloads job did not produce one"
           }
-          if (-not (Test-Path -LiteralPath $displayRoot -PathType Container)) {
-            throw "no display payloads at $displayRoot; the payloads job did not produce any"
+          if (-not (Test-Path -LiteralPath "$display/payload.zip")) {
+            throw "no display payload at $display; the payloads job did not produce one"
           }
-          # Wrapped, because one directory is not a collection and none is not
-          # an empty one: unwrapped, a single release would have no `Count` to
-          # read and none would have no object to read it from.
-          $display = @(Get-ChildItem -LiteralPath $displayRoot -Directory)
-          if ($display.Count -eq 0) {
-            throw "no display payloads at $displayRoot; the payloads job did not produce any"
-          }
-          $arguments = @('--gpu-payload', $gpu)
-          foreach ($release in $display) {
-            $arguments += '--display-payload'
-            $arguments += (Join-Path $displayRoot $release.Name)
-          }
-          cargo dist @arguments
+          cargo dist --gpu-payload $gpu --display-payload $display
 
       - name: Check the staged distribution
         shell: pwsh

@@ -6,28 +6,40 @@ repository -- these files are what produces one.
 
 ## Building
 
-Rebuild every supported release from the repository root:
+Rebuild from the repository root:
 
 ```sh
 ./rebuild_payload.sh
 ```
 
-The script writes separate results under `target/display-payload/ubuntu-22.04`,
-`ubuntu-24.04` and `ubuntu-26.04`. The equivalent commands for one release are:
+The script builds inside all three containers -- `target/display-payload/ubuntu-22.04`,
+`ubuntu-24.04` and `ubuntu-26.04` -- because each build is the proof the module
+compiles against that release's headers. It packs **one** of them,
+`ubuntu-24.04`, into `target/display-payload/release/`, and that is the artifact
+a release ships. Three archives would be one payload's content three times: the
+prepared trees differ in `recipe.json` and in nothing else, and since task #169
+a payload's distribution and release are provenance rather than a key, so one
+entry serves every guest on the same architecture.
+
+The equivalent commands by hand are:
 
 ```sh
 cargo display-services
 payloads/display/prepare.sh \
     --spec     payloads/display/ubuntu-24.04-amd64/payload.spec.json \
-    --output   target/display-payload \
+    --output   target/display-payload/ubuntu-24.04 \
     --services target/x86_64-unknown-linux-musl/release
+mkdir -p target/display-payload/release
 cargo run -p xtask -- display-payload pack \
-    --recipe        target/display-payload/recipe.json \
-    --input         target/display-payload/prepared \
-    --archive       target/display-payload/payload.zip \
-    --catalog-entry target/display-payload/catalog-entry.json
-cargo dist --display-payload target/display-payload
+    --recipe        target/display-payload/ubuntu-24.04/recipe.json \
+    --input         target/display-payload/ubuntu-24.04/prepared \
+    --archive       target/display-payload/release/payload.zip \
+    --catalog-entry target/display-payload/release/catalog-entry.json
+cargo dist --display-payload target/display-payload/release
 ```
+
+`pack` creates neither file's parent directory, which is what the `mkdir` is
+for.
 
 One `Dockerfile` and one `prepare.sh` serve all three supported releases: they
 differ by base image and by nothing else, and three copies would drift. Which
@@ -36,9 +48,10 @@ release is built is the `--spec` that is passed.
 The `target` in a spec is provenance: it records the release a build was proven
 on, and the host does not require a guest to match it. Nothing in the archive
 knows what a package manager is, so a guest nobody built a target for -- Arch,
-say -- is served by one of these. The architecture is the one dimension that
-stays a condition. See **ARCHITECTURE.md**, "Display: the guest payload", for
-how selection ranks what is left, and for why the GPU payload cannot do this.
+say -- is served by the packed payload like any other. The architecture is the
+one dimension that stays a condition. See **ARCHITECTURE.md**, "Display: the
+guest payload", for how selection ranks what is left, and for why the GPU
+payload cannot do this.
 
 **The container build is the test.** It installs that release's
 `linux-headers-generic` and builds `vmlord_drm` against them, so a module that
