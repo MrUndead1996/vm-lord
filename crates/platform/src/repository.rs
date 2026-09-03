@@ -32,6 +32,7 @@ use crate::{
     display_launches::{self, DisplayLaunches, LaunchRequest},
     display_runs::DisplayRuns,
     display_update, display_updates,
+    force_stop_workers::ForceStopWorkers,
     gpu_runs::GpuRuns,
     guest_ready::ReadinessTimeouts,
     hcn::HcnNetwork,
@@ -119,7 +120,11 @@ pub struct HcsVmRepository {
     shutdown: Arc<VmShutdownPipeline>,
     /// The shutdown requests being delivered right now.
     shutdowns: ShutdownWorkers,
-    force_stop: VmForceStopPipeline,
+    /// Shared with the worker threads that carry out forced stops, which is why
+    /// it is behind an `Arc`.
+    force_stop: Arc<VmForceStopPipeline>,
+    /// The forced stops being carried out right now.
+    force_stops: ForceStopWorkers,
     delete: VmDeletionPipeline,
     /// The display payload updates in flight, one thread each.
     display_updates: display_updates::DisplayUpdates,
@@ -182,7 +187,8 @@ impl HcsVmRepository {
             display_launches: DisplayLaunches::default(),
             shutdown: Arc::new(VmShutdownPipeline::production()),
             shutdowns: ShutdownWorkers::default(),
-            force_stop: VmForceStopPipeline::production(),
+            force_stop: Arc::new(VmForceStopPipeline::production()),
+            force_stops: ForceStopWorkers::default(),
             delete: VmDeletionPipeline::production(),
             display_updates: display_updates::DisplayUpdates::default(),
             events,
@@ -508,6 +514,42 @@ impl HcsVmRepository {
                         vm = finished.vm_name.as_str(),
                         code = error.code().unwrap_or_default(),
                         "Failed to stop VM \"{}\": {error}",
+                        finished.vm_name
+                    );
+                }
+            }
+        }
+    }
+
+    /// Collects the forced stops that have finished since the last refresh.
+    ///
+    /// A termination that succeeded means HCS tore the compute system down
+    /// under its guest, so everything that belonged to the run is given up
+    /// here: nothing will close the console pipe from the other end, and the
+    /// `Exited` event behind the display window is worth neither the wait nor
+    /// the assumption that it will arrive. A termination that failed means the
+    /// VM may still be running -- HCS never confirmed it stopped -- so its
+    /// sessions and handles stay exactly where they are, and only the reason is
+    /// reported.
+    fn finish_force_stops(&mut self) {
+        for finished in self.force_stops.take_finished() {
+            match finished.result {
+                Ok(()) => {
+                    tracing::info!("VM \"{}\" was forcibly stopped", finished.vm_name);
+                    self.com1_sessions.cancel(finished.vm_id);
+                    self.agent_sessions.cancel(finished.vm_id);
+                    self.gpu_runs.forget(finished.vm_id);
+                    self.display_runs.forget(finished.vm_id);
+                    self.display_launches.close(finished.vm_id);
+                    self.connections.remove(finished.vm_id);
+                }
+                Err(error) => {
+                    vmlord_core::diagnostic!(
+                        Error,
+                        Subsystem::Hcs,
+                        vm = finished.vm_name.as_str(),
+                        code = error.code().unwrap_or_default(),
+                        "Failed to forcibly stop VM \"{}\": {error}",
                         finished.vm_name
                     );
                 }
@@ -1597,19 +1639,19 @@ impl VmRepository for HcsVmRepository {
         self.builds.refuse_if_building(name)?;
 
         let mapping = self.mapping(name)?;
-        self.force_stop.force_stop(&self.store, name)?;
-        // Nothing will close the pipe from the other end: the compute system
-        // was torn down under its guest.
-        self.com1_sessions.cancel(mapping.vm_id);
-        self.agent_sessions.cancel(mapping.vm_id);
-        self.gpu_runs.forget(mapping.vm_id);
-        self.display_runs.forget(mapping.vm_id);
-        // Nothing is left behind the display window either, and the `Exited`
-        // event that says so is worth neither the wait nor the assumption that
-        // it will arrive.
-        self.display_launches.close(mapping.vm_id);
-        self.connections.remove(mapping.vm_id);
-        Ok(())
+        // Terminating a wedged compute system waits on HCS for up to the force
+        // stop pipeline's timeout, and that wait no longer happens on the UI
+        // thread: force stop is the one control a user reaches for because a VM
+        // is already misbehaving, so freezing the window until HCS answers made
+        // the escalation look like the hang it exists to end. The run's handles
+        // are given up once the termination finishes, in `finish_force_stops`.
+        let store = self.store.clone();
+        let force_stop = Arc::clone(&self.force_stop);
+        let vm_name = mapping.vm_name.clone();
+        self.force_stops
+            .start(mapping.vm_id, &mapping.vm_name, move || {
+                force_stop.force_stop(&store, &vm_name)
+            })
     }
 
     /// Deletes the VM and everything VMLord created for it.
@@ -1887,6 +1929,10 @@ impl VmRepository for HcsVmRepository {
         // The same call, for the same reason: a shutdown request that has been
         // answered has handles to give up, and they are reachable only here.
         self.finish_shutdowns();
+        // And the same again for a forced stop that has finished: the compute
+        // system it tore down leaves a console, an agent listener and a display
+        // window to give up, all reachable only on this thread.
+        self.finish_force_stops();
         let drained = watch::drain_events(&self.events, |vm_id, generation| {
             self.connections.is_superseded(vm_id, generation)
         });
@@ -1953,6 +1999,8 @@ impl Drop for HcsVmRepository {
         // A request still being delivered holds a handle to a compute system
         // this repository is about to drop.
         self.shutdowns.join_all();
+        // A termination still in flight holds the same, for the same reason.
+        self.force_stops.join_all();
         // A launch still probing holds nothing of the repository's, but its
         // thread must not outlive the process that started it.
         self.ssh_launches.join_all();
@@ -2793,6 +2841,58 @@ mod tests {
         assert_eq!(diagnostics[0].level, DiagnosticLevel::Error);
         assert!(
             diagnostics[0].message.contains("injected shutdown failure")
+                && diagnostics[0].message.contains("dev"),
+            "{}",
+            diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn a_finished_force_stop_gives_up_what_the_run_leaves_behind() {
+        let mut repository = repository();
+        let mapping = mapping(NetworkMode::None);
+        repository
+            .force_stops
+            .start(mapping.vm_id, &mapping.vm_name, || Ok(()))
+            .expect("the termination should be dispatched");
+
+        repository.force_stops.wait_until_answered();
+        let (_, diagnostics) = records(|| repository.finish_force_stops());
+
+        assert!(
+            diagnostics.is_empty(),
+            "a termination that went through is not news"
+        );
+        // The same VM can be terminated again once its termination is over.
+        repository
+            .force_stops
+            .start(mapping.vm_id, &mapping.vm_name, || Ok(()))
+            .expect("the VM is no longer being forcibly stopped");
+        repository.force_stops.join_all();
+    }
+
+    #[test]
+    fn a_force_stop_that_failed_is_reported_rather_than_lost() {
+        // The termination happens on a thread of its own, so the failure cannot
+        // come back as the return value of the click that caused it.
+        let mut repository = repository();
+        let mapping = mapping(NetworkMode::None);
+        repository
+            .force_stops
+            .start(mapping.vm_id, &mapping.vm_name, || {
+                Err(RepositoryError::new("injected termination failure"))
+            })
+            .expect("the termination should be dispatched");
+
+        repository.force_stops.wait_until_answered();
+        let (_, diagnostics) = records(|| repository.finish_force_stops());
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, DiagnosticLevel::Error);
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("injected termination failure")
                 && diagnostics[0].message.contains("dev"),
             "{}",
             diagnostics[0].message
