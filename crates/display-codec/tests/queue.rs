@@ -3,7 +3,7 @@
 
 use vmlord_display_codec::{
     CursorImage, CursorPosition, Decoder, Encoder, EncoderConfig, Frame, Geometry, Payload,
-    PixelFormat, TileSize,
+    PixelFormat, Rect, TileSize,
 };
 
 fn geometry() -> Geometry {
@@ -136,9 +136,9 @@ fn a_keyframe_request_with_no_pending_frame_reuses_the_last_one() {
 }
 
 #[test]
-fn the_protective_keyframe_arrives_on_its_interval() {
+fn only_the_first_frame_and_a_request_are_whole_frames() {
     let mut config = EncoderConfig::new(geometry());
-    config.keyframe_interval = 3;
+    config.refresh_interval = 3;
     let mut encoder = Encoder::new(config);
 
     let mut kinds = Vec::new();
@@ -153,13 +153,81 @@ fn the_protective_keyframe_arrives_on_its_interval() {
         }
     }
 
-    assert_eq!(kinds, vec!['K', 'D', 'D', 'K', 'D', 'D', 'K']);
+    // The protective interval used to put a `K` at every third place. It is a
+    // sweep now, which rides along inside the deltas.
+    assert_eq!(kinds, vec!['K', 'D', 'D', 'D', 'D', 'D', 'D']);
 }
 
 #[test]
-fn an_interval_of_zero_never_forces_a_keyframe() {
+fn a_still_desktop_costs_nothing_once_its_keyframe_is_out() {
     let mut config = EncoderConfig::new(geometry());
-    config.keyframe_interval = 0;
+    config.refresh_interval = 3;
+    let mut encoder = Encoder::new(config);
+
+    submit(&mut encoder, &frame(7));
+    assert!(matches!(encoder.next_payload(), Some(Payload::Keyframe(_))));
+
+    // Several sweeps' worth of frames, none of which changed a pixel. The
+    // sweep compares tiles; it does not send them.
+    for _ in 0..20 {
+        submit(&mut encoder, &frame(7));
+        assert!(encoder.next_payload().is_none());
+    }
+}
+
+#[test]
+fn the_sweep_repairs_tiles_no_damage_hint_ever_covered() {
+    let mut config = EncoderConfig::new(geometry());
+    // Twelve tiles across the grid, so a sweep of four frames checks three a
+    // frame and the corner the hint admits to is not one of the other eleven.
+    config.refresh_interval = 4;
+    let mut encoder = Encoder::new(config);
+
+    submit(&mut encoder, &frame(0));
+    let Some(Payload::Keyframe(bytes)) = encoder.next_payload() else {
+        panic!("a keyframe");
+    };
+    let bytes = bytes.to_vec();
+    let mut decoder = Decoder::new(geometry());
+    decoder.apply_keyframe(&bytes).unwrap();
+
+    // A frame that differs everywhere, submitted with a hint that admits to
+    // one tile only: a capture backend under-reporting its damage.
+    let changed = frame(9);
+    let corner = [Rect {
+        x: 0,
+        y: 0,
+        width: 32,
+        height: 32,
+    }];
+
+    for _ in 0..config.refresh_interval {
+        encoder
+            .submit(
+                Frame {
+                    pixels: &changed,
+                    stride: STRIDE,
+                },
+                Some(&corner),
+            )
+            .unwrap();
+        let Some(Payload::TileDelta(bytes)) = encoder.next_payload() else {
+            panic!("a delta");
+        };
+        let bytes = bytes.to_vec();
+        decoder.apply_delta(&bytes).unwrap();
+    }
+
+    // Within one interval of encoded frames the sweep has crossed the whole
+    // grid, so the viewer holds the frame the guest really had -- without a
+    // single whole frame having been sent.
+    assert_eq!(decoder.frame(), changed.as_slice());
+}
+
+#[test]
+fn an_interval_of_zero_sweeps_nothing() {
+    let mut config = EncoderConfig::new(geometry());
+    config.refresh_interval = 0;
     let mut encoder = Encoder::new(config);
 
     submit(&mut encoder, &frame(0));

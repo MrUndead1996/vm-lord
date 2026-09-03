@@ -19,7 +19,13 @@
 //! It needs the rights `DRM_IOCTL_MODE_GETFB2` needs, which in a guest means
 //! running it under `sudo`.
 
-use std::{collections::HashMap, io, path::Path, time::Instant};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{self, Write},
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
 use vmlord_display_codec::{Decoder, Geometry, PixelFormat, Rect, TileSize};
 use vmlord_display_protocol::{
@@ -46,6 +52,10 @@ const READS: u32 = 200;
 /// count. Two hundred is a few seconds of a desktop that is doing something.
 const DAMAGE_FRAMES: u32 = 200;
 
+/// How many committed frames a recording writes, unless `--record-frames`
+/// names another count.
+const RECORD_FRAMES: u32 = 30;
+
 /// How many vblanks the damage check waits through with nothing committed
 /// before it gives up and reports what it has.
 ///
@@ -60,6 +70,14 @@ struct Arguments {
     /// guest with nothing moving on screen wants: the check waits for commits
     /// that are not coming.
     damage: u32,
+    /// Where to write the raw frames, if the run is a recording.
+    ///
+    /// A recording does nothing else: the file is what `cargo display-bench
+    /// --raw` reads, and the measurements above it would only compete with the
+    /// compositor for the same buffers.
+    record: Option<PathBuf>,
+    /// How many committed frames a recording writes.
+    record_frames: u32,
 }
 
 /// What one plane's reads came to.
@@ -83,6 +101,8 @@ fn parse<I: IntoIterator<Item = String>>(arguments: I) -> Result<Arguments, Stri
     let mut parsed = Arguments {
         reads: READS,
         damage: DAMAGE_FRAMES,
+        record: None,
+        record_frames: RECORD_FRAMES,
     };
 
     while let Some(flag) = values.next() {
@@ -96,12 +116,23 @@ fn parse<I: IntoIterator<Item = String>>(arguments: I) -> Result<Arguments, Stri
         match flag.as_str() {
             "--reads" => parsed.reads = number("--reads")?,
             "--damage" => parsed.damage = number("--damage")?,
+            "--record" => {
+                parsed.record = Some(PathBuf::from(
+                    values
+                        .next()
+                        .ok_or_else(|| "missing value for --record".to_owned())?,
+                ));
+            }
+            "--record-frames" => parsed.record_frames = number("--record-frames")?,
             _ => return Err(format!("unknown argument `{flag}`")),
         }
     }
 
     if parsed.reads == 0 {
         return Err("--reads wants at least one read".to_owned());
+    }
+    if parsed.record.is_some() && parsed.record_frames == 0 {
+        return Err("--record-frames wants at least one frame".to_owned());
     }
 
     Ok(parsed)
@@ -666,6 +697,123 @@ fn drain(
     Ok(written)
 }
 
+/// Writes `frames` committed frames of the live desktop to `path`, packed.
+///
+/// The file is the one `cargo display-bench --raw` reads: `width * height * 4`
+/// bytes per frame and nothing else, so what the bench measures is the desktop
+/// the guest actually had on screen rather than a scene written to exercise
+/// the encoder. The geometry goes on stdout, because the file does not carry
+/// it.
+///
+/// Only frames the compositor committed are written -- a still desktop
+/// commits nothing, and a recorder that wrote the same buffer two hundred
+/// times would be measuring its own loop.
+fn record_frames(device: &mut Device, path: &Path, frames: u32) -> Result<(), String> {
+    let mut file = File::create(path)
+        .map_err(|error| format!("{} could not be created: {error}", path.display()))?;
+    let mut buffers: HashMap<u32, MappedBuffer> = HashMap::new();
+    let mut previous_commits: Option<u64> = None;
+    let mut shape: Option<(u32, u32)> = None;
+    let mut written = 0u32;
+    let mut idle = 0u32;
+
+    while written < frames {
+        if idle >= DAMAGE_STALL {
+            break;
+        }
+        if device.wait_vblank().is_err() {
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            idle += 1;
+            continue;
+        }
+        let snapshot = device
+            .snapshot()
+            .map_err(|error| format!("the planes could not be read: {error} (try sudo)"))?;
+        let Some(primary) = snapshot
+            .planes
+            .iter()
+            .find(|plane| plane.kind == PlaneKind::Primary)
+        else {
+            continue;
+        };
+        // The first frame is taken whatever the commit counter says. A still
+        // desktop commits nothing at all, and the still desktop is exactly the
+        // one whose keyframe cost is in question; everything after the first
+        // waits for a commit, so the rest of a recording is frames the
+        // compositor really drew.
+        if written > 0 && primary.commits == previous_commits {
+            idle += 1;
+            continue;
+        }
+        idle = 0;
+        previous_commits = primary.commits;
+
+        // A resolution change part way through would leave a file whose frames
+        // are not all the same size, and nothing downstream could tell.
+        match shape {
+            None => shape = Some((primary.width, primary.height)),
+            Some(size) if size == (primary.width, primary.height) => {}
+            Some((width, height)) => {
+                return Err(format!(
+                    "the desktop changed from {width}x{height} to {}x{} part way through",
+                    primary.width, primary.height
+                ));
+            }
+        }
+
+        if primary.fresh {
+            buffers.remove(&primary.fb_id);
+        }
+        let mapped = match buffers.remove(&primary.fb_id) {
+            Some(mapped) => mapped,
+            None => {
+                let length = primary.stride as usize * primary.height as usize;
+                let Some(descriptor) = device.buffer(primary.fb_id) else {
+                    continue;
+                };
+                MappedBuffer::map(descriptor, length)
+                    .map_err(|error| format!("the desktop would not map: {error}"))?
+            }
+        };
+
+        // Packed on the way out, because a capture backend's stride is its own
+        // business and the file's reader has only the geometry to go on.
+        let row = primary.width as usize * 4;
+        let stride = primary.stride as usize;
+        let result = mapped.read(|bytes| {
+            for y in 0..primary.height as usize {
+                file.write_all(&bytes[y * stride..y * stride + row])?;
+            }
+            Ok::<(), io::Error>(())
+        });
+        buffers.insert(primary.fb_id, mapped);
+        result.map_err(|error| format!("{} could not be written: {error}", path.display()))?;
+
+        written += 1;
+    }
+
+    file.flush()
+        .map_err(|error| format!("{} could not be flushed: {error}", path.display()))?;
+
+    let (width, height) = shape.ok_or_else(|| {
+        "the desktop committed nothing at all; move something on screen".to_owned()
+    })?;
+    println!(
+        "wrote {written} frames of {width}x{height} to {}\n\n    cargo display-bench --raw {} \
+         --width {width} --height {height}",
+        path.display(),
+        path.display()
+    );
+    if written < frames {
+        println!(
+            "\nthe desktop stopped committing after {written} frames: move something on screen, \
+             or ask for fewer with --record-frames"
+        );
+    }
+
+    Ok(())
+}
+
 /// Reads the desktop and reports what the coherency bracket costs.
 ///
 /// # Errors
@@ -674,11 +822,21 @@ fn drain(
 /// case where no `vmlord_drm` card exists -- which is every machine that is not
 /// a VMLord guest.
 pub fn run<I: IntoIterator<Item = String>>(arguments: I) -> Result<(), String> {
-    let Arguments { reads, damage } = parse(arguments)?;
+    let Arguments {
+        reads,
+        damage,
+        record,
+        record_frames: wanted,
+    } = parse(arguments)?;
 
     let mut device = Device::find(DRIVER, Path::new(DRM_CLASS), Path::new(DRM_DEVICES))
         .map_err(|error: io::Error| format!("the card could not be opened: {error}"))?
         .ok_or_else(|| format!("no card is driven by {DRIVER}; this is not a VMLord guest"))?;
+
+    if let Some(path) = record {
+        return record_frames(&mut device, &path, wanted);
+    }
+
     let snapshot = device
         .snapshot()
         .map_err(|error| format!("the planes could not be read: {error} (try sudo)"))?;

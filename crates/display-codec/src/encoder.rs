@@ -25,19 +25,25 @@ pub struct Frame<'a> {
 pub struct EncoderConfig {
     /// The stream's frames and tile grid.
     pub geometry: Geometry,
-    /// A protective keyframe every so many encoded frames, so that a viewer
-    /// which somehow diverged without noticing recovers on its own.
-    pub keyframe_interval: u32,
+    /// How many encoded frames the protective sweep takes to cover the whole
+    /// tile grid, so that a viewer which somehow diverged without noticing
+    /// recovers on its own. Zero turns the sweep off.
+    ///
+    /// This used to be a whole keyframe on the same period, which measured
+    /// badly: a real desktop's keyframe is megabytes, not the couple of
+    /// hundred kilobytes the synthetic scenes suggested, and an idle desktop
+    /// paid all of it for nothing. See [`Encoder::next_payload`].
+    pub refresh_interval: u32,
 }
 
 impl EncoderConfig {
-    /// The default configuration for a geometry: a keyframe every 300 frames,
-    /// which is ten seconds at thirty frames a second.
+    /// The default configuration for a geometry: a sweep that covers the grid
+    /// every 300 frames, which is ten seconds at thirty frames a second.
     #[must_use]
     pub fn new(geometry: Geometry) -> Self {
         Self {
             geometry,
-            keyframe_interval: 300,
+            refresh_interval: 300,
         }
     }
 }
@@ -62,15 +68,17 @@ pub enum Payload<'a> {
 /// The encoding half of the codec.
 pub struct Encoder {
     geometry: Geometry,
-    keyframe_interval: u32,
+    /// How many encoded frames the sweep takes to cross the grid. Zero is no
+    /// sweep at all.
+    refresh_interval: u32,
+    /// The tile the next protective sweep starts at. Wraps, so the grid is
+    /// covered once per interval for as long as frames keep being encoded.
+    sweep: u32,
     /// What has been captured and not yet encoded. Every slot is latest-wins.
     staging: Staging,
     /// What the far side is believed to hold: the last payload handed out.
     reference: Vec<u32>,
     has_reference: bool,
-    /// Frames encoded since the last keyframe, which is what the protective
-    /// interval counts.
-    since_keyframe: u32,
     output: Vec<u8>,
     tile: Vec<u32>,
     previous_tile: Vec<u32>,
@@ -95,11 +103,11 @@ impl Encoder {
 
         Self {
             geometry: config.geometry,
-            keyframe_interval: config.keyframe_interval,
+            refresh_interval: config.refresh_interval,
+            sweep: 0,
             staging: Staging::new(pixels),
             reference: vec![0; pixels],
             has_reference: false,
-            since_keyframe: 0,
             output: Vec::new(),
             tile: Vec::new(),
             previous_tile: Vec::new(),
@@ -198,7 +206,6 @@ impl Encoder {
             }
 
             if self.encode_delta(hint.as_deref()) {
-                self.since_keyframe += 1;
                 return Some(Payload::TileDelta(&self.output));
             }
         } else if self.staging.keyframe_requested() && self.has_reference {
@@ -222,13 +229,38 @@ impl Encoder {
 
     /// Whether the frame about to be encoded must be a whole one.
     ///
-    /// Three reasons, and no others: there is nothing to build on, the viewer
-    /// asked, or the protective interval came round.
+    /// Two reasons, and no others: there is nothing to build on, or the viewer
+    /// asked. The protective interval used to be a third, and is now the sweep
+    /// in [`Encoder::mark_sweep`] instead -- a whole frame on a period costs
+    /// megabytes on a real desktop even when nothing has moved, and the sweep
+    /// buys the same recovery for the bytes that actually differ.
     fn keyframe_due(&self) -> bool {
-        !self.has_reference
-            || self.staging.keyframe_requested()
-            || (self.keyframe_interval > 0
-                && self.since_keyframe.is_multiple_of(self.keyframe_interval))
+        !self.has_reference || self.staging.keyframe_requested()
+    }
+
+    /// Adds this frame's share of the protective sweep to the selection.
+    ///
+    /// Damage is a hint, so a tile no hint ever covers is a tile that could
+    /// stay wrong on the viewer forever. The sweep is the answer: every
+    /// encoded frame compares a slice of the grid whatever the hint said, and
+    /// the slice advances, so the whole grid is checked once per
+    /// `refresh_interval` frames. A tile that matches the reference costs
+    /// nothing to check -- which is every tile of a desktop nobody is touching
+    /// -- and one that does not is repaired by the same delta that carries the
+    /// rest of the frame.
+    fn mark_sweep(&mut self) {
+        let count = self.geometry.tile_count();
+        if self.refresh_interval == 0 || count == 0 {
+            return;
+        }
+
+        // Ceiling, so the interval is an upper bound on how long a tile can
+        // go unchecked rather than a target it may overshoot.
+        let slice = count.div_ceil(self.refresh_interval);
+        for step in 0..slice.min(count) {
+            self.selected[((self.sweep + step) % count) as usize] = true;
+        }
+        self.sweep = (self.sweep + slice) % count;
     }
 
     /// Writes every tile of the staged frame into `output`.
@@ -245,7 +277,9 @@ impl Encoder {
 
         self.reference.copy_from_slice(self.staging.frame());
         self.has_reference = true;
-        self.since_keyframe = 1;
+        // The whole grid just went out, so the sweep starts over rather than
+        // re-checking tiles that were sent this instant.
+        self.sweep = 0;
         self.staging.keyframe_sent();
     }
 
@@ -254,9 +288,12 @@ impl Encoder {
     /// A hint says where a frame *may* differ; the comparison still decides.
     /// Tiles no hint covers are not compared, and so are not advanced in the
     /// reference either -- what the reference holds is what the far side was
-    /// sent, never what was captured.
+    /// sent, never what was captured. The sweep is what keeps that bounded:
+    /// a tile the hints keep missing is still compared within
+    /// `refresh_interval` frames.
     fn encode_delta(&mut self, hint: Option<&[Rect]>) -> bool {
         select_tiles(&mut self.selected, self.geometry, hint);
+        self.mark_sweep();
 
         self.output.clear();
         container::write_header(&mut self.output, false, &self.geometry);
