@@ -4243,13 +4243,31 @@ the reference either. A hint that under-reports therefore loses pixels until a
 later hint or a keyframe covers them -- a bug in the capture backend -- but it
 cannot desynchronise the stream, and that is the property the tests hold.
 
-A keyframe is produced on the first frame, whenever the viewer asks through
-`RequestKeyframe`, and every `keyframe_interval` frames as a protective
-measure, 300 by default. A request that arrives with nothing newly captured is
-answered from the frame already staged rather than waiting for the guest to
-repaint. Geometry never changes inside an encoder: a resolution change is a new
-`StreamConfig`, hence a new encoder and a new decoder, which is also what makes
-the reference frame's size an invariant rather than a check.
+A keyframe is produced for two reasons only: the first frame of a stream, and
+a viewer asking through `RequestKeyframe`. A request that arrives with nothing
+newly captured is answered from the frame already staged rather than waiting
+for the guest to repaint. Geometry never changes inside an encoder: a
+resolution change is a new `StreamConfig`, hence a new encoder and a new
+decoder, which is also what makes the reference frame's size an invariant
+rather than a check.
+
+There used to be a third reason -- a protective whole frame every
+`keyframe_interval` encoded frames, 300 by default -- and it was a bad trade
+once measured on a real desktop rather than on the synthetic scenes. That
+period now drives a **protective sweep** instead, `refresh_interval` in
+`EncoderConfig`. Every encoded frame compares a slice of the tile grid whatever
+the damage hint said, and the slice advances, so the whole grid is checked
+within the interval. The recovery property is the one the keyframe had: a tile
+the hints keep missing cannot stay wrong for longer than `refresh_interval`
+encoded frames. The cost is not: a tile that matches the reference is free to
+check, so a desktop nobody is touching pays nothing at all, and a tile that
+does not match is repaired by the delta already being written. Setting the
+interval to zero turns the sweep off.
+
+The measurement behind that is in "What a real desktop costs" below. The short
+version is that a real 1920x1080 GNOME keyframe is 4.7 MB, not the 163 KB the
+synthetic scenes report, and on a desktop with one small thing moving on it the
+periodic keyframe was **98% of everything the stream sent**.
 
 ### What the benchmark measured
 
@@ -4268,9 +4286,10 @@ costs. Timing names `submit` (copying the captured pixels into staging),
 | scrolling | 8.0 MB | 7.9 MB | 7.9 MB |
 | fullscreen video | 8.3 MB | 8.3 MB | 8.3 MB |
 
-Keyframes are 211 KB, 163 KB and 131 KB at the three tile sizes; encoding a
-quiet frame costs one to two milliseconds and a full one ten to twelve, and
-decoding is well under two.
+Keyframes on these scenes are 211 KB, 163 KB and 131 KB at the three tile
+sizes -- a number that turned out to be worth nothing at all off the synthetic
+bench, see below. Encoding a quiet frame costs one to two milliseconds and a
+full one ten to twelve, and decoding is well under two.
 
 Two conclusions and one caveat. **LZ4 does not earn its place in the MVP**: on
 desktop-shaped frames ZRLE already compresses by three orders of magnitude, and
@@ -4282,9 +4301,71 @@ four times the pixels for a small change on content that is not synthetic.
 
 The caveat is that the scrolling and fullscreen scenes are noise, which is the
 worst case any lossless codec can be given, and the moving window is a flat
-rectangle, which is close to the best. What a real GNOME desktop costs is a
-measurement for task #115, when there is a real capture to make it with. The
-numbers here settle the codec's own decisions and nothing beyond them.
+rectangle, which is close to the best. The numbers here settle the codec's own
+decisions and nothing beyond them.
+
+### What a real desktop costs
+
+The caveat above was load-bearing, and the keyframe row was the part that hurt.
+`vmlord-display-guest-probe --record <path>` writes committed frames of the
+live desktop straight off the `vmlord_drm` plane, packed, and
+`cargo display-bench --raw <path>` runs that file through the same table as the
+scenes. Measured on a GNOME 1920x1080 guest:
+
+| capture | keyframe | mean delta | ratio |
+| --- | --- | --- | --- |
+| idle desktop (wallpaper) | 4.75 MB | nothing sent | 1.7 |
+| scrolling terminal | 3.96 MB | 33 KB | 84 |
+| fullscreen video | 0.86 MB | 678 KB | 12 |
+
+A real keyframe is **4.7 MB, not 163 KB** -- twenty-nine times what the
+synthetic scenes said, and the same within a percent at all three tile sizes
+(4.78 / 4.75 / 4.73 MB). The reason is the wallpaper: it is a photograph, and
+run-length coding does nothing to a photograph, so nearly every tile is stored
+raw and the tile size only moves the per-tile overhead. The video frame
+compresses *better* than the idle desktop, which looks backwards until one
+notices that a video frame is one decoded picture while the desktop is a
+photograph plus panels plus shadows.
+
+That is what condemned the periodic keyframe. The counter only advanced on
+frames that actually encoded something, so a perfectly still desktop never paid
+it -- but a desktop with one 32x32 tile changing, which is a clock or a text
+cursor, did. Over 600 frames of exactly that, built from the captured
+wallpaper:
+
+| | keyframes | mean bytes/frame | 600 frames |
+| --- | --- | --- | --- |
+| protective keyframe | 2 | 16.2 KB | 9.70 MB |
+| protective sweep | 1 | 8.3 KB | 4.95 MB |
+
+The steady-state delta is 339 bytes a frame -- 203 KB of the whole run. Every
+other byte was keyframe. Over a ten-minute session at thirty frames a second
+the periodic keyframe would send sixty of them, 285 MB, to protect a stream
+whose actual content is about 6 MB; the sweep sends the one keyframe the stream
+opens with and nothing further. On the scrolling capture the saving is smaller
+but still real, 14% of all bytes sent, and on fullscreen video it is noise,
+because a stream already sending whole frames does not care.
+
+The sweep is not free, but it is cheaper in CPU than what it replaced, and for
+the same reason it is cheaper in bytes. At 1920x1080 with tile 32 the grid is
+2040 tiles, so an interval of 300 compares seven of them a frame -- 28 KB of
+the frame against 28 KB of the reference, and a tile that matches is never
+gathered. Over the near-idle capture above, per frame:
+
+| | encode | whole frame path | bytes |
+| --- | --- | --- | --- |
+| no protection at all | 8.8 us | 291 us | 1.9 KB |
+| protective sweep | 19.2 us | 297 us | 1.9 KB |
+| protective keyframe | 37.3 us | 314 us | 16.2 KB |
+
+The sweep doubles the encode step, which sounds worse than it is: the encode
+step on a quiet desktop is nine microseconds, against a frame copy of nearly
+three hundred. What it adds to the whole path is 2%, where the periodic
+keyframe added 8% -- amortised, in bursts of twenty milliseconds every three
+hundred frames rather than ten microseconds every frame, which is the shape
+that matters for a frame deadline. Where the capture backend reports no usable
+damage at all and every tile is compared anyway, the sweep costs nothing
+measurable, because those tiles were already selected.
 
 
 ---

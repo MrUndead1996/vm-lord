@@ -103,7 +103,11 @@ Use the Cargo aliases from `.cargo/config.toml` rather than spelling targets out
   (`x86_64-unknown-linux-musl`, statically linked, no C toolchain needed).
 * `cargo display-services` — build the guest display broker and capture process
   (the same target, for the same reason).
-* `cargo display-bench` — run the desktop codec's benchmark scenes.
+* `cargo display-bench` — run the desktop codec's benchmark scenes. With
+  `--raw <file> --width <w> --height <h>` it measures a recording of a real
+  desktop through the same table instead — see `--record` below, and
+  **ARCHITECTURE.md**, "What a real desktop costs", for why the synthetic
+  scenes are not enough on their own.
 * `cargo display-pipeline-bench` — measure what a captured frame costs
   between the mapping and the socket: the cursor composite, the payload's
   copy into a record, and a mapped buffer against memory this process owns.
@@ -117,8 +121,11 @@ Use the Cargo aliases from `.cargo/config.toml` rather than spelling targets out
   two viewers end up with the same picture — the only way to find out whether
   a compositor's damage can be believed, since damage that misses a change is
   an error nothing reports. `--damage 0` skips it, which a guest with a still
-  screen wants. It is not installed by the display payload; copy it over by
-  hand.
+  screen wants. `--record <file>` instead writes committed frames of the live
+  desktop, packed, for `cargo display-bench --raw` to measure on the host; it
+  takes the first frame whatever the compositor committed, so a still desktop
+  yields the one frame it has rather than nothing. It is not installed by the
+  display payload; copy it over by hand.
 * `cargo dist` — Windows-only release build into `dist/`.
 
 Never add a dependency that forces the agent to link against system C
