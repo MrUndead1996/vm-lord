@@ -1,8 +1,9 @@
-//! Two readers, two sets of rules.
+//! How a value is printed into the YAML document.
 //!
-//! The document is read as YAML, and `/etc/default/keyboard` inside it is later
-//! read by shell scripts with `source`. A value safe for one is not thereby
-//! safe for the other, so neither escaping stands in for the other.
+//! Only YAML's own rules live here. A file carried inside the document has a
+//! second reader with rules of its own -- `/etc/default/keyboard` is read with
+//! `source` -- and that escaping belongs with the form the profile names it
+//! in, in `vmlord_core::KeyboardForm`.
 
 /// Prints a value as a single-quoted YAML scalar.
 ///
@@ -13,21 +14,9 @@ pub(crate) fn yaml(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-/// Escapes a value for a double-quoted shell assignment.
-pub(crate) fn shell(value: &str) -> String {
-    let mut escaped = String::with_capacity(value.len());
-    for character in value.chars() {
-        if matches!(character, '\\' | '"' | '`' | '$') {
-            escaped.push('\\');
-        }
-        escaped.push(character);
-    }
-    escaped
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{shell, yaml};
+    use super::yaml;
 
     #[test]
     fn a_plain_value_is_quoted() {
@@ -59,20 +48,5 @@ mod tests {
             assert!(quoted.ends_with('\''), "{quoted:?}");
             assert_eq!(quoted.matches('\'').count(), 2, "{quoted:?}");
         }
-    }
-
-    #[test]
-    fn a_plain_layout_passes_through_the_shell_untouched() {
-        assert_eq!(shell("us"), "us");
-    }
-
-    /// `/etc/default/keyboard` is read with `source`, so a value is code until
-    /// it is escaped: `$(...)` would run, and a quote would end the assignment.
-    #[test]
-    fn a_shell_value_cannot_run_a_command_or_end_its_assignment() {
-        assert_eq!(shell("us$(id)"), "us\\$(id)");
-        assert_eq!(shell("us\"; reboot #"), "us\\\"; reboot #");
-        assert_eq!(shell("us`id`"), "us\\`id\\`");
-        assert_eq!(shell("us\\"), "us\\\\");
     }
 }

@@ -75,6 +75,7 @@ fn seed() -> Seed {
         },
         locale: "en_US.UTF-8",
         keyboard: "us",
+        keyboard_files: &ubuntu().keyboard,
         timezone: "Europe/Moscow",
         admin_group: "sudo",
         ssh_daemon: &ubuntu().ssh,

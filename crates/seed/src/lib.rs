@@ -12,7 +12,7 @@ mod meta_data;
 mod scalar;
 mod user_data;
 
-use vmlord_core::{SshAccess, SshDaemon};
+use vmlord_core::{KeyboardFile, SshAccess, SshDaemon};
 
 /// Everything the two documents are printed from.
 pub struct SeedRequest<'a> {
@@ -29,7 +29,16 @@ pub struct SeedRequest<'a> {
     /// Whether the guest runs an SSH daemon and, if it does, on what port.
     pub ssh: SshAccess,
     pub locale: &'a str,
+    /// The XKB layout name the guest's keyboard is set to.
     pub keyboard: &'a str,
+    /// The files that layout has to be written into, as the distribution's
+    /// profile names them.
+    ///
+    /// Named by the profile rather than known here for the reason
+    /// [`SeedRequest::ssh_daemon`] is: one distribution keeps the layout in a
+    /// shell file, another splits the console from the graphical session, and
+    /// a generator that knew both would have to be edited for the third.
+    pub keyboard_files: &'a [KeyboardFile],
     pub timezone: &'a str,
     /// The group that grants administrative rights: `sudo` or `wheel`.
     pub admin_group: &'a str,
@@ -154,9 +163,15 @@ pub fn tools_image(agent: &[u8]) -> Vec<u8> {
 pub(crate) static UBUNTU_SSH: std::sync::LazyLock<SshDaemon> =
     std::sync::LazyLock::new(|| vmlord_core::ubuntu().ssh);
 
+/// Ubuntu's keyboard files, borrowed by the same fixtures and for the same
+/// reason.
+#[cfg(test)]
+pub(crate) static UBUNTU_KEYBOARD: std::sync::LazyLock<Vec<KeyboardFile>> =
+    std::sync::LazyLock::new(|| vmlord_core::ubuntu().keyboard);
+
 #[cfg(test)]
 mod tests {
-    use super::{SeedRequest, UBUNTU_SSH, build};
+    use super::{SeedRequest, UBUNTU_KEYBOARD, UBUNTU_SSH, build};
     use vmlord_core::{SshAccess, SshPort};
 
     /// The two constants the guest finds the agent by: the label `runcmd`
@@ -196,6 +211,7 @@ mod tests {
             },
             locale: "en_US.UTF-8",
             keyboard: "us",
+            keyboard_files: &UBUNTU_KEYBOARD,
             timezone: "Europe/Moscow",
             admin_group: "sudo",
             ssh_daemon: &UBUNTU_SSH,
@@ -223,6 +239,7 @@ mod tests {
             },
             locale: "en_US.UTF-8",
             keyboard: "us",
+            keyboard_files: &UBUNTU_KEYBOARD,
             timezone: "Europe/Moscow",
             admin_group: "sudo",
             ssh_daemon: &UBUNTU_SSH,

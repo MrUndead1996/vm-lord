@@ -474,6 +474,9 @@ fn write_provisioning(
         ssh: provisioning.ssh,
         locale: &provisioning.locale,
         keyboard: &provisioning.keyboard,
+        // Where that layout has to be written is the distribution's answer,
+        // not this crate's.
+        keyboard_files: &image.profile.keyboard,
         timezone: &provisioning.timezone,
         admin_group: &image.profile.admin_group,
         ssh_daemon: &image.profile.ssh,

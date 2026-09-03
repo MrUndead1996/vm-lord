@@ -1898,8 +1898,8 @@ their `hashed_passwd` and `lock_passwd`, membership in the profile's admin
 group, the sudo rule `ALL=(ALL) NOPASSWD:ALL` (cloud-init writes it into
 `/etc/sudoers.d` itself, so `sudo` and `wheel` need no special case), the
 authorized key, `ssh_pwauth`, `locale`, `timezone`, a `write_files` entry for
-`/etc/default/keyboard`, and `growpart`/`resize_rootfs`. Growing the root
-filesystem is a VMLord promise, so it is stated rather than left to cloud-init's
+every keyboard file the profile names, and `growpart`/`resize_rootfs`. Growing
+the root filesystem is a VMLord promise, so it is stated rather than left to cloud-init's
 defaults.
 
 SSH is the one thing in the document with two opposite shapes, and both come out
@@ -1992,9 +1992,8 @@ The documents are printed by hand, not serialised: they are small, fixed, and
 the `#cloud-config` line is a comment to YAML and a format marker to cloud-init.
 Every value from outside is printed as a single-quoted YAML scalar, where YAML
 has no escape sequences at all; the keyboard layout is escaped a second time for
-the shell, because `/etc/default/keyboard` is read with `source`, where `$` and
-a quote are code. The tests read the result back with a YAML parser and assert
-on meaning, the way cloud-init's PyYAML will.
+the file it lands in, which has a reader of its own. The tests read the result
+back with a YAML parser and assert on meaning, the way cloud-init's PyYAML will.
 
 `vmlord-seed::image` packs both documents into the ISO9660 volume the guest
 mounts: 2048-byte blocks, sixteen empty ones, a primary descriptor, a
@@ -2021,10 +2020,23 @@ directory as `seed.iso` and attaches it. The root directory grows by whole
 sectors as records need them, which is what lets the same transport carry a
 guest agent later without touching the writer.
 
-One limitation, stated rather than forgotten: `/etc/default/keyboard` is
-Debian-family. Fedora keeps the setting in `/etc/vconsole.conf` under different
-keys, which is a different mechanism rather than a different value; every other
-key in the document is a cloud-init module that works anywhere.
+The keyboard is the one guest setting cloud-init has no module for, so the seed
+writes the files itself -- and which files those are is `DistroProfile::keyboard`,
+a list of `KeyboardFile { path, form, template }` (#157). The template is the
+whole file with `{layout}` where the layout goes, so the generator never learns
+what `XKBMODEL` is, and `form` is what decides the escaping: `ShellAssignment`
+for `KEY="value"` files, where Debian's `/etc/default/keyboard` is read with
+`source` and `$`, a backtick or a quote is code; `XorgString` for
+`Option "XkbLayout" "value"`, where Xorg's parser knows no escape sequences at
+all and a quote is therefore dropped rather than escaped, since a backslash
+before it would be a literal character and the string would still end. A list
+rather than one path because the two are not one setting written twice: Debian
+keeps the whole answer in one file, while Arch configures the console through
+`/etc/vconsole.conf` and the graphical session through
+`/etc/X11/xorg.conf.d/00-keyboard.conf`. Neither escaping handles control
+characters and neither has to -- `Provisioning::validate` refuses them before a
+seed is built. Every other key in the document is a cloud-init module that works
+anywhere.
 
 Creating a VM is now the native backend's alone. AppSandbox's model was "media
 plus unattended answers", and the tool that carried out the answers was
