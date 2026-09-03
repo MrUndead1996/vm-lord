@@ -148,21 +148,38 @@ pub fn read_payload_facts(bytes: &[u8]) -> Result<PayloadFacts, String> {
     })
 }
 
-/// Whether a payload built for one guest applies to this one.
+/// Whether a payload built for one guest can run in this one.
 ///
-/// Distribution, release and architecture, and never the kernel: DKMS builds
-/// against the headers of the running kernel, and the kernel a payload records
-/// is what it was proven on.
+/// The architecture, and nothing else. A display payload carries DKMS sources
+/// and static musl binaries, so the distribution and release it records are
+/// provenance -- where its build was proven -- rather than who it may serve.
+/// The host stopped keying its catalogue on them in task #169, and this is the
+/// guest's half of the same claim: a stricter rule here would only move the
+/// refusal from the host's selection to the mount, which is exactly what a
+/// guest whose release nobody built for used to hit.
+///
+/// Never the kernel either: DKMS builds against the headers of the running
+/// kernel, and the kernel a payload records is what it was proven on.
 #[must_use]
-pub fn applies_to(
+pub fn serves(payload: &PayloadFacts, architecture: &str) -> bool {
+    payload.architecture.eq_ignore_ascii_case(architecture)
+}
+
+/// Whether this is the guest the payload was built and proven on.
+///
+/// Never a condition. What it decides is what the `PAYLOAD` stage reports, so
+/// that a guest running a payload proven somewhere else says so where a person
+/// reading the recipe will see it.
+#[must_use]
+pub fn was_built_for(
     payload: &PayloadFacts,
     distribution: &str,
     release: &str,
     architecture: &str,
 ) -> bool {
-    payload.distribution.eq_ignore_ascii_case(distribution)
+    serves(payload, architecture)
+        && payload.distribution.eq_ignore_ascii_case(distribution)
         && payload.release == release
-        && payload.architecture.eq_ignore_ascii_case(architecture)
 }
 
 /// What a guest already has of the display payload.
@@ -442,11 +459,12 @@ mod tests {
     use vmlord_agent_protocol::v1::{DisplayRecipeStageState, DisplayRecipeStep};
 
     use super::{
-        DKMS_PACKAGE, FALLBACK_MODE, InstalledVersions, Report, STEPS, SigningKeyState, applies_to,
+        DKMS_PACKAGE, FALLBACK_MODE, InstalledVersions, Report, STEPS, SigningKeyState,
         dkms_reports_installed, dkms_versions, has_recipe, modprobe_options, module_is_loaded,
         needs_build, needs_reload, parse_module_parameters, parse_module_signature_key,
-        parse_secure_boot_state, parse_subject_key_identifier, read_payload_facts,
-        signature_matches, signing_key_state, wanted_mode, was_rejected_for_its_signature,
+        parse_secure_boot_state, parse_subject_key_identifier, read_payload_facts, serves,
+        signature_matches, signing_key_state, wanted_mode, was_built_for,
+        was_rejected_for_its_signature,
     };
 
     #[test]
@@ -521,13 +539,27 @@ mod tests {
     }
 
     #[test]
-    fn a_payload_applies_by_triple_and_never_by_kernel() {
+    fn a_payload_applies_by_architecture_and_never_by_kernel() {
         let facts = read_payload_facts(&payload_json("0.1.0", "24.04")).unwrap();
 
-        assert!(applies_to(&facts, "ubuntu", "24.04", "amd64"));
-        assert!(applies_to(&facts, "Ubuntu", "24.04", "AMD64"));
-        assert!(!applies_to(&facts, "ubuntu", "22.04", "amd64"));
-        assert!(!applies_to(&facts, "debian", "24.04", "amd64"));
+        assert!(serves(&facts, "amd64"));
+        assert!(serves(&facts, "AMD64"));
+        assert!(
+            !serves(&facts, "arm64"),
+            "a binary built for amd64 does not run on anything else"
+        );
+    }
+
+    #[test]
+    fn a_release_nobody_built_for_is_provenance_and_not_a_refusal() {
+        let facts = read_payload_facts(&payload_json("0.1.0", "24.04")).unwrap();
+
+        // The case that came back from a real guest: the host selected the
+        // 24.04 payload for a 26.04 guest, and the mount used to refuse it.
+        assert!(serves(&facts, "amd64"));
+        assert!(!was_built_for(&facts, "ubuntu", "26.04", "amd64"));
+        assert!(!was_built_for(&facts, "arch", "rolling", "amd64"));
+        assert!(was_built_for(&facts, "Ubuntu", "24.04", "AMD64"));
     }
 
     #[test]
