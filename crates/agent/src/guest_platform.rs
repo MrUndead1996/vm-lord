@@ -10,7 +10,8 @@
 //! So nothing below branches on the name of a distribution. Which package
 //! manager is installed is whether one answers; whether libraries sit under a
 //! multiarch directory is whether that directory is there; what the desktop is
-//! is what logind says is on the screen.
+//! is what logind says is on the screen, and how its compositor is started is
+//! which cgroup the process holding the seat's card turned out to be in.
 //!
 //! Every decision is a function of text or of a directory that a test can
 //! point somewhere else, in the shape `display-services`' `seat` module
@@ -34,6 +35,9 @@ const DISPLAY_MANAGER: &str = "/etc/systemd/system/display-manager.service";
 
 /// Where logind keeps one file per session.
 const SESSIONS: &str = "/run/systemd/sessions";
+
+/// Where the kernel keeps one directory per process.
+const PROC: &str = "/proc";
 
 /// What the guest says it is, and what it turned out to be.
 ///
@@ -237,6 +241,12 @@ pub struct DesktopFacts {
     /// The unit `display-manager.service` is linked to -- `gdm.service`,
     /// `sddm.service` -- or `None` where nothing owns the login screen.
     pub display_manager: Option<String>,
+    /// How the compositor that is on the screen was started, which is what
+    /// decides how anything can be delivered to it.
+    ///
+    /// `None` where no compositor is running: a headless guest, and every
+    /// guest in the moment between boot and its greeter.
+    pub compositor: Option<CompositorLaunch>,
 }
 
 /// The names a GNOME session goes under, matched as substrings of a
@@ -304,11 +314,113 @@ impl DesktopFacts {
             (None, Some(kind)) => format!("an unnamed {kind} session"),
             (None, None) => "no session on the screen".to_owned(),
         };
-        match &self.display_manager {
+        let session = match &self.display_manager {
             Some(unit) => format!("{session}, under {unit}"),
+            None => session,
+        };
+        match &self.compositor {
+            Some(launch) => format!("{session}, {}", launch.describe()),
             None => session,
         }
     }
+}
+
+/// How the compositor that is on the screen was started.
+///
+/// Not what it is called: what started it. A drop-in reaches a compositor that
+/// systemd started and reaches nothing at all in a session that a login shell
+/// opened, and that difference -- not the name `gnome` or `Hyprland` -- is
+/// what an isolation has to be chosen by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompositorLaunch {
+    /// A systemd user unit, named as it is running:
+    /// `org.gnome.Shell@wayland.service`, `wayland-wm@hyprland.service`.
+    Unit(String),
+    /// The session's own scope, which is what a compositor started from a
+    /// login shell runs in. A scope is made by whoever asked for it and
+    /// carries no configuration a drop-in could add to.
+    Scope(String),
+}
+
+impl CompositorLaunch {
+    /// Where a drop-in for this compositor goes, relative to the user unit
+    /// directory, or `None` where there is no unit to attach one to.
+    ///
+    /// The template rather than the instance: `org.gnome.Shell@wayland.service`
+    /// is one instance among several -- the greeter runs its own, and so does
+    /// every user who logs in -- and systemd reads `foo@.service.d` for every
+    /// instance of `foo@`. A drop-in on the instance that happened to be
+    /// running when the recipe looked would miss the next one.
+    #[must_use]
+    pub fn drop_in_directory(&self) -> Option<String> {
+        let Self::Unit(unit) = self else {
+            return None;
+        };
+        let name = match unit.split_once('@') {
+            Some((template, _)) => format!("{template}@.service"),
+            None => unit.clone(),
+        };
+        Some(format!("{name}.d"))
+    }
+
+    /// The launch in one phrase, for the line a recipe reports.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Unit(unit) => format!("started by {unit}"),
+            Self::Scope(scope) => format!("started outside a unit, in {scope}"),
+        }
+    }
+}
+
+/// What the leaf of a process's cgroup path says started it.
+///
+/// systemd puts every process it starts in a cgroup named after its unit, and
+/// everything else a login opens in the session's scope, so the last segment
+/// of the path is the answer. A leaf that is neither is a cgroup nothing here
+/// can act on, and says so by being `None` rather than by being guessed at.
+fn launch_of(cgroup_path: &str) -> Option<CompositorLaunch> {
+    let leaf = cgroup_path.rsplit('/').find(|part| !part.is_empty())?;
+    if leaf.ends_with(".service") {
+        return Some(CompositorLaunch::Unit(leaf.to_owned()));
+    }
+    if leaf.ends_with(".scope") {
+        return Some(CompositorLaunch::Scope(leaf.to_owned()));
+    }
+
+    None
+}
+
+/// The cgroup path a `/proc/<pid>/cgroup` file names.
+///
+/// Two formats, and both are read: the unified hierarchy writes one `0::` line
+/// and a guest still on cgroup v1 writes one line per controller, of which the
+/// `name=systemd` one is where the units are.
+fn cgroup_path(text: &str) -> Option<&str> {
+    let mut legacy = None;
+    for line in text.lines() {
+        let mut fields = line.splitn(3, ':');
+        let Some((controllers, path)) = fields.nth(1).zip(fields.next()) else {
+            continue;
+        };
+        if controllers.is_empty() {
+            return Some(path.trim());
+        }
+        if controllers.split(',').any(|name| name == "name=systemd") {
+            legacy = Some(path.trim());
+        }
+    }
+
+    legacy
+}
+
+/// Whether this process belongs to a user's own slice.
+///
+/// The compositor is the session user's process; the display broker holds a
+/// card too and is a system service, so the slice is what tells them apart
+/// without either being named.
+fn belongs_to(cgroup_path: &str, uid: u32) -> bool {
+    cgroup_path.contains(&format!("/user-{uid}.slice/"))
 }
 
 /// The graphical session that is on the screen.
@@ -316,6 +428,10 @@ impl DesktopFacts {
 struct Session {
     desktop: Option<String>,
     kind: String,
+    /// Who the session belongs to, which is whose processes the compositor is
+    /// among. The greeter's own session has one of these as much as a
+    /// logged-in user's does.
+    uid: Option<u32>,
 }
 
 /// One logind session file, if that session is the graphical one on screen.
@@ -326,12 +442,14 @@ struct Session {
 fn graphical_session(text: &str) -> Option<Session> {
     let mut desktop = None;
     let mut kind = None;
+    let mut uid = None;
     let (mut seat, mut active) = (false, false);
 
     for line in text.lines() {
         match line.split_once('=') {
             Some(("SEAT", value)) => seat = value.trim() == "seat0",
             Some(("ACTIVE", value)) => active = value.trim() == "1",
+            Some(("UID", value)) => uid = value.trim().parse().ok(),
             Some(("TYPE", value)) => {
                 kind = matches!(value.trim(), "wayland" | "x11").then(|| value.trim().to_owned());
             }
@@ -346,6 +464,7 @@ fn graphical_session(text: &str) -> Option<Session> {
     (seat && active).then_some(Session {
         desktop,
         kind: kind?,
+        uid,
     })
 }
 
@@ -382,17 +501,110 @@ fn display_manager_unit(target: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// What desktop this guest has, read out of a sessions directory and a link.
-fn desktop_facts(sessions: &Path, display_manager: &Path) -> DesktopFacts {
+/// The processes of `uid` that have a card open, and how each was started.
+///
+/// A compositor is found by what it does rather than by what it is called: it
+/// holds the seat's card open, and a list of the programs that might be one is
+/// exactly the table of constants this module exists without. The slice keeps
+/// the guest's own display broker -- a system service that holds a card too --
+/// out of the answer.
+fn compositor_launch(proc: &Path, uid: u32) -> Option<CompositorLaunch> {
+    let Ok(entries) = std::fs::read_dir(proc) else {
+        return None;
+    };
+    let mut found = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(path.join("cgroup")) else {
+            continue;
+        };
+        let Some(cgroup) = cgroup_path(&text) else {
+            continue;
+        };
+        if !belongs_to(cgroup, uid) || !holds_a_card(&path.join("fd")) {
+            continue;
+        }
+        if let Some(launch) = launch_of(cgroup) {
+            found.push(launch);
+        }
+    }
+
+    // A unit ahead of a scope, and then by name: a session may have a second
+    // process holding a card -- an Xwayland, a probe -- and the answer must
+    // not depend on the order the kernel listed `/proc` in. A unit is the
+    // stronger answer of the two, because it is the one something can be
+    // delivered to.
+    found.sort_by(|left, right| key(left).cmp(&key(right)));
+    found.into_iter().next()
+}
+
+/// What `compositor_launch` orders candidates by.
+fn key(launch: &CompositorLaunch) -> (u8, &str) {
+    match launch {
+        CompositorLaunch::Unit(name) => (0, name),
+        CompositorLaunch::Scope(name) => (1, name),
+    }
+}
+
+/// Whether a process has one of the seat's cards open.
+fn holds_a_card(descriptors: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(descriptors) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        std::fs::read_link(entry.path())
+            .ok()
+            .and_then(|target| target.to_str().map(is_drm_card))
+            .unwrap_or(false)
+    })
+}
+
+/// Whether an open file is a DRM card.
+///
+/// The card and not a render node: everything that draws opens a render node,
+/// and what a compositor alone opens is the device that owns the outputs.
+fn is_drm_card(target: &str) -> bool {
+    target.strip_prefix("/dev/dri/card").is_some_and(|number| {
+        !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+/// What desktop this guest has, read out of a sessions directory, a link and
+/// the processes of whoever is at the screen.
+fn desktop_facts(sessions: &Path, display_manager: &Path, proc: &Path) -> DesktopFacts {
     let session = session_in(sessions);
     DesktopFacts {
         session: session.as_ref().and_then(|found| found.desktop.clone()),
-        session_type: session.map(|found| found.kind),
+        session_type: session.as_ref().map(|found| found.kind.clone()),
         display_manager: std::fs::read_link(display_manager)
             .ok()
             .as_deref()
             .and_then(display_manager_unit),
+        compositor: session
+            .and_then(|found| found.uid)
+            .and_then(|uid| compositor_launch(proc, uid)),
     }
+}
+
+/// What desktop this guest has right now.
+///
+/// Read again rather than carried: a recipe that ran before the greeter did
+/// asks this a second time, and the answer it wants is the one that is true
+/// when it asks.
+#[must_use]
+pub fn desktop_now() -> DesktopFacts {
+    desktop_facts(
+        Path::new(SESSIONS),
+        Path::new(DISPLAY_MANAGER),
+        Path::new(PROC),
+    )
 }
 
 /// Reads `ID` and the release out of an `/etc/os-release`.
@@ -444,7 +656,7 @@ pub fn guest_facts() -> Result<GuestFacts, String> {
     Ok(GuestFacts {
         package_manager: package_manager(program_answers),
         library_layout: library_layout(&architecture, |path| path.is_dir()),
-        desktop: desktop_facts(Path::new(SESSIONS), Path::new(DISPLAY_MANAGER)),
+        desktop: desktop_now(),
         distribution,
         release,
         architecture,
@@ -481,14 +693,28 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        DesktopFacts, GuestFacts, LibraryLayout, PackageManager, desktop_facts,
-        display_manager_unit, graphical_session, library_layout, library_triplet, package_manager,
-        parse_os_release, session_in,
+        CompositorLaunch, DesktopFacts, GuestFacts, LibraryLayout, PackageManager, cgroup_path,
+        compositor_launch, desktop_facts, display_manager_unit, graphical_session, is_drm_card,
+        launch_of, library_layout, library_triplet, package_manager, parse_os_release, session_in,
     };
 
     const GNOME_WAYLAND: &str =
         "UID=1000\nSEAT=seat0\nTYPE=wayland\nACTIVE=1\nDESKTOP=gnome\nSTATE=active\n";
     const TTY: &str = "UID=1000\nSEAT=seat0\nTYPE=tty\nACTIVE=1\nSTATE=active\n";
+
+    /// One process in a fixture `/proc`: where its cgroup says it was started
+    /// and what it has open.
+    fn process(proc: &Path, pid: u32, cgroup: &str, open: &[&str]) {
+        let directory = proc.join(pid.to_string());
+        std::fs::create_dir_all(directory.join("fd")).unwrap();
+        std::fs::write(directory.join("cgroup"), format!("0::{cgroup}\n")).unwrap();
+        for (index, target) in open.iter().enumerate() {
+            // Dangling on purpose: what is read is where the link points, and
+            // a fixture has no card to point it at.
+            std::os::unix::fs::symlink(target, directory.join("fd").join((index + 3).to_string()))
+                .unwrap();
+        }
+    }
 
     fn temporary(label: &str) -> PathBuf {
         let directory = std::env::temp_dir().join(format!(
@@ -660,7 +886,16 @@ mod tests {
         let link = directory.join("display-manager.service");
         std::os::unix::fs::symlink(&unit, &link).unwrap();
 
-        let facts = desktop_facts(&sessions, &link);
+        let proc = directory.join("proc");
+        process(
+            &proc,
+            410,
+            "/user.slice/user-1000.slice/user@1000.service/session.slice/\
+             org.gnome.Shell@wayland.service",
+            &["/dev/dri/card0"],
+        );
+
+        let facts = desktop_facts(&sessions, &link, &proc);
 
         let _ = std::fs::remove_dir_all(&directory);
         assert_eq!(
@@ -669,6 +904,9 @@ mod tests {
                 session: Some("gnome".to_owned()),
                 session_type: Some("wayland".to_owned()),
                 display_manager: Some("gdm.service".to_owned()),
+                compositor: Some(CompositorLaunch::Unit(
+                    "org.gnome.Shell@wayland.service".to_owned()
+                )),
             }
         );
         assert!(facts.found());
@@ -678,7 +916,11 @@ mod tests {
     fn a_headless_guest_has_a_desktop_of_nothing_rather_than_a_failure() {
         let directory = temporary("headless");
 
-        let facts = desktop_facts(&directory, &directory.join("display-manager.service"));
+        let facts = desktop_facts(
+            &directory,
+            &directory.join("display-manager.service"),
+            &directory.join("proc"),
+        );
 
         let _ = std::fs::remove_dir_all(&directory);
         assert_eq!(facts, DesktopFacts::default());
@@ -695,10 +937,15 @@ mod tests {
         let link = directory.join("display-manager.service");
         std::os::unix::fs::symlink(&unit, &link).unwrap();
 
-        let facts = desktop_facts(&sessions, &link);
+        let facts = desktop_facts(&sessions, &link, &directory.join("proc"));
 
         let _ = std::fs::remove_dir_all(&directory);
         assert_eq!(facts.session, None);
+        assert_eq!(
+            facts.compositor, None,
+            "a display manager that has started nothing yet has no compositor to be asked \
+             how it starts"
+        );
         assert_eq!(facts.display_manager.as_deref(), Some("gdm.service"));
         assert!(facts.found());
     }
@@ -713,6 +960,7 @@ mod tests {
                 session: Some(name.to_owned()),
                 session_type: Some("wayland".to_owned()),
                 display_manager: Some("gdm.service".to_owned()),
+                ..DesktopFacts::default()
             };
             assert!(found.is_gnome(), "{name} is a GNOME session");
         }
@@ -721,12 +969,36 @@ mod tests {
             session: Some("Hyprland".to_owned()),
             session_type: Some("wayland".to_owned()),
             display_manager: Some("gdm.service".to_owned()),
+            ..DesktopFacts::default()
         };
         assert!(
             !hyprland.is_gnome(),
             "the session on the screen outranks the greeter that started it: \
              a guest whose login screen is GDM is not running GNOME because \
              of it"
+        );
+    }
+
+    #[test]
+    fn the_unit_a_compositor_runs_in_is_what_starts_it() {
+        assert_eq!(
+            launch_of(
+                "/user.slice/user-1000.slice/user@1000.service/session.slice/org.gnome.Shell@wayland.service"
+            ),
+            Some(CompositorLaunch::Unit(
+                "org.gnome.Shell@wayland.service".to_owned()
+            ))
+        );
+        assert_eq!(
+            launch_of("/user.slice/user-1000.slice/session-3.scope"),
+            Some(CompositorLaunch::Scope("session-3.scope".to_owned())),
+            "a compositor a login shell started is in the session's own scope, \
+             which is not a unit anything can be added to"
+        );
+        assert_eq!(
+            launch_of("/user.slice/user-1000.slice"),
+            None,
+            "a cgroup that is neither says so rather than being read as one"
         );
     }
 
@@ -757,6 +1029,147 @@ mod tests {
     }
 
     #[test]
+    fn a_drop_in_goes_on_the_template_and_not_on_the_instance() {
+        // The greeter runs one instance and every user who logs in runs
+        // another; systemd reads the template's directory for all of them.
+        let gnome = CompositorLaunch::Unit("org.gnome.Shell@wayland.service".to_owned());
+        assert_eq!(
+            gnome.drop_in_directory().as_deref(),
+            Some("org.gnome.Shell@.service.d")
+        );
+
+        let uwsm = CompositorLaunch::Unit("wayland-wm@hyprland.service".to_owned());
+        assert_eq!(
+            uwsm.drop_in_directory().as_deref(),
+            Some("wayland-wm@.service.d")
+        );
+
+        let plain = CompositorLaunch::Unit("cage.service".to_owned());
+        assert_eq!(plain.drop_in_directory().as_deref(), Some("cage.service.d"));
+
+        assert_eq!(
+            CompositorLaunch::Scope("session-3.scope".to_owned()).drop_in_directory(),
+            None,
+            "a session with no unit gets no path, because a file written at one \
+             would be read by nothing"
+        );
+    }
+
+    #[test]
+    fn both_cgroup_formats_name_the_same_thing() {
+        assert_eq!(
+            cgroup_path("0::/user.slice/user-1000.slice/session-3.scope\n"),
+            Some("/user.slice/user-1000.slice/session-3.scope")
+        );
+        assert_eq!(
+            cgroup_path(
+                "12:pids:/user.slice/user-1000.slice\n\
+                 1:name=systemd:/user.slice/user-1000.slice/session-3.scope\n"
+            ),
+            Some("/user.slice/user-1000.slice/session-3.scope"),
+            "a guest still on cgroup v1 keeps the units in the systemd hierarchy"
+        );
+        assert_eq!(cgroup_path(""), None);
+        assert_eq!(
+            cgroup_path("nonsense\n0::/user.slice/user-1000.slice/session-3.scope\n"),
+            Some("/user.slice/user-1000.slice/session-3.scope"),
+            "a line that is not a cgroup line is skipped, not read as the end of the file"
+        );
+    }
+
+    #[test]
+    fn the_card_is_what_a_compositor_holds_and_a_render_node_is_not() {
+        assert!(is_drm_card("/dev/dri/card0"));
+        assert!(is_drm_card("/dev/dri/card12"));
+        assert!(
+            !is_drm_card("/dev/dri/renderD128"),
+            "everything that draws opens a render node; the card is the device \
+             that owns the outputs"
+        );
+        assert!(!is_drm_card("/dev/dri/card"));
+        assert!(!is_drm_card("/dev/null"));
+    }
+
+    #[test]
+    fn the_compositor_is_the_sessions_own_process_that_holds_a_card() {
+        let directory = temporary("compositor");
+        let proc = directory.join("proc");
+        // The guest's display broker holds a card too, and is a system
+        // service: without the slice it would be found first and answer for
+        // the compositor.
+        process(
+            &proc,
+            200,
+            "/system.slice/vmlord-display-broker.service",
+            &["/dev/dri/card1"],
+        );
+        process(
+            &proc,
+            410,
+            "/user.slice/user-1000.slice/user@1000.service/session.slice/\
+             org.gnome.Shell@wayland.service",
+            &["/dev/dri/card1"],
+        );
+        // An application of the same session, drawing through a render node.
+        process(
+            &proc,
+            520,
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/app-firefox.scope",
+            &["/dev/dri/renderD128"],
+        );
+
+        let found = compositor_launch(&proc, 1000);
+
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(
+            found,
+            Some(CompositorLaunch::Unit(
+                "org.gnome.Shell@wayland.service".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_compositor_started_from_a_login_shell_is_found_as_one() {
+        let directory = temporary("login-shell");
+        let proc = directory.join("proc");
+        process(
+            &proc,
+            300,
+            "/user.slice/user-1000.slice/session-2.scope",
+            &["/dev/dri/card0"],
+        );
+
+        let found = compositor_launch(&proc, 1000);
+
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(
+            found,
+            Some(CompositorLaunch::Scope("session-2.scope".to_owned())),
+            "Hyprland from a login shell is in the session's scope, and the \
+             recipe has to hear that rather than a unit that is not there"
+        );
+    }
+
+    #[test]
+    fn a_session_of_another_user_is_not_this_sessions_compositor() {
+        let directory = temporary("other-user");
+        let proc = directory.join("proc");
+        process(
+            &proc,
+            410,
+            "/user.slice/user-121.slice/user@121.service/session.slice/\
+             org.gnome.Shell@wayland.service",
+            &["/dev/dri/card0"],
+        );
+
+        let found = compositor_launch(&proc, 1000);
+
+        let _ = std::fs::remove_dir_all(&directory);
+        assert_eq!(found, None);
+    }
+
+    #[test]
     fn the_reported_platform_says_what_was_detected() {
         let mut facts = GuestFacts {
             distribution: "ubuntu".to_owned(),
@@ -769,11 +1182,15 @@ mod tests {
                 session: Some("gnome".to_owned()),
                 session_type: Some("wayland".to_owned()),
                 display_manager: Some("gdm.service".to_owned()),
+                compositor: Some(CompositorLaunch::Unit(
+                    "org.gnome.Shell@wayland.service".to_owned(),
+                )),
             },
         };
         assert_eq!(
             facts.platform(),
-            "apt-get, libraries in /usr/lib/x86_64-linux-gnu, gnome on wayland, under gdm.service"
+            "apt-get, libraries in /usr/lib/x86_64-linux-gnu, gnome on wayland, under \
+             gdm.service, started by org.gnome.Shell@wayland.service"
         );
 
         facts.package_manager = None;

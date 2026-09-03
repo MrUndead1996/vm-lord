@@ -2642,7 +2642,16 @@ kernel -- and beside it the platform: which package manager answers `--version`
 (`apt-get`, `pacman`, `dnf` or `zypper`, in that fixed order), whether the
 architecture's multiarch directory is there or the libraries are in `/usr/lib`,
 and what logind says is on the screen -- the session's own `DESKTOP` and type,
-and the unit `display-manager.service` is linked to.
+the unit `display-manager.service` is linked to, and how the compositor that is
+running was started.
+
+That last one is found by what a compositor does rather than by what it is
+called: among the processes of the user whose session is on the screen, the one
+that holds a `/dev/dri/card*` open is the compositor, and the leaf of its
+cgroup path is either a systemd unit or the session's own scope. The slice in
+that path is what keeps the guest's own display broker -- a system service that
+holds a card too -- out of the answer, and a render node is not a card, so an
+application that draws is not mistaken for the thing that lights the output.
 
 Nothing in that module branches on the name of a distribution, which is the
 point: a guest is what it answers, not what its `ID` implies. The identity half
@@ -4162,10 +4171,10 @@ and the running kernel's headers, from the guest's own package manager),
 read-only and DKMS writes beside its sources), `MODULE_BUILD`, `INITRAMFS`
 (`update-initramfs -u -k` for the running kernel after a successful DKMS
 install), then `MODULE_LOAD` (`modules-load.d`, the modprobe options, the unit that unbinds
-`simple-framebuffer`, the drop-in that keeps the compositor on the
-distribution's Mesa, and `modprobe`), `DEVICE` (a `/dev/dri/card*` whose
-driver is ours), and `SERVICES`/`SERVICES_START`, which are skipped with their
-reason until task #115 fills `content/services`.
+`simple-framebuffer`, and `modprobe`), `COMPOSITOR_ISOLATION` (the drop-in that
+keeps the compositor on the distribution's Mesa), `DEVICE` (a `/dev/dri/card*`
+whose driver is ours), and `SERVICES`/`SERVICES_START`, which are skipped with
+their reason until task #115 fills `content/services`.
 
 The modprobe options are written by the guest rather than copied out of the
 payload, from the mode the host has stored for that one VM -- a size belongs to
@@ -4175,21 +4184,45 @@ under a module already loaded costs a `modprobe -r` and a `modprobe`, because a
 module parameter is read once; a module that does not say what it was loaded
 with is left alone, because a reload on a guess drops a working desktop.
 
-The drop-in sits between the two: the same file for every VM, so it is copied
-out of the payload, with one line the payload cannot write. It lands on
-`org.gnome.Shell@.service`, which is a template, so it reaches the greeter's
-compositor and a logged-in user's both, and it says two things -- the GPU
-recipe's Mesa overrides unset, and `LD_LIBRARY_PATH` pointed at the
-distribution's libraries. The second is appended on install, out of the library
-layout the agent detected in the guest: a multiarch guest keeps that Mesa in
-`/usr/lib/<triplet>` and a guest without a multiarch directory keeps it in
-`/usr/lib`, and a shipped constant would be right on one of them. Both, because the
-GPU recipe reaches a process by two paths: the environment it exports, and
+`COMPOSITOR_ISOLATION` is a stage of its own because it is a decision and not a
+copy. The file is the same for every VM, so it comes out of the payload, and it
+says two things -- the GPU recipe's Mesa overrides unset, and `LD_LIBRARY_PATH`
+pointed at the distribution's libraries. Both, because the GPU recipe reaches a
+process by two paths: the environment it exports, and
 `/etc/ld.so.conf.d/vmlord-wsl-mesa.conf`, which no environment can undo. A
 compositor left on the payload's Mesa binds our device, fails to allocate a
 buffer on it, and never finishes its modeset; applications, which is where the
-GPU was wanted, keep the whole environment. A drop-in is read when a unit next
-starts, and on a normal boot this recipe runs before the greeter does.
+GPU was wanted, keep the whole environment.
+
+Two lines of it the payload cannot write. The library directory is appended out
+of the layout the agent detected: a multiarch guest keeps that Mesa in
+`/usr/lib/<triplet>` and a guest without a multiarch directory keeps it in
+`/usr/lib`, and a shipped constant would be right on one of them. And the unit
+whose `.d` directory it goes in is whichever one the compositor of this guest
+turned out to be started by, folded from the running instance back to its
+template -- `org.gnome.Shell@wayland.service` to `org.gnome.Shell@.service.d`,
+which reaches the greeter's compositor and every logged-in user's alike. That is
+the same path GNOME guests have always had, arrived at from the guest instead of
+from a constant.
+
+A compositor that no unit started -- Hyprland from a login shell lives in the
+session's own scope -- gets a skipped stage saying so rather than a file at a
+path nothing reads. The way that suits such a session is a wrapper, and it
+belongs to whoever brings that desktop up: a greeter launches a compositor
+through the `Exec=` of an entry in `/usr/share/wayland-sessions`, and an entry
+of the same name under `/usr/local/share/wayland-sessions` -- earlier in
+`XDG_DATA_DIRS` -- can exec that command through a script setting the same two
+things. What it must not do is set them for the session rather than for the
+compositor, or the applications lose the GPU that was the point.
+
+The drop-in is written and not applied: it is read when the unit next starts.
+Which is why the stage waits, once and within a bounded budget, for a greeter
+that a running display manager is about to start -- but only on a guest where no
+drop-in of ours is installed yet, since that is the only run whose answer cannot
+wait. On every later boot the file is already on disk, and it is the only record
+of what an earlier run decided: the stage finds it by name under
+`/etc/systemd/user/*.d/` and refreshes it, so a recipe that ran ahead of its own
+greeter needs nothing on the screen to do the right thing.
 
 Idempotence is by fact and not by a flag: the payload's version installed, the
 module loaded and a device that answers short-circuits the three build stages,

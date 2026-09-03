@@ -20,7 +20,7 @@ pub const MODULE: &str = "vmlord_drm";
 /// The order is the report's order, and the report is what the host logs, so it
 /// is written once here rather than implied by the sequence of calls in
 /// `display_kernel`.
-pub const STEPS: [DisplayRecipeStep; 12] = [
+pub const STEPS: [DisplayRecipeStep; 13] = [
     DisplayRecipeStep::Distribution,
     DisplayRecipeStep::Payload,
     DisplayRecipeStep::BuildDependencies,
@@ -30,6 +30,7 @@ pub const STEPS: [DisplayRecipeStep; 12] = [
     DisplayRecipeStep::ModuleSignature,
     DisplayRecipeStep::Initramfs,
     DisplayRecipeStep::ModuleLoad,
+    DisplayRecipeStep::CompositorIsolation,
     DisplayRecipeStep::Device,
     DisplayRecipeStep::Services,
     DisplayRecipeStep::ServicesStart,

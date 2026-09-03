@@ -82,19 +82,22 @@ asks for the capability even though it commits nothing.
 ## What is shipped beside it
 
 Two files that are configuration rather than code, both copied into a guest by
-`MODULE_LOAD`:
+the recipe:
 
 * `vmlord-display-unbind-simpledrm.service` unbinds `simple-framebuffer`, which
-  is builtin and so cannot be blacklisted;
-* `vmlord-display-compositor-mesa.conf` is a drop-in on
-  `org.gnome.Shell@.service` that keeps the compositor on the distribution's
-  Mesa. Under GPU-PV the payload's Mesa renders through `/dev/dxg` and cannot
-  hand a buffer to a foreign KMS device, so a compositor left on it binds this
-  device and then cannot draw on it. Applications keep the GPU; only the
-  compositor is moved off it. The file ships without its
-  `Environment=LD_LIBRARY_PATH=` line: which directory holds the
-  distribution's Mesa is what the agent detected in the guest, and it appends
-  that line when it installs the drop-in.
+  is builtin and so cannot be blacklisted, and is installed by `MODULE_LOAD`;
+* `vmlord-display-compositor-mesa.conf` is a systemd drop-in that keeps the
+  compositor on the distribution's Mesa, and is installed by
+  `COMPOSITOR_ISOLATION`. Under GPU-PV the payload's Mesa renders through
+  `/dev/dxg` and cannot hand a buffer to a foreign KMS device, so a compositor
+  left on it binds this device and then cannot draw on it. Applications keep
+  the GPU; only the compositor is moved off it. The file ships without its
+  `Environment=LD_LIBRARY_PATH=` line, and without a unit: which directory
+  holds the distribution's Mesa, and which unit's `.d` directory the drop-in
+  belongs in, are both what the agent found in the guest -- the unit the
+  compositor that is running turned out to be started by. A compositor started
+  outside a unit gets no drop-in, because a drop-in would reach nothing; that
+  session is isolated by whatever launches it.
 
 ## What it is not
 

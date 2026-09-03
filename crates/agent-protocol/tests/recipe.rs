@@ -109,6 +109,7 @@ fn the_recipe_has_a_step_for_the_signing_key_and_one_for_the_signature() {
 
     assert_eq!(i32::from(DisplayRecipeStep::SigningKey), 11);
     assert_eq!(i32::from(DisplayRecipeStep::ModuleSignature), 12);
+    assert_eq!(i32::from(DisplayRecipeStep::CompositorIsolation), 13);
 }
 
 #[test]
