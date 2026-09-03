@@ -3987,12 +3987,35 @@ selector: DKMS builds against the headers of the kernel a guest is running, and
 Ubuntu upgrades kernels unattended, so requiring the kernel a payload was built
 against would mean an upgrade kills the display until somebody repacks.
 
-Selection filters by the triple -- the hard gate, decided before the guest has
-booted -- keeps the entries whose protocol range covers this build's revision,
-and takes the greatest version. An entry outside that range is *passed over*
+The `target`'s distribution and release are a record too. What a display
+payload carries -- DKMS sources, static musl binaries, udev rules, units, audio
+configuration -- knows nothing about a package manager, and the three shipped
+specs under `payloads/display/` differ by base image and by nothing else. So
+the pair says where a build was *proven*, not who it may serve, and a guest
+nobody built a target for is served by a payload proven somewhere else rather
+than by nothing at all. The container build stays what proves it: a module that
+does not compile for 22.04, 24.04 or 26.04 is an artifact that never exists.
+
+This is the display payload's asymmetry with the GPU payload, and it is
+deliberate. A `mesa_policy: bundled` payload carries Mesa built against its
+base image's glibc and is pinned to a kernel release, so its distribution and
+release stay hard conditions.
+
+Selection has two hard gates, both decided before the guest has booted, which
+is why no kernel appears in either: the architecture, and a protocol range that
+covers this build's revision. An entry outside that range is *passed over*
 rather than failed: a payload may legitimately be built for a newer or an older
-VMLord. Nothing for this guest is `NoPayloadForGuest`, which is a degraded
-display and a VM that starts.
+VMLord. What is left is ranked -- an entry built for exactly this guest above
+one that was not, then the greatest version, then the payload ID, which is
+arbitrary but total, so that two equally good candidates cannot make the answer
+depend on the order a directory listed them. Ranking provenance first is what
+keeps Ubuntu's selection exactly what it was. Nothing for this guest is
+`NoPayloadForGuest`, which is a degraded display and a VM that starts.
+
+Which payload a guest got, and what it was proven on, is logged at selection
+(`crates/platform/src/display_staging.rs`) -- and at `info` rather than `debug`
+when the two differ, because that is the only place a payload serving a guest
+nobody built for is visible.
 
 Several versions for one guest is the ordinary state of this catalog -- it is
 what an update is made of -- so what a release may not do is carry the same

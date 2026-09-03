@@ -9,11 +9,22 @@ use crate::{PayloadVersion, ProtocolRange, ProtocolVersionParts};
 const ENTRY_SCHEMA_VERSION: u32 = 1;
 const PAYLOAD_ABI_VERSION: u32 = 1;
 
-/// The guest a payload was built for, as the host knows it before boot.
+/// The guest a payload was built on, as the build recorded it.
 ///
-/// Three dimensions and no kernel: the host chooses a payload before the guest
-/// that will run it has booted, so there is no running kernel to match on. What
-/// the payload was proven against is recorded beside this as `proven_on`.
+/// Provenance, not a key. What a display payload carries -- DKMS sources, static
+/// musl binaries, udev rules, units, audio configuration -- knows nothing about
+/// a package manager, so the distribution and release a build happened on say
+/// where it was proven and not who it may serve. One dimension survives as a
+/// condition: a binary built for `amd64` does not run on anything else.
+///
+/// No kernel here either: the host chooses a payload before the guest that will
+/// run it has booted. What the payload was proven against is recorded beside
+/// this as `proven_on`.
+///
+/// This is the display payload's asymmetry with the GPU payload's target, and
+/// it is deliberate: that one bundles Mesa built against its base image's glibc
+/// and is pinned to a kernel release, so its distribution and release stay
+/// conditions.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DisplayTarget {
@@ -32,11 +43,24 @@ pub struct GuestSelector<'a> {
 }
 
 impl DisplayTarget {
+    /// Whether a payload built here can run in `guest` at all.
+    ///
+    /// The architecture, and nothing else. This is what makes one payload serve
+    /// a guest nobody built a target for.
     #[must_use]
-    pub fn matches(&self, guest: &GuestSelector<'_>) -> bool {
-        self.distribution.eq_ignore_ascii_case(guest.distribution)
+    pub fn serves(&self, guest: &GuestSelector<'_>) -> bool {
+        self.architecture.eq_ignore_ascii_case(guest.architecture)
+    }
+
+    /// Whether this is the guest the payload was actually built and proven on.
+    ///
+    /// A preference and never a gate: it is what keeps a guest with a target of
+    /// its own getting that one.
+    #[must_use]
+    pub fn was_built_for(&self, guest: &GuestSelector<'_>) -> bool {
+        self.serves(guest)
+            && self.distribution.eq_ignore_ascii_case(guest.distribution)
             && self.release == guest.release
-            && self.architecture.eq_ignore_ascii_case(guest.architecture)
     }
 }
 
@@ -309,12 +333,21 @@ impl DisplayPayloadCatalog {
 
     /// The best entry for a guest this build can actually talk to.
     ///
-    /// The triple is the hard gate and is decided before the guest has booted,
-    /// which is why no kernel appears in it. Of what is left, an entry whose
-    /// protocol range this build is outside of is passed over rather than
-    /// failed: a payload may legitimately be built for a newer or an older
-    /// VMLord, and a release carrying one is not broken. The greatest version
-    /// wins, because a payload is only published when it is meant to be used.
+    /// Two hard gates, both decided before the guest has booted, which is why
+    /// no kernel appears in either: the architecture, and a protocol range that
+    /// covers this build. An entry outside the range is passed over rather than
+    /// failed -- a payload may legitimately be built for a newer or an older
+    /// VMLord, and a release carrying one is not broken.
+    ///
+    /// The distribution and release are *not* gates. They are the provenance a
+    /// build recorded, and a guest nobody built a target for is served by a
+    /// payload that was proven somewhere else rather than by nothing at all.
+    /// They still rank: an entry built for exactly this guest outranks one that
+    /// was not, so a guest with a target of its own keeps getting it. Then the
+    /// greatest version, because a payload is only published when it is meant
+    /// to be used, and finally the payload ID -- arbitrary, but a total order,
+    /// so that two equally good candidates cannot make the answer depend on the
+    /// order a directory listed them.
     ///
     /// # Errors
     ///
@@ -327,9 +360,15 @@ impl DisplayPayloadCatalog {
     ) -> Result<&DisplayCatalogEntry, PayloadError> {
         self.entries
             .iter()
-            .filter(|entry| entry.target.matches(guest))
+            .filter(|entry| entry.target.serves(guest))
             .filter(|entry| entry.protocol.covers(protocol.major, protocol.minor))
-            .max_by_key(|entry| entry.version)
+            .max_by(|left, right| {
+                left.target
+                    .was_built_for(guest)
+                    .cmp(&right.target.was_built_for(guest))
+                    .then(left.version.cmp(&right.version))
+                    .then_with(|| left.payload_id.cmp(&right.payload_id))
+            })
             .ok_or_else(|| PayloadError::NoPayloadForGuest {
                 distribution: guest.distribution.to_owned(),
                 release: guest.release.to_owned(),
@@ -517,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn a_release_that_is_not_a_version_number_keys_an_entry_like_any_other() {
+    fn a_release_that_is_not_a_version_number_records_provenance_like_any_other() {
         let catalog = catalog_with(&[entry_document("rolling", "0.1.0")]);
 
         assert_eq!(
@@ -532,26 +571,117 @@ mod tests {
                 .unwrap()
                 .payload_id(),
             "display-ubuntu-rolling-amd64-0.1.0",
-            "the key is a string the guest and the catalog spell the same way, not a version"
+            "provenance is a string the guest and the catalog spell the same way, not a version"
         );
     }
 
     #[test]
-    fn a_guest_with_no_entry_is_told_which_guest_had_none() {
+    fn a_guest_on_another_architecture_is_told_it_had_none() {
         let catalog = catalog_with(&[entry_document("24.04", "0.1.0")]);
 
         let error = catalog
             .select_for_guest(
                 &GuestSelector {
-                    release: "22.04",
+                    architecture: "arm64",
                     ..ubuntu_2404()
                 },
                 SPEAKS_1_0,
             )
-            .expect_err("no entry matches this release");
+            .expect_err("a binary built for amd64 does not run on arm64");
 
         assert!(matches!(error, PayloadError::NoPayloadForGuest { .. }));
-        assert!(error.to_string().contains("22.04"));
+        assert!(error.to_string().contains("arm64"));
+    }
+
+    #[test]
+    fn a_guest_nobody_built_a_target_for_is_served_anyway() {
+        let catalog = catalog_with(&[
+            entry_document("22.04", "0.1.8"),
+            entry_document("24.04", "0.1.8"),
+            entry_document("26.04", "0.1.8"),
+        ]);
+        let arch = GuestSelector {
+            distribution: "arch",
+            release: "rolling",
+            architecture: "amd64",
+        };
+
+        let chosen = catalog
+            .select_for_guest(&arch, SPEAKS_1_0)
+            .expect("what the payload carries knows nothing about a package manager");
+
+        assert_eq!(
+            chosen.payload_id(),
+            catalog
+                .select_for_guest(&arch, SPEAKS_1_0)
+                .unwrap()
+                .payload_id(),
+            "equally good candidates must not make the answer depend on listing order"
+        );
+    }
+
+    #[test]
+    fn a_guest_with_a_target_of_its_own_still_gets_that_one() {
+        let catalog = catalog_with(&[
+            entry_document("22.04", "0.1.8"),
+            entry_document("24.04", "0.1.8"),
+            entry_document("26.04", "0.1.8"),
+        ]);
+
+        for release in ["22.04", "24.04", "26.04"] {
+            assert_eq!(
+                catalog
+                    .select_for_guest(
+                        &GuestSelector {
+                            release,
+                            ..ubuntu_2404()
+                        },
+                        SPEAKS_1_0
+                    )
+                    .unwrap()
+                    .payload_id(),
+                format!("display-ubuntu-{release}-amd64-0.1.8"),
+                "the release Ubuntu asks for is the release it was proven on"
+            );
+        }
+    }
+
+    #[test]
+    fn the_guest_own_provenance_outranks_a_newer_foreign_one() {
+        let catalog = catalog_with(&[
+            entry_document("24.04", "0.1.0"),
+            entry_document("26.04", "0.9.0"),
+        ]);
+
+        assert_eq!(
+            catalog
+                .select_for_guest(&ubuntu_2404(), SPEAKS_1_0)
+                .unwrap()
+                .payload_id(),
+            "display-ubuntu-24.04-amd64-0.1.0",
+            "a payload proven on this guest beats a newer one proven elsewhere"
+        );
+    }
+
+    #[test]
+    fn a_foreign_payload_this_build_cannot_speak_to_is_still_passed_over() {
+        let mut future = entry_document("26.04", "0.2.0");
+        future["protocol"] = json!({ "major": 2, "min_minor": 0, "max_minor": 0 });
+        let catalog = catalog_with(&[future]);
+
+        assert!(
+            catalog
+                .select_for_guest(
+                    &GuestSelector {
+                        distribution: "arch",
+                        release: "rolling",
+                        architecture: "amd64"
+                    },
+                    SPEAKS_1_0
+                )
+                .is_err(),
+            "dropping the distribution gate must not drop the protocol one"
+        );
     }
 
     #[test]

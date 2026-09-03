@@ -86,6 +86,31 @@ pub fn stage_for_vm(
     let catalog = DisplayPayloadCatalog::from_release_directory(request.executable_directory)?;
     let entry = catalog.select_for_guest(&request.guest, speaks())?;
     let version = entry.version().to_string();
+    // Provenance is read out loud and is not a condition: a display payload
+    // carries DKMS sources and static binaries, so the release it was built on
+    // says where it was proven rather than who it may serve. When those differ,
+    // the guest is running a payload nobody built a target for, and the log is
+    // the only place that is visible.
+    let target = entry.target();
+    if target.was_built_for(&request.guest) {
+        tracing::debug!(
+            "display payload {} was built for {} {} and proven on {}",
+            entry.payload_id(),
+            target.distribution,
+            target.release,
+            entry.proven_on()
+        );
+    } else {
+        tracing::info!(
+            "display payload {} serves {} {}, having been built for {} {} and proven on {}",
+            entry.payload_id(),
+            request.guest.distribution,
+            request.guest.release,
+            target.distribution,
+            target.release,
+            entry.proven_on()
+        );
+    }
     let archive = release::archive_path(
         request.executable_directory,
         LOCAL_ARCHIVE_DIRECTORY,
