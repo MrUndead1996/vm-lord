@@ -32,6 +32,7 @@ mod enumerate;
 mod error;
 mod event;
 mod force_stop;
+mod force_stop_workers;
 mod gpu_assignment;
 mod gpu_discovery;
 mod gpu_enumerate;
