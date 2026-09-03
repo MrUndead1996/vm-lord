@@ -4171,10 +4171,12 @@ and the running kernel's headers, from the guest's own package manager),
 read-only and DKMS writes beside its sources), `MODULE_BUILD`, `INITRAMFS`
 (`update-initramfs -u -k` for the running kernel after a successful DKMS
 install), then `MODULE_LOAD` (`modules-load.d`, the modprobe options, the unit that unbinds
-`simple-framebuffer`, and `modprobe`), `COMPOSITOR_ISOLATION` (the drop-in that
-keeps the compositor on the distribution's Mesa), `DEVICE` (a `/dev/dri/card*`
-whose driver is ours), and `SERVICES`/`SERVICES_START`, which are skipped with
-their reason until task #115 fills `content/services`.
+`simple-framebuffer`, whichever way of hiding the guest's own synthetic
+display suits the desktop that was found, and `modprobe`),
+`COMPOSITOR_ISOLATION` (the drop-in that keeps the compositor on the
+distribution's Mesa), `DEVICE` (a `/dev/dri/card*` whose driver is ours, and
+that mechanism put into effect), and `SERVICES`/`SERVICES_START`, which are
+skipped with their reason until task #115 fills `content/services`.
 
 The modprobe options are written by the guest rather than copied out of the
 payload, from the mode the host has stored for that one VM -- a size belongs to
@@ -4183,6 +4185,42 @@ a VM and a payload is shared by all of them. A VM with no stored mode gets
 under a module already loaded costs a `modprobe -r` and a `modprobe`, because a
 module parameter is read once; a module that does not say what it was loaded
 with is left alone, because a reload on a guess drops a working desktop.
+
+Keeping the desktop on VMLord's output is the last thing `MODULE_LOAD`
+installs, and which of two ways it does that by follows the desktop that was
+*found*. A Hyper-V guest has a display of its own -- `simpledrm` at first,
+`hyperv_drm` once that is unbound -- and a compositor that finds two cards
+lights both; the second monitor is drawn on the Hyper-V console, where the
+viewer cannot see it, and an absolute pointer is stretched across the pair, so
+clicks land about a third of a screen from where they were aimed. Task #121
+measured that.
+
+Where mutter is what will be on the screen, `62-vmlord-display.rules` tags the
+synthetic card `mutter-device-ignore` -- mutter's own tag, which `61-mutter.rules`
+uses for vkms, and the file's number puts it after that one so the tag is added
+rather than replaced. That word means nothing to any other compositor, so where
+`DesktopFacts::output_selection` finds a desktop that is not GNOME the card is
+taken away from every compositor instead: `vmlord-display-unbind-hyperv.service`
+unbinds its driver, which is the one answer that needs no compositor to agree to
+anything, and it costs the Hyper-V console -- the screen nobody was looking at.
+Exactly one of the two is installed and the other is removed, so a guest whose
+desktop was replaced after it was created is left with the mechanism its current
+compositor understands rather than with both.
+
+Both carry the same safety net, and it is the reason the unbinding is not the
+default: each asks whether `/sys/devices/platform/vmlord_drm.0/drm` is there, so
+a guest whose module never built -- a payload that failed, a kernel it will not
+compile against -- keeps its desktop on the console instead of having no desktop
+at all. A guest with no desktop found gets the tag for the same reason: the
+recipe runs on guests whose desktop packages are still installing, and of the
+two mechanisms the tag is the one that cannot take a display away. Both were
+answered `no` when they were first read -- at boot the synthetic card is
+enumerated, and a greeter is a candidate to start, long before this module
+exists -- so the `DEVICE` stage asks again with the device present: `udevadm
+trigger` for the tag, `systemctl enable --now` for the unit, and in both cases
+before any compositor of this boot is up, because a tag is read when a card is
+enumerated and a driver cannot be unbound out from under a compositor that has
+already bound it.
 
 `COMPOSITOR_ISOLATION` is a stage of its own because it is a decision and not a
 copy. The file is the same for every VM, so it comes out of the payload, and it

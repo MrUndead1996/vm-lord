@@ -81,7 +81,7 @@ asks for the capability even though it commits nothing.
 
 ## What is shipped beside it
 
-Two files that are configuration rather than code, both copied into a guest by
+Four files that are configuration rather than code, copied into a guest by
 the recipe:
 
 * `vmlord-display-unbind-simpledrm.service` unbinds `simple-framebuffer`, which
@@ -98,6 +98,28 @@ the recipe:
   compositor that is running turned out to be started by. A compositor started
   outside a unit gets no drop-in, because a drop-in would reach nothing; that
   session is isolated by whatever launches it.
+
+The other two are the two ways of keeping the desktop on this output, both
+installed by `MODULE_LOAD`, and the agent installs exactly one of them -- whichever suits the desktop it found --
+and removes the other. A Hyper-V guest has a synthetic display of its own, and
+a compositor that finds two cards lights both; the second is drawn on the
+Hyper-V console, where nobody is looking, and it stretches the desktop an
+absolute pointer is mapped across, so clicks land about a third of a screen
+from where they were aimed (task #121):
+
+* `62-vmlord-display.rules` tags the `hyperv_drm` card `mutter-device-ignore`,
+  which is mutter's own tag -- `61-mutter.rules` uses it for vkms -- and the
+  file's number sorts it after that one so the tag is added rather than
+  replaced. Gentle and useless in equal measure outside mutter: no other
+  compositor reads that word;
+* `vmlord-display-unbind-hyperv.service` unbinds the card's driver instead,
+  which is what hides it from a compositor that reads no such tag. It costs the
+  Hyper-V console and needs nobody's agreement.
+
+Both ask first whether `/sys/devices/platform/vmlord_drm.0/drm` is there --
+`TEST==` in the rule, `ConditionPathExists=` in the unit -- so a guest whose
+module never built keeps its desktop on the console instead of losing it
+altogether.
 
 ## What it is not
 

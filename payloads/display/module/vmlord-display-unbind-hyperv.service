@@ -1,0 +1,29 @@
+[Unit]
+Description=Take the Hyper-V display away from a compositor that cannot be asked to ignore it
+Documentation=https://vmlord.invalid/display
+DefaultDependencies=no
+Before=display-manager.service
+# The safety net, and the same one `62-vmlord-display.rules` carries: with no
+# vmlord_drm loaded -- a payload that failed to build, a kernel it will not
+# compile against -- the Hyper-V card stays exactly what it was, and the guest
+# has a desktop on the console instead of none at all.
+ConditionPathExists=/sys/devices/platform/vmlord_drm.0/drm
+ConditionPathExists=/sys/bus/vmbus/drivers/hyperv_drm
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Installed instead of the udev rule, never beside it: `mutter-device-ignore`
+# is a word only mutter reads, so a compositor that does not read it lights the
+# synthetic card as a second monitor nobody can see -- and the only thing that
+# hides a card from a compositor with no such word is not having a driver bound
+# to it. Task #121 measured what the second monitor costs: an absolute pointer
+# stretched across both, and clicks landing a third of a screen away.
+#
+# By what is bound rather than by a name: hyperv_drm's devices are VMBus GUIDs,
+# and the driver directory holds its own files -- `bind`, `unbind`, `uevent` --
+# beside them. A device is the entry that has a driver of its own.
+ExecStart=/bin/sh -c 'for device in /sys/bus/vmbus/drivers/hyperv_drm/*; do [ -e "$device/driver" ] || continue; echo "${device##*/}" > /sys/bus/vmbus/drivers/hyperv_drm/unbind; done'
+
+[Install]
+WantedBy=multi-user.target

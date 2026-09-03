@@ -68,6 +68,34 @@ dmesg | grep -E 'vmlord_drm|Lockdown|verification'
 - Keyboard or pointer state is released when the input channel drops. Reopen
   the viewer if focus/input does not recover after the channel has rebound.
 
+## Clicks land away from where they were aimed
+
+The guest lit its own Hyper-V display beside VMLord's, and the pointer is
+mapped across both. The desktop is wider than the window shows, so a click is
+delivered to the right of where it was made.
+
+- Check which of the two ways of hiding that display this guest was given. It
+  follows the desktop the agent found: a GNOME guest gets
+  `/etc/udev/rules.d/62-vmlord-display.rules`, which tags the card
+  `mutter-device-ignore`, and any other desktop gets
+  `vmlord-display-unbind-hyperv.service`, which unbinds its driver instead.
+  Exactly one is installed; the `MODULE_LOAD` stage's line in the display
+  status says which.
+
+  ```bash
+  ls /etc/udev/rules.d/62-vmlord-display.rules
+  systemctl status vmlord-display-unbind-hyperv.service
+  ls /sys/class/drm
+  ```
+
+- A guest that has neither has no `vmlord_drm` device: both mechanisms ask for
+  `/sys/devices/platform/vmlord_drm.0/drm` first, so that a module that never
+  built leaves the guest a desktop on the console rather than none at all. Fix
+  the build and the mechanism follows.
+- A guest whose desktop was replaced after it was created gets the other
+  mechanism on the next display recipe, and the one it no longer needs is
+  removed. Restarting the VM is what runs it.
+
 ## Nothing pastes between the host and the guest
 
 The clipboard is a channel of its own, and it needs a graphical session -- not

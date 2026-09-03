@@ -295,6 +295,33 @@ impl DesktopFacts {
         })
     }
 
+    /// How the guest's synthetic Hyper-V display is kept off this desktop.
+    ///
+    /// The desktop that was *found*, because the mechanism is a thing done to
+    /// a running compositor rather than a property of the image the VM was
+    /// created from.
+    ///
+    /// Where mutter is what will be on the screen, the tag it already reads is
+    /// the gentlest answer there is: the card keeps its driver, the Hyper-V
+    /// console keeps working, and one compositor is asked to leave one device
+    /// alone. Where it is not, the tag is a word nothing reads, and the only
+    /// thing that hides a card from a compositor that has no such word is not
+    /// having a driver bound to it.
+    ///
+    /// Nothing found at all takes the tag as well, and that is a choice rather
+    /// than a default: the recipe runs on a guest whose desktop packages may
+    /// still be installing, and of the two mechanisms the tag is the one that
+    /// cannot take a display away from anybody. The unbinding is reserved for
+    /// a desktop somebody actually found.
+    #[must_use]
+    pub fn output_selection(&self) -> OutputSelection {
+        if self.is_gnome() || !self.found() {
+            return OutputSelection::Ignored;
+        }
+
+        OutputSelection::Unbound
+    }
+
     /// Whether anything of a desktop was found at all.
     #[must_use]
     pub fn found(&self) -> bool {
@@ -369,6 +396,46 @@ impl CompositorLaunch {
         match self {
             Self::Unit(unit) => format!("started by {unit}"),
             Self::Scope(scope) => format!("started outside a unit, in {scope}"),
+        }
+    }
+}
+
+/// How the guest's own synthetic display is kept from taking half the desktop.
+///
+/// A Hyper-V guest has a display of its own -- `simpledrm` at first,
+/// `hyperv_drm` once that is unbound -- and a compositor that finds two cards
+/// lights both. The second monitor is drawn on the Hyper-V console, where the
+/// viewer cannot see it, and an absolute pointer is mapped across the pair, so
+/// clicks land about a third of a screen from where they were aimed. Task #121
+/// measured exactly that.
+///
+/// Two ways of preventing it, and which one suits a guest is decided by the
+/// desktop found on it rather than written down beside a name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutputSelection {
+    /// The card stays bound and is tagged for a compositor that reads the tag.
+    ///
+    /// `mutter-device-ignore` is mutter's own -- `61-mutter.rules` uses it for
+    /// vkms -- and a udev rule sorting after that file adds to it. It means
+    /// nothing to any other compositor.
+    Ignored,
+    /// The card is taken away from every compositor by unbinding its driver.
+    ///
+    /// What is left for a compositor with no ignore tag of its own. It costs
+    /// the Hyper-V console, which is the screen nobody was looking at, and it
+    /// is the one answer that needs no compositor to agree to anything.
+    Unbound,
+}
+
+impl OutputSelection {
+    /// The choice in one phrase, for the line a recipe reports.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Ignored => {
+                "the Hyper-V display is tagged for a compositor that reads the tag".to_owned()
+            }
+            Self::Unbound => "the Hyper-V display is unbound from its driver".to_owned(),
         }
     }
 }
@@ -693,9 +760,10 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{
-        CompositorLaunch, DesktopFacts, GuestFacts, LibraryLayout, PackageManager, cgroup_path,
-        compositor_launch, desktop_facts, display_manager_unit, graphical_session, is_drm_card,
-        launch_of, library_layout, library_triplet, package_manager, parse_os_release, session_in,
+        CompositorLaunch, DesktopFacts, GuestFacts, LibraryLayout, OutputSelection, PackageManager,
+        cgroup_path, compositor_launch, desktop_facts, display_manager_unit, graphical_session,
+        is_drm_card, launch_of, library_layout, library_triplet, package_manager, parse_os_release,
+        session_in,
     };
 
     const GNOME_WAYLAND: &str =
@@ -1052,6 +1120,41 @@ mod tests {
             None,
             "a session with no unit gets no path, because a file written at one \
              would be read by nothing"
+        );
+    }
+
+    #[test]
+    fn a_desktop_that_reads_the_tag_gets_the_tag_and_no_other_one_does() {
+        // The one mechanism is a word mutter reads and every other compositor
+        // ignores, so a guest that is not running mutter would light the
+        // synthetic card as a second monitor nobody can see -- task #121
+        // measured the cost -- and the card has to lose its driver instead.
+        let gnome = DesktopFacts {
+            session: Some("ubuntu-wayland".to_owned()),
+            session_type: Some("wayland".to_owned()),
+            display_manager: Some("gdm3.service".to_owned()),
+            ..DesktopFacts::default()
+        };
+        assert_eq!(gnome.output_selection(), OutputSelection::Ignored);
+
+        let hyprland = DesktopFacts {
+            session: Some("Hyprland".to_owned()),
+            session_type: Some("wayland".to_owned()),
+            display_manager: Some("greetd.service".to_owned()),
+            ..DesktopFacts::default()
+        };
+        assert_eq!(hyprland.output_selection(), OutputSelection::Unbound);
+    }
+
+    #[test]
+    fn a_guest_with_nothing_on_screen_keeps_the_mechanism_that_removes_nothing() {
+        // Not the same question as "which desktop is this": with no desktop
+        // found there is no compositor to hide anything from, and the recipe
+        // runs on guests whose desktop packages are still installing. The tag
+        // is inert wherever it is not read; unbinding a card is not.
+        assert_eq!(
+            DesktopFacts::default().output_selection(),
+            OutputSelection::Ignored
         );
     }
 
