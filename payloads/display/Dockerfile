@@ -41,6 +41,7 @@ RUN set -eu; \
              /output/prepared/content/audio /output/prepared/licenses; \
     cp /src/module/vmlord_drm.c /src/module/vmlord_compat.h \
        /src/module/vmlord-display-unbind-simpledrm.service \
+       /src/module/vmlord-display-unbind-hyperv.service \
        /src/module/vmlord-display-compositor-mesa.conf \
        /src/module/62-vmlord-display.rules \
        /output/prepared/content/drm/; \

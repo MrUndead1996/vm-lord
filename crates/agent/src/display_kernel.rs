@@ -37,7 +37,8 @@ use crate::{
     guest_files::{copy_tree, failure, read, write_if_different},
     guest_packages::{self, Package},
     guest_platform::{
-        self, CompositorLaunch, DesktopFacts, GuestFacts, LibraryLayout, guest_facts,
+        self, CompositorLaunch, DesktopFacts, GuestFacts, LibraryLayout, OutputSelection,
+        guest_facts,
     },
 };
 
@@ -58,6 +59,11 @@ const COMPOSITOR_DROP_IN: &str = "vmlord-display-compositor-mesa.conf";
 /// Where the rule that keeps the desktop on this output goes. The number puts
 /// it after mutter's own `61-mutter.rules`, whose tag it adds to.
 const UDEV_RULES: &str = "/etc/udev/rules.d/62-vmlord-display.rules";
+/// The other way of keeping the desktop on this output, for a compositor with
+/// no tag of its own: the unit that unbinds the Hyper-V card's driver.
+const HYPERV_UNBIND_UNIT: &str = "/etc/systemd/system/vmlord-display-unbind-hyperv.service";
+/// The unit as systemd names it, which is what it is enabled and disabled by.
+const HYPERV_UNBIND: &str = "vmlord-display-unbind-hyperv.service";
 const DRM_DEVICES: &str = "/sys/class/drm";
 
 /// Where the two guest programs are installed. Beside the module's own unit,
@@ -360,9 +366,10 @@ fn run_stages(
         mode,
         built.then_some(guest.kernel_release.as_str()),
         certificate.as_ref(),
+        &guest,
     )?;
     compositor_isolation_stage(report, &guest)?;
-    device_stage(report)?;
+    device_stage(report, guest.desktop.output_selection())?;
     services_stages(
         report,
         &guest,
@@ -414,7 +421,8 @@ fn run_update(
         update_initramfs_stage(report, &guest.kernel_release)
             .map_err(UpdateAttemptFailure::Failed)?;
         reload_module_for_update(report, &payload.version, certificate.as_ref())?;
-        verify(report, &payload.version).map_err(UpdateAttemptFailure::Failed)
+        verify(report, &payload.version, guest.desktop.output_selection())
+            .map_err(UpdateAttemptFailure::Failed)
     })();
 
     match attempt {
@@ -1261,12 +1269,20 @@ fn update_initramfs(kernel_release: &str) -> command::Outcome {
 /// device it will not light -- and it is its own stage, because how it is
 /// delivered depends on something this one never asks: how the compositor of
 /// this guest is started.
+///
+/// And what is installed here is whichever of the two ways of hiding the
+/// guest's own synthetic display suits the desktop that was found. Exactly
+/// one of them, the other taken away, so that a guest whose desktop was
+/// replaced after it was created is left with the mechanism that matches the
+/// compositor it has now rather than with both.
 fn load_stage(
     report: &mut Report,
     mode: Option<(u32, u32)>,
     refresh_initramfs_for: Option<&str>,
     certificate: Option<&DisplaySigningCertificate>,
+    guest: &GuestFacts,
 ) -> Result<(), String> {
+    let selection = guest.desktop.output_selection();
     let wanted = wanted_mode(mode);
     let payload_drm = Path::new(PAYLOAD_MOUNT).join("content").join("drm");
     let install = |from: &str, to: &str, finish: &dyn Fn(String) -> String| -> Result<(), String> {
@@ -1291,7 +1307,7 @@ fn load_stage(
             .map_err(|error| format!("{MODPROBE_OPTIONS} could not be written: {error}"))
         })
         .and_then(|()| copy("vmlord-display-unbind-simpledrm.service", UNBIND_UNIT))
-        .and_then(|()| copy("62-vmlord-display.rules", UDEV_RULES));
+        .and_then(|()| install_output_selection(selection, &copy));
     if let Err(reason) = prepared {
         report.failed(DisplayRecipeStep::ModuleLoad, reason.clone());
         return Err(reason);
@@ -1320,7 +1336,12 @@ fn load_stage(
         }
         report.skipped(
             DisplayRecipeStep::ModuleLoad,
-            format!("{MODULE} is loaded at {}x{}", wanted.0, wanted.1),
+            format!(
+                "{MODULE} is loaded at {}x{}; {}",
+                wanted.0,
+                wanted.1,
+                selection.describe()
+            ),
         );
         return Ok(());
     }
@@ -1335,11 +1356,84 @@ fn load_stage(
     report.ok(
         DisplayRecipeStep::ModuleLoad,
         format!(
-            "loaded {MODULE} at {}x{} and asked for it on every boot",
-            wanted.0, wanted.1
+            "loaded {MODULE} at {}x{} and asked for it on every boot; {}",
+            wanted.0,
+            wanted.1,
+            selection.describe()
         ),
     );
     Ok(())
+}
+
+/// Writes the file that hides the Hyper-V display, and removes the other one.
+///
+/// Both mechanisms are shipped and one is chosen, so the file that was not
+/// chosen has to go: a guest that came up under GNOME and is now under
+/// something else would otherwise keep a unit that unbinds nothing beside a
+/// tag nothing reads, or -- the way that actually costs something -- a guest
+/// moved the other way would keep unbinding the console card that mutter had
+/// already agreed to leave alone.
+///
+/// A payload built before this task carries no unbind unit. It is asked for
+/// with the same `install` every other shipped file uses, which does nothing
+/// when the source is not there, so such a payload leaves an `Unbound` guest
+/// with neither mechanism -- one visible monitor too many, and never a display
+/// taken away.
+fn install_output_selection(
+    selection: OutputSelection,
+    copy: &dyn Fn(&str, &str) -> Result<(), String>,
+) -> Result<(), String> {
+    let ((shipped, installed), removed) = output_selection_files(selection);
+    // A unit is told to stop wanting to run before it is deleted; a rule file
+    // is read where it lies and only has to go.
+    if removed == HYPERV_UNBIND_UNIT {
+        disable_hyperv_unbind();
+    } else {
+        remove(Path::new(removed))?;
+    }
+
+    copy(shipped, installed)
+}
+
+/// Which file a choice installs, from which name in the payload, and which
+/// file it takes away.
+///
+/// Pulled out of the installing so that the pairing itself can be read and
+/// tested: the two mechanisms exclude each other, and the whole of that fact
+/// is here.
+fn output_selection_files(
+    selection: OutputSelection,
+) -> ((&'static str, &'static str), &'static str) {
+    match selection {
+        OutputSelection::Ignored => (("62-vmlord-display.rules", UDEV_RULES), HYPERV_UNBIND_UNIT),
+        OutputSelection::Unbound => (
+            ("vmlord-display-unbind-hyperv.service", HYPERV_UNBIND_UNIT),
+            UDEV_RULES,
+        ),
+    }
+}
+
+/// Takes a file away, treating one that is not there as the state wanted.
+fn remove(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("{} could not be removed: {error}", path.display())),
+    }
+}
+
+/// Stops the unbind unit wanting to run, and takes it away.
+///
+/// Disabled before it is removed, because a unit file deleted while its
+/// symlink in `multi-user.target.wants` remains is a boot that logs a failure
+/// on every start. Nothing here fails a stage: a guest that never had the unit
+/// is the common case, and one that could not be told to forget it still has
+/// the mechanism the desktop found on it needs.
+fn disable_hyperv_unbind() {
+    if Path::new(HYPERV_UNBIND_UNIT).exists() {
+        let _ = command::run("systemctl", &["disable", HYPERV_UNBIND], &[], SHORT_BUDGET);
+        let _ = remove(Path::new(HYPERV_UNBIND_UNIT));
+    }
 }
 
 /// Unloads whatever is running and loads what was just installed.
@@ -1385,14 +1479,14 @@ fn reload_module_for_update(
     Ok(())
 }
 
-fn device_stage(report: &mut Report) -> Result<(), String> {
+fn device_stage(report: &mut Report, selection: OutputSelection) -> Result<(), String> {
     if !device_is_present() {
         let reason =
             format!("{MODULE} is loaded and no display device appeared under {DRM_DEVICES}");
         report.failed(DisplayRecipeStep::Device, reason.clone());
         return Err(reason);
     }
-    keep_the_desktop_on_this_output();
+    keep_the_desktop_on_this_output(selection);
     report.ok(
         DisplayRecipeStep::Device,
         format!("a {MODULE} display device is present"),
@@ -1400,32 +1494,50 @@ fn device_stage(report: &mut Report) -> Result<(), String> {
     Ok(())
 }
 
-/// Asks udev to look at the display cards again, now that this one is here.
+/// Puts the chosen mechanism into effect now, rather than at the next boot.
 ///
-/// The rule that hides the Hyper-V card is written for a guest where this
-/// module is loaded, and it says so with a `TEST` on this device. At boot the
-/// synthetic card is there long before the module is, so the rule ran and
-/// found nothing; this is what makes it run again while the answer is yes.
-/// Before any compositor starts, because a tag is read when a card is
-/// enumerated and not after.
+/// Both mechanisms ask the same question of the guest -- is `vmlord_drm` here
+/// yet -- and both were answered `no` when they were first read: at boot the
+/// synthetic card is enumerated, and the greeter is a candidate to start, long
+/// before this module exists. So each is asked again here, with the device
+/// present and before any compositor of this boot is up, because a tag is read
+/// when a card is enumerated and a driver cannot be unbound out from under a
+/// compositor that has already bound it.
 ///
-/// Nothing here fails a stage: a guest whose udev refused is a guest with a
-/// second monitor nobody can see, which is worse than one monitor and better
-/// than no display.
-fn keep_the_desktop_on_this_output() {
-    let _ = command::run("udevadm", &["control", "--reload"], &[], SHORT_BUDGET);
-    let _ = command::run(
-        "udevadm",
-        &["trigger", "--subsystem-match=drm", "--action=change"],
-        &[],
-        SHORT_BUDGET,
-    );
+/// Nothing here fails a stage: a guest that refused is a guest with a second
+/// monitor nobody can see, which is worse than one monitor and better than no
+/// display.
+fn keep_the_desktop_on_this_output(selection: OutputSelection) {
+    match selection {
+        OutputSelection::Ignored => {
+            let _ = command::run("udevadm", &["control", "--reload"], &[], SHORT_BUDGET);
+            let _ = command::run(
+                "udevadm",
+                &["trigger", "--subsystem-match=drm", "--action=change"],
+                &[],
+                SHORT_BUDGET,
+            );
+        }
+        OutputSelection::Unbound => {
+            let _ = command::run("systemctl", &["daemon-reload"], &[], SHORT_BUDGET);
+            let _ = command::run(
+                "systemctl",
+                &["enable", "--now", HYPERV_UNBIND],
+                &[],
+                SHORT_BUDGET,
+            );
+        }
+    }
 }
 
 /// Checks the update did what it said: the target version loaded, on a device
 /// that exists.
-fn verify(report: &mut Report, target_version: &str) -> Result<(), String> {
-    device_stage(report)?;
+fn verify(
+    report: &mut Report,
+    target_version: &str,
+    selection: OutputSelection,
+) -> Result<(), String> {
+    device_stage(report, selection)?;
     match loaded_version() {
         Some(loaded) if loaded == target_version => {}
         Some(loaded) => {
@@ -1906,11 +2018,12 @@ mod tests {
 
     use super::{
         COMPOSITOR_DROP_IN, SYSTEMD_USER_UNITS, apply, compositor_drop_in, installed_drop_ins,
-        load_failure_message, sha256_hex, update, verify_declared_files,
+        load_failure_message, output_selection_files, remove, sha256_hex, update,
+        verify_declared_files,
     };
     use crate::display_recipe::{PayloadFacts, STEPS};
     use crate::guest_platform::{
-        CompositorLaunch, DesktopFacts, GuestFacts, LibraryLayout, PackageManager,
+        CompositorLaunch, DesktopFacts, GuestFacts, LibraryLayout, OutputSelection, PackageManager,
     };
 
     use super::reported_desktop;
@@ -2120,6 +2233,55 @@ mod tests {
             super::UDEV_RULES.contains("/62-"),
             "the file has to sort after 61-mutter.rules, whose tag it adds to"
         );
+    }
+
+    #[test]
+    fn the_unbind_unit_takes_the_synthetic_card_only_where_this_display_exists() {
+        // The other way of hiding it, for a compositor that reads no tag: a
+        // card with no driver bound is a card nothing can light. It carries
+        // the same safety net the rule does, because it is the mechanism that
+        // can actually take a guest's only display away.
+        let unit =
+            include_str!("../../../payloads/display/module/vmlord-display-unbind-hyperv.service");
+
+        assert!(
+            unit.contains("ConditionPathExists=/sys/devices/platform/vmlord_drm.0/drm"),
+            "without this a guest whose module never built loses its only display\n{unit}"
+        );
+        assert!(
+            unit.contains("/sys/bus/vmbus/drivers/hyperv_drm/unbind"),
+            "the card to take away is the synthetic one, unbound from its driver\n{unit}"
+        );
+        assert!(
+            unit.contains("Before=display-manager.service"),
+            "a driver cannot be unbound out from under a compositor that has \
+             already bound it\n{unit}"
+        );
+    }
+
+    #[test]
+    fn each_way_of_hiding_the_synthetic_display_removes_the_other() {
+        // One mechanism at a time, in both directions. A guest that came up
+        // under GNOME and was moved to another desktop would otherwise keep a
+        // tag nothing reads; moved back, it would keep unbinding the console
+        // card that mutter had already agreed to leave alone.
+        let ((shipped, installed), removed) = output_selection_files(OutputSelection::Ignored);
+        assert_eq!(shipped, "62-vmlord-display.rules");
+        assert_eq!(installed, super::UDEV_RULES);
+        assert_eq!(removed, super::HYPERV_UNBIND_UNIT);
+
+        let ((shipped, installed), removed) = output_selection_files(OutputSelection::Unbound);
+        assert_eq!(shipped, "vmlord-display-unbind-hyperv.service");
+        assert_eq!(installed, super::HYPERV_UNBIND_UNIT);
+        assert_eq!(removed, super::UDEV_RULES);
+    }
+
+    #[test]
+    fn a_file_that_is_not_there_is_already_removed() {
+        // The common case by far: the mechanism a guest was never given.
+        let absent = temporary("output-selection").join("vmlord-display-unbind-hyperv.service");
+
+        remove(&absent).expect("a file that is not there is the state wanted");
     }
 
     #[test]

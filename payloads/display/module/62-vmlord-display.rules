@@ -13,6 +13,12 @@
 # a display -- 61-mutter.rules uses it for vkms -- and this file sorts after
 # that one so the tag is added rather than overwritten.
 #
+# Which makes this one of two ways rather than the way. The tag is a word only
+# mutter reads, so the agent installs this file where the desktop it found is
+# GNOME and installs `vmlord-display-unbind-hyperv.service` instead where it is
+# not -- unbinding the card being what hides it from a compositor that reads no
+# such tag. Exactly one of the two is ever on a guest.
+#
 # The TEST is what keeps this from taking the only display a guest has: with no
 # vmlord_drm loaded -- a payload that failed to build, a kernel it will not
 # compile against -- the Hyper-V card stays exactly what it was, and the guest
