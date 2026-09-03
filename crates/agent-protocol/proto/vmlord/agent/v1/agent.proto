@@ -517,6 +517,29 @@ message ApplyDisplayRecipeResponse {
   // Absent when this guest has no signing key -- a kernel that cannot sign
   // modules, or a `SigningKey` step that failed.
   DisplaySigningCertificate signing_certificate = 3;
+  // The desktop the guest found in itself while the recipe ran.
+  //
+  // Absent is a guest that found none, which is the usual answer while a VM
+  // is being built: the recipe runs as root before anybody has logged in.
+  // What the VM asked for is the host's own field and is not sent back here.
+  GuestDesktop desktop = 4;
+}
+
+// What a guest turned out to have for a desktop, as opposed to what the VM
+// was created asking for.
+//
+// Names the guest chose rather than an enumeration, so that a desktop this
+// build has never heard of arrives under its own name instead of being read
+// back as the nearest one it knows. An empty string is "not found": proto3
+// scalars have no absence, and a desktop with no display manager is a real
+// answer rather than a missing one.
+message GuestDesktop {
+  // What the session on the screen calls itself -- `gnome`, `Hyprland`.
+  string session = 1;
+  // `wayland` or `x11`.
+  string session_type = 2;
+  // The unit that owns the login screen -- `gdm.service`, `sddm.service`.
+  string display_manager = 3;
 }
 
 // Moves the guest to the version the mounted payload carries.

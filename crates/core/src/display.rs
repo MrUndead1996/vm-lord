@@ -12,6 +12,11 @@
 //! reported ([`VmDisplayFacts`]) and the reading the application layer derives
 //! from that plus the two stored fields ([`VmDisplayStatus`]).
 //!
+//! The desktop itself is split along the same seam. [`DesktopProfile`] is what
+//! was asked for and is stored; [`GuestDesktop`] is what the agent found in
+//! the guest and is not, because a desktop can be replaced, fail to install or
+//! simply not be logged into yet. Nothing derives one from the other.
+//!
 //! Nothing in this module carries a credential. The guest password exists
 //! while a VM is being created and is hashed into the cloud-init seed there;
 //! a display session authenticates against the guest with its own per-session
@@ -29,6 +34,14 @@ use serde::{Deserialize, Serialize};
 /// know whether there is a desktop to connect to. The variant names are
 /// therefore an on-disk format -- renaming one changes what already-stored VMs
 /// read back as.
+///
+/// What was *asked for* and never what is *there*: this is what the seed's
+/// package list is filled from, before there is a guest to ask anything of,
+/// and it keeps saying GNOME for a VM whose desktop failed to install or was
+/// replaced by hand afterwards. What a guest turned out to have is
+/// [`GuestDesktop`], which the agent reads out of the guest itself. Code that
+/// wants to know what to install reads this one; code that wants to know what
+/// is running reads that one.
 ///
 /// Two variants and no `Auto`: the MVP installs GNOME on GDM under Wayland or
 /// installs nothing at all, and a third variant would be a promise no code
@@ -488,6 +501,54 @@ pub struct DisplayShare {
     pub name: String,
 }
 
+/// The desktop the agent found inside a running guest.
+///
+/// The other half of [`DesktopProfile`], and deliberately not the same type.
+/// The profile is what the VM was created *asking for*, it is stored, and it
+/// is what fills the seed's package list before there is a guest to ask. This
+/// is what a guest turned out to *have*: read out of logind and out of the
+/// `display-manager.service` link at the moment the recipe ran, reported over
+/// the agent channel, and never stored -- a desktop that was there before the
+/// VM was stopped says nothing about the one running now.
+///
+/// Every field is a name the guest chose, so nothing here is an enumeration:
+/// a desktop VMLord has never heard of reports its own name rather than
+/// reading back as the nearest variant. All three absent is a guest with no
+/// desktop on screen -- a headless VM, or one where nobody has logged in yet,
+/// which is every guest at the moment its display recipe runs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GuestDesktop {
+    /// What the session on the screen calls itself: `gnome`, `Hyprland`.
+    pub session: Option<String>,
+    /// `wayland` or `x11`, for that session.
+    pub session_type: Option<String>,
+    /// The unit owning the login screen: `gdm.service`, `sddm.service`.
+    pub display_manager: Option<String>,
+}
+
+impl GuestDesktop {
+    /// Whether the guest found anything of a desktop at all.
+    #[must_use]
+    pub const fn found(&self) -> bool {
+        self.session.is_some() || self.session_type.is_some() || self.display_manager.is_some()
+    }
+
+    /// The names that were found, in one line, or `None` when none were.
+    ///
+    /// Names and separators only, with no word of its own: these are what the
+    /// guest calls its desktop, and a sentence around them would be a second
+    /// wording to keep in step with the UI's catalogue.
+    #[must_use]
+    pub fn summary(&self) -> Option<String> {
+        let found: Vec<&str> = [&self.session, &self.session_type, &self.display_manager]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        (!found.is_empty()).then(|| found.join(", "))
+    }
+}
+
 /// What a backend observed about a VM's display, without deciding what it
 /// means.
 ///
@@ -519,6 +580,14 @@ pub struct VmDisplayFacts {
     /// module to answer an update, which is minutes during which the display
     /// keeps working and a second update must not be asked for.
     pub update_in_flight: bool,
+    /// The desktop the guest found in itself, when it has reported one.
+    ///
+    /// Beside the payload's facts rather than inside the guest's readiness
+    /// report, because what a guest has is worth knowing exactly when its
+    /// display did not come up: a VM created asking for GNOME whose recipe
+    /// stopped is one whose desktop somebody has to go looking for, and this
+    /// is the answer to where.
+    pub desktop: Option<GuestDesktop>,
 }
 
 /// Which versions of the display payload are in play for one VM.
@@ -619,6 +688,12 @@ pub struct VmDisplayStatus {
     pub message: String,
     /// What the guest reported, when it has reported anything.
     pub guest: Option<GuestDisplayDetail>,
+    /// The desktop the guest found in itself, when it has reported one.
+    ///
+    /// Beside the profile the caller already has rather than folded into it:
+    /// what a VM asked for and what its guest has are two answers, and a
+    /// person looking at a desktop that did not come up needs both.
+    pub desktop: Option<GuestDesktop>,
     /// Whether installing the desktop can be attempted again from here.
     pub can_retry: bool,
     /// Whether an update to a newer payload version is running right now.
@@ -745,6 +820,31 @@ mod tests {
         assert_eq!(DesktopProfile::default(), DesktopProfile::Gnome);
         assert!(DesktopProfile::default().wants_desktop());
         assert!(!DesktopProfile::Headless.wants_desktop());
+    }
+
+    #[test]
+    fn what_a_guest_was_found_to_have_is_not_what_it_was_asked_for() {
+        // A VM created asking for GNOME whose guest came up under something
+        // else: two answers, and neither one is derived from the other.
+        let found = GuestDesktop {
+            session: Some("Hyprland".to_owned()),
+            session_type: Some("wayland".to_owned()),
+            display_manager: None,
+        };
+
+        assert!(DesktopProfile::Gnome.wants_desktop());
+        assert!(found.found());
+        assert_eq!(found.summary().as_deref(), Some("Hyprland, wayland"));
+    }
+
+    #[test]
+    fn a_guest_with_no_desktop_on_screen_summarizes_to_nothing() {
+        // Every guest at the moment its display recipe runs: root, before
+        // anybody has logged in. Absence, and not a line of empty names.
+        let found = GuestDesktop::default();
+
+        assert!(!found.found());
+        assert_eq!(found.summary(), None);
     }
 
     #[test]

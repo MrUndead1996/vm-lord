@@ -49,6 +49,10 @@ pub fn derive_status(
             .then(|| facts.payload.available.clone())
             .flatten(),
         guest: guest_detail(facts),
+        // Whatever the guest last found, at every state: a desktop that was
+        // asked for and did not come up is exactly when what *is* there is
+        // worth reading, so this is not confined to the working case.
+        desktop: facts.desktop.clone(),
         can_retry,
         updating: facts.update_in_flight,
         observed_at,
@@ -435,6 +439,7 @@ mod tests {
             )),
             observed_at: Some(now()),
             update_in_flight: false,
+            desktop: None,
         };
 
         let status = derive_status(

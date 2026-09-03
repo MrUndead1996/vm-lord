@@ -28,7 +28,7 @@ pub mod ssh;
 pub use display::{
     Advisory, DISPLAY_PAYLOAD_SHARE, DesktopProfile, DisplayFailure, DisplayMode,
     DisplayPayloadFacts, DisplayProvisioning, DisplayShare, DisplayStage, DisplayState,
-    DisplayStatusCode, GuestDisplayDetail, GuestDisplayReport, MAX_DISPLAY_HEIGHT,
+    DisplayStatusCode, GuestDesktop, GuestDisplayDetail, GuestDisplayReport, MAX_DISPLAY_HEIGHT,
     MAX_DISPLAY_WIDTH, MIN_DESKTOP_CPU_CORES, MIN_DESKTOP_RAM_MB, MIN_DISPLAY_HEIGHT,
     MIN_DISPLAY_WIDTH, VmDisplayFacts, VmDisplayStatus, desktop_resource_advice,
 };

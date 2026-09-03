@@ -123,9 +123,33 @@ fn a_recipe_answer_can_carry_the_certificate_the_guest_signs_with() {
             sha256: "ab".repeat(32),
             subject_key_identifier: "0a1b2c".to_owned(),
         }),
+        desktop: None,
     };
 
     let certificate = answer.signing_certificate.expect("the field exists");
     assert_eq!(certificate.certificate, vec![0x30, 0x82]);
     assert_eq!(certificate.subject_key_identifier, "0a1b2c");
+}
+
+#[test]
+fn a_recipe_answer_carries_the_desktop_the_guest_found_and_not_the_one_it_was_asked_for() {
+    use vmlord_agent_protocol::v1::{ApplyDisplayRecipeResponse, GuestDesktop};
+
+    let answer = ApplyDisplayRecipeResponse {
+        stages: Vec::new(),
+        versions: None,
+        signing_certificate: None,
+        desktop: Some(GuestDesktop {
+            session: "Hyprland".to_owned(),
+            session_type: "wayland".to_owned(),
+            // A desktop with no login screen is a real answer, and an empty
+            // string is how proto3 spells one.
+            display_manager: String::new(),
+        }),
+    };
+
+    let desktop = answer.desktop.expect("the field exists");
+    assert_eq!(desktop.session, "Hyprland");
+    assert_eq!(desktop.session_type, "wayland");
+    assert!(desktop.display_manager.is_empty());
 }

@@ -3900,6 +3900,26 @@ seed, and "a local ISO with GNOME" is therefore a state that cannot be spelled
 rather than one to be rejected at run time. It is a creation-time decision;
 installing a desktop into a guest that was built without one is #127.
 
+`GuestDesktop` is the other half of that first type, and the reason it is a
+second type rather than a second reading of the first: the profile is what was
+*asked for* and the guest is what it *became*. The agent reads a session's own
+name, its type and the unit `display-manager.service` is linked to out of the
+guest it is running in (`agent::guest_platform`), the display recipe answers
+with them, and the host keeps them in `VmDisplayFacts` beside the payload's
+versions -- unstored, like every other runtime fact, because a desktop
+observed before a stop says nothing about the one running after one. It is
+reported at every outcome and not only at a working display: a VM created
+asking for GNOME whose recipe stopped is exactly the VM somebody has to go
+looking inside, and what the guest has is where that starts. Nothing derives
+one from the other, and the seed keeps being filled from the profile alone,
+because cloud-init writes it before there is a guest to ask anything of.
+
+Names and never an enumeration on that side: a desktop this build has never
+heard of arrives under its own name instead of reading back as the nearest
+variant, and all three absent is a real answer -- a headless guest, and every
+guest at the moment its display recipe runs, which is as root before anybody
+has logged in.
+
 `DisplayProvisioning` is how far installing it got -- `NotRequested`,
 `Pending`, `Ready` or `Degraded` with a reason. It is *stored*, in the VM's
 metadata mapping beside the GPU mode, and that is the point of it: the
@@ -3956,14 +3976,20 @@ the normal display export boundary and restores its fixed share name in
 therefore mount and report the desktop without waiting for a later reconnect.
 
 The desktop itself comes from the distribution's own archives. `DistroProfile`
-carries a `DesktopSetup` -- the packages and the display manager unit -- and
-the seed prints them as cloud-init's `packages` block with `package_update`,
+carries a `DesktopSetup`, and that setup is a package list and nothing else:
+the seed prints it as cloud-init's `packages` block with `package_update`,
 so Ubuntu installs `ubuntu-desktop-minimal` (GNOME Shell, GDM and the Wayland
 session, without the office suite) from the archives the guest is already
 configured with. Arch names the same session package by package --
 `gnome-shell`, `gdm`, `gnome-control-center`, `gnome-console`, `nautilus` --
 because it publishes no one metapackage for it. VMLord adds no repository,
 downloads no desktop binary of its own and signs nothing.
+
+A declared display manager unit sat in that setup and was deleted rather than
+kept: a package list is what has to be declared, because it is needed before a
+guest exists, while which unit owns the login screen is a link in the guest
+that the agent reads at the moment it matters. Two copies of that answer can
+disagree -- the guest's is the true one -- so there is now one.
 
 What has to happen before those packages are installed is
 `DistroProfile::package_refresh`, and it is a field because it is not a

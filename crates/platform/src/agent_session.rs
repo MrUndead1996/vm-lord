@@ -38,8 +38,8 @@ use vmlord_agent_protocol::{
 };
 use vmlord_core::{
     DisplayFailure, DisplayMode, DisplayShare, DisplayStage, DisplayStatusCode, GpuFailure,
-    GpuShareManifest, GpuShareRole as CoreShareRole, GpuStatusCode, GuestDisplayDetail,
-    GuestDisplayReport, GuestGpuDetail, GuestGpuReport,
+    GpuShareManifest, GpuShareRole as CoreShareRole, GpuStatusCode, GuestDesktop,
+    GuestDisplayDetail, GuestDisplayReport, GuestGpuDetail, GuestGpuReport,
 };
 
 use crate::agent::{DisplayUpdate, DisplayUpdateAnswer};
@@ -152,6 +152,13 @@ pub(crate) struct GuestDisplayPayloadReport {
     /// The DER of the certificate the guest signs its modules with, when it
     /// has one. The private half is never asked for and never sent.
     pub(crate) signing_certificate: Option<Vec<u8>>,
+    /// The desktop the guest found in itself, when the recipe reported one.
+    ///
+    /// `None` is a report that looked and found nothing, and a report that
+    /// never looked -- an update, or a mount that failed. Either way it leaves
+    /// whatever the guest last said standing, because a guest does not stop
+    /// having a desktop between two questions about its payload.
+    pub(crate) desktop: Option<GuestDesktop>,
 }
 
 /// Where a display report goes, for the same reason the GPU's has a sink.
@@ -768,9 +775,9 @@ fn report_display_update(
     };
 
     let payload = GuestDisplayPayloadReport {
-        installed: some_version(&versions.installed),
-        previous: some_version(&versions.previous),
-        loaded: some_version(&versions.loaded),
+        installed: some_text(&versions.installed),
+        previous: some_text(&versions.previous),
+        loaded: some_text(&versions.loaded),
         failure,
         // An update carries no certificate. The key is the VM's and does not
         // change between a start and an update, and the next start's recipe
@@ -780,6 +787,10 @@ fn report_display_update(
         // recipe reported when the session opened, and is not this answer's
         // to change.
         guest: None,
+        // Nor does an update look at the desktop: the guest was asked to
+        // change a module version, and the answer to a different question is
+        // still the one the recipe gave.
+        desktop: None,
     };
     sink(payload.clone());
 
@@ -921,6 +932,17 @@ fn report_display_recipe(
         .iter()
         .find(|stage| stage.step() == DisplayRecipeStep::ServicesStart)
         .map(|stage| stage.state());
+    // What the guest says it found, which is a different question from what
+    // the VM was created asking for: the host holds the profile itself and
+    // never reads it back off this channel.
+    let desktop = report.desktop.as_ref().map(|desktop| GuestDesktop {
+        session: some_text(&desktop.session),
+        session_type: some_text(&desktop.session_type),
+        display_manager: some_text(&desktop.display_manager),
+    });
+    // Readiness is a separate answer and stays one: what a guest found is
+    // carried beside the report and not folded into it, so there is one place
+    // the found desktop is read from rather than two that can disagree.
     let guest = match (services, &failure) {
         (Some(DisplayRecipeStageState::Ok), _) => {
             Some(GuestDisplayReport::Ready(GuestDisplayDetail::default()))
@@ -943,15 +965,16 @@ fn report_display_recipe(
     };
 
     sink(GuestDisplayPayloadReport {
-        installed: some_version(&versions.installed),
-        previous: some_version(&versions.previous),
-        loaded: some_version(&versions.loaded),
+        installed: some_text(&versions.installed),
+        previous: some_text(&versions.previous),
+        loaded: some_text(&versions.loaded),
         failure,
         guest,
         signing_certificate: report
             .signing_certificate
             .as_ref()
             .map(|certificate| certificate.certificate.clone()),
+        desktop,
     });
 }
 
@@ -987,7 +1010,11 @@ fn code_for(
 }
 
 /// An empty string on the wire is "not present" here.
-fn some_version(value: &str) -> Option<String> {
+///
+/// proto3 scalars have no absence, so every optional string the guest sends --
+/// a payload version, the name of a desktop -- arrives empty when the guest
+/// has none, and this is where that becomes the host's own `None`.
+fn some_text(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
@@ -1473,6 +1500,7 @@ mod tests {
             stages,
             versions: None,
             signing_certificate: None,
+            desktop: None,
         };
         let seen = Mutex::new(None);
 
@@ -1490,6 +1518,58 @@ mod tests {
             state: state as i32,
             message: "what the guest said".to_owned(),
         }
+    }
+
+    #[test]
+    fn a_recipe_that_stopped_still_says_what_desktop_the_guest_has() {
+        // The answer is worth most exactly here: a VM that asked for a desktop
+        // and did not get a display is one somebody has to go looking in, and
+        // what the guest reports is where to start.
+        let report = ApplyDisplayRecipeResponse {
+            stages: vec![stage(
+                DisplayRecipeStep::ModuleBuild,
+                DisplayRecipeStageState::Failed,
+            )],
+            versions: None,
+            signing_certificate: None,
+            desktop: Some(vmlord_agent_protocol::v1::GuestDesktop {
+                session: "gnome".to_owned(),
+                session_type: "wayland".to_owned(),
+                display_manager: "gdm.service".to_owned(),
+            }),
+        };
+        let seen = Mutex::new(None);
+
+        report_display_recipe(&report, "dev", &|report| {
+            *seen.lock().expect("an uncontended lock") = report.desktop;
+        });
+
+        let desktop = seen
+            .into_inner()
+            .expect("an uncontended lock")
+            .expect("the guest reported a desktop");
+        assert_eq!(desktop.session.as_deref(), Some("gnome"));
+        assert_eq!(desktop.display_manager.as_deref(), Some("gdm.service"));
+    }
+
+    #[test]
+    fn a_desktop_the_guest_did_not_find_arrives_as_absence_and_not_as_empty_names() {
+        // Every guest while its VM is being built: the recipe runs as root
+        // with nobody logged in. Three empty strings would read as a desktop
+        // whose every name is blank.
+        let report = ApplyDisplayRecipeResponse {
+            stages: Vec::new(),
+            versions: None,
+            signing_certificate: None,
+            desktop: None,
+        };
+        let seen = Mutex::new(None);
+
+        report_display_recipe(&report, "dev", &|report| {
+            *seen.lock().expect("an uncontended lock") = report.desktop;
+        });
+
+        assert_eq!(seen.into_inner().expect("an uncontended lock"), None);
     }
 
     #[test]
@@ -2196,6 +2276,7 @@ mod tests {
                     loaded: "0.1.0".to_owned(),
                 }),
                 signing_certificate: None,
+                desktop: None,
             }),
         ));
 
@@ -2403,6 +2484,7 @@ mod tests {
                 }],
                 versions: None,
                 signing_certificate: None,
+                desktop: None,
             }),
         ));
 
@@ -3069,6 +3151,7 @@ mod tests {
             }],
             versions: None,
             signing_certificate: None,
+            desktop: None,
         };
         let seen = Mutex::new(None);
 
@@ -3109,6 +3192,7 @@ mod tests {
                 ],
                 versions: None,
                 signing_certificate: None,
+                desktop: None,
             };
             let seen = Mutex::new(None);
 
@@ -3140,6 +3224,7 @@ mod tests {
                 sha256: "ab".repeat(32),
                 subject_key_identifier: "0a1b".to_owned(),
             }),
+            desktop: None,
         };
         let seen = Mutex::new(None);
 

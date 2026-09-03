@@ -34,7 +34,6 @@
       "gnome-control-center",
       "gnome-console",
       "nautilus"
-    ],
-    "display_manager": "gdm.service"
+    ]
   }
 }
