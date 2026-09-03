@@ -69,7 +69,9 @@ Update **ARCHITECTURE.md** whenever architectural decisions change.
 * Complete each task in a dedicated branch.
 * Commit the completed work before pushing the branch to the remote repository.
 * Open a merge request only after receiving explicit user approval.
-* Assign every merge request to `mrundead`.
+* Assign every merge request to `MrUndead1996`. That is the GitHub login;
+  `mrundead` is the local account name, and `gh pr create --assignee mrundead`
+  drops the assignee without saying so.
 
 ## Commits
 
