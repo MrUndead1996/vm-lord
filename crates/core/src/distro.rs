@@ -347,9 +347,15 @@ impl KeyboardForm {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct DesktopSetup {
     /// The packages that bring in GNOME, GDM and their Wayland session.
+    ///
+    /// The whole of what a distribution declares about a desktop, and
+    /// deliberately so: a package list is what cloud-init needs before there
+    /// is a guest to ask anything of, and everything else about a desktop --
+    /// which display manager owns the login screen, what the session on the
+    /// screen calls itself -- the agent reads out of the guest at the moment
+    /// it acts. A declared display manager was exactly that second copy, and
+    /// it was deleted rather than kept in step with the truth beside it.
     pub packages: Vec<String>,
-    /// The display manager unit that has to run for a login screen to appear.
-    pub display_manager: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -914,7 +920,7 @@ mod tests {
             profile.ssh.config_drop_in,
             "/etc/ssh/sshd_config.d/10-vmlord.conf"
         );
-        assert_eq!(profile.desktop.unwrap().display_manager, "gdm.service");
+        assert_eq!(profile.desktop.unwrap().packages[0], "gnome-shell");
     }
 
     /// A directory that names no release still has to answer the same two
@@ -1060,12 +1066,14 @@ mod tests {
 
     #[test]
     fn a_desktop_is_offered_only_to_a_profile_that_asks_for_one() {
+        // The seed's package list is filled from what was *asked for* and from
+        // nothing else: cloud-init writes it before there is a guest to ask
+        // what it has, so the found desktop has no say here and never will.
         let ubuntu = ubuntu();
         let desktop = ubuntu
             .desktop_for(DesktopProfile::Gnome)
             .expect("Ubuntu installs GNOME");
         assert_eq!(desktop.packages, ["ubuntu-desktop-minimal"]);
-        assert_eq!(desktop.display_manager, "gdm3.service");
         assert_eq!(ubuntu.desktop_for(DesktopProfile::Headless), None);
     }
 

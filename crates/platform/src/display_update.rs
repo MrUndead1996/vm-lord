@@ -368,6 +368,7 @@ mod tests {
                 failure: None,
                 guest: None,
                 signing_certificate: None,
+                desktop: None,
             },
         };
 
@@ -394,6 +395,7 @@ mod tests {
                 )),
                 guest: None,
                 signing_certificate: None,
+                desktop: None,
             },
         };
 

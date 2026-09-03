@@ -11,9 +11,7 @@ use std::{
     sync::atomic::AtomicBool,
 };
 
-use vmlord_core::{
-    DesktopProfile, DisplayFailure, DisplayStage, DisplayStatusCode, RepositoryError,
-};
+use vmlord_core::{DisplayFailure, DisplayStage, DisplayStatusCode, RepositoryError};
 use vmlord_payload::PayloadError;
 
 use crate::{
@@ -52,7 +50,11 @@ pub(crate) fn prepare(
     cache_root: &Path,
     canonicalize: &dyn Fn(&Path) -> Result<PathBuf, RepositoryError>,
 ) -> Option<PreparedDisplay> {
-    if !matches!(mapping.desktop_profile, DesktopProfile::Gnome) {
+    // What the VM asked for, which is the only half that exists yet: nothing
+    // has booted, so there is no guest to ask what it has. `wants_desktop`
+    // rather than a match on one variant, so that a second desktop profile is
+    // a profile and not an edit here.
+    if !mapping.desktop_profile.wants_desktop() {
         return None;
     }
 

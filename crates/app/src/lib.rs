@@ -1681,6 +1681,7 @@ mod tests {
                 failure: None,
                 observed_at: None,
                 update_in_flight: false,
+                desktop: None,
             },
             ..FakeRepository::default()
         }

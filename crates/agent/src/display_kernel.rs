@@ -21,7 +21,7 @@ use std::{
 
 use vmlord_agent_protocol::v1::{
     DisplayPayloadVersions, DisplayRecipeStage, DisplayRecipeStep, DisplaySigningCertificate,
-    DisplayUpdateOutcome,
+    DisplayUpdateOutcome, GuestDesktop,
 };
 
 use crate::{
@@ -36,7 +36,7 @@ use crate::{
     },
     guest_files::{copy_tree, failure, read, write_if_different},
     guest_packages::{self, Package},
-    guest_platform::{GuestFacts, LibraryLayout, guest_facts},
+    guest_platform::{DesktopFacts, GuestFacts, LibraryLayout, guest_facts},
 };
 
 /// Where the guest mounts the display payload share.
@@ -181,29 +181,60 @@ fn rollback_outcome(runtime_restored: bool) -> DisplayUpdateOutcome {
     }
 }
 
+/// What one run of the recipe found out and what it installed.
+///
+/// A struct rather than a tuple because the last two members are answers the
+/// recipe carries out of a run that failed: a certificate and a desktop are
+/// worth most exactly when the display did not come up, and positional
+/// members that far along stop saying what they are.
+pub struct RecipeOutcome {
+    pub stages: Vec<DisplayRecipeStage>,
+    pub versions: DisplayPayloadVersions,
+    /// The certificate this guest signs its modules with, when it has one.
+    pub certificate: Option<DisplaySigningCertificate>,
+    /// The desktop this guest turned out to have, when it has one.
+    ///
+    /// What the recipe found, never what the VM was created asking for: the
+    /// host holds that half itself and does not need it read back to it.
+    pub desktop: Option<GuestDesktop>,
+}
+
 /// Installs what the mounted payload says the guest should have.
 ///
 /// Idempotent by fact: a guest already running the mounted version passes
 /// through in a handful of checks and needs no network. Every failure is a
 /// stage that says so, and the VM keeps running regardless.
-pub fn apply(
-    stopping: &AtomicBool,
-    mode: Option<(u32, u32)>,
-) -> (
-    Vec<DisplayRecipeStage>,
-    DisplayPayloadVersions,
-    Option<DisplaySigningCertificate>,
-) {
+pub fn apply(stopping: &AtomicBool, mode: Option<(u32, u32)>) -> RecipeOutcome {
     let mut report = Report::new();
-    // Out-parameter rather than the `Ok` half: a recipe that failed at
-    // `ModuleLoad` is exactly when the host most needs the certificate, and a
-    // `Result` would drop it on the way out.
+    // Out-parameters rather than the `Ok` half: a recipe that failed at
+    // `ModuleLoad` is exactly when the host most needs the certificate and the
+    // desktop, and a `Result` would drop them on the way out.
     let mut certificate = None;
-    let reason = match run_stages(&mut report, stopping, mode, &mut certificate) {
+    let mut desktop = None;
+    let reason = match run_stages(&mut report, stopping, mode, &mut certificate, &mut desktop) {
         Ok(()) => "the recipe did not need this stage".to_owned(),
         Err(reason) => reason,
     };
-    (report.finish(&reason), versions(), certificate)
+    RecipeOutcome {
+        stages: report.finish(&reason),
+        versions: versions(),
+        certificate,
+        desktop,
+    }
+}
+
+/// The desktop the guest was found to have, in the shape the host reads.
+///
+/// `None` where nothing was found, which is what a guest with no desktop and
+/// a guest nobody has logged into yet both are. Absence travels as absence
+/// rather than as three empty strings, so the host is never left deciding
+/// whether a message full of nothing means a desktop was looked for.
+fn reported_desktop(facts: &DesktopFacts) -> Option<GuestDesktop> {
+    facts.found().then(|| GuestDesktop {
+        session: facts.session.clone().unwrap_or_default(),
+        session_type: facts.session_type.clone().unwrap_or_default(),
+        display_manager: facts.display_manager.clone().unwrap_or_default(),
+    })
 }
 
 /// Moves the guest to `target_version`, verifies it, and rolls back if it did
@@ -257,8 +288,13 @@ fn run_stages(
     stopping: &AtomicBool,
     mode: Option<(u32, u32)>,
     certificate: &mut Option<DisplaySigningCertificate>,
+    desktop: &mut Option<GuestDesktop>,
 ) -> Result<(), String> {
     let guest = guest_facts()?;
+    // Before the first stage can end the run: what a guest has for a desktop
+    // is the answer somebody needs most when the display did not come up, and
+    // a distribution with no recipe is one of the ways it does not.
+    *desktop = reported_desktop(&guest.desktop);
     if !has_recipe(&guest.distribution) {
         let reason = format!(
             "vmlord-agent has no display recipe for {} {}",
@@ -1712,6 +1748,8 @@ mod tests {
     use crate::display_recipe::{PayloadFacts, STEPS};
     use crate::guest_platform::{DesktopFacts, GuestFacts, LibraryLayout, PackageManager};
 
+    use super::reported_desktop;
+
     /// An ordinary Ubuntu guest, for the stages that now ask what it is.
     fn guest() -> GuestFacts {
         GuestFacts {
@@ -1735,6 +1773,44 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn the_recipe_reports_the_desktop_it_found_and_not_one_it_was_told_about() {
+        // Nothing in the agent knows what the VM was created asking for, and
+        // this is the whole of what it answers with: names read out of the
+        // guest, on their way to a host that holds the other half itself.
+        let found = reported_desktop(&DesktopFacts {
+            session: Some("gnome".to_owned()),
+            session_type: Some("wayland".to_owned()),
+            display_manager: Some("gdm.service".to_owned()),
+        })
+        .expect("a guest with a desktop reports one");
+
+        assert_eq!(found.session, "gnome");
+        assert_eq!(found.session_type, "wayland");
+        assert_eq!(found.display_manager, "gdm.service");
+    }
+
+    #[test]
+    fn a_guest_with_nothing_on_screen_reports_no_desktop_at_all() {
+        // What a headless guest is, and what every guest is while its VM is
+        // being built: the recipe runs before anybody has logged in.
+        assert!(reported_desktop(&DesktopFacts::default()).is_none());
+    }
+
+    #[test]
+    fn a_desktop_found_only_by_its_login_screen_is_still_a_desktop() {
+        // The shape at provisioning time: the display manager is linked, and
+        // there is no session on the screen yet.
+        let found = reported_desktop(&DesktopFacts {
+            display_manager: Some("gdm.service".to_owned()),
+            ..DesktopFacts::default()
+        })
+        .expect("a linked display manager is a desktop");
+
+        assert!(found.session.is_empty());
+        assert_eq!(found.display_manager, "gdm.service");
     }
 
     #[test]
@@ -2062,7 +2138,8 @@ mod tests {
         // This machine is not a VMLord guest: nothing is mounted at
         // /opt/vmlord/display-payload, which is the failure a guest whose share
         // never arrived would hit.
-        let (stages, versions, _certificate) = apply(&AtomicBool::new(false), None);
+        let outcome = apply(&AtomicBool::new(false), None);
+        let (stages, versions) = (outcome.stages, outcome.versions);
 
         assert_eq!(stages.len(), crate::display_recipe::STEPS.len());
         assert!(

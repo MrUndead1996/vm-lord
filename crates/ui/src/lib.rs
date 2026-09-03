@@ -11,7 +11,7 @@ use vmlord_app::{AvailableUpdate, BackendStatus, UpdateState, VmAction, Workspac
 use vmlord_core::{
     Advisory, AgentStatus, AppSettings, BuildProgress, BuildStep, CloudImage, DesktopProfile,
     DiagnosticLevel, DisplaySettings, DisplayState, DistroProfile, DownloadPhase,
-    FileClipboardSettings, GpuMode, GpuState, GuestDefaults, GuestReadinessTimeouts,
+    FileClipboardSettings, GpuMode, GpuState, GuestDefaults, GuestDesktop, GuestReadinessTimeouts,
     HostGpuCapabilities, Language, LogLevel, NetworkMode, Password, Provisioning, SshAccess,
     SshAuthentication, SshConfig, SshPort, VmCreateRequest, VmDeleteRequest, VmDisplayStatus,
     VmGpuStatus, VmSource, VmState, VmSummary, VmUpdateRequest,
@@ -2016,6 +2016,11 @@ fn desktop_profile_label(profile: DesktopProfile) -> String {
 }
 
 /// What to show beside a VM's desktop, in one line.
+///
+/// The desktop the guest was found to have is appended rather than shown
+/// instead of the state: the row already says what the VM asked for, and a VM
+/// asking for GNOME whose guest reports something else is exactly the sentence
+/// that needs both halves of.
 fn display_status_detail(profile: DesktopProfile, status: Option<&VmDisplayStatus>) -> String {
     let Some(status) = status else {
         return desktop_profile_label(profile);
@@ -2026,6 +2031,9 @@ fn display_status_detail(profile: DesktopProfile, status: Option<&VmDisplayStatu
         message = status.message
     )
     .to_string();
+    if let Some(found) = status.desktop.as_ref().and_then(GuestDesktop::summary) {
+        detail.push_str(&t!("selected_vm.desktop_found", desktop = found));
+    }
     if status.can_retry {
         detail.push_str(&t!("selected_vm.desktop_reinstallable"));
     }
@@ -3315,10 +3323,37 @@ mod tests {
             available_version: None,
             message: message.to_owned(),
             guest: None,
+            desktop: None,
             can_retry: false,
             updating: false,
             observed_at: std::time::SystemTime::UNIX_EPOCH,
         }
+    }
+
+    #[test]
+    fn the_desktop_row_says_what_the_guest_has_beside_what_it_was_asked_for() {
+        let mut status = display_status(DisplayState::Ready, "The guest offers its desktop.");
+        status.desktop = Some(vmlord_core::GuestDesktop {
+            session: Some("Hyprland".to_owned()),
+            session_type: Some("wayland".to_owned()),
+            display_manager: None,
+        });
+
+        let detail = display_status_detail(DesktopProfile::Gnome, Some(&status));
+
+        assert!(
+            detail.contains("Hyprland, wayland"),
+            "a guest running something other than what was asked for says so: {detail}"
+        );
+    }
+
+    #[test]
+    fn a_desktop_the_guest_never_reported_adds_nothing_to_the_row() {
+        let status = display_status(DisplayState::Provisioning, "The desktop is installing.");
+
+        let detail = display_status_detail(DesktopProfile::Gnome, Some(&status));
+
+        assert_eq!(detail, "Installing: The desktop is installing.");
     }
 
     #[test]

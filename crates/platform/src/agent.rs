@@ -277,6 +277,9 @@ impl AgentConnection {
                             if let Some(guest) = report.guest {
                                 display_facts.record_guest_display(vm_id, guest);
                             }
+                            if let Some(desktop) = report.desktop {
+                                display_facts.record_guest_desktop(vm_id, desktop);
+                            }
                             display_facts.record_guest_payload(
                                 vm_id,
                                 report.installed,

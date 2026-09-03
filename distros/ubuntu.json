@@ -25,7 +25,6 @@
     }
   ],
   "desktop": {
-    "packages": ["ubuntu-desktop-minimal"],
-    "display_manager": "gdm3.service"
+    "packages": ["ubuntu-desktop-minimal"]
   }
 }

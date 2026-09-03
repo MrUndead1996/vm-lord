@@ -16,7 +16,8 @@ use std::{
 
 use uuid::Uuid;
 use vmlord_core::{
-    DisplayFailure, DisplayPayloadFacts, DisplayShare, GuestDisplayReport, VmDisplayFacts,
+    DisplayFailure, DisplayPayloadFacts, DisplayShare, GuestDesktop, GuestDisplayReport,
+    VmDisplayFacts,
 };
 
 /// One VM's display, for the run it is in the middle of.
@@ -62,6 +63,19 @@ impl DisplayRuns {
         let mut runs = self.lock();
         let entry = runs.entry(vm_id).or_default();
         entry.facts.guest = Some(report);
+        entry.facts.observed_at = Some(SystemTime::now());
+    }
+
+    /// Records the desktop a VM's guest said it found in itself.
+    ///
+    /// Its own recorder, and one that only ever writes an answer: a report
+    /// with nothing to say about the desktop -- an update, a share that did
+    /// not mount -- must leave the last answer standing rather than erase a
+    /// desktop that is still there.
+    pub(crate) fn record_guest_desktop(&self, vm_id: Uuid, desktop: GuestDesktop) {
+        let mut runs = self.lock();
+        let entry = runs.entry(vm_id).or_default();
+        entry.facts.desktop = Some(desktop);
         entry.facts.observed_at = Some(SystemTime::now());
     }
 
