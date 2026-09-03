@@ -156,7 +156,12 @@ daemon, and it shows through GNOME's AppIndicator extension.
   supported desktops Ubuntu's own ships with the desktop; if neither is
   there, install `gnome-shell-extension-appindicator` and sign out and in
   once -- the tray asks the running shell to enable it when it starts, and
-  again on every reconnect, usually the next **Restart services**.
+  again on every reconnect, usually the next **Restart services**. On a
+  desktop that is not GNOME nothing is installed and nothing is enabled: the
+  tray needs only something on the session bus owning
+  `org.kde.StatusNotifierWatcher`, which a panel that shows tray icons
+  already does. Its journal says when it found neither a host nor a shell to
+  ask.
 - Check the broker socket. The menu still builds with no broker attached,
   but every click is dropped until the attach returns; the journal says
   when it does.

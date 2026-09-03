@@ -239,7 +239,52 @@ pub struct DesktopFacts {
     pub display_manager: Option<String>,
 }
 
+/// The names a GNOME session goes under, matched as substrings of a
+/// lowercased session name.
+///
+/// Two rather than a catalogue: GNOME calls its sessions `gnome`,
+/// `gnome-classic` and `gnome-xorg`, and Ubuntu renames its own to `ubuntu`,
+/// `ubuntu-wayland` and `ubuntu-xorg` while shipping the same shell. Anything
+/// else is a desktop this build has no special knowledge of, which is the
+/// answer that leaves it alone.
+const GNOME_SESSIONS: [&str; 2] = ["gnome", "ubuntu"];
+
+/// The units GNOME's login screen is linked as, without the `.service` suffix.
+///
+/// Debian and Ubuntu package it as `gdm3`; everyone else, GNOME included, as
+/// `gdm`.
+const GNOME_DISPLAY_MANAGERS: [&str; 2] = ["gdm", "gdm3"];
+
 impl DesktopFacts {
+    /// Whether the desktop found here is GNOME.
+    ///
+    /// The one desktop VMLord knows to need helping: GNOME hides
+    /// StatusNotifierItems until an AppIndicator extension is installed and
+    /// enabled, and its compositor is a templated user unit a drop-in can
+    /// reach. Both of those are things to do *to* a desktop rather than
+    /// properties to read off one, so they are asked of what was found and
+    /// never of what the VM was created asking for.
+    ///
+    /// The session on the screen settles it where there is one. Where there is
+    /// none -- which is every guest at the moment its display recipe runs,
+    /// root and before anybody has logged in -- the unit owning the login
+    /// screen does, because that is what the next session will be started by.
+    /// Nothing found at all is not GNOME: a headless guest gets nothing done
+    /// to it.
+    #[must_use]
+    pub fn is_gnome(&self) -> bool {
+        if let Some(session) = &self.session {
+            let session = session.to_lowercase();
+
+            return GNOME_SESSIONS.iter().any(|name| session.contains(name));
+        }
+        self.display_manager.as_deref().is_some_and(|unit| {
+            let unit = unit.trim_end_matches(".service").to_lowercase();
+
+            GNOME_DISPLAY_MANAGERS.contains(&unit.as_str())
+        })
+    }
+
     /// Whether anything of a desktop was found at all.
     #[must_use]
     pub fn found(&self) -> bool {
@@ -656,6 +701,59 @@ mod tests {
         assert_eq!(facts.session, None);
         assert_eq!(facts.display_manager.as_deref(), Some("gdm.service"));
         assert!(facts.found());
+    }
+
+    #[test]
+    fn the_session_on_the_screen_says_whether_this_is_gnome() {
+        // Ubuntu renames GNOME's sessions after itself and ships the same
+        // shell, so both names answer yes; a compositor that hosts its own
+        // tray items answers no and is left alone.
+        for name in ["gnome", "GNOME-Classic", "ubuntu-wayland"] {
+            let found = DesktopFacts {
+                session: Some(name.to_owned()),
+                session_type: Some("wayland".to_owned()),
+                display_manager: Some("gdm.service".to_owned()),
+            };
+            assert!(found.is_gnome(), "{name} is a GNOME session");
+        }
+
+        let hyprland = DesktopFacts {
+            session: Some("Hyprland".to_owned()),
+            session_type: Some("wayland".to_owned()),
+            display_manager: Some("gdm.service".to_owned()),
+        };
+        assert!(
+            !hyprland.is_gnome(),
+            "the session on the screen outranks the greeter that started it: \
+             a guest whose login screen is GDM is not running GNOME because \
+             of it"
+        );
+    }
+
+    #[test]
+    fn a_guest_with_no_session_yet_is_read_from_its_login_screen() {
+        // The shape at recipe time, when nobody has logged in: the greeter is
+        // the only evidence there is, and it is what starts the session that
+        // the tray extension will have to show through.
+        for unit in ["gdm.service", "gdm3.service"] {
+            let greeter = DesktopFacts {
+                display_manager: Some(unit.to_owned()),
+                ..DesktopFacts::default()
+            };
+            assert!(greeter.is_gnome(), "{unit} is GNOME's login screen");
+        }
+
+        let sddm = DesktopFacts {
+            display_manager: Some("sddm.service".to_owned()),
+            ..DesktopFacts::default()
+        };
+        assert!(!sddm.is_gnome());
+    }
+
+    #[test]
+    fn a_guest_with_nothing_on_screen_is_not_gnome() {
+        // A headless VM, and the answer that gets nothing installed into it.
+        assert!(!DesktopFacts::default().is_gnome());
     }
 
     #[test]
