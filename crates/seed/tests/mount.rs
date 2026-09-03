@@ -18,7 +18,7 @@
 
 use std::{fs, path::PathBuf, process::Command};
 
-use vmlord_core::{SshAccess, SshPort, ubuntu};
+use vmlord_core::{PackageRefresh, SshAccess, SshPort, ubuntu};
 use vmlord_seed::{Seed, SeedRequest, build, image, tools_image};
 
 /// A directory that unmounts and deletes itself however the test ends.
@@ -81,6 +81,7 @@ fn seed() -> Seed {
         ssh_daemon: &ubuntu().ssh,
         agent_secret: None,
         desktop_packages: &[],
+        package_refresh: PackageRefresh::Lists,
     })
 }
 

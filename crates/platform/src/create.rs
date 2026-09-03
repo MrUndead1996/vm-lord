@@ -488,6 +488,11 @@ fn write_provisioning(
             .profile
             .desktop_for(provisioning.desktop)
             .map_or(&[][..], |desktop| desktop.packages.as_slice()),
+        // And what installing anything at all on this distribution takes
+        // first, which on a rolling one is upgrading the guest rather than
+        // resolving new packages against an image months older than the
+        // repository they come from.
+        package_refresh: image.profile.package_refresh,
     });
 
     write_restricted(seed_path, &vmlord_seed::image(&seed), "the cloud-init seed")?;

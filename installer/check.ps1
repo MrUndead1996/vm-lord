@@ -119,8 +119,10 @@ Require-File 'THIRD-PARTY-LICENSES.txt'
 
 # The canonical distribution profiles the application copies into each user's
 # own directory on startup. Ubuntu is the one profile the product is not
-# usable without.
+# usable without; Arch is the release's second supported guest, and a build
+# that dropped it would offer a distribution the product no longer ships.
 Require-File 'distros\ubuntu.json'
+Require-File 'distros\arch.json'
 
 # A payload is a pair -- `<payload_id>.zip` beside `<payload_id>.json` -- and
 # the application assembles its catalog from whichever pairs it finds. The

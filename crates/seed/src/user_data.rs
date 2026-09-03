@@ -5,7 +5,7 @@
 //! is a comment to YAML and the format marker to cloud-init.
 
 use vmlord_agent_protocol::auth::GUEST_SECRET_PATH;
-use vmlord_core::{SshAccess, SshPort, SshUnits};
+use vmlord_core::{PackageRefresh, SshAccess, SshPort, SshUnits};
 
 use crate::{AGENT_FILE, SeedRequest, scalar};
 
@@ -64,11 +64,22 @@ pub(crate) fn render(request: &SeedRequest<'_>) -> String {
 /// on, which is exactly what a host with no working network must leave behind:
 /// a VM that runs, that SSH answers on, and whose desktop is missing and can
 /// be installed again.
+///
+/// `package_upgrade` joins it where the profile says the distribution needs
+/// it. On a rolling distribution the lists describe one moving repository, so
+/// installing against a refreshed list without upgrading what is already there
+/// is a partial upgrade -- the state Arch documents as unsupported. Which
+/// distributions those are is the profile's to say; all this knows is that a
+/// key is printed or it is not.
 fn packages(request: &SeedRequest<'_>) -> String {
     if request.desktop_packages.is_empty() {
         return String::new();
     }
-    let mut block = String::from("package_update: true\npackages:\n");
+    let mut block = String::from("package_update: true\n");
+    if request.package_refresh == PackageRefresh::FullUpgrade {
+        block.push_str("package_upgrade: true\n");
+    }
+    block.push_str("packages:\n");
     for package in request.desktop_packages {
         block.push_str(&format!("  - {}\n", scalar::yaml(package)));
     }
@@ -315,7 +326,9 @@ mod tests {
     use super::{GUEST_SECRET_PATH, render};
     use crate::{SeedRequest, UBUNTU_KEYBOARD, UBUNTU_SSH};
     use serde_yaml_ng::Value;
-    use vmlord_core::{KeyboardFile, KeyboardForm, SshAccess, SshDaemon, SshPort, SshUnits};
+    use vmlord_core::{
+        KeyboardFile, KeyboardForm, PackageRefresh, SshAccess, SshDaemon, SshPort, SshUnits,
+    };
 
     const HASH: &str = "$6$rounds=4096$salt$hash";
     const KEY: &str = "ssh-ed25519 AAAAC3Nz vmlord";
@@ -424,6 +437,7 @@ mod tests {
             // two tests about the secret set it themselves.
             agent_secret: None,
             desktop_packages: &[],
+            package_refresh: PackageRefresh::Lists,
         }
     }
 
@@ -486,6 +500,19 @@ mod tests {
         assert!(document.get("package_update").is_none());
     }
 
+    /// A rolling guest is upgraded before anything is added to it, and a guest
+    /// asked for nothing is not upgraded at all: there is no partial upgrade to
+    /// avoid where no package is installed.
+    #[test]
+    fn a_headless_vm_is_not_upgraded_even_on_a_rolling_distribution() {
+        let document = parsed(&render(&SeedRequest {
+            package_refresh: PackageRefresh::FullUpgrade,
+            ..request()
+        }));
+
+        assert!(document.get("package_upgrade").is_none());
+    }
+
     #[test]
     fn a_desktop_vm_installs_its_packages_from_the_distribution_s_archives() {
         let packages = ["ubuntu-desktop-minimal".to_owned()];
@@ -499,6 +526,27 @@ mod tests {
             Value::from(vec!["ubuntu-desktop-minimal"])
         );
         assert_eq!(document["package_update"], Value::from(true));
+        assert!(
+            document.get("package_upgrade").is_none(),
+            "a distribution that supports adding a package to an old image is not upgraded whole"
+        );
+    }
+
+    /// `pacman -Sy` followed by an install resolves against one moving
+    /// repository, which is the partial upgrade Arch documents as unsupported.
+    /// `package_upgrade` is the `-u` that makes it a full `-Syu`.
+    #[test]
+    fn a_rolling_distribution_upgrades_the_guest_before_installing_into_it() {
+        let packages = ["gnome-shell".to_owned()];
+        let document = parsed(&render(&SeedRequest {
+            desktop_packages: &packages,
+            package_refresh: PackageRefresh::FullUpgrade,
+            ..request()
+        }));
+
+        assert_eq!(document["package_update"], Value::from(true));
+        assert_eq!(document["package_upgrade"], Value::from(true));
+        assert_eq!(document["packages"], Value::from(vec!["gnome-shell"]));
     }
 
     #[test]

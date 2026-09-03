@@ -6,6 +6,7 @@
   "checksum_file": "SHA256SUMS",
   "default_user": "ubuntu",
   "admin_group": "sudo",
+  "package_refresh": "Lists",
   "ssh": {
     "units": {
       "SocketActivated": {

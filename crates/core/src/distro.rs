@@ -215,6 +215,14 @@ pub struct DistroProfile {
     /// desktop -- a VM built from it can only be headless, which is a fact
     /// about the profile rather than a failure to be reported later.
     pub desktop: Option<DesktopSetup>,
+    /// What has to happen to the guest's packages before the desktop's are
+    /// installed.
+    ///
+    /// Defaulted rather than required, because a profile written before this
+    /// field existed described a distribution where refreshing the lists is
+    /// the whole answer, which is what the default says.
+    #[serde(default)]
+    pub package_refresh: PackageRefresh,
     /// The files that tell this distribution's guest what keyboard layout it
     /// has.
     ///
@@ -225,6 +233,34 @@ pub struct DistroProfile {
     /// written twice but two files, in two syntaxes, that a guest needs both
     /// of.
     pub keyboard: Vec<KeyboardFile>,
+}
+
+/// What a distribution needs done to its packages before new ones are added.
+///
+/// The distinction is not a preference, it is what a distribution supports.
+/// Debian and its family resolve a new package against refreshed lists and
+/// leave everything installed where it is; Arch resolves against one moving
+/// repository, so installing into an image a month old pulls in libraries
+/// built for packages the guest has not upgraded to -- a partial upgrade, which
+/// Arch documents as unsupported and does not test.
+///
+/// A field rather than a branch on the distribution's name, for the reason
+/// [`SshDaemon`] is data: what the seed prints is one more cloud-init key, and
+/// a generator that knew which distributions roll would have to be edited for
+/// the next one.
+///
+/// The variant names are an on-disk format: they are what a profile's JSON
+/// spells.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+pub enum PackageRefresh {
+    /// Refresh the package lists and install against them. cloud-init's
+    /// `package_update`, which is what every profile written so far meant.
+    #[default]
+    Lists,
+    /// Upgrade everything installed first, then add the new packages.
+    /// cloud-init's `package_upgrade`, which on Arch is the `-u` that turns
+    /// `pacman -Sy` into a full `-Syu`.
+    FullUpgrade,
 }
 
 /// One file the seed writes to set the guest's keyboard layout.
@@ -589,21 +625,29 @@ mod tests {
     use std::{
         fs,
         path::PathBuf,
+        sync::atomic::{AtomicUsize, Ordering},
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use super::{
-        DesktopProfile, DistroCatalog, DistroProfile, KeyboardFile, KeyboardForm, SshUnits,
-        sync_bundled_profiles, ubuntu,
+        DesktopProfile, DistroCatalog, DistroProfile, KeyboardFile, KeyboardForm, PackageRefresh,
+        SshUnits, sync_bundled_profiles, ubuntu,
     };
     use crate::SettingsStore;
+
+    /// A counter beside the clock, because the clock is not enough on its own.
+    /// Windows advances `SystemTime` in steps of about fifteen milliseconds,
+    /// so two of these tests starting together read the same nanosecond and
+    /// would share a directory -- one of them then deleting the other's.
+    static FIXTURES: AtomicUsize = AtomicUsize::new(0);
 
     fn temporary_directory() -> std::path::PathBuf {
         let unique_id = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("vmlord-distro-test-{unique_id}"))
+        let sequence = FIXTURES.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("vmlord-distro-test-{unique_id}-{sequence}"))
     }
 
     fn profile_document(name: &str, user: &str) -> String {
@@ -832,6 +876,104 @@ mod tests {
             profile.desktop.unwrap().packages,
             ["ubuntu-desktop-minimal"]
         );
+    }
+
+    /// Every field here was read off the distribution rather than assumed.
+    /// The image and its `.SHA256` sit in one directory that carries no
+    /// release, which is why both templates spell no `{release}`; Arch's
+    /// `openssh` prepends `Include /etc/ssh/sshd_config.d/*.conf` to
+    /// `sshd_config` and ships no `sshd.socket`, and `arch-boxes` enables
+    /// `sshd` -- so the port is a plain drop-in read by one service.
+    #[test]
+    fn the_shipped_arch_profile_matches_what_the_distribution_publishes() {
+        let profile: DistroProfile =
+            serde_json::from_str(include_str!("../../../distros/arch.json")).unwrap();
+
+        assert_eq!(profile.name, "Arch Linux");
+        assert_eq!(profile.releases, ["rolling"]);
+        assert_eq!(profile.default_user, "arch");
+        assert_eq!(profile.admin_group, "wheel");
+        assert_eq!(
+            profile.image_url("rolling"),
+            "https://geo.mirror.pkgbuild.com/images/latest/Arch-Linux-x86_64-cloudimg.qcow2"
+        );
+        assert_eq!(
+            profile.checksums_url("rolling"),
+            "https://geo.mirror.pkgbuild.com/images/latest/\
+             Arch-Linux-x86_64-cloudimg.qcow2.SHA256"
+        );
+        assert_eq!(profile.ssh.units.all(), ["sshd.service"]);
+        assert_eq!(
+            profile.ssh.config_drop_in,
+            "/etc/ssh/sshd_config.d/10-vmlord.conf"
+        );
+        assert_eq!(profile.desktop.unwrap().display_manager, "gdm.service");
+    }
+
+    /// A directory that names no release still has to answer the same two
+    /// URLs for every release the profile offers, since the resolver asks for
+    /// them by release whatever the templates do with it.
+    #[test]
+    fn a_release_that_is_not_in_the_url_leaves_the_arch_templates_alone() {
+        let profile: DistroProfile =
+            serde_json::from_str(include_str!("../../../distros/arch.json")).unwrap();
+
+        assert_eq!(profile.image_url("rolling"), profile.image_url("24.04"));
+        assert_eq!(
+            profile.file_name("rolling"),
+            "Arch-Linux-x86_64-cloudimg.qcow2"
+        );
+    }
+
+    /// Arch resolves a new package against one moving repository, so a
+    /// month-old image has to be upgraded rather than added to; Ubuntu does
+    /// not, and saying so in the profile is what keeps the seed from branching
+    /// on a distribution's name.
+    #[test]
+    fn the_shipped_profiles_state_what_installing_into_them_takes() {
+        let arch: DistroProfile =
+            serde_json::from_str(include_str!("../../../distros/arch.json")).unwrap();
+        let ubuntu: DistroProfile =
+            serde_json::from_str(include_str!("../../../distros/ubuntu.json")).unwrap();
+
+        assert_eq!(arch.package_refresh, PackageRefresh::FullUpgrade);
+        assert_eq!(ubuntu.package_refresh, PackageRefresh::Lists);
+    }
+
+    /// Arch splits the console keymap from the graphical layout, and the two
+    /// files are read by different parsers -- which is what the forms are for.
+    #[test]
+    fn the_shipped_arch_profile_writes_both_keyboard_files() {
+        let profile: DistroProfile =
+            serde_json::from_str(include_str!("../../../distros/arch.json")).unwrap();
+
+        let [console, graphical] = profile.keyboard.as_slice() else {
+            panic!("Arch names two keyboard files");
+        };
+        assert_eq!(console.path, "/etc/vconsole.conf");
+        assert_eq!(console.form, KeyboardForm::ShellAssignment);
+        assert_eq!(console.content("ru"), "KEYMAP=\"ru\"\n");
+
+        assert_eq!(graphical.path, "/etc/X11/xorg.conf.d/00-keyboard.conf");
+        assert_eq!(graphical.form, KeyboardForm::XorgString);
+        assert!(
+            graphical
+                .content("ru")
+                .contains("Option \"XkbLayout\" \"ru\""),
+            "{}",
+            graphical.content("ru")
+        );
+    }
+
+    /// A profile written before the field existed still loads, and reads as
+    /// the distribution it was written for: one where refreshing the lists is
+    /// the whole answer.
+    #[test]
+    fn a_profile_that_says_nothing_about_upgrading_refreshes_the_lists() {
+        let profile: DistroProfile =
+            serde_json::from_str(&profile_document("legacy", "legacy")).unwrap();
+
+        assert_eq!(profile.package_refresh, PackageRefresh::Lists);
     }
 
     /// The file the shipped profile names is the one the seed used to carry as
