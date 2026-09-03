@@ -420,6 +420,13 @@ impl DistroCatalog {
             .iter()
             .map(|(id, profile)| (id.as_str(), profile.name.as_str()))
     }
+
+    /// Every loaded profile with the identifier it was loaded under.
+    pub fn profiles(&self) -> impl Iterator<Item = (&str, &DistroProfile)> {
+        self.profiles
+            .iter()
+            .map(|(id, profile)| (id.as_str(), profile))
+    }
 }
 
 #[derive(Debug)]
