@@ -4285,7 +4285,10 @@ run installed is removed. That Mesa carries a patch, described under "What the
 bundled Mesa is patched for", which lets d3d12 present a frame through a dumb BO
 on our own device: the compositor composites on the GPU and scans out through
 `vmlord_drm`. What used to be the failure this stage prevented is what the patch
-fixes.
+fixes. Verified on a live guest: with the drop-in removed, gnome-shell comes up
+mapping the payload's `libgallium` and the host's `libnvwgf2umx.so` -- a
+compositor on llvmpipe never loads the NVIDIA user-mode driver -- completes its
+atomic modeset, leaves the connector enabled, and logs no `EGL_BAD_ALLOC`.
 
 A guest with no adapter gets the drop-in, and needs it more than it used to. The
 file is the same for every VM, so it comes out of the payload, and it says two
