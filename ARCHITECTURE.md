@@ -1298,15 +1298,33 @@ llvmpipe on the same device gets one -- and copies the rendered frame into it on
 `flush_resource`, the call the frontend makes before every swap. Both halves
 already existed in d3d12; only `PIPE_BIND_DISPLAY_TARGET` reached them.
 
-The cost is one full-frame readback per presented frame, against llvmpipe
-compositing every frame on the CPU. Measured on an RTX 5070 Ti through GPU-PV,
-draw plus swap plus readback at 1080p: 1.03 ms on d3d12 against 5.52 ms on
-llvmpipe for the same frame. That is a synthetic draw, and a blocking read every
-frame can serialise CPU and GPU more than a bandwidth number suggests; the figure
-to trust is one taken under a real compositing load. The same copy is known to be
-pathological on at least one Intel iGPU -- WSLg issue #1498 reports 327-359 ms per
-frame at 720p -- which is a portability question this does not answer and which
-no guard here addresses yet.
+The cost is one full-frame readback per presented frame, and it is a fixed cost
+that buys a variable one. Measured on the live guest against an RTX 5070 Ti
+through GPU-PV, at 1080p, drawing N blended full-screen passes per frame:
+
+| passes | d3d12 | llvmpipe |
+| --- | --- | --- |
+| 0 | 7.75 ms | 4.19 ms |
+| 1 | 7.48 ms | 6.22 ms |
+| 2 | 7.48 ms | 8.58 ms |
+| 4 | 7.93 ms | 15.91 ms |
+| 8 | 8.44 ms | 28.40 ms |
+| 16 | 8.18 ms | 56.92 ms |
+
+d3d12 is flat, because what it pays is the copy and not the drawing; llvmpipe is
+linear in the compositing it is asked to do. **The two cross at about two blended
+full-screen passes**, which is less than a desktop with a wallpaper and one window
+already costs, so a real compositor is on the winning side of it -- but a guest
+showing almost nothing is not, and this is a slower way to present a still screen.
+
+The floor is proportional to pixels and nothing else: 3.73 ms at 720p, 8.07 at
+1080p, 13.45 at 1440p, 27.81 at 2160p -- about 1 GiB/s, where llvmpipe reads the
+same 8 MB out of system memory at roughly 5.9 GiB/s in the same probe. That ratio
+is what a read across the bus costs, which says the frame is being read out of
+VRAM rather than out of a system-memory heap. Fixing that is a further patch and
+not this one; it is also what makes the same copy pathological on at least one
+Intel iGPU, where WSLg issue #1498 reports 327-359 ms per frame at 720p. No guard
+here addresses that yet.
 
 A patch is provenance, so it is recorded rather than merely applied. It is
 declared on the mesa source in `payload.spec.json`, `prepare.py` digests the

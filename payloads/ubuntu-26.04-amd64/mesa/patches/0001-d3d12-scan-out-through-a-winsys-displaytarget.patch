@@ -28,9 +28,18 @@ for a committed texture. A resource presented by copying does not need a row-maj
 layout -- the copy is what makes the layout linear -- so the demand is dropped
 whenever there is a winsys to copy into. Without one, nothing here changes.
 
-The cost is one full-frame readback per presented frame. Measured on an RTX 5070
-Ti through GPU-PV, draw plus swap plus readback at 1080p: 1.03 ms against
-llvmpipe's 5.52 ms for the same frame. On at least one Intel iGPU the same copy
+The cost is one full-frame readback per presented frame: a fixed cost in exchange
+for a variable one. Measured on an RTX 5070 Ti through GPU-PV at 1080p, drawing N
+blended full-screen passes, d3d12 against llvmpipe: 7.75/4.19 ms at N=0,
+7.48/8.58 at N=2, 8.44/28.40 at N=8, 8.18/56.92 at N=16. d3d12 is flat because
+what it pays is the copy; the two cross at about two passes, which a desktop
+exceeds before it has drawn a window.
+
+The floor is proportional to pixels alone -- 3.73 ms at 720p to 27.81 ms at
+2160p, about 1 GiB/s, against roughly 5.9 GiB/s for a system-memory read of the
+same frame in the same probe. That is the cost of reading across the bus: the
+render target lives in a DEFAULT heap, and a system-memory heap for the scanout
+resource would be the next thing to try. On at least one Intel iGPU the same copy
 is pathological -- WSLg issue #1498 reports 327-359 ms per frame at 720p -- so a
 host that is not known good deserves a measurement before this path is trusted.
 
