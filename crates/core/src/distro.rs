@@ -356,6 +356,25 @@ pub struct DesktopSetup {
     /// it acts. A declared display manager was exactly that second copy, and
     /// it was deleted rather than kept in step with the truth beside it.
     pub packages: Vec<String>,
+    /// The display manager unit the first boot enables once those packages
+    /// are installed.
+    ///
+    /// Not the copy #159 deleted, and the difference is which way it points.
+    /// That field answered *what the guest has*, which the agent reads out of
+    /// the guest -- two sources for one answer, which can disagree. This one
+    /// answers *what to switch on*, before there is a guest to ask: a request,
+    /// like the package list beside it, and one nothing reads back as a fact.
+    ///
+    /// It has to be declared because packaging does not agree on who enables a
+    /// display manager. Debian and Ubuntu do it from the package's
+    /// `postinst`; Arch leaves enabling a unit to the administrator, and it is
+    /// the rule rather than the exception. So the packages land, the guest
+    /// reaches `graphical.target` with nothing in it, and sits at a text
+    /// console with GDM installed and inactive.
+    ///
+    /// `SshDaemon::units` names units for the same reason: what a
+    /// distribution calls its own service is the distribution's to say.
+    pub service: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -885,10 +904,12 @@ mod tests {
             "https://cloud-images.ubuntu.com/releases/24.04/release/SHA256SUMS"
         );
         assert_eq!(profile.ssh.units.all(), ["ssh.socket", "ssh.service"]);
-        assert_eq!(
-            profile.desktop.unwrap().packages,
-            ["ubuntu-desktop-minimal"]
-        );
+        let desktop = profile.desktop.unwrap();
+        assert_eq!(desktop.packages, ["ubuntu-desktop-minimal"]);
+        // Named even though the deb enables it: the profiles say the same
+        // thing in the same place, and Ubuntu stops depending on a side
+        // effect of someone else's `postinst` for its login screen.
+        assert_eq!(desktop.service, "gdm3.service");
     }
 
     /// Every field here was read off the distribution rather than assumed.
@@ -920,7 +941,12 @@ mod tests {
             profile.ssh.config_drop_in,
             "/etc/ssh/sshd_config.d/10-vmlord.conf"
         );
-        assert_eq!(profile.desktop.unwrap().packages[0], "gnome-shell");
+        let desktop = profile.desktop.unwrap();
+        assert_eq!(desktop.packages[0], "gnome-shell");
+        // `gdm`, not `gdm3`: Debian renamed the package and the unit with it.
+        // Nothing in a pacman package enables this, which is why the profile
+        // has to name it at all.
+        assert_eq!(desktop.service, "gdm.service");
     }
 
     /// A directory that names no release still has to answer the same two
@@ -1074,6 +1100,7 @@ mod tests {
             .desktop_for(DesktopProfile::Gnome)
             .expect("Ubuntu installs GNOME");
         assert_eq!(desktop.packages, ["ubuntu-desktop-minimal"]);
+        assert_eq!(desktop.service, "gdm3.service");
         assert_eq!(ubuntu.desktop_for(DesktopProfile::Headless), None);
     }
 

@@ -42,6 +42,7 @@ mod tests {
             ssh_daemon: &UBUNTU_SSH,
             agent_secret: None,
             desktop_packages: &[],
+            desktop_service: None,
             package_refresh: PackageRefresh::Lists,
         }
     }

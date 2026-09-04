@@ -81,6 +81,7 @@ fn seed() -> Seed {
         ssh_daemon: &ubuntu().ssh,
         agent_secret: None,
         desktop_packages: &[],
+        desktop_service: None,
         package_refresh: PackageRefresh::Lists,
     })
 }

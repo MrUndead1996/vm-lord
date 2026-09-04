@@ -25,6 +25,7 @@
     }
   ],
   "desktop": {
-    "packages": ["ubuntu-desktop-minimal"]
+    "packages": ["ubuntu-desktop-minimal"],
+    "service": "gdm3.service"
   }
 }

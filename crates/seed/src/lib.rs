@@ -60,6 +60,16 @@ pub struct SeedRequest<'a> {
     /// rather than a profile, because this crate prints documents and has no
     /// business knowing what GNOME is.
     pub desktop_packages: &'a [String],
+    /// The display manager unit the first boot enables once those packages
+    /// are installed, or `None` for a VM with no desktop.
+    ///
+    /// A name, like the packages above, and for the same reason: this crate
+    /// prints documents and has no business knowing which unit GNOME's login
+    /// screen is. Whose job enabling it is differs by packaging -- Debian's
+    /// `postinst` does it, Arch leaves it to the administrator -- so the seed
+    /// does it everywhere rather than depending on which of the two a
+    /// distribution turned out to be.
+    pub desktop_service: Option<&'a str>,
     /// What the distribution needs done to its packages before those are
     /// installed.
     ///
@@ -225,6 +235,7 @@ mod tests {
             ssh_daemon: &UBUNTU_SSH,
             agent_secret: None,
             desktop_packages: &[],
+            desktop_service: None,
             package_refresh: PackageRefresh::Lists,
         });
 
@@ -254,6 +265,7 @@ mod tests {
             ssh_daemon: &UBUNTU_SSH,
             agent_secret: None,
             desktop_packages: &[],
+            desktop_service: None,
             package_refresh: PackageRefresh::Lists,
         });
 
