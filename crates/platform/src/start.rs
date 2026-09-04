@@ -22,7 +22,7 @@ use crate::{
     gpu_prepare::{self, PreparedGpu},
     gpu_runs::GpuRuns,
     hcn::HcnNetwork,
-    hcn_endpoint::{EndpointAddress, HcnEndpoint},
+    hcn_endpoint::{EndpointAddress, EndpointIdentity, HcnEndpoint},
     hcs::{HCS_ACCESS_ALL, HcsStartFailure, HcsSystemState},
     hcs_config::{self, Plan9Export},
     layout,
@@ -786,14 +786,16 @@ fn ensure_endpoint(
             if let Some(id) = recorded {
                 tracing::warn!(
                     "HNS no longer knows endpoint {id} of VM \"{vm_name}\"; \
-                     creating a new one, which changes the address the guest is offered"
+                     creating a new one, which changes both the address the guest is offered \
+                     and the card it is offered on -- a guest whose network configuration was \
+                     pinned to the old MAC will not bring its link up"
                 );
             }
             let id = Uuid::new_v4();
             (id, HcnEndpoint::create(&network, id, vm_name)?)
         }
         (EndpointPolicy::Replace, existing) => {
-            let address = replaced_address(vm_name, existing.as_ref())?;
+            let identity = replaced_identity(vm_name, existing.as_ref())?;
             if let Some(id) = recorded {
                 // The handle has to close before HNS will delete what it points
                 // at.
@@ -801,18 +803,13 @@ fn ensure_endpoint(
                 HcnEndpoint::delete(id)?;
             }
             let id = Uuid::new_v4();
-            match &address {
-                Some(address) => tracing::info!(
-                    "replacing the occupied endpoint of VM \"{vm_name}\" with {id} on {}",
-                    address.ip_address
-                ),
-                None => {
-                    tracing::info!("replacing the occupied endpoint of VM \"{vm_name}\" with {id}")
-                }
-            }
+            tracing::info!(
+                "replacing the occupied endpoint of VM \"{vm_name}\" with {id}{}",
+                repeated_identity(&identity)
+            );
             (
                 id,
-                HcnEndpoint::create_with_address(&network, id, vm_name, address.as_ref())?,
+                HcnEndpoint::create_with_identity(&network, id, vm_name, &identity)?,
             )
         }
     };
@@ -824,21 +821,48 @@ fn ensure_endpoint(
     })
 }
 
-/// The address a replacement endpoint should ask for.
+/// What the replacement was able to keep, for the line that records it.
 ///
-/// `None` when HNS no longer has the old endpoint or reports no address for it:
-/// the guest then gets whatever the network's IPAM assigns, which is worse than
-/// keeping its address but far better than not starting.
-fn replaced_address(
+/// Empty when it kept nothing, so that the sentence reads as a plain
+/// replacement rather than trailing off: what a replacement could not repeat is
+/// warned about where it was found, and saying it twice would only make the
+/// second sentence the one people read.
+fn repeated_identity(identity: &EndpointIdentity) -> String {
+    let mut kept = String::new();
+    if let Some(address) = &identity.address {
+        kept.push_str(&format!(" on {}", address.ip_address));
+    }
+    if let Some(mac) = &identity.mac_address {
+        kept.push_str(&format!(" at {mac}"));
+    }
+    kept
+}
+
+/// What a replacement endpoint should ask HNS to repeat.
+///
+/// Both halves matter, and the MAC is the one that decides whether the guest
+/// has a network at all. A guest writes its network configuration on its first
+/// boot and pins it to the card it saw -- cloud-init's networkd renderer
+/// matches on `MACAddress`, netplan on `macaddress` -- so a replacement with a
+/// fresh MAC matches nothing the guest wrote, the link is never brought up, and
+/// the address kept for it is never asked for. That is what a second start of
+/// the Arch guest looked like from inside: `eth0` down, no address,
+/// `systemd-networkd-wait-online` timing out.
+///
+/// Absent when HNS no longer has the old endpoint or reports nothing for it:
+/// the guest then gets whatever HNS assigns, which is worse than keeping what
+/// it had but far better than not starting.
+fn replaced_identity(
     vm_name: &str,
     existing: Option<&(Uuid, HcnEndpoint)>,
-) -> Result<Option<EndpointAddress>, RepositoryError> {
+) -> Result<EndpointIdentity, RepositoryError> {
     let Some((id, endpoint)) = existing else {
         tracing::warn!(
             "HNS no longer knows the occupied endpoint of VM \"{vm_name}\"; \
-             its replacement is created without an address of its own"
+             its replacement is created without an address or a MAC of its own, so the guest \
+             is offered a card its network configuration was not written against"
         );
-        return Ok(None);
+        return Ok(EndpointIdentity::fresh());
     };
 
     let address = endpoint.address()?;
@@ -848,7 +872,25 @@ fn replaced_address(
              its replacement cannot ask for the old one, so the guest is offered a new address"
         );
     }
-    Ok(address)
+    // Not fatal, unlike `HcnEndpoint::mac_address`: a start that cannot repeat
+    // the MAC is a start that costs the guest its network configuration, and
+    // refusing to start would cost it more.
+    let mac_address = match endpoint.mac_address() {
+        Ok(mac) => Some(mac),
+        Err(error) => {
+            tracing::warn!(
+                "HNS reports no MAC address for endpoint {id} of VM \"{vm_name}\": {error}; \
+                 its replacement is given a new one, which a guest that pinned its network \
+                 configuration to the old card will not recognise"
+            );
+            None
+        }
+    };
+
+    Ok(EndpointIdentity {
+        address,
+        mac_address,
+    })
 }
 
 /// Starts the compute system `id`, re-creating it from `configuration` first
@@ -992,11 +1034,11 @@ mod tests {
     use super::{
         EndpointPolicy, ExistingSystemPlan, GpuRuns, HcsSystemState, PreparedDisplay, PreparedGpu,
         VmNetworkAdapter, VmStartPipeline, attachment_paths, canonicalize_for_export,
-        plan_for_existing,
+        plan_for_existing, repeated_identity,
     };
     use crate::{
         Com1Launcher,
-        hcn_endpoint::EndpointAddress,
+        hcn_endpoint::{EndpointAddress, EndpointIdentity},
         hcs::HcsStartFailure,
         metadata::{MetadataStore, VmComputeSystemMapping},
     };
@@ -2256,5 +2298,28 @@ mod tests {
             "{error}"
         );
         assert!(calls.dhcp.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_replacement_line_names_both_halves_it_kept() {
+        let identity = EndpointIdentity {
+            address: Some(EndpointAddress {
+                ip_address: "172.22.42.7".into(),
+                prefix_length: 24,
+            }),
+            mac_address: Some("00-15-5D-3B-81-44".to_owned()),
+        };
+
+        assert_eq!(
+            repeated_identity(&identity),
+            " on 172.22.42.7 at 00-15-5D-3B-81-44"
+        );
+    }
+
+    #[test]
+    fn a_replacement_that_kept_nothing_names_nothing() {
+        // The warnings at the point each half was lost say what happened; this
+        // line would only repeat them less precisely.
+        assert_eq!(repeated_identity(&EndpointIdentity::fresh()), "");
     }
 }
