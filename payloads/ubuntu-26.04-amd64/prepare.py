@@ -33,6 +33,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--spec", type=Path, required=True)
     parser.add_argument("--overlays", type=Path, required=True)
+    parser.add_argument("--patches", type=Path, required=True)
     parser.add_argument("--licenses", type=Path, required=True)
     parser.add_argument("--checkout", type=Path, required=True)
     parser.add_argument("--mesa", type=Path, default=None)
@@ -60,7 +61,9 @@ def main() -> None:
     provenance = {
         "target": spec["target"],
         "mesa_policy": spec["mesa_policy"],
-        "sources": source_records(spec, arguments.checkout, prepared, arguments.mesa),
+        "sources": source_records(
+            spec, arguments.checkout, prepared, arguments.mesa, arguments.patches
+        ),
         "overlays": [overlay_record(overlay, prepared) for overlay in spec["overlays"]],
     }
 
@@ -121,14 +124,16 @@ def copy_files(root: Path, prepared: Path, pairs: list[tuple[str, str]]) -> None
         shutil.copyfile(root / name, destination)
 
 
-def source_records(spec: dict, checkout: Path, prepared: Path, mesa: Path | None) -> list[dict]:
+def source_records(
+    spec: dict, checkout: Path, prepared: Path, mesa: Path | None, patches: Path
+) -> list[dict]:
     """The provenance record for every source, in the order the spec lists them."""
     records = []
     for source in spec["sources"]:
         if source["kind"] == "checkout":
             records.append(checkout_record(source, checkout))
         else:
-            records.append(built_record(source, prepared, mesa))
+            records.append(built_record(source, prepared, mesa, patches))
     return records
 
 
@@ -148,12 +153,16 @@ def checkout_record(source: dict, checkout: Path) -> dict:
     }
 
 
-def built_record(source: dict, prepared: Path, mesa: Path | None) -> dict:
+def built_record(source: dict, prepared: Path, mesa: Path | None, patches: Path) -> dict:
     """The record for a tree that was compiled rather than copied.
 
     The digest covers what shipped, by the same rule the upstream digest uses, so the
     builder can check it against the files it is about to pack instead of taking it on
     trust.
+
+    `patches` names what this repository changed in the upstream tree before compiling
+    it, digested from the patch files the image just applied. Without it the record
+    would name a commit whose sources are not what these binaries were built from.
     """
     if mesa is None:
         raise SystemExit("this payload's policy is bundled: --mesa <tree> is required")
@@ -169,7 +178,17 @@ def built_record(source: dict, prepared: Path, mesa: Path | None) -> dict:
         "output": source["output"],
         "licenses": source["licenses"],
         "inputs": source["inputs"],
+        "patches": [patch_record(patch, patches) for patch in source.get("patches", [])],
         "sha256": tree_digest(prepared, output),
+    }
+
+
+def patch_record(patch: dict, patches: Path) -> dict:
+    return {
+        "file": patch["file"],
+        "sha256": sha256(patches / patch["file"]),
+        "author": patch["author"],
+        "reason": patch["reason"],
     }
 
 

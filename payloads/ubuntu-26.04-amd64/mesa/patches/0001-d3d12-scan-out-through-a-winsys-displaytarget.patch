@@ -1,0 +1,249 @@
+d3d12: scan out through a winsys displaytarget
+
+Against mesa-26.2.0 (9f0a761020bca92f2b07156a0621e5360cb8eca5), the commit
+payload.spec.json pins. Not submitted upstream.
+
+A GPU-PV guest has exactly one DRM device, `vmlord_drm`, and it has no render
+half -- so gbm loads the kms_swrast screen and `GALLIUM_DRIVER` picks what draws
+into it. d3d12 draws there today: a context comes up on the host's adapter and
+`eglSwapBuffers` succeeds. What did not work is the last hop, handing the frame
+to KMS, and that is the whole of what this patch changes.
+
+Two things were in the way.
+
+The frame was never in a buffer KMS could address. gbm asks for a scanout buffer
+and then asks that buffer for a DRM handle; d3d12 returned a resource in D3D12
+memory, so the handle came back 0 and `drmModeAddFB2` answered EINVAL. llvmpipe
+on the same device answers with handle 1, because it routes a `PIPE_BIND_SCANOUT`
+resource onto a winsys displaytarget -- a dumb BO on the KMS device, which does
+carry a handle. This patch does the same, and copies the rendered frame into that
+displaytarget on `flush_resource`, which the frontend calls before every swap.
+Both halves already existed in d3d12: displaytarget allocation through the winsys
+and the copy in `d3d12_flush_frontbuffer`. Only `PIPE_BIND_DISPLAY_TARGET` reached
+them, and gbm asks for `PIPE_BIND_SCANOUT`.
+
+And with `GBM_BO_USE_SCANOUT` the allocation failed outright, before any of that:
+`PIPE_BIND_SCANOUT` forced `D3D12_TEXTURE_LAYOUT_ROW_MAJOR`, which D3D12 refuses
+for a committed texture. A resource presented by copying does not need a row-major
+layout -- the copy is what makes the layout linear -- so the demand is dropped
+whenever there is a winsys to copy into. Without one, nothing here changes.
+
+The cost is one full-frame readback per presented frame: a fixed cost in exchange
+for a variable one. Measured on an RTX 5070 Ti through GPU-PV at 1080p, drawing N
+blended full-screen passes, d3d12 against llvmpipe: 7.75/4.19 ms at N=0,
+7.48/8.58 at N=2, 8.44/28.40 at N=8, 8.18/56.92 at N=16. d3d12 is flat because
+what it pays is the copy; the two cross at about two passes, which a desktop
+exceeds before it has drawn a window.
+
+The floor is proportional to pixels alone -- 3.73 ms at 720p to 27.81 ms at
+2160p -- 0.96 GiB/s at 1080p, against 5.64 GiB/s for a system-memory read of the
+same frame in the same probe. Where that 5.9x goes is not established: the read
+is staged through a READBACK heap, so a GPU copy, a fence wait and a CPU copy are
+all in it, and which one dominates has not been measured. On at least one Intel
+iGPU the same copy is pathological -- WSLg issue #1498 reports 327-359 ms per
+frame at 720p -- so a host that is not known good deserves a measurement before
+this path is trusted.
+
+Refs: #180
+diff --git a/src/gallium/drivers/d3d12/d3d12_context_common.cpp b/src/gallium/drivers/d3d12/d3d12_context_common.cpp
+index 73e2d5d..b90d39e 100644
+--- a/src/gallium/drivers/d3d12/d3d12_context_common.cpp
++++ b/src/gallium/drivers/d3d12/d3d12_context_common.cpp
+@@ -58,6 +58,9 @@
+ #include "util/u_upload_mgr.h"
+ #include "util/u_pstipple.h"
+ #include "util/u_sample_positions.h"
++#include "util/u_surface.h"
++
++#include "frontend/sw_winsys.h"
+ #include "util/u_dl.h"
+ #include <dxguids/dxguids.h>
+ #include <string.h>
+@@ -210,6 +213,42 @@ d3d12_flush(struct pipe_context *pipe,
+    }
+ }
+ 
++/* Copies a scanout resource into the displaytarget its consumer scans out of.
++ *
++ * A scanout consumer -- gbm, and through it a KMS compositor -- was handed the
++ * displaytarget's DRM handle when it asked this resource for one, so the frame
++ * has to be in the displaytarget by the time the frame is handed over. The
++ * frontend flushes the back buffer before every swap, which is that moment.
++ *
++ * This is the same copy d3d12_flush_frontbuffer performs for a display target,
++ * without the presentation the winsys does afterwards: on a KMS device the
++ * consumer presents, not the winsys.
++ */
++static void
++d3d12_present_to_displaytarget(struct pipe_context *pctx,
++                               struct d3d12_resource *res)
++{
++   struct d3d12_screen *screen = d3d12_screen(pctx->screen);
++   struct sw_winsys *winsys = screen->winsys;
++   struct pipe_resource *pres = &res->base.b;
++
++   void *map = winsys->displaytarget_map(winsys, res->dt, 0);
++   if (!map)
++      return;
++
++   struct pipe_transfer *transfer = nullptr;
++   void *res_map = pipe_texture_map(pctx, pres, 0, 0, PIPE_MAP_READ, 0, 0,
++                                    pres->width0, pres->height0, &transfer);
++   if (res_map) {
++      util_copy_rect((uint8_t *)map, pres->format, res->dt_stride, 0, 0,
++                     transfer->box.width, transfer->box.height,
++                     (const uint8_t *)res_map, transfer->stride, 0, 0);
++      pipe_texture_unmap(pctx, transfer);
++   }
++
++   winsys->displaytarget_unmap(winsys, res->dt);
++}
++
+ static void
+ d3d12_flush_resource(struct pipe_context *pctx,
+                      struct pipe_resource *pres)
+@@ -223,6 +262,9 @@ d3d12_flush_resource(struct pipe_context *pctx,
+    d3d12_apply_resource_states(ctx, false);
+    d3d12_batch_reference_resource(d3d12_current_batch(ctx), res, true);
+    ctx->has_commands = true;
++
++   if (res->dt && (pres->bind & PIPE_BIND_SCANOUT))
++      d3d12_present_to_displaytarget(pctx, res);
+ }
+ 
+ static void
+diff --git a/src/gallium/drivers/d3d12/d3d12_resource.cpp b/src/gallium/drivers/d3d12/d3d12_resource.cpp
+index 5a96e44..adf4e28 100644
+--- a/src/gallium/drivers/d3d12/d3d12_resource.cpp
++++ b/src/gallium/drivers/d3d12/d3d12_resource.cpp
+@@ -316,7 +316,14 @@ init_texture(struct d3d12_screen *screen,
+       }
+    }
+ 
+-   if (templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_LINEAR))
++   /* A scanout resource is presented by copying it into a winsys displaytarget
++    * -- a dumb BO on the KMS device -- so the D3D12 resource itself is an
++    * ordinary tiled render target. Asking for ROW_MAJOR here would be asking
++    * D3D12 for a layout it rejects on a committed texture, which is why a gbm
++    * surface with GBM_BO_USE_SCANOUT used to fail allocation outright.
++    */
++   if ((templ->bind & PIPE_BIND_LINEAR) ||
++       ((templ->bind & PIPE_BIND_SCANOUT) && !screen->winsys))
+       desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+ 
+    HRESULT hres = E_FAIL;
+@@ -414,7 +421,13 @@ init_texture(struct d3d12_screen *screen,
+    if (FAILED(hres))
+       return false;
+ 
+-   if (screen->winsys && (templ->bind & PIPE_BIND_DISPLAY_TARGET)) {
++   /* PIPE_BIND_SCANOUT is here for the same reason PIPE_BIND_DISPLAY_TARGET is:
++    * neither can be presented from D3D12 memory. A displaytarget on the KMS
++    * winsys is a dumb BO that carries a DRM handle, which is what a scanout
++    * consumer -- gbm, and through it a KMS compositor -- asks this resource
++    * for. d3d12_flush_resource copies into it before the frame is handed over.
++    */
++   if (screen->winsys && (templ->bind & (PIPE_BIND_DISPLAY_TARGET | PIPE_BIND_SCANOUT))) {
+       struct sw_winsys *winsys = screen->winsys;
+       if (winsys->is_displaytarget_format_supported(winsys, res->base.b.bind, res->base.b.format)) {
+          res->dt = winsys->displaytarget_create(screen->winsys,
+@@ -424,8 +437,10 @@ init_texture(struct d3d12_screen *screen,
+                                                 templ->height0,
+                                                 64, NULL,
+                                                 &res->dt_stride);
++         if (!res->dt)
++            return false;
+          res->dt_refcount = 1;
+-      } else {
++      } else if (templ->bind & PIPE_BIND_DISPLAY_TARGET) {
+          assert(res->base.b.format == PIPE_FORMAT_R16G16B16A16_FLOAT); /* The only format we proxy right now */
+          struct pipe_resource proxy_templ = *templ;
+          proxy_templ.format = PIPE_FORMAT_R8G8B8A8_UNORM;
+@@ -433,6 +448,12 @@ init_texture(struct d3d12_screen *screen,
+          if (!res->dt_proxy)
+             return false;
+          assert(d3d12_resource(res->dt_proxy)->dt);
++      } else {
++         /* A scanout resource with no displaytarget behind it could be
++          * allocated, but nothing could ever present it. Fail here rather than
++          * at drmModeAddFB2, which is far from the cause.
++          */
++         return false;
+       }
+    }
+ 
+@@ -847,6 +868,15 @@ d3d12_resource_get_handle(struct pipe_screen *pscreen,
+    case WINSYS_HANDLE_TYPE_D3D12_RES:
+       handle->com_obj = d3d12_resource_resource(res);
+       return true;
++   case WINSYS_HANDLE_TYPE_KMS:
++   case WINSYS_HANDLE_TYPE_SHARED:
++      /* The frame the consumer scans out lives in the displaytarget, not in
++       * the D3D12 resource, so the handle it wants is the displaytarget's.
++       */
++      if (!res->dt || !(res->base.b.bind & PIPE_BIND_SCANOUT) ||
++          !screen->winsys || !screen->winsys->displaytarget_get_handle)
++         return false;
++      return screen->winsys->displaytarget_get_handle(screen->winsys, res->dt, handle);
+    case WINSYS_HANDLE_TYPE_FD: {
+       HANDLE d3d_handle = nullptr;
+ 
+@@ -1000,6 +1030,39 @@ d3d12_resource_get_param(struct pipe_screen *pscreen,
+    struct d3d12_resource* res = d3d12_resource(pres);
+    unsigned num_planes = util_format_get_num_planes(res->overall_format);
+ 
++   /* Everything about a resource backed by a displaytarget that a scanout
++    * consumer can act on describes the displaytarget: its stride, its handle
++    * and its modifier. The D3D12 resource's own footprint describes memory the
++    * consumer cannot reach.
++    */
++   if (res->dt && (res->base.b.bind & PIPE_BIND_SCANOUT)) {
++      struct winsys_handle whandle;
++
++      switch (param) {
++      case PIPE_RESOURCE_PARAM_STRIDE:
++         *value = res->dt_stride;
++         return true;
++      case PIPE_RESOURCE_PARAM_OFFSET:
++      case PIPE_RESOURCE_PARAM_MODIFIER:
++      case PIPE_RESOURCE_PARAM_HANDLE_TYPE_SHARED:
++      case PIPE_RESOURCE_PARAM_HANDLE_TYPE_KMS:
++         memset(&whandle, 0, sizeof(whandle));
++         whandle.type = param == PIPE_RESOURCE_PARAM_HANDLE_TYPE_SHARED ?
++            WINSYS_HANDLE_TYPE_SHARED : WINSYS_HANDLE_TYPE_KMS;
++         if (!d3d12_resource_get_handle(pscreen, context, pres, &whandle, handle_usage))
++            return false;
++         if (param == PIPE_RESOURCE_PARAM_OFFSET)
++            *value = whandle.offset;
++         else if (param == PIPE_RESOURCE_PARAM_MODIFIER)
++            *value = whandle.modifier;
++         else
++            *value = (uint64_t)(uintptr_t)whandle.handle;
++         return true;
++      default:
++         break;
++      }
++   }
++
+    pipe_resource *planes[d3d12_max_planes];
+    unsigned int strides[d3d12_max_planes];
+    unsigned int layer_strides[d3d12_max_planes];
+diff --git a/src/gallium/drivers/d3d12/d3d12_screen.cpp b/src/gallium/drivers/d3d12/d3d12_screen.cpp
+index af1d2f2..ebe0d5f 100644
+--- a/src/gallium/drivers/d3d12/d3d12_screen.cpp
++++ b/src/gallium/drivers/d3d12/d3d12_screen.cpp
+@@ -529,6 +529,14 @@ d3d12_is_format_supported(struct pipe_screen *pscreen,
+          return false;
+    }
+ 
++   /* A scanout resource is presented through a displaytarget, so a format the
++    * winsys cannot hold is a format this screen cannot scan out -- there is no
++    * proxy for it the way there is for a display target.
++    */
++   if ((bind & PIPE_BIND_SCANOUT) && screen->winsys &&
++       !screen->winsys->is_displaytarget_format_supported(screen->winsys, bind, format))
++      return false;
++
+    D3D12_FEATURE_DATA_FORMAT_SUPPORT fmt_info;
+    fmt_info.Format = d3d12_get_resource_rt_format(format);
+    if (FAILED(screen->dev->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT,

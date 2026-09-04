@@ -124,6 +124,23 @@ is `prepare_test.py`, which the Dockerfile runs in the same stage that runs
 `prepare.py`, so every payload build executes it and no host needs a test
 framework — or a `python3` — to get the check.
 
+`patches` on the `built` record is the other thing a commit alone cannot say.
+The Mesa in this payload is not the pinned commit: it is that commit plus what
+`mesa/patches/` holds, applied by `git apply` in the image before `build.sh`
+runs. Each patch is declared in the spec with the file, its author and why it is
+there; `prepare.py` measures the digest from the patch file itself, the same way
+overlay digests are measured, so editing a patch changes the record on the next
+run. A patch adds no catalog row — it is not a source anyone can fetch, and the
+tree it changes is already a row — but without it a reader of the manifest would
+take the commit for the whole truth about these binaries.
+
+`git apply` rather than `patch`, and without `--3way`: a patch that no longer
+applies exactly is a pin that moved under us, and that has to stop the build
+rather than be reconciled by a tool that cannot know whether the reconciliation
+is right. What ships today is one patch, described in **ARCHITECTURE.md** under
+"What the bundled Mesa is patched for": it is what lets d3d12 present a frame to
+`vmlord_drm`, and so what lets the guest's compositor draw on the GPU.
+
 Overlay digests are measured from the files that were just copied. Editing an
 overlay changes them on the next run; nothing needs transcribing.
 
@@ -220,10 +237,12 @@ it was 12 MB of what would otherwise have travelled.
 The payload holds no symbolic links, because `collect_files` in the builder
 rejects one outright rather than resolving it, so `build.sh` copies the staged
 tree with `cp -rL` and every link arrives as the file it pointed at. Measured
-on `mesa-26.2.0` the whole payload is 38,289,686 bytes across 40 files, with
-`expanded_size_limit` at 38,295,400 — the tree plus the 5,714-byte manifest the
-builder generates — and `file_count_limit` at 40; the archive is 9,017,460
-bytes. The previous, `distro` payload's limits were 481,306 and 20. The cost of
+on `mesa-26.2.0` plus this repository's patch the whole payload is 38,290,001
+bytes across 40 files, with `expanded_size_limit` at 38,295,715 — the tree plus
+the manifest the builder generates — and `file_count_limit` at 40; the archive
+is 9,018,185 bytes. Both limits are derived by `pack` from the tree it is
+packing, so these are a measurement of one build and not a gate anyone raises by
+hand. The previous, `distro` payload's limits were 481,306 and 20. The cost of
 the rule is smaller than it looks: `d3d12_dri.so`, `swrast_dri.so` and
 `kms_swrast_dri.so` are each a full copy of the 121,136-byte `libdril_dri.so`
 loader shim, and the `.so.0`/`.so.0.0.0` pairs for the two glvnd vendor

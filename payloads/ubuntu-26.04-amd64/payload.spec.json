@@ -46,6 +46,13 @@
           "commit": "9e393d6d8a3b30dcc6f2806ef604ec16a27b0d7e",
           "version": "v1.619.1"
         }
+      ],
+      "patches": [
+        {
+          "file": "0001-d3d12-scan-out-through-a-winsys-displaytarget.patch",
+          "author": "VMLord contributors",
+          "reason": "d3d12 cannot present a frame to a KMS device without it"
+        }
       ]
     }
   ],
