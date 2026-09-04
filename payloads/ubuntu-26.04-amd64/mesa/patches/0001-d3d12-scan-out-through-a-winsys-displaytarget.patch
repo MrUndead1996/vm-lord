@@ -37,11 +37,12 @@ exceeds before it has drawn a window.
 
 The floor is proportional to pixels alone -- 3.73 ms at 720p to 27.81 ms at
 2160p -- 0.96 GiB/s at 1080p, against 5.64 GiB/s for a system-memory read of the
-same frame in the same probe. A 5.9x gap is the cost of reading across the bus: the
-render target lives in a DEFAULT heap, and a system-memory heap for the scanout
-resource would be the next thing to try. On at least one Intel iGPU the same copy
-is pathological -- WSLg issue #1498 reports 327-359 ms per frame at 720p -- so a
-host that is not known good deserves a measurement before this path is trusted.
+same frame in the same probe. Where that 5.9x goes is not established: the read
+is staged through a READBACK heap, so a GPU copy, a fence wait and a CPU copy are
+all in it, and which one dominates has not been measured. On at least one Intel
+iGPU the same copy is pathological -- WSLg issue #1498 reports 327-359 ms per
+frame at 720p -- so a host that is not known good deserves a measurement before
+this path is trusted.
 
 Refs: #180
 diff --git a/src/gallium/drivers/d3d12/d3d12_context_common.cpp b/src/gallium/drivers/d3d12/d3d12_context_common.cpp

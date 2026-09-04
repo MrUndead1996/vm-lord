@@ -1317,14 +1317,26 @@ full-screen passes**, which is less than a desktop with a wallpaper and one wind
 already costs, so a real compositor is on the winning side of it -- but a guest
 showing almost nothing is not, and this is a slower way to present a still screen.
 
-The floor is proportional to pixels and nothing else: 3.73 ms at 720p, 8.07 at
+The floor is proportional to pixels alone: 3.73 ms at 720p, 8.07 at
 1080p, 13.45 at 1440p, 27.81 at 2160p -- 0.96 GiB/s at 1080p, where llvmpipe
 reads the same 8 MB frame out of system memory at 5.64 GiB/s in the same probe.
-A 5.9x gap is what a read across the bus costs, which says the frame is being
-read out of VRAM rather than out of a system-memory heap. Fixing that is a further patch and
-not this one; it is also what makes the same copy pathological on at least one
-Intel iGPU, where WSLg issue #1498 reports 327-359 ms per frame at 720p. No guard
-here addresses that yet.
+
+**Where that 5.9x goes is not established.** The present path is three steps, not
+one: `d3d12_transfer_map` stages the read through a `D3D12_HEAP_TYPE_READBACK`
+buffer (`d3d12_bufmgr.cpp:137`), so a GPU copy moves the frame out of the render
+target first and the CPU then reads guest system memory and copies that into the
+dumb BO. The CPU never maps the render target itself. Which of the three -- the
+GPU copy, the fence wait that serialises it against the next frame, or the CPU's
+own copy -- carries the 8 ms has not been measured, and an earlier draft of this
+section asserted a fourth thing that the code does not do (a CPU read straight
+out of VRAM). Instrumenting the three phases is what would settle it.
+
+What the number does say is that the CPU hop is worth removing rather than
+making cheaper, which is the direction "Can the CPU leave the path?" below takes.
+The same copy is pathological on at least one Intel iGPU -- WSLg issue #1498
+reports 327-359 ms per frame at 720p, with its own instrumentation blaming the
+first CPU reads of the readback allocation -- and no guard here addresses that
+yet.
 
 A patch is provenance, so it is recorded rather than merely applied. It is
 declared on the mesa source in `payload.spec.json`, `prepare.py` digests the
