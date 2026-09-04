@@ -33,6 +33,11 @@ png = "0.18"
 # The COM callback for endpoint changes is written with `#[implement]`, whose
 # expansion names `windows_core` at the crate root rather than through the
 # `windows` re-export.
+#
+# The version is not ours to choose: `windows` 0.62 depends on
+# `windows-core` ^0.62, and a newer one here is a second copy of the crate
+# rather than a replacement -- `#[implement]` then expands against traits the
+# interfaces from `windows` do not implement. It moves when `windows` does.
 windows-core = "0.62"
 windows = { workspace = true, features = [
     "Win32_Devices_Display",
