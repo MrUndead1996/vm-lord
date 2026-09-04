@@ -425,7 +425,11 @@ impl eframe::App for VmlordUi {
         false
     }
 
-    fn update(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // The dialogs are windows rather than widgets of this `Ui`, and they
+        // are addressed through the context; `eframe` hands out the `Ui` and
+        // leaves the clone to whoever needs the one behind it.
+        let context = ui.ctx().clone();
         context.request_repaint_after(AUTO_REFRESH_INTERVAL);
         // The update worker reports through a channel the application layer
         // drains here, so a check or a download that finished between frames
@@ -438,7 +442,7 @@ impl eframe::App for VmlordUi {
             self.last_refresh = Instant::now();
         }
 
-        let action = egui::CentralPanel::default().show(context, |ui| {
+        let action = egui::CentralPanel::default().show(ui, |ui| {
             let mut selected_action = None;
 
             ui.heading("VMLord");
@@ -585,7 +589,7 @@ impl eframe::App for VmlordUi {
         let distro_profiles = self.application.distro_profiles().collect::<Vec<_>>();
         let create_dialog_action = self.create_vm_form.as_mut().and_then(|form| {
             render_create_vm_dialog(
-                context,
+                &context,
                 form,
                 self.application.vms(),
                 &distro_profiles,
@@ -624,10 +628,9 @@ impl eframe::App for VmlordUi {
 
         let distro_options = self.application.distro_options().collect::<Vec<_>>();
         let update_state = self.application.update_state().clone();
-        let settings_dialog_action = self
-            .settings_form
-            .as_mut()
-            .and_then(|form| render_settings_dialog(context, form, &distro_options, &update_state));
+        let settings_dialog_action = self.settings_form.as_mut().and_then(|form| {
+            render_settings_dialog(&context, form, &distro_options, &update_state)
+        });
         match settings_dialog_action {
             Some(SettingsDialogAction::BrowseVmStorage) => {
                 match self.application.pick_vm_storage_directory() {
@@ -707,7 +710,7 @@ impl eframe::App for VmlordUi {
         let confirmation_action = self
             .install_confirmation
             .as_deref()
-            .and_then(|version| render_install_confirmation(context, version));
+            .and_then(|version| render_install_confirmation(&context, version));
         match confirmation_action {
             Some(InstallConfirmationAction::Cancel) => self.install_confirmation = None,
             Some(InstallConfirmationAction::Install) => {
@@ -733,7 +736,7 @@ impl eframe::App for VmlordUi {
         let edit_dialog_action = self
             .edit_vm_form
             .as_mut()
-            .and_then(|form| render_edit_vm_dialog(context, form, host_gpu));
+            .and_then(|form| render_edit_vm_dialog(&context, form, host_gpu));
         match edit_dialog_action {
             Some(EditVmDialogAction::Cancel) => self.edit_vm_form = None,
             Some(EditVmDialogAction::Submit(request)) => {
@@ -752,7 +755,7 @@ impl eframe::App for VmlordUi {
         let delete_dialog_action = self
             .delete_vm_form
             .as_mut()
-            .and_then(|form| render_delete_vm_dialog(context, form));
+            .and_then(|form| render_delete_vm_dialog(&context, form));
         match delete_dialog_action {
             Some(DeleteVmDialogAction::Cancel) => self.delete_vm_form = None,
             Some(DeleteVmDialogAction::Submit) => {

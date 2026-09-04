@@ -6,10 +6,10 @@ license.workspace = true
 publish = false
 
 [dependencies]
-eframe = { version = "0.33", features = ["persistence"] }
+eframe = { version = "0.36", features = ["persistence"] }
 # The UI's message catalogues, embedded at compile time from `locales/`.
 # It stops here on purpose: no other crate has text a user reads.
-rust-i18n = "3"
+rust-i18n = "4.2"
 vmlord-app = { path = "../app" }
 vmlord-core = { path = "../core" }
 
