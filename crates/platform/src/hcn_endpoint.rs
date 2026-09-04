@@ -56,6 +56,35 @@ pub struct EndpointAddress {
     pub prefix_length: u8,
 }
 
+/// What a replacement endpoint repeats from the one it replaces.
+///
+/// Both halves are read back from HNS rather than chosen. VMLord never invents
+/// an address, so it does not become a second allocator beside HNS's IPAM, and
+/// it never invents a MAC either -- it only asks for the one the guest has
+/// already seen.
+///
+/// Why the MAC belongs here beside the address: a guest writes its network
+/// configuration on its first boot and pins it to the card it saw. cloud-init's
+/// networkd renderer matches on `MACAddress`, netplan on `macaddress`. An
+/// endpoint recreated with a fresh MAC therefore matches nothing the guest
+/// wrote, and the interface is never brought up -- so keeping the address alone
+/// buys nothing: the guest never asks for it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EndpointIdentity {
+    pub address: Option<EndpointAddress>,
+    /// As HNS spells it, `00-15-5D-01-02-03`, which is also how it is written
+    /// into the VM's `NetworkAdapters` section.
+    pub mac_address: Option<String>,
+}
+
+impl EndpointIdentity {
+    /// An endpoint with nothing to repeat: HNS picks both.
+    #[must_use]
+    pub fn fresh() -> Self {
+        Self::default()
+    }
+}
+
 /// Whether HNS is reporting that it does not have the endpoint.
 fn is_endpoint_absent(error: &windows::core::Error) -> bool {
     is_absent(error, HCN_E_ENDPOINT_NOT_FOUND)
@@ -87,22 +116,22 @@ impl HcnEndpoint {
     /// between this call and that write leaves an orphan behind, which is what
     /// the cleanup on `initialize` exists to collect.
     pub fn create(network: &HcnNetwork, id: Uuid, vm_name: &str) -> Result<Self, RepositoryError> {
-        Self::create_with_address(network, id, vm_name, None)
+        Self::create_with_identity(network, id, vm_name, &EndpointIdentity::fresh())
     }
 
-    /// Creates the endpoint `id`, asking HNS for `address` when one is given.
+    /// Creates the endpoint `id`, asking HNS to repeat what `identity` names.
     ///
-    /// Only the recovery path passes an address, and only one HNS itself
-    /// assigned to the endpoint being replaced: repeating it is what keeps the
-    /// guest reachable where it was. VMLord never invents an address, so it
-    /// does not become a second allocator beside HNS's IPAM.
-    pub fn create_with_address(
+    /// Only the recovery path passes a non-empty identity, and only what HNS
+    /// itself assigned to the endpoint being replaced: repeating it is what
+    /// keeps the guest reachable where it was, on the card its own
+    /// configuration is written against.
+    pub fn create_with_identity(
         network: &HcnNetwork,
         id: Uuid,
         vm_name: &str,
-        address: Option<&EndpointAddress>,
+        identity: &EndpointIdentity,
     ) -> Result<Self, RepositoryError> {
-        let settings = endpoint_settings(vm_name, address)?;
+        let settings = endpoint_settings(vm_name, identity)?;
         tracing::debug!("creating HCN endpoint {id} for VM \"{vm_name}\"");
 
         let guid = GUID::from_u128(id.as_u128());
@@ -429,7 +458,7 @@ impl Drop for HcnAllocatedString {
 /// address HNS assigned to an earlier endpoint of the same VM.
 fn endpoint_settings(
     vm_name: &str,
-    address: Option<&EndpointAddress>,
+    identity: &EndpointIdentity,
 ) -> Result<String, RepositoryError> {
     let settings = EndpointSettings {
         schema_version: SchemaVersion::V2,
@@ -438,7 +467,10 @@ fn endpoint_settings(
         // network the endpoint joins is named only here.
         host_compute_network: GUID::from_u128(VMLORD_NETWORK_ID),
         flags: 0,
-        ip_configurations: address
+        mac_address: identity.mac_address.clone(),
+        ip_configurations: identity
+            .address
+            .as_ref()
             .map(|address| IpConfiguration {
                 ip_address: address.ip_address.clone(),
                 prefix_length: address.prefix_length,
@@ -470,6 +502,10 @@ struct EndpointSettings {
     #[serde(serialize_with = "serialize_guid")]
     host_compute_network: GUID,
     flags: u32,
+    /// Omitted when absent, so that a fresh endpoint leaves the choice to HNS
+    /// rather than asking it for a blank address.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mac_address: Option<String>,
     /// Omitted entirely when empty: an `IpConfigurations: []` would be VMLord
     /// asking HNS for no address rather than leaving the choice to its IPAM.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -493,12 +529,12 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        EndpointAddress, VMLORD_NETWORK_ID, address, endpoint_ids, endpoint_settings, mac_address,
-        network,
+        EndpointAddress, EndpointIdentity, VMLORD_NETWORK_ID, address, endpoint_ids,
+        endpoint_settings, mac_address, network,
     };
 
     fn settings(vm_name: &str) -> serde_json::Value {
-        serde_json::from_str(&endpoint_settings(vm_name, None).unwrap())
+        serde_json::from_str(&endpoint_settings(vm_name, &EndpointIdentity::fresh()).unwrap())
             .expect("the settings document should be valid JSON")
     }
 
@@ -569,14 +605,77 @@ mod tests {
             prefix_length: 24,
         };
 
-        let document: serde_json::Value =
-            serde_json::from_str(&endpoint_settings("dev-linux", Some(&requested)).unwrap())
-                .unwrap();
+        let document: serde_json::Value = serde_json::from_str(
+            &endpoint_settings(
+                "dev-linux",
+                &EndpointIdentity {
+                    address: Some(requested),
+                    mac_address: None,
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
 
         assert_eq!(
             document["IpConfigurations"],
             serde_json::json!([{ "IpAddress": "172.22.42.7", "PrefixLength": 24 }])
         );
+    }
+
+    /// The other half of the same argument, and the one that was missed. A
+    /// guest's network configuration is written on its first boot and pinned
+    /// to the card it saw: cloud-init's networkd renderer matches on
+    /// `MACAddress`, netplan on `macaddress`. A replacement endpoint with a
+    /// fresh MAC matches none of it, so the link is never brought up at all --
+    /// no address, no DHCP request, no SSH, on a guest whose address VMLord
+    /// carefully kept.
+    #[test]
+    fn requested_settings_name_the_mac_address_the_endpoint_must_take() {
+        let document: serde_json::Value = serde_json::from_str(
+            &endpoint_settings(
+                "dev-linux",
+                &EndpointIdentity {
+                    address: None,
+                    mac_address: Some("00-15-5D-3B-81-44".to_owned()),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(document["MacAddress"], "00-15-5D-3B-81-44");
+    }
+
+    #[test]
+    fn a_fresh_endpoint_asks_for_no_mac_address_of_its_own() {
+        // HNS picks it, for the same reason its IPAM picks the address: VMLord
+        // repeats a MAC it was given and never invents one.
+        assert!(settings("dev-linux").get("MacAddress").is_none());
+    }
+
+    #[test]
+    fn a_replacement_repeats_both_halves_of_what_the_guest_saw() {
+        let document: serde_json::Value = serde_json::from_str(
+            &endpoint_settings(
+                "dev-linux",
+                &EndpointIdentity {
+                    address: Some(EndpointAddress {
+                        ip_address: "172.22.42.7".into(),
+                        prefix_length: 24,
+                    }),
+                    mac_address: Some("00-15-5D-3B-81-44".to_owned()),
+                },
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            document["IpConfigurations"],
+            serde_json::json!([{ "IpAddress": "172.22.42.7", "PrefixLength": 24 }])
+        );
+        assert_eq!(document["MacAddress"], "00-15-5D-3B-81-44");
     }
 
     #[test]

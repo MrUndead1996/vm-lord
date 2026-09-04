@@ -326,13 +326,30 @@ What is left over is recovered on the next start. A guest that powers itself
 off, a crash, or a VMLord restart leaves no compute system to detach from, so
 `platform::VmStartPipeline` recognises `HCN_E_ENDPOINT_ALREADY_ATTACHED` -- from
 either the re-creation or the start -- and retries exactly once with a replaced
-endpoint: it reads the occupied endpoint's address, deletes it, and creates a
-new one asking for that same address. This is the one place VMLord names a guest
-address, and it names one HNS assigned rather than one it chose, so HNS's IPAM
-remains the sole allocator. A second occupied endpoint fails the start: one
-replacement is a recovery, a loop of them would create an endpoint per attempt.
-When the old address cannot be read, the replacement is created without one and
-the guest is warned that its address changed.
+endpoint: it reads the occupied endpoint's address *and its MAC*, deletes it,
+and creates a new one asking for both. This is the one place VMLord names a
+guest address or a guest MAC, and it names ones HNS assigned rather than ones it
+chose, so HNS's IPAM remains the sole allocator. A second occupied endpoint
+fails the start: one replacement is a recovery, a loop of them would create an
+endpoint per attempt. When either half cannot be read, the replacement is
+created without it and the guest is warned about what changed.
+
+The MAC is the half that decides whether the guest has a network at all, and
+keeping the address alone bought nothing. A guest writes its network
+configuration on its first boot and pins it to the card it saw: cloud-init's
+networkd renderer matches on `MACAddress`, netplan on `macaddress`. A
+replacement endpoint with a fresh MAC therefore matches nothing the guest wrote,
+so the link is never brought up, no DHCP Discover is ever sent, and the address
+carefully kept for the guest is never asked for. That is what the second start
+of the Arch guest looked like from inside: `eth0` down with no address and
+`systemd-networkd-wait-online` timing out, on a VM whose endpoint had been
+replaced and whose reservation was still waiting for it.
+
+That path is not an exotic one. A guest that powers itself off leaves nothing
+for `VmForceStopPipeline` to detach, so the endpoint stays occupied and the next
+start replaces it -- which makes a plain reboot from inside the guest enough to
+change its card. The recovery has to preserve the guest's identity, not only its
+address.
 
 AppSandbox's `hcs_detach_network` is not the precedent it looks like: the
 function exists but is never called, and its comment -- that a detach is what
