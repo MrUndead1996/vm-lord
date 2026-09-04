@@ -1318,10 +1318,10 @@ already costs, so a real compositor is on the winning side of it -- but a guest
 showing almost nothing is not, and this is a slower way to present a still screen.
 
 The floor is proportional to pixels and nothing else: 3.73 ms at 720p, 8.07 at
-1080p, 13.45 at 1440p, 27.81 at 2160p -- about 1 GiB/s, where llvmpipe reads the
-same 8 MB out of system memory at roughly 5.9 GiB/s in the same probe. That ratio
-is what a read across the bus costs, which says the frame is being read out of
-VRAM rather than out of a system-memory heap. Fixing that is a further patch and
+1080p, 13.45 at 1440p, 27.81 at 2160p -- 0.96 GiB/s at 1080p, where llvmpipe
+reads the same 8 MB frame out of system memory at 5.64 GiB/s in the same probe.
+A 5.9x gap is what a read across the bus costs, which says the frame is being
+read out of VRAM rather than out of a system-memory heap. Fixing that is a further patch and
 not this one; it is also what makes the same copy pathological on at least one
 Intel iGPU, where WSLg issue #1498 reports 327-359 ms per frame at 720p. No guard
 here addresses that yet.
