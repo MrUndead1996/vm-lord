@@ -2629,8 +2629,8 @@ musl binary built without a C toolchain.
 The host has to declare what it cannot see: a cloud image is found and verified
 before anything boots, and cloud-init runs before there is a system to ask, so
 the image templates, the checksum file, the default user, the admin group, the
-SSH units, the keyboard files and the packages that install a desktop are
-profile data in `distros/*.json`. Everything else the agent asks the guest
+SSH units, the keyboard files, the packages that install a desktop and the
+display manager unit that starts it are profile data in `distros/*.json`. Everything else the agent asks the guest
 itself, at the moment it acts, in `crates/agent/src/guest_platform.rs`.
 
 Detection there is not merely cheaper than a profile field, it is truthful. A
@@ -4002,20 +4002,35 @@ the normal display export boundary and restores its fixed share name in
 therefore mount and report the desktop without waiting for a later reconnect.
 
 The desktop itself comes from the distribution's own archives. `DistroProfile`
-carries a `DesktopSetup`, and that setup is a package list and nothing else:
-the seed prints it as cloud-init's `packages` block with `package_update`,
-so Ubuntu installs `ubuntu-desktop-minimal` (GNOME Shell, GDM and the Wayland
-session, without the office suite) from the archives the guest is already
-configured with. Arch names the same session package by package --
+carries a `DesktopSetup`: a package list and the display manager unit to
+enable. The seed prints the list as cloud-init's `packages` block with
+`package_update`, so Ubuntu installs `ubuntu-desktop-minimal` (GNOME Shell, GDM
+and the Wayland session, without the office suite) from the archives the guest
+is already configured with. Arch names the same session package by package --
 `gnome-shell`, `gdm`, `gnome-control-center`, `gnome-console`, `nautilus` --
 because it publishes no one metapackage for it. VMLord adds no repository,
 downloads no desktop binary of its own and signs nothing.
 
-A declared display manager unit sat in that setup and was deleted rather than
-kept: a package list is what has to be declared, because it is needed before a
-guest exists, while which unit owns the login screen is a link in the guest
-that the agent reads at the moment it matters. Two copies of that answer can
-disagree -- the guest's is the true one -- so there is now one.
+Installing a display manager and running one are two different things, and
+which of them a package does is the packaging's choice. Debian and Ubuntu
+enable `gdm3` from the package's `postinst`; Arch leaves enabling a unit to the
+administrator, and that is the rule rather than the exception. A guest packaged
+the second way boots into a `graphical.target` with nothing in it -- GDM
+installed, disabled and inactive -- and since the agent reads the found desktop
+off the `display-manager.service` link, the found desktop is empty too, and the
+tray, the compositor's isolation and the output choice all follow it into
+"there is no desktop here". So the seed enables `DesktopSetup::service` itself,
+on every distribution: `systemctl enable --now`, which is what the packaging
+already did on Ubuntu and changes nothing there. `--now` because nothing
+reboots the guest after cloud-init, and a desktop left for the next boot is a
+desktop the person who asked for one does not get.
+
+That unit is not the declared display manager #159 deleted, and the difference
+is which way it points. The deleted field answered *what the guest has*, which
+the agent reads out of the guest -- two sources for one answer, and the guest's
+is the true one. This one answers *what to switch on*, before there is a guest
+to ask: a request, like the package list beside it, read only by the seed and
+never read back as a fact. `SshDaemon::units` names units for the same reason.
 
 What has to happen before those packages are installed is
 `DistroProfile::package_refresh`, and it is a field because it is not a

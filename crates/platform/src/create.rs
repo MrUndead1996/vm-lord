@@ -488,6 +488,14 @@ fn write_provisioning(
             .profile
             .desktop_for(provisioning.desktop)
             .map_or(&[][..], |desktop| desktop.packages.as_slice()),
+        // And the unit that turns those packages into a login screen, which
+        // only the distribution knows the name of and only the seed is in a
+        // position to switch on: it runs after the packages land and before
+        // there is any guest to ask.
+        desktop_service: image
+            .profile
+            .desktop_for(provisioning.desktop)
+            .map(|desktop| desktop.service.as_str()),
         // And what installing anything at all on this distribution takes
         // first, which on a rolling one is upgrading the guest rather than
         // resolving new packages against an image months older than the

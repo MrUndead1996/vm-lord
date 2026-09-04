@@ -136,6 +136,9 @@ fn runcmd(request: &SeedRequest<'_>) -> String {
     if request.agent_secret.is_some() {
         commands.extend(agent_install_commands());
     }
+    if let Some(unit) = request.desktop_service {
+        commands.push(enable_display_manager(unit));
+    }
     if commands.is_empty() {
         return String::new();
     }
@@ -152,6 +155,35 @@ fn runcmd(request: &SeedRequest<'_>) -> String {
         ));
     }
     block
+}
+
+/// Starts the login screen the desktop packages have just installed.
+///
+/// Installing a display manager and running one are two different things, and
+/// which of them a package does is the packaging's choice. Debian and Ubuntu
+/// enable the unit from the package's `postinst`; Arch leaves enabling a unit
+/// to the administrator, and so does everything that follows the same rule. A
+/// guest packaged the second way boots into a `graphical.target` with nothing
+/// in it: GDM installed, disabled, inactive, no `display-manager.service` for
+/// the agent to read, and therefore no desktop found -- which reads as a
+/// broken detection and is nothing of the kind.
+///
+/// `--now` rather than a bare `enable`, because nothing reboots the guest
+/// after cloud-init. A desktop left for the next boot is a desktop the person
+/// who asked for one does not get. Starting it on the boot that installed it
+/// was checked on a live Arch guest that had just taken a full upgrade: the
+/// Wayland greeter came up on `seat0` at the first attempt.
+///
+/// Harmless where the packaging already did it: `enable --now` on a running,
+/// enabled unit changes nothing.
+fn enable_display_manager(unit: &str) -> Vec<String> {
+    tracing::debug!("the seed enables the display manager: {unit}");
+    vec![
+        "systemctl".to_owned(),
+        "enable".to_owned(),
+        "--now".to_owned(),
+        unit.to_owned(),
+    ]
 }
 
 fn agent_install_commands() -> Vec<Vec<String>> {
@@ -437,6 +469,7 @@ mod tests {
             // two tests about the secret set it themselves.
             agent_secret: None,
             desktop_packages: &[],
+            desktop_service: None,
             package_refresh: PackageRefresh::Lists,
         }
     }
@@ -547,6 +580,66 @@ mod tests {
         assert_eq!(document["package_update"], Value::from(true));
         assert_eq!(document["package_upgrade"], Value::from(true));
         assert_eq!(document["packages"], Value::from(vec!["gnome-shell"]));
+    }
+
+    /// Installing the packages is not the same as running the desktop. Debian
+    /// and Ubuntu enable the display manager from the package's `postinst`,
+    /// and a distribution whose packaging leaves that to the administrator --
+    /// Arch, and it is the rule rather than the exception -- boots into a
+    /// `graphical.target` with nothing in it: GDM installed, disabled and
+    /// inactive, and no `display-manager.service` for the agent to read.
+    #[test]
+    fn a_desktop_vm_enables_the_display_manager_the_profile_names() {
+        let packages = ["gnome-shell".to_owned()];
+        let document = parsed(&render(&SeedRequest {
+            desktop_packages: &packages,
+            desktop_service: Some("gdm.service"),
+            ..request()
+        }));
+
+        assert!(
+            commands(&document).contains(&vec![
+                "systemctl".to_owned(),
+                "enable".to_owned(),
+                "--now".to_owned(),
+                "gdm.service".to_owned(),
+            ]),
+            "the seed enables the display manager: {:?}",
+            commands(&document)
+        );
+    }
+
+    /// `--now` rather than a bare `enable`: nothing reboots the guest after
+    /// cloud-init, so a desktop left for the next boot is a desktop the person
+    /// who asked for one does not get.
+    #[test]
+    fn the_display_manager_starts_on_the_boot_that_installed_it() {
+        let packages = ["gnome-shell".to_owned()];
+        let document = parsed(&render(&SeedRequest {
+            desktop_packages: &packages,
+            desktop_service: Some("gdm.service"),
+            ..request()
+        }));
+
+        let enable = commands(&document)
+            .into_iter()
+            .find(|command| command.contains(&"gdm.service".to_owned()))
+            .expect("the display manager is enabled");
+
+        assert!(enable.contains(&"--now".to_owned()), "{enable:?}");
+    }
+
+    #[test]
+    fn a_headless_vm_enables_no_display_manager() {
+        let document = parsed(&render(&request()));
+
+        assert!(
+            !commands(&document)
+                .iter()
+                .any(|command| command.iter().any(|word| word.contains("gdm"))),
+            "{:?}",
+            commands(&document)
+        );
     }
 
     #[test]
