@@ -124,6 +124,23 @@ is `prepare_test.py`, which the Dockerfile runs in the same stage that runs
 `prepare.py`, so every payload build executes it and no host needs a test
 framework — or a `python3` — to get the check.
 
+`patches` on the `built` record is the other thing a commit alone cannot say.
+The Mesa in this payload is not the pinned commit: it is that commit plus what
+`mesa/patches/` holds, applied by `git apply` in the image before `build.sh`
+runs. Each patch is declared in the spec with the file, its author and why it is
+there; `prepare.py` measures the digest from the patch file itself, the same way
+overlay digests are measured, so editing a patch changes the record on the next
+run. A patch adds no catalog row — it is not a source anyone can fetch, and the
+tree it changes is already a row — but without it a reader of the manifest would
+take the commit for the whole truth about these binaries.
+
+`git apply` rather than `patch`, and without `--3way`: a patch that no longer
+applies exactly is a pin that moved under us, and that has to stop the build
+rather than be reconciled by a tool that cannot know whether the reconciliation
+is right. What ships today is one patch, described in **ARCHITECTURE.md** under
+"What the bundled Mesa is patched for": it is what lets d3d12 present a frame to
+`vmlord_drm`, and so what lets the guest's compositor draw on the GPU.
+
 Overlay digests are measured from the files that were just copied. Editing an
 overlay changes them on the next run; nothing needs transcribing.
 

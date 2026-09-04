@@ -50,10 +50,21 @@ RUN git init /src/directx-headers \
     && mv /src/directx-headers /src/mesa/subprojects/DirectX-Headers-1.0
 
 FROM sources AS mesa
+COPY mesa/patches /src/patches
 COPY mesa/build.sh /usr/local/bin/build-mesa
-# No network: everything that reaches the binaries came from a pin above, and a wrap
-# cannot quietly add to it.
+# The patches are applied here rather than inside build.sh so that the script stays about
+# building: what the tree is, is decided before it is compiled. `git apply` refuses a
+# patch that does not apply exactly, which is what makes a pin bump that upstream has
+# moved under fail loudly here instead of silently shipping an unpatched Mesa.
+#
+# Every patch is recorded in payload.spec.json, and prepare.py digests it into the
+# manifest: the binaries no longer correspond to the pinned commit alone, and a payload
+# that did not say so would be claiming a provenance it does not have.
+#
+# No network: everything that reaches the binaries came from a pin above or from
+# /src/patches, and a wrap cannot quietly add to it.
 RUN --network=none chmod +x /usr/local/bin/build-mesa \
+    && git -C /src/mesa apply --verbose /src/patches/*.patch \
     && build-mesa /src/mesa /out/mesa
 
 FROM ${BASE} AS closure
@@ -93,6 +104,7 @@ COPY --from=mesa /out/mesa /mesa
 COPY --from=closure /check/mesa/share/vulkan/icd.d/dzn_icd.x86_64.json /closure-passed.json
 COPY payload.spec.json prepare.py prepare_test.py ./
 COPY overlays ./overlays
+COPY mesa/patches ./patches
 COPY licenses ./licenses
 # The layout script's digest rule has a twin in crates/gpu-payload/src/builder.rs, and a
 # disagreement between them surfaces only as `pack` refusing a tree it just built. The
@@ -102,6 +114,7 @@ RUN --network=none python3 prepare_test.py
 RUN --network=none python3 prepare.py \
         --spec payload.spec.json \
         --overlays overlays \
+        --patches patches \
         --licenses . \
         --checkout /src/kernel \
         --mesa /mesa \

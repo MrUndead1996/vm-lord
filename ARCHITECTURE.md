@@ -1279,6 +1279,45 @@ trusted for being compiled into the executable; it is trusted because whoever
 can write into the installation directory can equally replace `vmlord.exe`
 itself. The boundary does not move -- it becomes visible.
 
+#### What the bundled Mesa is patched for
+
+The `ubuntu-26.04-amd64` payload builds Mesa from a pinned commit and applies
+one patch of ours before compiling it:
+`payloads/ubuntu-26.04-amd64/mesa/patches/0001-d3d12-scan-out-through-a-winsys-displaytarget.patch`.
+
+It exists because a GPU-PV guest has one DRM device, `vmlord_drm`, and no render
+node -- so gbm loads the `kms_swrast` screen and `GALLIUM_DRIVER` decides what
+draws into it. d3d12 draws there already; what it could not do was hand the
+finished frame to KMS. It returned a resource in D3D12 memory, so the DRM handle
+gbm asked for came back zero and `drmModeAddFB2` answered `EINVAL`; and asking
+for a scanout buffer outright failed to allocate at all, because
+`PIPE_BIND_SCANOUT` forced a row-major layout that D3D12 refuses for a committed
+texture. The patch routes a scanout resource onto a winsys displaytarget -- a
+dumb BO on our device, which does carry a handle, and which is exactly how
+llvmpipe on the same device gets one -- and copies the rendered frame into it on
+`flush_resource`, the call the frontend makes before every swap. Both halves
+already existed in d3d12; only `PIPE_BIND_DISPLAY_TARGET` reached them.
+
+The cost is one full-frame readback per presented frame, against llvmpipe
+compositing every frame on the CPU. Measured on an RTX 5070 Ti through GPU-PV,
+draw plus swap plus readback at 1080p: 1.03 ms on d3d12 against 5.52 ms on
+llvmpipe for the same frame. That is a synthetic draw, and a blocking read every
+frame can serialise CPU and GPU more than a bandwidth number suggests; the figure
+to trust is one taken under a real compositing load. The same copy is known to be
+pathological on at least one Intel iGPU -- WSLg issue #1498 reports 327-359 ms per
+frame at 720p -- which is a portability question this does not answer and which
+no guard here addresses yet.
+
+A patch is provenance, so it is recorded rather than merely applied. It is
+declared on the mesa source in `payload.spec.json`, `prepare.py` digests the
+patch file into the built record's `patches`, and both `builder.rs` and
+`manifest.rs` carry the field: a record naming a commit is not the whole truth
+about binaries built from a modified tree. The field is optional on the wire, so
+that a payload prepared before patches existed still reads -- an absent list and
+an empty one say the same thing. `git apply` in the image refuses a patch that
+does not apply exactly, which is what makes a pin bump upstream has moved under
+fail at build time rather than ship an unpatched Mesa quietly.
+
 Ready content is materialized below a VM's exact `gpu-payload` child as
 `generations/<digest>` followed by `ready/<digest>.json`. The third logical
 share, `GpuPayload` / `vmlord.gpu.payload`, exports only that canonical child;
@@ -4204,7 +4243,8 @@ read-only and DKMS writes beside its sources), `MODULE_BUILD`, `INITRAMFS`
 (`update-initramfs -u -k` for the running kernel after a successful DKMS
 install), then `MODULE_LOAD` (`modules-load.d`, the modprobe options, the unit that unbinds
 `simple-framebuffer`, and `modprobe`), `COMPOSITOR_ISOLATION` (the drop-in that
-keeps the compositor on the distribution's Mesa), `DEVICE` (a `/dev/dri/card*`
+keeps the compositor on the distribution's Mesa, on a guest that has no
+adapter), `DEVICE` (a `/dev/dri/card*`
 whose driver is ours), and `SERVICES`/`SERVICES_START`, which are skipped with
 their reason until task #115 fills `content/services`.
 
@@ -4217,14 +4257,34 @@ module parameter is read once; a module that does not say what it was loaded
 with is left alone, because a reload on a guess drops a working desktop.
 
 `COMPOSITOR_ISOLATION` is a stage of its own because it is a decision and not a
-copy. The file is the same for every VM, so it comes out of the payload, and it
-says two things -- the GPU recipe's Mesa overrides unset, and `LD_LIBRARY_PATH`
-pointed at the distribution's libraries. Both, because the GPU recipe reaches a
-process by two paths: the environment it exports, and
+copy, and since task #180 the decision has two answers rather than one. The
+stage asks `/dev/dxg` -- opened, not stat'd, and asked here rather than carried
+in the guest's facts, because the recipe ran minutes ago and an adapter that has
+since gone is the case being decided for.
+
+A guest with an adapter is left on the payload's Mesa and any drop-in an earlier
+run installed is removed. That Mesa carries a patch, described under "What the
+bundled Mesa is patched for", which lets d3d12 present a frame through a dumb BO
+on our own device: the compositor composites on the GPU and scans out through
+`vmlord_drm`. What used to be the failure this stage prevented is what the patch
+fixes.
+
+A guest with no adapter gets the drop-in, and needs it more than it used to. The
+file is the same for every VM, so it comes out of the payload, and it says two
+things -- the GPU recipe's Mesa overrides unset, and `LD_LIBRARY_PATH` pointed
+at the distribution's libraries. Both, because the GPU recipe reaches a process
+by two paths: the environment it exports, and
 `/etc/ld.so.conf.d/vmlord-wsl-mesa.conf`, which no environment can undo. A
-compositor left on the payload's Mesa binds our device, fails to allocate a
-buffer on it, and never finishes its modeset; applications, which is where the
-GPU was wanted, keep the whole environment.
+compositor left on the payload's Mesa with no adapter under it binds our device,
+fails to allocate a buffer on it, and never finishes its modeset -- and even
+where it did not, the payload's Mesa is built `-Dllvm=disabled`, so its
+software fallback is softpipe where the distribution's is llvmpipe. Applications,
+which is where the GPU was wanted, keep the whole environment either way.
+
+Removal rather than rewriting, on the guest that no longer wants it: the drop-in
+exists to name a different Mesa, and a guest that wants no such naming wants no
+file. The empty `.d` directory stays -- systemd reads it as nothing, and another
+drop-in may live in it.
 
 Two lines of it the payload cannot write. The library directory is appended out
 of the layout the agent detected: a multiarch guest keeps that Mesa in

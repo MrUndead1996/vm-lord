@@ -154,6 +154,10 @@ struct BuiltRecord {
     output: String,
     licenses: Vec<String>,
     inputs: Vec<SourceInputRecord>,
+    /// Absent in a payload prepared before patches existed, which is the same
+    /// statement as an empty list: nothing was changed before compiling.
+    #[serde(default)]
+    patches: Vec<SourcePatchRecord>,
     sha256: Sha256Digest,
 }
 
@@ -167,6 +171,20 @@ struct SourceInputRecord {
     url: String,
     commit: String,
     version: String,
+}
+
+/// A change this repository made to an upstream tree before compiling it.
+///
+/// It contributes no catalog row -- the upstream it patches is already one, and a patch
+/// is not a source anyone can fetch. It is here so that `commit` above is not read as
+/// the whole truth about what these binaries were built from.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SourcePatchRecord {
+    file: String,
+    sha256: Sha256Digest,
+    author: String,
+    reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -562,6 +580,39 @@ mod tests {
 
         SourceManifest::parse_and_validate(&document, &entry)
             .expect("a built record and its inputs are the catalog's two source rows");
+    }
+
+    /// A patch is not an upstream: it names no commit anyone can fetch, and the tree it
+    /// changes is already a catalog row. Recording one must therefore leave the catalog
+    /// exactly as it was -- were it to add a row, the entry would stop matching.
+    #[test]
+    fn a_patch_on_a_built_source_is_recorded_without_reaching_the_catalog() {
+        let entry = built_entry();
+        let mut document = built_sources();
+        document["sources"][0]["patches"] = json!([{
+            "file": "0001-d3d12-scan-out-through-a-winsys-displaytarget.patch",
+            "sha256": ZERO,
+            "author": "VMLord contributors",
+            "reason": "d3d12 cannot present a frame to a KMS device without it"
+        }]);
+
+        SourceManifest::parse_and_validate(&serde_json::to_vec(&document).unwrap(), &entry)
+            .expect("a patch is provenance, not a source row");
+    }
+
+    /// The field is optional so that a payload prepared before patches existed still
+    /// reads, and `built_sources` omitting it is what keeps that path exercised.
+    #[test]
+    fn a_patch_record_that_is_missing_a_field_is_refused() {
+        let entry = built_entry();
+        let mut document = built_sources();
+        document["sources"][0]["patches"] = json!([{"file": "0001.patch", "sha256": ZERO}]);
+
+        let error =
+            SourceManifest::parse_and_validate(&serde_json::to_vec(&document).unwrap(), &entry)
+                .unwrap_err();
+
+        assert!(matches!(error, PayloadError::InvalidManifest(_)));
     }
 
     #[test]

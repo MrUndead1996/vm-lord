@@ -34,6 +34,7 @@ use crate::{
         parse_subject_key_identifier, read_payload_facts, serves, signature_matches,
         signing_key_state, wanted_mode, was_built_for, was_rejected_for_its_signature,
     },
+    gpu_kernel,
     guest_files::{copy_tree, failure, read, write_if_different},
     guest_packages::{self, Package},
     guest_platform::{
@@ -1104,6 +1105,25 @@ fn compositor_drop_in(shipped: &str, layout: &LibraryLayout) -> String {
 /// environment, which is where the acceleration was asked for.
 fn compositor_isolation_stage(report: &mut Report, guest: &GuestFacts) -> Result<(), String> {
     let step = DisplayRecipeStep::CompositorIsolation;
+    let user_units = Path::new(SYSTEMD_USER_UNITS);
+
+    // A guest with an adapter no longer wants this drop-in: the payload's Mesa
+    // presents through a dumb BO on `vmlord_drm` now, so the compositor belongs
+    // on it rather than off it, and the drop-in would put it back on llvmpipe.
+    //
+    // A guest without one still wants it, and wants it more than it used to. The
+    // payload's Mesa is built `-Dllvm=disabled`, so the renderer it falls back to
+    // with no adapter is softpipe; the distribution's is llvmpipe. Leaving such a
+    // guest on the payload's Mesa would trade a degraded desktop for an unusable
+    // one.
+    //
+    // Asked here rather than carried in `GuestFacts` because the answer expires:
+    // the recipe ran minutes ago, and an adapter that has since gone is the case
+    // this is deciding for.
+    if gpu_kernel::device_is_usable() {
+        return compositor_on_the_payloads_mesa(report, step, user_units);
+    }
+
     let shipped = Path::new(PAYLOAD_MOUNT)
         .join("content")
         .join("drm")
@@ -1127,7 +1147,6 @@ fn compositor_isolation_stage(report: &mut Report, guest: &GuestFacts) -> Result
         })
     };
 
-    let user_units = Path::new(SYSTEMD_USER_UNITS);
     let installed = installed_drop_ins(user_units);
     // Only when nothing is installed yet, because that is the only run whose
     // answer cannot wait: on every later boot the drop-in is already on disk
@@ -1189,6 +1208,50 @@ fn compositor_isolation_stage(report: &mut Report, guest: &GuestFacts) -> Result
         ),
     }
 
+    Ok(())
+}
+
+/// Leaves this guest's compositor on the payload's Mesa, undoing an isolation an
+/// earlier run installed.
+///
+/// Removal rather than rewriting: the drop-in exists to name a different Mesa,
+/// and a guest that wants no such naming wants no file. What is left behind is
+/// the empty `.d` directory, which systemd reads as nothing and which is not
+/// ours to remove -- another drop-in may live in it.
+///
+/// The compositor reads a drop-in when it next starts, so this reaches the
+/// screen on the start after this one, exactly as installing it does.
+fn compositor_on_the_payloads_mesa(
+    report: &mut Report,
+    step: DisplayRecipeStep,
+    user_units: &Path,
+) -> Result<(), String> {
+    let installed = installed_drop_ins(user_units);
+    if installed.is_empty() {
+        report.ok(
+            step,
+            "this guest has an adapter, so its compositor draws on the payload's Mesa;              no drop-in holds it back",
+        );
+        return Ok(());
+    }
+    for path in &installed {
+        fs::remove_file(path).map_err(|error| {
+            let reason = format!("{} could not be removed: {error}", path.display());
+            report.failed(step, reason.clone());
+            reason
+        })?;
+    }
+    report.ok(
+        step,
+        format!(
+            "this guest has an adapter, so its compositor draws on the payload's Mesa;              removed the drop-in that held it back at {}",
+            installed
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    );
     Ok(())
 }
 
@@ -1905,10 +1968,11 @@ mod tests {
     use vmlord_agent_protocol::v1::{DisplayRecipeStageState, DisplayRecipeStep};
 
     use super::{
-        COMPOSITOR_DROP_IN, SYSTEMD_USER_UNITS, apply, compositor_drop_in, installed_drop_ins,
-        load_failure_message, sha256_hex, update, verify_declared_files,
+        COMPOSITOR_DROP_IN, SYSTEMD_USER_UNITS, apply, compositor_drop_in,
+        compositor_on_the_payloads_mesa, installed_drop_ins, load_failure_message, sha256_hex,
+        update, verify_declared_files,
     };
-    use crate::display_recipe::{PayloadFacts, STEPS};
+    use crate::display_recipe::{PayloadFacts, Report, STEPS};
     use crate::guest_platform::{
         CompositorLaunch, DesktopFacts, GuestFacts, LibraryLayout, PackageManager,
     };
@@ -2088,6 +2152,50 @@ mod tests {
         assert!(
             installed_drop_ins(Path::new("/nonexistent-user-units")).is_empty(),
             "a guest with no user unit directory has no drop-in of ours, and no error either"
+        );
+    }
+
+    #[test]
+    fn a_guest_with_an_adapter_has_the_drop_in_taken_off_it() {
+        // The drop-in's whole job is to name a Mesa other than the payload's.
+        // Once the payload's Mesa can present to `vmlord_drm`, a guest with an
+        // adapter wants no such naming -- so the file goes, and somebody else's
+        // drop-in in the same directory stays.
+        let directory = std::env::temp_dir().join(format!(
+            "vmlord-display-adapter-drop-ins-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&directory);
+        let ours = directory
+            .join("org.gnome.Shell@.service.d")
+            .join(COMPOSITOR_DROP_IN);
+        fs::create_dir_all(ours.parent().unwrap()).unwrap();
+        fs::write(&ours, "[Service]\n").unwrap();
+        let theirs = directory.join("org.gnome.Shell@.service.d/99-other.conf");
+        fs::write(&theirs, "").unwrap();
+        let mut report = Report::new();
+
+        compositor_on_the_payloads_mesa(
+            &mut report,
+            DisplayRecipeStep::CompositorIsolation,
+            &directory,
+        )
+        .unwrap();
+
+        let ours_is_gone = !ours.exists();
+        let theirs_remains = theirs.exists();
+        let _ = fs::remove_dir_all(&directory);
+        assert!(
+            ours_is_gone,
+            "the drop-in that held the compositor back is removed"
+        );
+        assert!(
+            theirs_remains,
+            "a drop-in that is not ours is not ours to remove"
+        );
+        assert!(
+            installed_drop_ins(Path::new("/nonexistent-user-units")).is_empty(),
+            "a guest that never had one is not an error either"
         );
     }
 

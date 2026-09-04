@@ -86,6 +86,10 @@ struct RecipeBuilt {
     output: String,
     licenses: Vec<String>,
     inputs: Vec<RecipeSourceInput>,
+    /// Absent in a payload prepared before patches existed, which is the same
+    /// statement as an empty list: nothing was changed before compiling.
+    #[serde(default)]
+    patches: Vec<RecipeSourcePatch>,
     sha256: Sha256Digest,
 }
 
@@ -96,6 +100,20 @@ struct RecipeSourceInput {
     url: String,
     commit: String,
     version: String,
+}
+
+/// A change this repository made to an upstream tree before compiling it.
+///
+/// It contributes no catalog row: the upstream it patches is already a row, and a patch
+/// is not a source anyone can fetch. What it carries is the digest, which is the only
+/// way to tell one revision of a patch from another after the binaries exist.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RecipeSourcePatch {
+    file: String,
+    sha256: Sha256Digest,
+    author: String,
+    reason: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
