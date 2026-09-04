@@ -39,7 +39,7 @@ jobs:
 
       # Rust analysis uses rust-analyzer and does not need a product build.
       - name: Initialise CodeQL
-        uses: github/codeql-action/init@6f5948dfacef28e207b48d0905cf90c03365536d # v3
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           languages: rust
           build-mode: none
