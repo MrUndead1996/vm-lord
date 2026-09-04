@@ -237,10 +237,12 @@ it was 12 MB of what would otherwise have travelled.
 The payload holds no symbolic links, because `collect_files` in the builder
 rejects one outright rather than resolving it, so `build.sh` copies the staged
 tree with `cp -rL` and every link arrives as the file it pointed at. Measured
-on `mesa-26.2.0` the whole payload is 38,289,686 bytes across 40 files, with
-`expanded_size_limit` at 38,295,400 — the tree plus the 5,714-byte manifest the
-builder generates — and `file_count_limit` at 40; the archive is 9,017,460
-bytes. The previous, `distro` payload's limits were 481,306 and 20. The cost of
+on `mesa-26.2.0` plus this repository's patch the whole payload is 38,290,001
+bytes across 40 files, with `expanded_size_limit` at 38,295,715 — the tree plus
+the manifest the builder generates — and `file_count_limit` at 40; the archive
+is 9,018,185 bytes. Both limits are derived by `pack` from the tree it is
+packing, so these are a measurement of one build and not a gate anyone raises by
+hand. The previous, `distro` payload's limits were 481,306 and 20. The cost of
 the rule is smaller than it looks: `d3d12_dri.so`, `swrast_dri.so` and
 `kms_swrast_dri.so` are each a full copy of the 121,136-byte `libdril_dri.so`
 loader shim, and the `.so.0`/`.so.0.0.0` pairs for the two glvnd vendor
