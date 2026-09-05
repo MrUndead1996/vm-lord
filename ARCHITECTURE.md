@@ -2803,6 +2803,7 @@ release of `/etc/os-release`, the Debian name of the machine, the running
 kernel -- and beside it the platform: which package manager answers `--version`
 (`apt-get`, `pacman`, `dnf` or `zypper`, in that fixed order), whether the
 architecture's multiarch directory is there or the libraries are in `/usr/lib`,
+which of `update-initramfs`, `mkinitcpio` and `dracut` is on `PATH`,
 and what logind says is on the screen -- the session's own `DESKTOP` and type,
 the unit `display-manager.service` is linked to, and how the compositor that is
 running was started.
@@ -4346,13 +4347,43 @@ digest -- before anything is copied), `BUILD_DEPENDENCIES` (DKMS, a compiler
 and the running kernel's headers, from the guest's own package manager),
 `MODULE_SOURCE` (copied to `/usr/src/vmlord-display-<version>`, because 9p is
 read-only and DKMS writes beside its sources), `MODULE_BUILD`, `INITRAMFS`
-(`update-initramfs -u -k` for the running kernel after a successful DKMS
-install), then `MODULE_LOAD` (`modules-load.d`, the modprobe options, the unit that unbinds
+(the guest's own initramfs builder, for the running kernel, after a successful
+DKMS install), then `MODULE_LOAD` (`modules-load.d`, the modprobe options, the unit that unbinds
 `simple-framebuffer`, and `modprobe`), `COMPOSITOR_ISOLATION` (the drop-in that
 keeps the compositor on the distribution's Mesa, on a guest that has no
 adapter), `DEVICE` (a `/dev/dri/card*`
 whose driver is ours), and `SERVICES`/`SERVICES_START`, which are skipped with
 their reason until task #115 fills `content/services`.
+
+`DISTRIBUTION` is a report and no longer a gate. Until #185 it was
+`distribution == "ubuntu"`, and every one of the thirteen stages on an Arch
+guest was skipped with that one reason. What is under it needs nothing a
+distribution's name answers: the payload is keyed by architecture alone
+(#169), the packages come from the manager the guest turned out to have
+(#155), the library path from the directory that is there (#156), and the
+initramfs command from the builder that is installed. So a guest that cannot
+be brought up now says which program it is missing, in the stage that wanted
+it, instead of being told it is the wrong distribution.
+
+`INITRAMFS` is the last of those to become a detected fact. `update-initramfs`
+is `initramfs-tools`, which is Debian's and Ubuntu's; Arch writes its boot
+image with `mkinitcpio -P` and Fedora and SUSE with `dracut --force --kver`.
+Which one a guest has is asked of the guest, beside the package manager and
+for the same reason -- a Debian moved onto dracut is a guest whose
+`update-initramfs` is a stub that tells you to stop calling it. `mkinitcpio`
+is the odd one in the table: it is driven by presets rather than by kernel
+release, and the release a preset is for is written in the preset, so `-P` is
+how one asks it for "the image this kernel boots from" without knowing which
+preset that is. A guest with none of the three skips the stage rather than
+ending the recipe -- `MODULE_LOAD` runs `modprobe` either way, and what an
+unrefreshed image costs is a first frame that waits for `modules-load` on the
+next boot.
+
+The programs a stage needs are looked for on `PATH` and not at one
+distribution's placing of them: `dkms` is `/usr/sbin/dkms` on Debian and
+`/usr/bin/dkms` on Arch, and the written-out path finds nothing on the second.
+The kernel headers are still a path, because `/lib/modules/<release>/build` is
+where a build tree is on every distribution that ships one.
 
 The modprobe options are written by the guest rather than copied out of the
 payload, from the mode the host has stored for that one VM -- a size belongs to

@@ -29,8 +29,8 @@ use crate::{
     display_recipe::{
         DKMS_PACKAGE, InstalledVersions, KeyCreation, MODULE, PayloadFacts, Report,
         SigningKeyState, SigningPair, compositor_isolation, dkms_reports_installed, dkms_versions,
-        has_recipe, kernel_signs_modules, modprobe_options, module_is_loaded, needs_build,
-        needs_reload, parse_module_parameters, parse_module_signature_key, parse_module_version,
+        kernel_signs_modules, modprobe_options, module_is_loaded, needs_build, needs_reload,
+        parse_module_parameters, parse_module_signature_key, parse_module_version,
         parse_secure_boot_state, parse_subject_key_identifier, read_payload_facts, serves,
         signature_matches, signing_key_state, signing_pair, wanted_mode, was_built_for,
         was_rejected_for_its_signature,
@@ -40,7 +40,8 @@ use crate::{
     guest_files::{copy_tree, failure, read, write_if_different},
     guest_packages::{self, Package},
     guest_platform::{
-        self, CompositorLaunch, DesktopFacts, GuestFacts, LibraryLayout, guest_facts,
+        self, CompositorLaunch, DesktopFacts, GuestFacts, InitramfsBuilder, LibraryLayout,
+        guest_facts, program_on_path,
     },
 };
 
@@ -142,10 +143,6 @@ const BUILD_BUDGET: Duration = Duration::from_secs(900);
 const SHORT_BUDGET: Duration = Duration::from_secs(30);
 
 const KEPT_LOG_LINES: usize = 40;
-
-fn update_initramfs_arguments(kernel_release: &str) -> [&str; 3] {
-    ["-u", "-k", kernel_release]
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReloadDisposition {
@@ -297,17 +294,13 @@ fn run_stages(
 ) -> Result<(), String> {
     let guest = guest_facts()?;
     // Before the first stage can end the run: what a guest has for a desktop
-    // is the answer somebody needs most when the display did not come up, and
-    // a distribution with no recipe is one of the ways it does not.
+    // is the answer somebody needs most when the display did not come up.
     *desktop = reported_desktop(&guest.desktop);
-    if !has_recipe(&guest.distribution) {
-        let reason = format!(
-            "vmlord-agent has no display recipe for {} {}",
-            guest.distribution, guest.release
-        );
-        report.skipped(DisplayRecipeStep::Distribution, reason.clone());
-        return Err(reason);
-    }
+    // No list of distributions this build knows: every later stage asks the
+    // guest for what it needs -- a package manager, an initramfs builder, a
+    // compositor -- and says so by name when the guest has none. A recipe that
+    // stopped here instead would be telling a guest it is the wrong
+    // distribution when what it actually lacks is one program.
     report.ok(
         DisplayRecipeStep::Distribution,
         format!(
@@ -368,7 +361,7 @@ fn run_stages(
     load_stage(
         report,
         mode,
-        built.then_some(guest.kernel_release.as_str()),
+        built.then_some((guest.initramfs_builder, guest.kernel_release.as_str())),
         signing.as_ref(),
     )?;
     compositor_isolation_stage(report, &guest)?;
@@ -423,7 +416,7 @@ fn run_update(
         build_stage(report, &payload.version, &guest.kernel_release)
             .map_err(UpdateAttemptFailure::Failed)?;
         module_signature_stage(report, signing.as_ref(), &guest.kernel_release);
-        update_initramfs_stage(report, &guest.kernel_release)
+        update_initramfs_stage(report, guest.initramfs_builder, &guest.kernel_release)
             .map_err(UpdateAttemptFailure::Failed)?;
         reload_module_for_update(report, &payload.version, signing.as_ref())?;
         verify(report, &payload.version).map_err(UpdateAttemptFailure::Failed)
@@ -444,12 +437,9 @@ fn run_update(
             reason,
             outcome: DisplayUpdateOutcome::RebootRequired,
         }),
-        Err(UpdateAttemptFailure::Failed(reason)) => Err(roll_back(
-            &before,
-            &payload.version,
-            &guest.kernel_release,
-            reason,
-        )),
+        Err(UpdateAttemptFailure::Failed(reason)) => {
+            Err(roll_back(&before, &payload.version, &guest, reason))
+        }
     }
 }
 
@@ -460,7 +450,7 @@ fn run_update(
 fn roll_back(
     before: &InstalledVersions,
     attempted: &str,
-    kernel_release: &str,
+    guest: &GuestFacts,
     reason: String,
 ) -> UpdateFailure {
     let Some(previous) = before.loaded.clone().or_else(|| before.previous(attempted)) else {
@@ -478,33 +468,33 @@ fn roll_back(
         SHORT_BUDGET,
     );
     let _ = command::run("modprobe", &[MODULE], &[], SHORT_BUDGET);
-    let initramfs = update_initramfs(kernel_release);
+    let initramfs = guest
+        .initramfs_builder
+        .map(|builder| (builder, update_initramfs(builder, &guest.kernel_release)));
 
     let runtime_restored = module_is_loaded(&read(Path::new("/proc/modules")))
         && loaded_version().as_deref() == Some(previous.as_str())
         && device_is_present();
 
     if rollback_outcome(runtime_restored) == DisplayUpdateOutcome::RolledBack {
-        let boot = if initramfs.succeeded() {
-            String::new()
-        } else {
-            format!(
+        let boot = match &initramfs {
+            Some((builder, outcome)) if !outcome.succeeded() => format!(
                 "; {previous} is running, but the rollback could not refresh initramfs: {}",
-                failure("update-initramfs", &initramfs)
-            )
+                failure(&builder.command(&guest.kernel_release), outcome)
+            ),
+            _ => String::new(),
         };
         UpdateFailure {
             reason: format!("{reason}; {previous} is running again{boot}"),
             outcome: DisplayUpdateOutcome::RolledBack,
         }
     } else {
-        let boot = if initramfs.succeeded() {
-            String::new()
-        } else {
-            format!(
+        let boot = match &initramfs {
+            Some((builder, outcome)) if !outcome.succeeded() => format!(
                 "; rollback also could not refresh initramfs: {}",
-                failure("update-initramfs", &initramfs)
-            )
+                failure(&builder.command(&guest.kernel_release), outcome)
+            ),
+            _ => String::new(),
         };
         UpdateFailure {
             reason: format!("{reason}; {previous} could not be brought back either{boot}"),
@@ -1049,9 +1039,14 @@ fn dependencies_stage(report: &mut Report, guest: &GuestFacts) -> Result<(), Str
     Ok(())
 }
 
+/// Whether the guest can already build a module for its own kernel.
+///
+/// `dkms` is looked for on `PATH` rather than at `/usr/sbin/dkms`: that is
+/// Debian's placing of it, Arch's is `/usr/bin`, and the written-out path
+/// finds nothing on the second one. The headers are still a path, because that
+/// is where a kernel's build tree is on every distribution that ships one.
 fn dependencies_are_present(kernel_release: &str) -> bool {
-    Path::new("/usr/sbin/dkms").exists()
-        && Path::new(&format!("/lib/modules/{kernel_release}/build")).exists()
+    program_on_path("dkms") && Path::new(&format!("/lib/modules/{kernel_release}/build")).exists()
 }
 
 /// Copies the payload's sources where DKMS can write beside them.
@@ -1157,16 +1152,33 @@ fn make_log(version: &str) -> Option<String> {
 }
 
 /// Refreshes the boot image that may carry this module and its load policy.
-fn update_initramfs_stage(report: &mut Report, kernel_release: &str) -> Result<(), String> {
-    let outcome = update_initramfs(kernel_release);
+fn update_initramfs_stage(
+    report: &mut Report,
+    builder: Option<InitramfsBuilder>,
+    kernel_release: &str,
+) -> Result<(), String> {
+    // A guest with no builder this build knows is a stage that skips rather
+    // than one that ends the recipe: the module is loaded by `modprobe` in the
+    // stage after this one either way, and what an unrefreshed image costs is
+    // a first frame that waits for `modules-load` on the next boot.
+    let Some(builder) = builder else {
+        report.skipped(
+            DisplayRecipeStep::Initramfs,
+            "no initramfs builder this build knows is installed, \
+             so the boot image keeps whatever it had",
+        );
+        return Ok(());
+    };
+
+    let outcome = update_initramfs(builder, kernel_release);
     if !outcome.succeeded() {
-        let reason = failure("update-initramfs", &outcome);
+        let reason = failure(&builder.command(kernel_release), &outcome);
         report.failed(DisplayRecipeStep::Initramfs, reason.clone());
         return Err(reason);
     }
     report.ok(
         DisplayRecipeStep::Initramfs,
-        format!("rebuilt initramfs for kernel {kernel_release}"),
+        format!("rebuilt initramfs for kernel {kernel_release} with {builder}"),
     );
     Ok(())
 }
@@ -1425,13 +1437,10 @@ fn compositor_when_one_starts(facts: &DesktopFacts) -> Option<CompositorLaunch> 
     }
 }
 
-fn update_initramfs(kernel_release: &str) -> command::Outcome {
-    command::run(
-        "update-initramfs",
-        &update_initramfs_arguments(kernel_release),
-        &[],
-        BUILD_BUDGET,
-    )
+fn update_initramfs(builder: InitramfsBuilder, kernel_release: &str) -> command::Outcome {
+    let arguments = builder.arguments(kernel_release);
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    command::run(builder.program(), &arguments, &[], BUILD_BUDGET)
 }
 
 /// Loads the module now, and arranges for it on every boot after this one.
@@ -1448,7 +1457,7 @@ fn update_initramfs(kernel_release: &str) -> command::Outcome {
 fn load_stage(
     report: &mut Report,
     mode: Option<(u32, u32)>,
-    refresh_initramfs_for: Option<&str>,
+    refresh_initramfs_for: Option<(Option<InitramfsBuilder>, &str)>,
     signing: Option<&GuestSigning>,
 ) -> Result<(), String> {
     let wanted = wanted_mode(mode);
@@ -1487,8 +1496,8 @@ fn load_stage(
         SHORT_BUDGET,
     );
 
-    if let Some(kernel_release) = refresh_initramfs_for {
-        update_initramfs_stage(report, kernel_release)?;
+    if let Some((builder, kernel_release)) = refresh_initramfs_for {
+        update_initramfs_stage(report, builder, kernel_release)?;
     }
 
     if module_is_loaded(&read(Path::new("/proc/modules"))) {
@@ -2092,7 +2101,7 @@ mod tests {
     };
     use crate::display_recipe::{PayloadFacts, Report, STEPS};
     use crate::guest_platform::{
-        CompositorLaunch, DesktopFacts, GuestFacts, LibraryLayout, PackageManager,
+        CompositorLaunch, DesktopFacts, GuestFacts, InitramfsBuilder, LibraryLayout, PackageManager,
     };
 
     use super::reported_desktop;
@@ -2105,6 +2114,7 @@ mod tests {
             architecture: "amd64".to_owned(),
             kernel_release: "7.0.0-14-generic".to_owned(),
             package_manager: Some(PackageManager::Apt),
+            initramfs_builder: Some(InitramfsBuilder::UpdateInitramfs),
             library_layout: LibraryLayout::Multiarch("x86_64-linux-gnu".to_owned()),
             desktop: DesktopFacts::default(),
         }
@@ -2638,10 +2648,22 @@ mod tests {
     }
 
     #[test]
-    fn initramfs_is_rebuilt_for_the_running_kernel() {
-        assert_eq!(
-            super::update_initramfs_arguments("7.0.0-30-generic"),
-            ["-u", "-k", "7.0.0-30-generic"]
+    fn a_guest_with_no_initramfs_builder_skips_that_stage_rather_than_stopping() {
+        let mut report = Report::new();
+
+        let outcome = super::update_initramfs_stage(&mut report, None, "7.0.0-30-generic");
+
+        assert!(outcome.is_ok(), "a missing builder does not end the recipe");
+        let stages = report.finish("the recipe stopped before this stage");
+        let initramfs = stages
+            .iter()
+            .find(|stage| stage.step() == DisplayRecipeStep::Initramfs)
+            .expect("the report names every step");
+        assert_eq!(initramfs.state(), DisplayRecipeStageState::Skipped);
+        assert!(
+            initramfs.message.contains("no initramfs builder"),
+            "{}",
+            initramfs.message
         );
     }
 
