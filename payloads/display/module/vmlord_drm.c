@@ -223,7 +223,7 @@ static const uint64_t vmlord_modifiers[] = {
 /* ------------------------------------------------------------------ plane */
 
 static int vmlord_plane_atomic_check(struct drm_plane *plane,
-				     struct drm_atomic_state *state)
+				     struct vmlord_atomic_state *state)
 {
 	struct drm_plane_state *new_state =
 		drm_atomic_get_new_plane_state(state, plane);
@@ -257,7 +257,7 @@ static int vmlord_plane_atomic_check(struct drm_plane *plane,
  * this plane's state is what a capture client walks the planes to find.
  */
 static void vmlord_plane_atomic_update(struct drm_plane *plane,
-				       struct drm_atomic_state *state)
+				       struct vmlord_atomic_state *state)
 {
 	struct vmlord_device *vmlord =
 		container_of(plane->dev, struct vmlord_device, drm);
@@ -333,7 +333,7 @@ static void vmlord_crtc_disable_vblank(struct drm_crtc *crtc)
 }
 
 static void vmlord_crtc_atomic_enable(struct drm_crtc *crtc,
-				      struct drm_atomic_state *state)
+				      struct vmlord_atomic_state *state)
 {
 	struct vmlord_device *vmlord =
 		container_of(crtc, struct vmlord_device, crtc);
@@ -359,7 +359,7 @@ static void vmlord_crtc_atomic_enable(struct drm_crtc *crtc,
 }
 
 static void vmlord_crtc_atomic_disable(struct drm_crtc *crtc,
-				       struct drm_atomic_state *state)
+				       struct vmlord_atomic_state *state)
 {
 	drm_crtc_vblank_off(crtc);
 }
@@ -373,7 +373,7 @@ static void vmlord_crtc_atomic_disable(struct drm_crtc *crtc,
  * what this driver did for every commit before it had a clock.
  */
 static void vmlord_crtc_atomic_flush(struct drm_crtc *crtc,
-				     struct drm_atomic_state *state)
+				     struct vmlord_atomic_state *state)
 {
 	struct drm_pending_vblank_event *event = crtc->state->event;
 
