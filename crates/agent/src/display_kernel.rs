@@ -27,12 +27,12 @@ use vmlord_agent_protocol::v1::{
 use crate::{
     command,
     display_recipe::{
-        DKMS_PACKAGE, InstalledVersions, MODULE, PayloadFacts, Report, SIGNING_CERTIFICATE,
-        SIGNING_KEY, SigningKeyState, compositor_isolation, dkms_reports_installed, dkms_versions,
-        has_recipe, modprobe_options, module_is_loaded, needs_build, needs_reload,
-        parse_module_parameters, parse_module_signature_key, parse_module_version,
+        DKMS_PACKAGE, InstalledVersions, KeyCreation, MODULE, PayloadFacts, Report,
+        SigningKeyState, SigningPair, compositor_isolation, dkms_reports_installed, dkms_versions,
+        has_recipe, kernel_signs_modules, modprobe_options, module_is_loaded, needs_build,
+        needs_reload, parse_module_parameters, parse_module_signature_key, parse_module_version,
         parse_secure_boot_state, parse_subject_key_identifier, read_payload_facts, serves,
-        signature_matches, signing_key_state, wanted_mode, was_built_for,
+        signature_matches, signing_key_state, signing_pair, wanted_mode, was_built_for,
         was_rejected_for_its_signature,
     },
     gpu_kernel,
@@ -214,16 +214,16 @@ pub fn apply(stopping: &AtomicBool, mode: Option<(u32, u32)>) -> RecipeOutcome {
     // Out-parameters rather than the `Ok` half: a recipe that failed at
     // `ModuleLoad` is exactly when the host most needs the certificate and the
     // desktop, and a `Result` would drop them on the way out.
-    let mut certificate = None;
+    let mut signing = None;
     let mut desktop = None;
-    let reason = match run_stages(&mut report, stopping, mode, &mut certificate, &mut desktop) {
+    let reason = match run_stages(&mut report, stopping, mode, &mut signing, &mut desktop) {
         Ok(()) => "the recipe did not need this stage".to_owned(),
         Err(reason) => reason,
     };
     RecipeOutcome {
         stages: report.finish(&reason),
         versions: versions(),
-        certificate,
+        certificate: signing.map(|signing| signing.certificate),
         desktop,
     }
 }
@@ -292,7 +292,7 @@ fn run_stages(
     report: &mut Report,
     stopping: &AtomicBool,
     mode: Option<(u32, u32)>,
-    certificate: &mut Option<DisplaySigningCertificate>,
+    signing: &mut Option<GuestSigning>,
     desktop: &mut Option<GuestDesktop>,
 ) -> Result<(), String> {
     let guest = guest_facts()?;
@@ -329,17 +329,10 @@ fn run_stages(
     )?;
     halted(stopping)?;
 
-    *certificate = signing_key_stage(report, &guest.kernel_release);
-    halted(stopping)?;
-
     let installed = installed_versions();
     let built = needs_build(&installed, &payload.version, device_is_present());
     if built {
         dependencies_stage(report, &guest)?;
-        halted(stopping)?;
-        source_stage(report, &payload)?;
-        halted(stopping)?;
-        build_stage(report, &payload.version, &guest.kernel_release)?;
         halted(stopping)?;
     } else {
         let already = format!(
@@ -355,14 +348,28 @@ fn run_stages(
         }
     }
 
-    module_signature_stage(report, certificate.as_ref(), &guest.kernel_release);
+    // After `BuildDependencies` and before anything builds, which is where
+    // `STEPS` puts it: whether this kernel signs modules is written in its
+    // build tree, which is what that stage installs, and the pair has to exist
+    // before the build that signs with it.
+    *signing = signing_key_stage(report, &guest);
+    halted(stopping)?;
+
+    if built {
+        source_stage(report, &payload)?;
+        halted(stopping)?;
+        build_stage(report, &payload.version, &guest.kernel_release)?;
+        halted(stopping)?;
+    }
+
+    module_signature_stage(report, signing.as_ref(), &guest.kernel_release);
     halted(stopping)?;
 
     load_stage(
         report,
         mode,
         built.then_some(guest.kernel_release.as_str()),
-        certificate.as_ref(),
+        signing.as_ref(),
     )?;
     compositor_isolation_stage(report, &guest)?;
     device_stage(report)?;
@@ -405,18 +412,20 @@ fn run_update(
 
     // What a rollback returns to, read before anything changes.
     let before = installed_versions();
-    let certificate = signing_key_stage(report, &guest.kernel_release);
     halted(stopping).map_err(failed)?;
 
     let attempt = (|| -> Result<(), UpdateAttemptFailure> {
         dependencies_stage(report, &guest).map_err(UpdateAttemptFailure::Failed)?;
+        // After the headers are there: the kernel configuration that says
+        // whether modules are signed at all lives in the build tree.
+        let signing = signing_key_stage(report, &guest);
         source_stage(report, &payload).map_err(UpdateAttemptFailure::Failed)?;
         build_stage(report, &payload.version, &guest.kernel_release)
             .map_err(UpdateAttemptFailure::Failed)?;
-        module_signature_stage(report, certificate.as_ref(), &guest.kernel_release);
+        module_signature_stage(report, signing.as_ref(), &guest.kernel_release);
         update_initramfs_stage(report, &guest.kernel_release)
             .map_err(UpdateAttemptFailure::Failed)?;
-        reload_module_for_update(report, &payload.version, certificate.as_ref())?;
+        reload_module_for_update(report, &payload.version, signing.as_ref())?;
         verify(report, &payload.version).map_err(UpdateAttemptFailure::Failed)
     })();
 
@@ -622,6 +631,18 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// The pair this guest signs with, once the stage has made sure it exists.
+///
+/// The certificate travels to the host as bytes; the path stays here, because
+/// what an enrollment is performed on is a file on this guest and the host's
+/// own copy is a copy.
+struct GuestSigning {
+    /// Where the certificate lives on this guest.
+    certificate_path: String,
+    /// What it is, in the two identities the host and the report need.
+    certificate: DisplaySigningCertificate,
+}
+
 /// Makes sure the guest has a MOK to sign with, and says which one it is.
 ///
 /// Never signs and never fails the recipe. Signing happens inside `dkms
@@ -629,53 +650,65 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// upgrade triggers with no host connected; and with Secure Boot off an
 /// unsigned module loads, so a guest that cannot produce a key still gets its
 /// desktop.
-fn signing_key_stage(
-    report: &mut Report,
-    kernel_release: &str,
-) -> Option<DisplaySigningCertificate> {
-    if !kernel_can_sign_modules(kernel_release) {
-        report.skipped(
-            DisplayRecipeStep::SigningKey,
-            format!("kernel {kernel_release} is built without module signing"),
-        );
-        return None;
+fn signing_key_stage(report: &mut Report, guest: &GuestFacts) -> Option<GuestSigning> {
+    match kernel_module_signing(&guest.kernel_release) {
+        Ok(true) => {}
+        Ok(false) => {
+            report.skipped(
+                DisplayRecipeStep::SigningKey,
+                format!(
+                    "kernel {} is built without module signing",
+                    guest.kernel_release
+                ),
+            );
+            return None;
+        }
+        // Not the same answer as "this kernel does not sign", and reported as
+        // the different thing it is: a guest whose headers are elsewhere would
+        // otherwise be recorded as one whose kernel refuses signatures, and
+        // the day Secure Boot is on that reading is the wrong one.
+        Err(reason) => {
+            report.skipped(DisplayRecipeStep::SigningKey, reason);
+            return None;
+        }
     }
 
+    let pair = signing_pair(&dkms_framework_configuration(), &guest.distribution);
     let state = signing_key_state(
-        Path::new(SIGNING_KEY).exists(),
-        Path::new(SIGNING_CERTIFICATE).exists(),
+        Path::new(&pair.key).exists(),
+        Path::new(&pair.certificate).exists(),
     );
     let replaced = state != SigningKeyState::Complete;
     let half = state == SigningKeyState::HalfPresent;
     if replaced {
         // A certificate cannot be derived from a private key, so half a pair
         // is replaced whole rather than completed.
-        let _ = fs::remove_file(SIGNING_KEY);
-        let _ = fs::remove_file(SIGNING_CERTIFICATE);
-        if let Err(reason) = create_signing_key() {
+        let _ = fs::remove_file(&pair.key);
+        let _ = fs::remove_file(&pair.certificate);
+        if let Err(reason) = create_signing_key(&pair) {
             report.failed(DisplayRecipeStep::SigningKey, reason);
             return None;
         }
     }
 
-    let der = match fs::read(SIGNING_CERTIFICATE) {
+    let der = match fs::read(&pair.certificate) {
         Ok(bytes) if !bytes.is_empty() => bytes,
         Ok(_) => {
             report.failed(
                 DisplayRecipeStep::SigningKey,
-                format!("{SIGNING_CERTIFICATE} is empty"),
+                format!("{} is empty", pair.certificate),
             );
             return None;
         }
         Err(error) => {
             report.failed(
                 DisplayRecipeStep::SigningKey,
-                format!("{SIGNING_CERTIFICATE} could not be read: {error}"),
+                format!("{} could not be read: {error}", pair.certificate),
             );
             return None;
         }
     };
-    restrict_to_root(Path::new(SIGNING_KEY));
+    restrict_to_root(Path::new(&pair.key));
 
     let printed = command::run(
         "openssl",
@@ -684,7 +717,7 @@ fn signing_key_stage(
             "-inform",
             "DER",
             "-in",
-            SIGNING_CERTIFICATE,
+            &pair.certificate,
             "-noout",
             "-text",
         ],
@@ -694,7 +727,7 @@ fn signing_key_stage(
     let Some(identifier) = parse_subject_key_identifier(&printed.output) else {
         report.failed(
             DisplayRecipeStep::SigningKey,
-            format!("{SIGNING_CERTIFICATE} carries no subject key identifier"),
+            format!("{} carries no subject key identifier", pair.certificate),
         );
         return None;
     };
@@ -704,12 +737,13 @@ fn signing_key_stage(
         // Every version DKMS holds was signed by the key that is now gone, so
         // a rollback would land on a module Secure Boot refuses. Re-signing
         // them is what makes the rollback path survive a replaced key.
-        resign_installed_versions(report, kernel_release);
+        resign_installed_versions(report, &guest.kernel_release);
     }
     report.ok(
         DisplayRecipeStep::SigningKey,
         format!(
-            "modules are signed with {SIGNING_CERTIFICATE} (sha256 {sha256}, key id {identifier}){}",
+            "modules are signed with {} (sha256 {sha256}, key id {identifier}){}",
+            pair.certificate,
             if half {
                 ", replaced because it was half a pair -- its enrollment has to be performed again"
             } else {
@@ -718,57 +752,132 @@ fn signing_key_stage(
         ),
     );
 
-    Some(DisplaySigningCertificate {
-        certificate: der,
-        sha256,
-        subject_key_identifier: identifier,
+    Some(GuestSigning {
+        certificate_path: pair.certificate,
+        certificate: DisplaySigningCertificate {
+            certificate: der,
+            sha256,
+            subject_key_identifier: identifier,
+        },
     })
 }
 
-/// Whether this kernel signs modules at all. `dkms` skips signing without it.
-fn kernel_can_sign_modules(kernel_release: &str) -> bool {
-    read(Path::new(&format!("/boot/config-{kernel_release}"))).contains("CONFIG_MODULE_SIG_HASH=")
+/// Whether this kernel signs modules, asked of the file dkms will ask.
+///
+/// Not `/boot/config-<release>`: that is where one packaging puts a copy, and
+/// a guest that keeps its configuration elsewhere would answer "this kernel
+/// does not sign modules" by having no such file. dkms reads the configuration
+/// out of the kernel's own build tree -- `include/config/auto.conf` where the
+/// build left one, `.config` otherwise -- and reading the same file is what
+/// makes this stage's answer and the build's behaviour the same answer.
+///
+/// `Err` is a guest where neither file is there, which is a question that was
+/// not answered rather than an answer of no. The tree is what
+/// `BuildDependencies` installs, and that stage runs before this one on every
+/// guest that needs a build.
+fn kernel_module_signing(kernel_release: &str) -> Result<bool, String> {
+    let build = PathBuf::from(format!("/lib/modules/{kernel_release}/build"));
+    for name in ["include/config/auto.conf", ".config"] {
+        let path = build.join(name);
+        if path.exists() {
+            return Ok(kernel_signs_modules(&read(&path)));
+        }
+    }
+    Err(format!(
+        "kernel {kernel_release} has no configuration under {} to say whether it signs modules",
+        build.display()
+    ))
 }
 
-/// Creates the guest's own pair, preferring the distribution's own way of it.
-fn create_signing_key() -> Result<(), String> {
-    let policy = command::run(
-        "update-secureboot-policy",
-        &["--new-key"],
-        &[
-            ("SHIM_NOTRIGGER", "y"),
-            ("DEBIAN_FRONTEND", "noninteractive"),
-        ],
-        SHORT_BUDGET,
-    );
-    if policy.succeeded() && Path::new(SIGNING_CERTIFICATE).exists() {
-        return Ok(());
+/// What dkms's own configuration files say, as one text.
+///
+/// Concatenated rather than merged, because the only thing read out of them is
+/// the last assignment of a name -- and `framework.conf.d` is read after
+/// `framework.conf` for exactly that reason.
+fn dkms_framework_configuration() -> String {
+    let mut text = read(Path::new("/etc/dkms/framework.conf"));
+    let Ok(entries) = fs::read_dir("/etc/dkms/framework.conf.d") else {
+        return text;
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "conf")
+        })
+        .collect();
+    // The shell expands the glob in order and the last assignment wins, so the
+    // order two drop-ins are read in is part of the answer.
+    files.sort();
+    for path in files {
+        text.push('\n');
+        text.push_str(&read(&path));
+    }
+    text
+}
+
+/// Creates the guest's own pair, the way this guest's dkms would create it.
+fn create_signing_key(pair: &SigningPair) -> Result<(), String> {
+    if let Some(directory) = Path::new(&pair.key).parent() {
+        let _ = fs::create_dir_all(directory);
+    }
+    if let Some(directory) = Path::new(&pair.certificate).parent() {
+        let _ = fs::create_dir_all(directory);
     }
 
-    // No `shim-signed` on this guest. The configuration file is the one thing
-    // that must not be substituted: without its `subjectKeyIdentifier = hash`
-    // the certificate carries nothing a signature can be matched on.
+    if pair.creation == KeyCreation::SecureBootPolicy {
+        let policy = command::run(
+            "update-secureboot-policy",
+            &["--new-key"],
+            &[
+                ("SHIM_NOTRIGGER", "y"),
+                ("DEBIAN_FRONTEND", "noninteractive"),
+            ],
+            SHORT_BUDGET,
+        );
+        if policy.succeeded() && Path::new(&pair.certificate).exists() {
+            return Ok(());
+        }
+        // `shim-signed` is not installed after all. openssl is what dkms
+        // itself falls back to, and it is what this falls back to.
+    }
+
+    // The extensions are named in the command rather than taken from a
+    // configuration file. `shim-signed` ships one at
+    // `/usr/lib/shim/mok/openssl.cnf` and a guest without that package has no
+    // such file; what the file was needed for is `subjectKeyIdentifier`, which
+    // is what `sign-file` records into the module and what `ModuleSignature`
+    // matches on, and asking for it directly asks for it on every guest.
     let openssl = command::run(
         "openssl",
         &[
             "req",
-            "-config",
-            "/usr/lib/shim/mok/openssl.cnf",
             "-new",
             "-x509",
-            "-newkey",
-            "rsa:2048",
             "-nodes",
+            "-utf8",
+            "-batch",
             "-days",
             "36500",
-            "-outform",
-            "DER",
-            "-keyout",
-            SIGNING_KEY,
-            "-out",
-            SIGNING_CERTIFICATE,
+            "-newkey",
+            "rsa:2048",
             "-subj",
             "/CN=VMLord display module signing key/",
+            "-addext",
+            "basicConstraints=critical,CA:FALSE",
+            "-addext",
+            "keyUsage=digitalSignature",
+            "-addext",
+            "extendedKeyUsage=codeSigning,1.3.6.1.4.1.2312.16.1.2",
+            "-addext",
+            "subjectKeyIdentifier=hash",
+            "-keyout",
+            &pair.key,
+            "-outform",
+            "DER",
+            "-out",
+            &pair.certificate,
         ],
         &[],
         SHORT_BUDGET,
@@ -822,10 +931,10 @@ fn resign_installed_versions(report: &mut Report, kernel_release: &str) {
 /// already says whether this guest was producing signed modules.
 fn module_signature_stage(
     report: &mut Report,
-    certificate: Option<&DisplaySigningCertificate>,
+    signing: Option<&GuestSigning>,
     kernel_release: &str,
 ) {
-    let Some(certificate) = certificate else {
+    let Some(certificate) = signing.map(|signing| &signing.certificate) else {
         report.skipped(
             DisplayRecipeStep::ModuleSignature,
             "this guest has no signing key, so there is no signature to check",
@@ -867,7 +976,7 @@ fn module_signature_stage(
 fn load_failure_message(
     reason: &str,
     secure_boot: Option<bool>,
-    subject_key_identifier: Option<&str>,
+    certificate: Option<(&str, &str)>,
 ) -> String {
     if !was_rejected_for_its_signature(reason) {
         return reason.to_owned();
@@ -877,9 +986,9 @@ fn load_failure_message(
         Some(false) => "Secure Boot is off",
         None => "the Secure Boot state is unknown",
     };
-    let certificate = match subject_key_identifier {
-        Some(identifier) => {
-            format!("enroll {SIGNING_CERTIFICATE} (key id {identifier}) as a MOK")
+    let certificate = match certificate {
+        Some((path, identifier)) => {
+            format!("enroll {path} (key id {identifier}) as a MOK")
         }
         None => "this guest has no certificate to enroll".to_owned(),
     };
@@ -887,10 +996,7 @@ fn load_failure_message(
 }
 
 /// What a failed `modprobe` of our module is reported as, asked once.
-fn load_failure(
-    outcome: &command::Outcome,
-    certificate: Option<&DisplaySigningCertificate>,
-) -> String {
+fn load_failure(outcome: &command::Outcome, signing: Option<&GuestSigning>) -> String {
     let reason = failure(&format!("modprobe {MODULE}"), outcome);
     if !was_rejected_for_its_signature(&reason) {
         return reason;
@@ -901,7 +1007,12 @@ fn load_failure(
     load_failure_message(
         &reason,
         secure_boot,
-        certificate.map(|certificate| certificate.subject_key_identifier.as_str()),
+        signing.map(|signing| {
+            (
+                signing.certificate_path.as_str(),
+                signing.certificate.subject_key_identifier.as_str(),
+            )
+        }),
     )
 }
 
@@ -1338,7 +1449,7 @@ fn load_stage(
     report: &mut Report,
     mode: Option<(u32, u32)>,
     refresh_initramfs_for: Option<&str>,
-    certificate: Option<&DisplaySigningCertificate>,
+    signing: Option<&GuestSigning>,
 ) -> Result<(), String> {
     let wanted = wanted_mode(mode);
     let payload_drm = Path::new(PAYLOAD_MOUNT).join("content").join("drm");
@@ -1389,7 +1500,7 @@ fn load_stage(
             // The stored mode changed under a module that is already up, and a
             // module parameter is read once. A reload that fails is a failed
             // stage and a degraded display -- and a VM that keeps running.
-            return reload_module(report, certificate);
+            return reload_module(report, signing);
         }
         report.skipped(
             DisplayRecipeStep::ModuleLoad,
@@ -1400,7 +1511,7 @@ fn load_stage(
 
     let outcome = command::run("modprobe", &[MODULE], &[], SHORT_BUDGET);
     if !outcome.succeeded() {
-        let reason = load_failure(&outcome, certificate);
+        let reason = load_failure(&outcome, signing);
         report.failed(DisplayRecipeStep::ModuleLoad, reason.clone());
         return Err(reason);
     }
@@ -1416,14 +1527,11 @@ fn load_stage(
 }
 
 /// Unloads whatever is running and loads what was just installed.
-fn reload_module(
-    report: &mut Report,
-    certificate: Option<&DisplaySigningCertificate>,
-) -> Result<(), String> {
+fn reload_module(report: &mut Report, signing: Option<&GuestSigning>) -> Result<(), String> {
     let _ = command::run("modprobe", &["-r", MODULE], &[], SHORT_BUDGET);
     let outcome = command::run("modprobe", &[MODULE], &[], SHORT_BUDGET);
     if !outcome.succeeded() {
-        let reason = load_failure(&outcome, certificate);
+        let reason = load_failure(&outcome, signing);
         report.failed(DisplayRecipeStep::ModuleLoad, reason.clone());
         return Err(reason);
     }
@@ -1436,7 +1544,7 @@ fn reload_module(
 fn reload_module_for_update(
     report: &mut Report,
     target_version: &str,
-    certificate: Option<&DisplaySigningCertificate>,
+    signing: Option<&GuestSigning>,
 ) -> Result<(), UpdateAttemptFailure> {
     let unloaded = command::run("modprobe", &["-r", MODULE], &[], SHORT_BUDGET);
     let still_loaded = module_is_loaded(&read(Path::new("/proc/modules")));
@@ -1450,7 +1558,7 @@ fn reload_module_for_update(
 
     let outcome = command::run("modprobe", &[MODULE], &[], SHORT_BUDGET);
     if !outcome.succeeded() {
-        let reason = load_failure(&outcome, certificate);
+        let reason = load_failure(&outcome, signing);
         report.failed(DisplayRecipeStep::ModuleLoad, reason.clone());
         return Err(UpdateAttemptFailure::Failed(reason));
     }
@@ -2620,7 +2728,7 @@ mod tests {
             "modprobe vmlord_drm exited with 1: modprobe: ERROR: could not insert \
              'vmlord_drm': Key was rejected by service",
             Some(true),
-            Some("0a1b2c"),
+            Some(("/var/lib/dkms/mok.pub", "0a1b2c")),
         );
 
         assert!(
@@ -2637,7 +2745,11 @@ mod tests {
                       insert 'vmlord_drm': Invalid argument";
 
         assert_eq!(
-            load_failure_message(reason, Some(false), Some("0a1b2c")),
+            load_failure_message(
+                reason,
+                Some(false),
+                Some(("/var/lib/dkms/mok.pub", "0a1b2c"))
+            ),
             reason
         );
     }
