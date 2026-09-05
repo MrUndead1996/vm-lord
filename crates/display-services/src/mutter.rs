@@ -25,11 +25,10 @@
 
 use std::{
     collections::HashMap,
-    io::{self, Read},
-    os::fd::{AsRawFd, OwnedFd},
+    os::fd::OwnedFd,
     sync::mpsc::{self, Receiver, Sender},
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use vmlord_display_protocol::clipboard::Kind;
@@ -38,8 +37,12 @@ use zbus::{
     zvariant::{OwnedObjectPath, Value},
 };
 
-use crate::guest_clipboard::{
-    ClipboardError, Event, GNOME_COPIED_MIME, GuestClipboard, URI_LIST_MIME,
+use crate::{
+    clipboard_pipe::{drain, fill},
+    guest_clipboard::{
+        ClipboardError, Event, GNOME_COPIED_MIME, GuestClipboard, URI_LIST_MIME, kinds_of,
+        offers_files,
+    },
 };
 
 /// The bus name every call here goes to.
@@ -271,13 +274,6 @@ fn transfer(message: &zbus::Message) -> Option<Event> {
     None
 }
 
-/// Whether a selection names files, whichever of the two formats it uses.
-fn offers_files(mimes: &[String]) -> bool {
-    mimes
-        .iter()
-        .any(|mime| mime == URI_LIST_MIME || mime == GNOME_COPIED_MIME)
-}
-
 /// Every string anywhere inside one `a{sv}` value.
 ///
 /// Written as a walk rather than a conversion because of what mutter actually
@@ -296,182 +292,31 @@ fn strings_in(value: &zbus::zvariant::Value<'_>) -> Vec<String> {
     }
 }
 
-/// The kinds these mime types name, in the protocol's canonical order.
-fn kinds_of(mimes: &[String]) -> Vec<Kind> {
-    let mut kinds = Vec::new();
-    for kind in [Kind::Text, Kind::Html, Kind::Bmp, Kind::Png] {
-        if mimes.iter().any(|mime| mime == kind.mime()) {
-            kinds.push(kind);
-        }
-    }
-
-    kinds
-}
-
-/// Reads a descriptor that is not blocking, and may not be ready for a while.
-fn drain<R: AsRawFd>(
-    source: &R,
-    cap: usize,
-    deadline: Duration,
-) -> Result<Vec<u8>, ClipboardError> {
-    let mut file = unsafe_borrowed(source);
-    let mut bytes = Vec::new();
-    let mut buffer = [0u8; 16 * 1024];
-    let until = Instant::now() + deadline;
-
-    loop {
-        match file.read(&mut buffer) {
-            Ok(0) => return Ok(bytes),
-            Ok(read) => {
-                if bytes.len() + read > cap {
-                    return Err(ClipboardError::TooLarge);
-                }
-                bytes.extend_from_slice(&buffer[..read]);
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if Instant::now() >= until {
-                    return Err(ClipboardError::Idle);
-                }
-                wait(source.as_raw_fd(), libc::POLLIN);
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(ClipboardError::Transfer(error)),
-        }
-    }
-}
-
-/// Writes a whole selection to a descriptor that may not take it all at once.
-fn fill(sink: &OwnedFd, bytes: &[u8]) -> Result<(), ClipboardError> {
-    use std::io::Write;
-
-    let mut file = unsafe_borrowed(sink);
-    let mut rest = bytes;
-
-    while !rest.is_empty() {
-        match file.write(rest) {
-            Ok(0) => {
-                return Err(ClipboardError::Transfer(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "the reader took nothing",
-                )));
-            }
-            Ok(written) => rest = &rest[written..],
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                wait(file.as_raw_fd(), libc::POLLOUT);
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(ClipboardError::Transfer(error)),
-        }
-    }
-
-    Ok(())
-}
-
-/// Waits until a descriptor is ready, or a second passes.
-fn wait(descriptor: libc::c_int, events: libc::c_short) {
-    let mut poll = libc::pollfd {
-        fd: descriptor,
-        events,
-        revents: 0,
-    };
-
-    // SAFETY: one live `pollfd` describing a descriptor the caller owns, and a
-    // count that matches. A timeout means the loop above checks its deadline.
-    unsafe {
-        libc::poll(&raw mut poll, 1, 1000);
-    }
-}
-
-/// A `File` over a descriptor this function does not own.
-///
-/// The descriptor belongs to the caller, which closes it when it drops; the
-/// file is wrapped in `ManuallyDrop` so that reading through it does not close
-/// something twice.
-fn unsafe_borrowed<F: AsRawFd>(descriptor: &F) -> std::mem::ManuallyDrop<std::fs::File> {
-    use std::os::fd::FromRawFd;
-
-    // SAFETY: the descriptor is live for as long as the caller holds it, and
-    // the file this makes is never dropped, so it never closes it.
-    std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(descriptor.as_raw_fd()) })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn only_allowlisted_mime_types_reach_a_kind() {
-        let offered = vec![
-            "text/uri-list".to_owned(),
-            "image/png".to_owned(),
+    fn a_structure_wrapped_array_still_names_its_mime_types() {
+        // The shape mutter actually sends `mime-types` in: `(as)`, a structure
+        // wrapping the array rather than the array. A direct conversion sees
+        // nothing here, which is what the walk exists to fix.
+        let wrapped = Value::from(zbus::zvariant::Structure::from((vec![
             "text/plain;charset=utf-8".to_owned(),
-        ];
-
-        assert_eq!(kinds_of(&offered), vec![Kind::Text, Kind::Png]);
-    }
-
-    #[test]
-    fn an_offer_of_files_alone_names_no_kind() {
-        assert!(kinds_of(&["text/uri-list".to_owned()]).is_empty());
-    }
-
-    #[test]
-    fn an_offer_of_files_is_seen_under_either_of_its_names() {
-        assert!(offers_files(&[URI_LIST_MIME.to_owned()]));
-        assert!(offers_files(&[GNOME_COPIED_MIME.to_owned()]));
-        assert!(!offers_files(&["text/plain;charset=utf-8".to_owned()]));
-    }
-
-    #[test]
-    fn a_read_stops_at_its_cap() {
-        let (reader, writer) = pipe();
-        std::thread::spawn(move || {
-            use std::io::Write;
-            let mut sink = std::fs::File::from(writer);
-            let _ = sink.write_all(&[b'x'; 40]);
-        });
-
-        assert!(matches!(
-            drain(&reader, 16, Duration::from_secs(2)),
-            Err(MutterError::TooLarge)
-        ));
-    }
-
-    #[test]
-    fn a_read_that_never_arrives_gives_up() {
-        let (reader, writer) = pipe();
-
-        let outcome = drain(&reader, 1024, Duration::from_millis(50));
-
-        drop(writer);
-        assert!(matches!(outcome, Err(MutterError::Idle)));
-    }
-
-    #[test]
-    fn a_read_takes_everything_up_to_the_close() {
-        let (reader, writer) = pipe();
-        std::thread::spawn(move || {
-            use std::io::Write;
-            let mut sink = std::fs::File::from(writer);
-            let _ = sink.write_all(b"a selection");
-        });
+            "image/png".to_owned(),
+        ],)));
 
         assert_eq!(
-            drain(&reader, 1024, Duration::from_secs(2)).expect("a readable pipe"),
-            b"a selection"
+            strings_in(&wrapped),
+            vec![
+                "text/plain;charset=utf-8".to_owned(),
+                "image/png".to_owned()
+            ]
         );
     }
 
-    /// A non-blocking pipe, which is what `SelectionRead` hands back.
-    fn pipe() -> (OwnedFd, OwnedFd) {
-        use std::os::fd::FromRawFd;
-
-        let mut ends = [0 as libc::c_int; 2];
-        // SAFETY: `ends` is two live ints, which is what `pipe2` fills.
-        let made = unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
-        assert_eq!(made, 0, "a pipe");
-
-        // SAFETY: `pipe2` succeeded, so both are descriptors this owns.
-        unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) }
+    #[test]
+    fn a_value_that_names_no_string_walks_to_nothing() {
+        assert!(strings_in(&Value::from(7u32)).is_empty());
     }
 }

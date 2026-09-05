@@ -18,6 +18,30 @@ pub const URI_LIST_MIME: &str = "text/uri-list";
 /// How GNOME's file manager names one, with the operation on the first line.
 pub const GNOME_COPIED_MIME: &str = "x-special/gnome-copied-files";
 
+/// The kinds these mime types name, in the protocol's canonical order.
+///
+/// The allowlist is the whole point: a guest copying a spreadsheet cell offers
+/// a dozen formats, and only these four ever cross.
+#[must_use]
+pub fn kinds_of(mimes: &[String]) -> Vec<Kind> {
+    let mut kinds = Vec::new();
+    for kind in [Kind::Text, Kind::Html, Kind::Bmp, Kind::Png] {
+        if mimes.iter().any(|mime| mime == kind.mime()) {
+            kinds.push(kind);
+        }
+    }
+
+    kinds
+}
+
+/// Whether a selection names files, whichever of the two formats it uses.
+#[must_use]
+pub fn offers_files(mimes: &[String]) -> bool {
+    mimes
+        .iter()
+        .any(|mime| mime == URI_LIST_MIME || mime == GNOME_COPIED_MIME)
+}
+
 /// What the compositor says happened.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -151,14 +175,126 @@ pub trait GuestClipboard {
     fn refuse(&self, serial: u32) -> Result<(), ClipboardError>;
 }
 
+/// The clipboard of whichever desktop this guest is running.
+///
+/// The choice is made from what the session offers rather than from the name
+/// of a desktop: a GNOME session announces `org.gnome.Mutter.RemoteDesktop` on
+/// its bus and no data-control protocol on its registry, a wlroots one the
+/// reverse, and a session with neither has nobody logged into it. Deciding by
+/// name would need a table of desktops to keep up to date, and would be wrong
+/// the first time a compositor grew the other protocol.
+///
+/// Data-control first, because it is the cheaper question -- one round trip on
+/// a socket the session already has -- and because a compositor that offers it
+/// is one whose clipboard lives outside the compositor's own D-Bus name.
+pub enum Desktop {
+    /// A wlroots-style compositor: Hyprland, Sway, and the rest.
+    DataControl(crate::data_control::Clipboard),
+    /// GNOME.
+    Mutter(crate::mutter::Clipboard),
+}
+
+impl GuestClipboard for Desktop {
+    /// Opens whichever clipboard this session has.
+    ///
+    /// # Errors
+    ///
+    /// [`ClipboardError::Compositor`] naming both refusals if neither answers,
+    /// which is what a guest with nobody logged in looks like.
+    fn open() -> Result<(Self, Receiver<Event>), ClipboardError> {
+        let data_control = match crate::data_control::Clipboard::open() {
+            Ok((clipboard, events)) => {
+                eprintln!("vmlord-display-clipboard: the session speaks data-control");
+
+                return Ok((Self::DataControl(clipboard), events));
+            }
+            Err(error) => error,
+        };
+
+        match crate::mutter::Clipboard::open() {
+            Ok((clipboard, events)) => {
+                eprintln!("vmlord-display-clipboard: the session speaks Mutter's RemoteDesktop");
+
+                Ok((Self::Mutter(clipboard), events))
+            }
+            // Both, because either one alone reads as the wrong diagnosis:
+            // "no compositor on the bus" in a Hyprland guest sends a reader
+            // looking for GNOME.
+            Err(mutter) => Err(ClipboardError::Compositor(format!(
+                "no data-control ({data_control}) and no Mutter ({mutter})"
+            ))),
+        }
+    }
+
+    fn listen(&self) -> Result<(), ClipboardError> {
+        match self {
+            Self::DataControl(clipboard) => clipboard.listen(),
+            Self::Mutter(clipboard) => clipboard.listen(),
+        }
+    }
+
+    fn own(&self, kinds: &[Kind], files: bool) -> Result<(), ClipboardError> {
+        match self {
+            Self::DataControl(clipboard) => clipboard.own(kinds, files),
+            Self::Mutter(clipboard) => clipboard.own(kinds, files),
+        }
+    }
+
+    fn read_mime(&self, mime: &str, cap: usize) -> Result<Vec<u8>, ClipboardError> {
+        match self {
+            Self::DataControl(clipboard) => clipboard.read_mime(mime, cap),
+            Self::Mutter(clipboard) => clipboard.read_mime(mime, cap),
+        }
+    }
+
+    fn write(&self, serial: u32, bytes: &[u8]) -> Result<(), ClipboardError> {
+        match self {
+            Self::DataControl(clipboard) => clipboard.write(serial, bytes),
+            Self::Mutter(clipboard) => clipboard.write(serial, bytes),
+        }
+    }
+
+    fn refuse(&self, serial: u32) -> Result<(), ClipboardError> {
+        match self {
+            Self::DataControl(clipboard) => clipboard.refuse(serial),
+            Self::Mutter(clipboard) => clipboard.refuse(serial),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn the_mutter_adapter_speaks_the_seam() {
+    fn both_adapters_speak_the_seam() {
         fn assert_guest_clipboard<C: GuestClipboard>() {}
 
         assert_guest_clipboard::<crate::mutter::Clipboard>();
+        assert_guest_clipboard::<crate::data_control::Clipboard>();
+        assert_guest_clipboard::<Desktop>();
+    }
+
+    #[test]
+    fn only_allowlisted_mime_types_reach_a_kind() {
+        let offered = vec![
+            "text/uri-list".to_owned(),
+            "image/png".to_owned(),
+            "text/plain;charset=utf-8".to_owned(),
+        ];
+
+        assert_eq!(kinds_of(&offered), vec![Kind::Text, Kind::Png]);
+    }
+
+    #[test]
+    fn an_offer_of_files_alone_names_no_kind() {
+        assert!(kinds_of(&["text/uri-list".to_owned()]).is_empty());
+    }
+
+    #[test]
+    fn an_offer_of_files_is_seen_under_either_of_its_names() {
+        assert!(offers_files(&[URI_LIST_MIME.to_owned()]));
+        assert!(offers_files(&[GNOME_COPIED_MIME.to_owned()]));
+        assert!(!offers_files(&["text/plain;charset=utf-8".to_owned()]));
     }
 }

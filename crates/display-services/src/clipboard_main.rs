@@ -42,9 +42,10 @@ use vmlord_display_protocol::{
 use crate::{
     channel::{self, BindError},
     clipboard_files::{Produced, SourceTree, Staging, parse_uri_list, uri_lists},
-    guest_clipboard::{ClipboardError, Event, GNOME_COPIED_MIME, GuestClipboard, URI_LIST_MIME},
+    guest_clipboard::{
+        ClipboardError, Desktop, Event, GNOME_COPIED_MIME, GuestClipboard, URI_LIST_MIME,
+    },
     ipc::Message,
-    mutter,
     unix::Connection,
     vsock::{self, CLIPBOARD_PORT},
 };
@@ -207,9 +208,10 @@ fn serve_session(
         .set_read_timeout(PATIENCE)
         .map_err(|error| format!("the clipboard socket refused a timeout: {error}"))?;
 
-    // The implementation of the seam is chosen here: today it is Mutter, and
-    // the choice will follow what the session offers.
-    pump::<_, mutter::Clipboard>(&mut stream, generation, &session_token(&session_id))
+    // Which implementation of the seam serves this session is `Desktop`'s
+    // question, and it is asked again on every reopen: a daemon outlives a
+    // logout, and the desktop that comes back need not be the one that left.
+    pump::<_, Desktop>(&mut stream, generation, &session_token(&session_id))
 }
 
 /// The name a session's staging directory is made under.
