@@ -1032,6 +1032,24 @@ fn dependencies_stage(report: &mut Report, guest: &GuestFacts) -> Result<(), Str
         return Err(reason);
     }
 
+    // Installing is not the same as having. A rolling distribution ships one
+    // headers package for the kernel it ships now, so a guest that was
+    // upgraded and not rebooted installs headers for a kernel it is not
+    // running and DKMS then fails four stages later with a path. Said here,
+    // where the guest is asked for what it needs, it is one sentence naming
+    // the reboot that fixes it.
+    if !dependencies_are_present(&guest.kernel_release) {
+        let reason = format!(
+            "installed {installed}, and kernel {} still has no build tree at \
+             /lib/modules/{}/build: this guest is running a kernel its \
+             distribution no longer packages headers for, which a reboot into \
+             the installed kernel fixes",
+            guest.kernel_release, guest.kernel_release
+        );
+        report.failed(DisplayRecipeStep::BuildDependencies, reason.clone());
+        return Err(reason);
+    }
+
     report.ok(
         DisplayRecipeStep::BuildDependencies,
         format!("installed {installed}"),

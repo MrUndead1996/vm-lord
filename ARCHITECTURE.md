@@ -4344,7 +4344,10 @@ as entries in one Plan9 device.
 Stages, in order, reported as a list and never as a verdict:
 `DISTRIBUTION`, `PAYLOAD` (the mount, its manifest, and every declared file's
 digest -- before anything is copied), `BUILD_DEPENDENCIES` (DKMS, a compiler
-and the running kernel's headers, from the guest's own package manager),
+and the running kernel's headers, from the guest's own package manager --
+checked again after the install, because a rolling distribution packages
+headers for the kernel it ships now and a guest upgraded but not rebooted
+installs headers for a kernel it is not running),
 `MODULE_SOURCE` (copied to `/usr/src/vmlord-display-<version>`, because 9p is
 read-only and DKMS writes beside its sources), `MODULE_BUILD`, `INITRAMFS`
 (the guest's own initramfs builder, for the running kernel, after a successful
