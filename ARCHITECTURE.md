@@ -1410,6 +1410,20 @@ an empty one say the same thing. `git apply` in the image refuses a patch that
 does not apply exactly, which is what makes a pin bump upstream has moved under
 fail at build time rather than ship an unpatched Mesa quietly.
 
+A patch describes where binaries came from; it does not tell a guest what they
+can do. That is `guest_capabilities`, a list declared beside `required_renderers`
+in `payload.spec.json` and written by `prepare.py` into both documents it
+generates, so the packer and the guest read the same statement and `pack` refuses
+the pair unless they agree. The two lists face opposite ways: `required_renderers`
+says what a payload needs of the host and is catalog material, while
+`guest_capabilities` says what the guest may rely on the payload for and travels
+in `sources.json`, which is the only provenance the guest itself reads. One
+capability exists today, `compositor-scanout` -- the Mesa patch above -- and
+`COMPOSITOR_ISOLATION` is its only reader. The field is optional on the wire for
+the same reason `patches` is, and the omission carries meaning: a payload that
+declares nothing is a payload an agent must treat as able to do nothing, which is
+exactly right for every payload built before the capability existed.
+
 Ready content is materialized below a VM's exact `gpu-payload` child as
 `generations/<digest>` followed by `ready/<digest>.json`. The third logical
 share, `GpuPayload` / `vmlord.gpu.payload`, exports only that canonical child;
@@ -4349,13 +4363,22 @@ module parameter is read once; a module that does not say what it was loaded
 with is left alone, because a reload on a guess drops a working desktop.
 
 `COMPOSITOR_ISOLATION` is a stage of its own because it is a decision and not a
-copy, and since task #180 the decision has two answers rather than one. The
-stage asks `/dev/dxg` -- opened, not stat'd, and asked here rather than carried
-in the guest's facts, because the recipe ran minutes ago and an adapter that has
-since gone is the case being decided for.
+copy, and since task #180 the decision has two answers rather than one. It turns
+on two questions, and only one of them is about this guest. The first is
+`/dev/dxg` -- opened, not stat'd, and asked here rather than carried in the
+guest's facts, because the recipe ran minutes ago and an adapter that has since
+gone is the case being decided for. The second is the GPU payload's
+`guest_capabilities`, because presenting a frame is the payload's ability and not
+the device's, and the two are versioned apart: `cargo dist` copies whatever
+payload was packed last, so a build carrying every commit since #180 can ship a
+payload that predates all of them. A compositor moved onto such a Mesa draws on
+the GPU and then cannot hand the frame to KMS -- gnome-shell reports `No GPUs
+found`, gdm gives up, and the screen stays black through every later boot. Read
+as absent whenever it cannot be read as present, since the cost of the two
+mistakes is a slower desktop against no desktop at all.
 
-A guest with an adapter is left on the payload's Mesa and any drop-in an earlier
-run installed is removed. That Mesa carries a patch, described under "What the
+A guest with an adapter whose payload declares `compositor-scanout` is left on
+the payload's Mesa and any drop-in an earlier run installed is removed. That Mesa carries a patch, described under "What the
 bundled Mesa is patched for", which lets d3d12 present a frame through a dumb BO
 on our own device: the compositor composites on the GPU and scans out through
 `vmlord_drm`. What used to be the failure this stage prevented is what the patch
@@ -4364,7 +4387,10 @@ mapping the payload's `libgallium` and the host's `libnvwgf2umx.so` -- a
 compositor on llvmpipe never loads the NVIDIA user-mode driver -- completes its
 atomic modeset, leaves the connector enabled, and logs no `EGL_BAD_ALLOC`.
 
-A guest with no adapter gets the drop-in, and needs it more than it used to. The
+A guest that fails either question gets the drop-in, and the stage's message says
+which one it failed, so that a guest holding its compositor back reads as a guest
+with an old payload rather than as a guest with no adapter. A guest with no
+adapter needs the drop-in more than it used to. The
 file is the same for every VM, so it comes out of the payload, and it says two
 things -- the GPU recipe's Mesa overrides unset, and `LD_LIBRARY_PATH` pointed
 at the distribution's libraries. Both, because the GPU recipe reaches a process

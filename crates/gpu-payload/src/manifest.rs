@@ -2,7 +2,10 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{CatalogEntry, GuestTarget, MesaPolicy, PayloadError, PreparedFile, Sha256Digest};
+use crate::{
+    CatalogEntry, GuestCapability, GuestTarget, MesaPolicy, PayloadError, PreparedFile,
+    Sha256Digest,
+};
 use vmlord_payload::validate_path;
 
 const D3DKMTHK_PATH: &str = "include/uapi/misc/d3dkmthk.h";
@@ -96,6 +99,17 @@ impl PayloadManifest {
 struct SourceManifestDocument {
     schema_version: u32,
     target: GuestTarget,
+    /// What the guest may rely on this payload's userspace for.
+    ///
+    /// Absent in a payload prepared before capabilities existed, which is the same
+    /// statement as an empty list: it promises nothing, and an agent that meets it
+    /// must keep whatever it does for a payload that cannot.
+    ///
+    /// Skipped when empty on the way out as well as defaulted on the way in, so
+    /// that re-serialising a payload prepared before the field existed gives the
+    /// document back unchanged: this one is kept as provenance and compared.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    guest_capabilities: Vec<GuestCapability>,
     mesa_policy: MesaPolicy,
     sources: Vec<SourceRecord>,
     overlays: Vec<OverlayRecord>,

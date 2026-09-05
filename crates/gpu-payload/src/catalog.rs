@@ -42,6 +42,21 @@ pub enum RendererCapability {
     D3d12Gallium,
     DznVulkan,
 }
+/// Something a payload's userspace can do for the guest beyond rendering.
+///
+/// Separate from [`RendererCapability`], which says what a payload needs of the
+/// host: this says what the guest may rely on the payload for. The guest reads
+/// it out of the `sources.json` it was shipped, and a payload built before a
+/// capability existed declares nothing -- which is the whole point of the list,
+/// because payload and agent are versioned apart and the agent meets both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GuestCapability {
+    /// This payload's Mesa can hand a finished frame to KMS: a `PIPE_BIND_SCANOUT`
+    /// resource gets a dumb BO on `vmlord_drm` beside it, which is what lets a
+    /// compositor run on the payload's Mesa rather than beside it (#180).
+    CompositorScanout,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MesaPolicy {

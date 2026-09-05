@@ -11,8 +11,8 @@ use vmlord_payload::builder::{
 };
 
 use crate::{
-    CatalogEntry, GuestTarget, MesaPolicy, PayloadError, PayloadManifest, RendererCapability,
-    Sha256Digest, SourceManifest,
+    CatalogEntry, GuestCapability, GuestTarget, MesaPolicy, PayloadError, PayloadManifest,
+    RendererCapability, Sha256Digest, SourceManifest,
 };
 
 pub use vmlord_payload::builder::BuiltArtifact as BuiltGpuArtifact;
@@ -32,6 +32,10 @@ struct PackRecipe {
     payload_id: String,
     target: GuestTarget,
     required_renderers: Vec<RendererCapability>,
+    /// Absent in a payload prepared before capabilities existed, which is the
+    /// same statement as an empty list: it promises the guest nothing.
+    #[serde(default)]
+    guest_capabilities: Vec<GuestCapability>,
     mesa_policy: MesaPolicy,
     sources: Vec<RecipeSource>,
     overlays: Vec<RecipeOverlay>,
@@ -144,6 +148,8 @@ struct RecipeLicense {
 struct PreparedSources {
     schema_version: u32,
     target: GuestTarget,
+    #[serde(default)]
+    guest_capabilities: Vec<GuestCapability>,
     mesa_policy: MesaPolicy,
     sources: Vec<RecipeSource>,
     overlays: Vec<RecipeOverlay>,
@@ -332,6 +338,7 @@ fn validate_prepared_provenance(
         .map_err(|error| PayloadError::InvalidManifest(error.to_string()))?;
     if prepared.schema_version != 2
         || prepared.target != recipe.target
+        || prepared.guest_capabilities != recipe.guest_capabilities
         || prepared.mesa_policy != recipe.mesa_policy
         || prepared.sources != recipe.sources
         || prepared.overlays != recipe.overlays
@@ -672,7 +679,7 @@ mod tests {
 
     #[test]
     fn prepared_sources_must_match_entire_recipe_provenance() {
-        for mutation in ["source", "target", "mesa"] {
+        for mutation in ["source", "target", "mesa", "capabilities"] {
             let fixture = PreparedFixture::new(&format!("source-provenance-{mutation}"));
             rewrite_json(
                 &fixture.prepared.join("sources.json"),
@@ -683,6 +690,12 @@ mod tests {
                     }
                     "target" => sources["target"]["kernel_release"] = "other".into(),
                     "mesa" => sources["mesa_policy"] = "distro".into(),
+                    // A capability the guest would read but the recipe never
+                    // declared: the one field here whose whole purpose is to be
+                    // believed by an agent that cannot check it.
+                    "capabilities" => {
+                        sources["guest_capabilities"] = serde_json::json!(["compositor-scanout"])
+                    }
                     _ => unreachable!(),
                 },
             );
@@ -698,6 +711,55 @@ mod tests {
                 "accepted mismatched {mutation} provenance"
             );
         }
+    }
+
+    #[test]
+    fn a_payload_may_declare_what_its_userspace_can_do_for_the_guest() {
+        // The fixtures declare nothing, which is a payload prepared before the
+        // field existed: it must still pack, because that is what every payload
+        // already built looks like.
+        let fixture = PreparedFixture::new("capabilities");
+        assert!(
+            pack(fixture.request(
+                &fixture.root.join("silent.zip"),
+                &fixture.root.join("silent.json")
+            ))
+            .is_ok()
+        );
+
+        let declared = serde_json::json!(["compositor-scanout"]);
+        rewrite_json(&fixture.prepared.join("sources.json"), |sources| {
+            sources["guest_capabilities"] = declared.clone();
+        });
+        fixture.rewrite_recipe(|recipe| recipe["guest_capabilities"] = declared.clone());
+        assert!(
+            pack(fixture.request(
+                &fixture.root.join("declared.zip"),
+                &fixture.root.join("declared.json")
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_capability_this_build_has_never_heard_of_is_refused() {
+        // Not read as "some capability, unknown": a guest reads this list to
+        // decide what it may rely on, and a name the packer cannot resolve is a
+        // recipe that means something this build does not implement.
+        let fixture = PreparedFixture::new("unknown-capability");
+        let declared = serde_json::json!(["compositor-teleport"]);
+        rewrite_json(&fixture.prepared.join("sources.json"), |sources| {
+            sources["guest_capabilities"] = declared.clone();
+        });
+        fixture.rewrite_recipe(|recipe| recipe["guest_capabilities"] = declared.clone());
+
+        assert!(matches!(
+            pack(fixture.request(
+                &fixture.root.join("payload.zip"),
+                &fixture.root.join("entry.json")
+            )),
+            Err(PayloadError::InvalidCatalog(_))
+        ));
     }
 
     #[test]

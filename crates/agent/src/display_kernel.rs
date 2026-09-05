@@ -28,13 +28,15 @@ use crate::{
     command,
     display_recipe::{
         DKMS_PACKAGE, InstalledVersions, MODULE, PayloadFacts, Report, SIGNING_CERTIFICATE,
-        SIGNING_KEY, SigningKeyState, dkms_reports_installed, dkms_versions, has_recipe,
-        modprobe_options, module_is_loaded, needs_build, needs_reload, parse_module_parameters,
-        parse_module_signature_key, parse_module_version, parse_secure_boot_state,
-        parse_subject_key_identifier, read_payload_facts, serves, signature_matches,
-        signing_key_state, wanted_mode, was_built_for, was_rejected_for_its_signature,
+        SIGNING_KEY, SigningKeyState, compositor_isolation, dkms_reports_installed, dkms_versions,
+        has_recipe, modprobe_options, module_is_loaded, needs_build, needs_reload,
+        parse_module_parameters, parse_module_signature_key, parse_module_version,
+        parse_secure_boot_state, parse_subject_key_identifier, read_payload_facts, serves,
+        signature_matches, signing_key_state, wanted_mode, was_built_for,
+        was_rejected_for_its_signature,
     },
     gpu_kernel,
+    gpu_targets::PAYLOAD as GPU_PAYLOAD,
     guest_files::{copy_tree, failure, read, write_if_different},
     guest_packages::{self, Package},
     guest_platform::{
@@ -1107,22 +1109,9 @@ fn compositor_isolation_stage(report: &mut Report, guest: &GuestFacts) -> Result
     let step = DisplayRecipeStep::CompositorIsolation;
     let user_units = Path::new(SYSTEMD_USER_UNITS);
 
-    // A guest with an adapter no longer wants this drop-in: the payload's Mesa
-    // presents through a dumb BO on `vmlord_drm` now, so the compositor belongs
-    // on it rather than off it, and the drop-in would put it back on llvmpipe.
-    //
-    // A guest without one still wants it, and wants it more than it used to. The
-    // payload's Mesa is built `-Dllvm=disabled`, so the renderer it falls back to
-    // with no adapter is softpipe; the distribution's is llvmpipe. Leaving such a
-    // guest on the payload's Mesa would trade a degraded desktop for an unusable
-    // one.
-    //
-    // Asked here rather than carried in `GuestFacts` because the answer expires:
-    // the recipe ran minutes ago, and an adapter that has since gone is the case
-    // this is deciding for.
-    if gpu_kernel::device_is_usable() {
+    let Some(held_back) = compositor_is_held_back() else {
         return compositor_on_the_payloads_mesa(report, step, user_units);
-    }
+    };
 
     let shipped = Path::new(PAYLOAD_MOUNT)
         .join("content")
@@ -1166,17 +1155,18 @@ fn compositor_isolation_stage(report: &mut Report, guest: &GuestFacts) -> Result
             report.ok(
                 step,
                 format!(
-                    "the compositor is {}, and {} keeps it on this guest's own Mesa",
-                    launch.describe(),
-                    path.display()
+                    "{held_back}, so {} keeps it on this guest's own Mesa; the compositor is {}",
+                    path.display(),
+                    launch.describe()
                 ),
             );
         }
         Some((launch, None)) => report.skipped(
             step,
             format!(
-                "the compositor is {}, so there is no unit for a drop-in to attach to; \
-                 this guest's compositor is isolated by whatever starts it, not from here",
+                "{held_back}, but the compositor is {}, so there is no unit for a drop-in \
+                 to attach to; this guest's compositor is isolated by whatever starts it, \
+                 not from here",
                 launch.describe()
             ),
         ),
@@ -1191,8 +1181,8 @@ fn compositor_isolation_stage(report: &mut Report, guest: &GuestFacts) -> Result
             report.ok(
                 step,
                 format!(
-                    "no compositor is running to be asked how it starts; refreshed the \
-                     drop-in already installed at {}",
+                    "{held_back}; no compositor is running to be asked how it starts, so \
+                     refreshed the drop-in already installed at {}",
                     installed
                         .iter()
                         .map(|path| path.display().to_string())
@@ -1203,12 +1193,29 @@ fn compositor_isolation_stage(report: &mut Report, guest: &GuestFacts) -> Result
         }
         None => report.skipped(
             step,
-            "no compositor has started on this guest yet, so how one is started is not \
-             known and nothing was written; the next run that finds one installs it",
+            format!(
+                "{held_back}, but no compositor has started on this guest yet, so how one \
+                 is started is not known and nothing was written; the next run that finds \
+                 one installs it"
+            ),
         ),
     }
 
     Ok(())
+}
+
+/// Why this guest's compositor is kept off the payload's Mesa, or nothing when
+/// it belongs on it.
+///
+/// The adapter is asked for here rather than carried in `GuestFacts` because the
+/// answer expires: the recipe ran minutes ago, and an adapter that has since
+/// gone is exactly the case this is deciding for. What the two answers mean is
+/// decided in `display_recipe`, out of the text this hands it.
+fn compositor_is_held_back() -> Option<String> {
+    compositor_isolation(
+        gpu_kernel::device_is_usable(),
+        &read(&Path::new(GPU_PAYLOAD).join("sources.json")),
+    )
 }
 
 /// Leaves this guest's compositor on the payload's Mesa, undoing an isolation an
@@ -1230,7 +1237,8 @@ fn compositor_on_the_payloads_mesa(
     if installed.is_empty() {
         report.ok(
             step,
-            "this guest has an adapter, so its compositor draws on the payload's Mesa;              no drop-in holds it back",
+            "this guest has an adapter and its GPU payload declares compositor-scanout, \
+             so its compositor draws on the payload's Mesa; no drop-in holds it back",
         );
         return Ok(());
     }
@@ -1244,7 +1252,9 @@ fn compositor_on_the_payloads_mesa(
     report.ok(
         step,
         format!(
-            "this guest has an adapter, so its compositor draws on the payload's Mesa;              removed the drop-in that held it back at {}",
+            "this guest has an adapter and its GPU payload declares compositor-scanout, \
+             so its compositor draws on the payload's Mesa; removed the drop-in that held \
+             it back at {}",
             installed
                 .iter()
                 .map(|path| path.display().to_string())

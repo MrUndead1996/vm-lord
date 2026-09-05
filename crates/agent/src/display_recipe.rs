@@ -9,6 +9,8 @@
 
 use vmlord_agent_protocol::v1::{DisplayRecipeStage, DisplayRecipeStageState, DisplayRecipeStep};
 
+use crate::gpu_recipe::{GuestCapability, payload_declares};
+
 /// The DKMS package a display payload installs.
 pub const DKMS_PACKAGE: &str = "vmlord-display";
 
@@ -455,18 +457,95 @@ pub fn needs_reload(loaded: Option<(u32, u32)>, wanted: (u32, u32)) -> bool {
     loaded.is_some_and(|loaded| loaded != wanted)
 }
 
+/// Why this guest's compositor is kept off the payload's Mesa, or nothing when
+/// it belongs on it.
+///
+/// Two things have to be true before a compositor may draw on the payload's
+/// Mesa, and only one of them is about this guest.
+///
+/// `device_is_usable` is the adapter. A guest without one wants the isolation
+/// drop-in more than it used to: the payload's Mesa is built `-Dllvm=disabled`,
+/// so the renderer it falls back to with no adapter is softpipe where the
+/// distribution's is llvmpipe.
+///
+/// `gpu_sources` is the GPU payload's `sources.json`, because presenting a frame
+/// is the payload's ability and not the device's, and the two are versioned
+/// apart -- a build carrying every commit since #180 can ship a payload packed
+/// before any of them. A compositor moved onto such a Mesa draws on the GPU and
+/// then cannot hand the frame to KMS: `No GPUs found`, a display manager that
+/// gives up, and a screen that stays black through every later boot. Nothing the
+/// guest can look at tells that Mesa from a patched one, so the payload says so
+/// itself, and a payload that says nothing is believed to be the old one.
+///
+/// The string is the reason, and it exists because the two answers have to be
+/// told apart by whoever reads the report: a guest holding its compositor back
+/// on an old payload otherwise looks exactly like a guest with no adapter.
+pub fn compositor_isolation(device_is_usable: bool, gpu_sources: &str) -> Option<String> {
+    if !device_is_usable {
+        return Some("this guest has no adapter".to_owned());
+    }
+    if !payload_declares(gpu_sources, GuestCapability::CompositorScanout) {
+        return Some(
+            "this guest has an adapter, but its GPU payload does not declare \
+             compositor-scanout, so that Mesa cannot hand a finished frame to vmlord_drm"
+                .to_owned(),
+        );
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use vmlord_agent_protocol::v1::{DisplayRecipeStageState, DisplayRecipeStep};
 
     use super::{
         DKMS_PACKAGE, FALLBACK_MODE, InstalledVersions, Report, STEPS, SigningKeyState,
-        dkms_reports_installed, dkms_versions, has_recipe, modprobe_options, module_is_loaded,
-        needs_build, needs_reload, parse_module_parameters, parse_module_signature_key,
-        parse_secure_boot_state, parse_subject_key_identifier, read_payload_facts, serves,
-        signature_matches, signing_key_state, wanted_mode, was_built_for,
-        was_rejected_for_its_signature,
+        compositor_isolation, dkms_reports_installed, dkms_versions, has_recipe, modprobe_options,
+        module_is_loaded, needs_build, needs_reload, parse_module_parameters,
+        parse_module_signature_key, parse_secure_boot_state, parse_subject_key_identifier,
+        read_payload_facts, serves, signature_matches, signing_key_state, wanted_mode,
+        was_built_for, was_rejected_for_its_signature,
     };
+
+    const DECLARED: &str =
+        r#"{"guest_capabilities":["compositor-scanout"],"mesa_policy":"bundled"}"#;
+    const SILENT: &str = r#"{"schema_version":2,"mesa_policy":"bundled"}"#;
+
+    #[test]
+    fn a_compositor_draws_on_the_payloads_mesa_only_when_both_halves_are_there() {
+        assert_eq!(compositor_isolation(true, DECLARED), None);
+    }
+
+    #[test]
+    fn a_payload_that_cannot_present_keeps_the_compositor_on_the_guests_own_mesa() {
+        // The bug this exists for: an adapter opens, so the old rule moved the
+        // compositor onto a Mesa that draws on the GPU and then cannot hand the
+        // frame to KMS. Black screen, permanently. An undeclared capability is
+        // an old payload, and an old payload keeps the drop-in.
+        for sources in [SILENT, r#"{"guest_capabilities":[]}"#, "not json", ""] {
+            let held_back = compositor_isolation(true, sources);
+            assert!(held_back.is_some(), "{sources}");
+            assert!(
+                held_back.unwrap().contains("compositor-scanout"),
+                "the reason must name what was missing, or a guest with an old \
+                 payload reads as a guest with no adapter: {sources}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_guest_with_no_adapter_is_isolated_whatever_its_payload_declares() {
+        // The declaration is about the payload, not about this guest: that Mesa
+        // falls back to softpipe with no adapter under it, where the
+        // distribution's falls back to llvmpipe.
+        for sources in [DECLARED, SILENT] {
+            assert_eq!(
+                compositor_isolation(false, sources),
+                Some("this guest has no adapter".to_owned()),
+                "{sources}"
+            );
+        }
+    }
 
     #[test]
     fn a_mode_the_module_will_not_drive_falls_back() {

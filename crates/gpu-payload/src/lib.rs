@@ -7,7 +7,8 @@ mod release;
 #[cfg(test)]
 pub(crate) use catalog::test_entry;
 pub use catalog::{
-    CatalogEntry, GuestSelector, GuestTarget, MesaPolicy, PayloadCatalog, RendererCapability,
+    CatalogEntry, GuestCapability, GuestSelector, GuestTarget, MesaPolicy, PayloadCatalog,
+    RendererCapability,
 };
 pub use manifest::{PayloadManifest, SourceManifest};
 // The primitives every payload shares, re-exported under the names this

@@ -9,6 +9,7 @@
     "payload_abi": 1
   },
   "required_renderers": ["d3d12-gallium", "dzn-vulkan"],
+  "guest_capabilities": ["compositor-scanout"],
   "mesa_policy": "bundled",
   "sources": [
     {
