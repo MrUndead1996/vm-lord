@@ -1317,7 +1317,7 @@ full-screen passes**, which is less than a desktop with a wallpaper and one wind
 already costs, so a real compositor is on the winning side of it -- but a guest
 showing almost nothing is not, and this is a slower way to present a still screen.
 
-The floor is proportional to pixels alone: 3.73 ms at 720p, 8.07 at
+The floor was proportional to pixels alone: 3.73 ms at 720p, 8.07 at
 1080p, 13.45 at 1440p, 27.81 at 2160p -- 0.96 GiB/s at 1080p, where llvmpipe
 reads the same 8 MB frame out of system memory at 5.64 GiB/s in the same probe.
 
@@ -1327,7 +1327,7 @@ the read through a `D3D12_HEAP_TYPE_READBACK` buffer (`d3d12_bufmgr.cpp:137`),
 so a GPU copy moves the frame out of the render target first and the CPU then
 reads guest system memory and copies that into the dumb BO. The CPU never maps
 the render target itself. Per present at 1080p: the CPU's own `util_copy_rect`
-is 2.90 ms, the GPU copy and its fence wait 0.68 ms, and mapping and unmapping
+was 2.90 ms, the GPU copy and its fence wait 0.68 ms, and mapping and unmapping
 the two ends 0.30 ms.
 
 The other half is that **the frame pays for that twice**. `flush_resource` is
@@ -1337,9 +1337,22 @@ and on this path both copy the same resource into the same dumb BO. Suppressing
 the second halves the frame at every resolution -- 7.27 ms to 3.81 at 1080p --
 with the front buffer still reading back the colour last cleared into it.
 
-So the CPU hop is worth removing rather than making cheaper, which is the
-direction "Can the CPU leave the path?" below takes, and the redundant present
-is worth a guard before that. The fence wait, which an earlier draft feared
+**Most of that copy then turned out not to be a copy.** The patch mapped the
+displaytarget around every present, and `kms_sw_displaytarget_unmap` munmaps as
+soon as its refcount reaches zero -- so the scanout buffer was mmap'ed afresh
+each frame and the copy faulted in every page of it before writing. Reading the
+readback mapping itself runs at 17-18 GiB/s; the same copy is 2.50 ms against a
+mapping taken per present and 0.19 ms against one that is held. The patch now
+holds it for the life of the resource and drops it in `d3d12_resource_destroy`,
+and the frame falls to 1.14 ms at 720p, 1.89 at 1080p and 6.76 at 2160p -- from
+3.69, 7.78 and 28.00 -- still flat under draw load. Removing the CPU copy
+altogether would need the GPU copy to land in the dumb BO's own pages; `dxgkrnl`
+implements that, but the D3D12 runtime a guest gets from the host's WSL package
+answers `E_NOTIMPL` to `OpenExistingHeapFromAddress`, so it is not reachable from
+userspace.
+
+With the mapping held, the redundant present is the largest item left, and it
+doubles whatever remains. The fence wait, which an earlier draft feared
 would serialise frames, is 0.25-0.33 ms of queued work per present and does not
 grow with draw load; giving the surface more buffers to rotate through changes
 nothing, because the copy runs on the calling thread inside the swap. The same

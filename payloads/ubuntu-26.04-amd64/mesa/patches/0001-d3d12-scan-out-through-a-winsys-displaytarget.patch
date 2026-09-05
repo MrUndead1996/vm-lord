@@ -28,28 +28,46 @@ for a committed texture. A resource presented by copying does not need a row-maj
 layout -- the copy is what makes the layout linear -- so the demand is dropped
 whenever there is a winsys to copy into. Without one, nothing here changes.
 
-The cost is one full-frame readback per presented frame: a fixed cost in exchange
-for a variable one. Measured on an RTX 5070 Ti through GPU-PV at 1080p, drawing N
-blended full-screen passes, d3d12 against llvmpipe: 7.75/4.19 ms at N=0,
-7.48/8.58 at N=2, 8.44/28.40 at N=8, 8.18/56.92 at N=16. d3d12 is flat because
-what it pays is the copy; the two cross at about two passes, which a desktop
-exceeds before it has drawn a window.
+The displaytarget mapping is held for the life of the resource rather than taken
+per present, which is where this hop's cost was. `kms_sw_displaytarget_unmap`
+munmaps as soon as its refcount reaches zero, so a map around every present means
+mmap'ing the scanout buffer afresh every frame, and the copy then faults in every
+page of it before it can write. Measured on an RTX 5070 Ti through GPU-PV, the
+same copy costs 1.02/2.49/11.77 ms at 720p/1080p/2160p against a mapping made per
+present and 0.07/0.22/2.51 ms against one that is held -- 3.22 GiB/s against
+35.95 GiB/s at 1080p. `d3d12_resource_destroy` drops the mapping, because
+`kms_sw_displaytarget_destroy` will not munmap a buffer that is still mapped; it
+only says so in its debug output.
 
-The floor is proportional to pixels alone -- 3.73 ms at 720p to 27.81 ms at
-2160p -- 0.96 GiB/s at 1080p, against 5.64 GiB/s for a system-memory read of the
-same frame in the same probe. Two things account for that 5.9x. The read is
-staged through a READBACK heap, and per present at 1080p the CPU's own
-`util_copy_rect` out of that mapping is 2.90 ms against 0.68 ms for the GPU copy
-and its fence wait. And the frame pays for the whole hop twice: the frontend
-calls `flush_resource` on the back buffer both before the swap and again when
-the drawable is revalidated after it, and on this path both copies have the same
-source and the same destination. On at least one Intel iGPU the CPU half is
-pathological -- WSLg issue #1498 reports 327-359 ms per frame at 720p -- so a
-host that is not known good deserves a measurement before this path is trusted.
+The cost that remains is one full-frame readback per presented frame: a fixed
+cost in exchange for a variable one. Measured at 1080p, drawing N blended
+full-screen passes, d3d12 against llvmpipe: 7.75/4.19 ms at N=0, 7.48/8.58 at
+N=2, 8.44/28.40 at N=8, 8.18/56.92 at N=16 -- taken before the mapping was held,
+so d3d12's flat line is now lower, but it is still flat and llvmpipe's is not.
+The two cross at about two passes, which a desktop exceeds before it has drawn a
+window.
 
-Refs: #180, #188
+A frame pays for the hop twice: the frontend calls `flush_resource` on the back
+buffer both before the swap and again when the drawable is revalidated after it,
+and on this path both copies have the same source and the same destination. That
+is not addressed here.
+
+The GPU copy into a `D3D12_HEAP_TYPE_READBACK` staging buffer and the fence wait
+on it are what is left, 0.68 ms per present at 1080p. Aiming the GPU copy at the
+dumb BO's own pages instead would remove the CPU from this hop entirely, and the
+kernel half of that exists -- `dxgkrnl` implements `EXISTINGHEAP` over pinned
+guest pages -- but the userspace half does not: the D3D12 runtime a guest gets
+from the host's WSL package answers `E_NOTIMPL` to both
+`ID3D12Device3::OpenExistingHeapFromAddress` and
+`ID3D12Device13::OpenExistingHeapFromAddress1`.
+
+On at least one Intel iGPU this hop is pathological -- WSLg issue #1498 reports
+327-359 ms per frame at 720p -- so a host that is not known good deserves a
+measurement before this path is trusted.
+
+Refs: #180, #188, #189
 diff --git a/src/gallium/drivers/d3d12/d3d12_context_common.cpp b/src/gallium/drivers/d3d12/d3d12_context_common.cpp
-index 73e2d5d..b90d39e 100644
+index 73e2d5d..428d85d 100644
 --- a/src/gallium/drivers/d3d12/d3d12_context_common.cpp
 +++ b/src/gallium/drivers/d3d12/d3d12_context_common.cpp
 @@ -58,6 +58,9 @@
@@ -62,7 +80,7 @@ index 73e2d5d..b90d39e 100644
  #include "util/u_dl.h"
  #include <dxguids/dxguids.h>
  #include <string.h>
-@@ -210,6 +213,42 @@ d3d12_flush(struct pipe_context *pipe,
+@@ -210,6 +213,51 @@ d3d12_flush(struct pipe_context *pipe,
     }
  }
  
@@ -76,6 +94,15 @@ index 73e2d5d..b90d39e 100644
 + * This is the same copy d3d12_flush_frontbuffer performs for a display target,
 + * without the presentation the winsys does afterwards: on a KMS device the
 + * consumer presents, not the winsys.
++ *
++ * The mapping is taken once and held for the life of the resource, which is
++ * not what a display target does and is the whole cost of this hop. The kms_sw
++ * winsys refcounts its mapping and munmaps the dumb BO the moment the count
++ * reaches zero, so mapping per present means mmap'ing the scanout buffer afresh
++ * every frame -- and then the copy faults in every page of it before it can
++ * write. Measured on an RTX 5070 Ti through GPU-PV at 1080p, the same copy is
++ * 2.49 ms against a mapping made per present and 0.22 ms against one that is
++ * held; 3.22 GiB/s against 35.95 GiB/s. d3d12_resource_destroy drops it.
 + */
 +static void
 +d3d12_present_to_displaytarget(struct pipe_context *pctx,
@@ -85,27 +112,27 @@ index 73e2d5d..b90d39e 100644
 +   struct sw_winsys *winsys = screen->winsys;
 +   struct pipe_resource *pres = &res->base.b;
 +
-+   void *map = winsys->displaytarget_map(winsys, res->dt, 0);
-+   if (!map)
-+      return;
++   if (!res->dt_map) {
++      res->dt_map = winsys->displaytarget_map(winsys, res->dt, 0);
++      if (!res->dt_map)
++         return;
++   }
 +
 +   struct pipe_transfer *transfer = nullptr;
 +   void *res_map = pipe_texture_map(pctx, pres, 0, 0, PIPE_MAP_READ, 0, 0,
 +                                    pres->width0, pres->height0, &transfer);
 +   if (res_map) {
-+      util_copy_rect((uint8_t *)map, pres->format, res->dt_stride, 0, 0,
++      util_copy_rect((uint8_t *)res->dt_map, pres->format, res->dt_stride, 0, 0,
 +                     transfer->box.width, transfer->box.height,
 +                     (const uint8_t *)res_map, transfer->stride, 0, 0);
 +      pipe_texture_unmap(pctx, transfer);
 +   }
-+
-+   winsys->displaytarget_unmap(winsys, res->dt);
 +}
 +
  static void
  d3d12_flush_resource(struct pipe_context *pctx,
                       struct pipe_resource *pres)
-@@ -223,6 +262,9 @@ d3d12_flush_resource(struct pipe_context *pctx,
+@@ -223,6 +271,9 @@ d3d12_flush_resource(struct pipe_context *pctx,
     d3d12_apply_resource_states(ctx, false);
     d3d12_batch_reference_resource(d3d12_current_batch(ctx), res, true);
     ctx->has_commands = true;
@@ -116,10 +143,27 @@ index 73e2d5d..b90d39e 100644
  
  static void
 diff --git a/src/gallium/drivers/d3d12/d3d12_resource.cpp b/src/gallium/drivers/d3d12/d3d12_resource.cpp
-index 5a96e44..adf4e28 100644
+index 5a96e44..cfc28b8 100644
 --- a/src/gallium/drivers/d3d12/d3d12_resource.cpp
 +++ b/src/gallium/drivers/d3d12/d3d12_resource.cpp
-@@ -316,7 +316,14 @@ init_texture(struct d3d12_screen *screen,
+@@ -78,6 +78,16 @@ d3d12_resource_destroy(struct pipe_screen *pscreen,
+    // to different planes of the same overall (ie. NV12) planar d3d12_resource
+    // sharing the same dt, so keep a refcount when destroying them
+    // and only destroy it on the last plane being destroyed
++   /* One unmap for the one map d3d12_present_to_displaytarget took, before the
++    * displaytarget goes: kms_sw_displaytarget_destroy does not munmap a buffer
++    * that is still mapped, it only says so in its debug output.
++    */
++   if (resource->dt_map) {
++      struct d3d12_screen *screen = d3d12_screen(pscreen);
++      screen->winsys->displaytarget_unmap(screen->winsys, resource->dt);
++      resource->dt_map = nullptr;
++   }
++
+    if (resource->dt_refcount > 0)
+       resource->dt_refcount--;
+    if ((resource->dt_refcount == 0) && resource->dt)
+@@ -316,7 +326,14 @@ init_texture(struct d3d12_screen *screen,
        }
     }
  
@@ -135,7 +179,7 @@ index 5a96e44..adf4e28 100644
        desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
  
     HRESULT hres = E_FAIL;
-@@ -414,7 +421,13 @@ init_texture(struct d3d12_screen *screen,
+@@ -414,7 +431,13 @@ init_texture(struct d3d12_screen *screen,
     if (FAILED(hres))
        return false;
  
@@ -150,7 +194,7 @@ index 5a96e44..adf4e28 100644
        struct sw_winsys *winsys = screen->winsys;
        if (winsys->is_displaytarget_format_supported(winsys, res->base.b.bind, res->base.b.format)) {
           res->dt = winsys->displaytarget_create(screen->winsys,
-@@ -424,8 +437,10 @@ init_texture(struct d3d12_screen *screen,
+@@ -424,8 +447,10 @@ init_texture(struct d3d12_screen *screen,
                                                  templ->height0,
                                                  64, NULL,
                                                  &res->dt_stride);
@@ -162,7 +206,7 @@ index 5a96e44..adf4e28 100644
           assert(res->base.b.format == PIPE_FORMAT_R16G16B16A16_FLOAT); /* The only format we proxy right now */
           struct pipe_resource proxy_templ = *templ;
           proxy_templ.format = PIPE_FORMAT_R8G8B8A8_UNORM;
-@@ -433,6 +448,12 @@ init_texture(struct d3d12_screen *screen,
+@@ -433,6 +458,12 @@ init_texture(struct d3d12_screen *screen,
           if (!res->dt_proxy)
              return false;
           assert(d3d12_resource(res->dt_proxy)->dt);
@@ -175,7 +219,7 @@ index 5a96e44..adf4e28 100644
        }
     }
  
-@@ -847,6 +868,15 @@ d3d12_resource_get_handle(struct pipe_screen *pscreen,
+@@ -847,6 +878,15 @@ d3d12_resource_get_handle(struct pipe_screen *pscreen,
     case WINSYS_HANDLE_TYPE_D3D12_RES:
        handle->com_obj = d3d12_resource_resource(res);
        return true;
@@ -191,7 +235,7 @@ index 5a96e44..adf4e28 100644
     case WINSYS_HANDLE_TYPE_FD: {
        HANDLE d3d_handle = nullptr;
  
-@@ -1000,6 +1030,39 @@ d3d12_resource_get_param(struct pipe_screen *pscreen,
+@@ -1000,6 +1040,39 @@ d3d12_resource_get_param(struct pipe_screen *pscreen,
     struct d3d12_resource* res = d3d12_resource(pres);
     unsigned num_planes = util_format_get_num_planes(res->overall_format);
  
@@ -231,6 +275,20 @@ index 5a96e44..adf4e28 100644
     pipe_resource *planes[d3d12_max_planes];
     unsigned int strides[d3d12_max_planes];
     unsigned int layer_strides[d3d12_max_planes];
+diff --git a/src/gallium/drivers/d3d12/d3d12_resource.h b/src/gallium/drivers/d3d12/d3d12_resource.h
+index fc679ff..27c9f1f 100644
+--- a/src/gallium/drivers/d3d12/d3d12_resource.h
++++ b/src/gallium/drivers/d3d12/d3d12_resource.h
+@@ -53,6 +53,9 @@ struct d3d12_resource {
+    unsigned dt_refcount; /* For planar resources sharing the dt pointer */
+    unsigned dt_stride;
+    struct pipe_resource *dt_proxy;
++   /* Held across presents rather than taken per present; see
++    * d3d12_present_to_displaytarget. NULL until the first present. */
++   void *dt_map;
+ 
+    struct util_range valid_buffer_range;
+    uint32_t bind_counts[MESA_SHADER_STAGES][D3D12_RESOURCE_BINDING_TYPES];
 diff --git a/src/gallium/drivers/d3d12/d3d12_screen.cpp b/src/gallium/drivers/d3d12/d3d12_screen.cpp
 index af1d2f2..ebe0d5f 100644
 --- a/src/gallium/drivers/d3d12/d3d12_screen.cpp
