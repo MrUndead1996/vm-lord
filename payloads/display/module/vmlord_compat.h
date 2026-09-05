@@ -32,6 +32,23 @@ static const struct drm_encoder_funcs vmlord_encoder_funcs = {
 };
 
 /*
+ * drm_atomic_state was renamed drm_atomic_commit in 7.2, tree-wide and with no
+ * alias left behind: the tag with the old name does not exist on such a kernel,
+ * which is why a build against it fails on the helper vtables rather than on
+ * anything this module does with the object. The hooks here only hand the
+ * pointer back to the accessors, so naming the type is the whole difference.
+ *
+ * Arch is what reached 7.2 first; the Ubuntu releases the payload is gated on
+ * are still below it, which is why this did not surface until a guest built
+ * the module itself.
+ */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+#define vmlord_atomic_state drm_atomic_commit
+#else
+#define vmlord_atomic_state drm_atomic_state
+#endif
+
+/*
  * hrtimer_setup() replaced hrtimer_init plus a function assignment in 6.15.
  * This is the fourth of the four moves task #111 measured, and the only one
  * that is a statement rather than a struct field -- which is why it is wrapped

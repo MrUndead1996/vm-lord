@@ -127,6 +127,13 @@ if left NULL before that). Two live in `vmlord_compat.h`:
 replaced `hrtimer_init` plus a function assignment in 6.15 -- the latter as
 `vmlord_hrtimer_setup`, because it is a statement rather than a field.
 
+A fifth guard came from a guest rather than from a container: 7.2 renamed
+`struct drm_atomic_state` to `struct drm_atomic_commit` tree-wide and left no
+alias, so the five helper hooks that take one stop matching their vtables.
+`vmlord_compat.h` names the type as `vmlord_atomic_state` and the hooks take
+that. The releases above are all below 7.2, which is why the container builds
+say nothing about this guard: the kernel that proves it is an Arch guest's.
+
 ## Building
 
 The build that matters is the one in `payloads/display/ubuntu-<release>-amd64`:
