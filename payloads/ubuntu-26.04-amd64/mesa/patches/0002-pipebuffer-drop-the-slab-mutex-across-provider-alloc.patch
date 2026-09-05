@@ -1,0 +1,83 @@
+pipebuffer: don't hold the slab manager's mutex across a provider allocation
+
+Against mesa-26.2.0 (9f0a761020bca92f2b07156a0621e5360cb8eca5), the commit
+payload.spec.json pins. Not submitted upstream.
+
+A GNOME session on the d3d12 driver freezes: gnome-shell's main thread stops on
+a pthread mutex whose owner field holds its own thread id, and the desktop never
+repaints again. The mouse pointer keeps moving, because mutter draws it from its
+KMS thread, which makes the failure look like a stall in the present path. It is
+not; it is a plain self-deadlock, and the whole of it is visible in one stack:
+
+    _cogl_texture_set_region -> glTexSubImage2D -> st_TexSubImage
+      d3d12_transfer_map                          needs a staging buffer
+        pb_slab_manager_create_buffer             mtx_lock(&mgr->mutex)
+          pb_slab_create                          no partial slab is left
+            pb_cache_manager_create_buffer
+              d3d12_bufmgr_create_buffer
+                d3d12_bo_new
+                  d3d12_screen_reclaim_completed  retires deferred frees
+                    d3d12_bo_destroy
+                      pb_reference(&bo->buffer, NULL)
+                        pb_slab_buffer_destroy    mtx_lock(&mgr->mutex)
+
+pb_slab_manager_create_buffer takes mgr->mutex and calls pb_slab_create under
+it, which asks the provider below for the slab's backing buffer. For d3d12 that
+provider is a pb_cache manager over d3d12_bufmgr, and d3d12_bo_new reclaims its
+completed deferred frees before allocating -- so a buffer belonging to this same
+slab manager can be released from inside the call, and pb_slab_buffer_destroy
+reaches for a mutex the same thread is already holding. mgr->mutex is not
+recursive, so the thread waits on itself.
+
+It takes a coincidence to hit: the slab manager must be out of partial slabs at
+the moment a deferred free has retired. That is why a desktop runs for a while,
+through window switches and menus, and then stops.
+
+The fix is to drop the mutex around the provider call. This is not a new idea in
+Mesa: the newer pb_slab_alloc_reclaimed in util/pb_slab.c does exactly this, for
+exactly this reason, and says so in a comment. The older manager in
+pipebuffer/pb_bufmgr_slab.c, which is the one d3d12 uses, never got the same
+treatment. Racing threads may then create more than one slab; the caller
+re-reads mgr->slabs after pb_slab_create returns, and an untouched slab is only
+idle memory, so correctness is unaffected -- again the same trade util/pb_slab.c
+already accepts.
+
+Refs: VMLord tasks #180, #188, #189, #190 for the d3d12 scanout path this
+frees up.
+
+--- a/src/gallium/auxiliary/pipebuffer/pb_bufmgr_slab.c	2026-09-05 16:11:17.510126091 +0400
++++ b/src/gallium/auxiliary/pipebuffer/pb_bufmgr_slab.c	2026-09-05 16:11:17.518126088 +0400
+@@ -289,6 +289,9 @@
+  * Create a new slab.
+  * 
+  * Called when we ran out of free slabs.
++ *
++ * Called with mgr->mutex held, and returns with it held -- but it does not hold
++ * it the whole way through; see the provider call below.
+  */
+ static enum pipe_error
+ pb_slab_create(struct pb_slab_manager *mgr)
+@@ -303,7 +306,23 @@
+    if (!slab)
+       return PIPE_ERROR_OUT_OF_MEMORY;
+ 
++   /* Drop the mutex temporarily to prevent a deadlock where the allocation
++    * calls back into slab functions. A provider is free to release buffers of
++    * its own while serving an allocation, and any of those may be a slab
++    * buffer of this very manager, whose pb_slab_buffer_destroy takes this
++    * mutex -- which is not recursive. The d3d12 driver does exactly that:
++    * d3d12_bo_new reclaims its completed deferred frees before it allocates.
++    *
++    * There's a chance that racing threads will end up allocating multiple
++    * slabs, but that doesn't hurt correctness: our caller re-reads mgr->slabs
++    * after we return, and a slab nobody took buffers from is merely idle.
++    *
++    * This is the same fix, for the same reason, that pb_slab_alloc_reclaimed
++    * in util/pb_slab.c already carries; this older manager never got it.
++    */
++   mtx_unlock(&mgr->mutex);
+    slab->bo = mgr->provider->create_buffer(mgr->provider, mgr->slabSize, &mgr->desc);
++   mtx_lock(&mgr->mutex);
+    if(!slab->bo) {
+       ret = PIPE_ERROR_OUT_OF_MEMORY;
+       goto out_err0;
