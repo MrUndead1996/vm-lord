@@ -246,6 +246,53 @@ pub fn parse_mesa_policy(json: &str) -> Result<MesaPolicy, String> {
     }
 }
 
+/// Something a payload's userspace promises the guest it can do.
+///
+/// The payload and this agent are versioned apart and shipped together only by
+/// accident of what was packed last, so an agent that assumes a payload can do
+/// what the newest one can is an agent that breaks a guest whenever the two
+/// drift. What a payload can do it says, in `guest_capabilities`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GuestCapability {
+    /// This payload's Mesa can hand a finished frame to KMS: a scanout resource
+    /// gets a dumb BO on `vmlord_drm` beside it, which is what a compositor
+    /// running on that Mesa needs in order to put anything on the screen.
+    CompositorScanout,
+}
+
+impl GuestCapability {
+    /// The name a payload declares this capability under.
+    fn declared_as(self) -> &'static str {
+        match self {
+            Self::CompositorScanout => "compositor-scanout",
+        }
+    }
+}
+
+/// Whether a payload's `sources.json` declares `capability`.
+///
+/// A bool and not a `Result`, unlike everything else read out of this document:
+/// every way of failing to find the declaration -- a document that will not
+/// parse, a payload prepared before the field existed, a name this build has
+/// never heard of -- means the same thing to a caller, which is that nothing
+/// promised this and nothing may be built on it. A capability read wrongly as
+/// present is a guest that loses its desktop; read wrongly as absent it is a
+/// guest that keeps the older, slower arrangement that worked.
+pub fn payload_declares(json: &str, capability: GuestCapability) -> bool {
+    let Ok(document) = serde_json::from_str::<serde_json::Value>(json) else {
+        return false;
+    };
+    document
+        .get("guest_capabilities")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|declared| {
+            declared
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .any(|name| name == capability.declared_as())
+        })
+}
+
 /// The Vulkan ICD documents among the names of a directory's entries.
 ///
 /// Names from the payload and never a constant: AppSandbox's own notes record
@@ -367,10 +414,10 @@ mod tests {
     use crate::guest_platform::{DesktopFacts, LibraryLayout, PackageManager};
 
     use super::{
-        Applicability, DkmsPackage, Environment, GpuRecipe, GuestFacts, MesaPolicy, PayloadTarget,
-        Report, STEPS, Shell, applicability, dkms_reports_installed, environment_document,
-        icd_documents, module_is_loaded, parse_dkms_conf, parse_mesa_policy, parse_payload_target,
-        recipe_for,
+        Applicability, DkmsPackage, Environment, GpuRecipe, GuestCapability, GuestFacts,
+        MesaPolicy, PayloadTarget, Report, STEPS, Shell, applicability, dkms_reports_installed,
+        environment_document, icd_documents, module_is_loaded, parse_dkms_conf, parse_mesa_policy,
+        parse_payload_target, payload_declares, recipe_for,
     };
 
     fn ubuntu_guest() -> GuestFacts {
@@ -589,6 +636,40 @@ mod tests {
         // to rather than be treated as one of the policies that exist today.
         for document in [r#"{"mesa_policy": "flatpak"}"#, "{}", "not json"] {
             assert!(parse_mesa_policy(document).is_err(), "{document}");
+        }
+    }
+
+    #[test]
+    fn a_payload_declares_what_its_userspace_can_do_for_the_guest() {
+        assert!(payload_declares(
+            r#"{"mesa_policy":"bundled","guest_capabilities":["compositor-scanout"]}"#,
+            GuestCapability::CompositorScanout
+        ));
+        assert!(payload_declares(
+            r#"{"guest_capabilities":["something-else","compositor-scanout"]}"#,
+            GuestCapability::CompositorScanout
+        ));
+    }
+
+    #[test]
+    fn a_payload_that_does_not_declare_a_capability_does_not_have_it() {
+        // The first two are the case this exists for: a payload prepared before
+        // the field existed, and one prepared after it that declares nothing.
+        // The rest are documents nothing can be read out of at all -- an
+        // unmounted payload reads as the empty string here -- and they must
+        // answer no rather than panic or be believed.
+        for document in [
+            r#"{"schema_version":2,"mesa_policy":"bundled"}"#,
+            r#"{"guest_capabilities":[]}"#,
+            r#"{"guest_capabilities":["compositor-scanout-2"]}"#,
+            r#"{"guest_capabilities":"compositor-scanout"}"#,
+            "not json",
+            "",
+        ] {
+            assert!(
+                !payload_declares(document, GuestCapability::CompositorScanout),
+                "{document}"
+            );
         }
     }
 

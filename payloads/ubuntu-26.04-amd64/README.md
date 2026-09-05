@@ -141,6 +141,16 @@ is right. What ships today is one patch, described in **ARCHITECTURE.md** under
 "What the bundled Mesa is patched for": it is what lets d3d12 present a frame to
 `vmlord_drm`, and so what lets the guest's compositor draw on the GPU.
 
+`guest_capabilities` is what that same patch means to the guest. A record of what
+was applied is provenance; the guest needs a statement it can act on, because
+nothing it can look at tells an old Mesa from a patched one until a compositor
+has already failed to present on it. This payload declares `compositor-scanout`,
+and the agent takes the compositor isolation drop-in away only for a payload that
+declares it. The field is optional, and a payload that omits it promises nothing:
+that is what makes every payload built before this one degrade to llvmpipe rather
+than to a black screen. Removing the patch means removing the declaration in the
+same commit — they are one statement written twice.
+
 Overlay digests are measured from the files that were just copied. Editing an
 overlay changes them on the next run; nothing needs transcribing.
 

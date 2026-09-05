@@ -60,6 +60,11 @@ def main() -> None:
 
     provenance = {
         "target": spec["target"],
+        # What the guest may rely on this payload's userspace for, carried into both
+        # documents because the guest reads sources.json and the packer reads the
+        # recipe, and the two are refused unless they agree. Optional in the spec: a
+        # payload that claims nothing is a payload an agent must assume can do nothing.
+        "guest_capabilities": spec.get("guest_capabilities", []),
         "mesa_policy": spec["mesa_policy"],
         "sources": source_records(
             spec, arguments.checkout, prepared, arguments.mesa, arguments.patches
