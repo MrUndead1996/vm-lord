@@ -339,6 +339,34 @@ pub(crate) fn remove_network_adapter(document: &str) -> Result<String, Repositor
     })
 }
 
+/// Reads the MAC address of the network adapter a stored configuration
+/// attaches.
+///
+/// The section a start writes is the only surviving record of the card a guest
+/// booted on once HNS has lost the endpoint itself: the endpoint's properties
+/// cannot be asked for, but the document on disk still names the card, and a
+/// replacement endpoint that repeats it is one the guest's own network
+/// configuration still matches.
+///
+/// `None` rather than a failure when the document attaches no adapter or its
+/// section cannot be read: a caller is recreating an endpoint HNS no longer
+/// has, and a card nothing records is answered with a fresh one -- which is
+/// what a VM that never booted needs anyway.
+pub(crate) fn attached_mac_address(document: &str) -> Option<String> {
+    let configuration = parse(document).ok()?;
+    let adapters = configuration
+        .pointer(&format!("{DEVICES_POINTER}/{NETWORK_ADAPTERS_KEY}"))?
+        .as_object()?;
+    // The section carries exactly one entry -- a start replaces it whole -- so
+    // the first one is the adapter, and a section with none is not one.
+    let adapter = adapters.values().next()?;
+    let mac_address = adapter.get("MacAddress")?.as_str()?;
+    if mac_address.is_empty() {
+        return None;
+    }
+    Some(mac_address.to_owned())
+}
+
 /// One directory a VM is offered, whatever decided to offer it.
 pub(crate) struct Plan9Export<'a> {
     pub name: &'a str,
@@ -746,9 +774,9 @@ mod tests {
 
     use super::{
         HcsVmConfigBuilder, Plan9Export, StateFilePaths, VmTopology, adapter_key,
-        apply_network_adapter, apply_plan9_shares, apply_topology, com1_pipe_path,
-        ensure_supported_network_mode, media_path, read_topology, remove_network_adapter,
-        remove_plan9_shares,
+        apply_network_adapter, apply_plan9_shares, apply_topology, attached_mac_address,
+        com1_pipe_path, ensure_supported_network_mode, media_path, read_topology,
+        remove_network_adapter, remove_plan9_shares,
     };
 
     /// The identity a created compute system is given, fixed so that the pipe
@@ -1404,6 +1432,63 @@ mod tests {
         let error = remove_network_adapter("not json").unwrap_err().to_string();
 
         assert!(error.contains("not valid JSON"), "got: {error}");
+    }
+
+    #[test]
+    fn the_mac_address_a_start_wrote_reads_back() {
+        let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
+        let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
+        let created = HcsVmConfigBuilder::build(
+            &request(),
+            &system_disk_path,
+            &seed_path,
+            None,
+            &state_paths(),
+            VM_ID,
+        )
+        .unwrap();
+        let attached = apply_network_adapter(&created, ENDPOINT_ID, "00-15-5D-01-02-03").unwrap();
+
+        assert_eq!(
+            attached_mac_address(&attached),
+            Some("00-15-5D-01-02-03".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_configuration_without_an_adapter_reads_as_none() {
+        let system_disk_path = PathBuf::from("C:\\vms\\test-vm\\disks\\system.vhdx");
+        let seed_path = PathBuf::from("C:\\vms\\test-vm\\seed.iso");
+        let created = HcsVmConfigBuilder::build(
+            &request(),
+            &system_disk_path,
+            &seed_path,
+            None,
+            &state_paths(),
+            VM_ID,
+        )
+        .unwrap();
+
+        // A VM that never started, and one whose adapter a start removed: both
+        // have no card on record, and both are recreated without one to repeat.
+        assert_eq!(attached_mac_address(&created), None);
+        assert_eq!(attached_mac_address("not json"), None);
+    }
+
+    #[test]
+    fn an_adapter_section_that_cannot_be_read_reads_as_none() {
+        for section in [
+            json!({ "3F2B0C11-5C78-4C1B-9E2F-3A8B7D4C6E50": { "EndpointId": "3F2B0C11-5C78-4C1B-9E2F-3A8B7D4C6E50", "MacAddress": "" } }),
+            json!({ "3F2B0C11-5C78-4C1B-9E2F-3A8B7D4C6E50": { "EndpointId": "3F2B0C11-5C78-4C1B-9E2F-3A8B7D4C6E50", "MacAddress": 42 } }),
+            json!({}),
+        ] {
+            let document = json!({
+                "VirtualMachine": { "Devices": { "NetworkAdapters": section } }
+            })
+            .to_string();
+
+            assert_eq!(attached_mac_address(&document), None, "{section}");
+        }
     }
 
     #[test]

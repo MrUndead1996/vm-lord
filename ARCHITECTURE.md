@@ -283,9 +283,14 @@ The recorded `endpoint_id` is opened rather than trusted, the same way
 `HcsSystem::open_if_present` treats a compute system id: an endpoint deleted
 outside VMLord or lost to an HNS reset is replaced instead of failing the start.
 That changes the guest's address, but a VM that can no longer start is worse.
-Nothing is undone when a later step fails -- the endpoint outlives stops and
-lives until the VM is deleted, and dropping it after a failed start would hand
-the guest a new address on the next attempt.
+The replacement asks HNS to repeat the card the stored `config.json` records --
+the one surviving record of it once the endpoint itself is gone -- because the
+guest's own network configuration was written against that card (see below). A
+VM whose configuration names no card, one that never booted or one that gave
+the network up, is given a fresh one and warned. Nothing is undone when a later
+step fails -- the endpoint outlives stops and lives until the VM is deleted,
+and dropping it after a failed start would hand the guest a new address on the
+next attempt.
 
 The endpoint and its MAC are then written into the stored `config.json` as a
 `Devices/NetworkAdapters` entry keyed by the endpoint's own identifier, using
@@ -327,12 +332,15 @@ off, a crash, or a VMLord restart leaves no compute system to detach from, so
 `platform::VmStartPipeline` recognises `HCN_E_ENDPOINT_ALREADY_ATTACHED` -- from
 either the re-creation or the start -- and retries exactly once with a replaced
 endpoint: it reads the occupied endpoint's address *and its MAC*, deletes it,
-and creates a new one asking for both. This is the one place VMLord names a
-guest address or a guest MAC, and it names ones HNS assigned rather than ones it
-chose, so HNS's IPAM remains the sole allocator. A second occupied endpoint
-fails the start: one replacement is a recovery, a loop of them would create an
-endpoint per attempt. When either half cannot be read, the replacement is
-created without it and the guest is warned about what changed.
+and creates a new one asking for both. When the occupied endpoint has vanished
+by the time of that retry, the card the stored `config.json` records answers
+for the MAC instead. This is the one place VMLord names a guest address or a
+guest MAC, and it names ones HNS assigned -- or one HNS assigned, recorded in a
+document HCS was given -- rather than ones it chose, so HNS's IPAM remains the
+sole allocator. A second occupied endpoint fails the start: one replacement is
+a recovery, a loop of them would create an endpoint per attempt. When either
+half cannot be read, the replacement is created without it and the guest is
+warned about what changed.
 
 The MAC is the half that decides whether the guest has a network at all, and
 keeping the address alone bought nothing. A guest writes its network
