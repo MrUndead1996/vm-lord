@@ -1,5 +1,6 @@
 //! GNOME's clipboard, through the one interface that reaches it from outside a
-//! Wayland client.
+//! Wayland client. This module is the Mutter implementation of
+//! [`crate::guest_clipboard::GuestClipboard`].
 //!
 //! `org.gnome.Mutter.RemoteDesktop` is what `gnome-remote-desktop` drives, and
 //! it has carried a clipboard since GNOME 42 -- the whole compatibility matrix.
@@ -24,8 +25,6 @@
 
 use std::{
     collections::HashMap,
-    error::Error,
-    fmt,
     io::{self, Read},
     os::fd::{AsRawFd, OwnedFd},
     sync::mpsc::{self, Receiver, Sender},
@@ -39,6 +38,10 @@ use zbus::{
     zvariant::{OwnedObjectPath, Value},
 };
 
+use crate::guest_clipboard::{
+    ClipboardError, Event, GNOME_COPIED_MIME, GuestClipboard, URI_LIST_MIME,
+};
+
 /// The bus name every call here goes to.
 const NAME: &str = "org.gnome.Mutter.RemoteDesktop";
 
@@ -48,13 +51,6 @@ const ROOT: &str = "/org/gnome/Mutter/RemoteDesktop";
 /// The interface a session speaks.
 const SESSION: &str = "org.gnome.Mutter.RemoteDesktop.Session";
 
-/// How a file selection is named in a uri-list, which is what most of the
-/// desktop reads.
-pub const URI_LIST_MIME: &str = "text/uri-list";
-
-/// How GNOME's file manager names one, with the operation on the first line.
-pub const GNOME_COPIED_MIME: &str = "x-special/gnome-copied-files";
-
 /// How long one transfer may take before it is abandoned.
 ///
 /// The same five seconds the protocol's own inactivity limit uses: a guest
@@ -62,68 +58,12 @@ pub const GNOME_COPIED_MIME: &str = "x-special/gnome-copied-files";
 /// process, and the host is told the same thing either way.
 const DEADLINE: Duration = Duration::from_secs(5);
 
-/// What the compositor says happened.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Event {
-    /// The guest's selection changed and this side does not own it.
-    PeerOffer {
-        /// What it can produce, of what may be carried.
-        kinds: Vec<Kind>,
-        /// Whether it also names files.
-        files: bool,
-    },
-    /// Something in the guest wants the selection this side owns.
-    Transfer {
-        /// Which format it asked for.
-        kind: Kind,
-        /// The serial to answer with.
-        serial: u32,
-    },
-    /// Something in the guest wants the files of the selection this side owns.
-    TransferFiles {
-        /// Which of the two file formats it asked for.
-        mime: String,
-        /// The serial to answer with.
-        serial: u32,
-    },
-    /// The compositor closed the session. The daemon opens another when a
-    /// session exists again.
-    Closed,
-}
+/// The name the tests that anchor this module know the shared error by.
+pub type MutterError = ClipboardError;
 
-/// A clipboard call that did not work.
-#[derive(Debug)]
-pub enum MutterError {
-    /// The bus, the session or one call on it failed.
-    Bus(String),
-    /// A selection larger than this side will carry.
-    TooLarge,
-    /// Nothing arrived before the deadline.
-    Idle,
-    /// A descriptor could not be read or written.
-    Transfer(io::Error),
-}
-
-impl fmt::Display for MutterError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Bus(detail) => write!(formatter, "the compositor's clipboard failed: {detail}"),
-            Self::TooLarge => {
-                formatter.write_str("the selection is larger than this build carries")
-            }
-            Self::Idle => formatter.write_str("the selection did not arrive in time"),
-            Self::Transfer(error) => {
-                write!(formatter, "a selection descriptor failed: {error}")
-            }
-        }
-    }
-}
-
-impl Error for MutterError {}
-
-impl From<zbus::Error> for MutterError {
+impl From<zbus::Error> for ClipboardError {
     fn from(error: zbus::Error) -> Self {
-        Self::Bus(error.to_string())
+        Self::Compositor(error.to_string())
     }
 }
 
@@ -132,15 +72,16 @@ pub struct Clipboard {
     session: Proxy<'static>,
 }
 
-impl Clipboard {
-    /// Creates a session, starts it, and begins turning signals into events.
+impl GuestClipboard for Clipboard {
+    /// Creates a RemoteDesktop session, starts it, and begins turning its
+    /// signals into events.
     ///
     /// # Errors
     ///
-    /// [`MutterError::Bus`] if there is no session bus, no compositor on it, or
-    /// the session cannot be created or started -- which is what a guest with
-    /// nobody logged in looks like.
-    pub fn open() -> Result<(Self, Receiver<Event>), MutterError> {
+    /// [`ClipboardError::Compositor`] if there is no session bus, no
+    /// compositor on it, or the session cannot be created or started -- which
+    /// is what a guest with nobody logged in looks like.
+    fn open() -> Result<(Self, Receiver<Event>), ClipboardError> {
         let connection = Connection::session()?;
         let root = Proxy::new(&connection, NAME, ROOT, NAME)?;
         let path: OwnedObjectPath = root.call("CreateSession", &())?;
@@ -169,12 +110,12 @@ impl Clipboard {
         Ok((Self { session }, receiver))
     }
 
-    /// Watches the guest's selection without owning it.
+    /// `EnableClipboard` with no mime types, which is what watching is here.
     ///
     /// # Errors
     ///
-    /// [`MutterError::Bus`] if the call is refused.
-    pub fn listen(&self) -> Result<(), MutterError> {
+    /// [`ClipboardError::Compositor`] if the call is refused.
+    fn listen(&self) -> Result<(), ClipboardError> {
         // A map, not a list of pairs: these options are `a{sv}` on the wire,
         // and a `Vec` of tuples serialises as `a(sv)`, which mutter refuses.
         let options: HashMap<&str, Value<'_>> = HashMap::new();
@@ -185,15 +126,17 @@ impl Clipboard {
         Ok(())
     }
 
-    /// Takes the guest's selection, offering these formats.
+    /// `SetSelection` with these formats, which makes this side the owner --
+    /// and Mutter refuses `SelectionRead` on a selection its caller owns, so
+    /// this stays a listener until the host actually sends a selection.
     ///
-    /// `files` adds the two names a file selection is offered under, which is
-    /// what a file manager in the guest looks for and what nothing else does.
+    /// `files` adds [`URI_LIST_MIME`] and [`GNOME_COPIED_MIME`], the two names
+    /// a file selection carries under GNOME.
     ///
     /// # Errors
     ///
-    /// [`MutterError::Bus`] if the call is refused.
-    pub fn own(&self, kinds: &[Kind], files: bool) -> Result<(), MutterError> {
+    /// [`ClipboardError::Compositor`] if the call is refused.
+    fn own(&self, kinds: &[Kind], files: bool) -> Result<(), ClipboardError> {
         let mut mimes: Vec<&str> = kinds.iter().map(|kind| kind.mime()).collect();
         if files {
             mimes.push(URI_LIST_MIME);
@@ -206,40 +149,25 @@ impl Clipboard {
         Ok(())
     }
 
-    /// Reads one format of the guest's selection, up to `cap` bytes.
+    /// `SelectionRead`, whose descriptor is non-blocking: the first read of it
+    /// usually answers `EAGAIN`, so the read is the poll loop `drain` below.
     ///
     /// # Errors
     ///
-    /// [`MutterError::Bus`] if the call is refused -- which is what owning the
-    /// selection this asks for looks like -- [`MutterError::TooLarge`] past
-    /// `cap`, [`MutterError::Idle`] if nothing arrives in time, and
-    /// [`MutterError::Transfer`] if the descriptor fails.
-    pub fn read(&self, kind: Kind, cap: usize) -> Result<Vec<u8>, MutterError> {
-        self.read_mime(kind.mime(), cap)
-    }
-
-    /// Reads one format of the guest's selection by name, up to `cap` bytes.
-    ///
-    /// The untyped edge, for the two file formats: their bodies are lists of
-    /// paths, not clipboard payloads, and no file's contents ever pass through
-    /// here.
-    ///
-    /// # Errors
-    ///
-    /// The same as [`Clipboard::read`].
-    pub fn read_mime(&self, mime: &str, cap: usize) -> Result<Vec<u8>, MutterError> {
+    /// The same as [`GuestClipboard::read`].
+    fn read_mime(&self, mime: &str, cap: usize) -> Result<Vec<u8>, ClipboardError> {
         let descriptor: zbus::zvariant::OwnedFd = self.session.call("SelectionRead", &(mime,))?;
 
         drain(&OwnedFd::from(descriptor), cap, DEADLINE)
     }
 
-    /// Answers a transfer of the selection this side owns.
+    /// `SelectionWrite`, then `SelectionWriteDone` with the outcome.
     ///
     /// # Errors
     ///
-    /// [`MutterError::Bus`] if either call is refused and
-    /// [`MutterError::Transfer`] if the descriptor cannot be written.
-    pub fn write(&self, serial: u32, bytes: &[u8]) -> Result<(), MutterError> {
+    /// [`ClipboardError::Compositor`] if either call is refused and
+    /// [`ClipboardError::Transfer`] if the descriptor cannot be written.
+    fn write(&self, serial: u32, bytes: &[u8]) -> Result<(), ClipboardError> {
         let descriptor: zbus::zvariant::OwnedFd =
             self.session.call("SelectionWrite", &(serial,))?;
         let outcome = fill(&OwnedFd::from(descriptor), bytes);
@@ -252,12 +180,12 @@ impl Clipboard {
         outcome
     }
 
-    /// Refuses a transfer this side cannot answer.
+    /// `SelectionWriteDone` without success, which is what refusing is here.
     ///
     /// # Errors
     ///
-    /// [`MutterError::Bus`] if the call is refused.
-    pub fn refuse(&self, serial: u32) -> Result<(), MutterError> {
+    /// [`ClipboardError::Compositor`] if the call is refused.
+    fn refuse(&self, serial: u32) -> Result<(), ClipboardError> {
         self.session
             .call::<_, _, ()>("SelectionWriteDone", &(serial, false))?;
 
@@ -381,7 +309,11 @@ fn kinds_of(mimes: &[String]) -> Vec<Kind> {
 }
 
 /// Reads a descriptor that is not blocking, and may not be ready for a while.
-fn drain<R: AsRawFd>(source: &R, cap: usize, deadline: Duration) -> Result<Vec<u8>, MutterError> {
+fn drain<R: AsRawFd>(
+    source: &R,
+    cap: usize,
+    deadline: Duration,
+) -> Result<Vec<u8>, ClipboardError> {
     let mut file = unsafe_borrowed(source);
     let mut bytes = Vec::new();
     let mut buffer = [0u8; 16 * 1024];
@@ -392,24 +324,24 @@ fn drain<R: AsRawFd>(source: &R, cap: usize, deadline: Duration) -> Result<Vec<u
             Ok(0) => return Ok(bytes),
             Ok(read) => {
                 if bytes.len() + read > cap {
-                    return Err(MutterError::TooLarge);
+                    return Err(ClipboardError::TooLarge);
                 }
                 bytes.extend_from_slice(&buffer[..read]);
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 if Instant::now() >= until {
-                    return Err(MutterError::Idle);
+                    return Err(ClipboardError::Idle);
                 }
                 wait(source.as_raw_fd(), libc::POLLIN);
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(MutterError::Transfer(error)),
+            Err(error) => return Err(ClipboardError::Transfer(error)),
         }
     }
 }
 
 /// Writes a whole selection to a descriptor that may not take it all at once.
-fn fill(sink: &OwnedFd, bytes: &[u8]) -> Result<(), MutterError> {
+fn fill(sink: &OwnedFd, bytes: &[u8]) -> Result<(), ClipboardError> {
     use std::io::Write;
 
     let mut file = unsafe_borrowed(sink);
@@ -418,7 +350,7 @@ fn fill(sink: &OwnedFd, bytes: &[u8]) -> Result<(), MutterError> {
     while !rest.is_empty() {
         match file.write(rest) {
             Ok(0) => {
-                return Err(MutterError::Transfer(io::Error::new(
+                return Err(ClipboardError::Transfer(io::Error::new(
                     io::ErrorKind::WriteZero,
                     "the reader took nothing",
                 )));
@@ -428,7 +360,7 @@ fn fill(sink: &OwnedFd, bytes: &[u8]) -> Result<(), MutterError> {
                 wait(file.as_raw_fd(), libc::POLLOUT);
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(MutterError::Transfer(error)),
+            Err(error) => return Err(ClipboardError::Transfer(error)),
         }
     }
 
