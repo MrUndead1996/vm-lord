@@ -3551,7 +3551,39 @@ Those calls sit behind a seam, `GuestClipboard`
 (`crates/display-services/src/guest_clipboard.rs`) -- a genuine trait rather
 than a table of functions, because Mutter's RemoteDesktop and wlroots'
 `wlr-data-control` differ in their selection-ownership models, not just in
-spelling. Mutter's is the implementation today, and a wlroots one follows.
+spelling.
+
+The second implementation (`data_control.rs`) is what makes that a real seam.
+A wlroots compositor puts its clipboard in a Wayland protocol rather than on a
+bus, and offers it under two names -- `ext-data-control-v1`, the standardised
+one, and `zwlr-data-control-unstable-v1`, the original. Both are spoken and
+`ext` is preferred, which is four small enumerations' worth of difference
+rather than a second module. The Wayland crates are pure Rust with their
+`system` and `dlopen` features off, so the daemon is still a static binary
+built without a C toolchain.
+
+Three properties separate that protocol from Mutter's, and they are why the
+seam is a trait. **There are no serials:** Mutter announces a transfer and
+hands over a descriptor when asked for one by serial, while data-control
+delivers the descriptor *with* the announcement, so the serials in the seam's
+events are minted by this implementation and the descriptors wait in a table
+until the daemon answers. **Owning the selection does not blind this side,** so
+`listen` is nothing at all here -- but a client that sets the selection is told
+about it like anybody else, and that echo is suppressed by a flag cleared when
+the compositor cancels the source, which it does before announcing the
+replacement. **Reading is a pipe this side makes:** `receive` takes a
+descriptor rather than returning one, and the pipe is then drained by the same
+poll loop the Mutter side uses -- `clipboard_pipe.rs`, which is where both
+implementations' descriptor handling lives.
+
+Which of the two serves a session is decided by what the session offers, never
+by the name of a desktop: data-control is tried first, one round trip on the
+Wayland socket, and a session whose registry does not announce it falls through
+to Mutter's bus name. A table of desktop names would be one more thing to keep
+current, and would be wrong the first time a compositor grew the other
+protocol. The question is asked again on every reopen, because the daemon
+outlives a logout and the desktop that comes back need not be the one that
+left.
 
 Two more properties shape what a user sees rather than the code. Mutter
 inhibits session creation entirely while the screen is locked, so the daemon
