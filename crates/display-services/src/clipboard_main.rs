@@ -1,9 +1,10 @@
 //! The guest's clipboard daemon.
 //!
 //! It lives in the user's graphical session, because a selection does. What it
-//! owns is one vsock socket and one Mutter session; what it decides is nothing
-//! -- every rule about what may cross, how large it may be and when a transfer
-//! ends is [`vmlord_display_protocol::clipboard`], which the host runs too.
+//! owns is one vsock socket and one compositor clipboard; what it decides is
+//! nothing -- every rule about what may cross, how large it may be and when a
+//! transfer ends is [`vmlord_display_protocol::clipboard`], which the host runs
+//! too.
 //!
 //! It holds no secret. The broker does the control handshake and sends one
 //! channel key over `/run/vmlord/display-clipboard.sock`, which is worth one
@@ -41,8 +42,9 @@ use vmlord_display_protocol::{
 use crate::{
     channel::{self, BindError},
     clipboard_files::{Produced, SourceTree, Staging, parse_uri_list, uri_lists},
+    guest_clipboard::{ClipboardError, Event, GNOME_COPIED_MIME, GuestClipboard, URI_LIST_MIME},
     ipc::Message,
-    mutter::{self, Clipboard, GNOME_COPIED_MIME, URI_LIST_MIME},
+    mutter,
     unix::Connection,
     vsock::{self, CLIPBOARD_PORT},
 };
@@ -205,7 +207,9 @@ fn serve_session(
         .set_read_timeout(PATIENCE)
         .map_err(|error| format!("the clipboard socket refused a timeout: {error}"))?;
 
-    pump(&mut stream, generation, &session_token(&session_id))
+    // The implementation of the seam is chosen here: today it is Mutter, and
+    // the choice will follow what the session offers.
+    pump::<_, mutter::Clipboard>(&mut stream, generation, &session_token(&session_id))
 }
 
 /// The name a session's staging directory is made under.
@@ -233,7 +237,11 @@ fn guard(last_bound: Option<&(Vec<u8>, u32)>, session_id: &[u8]) -> Option<u32> 
 }
 
 /// The loop: records in, compositor events in, records out.
-fn pump<S: Read + Write>(stream: &mut S, generation: u32, session: &str) -> Result<(), String> {
+fn pump<S: Read + Write, C: GuestClipboard>(
+    stream: &mut S,
+    generation: u32,
+    session: &str,
+) -> Result<(), String> {
     let limits = Limits::new(0, 0);
     let mut exchange = Exchange::new();
     let mut files = files::Exchange::new(Policy::default(), Instant::now());
@@ -253,7 +261,7 @@ fn pump<S: Read + Write>(stream: &mut S, generation: u32, session: &str) -> Resu
 
     // The compositor may not be reachable yet -- this daemon can outlive a
     // logout -- so it is opened lazily and reopened when it closes.
-    let mut clipboard: Option<(Clipboard, std::sync::mpsc::Receiver<mutter::Event>)> = None;
+    let mut clipboard: Option<(C, std::sync::mpsc::Receiver<Event>)> = None;
     let mut next_open = Instant::now();
 
     loop {
@@ -262,7 +270,7 @@ fn pump<S: Read + Write>(stream: &mut S, generation: u32, session: &str) -> Resu
 
         if clipboard.is_none() && now >= next_open {
             next_open = now + RETRY;
-            match Clipboard::open().and_then(|(clipboard, events)| {
+            match C::open().and_then(|(clipboard, events)| {
                 // A listener, never an owner, until the host actually sends a
                 // selection: Mutter refuses to read a selection its caller owns.
                 clipboard.listen()?;
@@ -293,10 +301,10 @@ fn pump<S: Read + Write>(stream: &mut S, generation: u32, session: &str) -> Resu
             Err(error) => return Err(format!("the clipboard channel ended: {error}")),
         }
 
-        if let Some((mutter_clipboard, events)) = clipboard.as_ref() {
+        if let Some((compositor, events)) = clipboard.as_ref() {
             loop {
                 match events.try_recv() {
-                    Ok(mutter::Event::PeerOffer {
+                    Ok(Event::PeerOffer {
                         kinds,
                         files: has_files,
                     }) => {
@@ -320,13 +328,13 @@ fn pump<S: Read + Write>(stream: &mut S, generation: u32, session: &str) -> Resu
                             file_ops.extend(files.local_offer(now));
                         }
                     }
-                    Ok(mutter::Event::Transfer { kind, serial }) => {
-                        answer_transfer(mutter_clipboard, &held, kind, serial);
+                    Ok(Event::Transfer { kind, serial }) => {
+                        answer_transfer(compositor, &held, kind, serial);
                     }
-                    Ok(mutter::Event::TransferFiles { mime, serial }) => {
-                        answer_files(mutter_clipboard, &held_files, &mime, serial);
+                    Ok(Event::TransferFiles { mime, serial }) => {
+                        answer_files(compositor, &held_files, &mime, serial);
                     }
-                    Ok(mutter::Event::Closed) | Err(TryRecvError::Disconnected) => {
+                    Ok(Event::Closed) | Err(TryRecvError::Disconnected) => {
                         eprintln!("vmlord-display-clipboard: the desktop's clipboard went away");
                         clipboard = None;
                         held.clear();
@@ -382,7 +390,7 @@ fn pump<S: Read + Write>(stream: &mut S, generation: u32, session: &str) -> Resu
                 Op::Produce { kind, transfer } => {
                     let produced = clipboard
                         .as_ref()
-                        .ok_or(mutter::MutterError::Idle)
+                        .ok_or(ClipboardError::Idle)
                         .and_then(|(clipboard, _)| clipboard.read(kind, kind.cap()));
 
                     match produced {
@@ -534,7 +542,7 @@ fn pump<S: Read + Write>(stream: &mut S, generation: u32, session: &str) -> Resu
 }
 
 /// Answers the compositor's request for the files this side owns.
-fn answer_files(clipboard: &Clipboard, held: &[PathBuf], mime: &str, serial: u32) {
+fn answer_files(clipboard: &impl GuestClipboard, held: &[PathBuf], mime: &str, serial: u32) {
     if held.is_empty() {
         let _ = clipboard.refuse(serial);
 
@@ -557,7 +565,7 @@ fn answer_files(clipboard: &Clipboard, held: &[PathBuf], mime: &str, serial: u32
 }
 
 /// Answers the compositor's request for the selection this side owns.
-fn answer_transfer(clipboard: &Clipboard, held: &[Piece], kind: Kind, serial: u32) {
+fn answer_transfer(clipboard: &impl GuestClipboard, held: &[Piece], kind: Kind, serial: u32) {
     let Some(piece) = held.iter().find(|piece| piece.kind == kind) else {
         let _ = clipboard.refuse(serial);
 

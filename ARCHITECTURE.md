@@ -3547,6 +3547,12 @@ selection, so the daemon listens until the host actually sends something; and
 the descriptor `SelectionRead` returns is non-blocking, so reading a selection
 is a poll loop -- which is where the size cap and the deadline live.
 
+Those calls sit behind a seam, `GuestClipboard`
+(`crates/display-services/src/guest_clipboard.rs`) -- a genuine trait rather
+than a table of functions, because Mutter's RemoteDesktop and wlroots'
+`wlr-data-control` differ in their selection-ownership models, not just in
+spelling. Mutter's is the implementation today, and a wlroots one follows.
+
 Two more properties shape what a user sees rather than the code. Mutter
 inhibits session creation entirely while the screen is locked, so the daemon
 comes and goes with the lock and retries rather than failing; and it announces a
