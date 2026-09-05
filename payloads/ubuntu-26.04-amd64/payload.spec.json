@@ -52,6 +52,11 @@
           "file": "0001-d3d12-scan-out-through-a-winsys-displaytarget.patch",
           "author": "VMLord contributors",
           "reason": "d3d12 cannot present a frame to a KMS device without it"
+        },
+        {
+          "file": "0002-pipebuffer-drop-the-slab-mutex-across-provider-alloc.patch",
+          "author": "VMLord contributors",
+          "reason": "d3d12 deadlocks the slab manager against itself and the desktop freezes"
         }
       ]
     }

@@ -1282,8 +1282,9 @@ itself. The boundary does not move -- it becomes visible.
 #### What the bundled Mesa is patched for
 
 The `ubuntu-26.04-amd64` payload builds Mesa from a pinned commit and applies
-one patch of ours before compiling it:
-`payloads/ubuntu-26.04-amd64/mesa/patches/0001-d3d12-scan-out-through-a-winsys-displaytarget.patch`.
+two patches of ours before compiling it, in
+`payloads/ubuntu-26.04-amd64/mesa/patches/`: one that makes d3d12 able to scan
+out at all, and one that keeps it from deadlocking against itself once it does.
 
 It exists because a GPU-PV guest has one DRM device, `vmlord_drm`, and no render
 node -- so gbm loads the `kms_swrast` screen and `GALLIUM_DRIVER` decides what
@@ -1368,6 +1369,36 @@ nothing, because the copy runs on the calling thread inside the swap. The same
 copy is pathological on at least one Intel iGPU -- WSLg issue #1498 reports
 327-359 ms per frame at 720p, with its own instrumentation blaming the first CPU
 reads of the readback allocation -- and no guard here addresses that yet.
+
+The second patch, `0002-pipebuffer-drop-the-slab-mutex-across-provider-alloc.patch`,
+is not about presenting; it is what a working desktop ran into afterwards. A
+GNOME session on d3d12 froze after a minute or two of use, with the pointer
+still moving -- mutter draws that from its KMS thread -- while gnome-shell's
+main thread sat on a mutex whose owner field held its own thread id.
+
+The path is one stack. A texture upload takes a `PIPE_USAGE_STAGING` buffer from
+`screen->readback_slab_bufmgr`, a `pb_slab_range_manager` whose buckets run 16
+to 65536 bytes over a 65536-byte slab -- so in the top bucket a slab holds
+exactly one buffer, created around every allocation and destroyed around every
+free. `pb_slab_manager_create_buffer` holds `mgr->mutex` while `pb_slab_create`
+asks the provider below for that slab's backing buffer, and `d3d12_bo_new`
+drains `screen->pending_free_list` on the way in. Every bo a submitted batch
+touched is on that list, so a retired entry can hold the last reference to a bo
+backed by this same manager -- and `pb_slab_buffer_destroy` then reaches for the
+mutex the thread is already holding. It is `mtx_plain`, so the thread waits on
+itself, forever.
+
+The fix is to drop the mutex around the provider call. That is not a new idea in
+Mesa: `pb_slab_alloc_reclaimed` in `util/pb_slab.c` already does exactly this,
+for exactly this reason, and says so in a comment. The older manager in
+`pipebuffer/pb_bufmgr_slab.c`, which is the one d3d12 uses, never got the same
+treatment. Racing threads may then create more than one slab; the caller
+re-reads `mgr->slabs` after `pb_slab_create` returns, and a slab nobody took
+buffers from is only idle memory.
+
+Nothing about this is ours -- neither file is patched by the scanout work -- and
+it is reachable by any d3d12 caller that uploads textures. We reach it because
+we are the ones running a compositor on this driver.
 
 A patch is provenance, so it is recorded rather than merely applied. It is
 declared on the mesa source in `payload.spec.json`, `prepare.py` digests the
