@@ -270,15 +270,120 @@ pub fn parse_module_version(text: &str) -> Option<String> {
     (!version.is_empty()).then(|| version.to_owned())
 }
 
-/// Where the guest's own module-signing MOK lives.
-///
-/// Not a path VMLord chose: it is what `dkms` on 22.04, 24.04 and 26.04 all
-/// sign with by default, which is why VMLord configures no signing of its own
-/// and writes neither `framework.conf` nor a `framework.conf.d` file.
-pub const SIGNING_KEY: &str = "/var/lib/shim-signed/mok/MOK.priv";
+/// The pair `shim-signed` owns, and the one dkms signs with on Ubuntu.
+const SHIM_KEY: &str = "/var/lib/shim-signed/mok/MOK.priv";
+const SHIM_CERTIFICATE: &str = "/var/lib/shim-signed/mok/MOK.der";
 
-/// The certificate half of that pair, and the only half that ever leaves.
-pub const SIGNING_CERTIFICATE: &str = "/var/lib/shim-signed/mok/MOK.der";
+/// The pair dkms makes for itself where no distribution names another.
+const DKMS_KEY: &str = "/var/lib/dkms/mok.key";
+const DKMS_CERTIFICATE: &str = "/var/lib/dkms/mok.pub";
+
+/// Where the guest's own module-signing MOK lives, and how it comes to exist.
+///
+/// Not a path VMLord chose and not one it can choose: signing happens inside
+/// `dkms build`, so the pair that counts is the pair dkms will read, and every
+/// other pair on the guest is a file nothing signs with. VMLord writes no
+/// `framework.conf` and ships no key; it answers the same question dkms
+/// answers, in the same order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SigningPair {
+    /// The private key half, which never leaves the guest.
+    pub key: String,
+    /// The certificate half, and the only half that ever leaves.
+    pub certificate: String,
+    /// What creates the pair when it is not there.
+    pub creation: KeyCreation,
+}
+
+/// How a guest that has no pair yet gets one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyCreation {
+    /// `update-secureboot-policy --new-key`, from Ubuntu's `shim-signed`.
+    ///
+    /// Only where the pair is `shim-signed`'s own: it writes that pair and no
+    /// other, and it stages the enrollment request alongside, which is the
+    /// half a plain `openssl` cannot do.
+    SecureBootPolicy,
+    /// `openssl req`, which every guest with openssl can do.
+    OpenSsl,
+}
+
+/// Which pair dkms will sign with on this guest.
+///
+/// `framework` is `/etc/dkms/framework.conf` and every
+/// `framework.conf.d/*.conf` beside it, concatenated; `distribution` is the
+/// `ID` of `/etc/os-release`. The order is dkms's own `prepare_mok`: what the
+/// configuration names wins, Ubuntu without one gets `shim-signed`'s pair, and
+/// everyone else gets the pair dkms generates under its own tree.
+///
+/// A guest whose dkms resolves the pair some third way -- Gentoo reads it out
+/// of `make.conf` and the kernel's `CONFIG_MODULE_SIG_KEY` -- is one this
+/// answers wrongly, and one no profile builds. It costs a mismatch in the
+/// report and no display: the module is signed either way, with a key the
+/// report then names as not ours.
+#[must_use]
+pub fn signing_pair(framework: &str, distribution: &str) -> SigningPair {
+    let key = framework_variable(framework, "mok_signing_key");
+    let certificate = framework_variable(framework, "mok_certificate");
+
+    // dkms asks about the key alone, so a configuration that names only the
+    // certificate leaves the distribution's branch untaken -- and this has to
+    // be wrong in the same way to be right about the same guest.
+    if key.is_none() && distribution == "ubuntu" {
+        return SigningPair {
+            key: SHIM_KEY.to_owned(),
+            certificate: SHIM_CERTIFICATE.to_owned(),
+            creation: KeyCreation::SecureBootPolicy,
+        };
+    }
+
+    SigningPair {
+        key: key.unwrap_or_else(|| DKMS_KEY.to_owned()),
+        certificate: certificate.unwrap_or_else(|| DKMS_CERTIFICATE.to_owned()),
+        creation: KeyCreation::OpenSsl,
+    }
+}
+
+/// One shell assignment out of a dkms framework configuration.
+///
+/// Read rather than sourced, which is the difference between this and dkms:
+/// it runs the file as shell and this looks for `name=value` on a line of its
+/// own, unquoted or in either quote. A value written as an expansion is
+/// therefore not read -- and is answered with `None`, which sends the caller
+/// to the same default the file was trying to override rather than to a path
+/// spelled `$dkms_tree/mok.key`.
+fn framework_variable(text: &str, name: &str) -> Option<String> {
+    text.lines()
+        .rev()
+        .filter_map(|line| line.trim().strip_prefix(name)?.strip_prefix('='))
+        .map(|value| {
+            let value = value.trim();
+            value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .or_else(|| {
+                    value
+                        .strip_prefix('\'')
+                        .and_then(|value| value.strip_suffix('\''))
+                })
+                .unwrap_or(value)
+        })
+        .find(|value| !value.is_empty() && !value.contains('$'))
+        .map(str::to_owned)
+}
+
+/// Whether this kernel signs modules at all, from the configuration dkms
+/// reads.
+///
+/// The one line dkms greps for: without `CONFIG_MODULE_SIG_HASH` it prints
+/// that the kernel is built without the module signing facility and signs
+/// nothing, whatever pair the guest holds.
+#[must_use]
+pub fn kernel_signs_modules(kernel_config: &str) -> bool {
+    kernel_config
+        .lines()
+        .any(|line| line.starts_with("CONFIG_MODULE_SIG_HASH="))
+}
 
 /// What the guest has of a signing pair.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -306,8 +411,8 @@ pub fn signing_key_state(private_key_exists: bool, certificate_exists: bool) -> 
 ///
 /// Lower-case and without separators, which is the form [`signature_matches`]
 /// compares in. `None` is a certificate carrying no subject key identifier at
-/// all -- one generated without `/usr/lib/shim/mok/openssl.cnf` -- and means
-/// there is nothing a signature can be matched against.
+/// all -- one generated without asking for one -- and means there is nothing a
+/// signature can be matched against.
 #[must_use]
 pub fn parse_subject_key_identifier(text: &str) -> Option<String> {
     let mut lines = text
@@ -321,8 +426,8 @@ pub fn parse_subject_key_identifier(text: &str) -> Option<String> {
 /// The key `modinfo` says signed this module, in the same form.
 ///
 /// `sign-file` writes the certificate's subject key identifier when it has
-/// one, which is why the certificate is generated with
-/// `/usr/lib/shim/mok/openssl.cnf` and its `subjectKeyIdentifier = hash`.
+/// one, which is why every certificate this guest generates is generated with
+/// `subjectKeyIdentifier=hash` asked for explicitly.
 #[must_use]
 pub fn parse_module_signature_key(modinfo: &str) -> Option<String> {
     let key = hex_only(
@@ -499,17 +604,86 @@ mod tests {
     use vmlord_agent_protocol::v1::{DisplayRecipeStageState, DisplayRecipeStep};
 
     use super::{
-        DKMS_PACKAGE, FALLBACK_MODE, InstalledVersions, Report, STEPS, SigningKeyState,
-        compositor_isolation, dkms_reports_installed, dkms_versions, has_recipe, modprobe_options,
-        module_is_loaded, needs_build, needs_reload, parse_module_parameters,
-        parse_module_signature_key, parse_secure_boot_state, parse_subject_key_identifier,
-        read_payload_facts, serves, signature_matches, signing_key_state, wanted_mode,
-        was_built_for, was_rejected_for_its_signature,
+        DKMS_PACKAGE, FALLBACK_MODE, InstalledVersions, KeyCreation, Report, STEPS,
+        SigningKeyState, compositor_isolation, dkms_reports_installed, dkms_versions, has_recipe,
+        kernel_signs_modules, modprobe_options, module_is_loaded, needs_build, needs_reload,
+        parse_module_parameters, parse_module_signature_key, parse_secure_boot_state,
+        parse_subject_key_identifier, read_payload_facts, serves, signature_matches,
+        signing_key_state, signing_pair, wanted_mode, was_built_for,
+        was_rejected_for_its_signature,
     };
 
     const DECLARED: &str =
         r#"{"guest_capabilities":["compositor-scanout"],"mesa_policy":"bundled"}"#;
     const SILENT: &str = r#"{"schema_version":2,"mesa_policy":"bundled"}"#;
+
+    #[test]
+    fn ubuntu_without_a_framework_file_signs_with_the_pair_shim_signed_owns() {
+        let pair = signing_pair("", "ubuntu");
+
+        assert_eq!(pair.key, "/var/lib/shim-signed/mok/MOK.priv");
+        assert_eq!(pair.certificate, "/var/lib/shim-signed/mok/MOK.der");
+        assert_eq!(pair.creation, KeyCreation::SecureBootPolicy);
+    }
+
+    #[test]
+    fn every_other_guest_signs_with_the_pair_dkms_makes_for_itself() {
+        // The whole point of the stage on Arch: a key written to the Debian
+        // path is a key dkms never reads, and a module signed with a key the
+        // report does not know about reads as a module signed by a stranger.
+        let pair = signing_pair("", "arch");
+
+        assert_eq!(pair.key, "/var/lib/dkms/mok.key");
+        assert_eq!(pair.certificate, "/var/lib/dkms/mok.pub");
+        assert_eq!(pair.creation, KeyCreation::OpenSsl);
+    }
+
+    #[test]
+    fn a_framework_file_that_names_a_pair_is_what_wins_on_any_distribution() {
+        let framework = "# mok_signing_key=\"/nowhere\"\n\
+                         mok_signing_key=\"/etc/keys/module.key\"\n\
+                         mok_certificate='/etc/keys/module.der'\n";
+
+        for distribution in ["ubuntu", "arch"] {
+            let pair = signing_pair(framework, distribution);
+
+            assert_eq!(pair.key, "/etc/keys/module.key", "{distribution}");
+            assert_eq!(pair.certificate, "/etc/keys/module.der", "{distribution}");
+            assert_eq!(pair.creation, KeyCreation::OpenSsl, "{distribution}");
+        }
+    }
+
+    #[test]
+    fn the_last_assignment_of_a_name_is_the_one_that_takes_effect() {
+        // `framework.conf.d` is read after `framework.conf` and sourced, so a
+        // drop-in overriding the file it sits beside is the ordinary case.
+        let framework = "mok_signing_key=/var/lib/dkms/mok.key\n\
+                         mok_signing_key=/etc/keys/module.key\n";
+
+        assert_eq!(signing_pair(framework, "arch").key, "/etc/keys/module.key");
+    }
+
+    #[test]
+    fn a_value_this_cannot_read_leaves_the_default_standing() {
+        // An expansion is shell, and reading it literally would name a
+        // directory spelled with a dollar sign.
+        let pair = signing_pair("mok_signing_key=\"$dkms_tree/mok.key\"\n", "arch");
+
+        assert_eq!(pair.key, "/var/lib/dkms/mok.key");
+    }
+
+    #[test]
+    fn a_kernel_signs_modules_when_its_configuration_names_the_hash() {
+        assert!(kernel_signs_modules(
+            "CONFIG_MODULE_SIG=y\nCONFIG_MODULE_SIG_HASH=\"sha512\"\n"
+        ));
+        assert!(!kernel_signs_modules("CONFIG_MODULE_SIG_ALL=y\n"));
+        // Commented out is how a configuration says a symbol is unset, and
+        // a substring match would read it as set.
+        assert!(!kernel_signs_modules(
+            "# CONFIG_MODULE_SIG_HASH= is not set\n"
+        ));
+    }
 
     #[test]
     fn a_compositor_draws_on_the_payloads_mesa_only_when_both_halves_are_there() {
