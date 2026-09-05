@@ -58,6 +58,9 @@ pub struct GuestFacts {
     /// The package manager that answered, or `None` on a guest carrying none
     /// this build knows how to drive.
     pub package_manager: Option<PackageManager>,
+    /// The program that rebuilds this guest's boot image, or `None` where none
+    /// this build knows how to drive is installed.
+    pub initramfs_builder: Option<InitramfsBuilder>,
     /// Where this guest keeps its shared libraries.
     pub library_layout: LibraryLayout,
     /// The desktop found here, which is not the desktop the VM was created
@@ -77,8 +80,12 @@ impl GuestFacts {
             Some(manager) => manager.program().to_owned(),
             None => "no package manager this build knows".to_owned(),
         };
+        let initramfs = match self.initramfs_builder {
+            Some(builder) => builder.program().to_owned(),
+            None => "no initramfs builder this build knows".to_owned(),
+        };
         format!(
-            "{manager}, libraries in {}, {}",
+            "{manager}, {initramfs}, libraries in {}, {}",
             self.library_layout.directory(),
             self.desktop.describe()
         )
@@ -140,6 +147,114 @@ pub fn package_manager(present: impl Fn(&str) -> bool) -> Option<PackageManager>
     MANAGERS
         .into_iter()
         .find(|manager| present(manager.program()))
+}
+
+/// The program that rebuilds a guest's boot image.
+///
+/// Beside the package manager and for the same reason: which one a guest has
+/// is a fact about the guest, not about the name in its `/etc/os-release`.
+/// Debian and Ubuntu carry `initramfs-tools`, Arch `mkinitcpio`, Fedora and
+/// SUSE `dracut` -- and a Debian that has been moved onto dracut is a guest
+/// whose `update-initramfs` is a stub that tells you to stop calling it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitramfsBuilder {
+    /// `initramfs-tools`, on Debian and Ubuntu.
+    UpdateInitramfs,
+    /// `mkinitcpio`, on Arch.
+    Mkinitcpio,
+    /// `dracut`, on Fedora and SUSE.
+    Dracut,
+}
+
+/// The builders that are looked for, in the order they are tried.
+///
+/// Fixed for the same reason [`MANAGERS`] is: a guest with two installed has
+/// to get the same answer on every boot. `update-initramfs` comes first
+/// because a Debian carrying dracut as well still boots off the image
+/// `initramfs-tools` writes.
+pub const INITRAMFS_BUILDERS: [InitramfsBuilder; 3] = [
+    InitramfsBuilder::UpdateInitramfs,
+    InitramfsBuilder::Mkinitcpio,
+    InitramfsBuilder::Dracut,
+];
+
+impl InitramfsBuilder {
+    /// The program that is run, and whose presence is what detects it.
+    #[must_use]
+    pub const fn program(self) -> &'static str {
+        match self {
+            Self::UpdateInitramfs => "update-initramfs",
+            Self::Mkinitcpio => "mkinitcpio",
+            Self::Dracut => "dracut",
+        }
+    }
+
+    /// The arguments that rebuild the image the given kernel boots from.
+    ///
+    /// `mkinitcpio` is the odd one: it is driven by presets rather than by
+    /// kernel release, and the release a preset is for is written in the
+    /// preset, so `-P` -- every preset this guest has -- is how one asks it
+    /// for "the image this kernel boots from" without knowing which preset
+    /// that is.
+    #[must_use]
+    pub fn arguments(self, kernel_release: &str) -> Vec<String> {
+        let owned = |arguments: &[&str]| arguments.iter().map(|a| (*a).to_owned()).collect();
+        match self {
+            Self::UpdateInitramfs => owned(&["-u", "-k", kernel_release]),
+            Self::Mkinitcpio => owned(&["-P"]),
+            Self::Dracut => owned(&["--force", "--kver", kernel_release]),
+        }
+    }
+
+    /// The whole call, in the words a failed stage is reported with.
+    #[must_use]
+    pub fn command(self, kernel_release: &str) -> String {
+        std::iter::once(self.program().to_owned())
+            .chain(self.arguments(kernel_release))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+impl std::fmt::Display for InitramfsBuilder {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.program())
+    }
+}
+
+/// The first builder `present` finds.
+///
+/// Split from the probing the way [`package_manager`] is, and probed
+/// differently: `update-initramfs` answers no `--version` at all -- an unknown
+/// option gets a usage message and a non-zero exit -- so what detects these is
+/// an executable of that name on `PATH`.
+pub fn initramfs_builder(present: impl Fn(&str) -> bool) -> Option<InitramfsBuilder> {
+    INITRAMFS_BUILDERS
+        .into_iter()
+        .find(|builder| present(builder.program()))
+}
+
+/// Whether a program of this name is on `PATH` and executable.
+///
+/// `PATH` rather than a written-out directory: `dkms` is in `/usr/sbin` on
+/// Debian and `/usr/bin` on Arch, and a check that names one of those is a
+/// check that finds nothing on the other. The fallback list is systemd's own
+/// default, for the case of a unit started with no `PATH` in its environment.
+pub fn program_on_path(program: &str) -> bool {
+    const FALLBACK: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+    let path = std::env::var("PATH").unwrap_or_else(|_| FALLBACK.to_owned());
+    path.split(':')
+        .filter(|directory| !directory.is_empty())
+        .any(|directory| is_executable(&Path::new(directory).join(program)))
+}
+
+/// Whether this path is a file anybody may execute.
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
 }
 
 /// Whether a program is installed and can be run.
@@ -655,6 +770,7 @@ pub fn guest_facts() -> Result<GuestFacts, String> {
 
     Ok(GuestFacts {
         package_manager: package_manager(program_answers),
+        initramfs_builder: initramfs_builder(program_on_path),
         library_layout: library_layout(&architecture, |path| path.is_dir()),
         desktop: desktop_now(),
         distribution,
@@ -690,12 +806,16 @@ fn field(bytes: &[libc::c_char]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::{
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+    };
 
     use super::{
-        CompositorLaunch, DesktopFacts, GuestFacts, LibraryLayout, PackageManager, cgroup_path,
-        compositor_launch, desktop_facts, display_manager_unit, graphical_session, is_drm_card,
-        launch_of, library_layout, library_triplet, package_manager, parse_os_release, session_in,
+        CompositorLaunch, DesktopFacts, GuestFacts, InitramfsBuilder, LibraryLayout,
+        PackageManager, cgroup_path, compositor_launch, desktop_facts, display_manager_unit,
+        graphical_session, initramfs_builder, is_drm_card, launch_of, library_layout,
+        library_triplet, package_manager, parse_os_release, program_on_path, session_in,
     };
 
     const GNOME_WAYLAND: &str =
@@ -756,6 +876,79 @@ mod tests {
         }
         assert_eq!(PackageManager::Apt.program(), "apt-get");
         assert_eq!(PackageManager::Apt.to_string(), "apt-get");
+    }
+
+    #[test]
+    fn the_first_initramfs_builder_that_is_installed_is_the_one() {
+        assert_eq!(
+            initramfs_builder(|program| program == "mkinitcpio"),
+            Some(InitramfsBuilder::Mkinitcpio)
+        );
+        assert_eq!(
+            initramfs_builder(|program| matches!(program, "update-initramfs" | "dracut")),
+            Some(InitramfsBuilder::UpdateInitramfs),
+            "a guest carrying two builders boots off the image the first of the \
+             fixed order writes"
+        );
+        assert_eq!(initramfs_builder(|_| false), None);
+    }
+
+    #[test]
+    fn every_builder_rebuilds_the_image_the_running_kernel_boots_from() {
+        assert_eq!(
+            InitramfsBuilder::UpdateInitramfs.arguments("7.0.0-30-generic"),
+            ["-u", "-k", "7.0.0-30-generic"]
+        );
+        assert_eq!(
+            InitramfsBuilder::Mkinitcpio.arguments("6.16.7-arch1-1"),
+            ["-P"],
+            "mkinitcpio is driven by presets, and the kernel a preset is for is \
+             written in the preset"
+        );
+        assert_eq!(
+            InitramfsBuilder::Dracut.arguments("6.16.7-200.fc42.x86_64"),
+            ["--force", "--kver", "6.16.7-200.fc42.x86_64"]
+        );
+        assert_eq!(
+            InitramfsBuilder::Mkinitcpio.command("6.16.7-arch1-1"),
+            "mkinitcpio -P"
+        );
+    }
+
+    #[test]
+    fn a_program_is_looked_for_on_path_and_not_at_one_distributions_placing_of_it() {
+        let directory = temporary("path");
+        let program = directory.join("vmlord-fake-dkms");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // SAFETY: single-threaded at this point in the test, and the value is
+        // put back before returning.
+        let previous = std::env::var("PATH").unwrap_or_default();
+        unsafe { std::env::set_var("PATH", directory.display().to_string()) };
+        let found = program_on_path("vmlord-fake-dkms");
+        let missing = program_on_path("vmlord-no-such-program");
+        unsafe { std::env::set_var("PATH", previous) };
+
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(
+            found,
+            "an executable on PATH is found wherever PATH puts it"
+        );
+        assert!(!missing);
+    }
+
+    #[test]
+    fn a_file_that_is_not_executable_is_not_a_program() {
+        let directory = temporary("not-executable");
+        let path = directory.join("dkms");
+        std::fs::write(&path, "").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let executable = super::is_executable(&path);
+
+        let _ = std::fs::remove_dir_all(&directory);
+        assert!(!executable);
     }
 
     #[test]
@@ -1177,6 +1370,7 @@ mod tests {
             architecture: "amd64".to_owned(),
             kernel_release: "7.0.0-14-generic".to_owned(),
             package_manager: Some(PackageManager::Apt),
+            initramfs_builder: Some(InitramfsBuilder::UpdateInitramfs),
             library_layout: LibraryLayout::Multiarch("x86_64-linux-gnu".to_owned()),
             desktop: DesktopFacts {
                 session: Some("gnome".to_owned()),
@@ -1189,16 +1383,18 @@ mod tests {
         };
         assert_eq!(
             facts.platform(),
-            "apt-get, libraries in /usr/lib/x86_64-linux-gnu, gnome on wayland, under \
-             gdm.service, started by org.gnome.Shell@wayland.service"
+            "apt-get, update-initramfs, libraries in /usr/lib/x86_64-linux-gnu, gnome on \
+             wayland, under gdm.service, started by org.gnome.Shell@wayland.service"
         );
 
         facts.package_manager = None;
+        facts.initramfs_builder = None;
         facts.library_layout = LibraryLayout::Flat;
         facts.desktop = DesktopFacts::default();
         assert_eq!(
             facts.platform(),
-            "no package manager this build knows, libraries in /usr/lib, no desktop",
+            "no package manager this build knows, no initramfs builder this build knows, \
+             libraries in /usr/lib, no desktop",
             "a guest the recipe can do nothing with still says why, because \
              this line is all a host has to diagnose a detection from"
         );

@@ -411,7 +411,7 @@ pub fn dkms_reports_installed(status: &str, package: &DkmsPackage, kernel: &str)
 mod tests {
     use vmlord_agent_protocol::v1::{GpuRecipeStageState, GpuRecipeStep};
 
-    use crate::guest_platform::{DesktopFacts, LibraryLayout, PackageManager};
+    use crate::guest_platform::{DesktopFacts, InitramfsBuilder, LibraryLayout, PackageManager};
 
     use super::{
         Applicability, DkmsPackage, Environment, GpuRecipe, GuestCapability, GuestFacts,
@@ -427,6 +427,7 @@ mod tests {
             architecture: "amd64".to_owned(),
             kernel_release: "7.0.0-14-generic".to_owned(),
             package_manager: Some(PackageManager::Apt),
+            initramfs_builder: Some(InitramfsBuilder::UpdateInitramfs),
             library_layout: LibraryLayout::Multiarch("x86_64-linux-gnu".to_owned()),
             desktop: DesktopFacts::default(),
         }

@@ -94,16 +94,6 @@ impl Report {
     }
 }
 
-/// A distribution this build knows how to bring a display up on.
-///
-/// The whole "an unsupported release degrades the display and does not stop the
-/// VM" rule starts here: a guest with no recipe is a skipped first stage, not
-/// an error.
-#[must_use]
-pub fn has_recipe(distribution: &str) -> bool {
-    distribution == "ubuntu"
-}
-
 /// What the mounted payload says it is.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PayloadFacts {
@@ -605,7 +595,7 @@ mod tests {
 
     use super::{
         DKMS_PACKAGE, FALLBACK_MODE, InstalledVersions, KeyCreation, Report, STEPS,
-        SigningKeyState, compositor_isolation, dkms_reports_installed, dkms_versions, has_recipe,
+        SigningKeyState, compositor_isolation, dkms_reports_installed, dkms_versions,
         kernel_signs_modules, modprobe_options, module_is_loaded, needs_build, needs_reload,
         parse_module_parameters, parse_module_signature_key, parse_secure_boot_state,
         parse_subject_key_identifier, read_payload_facts, serves, signature_matches,
@@ -895,12 +885,6 @@ other-module/1.0, 6.8.0-137-generic, x86_64: installed";
             "vmlord_drm 20480 0 - Live 0x0000\ndrm 1 0"
         ));
         assert!(!module_is_loaded("hyperv_drm 20480 0 - Live 0x0000"));
-    }
-
-    #[test]
-    fn only_ubuntu_has_a_display_recipe_today() {
-        assert!(has_recipe("ubuntu"));
-        assert!(!has_recipe("fedora"));
     }
 
     #[test]
