@@ -65,7 +65,12 @@ type SystemPreparer = Box<dyn Fn(&str, &str) -> Result<(), HcsStartFailure> + Se
 /// Starts a compute system a preparer has already brought into shape.
 type SystemStarter = Box<dyn Fn(&str) -> Result<(), HcsStartFailure> + Send + Sync>;
 type EndpointProvider = Box<
-    dyn Fn(&str, Option<Uuid>, EndpointPolicy) -> Result<VmNetworkAdapter, RepositoryError>
+    dyn Fn(
+            &str,
+            Option<Uuid>,
+            &EndpointIdentity,
+            EndpointPolicy,
+        ) -> Result<VmNetworkAdapter, RepositoryError>
         + Send
         + Sync,
 >;
@@ -182,6 +187,7 @@ impl VmStartPipeline {
         endpoint_provider: impl Fn(
             &str,
             Option<Uuid>,
+            &EndpointIdentity,
             EndpointPolicy,
         ) -> Result<VmNetworkAdapter, RepositoryError>
         + Send
@@ -539,7 +545,12 @@ impl VmStartPipeline {
             return Ok((updated, None));
         }
 
-        let adapter = (self.endpoint_provider)(&mapping.vm_name, recorded, policy)?;
+        let adapter = (self.endpoint_provider)(
+            &mapping.vm_name,
+            recorded,
+            &remembered_identity(&configuration),
+            policy,
+        )?;
         if recorded != Some(adapter.endpoint_id) {
             store.insert(VmComputeSystemMapping {
                 endpoint_id: Some(adapter.endpoint_id),
@@ -755,12 +766,16 @@ fn grant_vm_access(id: &str, path: &Path) -> Result<(), RepositoryError> {
 
 /// Resolves the endpoint VM `vm_name` starts on.
 ///
-/// `recorded` is the identifier the VM's mapping remembers, if any.
+/// `recorded` is the identifier the VM's mapping remembers, if any, and
+/// `remembered` the card the stored configuration last attached -- see
+/// [`remembered_identity`].
 ///
 /// Under [`EndpointPolicy::Reuse`] the recorded endpoint is opened rather than
 /// trusted: one deleted outside VMLord, or lost to an HNS reset, is replaced by
-/// a new one instead of failing the start. That hands the guest a different
-/// address, but the alternative is a VM that can no longer start at all.
+/// a new one instead of failing the start. The replacement asks HNS to repeat
+/// the remembered card, because the guest's own network configuration was
+/// written against it; without it the guest would be offered a card it has
+/// never seen and never bring its link up.
 ///
 /// Under [`EndpointPolicy::Replace`] the recorded endpoint is deleted and a new
 /// one created in its place, because HNS still has it attached to a compute
@@ -769,6 +784,7 @@ fn grant_vm_access(id: &str, path: &Path) -> Result<(), RepositoryError> {
 fn ensure_endpoint(
     vm_name: &str,
     recorded: Option<Uuid>,
+    remembered: &EndpointIdentity,
     policy: EndpointPolicy,
 ) -> Result<VmNetworkAdapter, RepositoryError> {
     // The network first: an endpoint cannot be created outside one, and an
@@ -784,18 +800,29 @@ fn ensure_endpoint(
         (EndpointPolicy::Reuse, Some(existing)) => existing,
         (EndpointPolicy::Reuse, None) => {
             if let Some(id) = recorded {
-                tracing::warn!(
-                    "HNS no longer knows endpoint {id} of VM \"{vm_name}\"; \
-                     creating a new one, which changes both the address the guest is offered \
-                     and the card it is offered on -- a guest whose network configuration was \
-                     pinned to the old MAC will not bring its link up"
-                );
+                if remembered.mac_address.is_some() {
+                    tracing::warn!(
+                        "HNS no longer knows endpoint {id} of VM \"{vm_name}\"; creating a new \
+                         one on the card the stored configuration last gave the guest{}",
+                        repeated_identity(remembered)
+                    );
+                } else {
+                    tracing::warn!(
+                        "HNS no longer knows endpoint {id} of VM \"{vm_name}\"; creating a new \
+                         one. Nothing records the card the guest was last given, so HNS assigns \
+                         a fresh one -- a guest whose network configuration was pinned to the \
+                         old MAC will not bring its link up"
+                    );
+                }
             }
             let id = Uuid::new_v4();
-            (id, HcnEndpoint::create(&network, id, vm_name)?)
+            (
+                id,
+                HcnEndpoint::create_with_identity(&network, id, vm_name, remembered)?,
+            )
         }
         (EndpointPolicy::Replace, existing) => {
-            let identity = replaced_identity(vm_name, existing.as_ref())?;
+            let identity = replaced_identity(vm_name, existing.as_ref(), remembered)?;
             if let Some(id) = recorded {
                 // The handle has to close before HNS will delete what it points
                 // at.
@@ -821,6 +848,20 @@ fn ensure_endpoint(
     })
 }
 
+/// The identity a recreated endpoint should repeat, as the stored
+/// configuration records it.
+///
+/// The MAC alone: the document names the card the guest last booted on but
+/// never an address, and an address HNS assigns is an address HNS can assign
+/// again -- while a guest whose card changes never asks for any address at
+/// all. See [`EndpointIdentity`] for why the card is the half that decides.
+fn remembered_identity(configuration: &str) -> EndpointIdentity {
+    EndpointIdentity {
+        address: None,
+        mac_address: hcs_config::attached_mac_address(configuration),
+    }
+}
+
 /// What the replacement was able to keep, for the line that records it.
 ///
 /// Empty when it kept nothing, so that the sentence reads as a plain
@@ -840,6 +881,12 @@ fn repeated_identity(identity: &EndpointIdentity) -> String {
 
 /// What a replacement endpoint should ask HNS to repeat.
 ///
+/// The live endpoint comes first: while HNS still has the one being replaced,
+/// its own properties answer for both halves. `remembered` -- the card the
+/// stored configuration records -- answers when HNS no longer has the endpoint
+/// at all, which is the one case that would otherwise leave the guest a card
+/// its network configuration was never written against.
+///
 /// Both halves matter, and the MAC is the one that decides whether the guest
 /// has a network at all. A guest writes its network configuration on its first
 /// boot and pins it to the card it saw -- cloud-init's networkd renderer
@@ -849,20 +896,30 @@ fn repeated_identity(identity: &EndpointIdentity) -> String {
 /// the Arch guest looked like from inside: `eth0` down, no address,
 /// `systemd-networkd-wait-online` timing out.
 ///
-/// Absent when HNS no longer has the old endpoint or reports nothing for it:
+/// Absent when neither the old endpoint nor the stored configuration has one:
 /// the guest then gets whatever HNS assigns, which is worse than keeping what
 /// it had but far better than not starting.
 fn replaced_identity(
     vm_name: &str,
     existing: Option<&(Uuid, HcnEndpoint)>,
+    remembered: &EndpointIdentity,
 ) -> Result<EndpointIdentity, RepositoryError> {
     let Some((id, endpoint)) = existing else {
-        tracing::warn!(
-            "HNS no longer knows the occupied endpoint of VM \"{vm_name}\"; \
-             its replacement is created without an address or a MAC of its own, so the guest \
-             is offered a card its network configuration was not written against"
-        );
-        return Ok(EndpointIdentity::fresh());
+        if remembered.mac_address.is_some() {
+            tracing::warn!(
+                "HNS no longer knows the occupied endpoint of VM \"{vm_name}\"; its \
+                 replacement is created on the card the stored configuration last gave the \
+                 guest{}",
+                repeated_identity(remembered)
+            );
+        } else {
+            tracing::warn!(
+                "HNS no longer knows the occupied endpoint of VM \"{vm_name}\"; \
+                 its replacement is created without an address or a MAC of its own, so the guest \
+                 is offered a card its network configuration was not written against"
+            );
+        }
+        return Ok(remembered.clone());
     };
 
     let address = endpoint.address()?;
@@ -1040,6 +1097,7 @@ mod tests {
         Com1Launcher,
         hcn_endpoint::{EndpointAddress, EndpointIdentity},
         hcs::HcsStartFailure,
+        hcs_config,
         metadata::{MetadataStore, VmComputeSystemMapping},
     };
 
@@ -1128,6 +1186,11 @@ mod tests {
     const NEW_ENDPOINT_GUID: &str = "3F2B0C11-5C78-4C1B-9E2F-3A8B7D4C6E50";
     const MAC_ADDRESS: &str = "00-15-5D-01-02-03";
 
+    /// The card a stored configuration that already attaches an adapter names:
+    /// deliberately not [`MAC_ADDRESS`], so a test that confuses the card the
+    /// guest was given with the one the provider hands out fails.
+    const PREVIOUS_MAC_ADDRESS: &str = "00-15-5D-56-FF-1D";
+
     /// The address the test endpoint provider reports for its endpoint.
     fn endpoint_address() -> EndpointAddress {
         EndpointAddress {
@@ -1161,9 +1224,10 @@ mod tests {
         console_cancellations: Arc<AtomicUsize>,
     }
 
-    /// One call into the endpoint provider: the identifier it was offered and
-    /// what it was asked to do with it.
-    type EndpointRequest = (Option<Uuid>, EndpointPolicy);
+    /// One call into the endpoint provider: the identifier it was offered,
+    /// what the stored configuration let VMLord remember of the guest's card,
+    /// and what it was asked to do with the endpoint.
+    type EndpointRequest = (Option<Uuid>, EndpointIdentity, EndpointPolicy);
 
     /// Which collaborators fail; by default none of them do.
     #[derive(Clone, Copy, Default)]
@@ -1212,6 +1276,25 @@ mod tests {
 
     fn fixture(label: &str) -> Fixture {
         fixture_with(label, NetworkMode::None, None)
+    }
+
+    /// A fixture whose stored configuration already attaches a network
+    /// adapter: the document a VM that has started before carries, and the
+    /// only record of the guest's card once HNS has lost the endpoint.
+    ///
+    /// The mapping records an endpoint id so the start takes the lost-endpoint
+    /// path a VM that has booted before would take.
+    fn fixture_with_adapter(label: &str) -> Fixture {
+        let fixture = fixture_with(label, NetworkMode::Nat, Some(Uuid::new_v4()));
+        let configuration = fs::read_to_string(fixture.vm_directory.join("config.json")).unwrap();
+        let attached = hcs_config::apply_network_adapter(
+            &configuration,
+            NEW_ENDPOINT_ID,
+            PREVIOUS_MAC_ADDRESS,
+        )
+        .unwrap();
+        fs::write(fixture.vm_directory.join("config.json"), attached).unwrap();
+        fixture
     }
 
     fn fixture_with(label: &str, network_mode: NetworkMode, endpoint_id: Option<Uuid>) -> Fixture {
@@ -1419,9 +1502,16 @@ mod tests {
             },
             {
                 let calls = calls.clone();
-                move |_vm_name: &str, recorded: Option<Uuid>, policy: EndpointPolicy| {
+                move |_vm_name: &str,
+                      recorded: Option<Uuid>,
+                      remembered: &EndpointIdentity,
+                      policy: EndpointPolicy| {
                     calls.steps.lock().unwrap().push("endpoint");
-                    calls.endpoint.lock().unwrap().push((recorded, policy));
+                    calls
+                        .endpoint
+                        .lock()
+                        .unwrap()
+                        .push((recorded, remembered.clone(), policy));
                     if behavior.fail_endpoint {
                         return Err(RepositoryError::new("injected endpoint failure"));
                     }
@@ -1647,7 +1737,7 @@ mod tests {
 
         assert_eq!(
             calls.endpoint.lock().unwrap().clone(),
-            vec![(None, EndpointPolicy::Reuse)]
+            vec![(None, EndpointIdentity::fresh(), EndpointPolicy::Reuse)]
         );
         assert_eq!(fixture.recorded_endpoint(), Some(NEW_ENDPOINT_ID));
     }
@@ -1666,9 +1756,57 @@ mod tests {
 
         assert_eq!(
             calls.endpoint.lock().unwrap().clone(),
-            vec![(Some(recorded), EndpointPolicy::Reuse)]
+            vec![(
+                Some(recorded),
+                EndpointIdentity::fresh(),
+                EndpointPolicy::Reuse
+            )]
         );
         assert_eq!(fixture.recorded_endpoint(), Some(recorded));
+    }
+
+    #[test]
+    fn a_lost_endpoint_is_recreated_on_the_card_the_stored_configuration_remembers() {
+        // HNS loses endpoints -- a reset, a hand-run cleanup -- and a
+        // replacement created with a fresh MAC is a card the guest's own
+        // network configuration does not match: the link stays down and no
+        // DHCP Discover is ever sent. The stored configuration is the only
+        // remaining record of the card, so it is what the provider is handed.
+        let fixture = fixture_with_adapter("nat-remembered");
+        let calls = fixture.calls.clone();
+
+        pipeline(&calls, Behavior::default())
+            .start(&fixture.store, "dev", &fixture.vm_directory)
+            .expect("start should succeed");
+
+        let requests = calls.endpoint.lock().unwrap().clone();
+        assert_eq!(
+            requests[0].1.mac_address.as_deref(),
+            Some(PREVIOUS_MAC_ADDRESS),
+            "the replacement must be offered the card the guest was last given"
+        );
+        assert_eq!(
+            requests[0].1.address, None,
+            "the document records no address, and HNS's IPAM stays the sole allocator"
+        );
+    }
+
+    #[test]
+    fn a_vm_whose_configuration_names_no_card_is_offered_a_fresh_one() {
+        // A VM that never booted has no card for a replacement to repeat, and
+        // one whose adapter a start removed gave the network up: both start the
+        // way they always did.
+        let fixture = fixture_with("nat-no-remembered", NetworkMode::Nat, None);
+        let calls = fixture.calls.clone();
+
+        pipeline(&calls, Behavior::default())
+            .start(&fixture.store, "dev", &fixture.vm_directory)
+            .expect("start should succeed");
+
+        assert_eq!(
+            calls.endpoint.lock().unwrap().clone(),
+            vec![(None, EndpointIdentity::fresh(), EndpointPolicy::Reuse)]
+        );
     }
 
     #[test]
@@ -1771,8 +1909,16 @@ mod tests {
         assert_eq!(
             calls.endpoint.lock().unwrap().clone(),
             vec![
-                (Some(recorded), EndpointPolicy::Reuse),
-                (Some(recorded), EndpointPolicy::Replace),
+                (
+                    Some(recorded),
+                    EndpointIdentity::fresh(),
+                    EndpointPolicy::Reuse
+                ),
+                (
+                    Some(recorded),
+                    EndpointIdentity::fresh(),
+                    EndpointPolicy::Replace
+                ),
             ]
         );
         assert_eq!(
@@ -1781,6 +1927,33 @@ mod tests {
                 "endpoint", "dhcp", "grant", "grant", "prepare", "console", "start", "endpoint",
                 "dhcp", "grant", "grant", "prepare", "console", "start"
             ]
+        );
+    }
+
+    #[test]
+    fn a_retry_is_offered_the_remembered_card_as_well() {
+        // The Replace path reads the identity off the live endpoint while HNS
+        // still has it; the remembered card is what answers when even that is
+        // gone, so the retry is handed it too.
+        let fixture = fixture_with_adapter("busy-remembered");
+        let calls = fixture.calls.clone();
+
+        pipeline(
+            &calls,
+            Behavior {
+                busy_starts: 1,
+                ..Behavior::default()
+            },
+        )
+        .start(&fixture.store, "dev", &fixture.vm_directory)
+        .expect("a start blocked by an occupied endpoint must recover");
+
+        let requests = calls.endpoint.lock().unwrap().clone();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1].2, EndpointPolicy::Replace);
+        assert_eq!(
+            requests[1].1.mac_address.as_deref(),
+            Some(PREVIOUS_MAC_ADDRESS)
         );
     }
 
@@ -2269,7 +2442,10 @@ mod tests {
             |_id: &str, _path: &Path| Ok(()),
             |_id: &str, _configuration: &str| Ok(()),
             |_id: &str| Ok(()),
-            |_vm_name: &str, _recorded: Option<Uuid>, _policy: EndpointPolicy| {
+            |_vm_name: &str,
+             _recorded: Option<Uuid>,
+             _remembered: &EndpointIdentity,
+             _policy: EndpointPolicy| {
                 Ok(VmNetworkAdapter {
                     endpoint_id: NEW_ENDPOINT_ID,
                     mac_address: MAC_ADDRESS.to_owned(),
