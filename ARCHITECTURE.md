@@ -1321,22 +1321,31 @@ The floor is proportional to pixels alone: 3.73 ms at 720p, 8.07 at
 1080p, 13.45 at 1440p, 27.81 at 2160p -- 0.96 GiB/s at 1080p, where llvmpipe
 reads the same 8 MB frame out of system memory at 5.64 GiB/s in the same probe.
 
-**Where that 5.9x goes is not established.** The present path is three steps, not
-one: `d3d12_transfer_map` stages the read through a `D3D12_HEAP_TYPE_READBACK`
-buffer (`d3d12_bufmgr.cpp:137`), so a GPU copy moves the frame out of the render
-target first and the CPU then reads guest system memory and copies that into the
-dumb BO. The CPU never maps the render target itself. Which of the three -- the
-GPU copy, the fence wait that serialises it against the next frame, or the CPU's
-own copy -- carries the 8 ms has not been measured, and an earlier draft of this
-section asserted a fourth thing that the code does not do (a CPU read straight
-out of VRAM). Instrumenting the three phases is what would settle it.
+**Where that 5.9x goes was measured, phase by phase, and the answer has two
+halves.** The present path is three steps, not one: `d3d12_transfer_map` stages
+the read through a `D3D12_HEAP_TYPE_READBACK` buffer (`d3d12_bufmgr.cpp:137`),
+so a GPU copy moves the frame out of the render target first and the CPU then
+reads guest system memory and copies that into the dumb BO. The CPU never maps
+the render target itself. Per present at 1080p: the CPU's own `util_copy_rect`
+is 2.90 ms, the GPU copy and its fence wait 0.68 ms, and mapping and unmapping
+the two ends 0.30 ms.
 
-What the number does say is that the CPU hop is worth removing rather than
-making cheaper, which is the direction "Can the CPU leave the path?" below takes.
-The same copy is pathological on at least one Intel iGPU -- WSLg issue #1498
-reports 327-359 ms per frame at 720p, with its own instrumentation blaming the
-first CPU reads of the readback allocation -- and no guard here addresses that
-yet.
+The other half is that **the frame pays for that twice**. `flush_resource` is
+called on the back buffer once by `notify_before_flush_cb` before the swap and
+once by `dri2_allocate_textures` when the drawable is revalidated afterwards,
+and on this path both copy the same resource into the same dumb BO. Suppressing
+the second halves the frame at every resolution -- 7.27 ms to 3.81 at 1080p --
+with the front buffer still reading back the colour last cleared into it.
+
+So the CPU hop is worth removing rather than making cheaper, which is the
+direction "Can the CPU leave the path?" below takes, and the redundant present
+is worth a guard before that. The fence wait, which an earlier draft feared
+would serialise frames, is 0.25-0.33 ms of queued work per present and does not
+grow with draw load; giving the surface more buffers to rotate through changes
+nothing, because the copy runs on the calling thread inside the swap. The same
+copy is pathological on at least one Intel iGPU -- WSLg issue #1498 reports
+327-359 ms per frame at 720p, with its own instrumentation blaming the first CPU
+reads of the readback allocation -- and no guard here addresses that yet.
 
 A patch is provenance, so it is recorded rather than merely applied. It is
 declared on the mesa source in `payload.spec.json`, `prepare.py` digests the
