@@ -1330,12 +1330,17 @@ the render target itself. Per present at 1080p: the CPU's own `util_copy_rect`
 was 2.90 ms, the GPU copy and its fence wait 0.68 ms, and mapping and unmapping
 the two ends 0.30 ms.
 
-The other half is that **the frame pays for that twice**. `flush_resource` is
+The other half is that **the frame paid for that twice**. `flush_resource` is
 called on the back buffer once by `notify_before_flush_cb` before the swap and
 once by `dri2_allocate_textures` when the drawable is revalidated afterwards,
-and on this path both copy the same resource into the same dumb BO. Suppressing
-the second halves the frame at every resolution -- 7.27 ms to 3.81 at 1080p --
-with the front buffer still reading back the colour last cleared into it.
+and on this path both copy the same resource into the same dumb BO. The patch
+now makes the copy idempotent instead of performing it twice: a flag says the
+displaytarget already holds what the resource holds, the copy sets it, and the
+two places every write passes through clear it -- `d3d12_batch_reference_resource`
+for a GPU write, `d3d12_transfer_map` for a CPU one. The frontend's second flush
+then finds nothing to do. This is a guard rather than a new mechanism, and its
+failure mode would be a silently dropped frame, which is why the flag is cleared
+at chokepoints rather than at the writers themselves.
 
 **Most of that copy then turned out not to be a copy.** The patch mapped the
 displaytarget around every present, and `kms_sw_displaytarget_unmap` munmaps as
@@ -1351,8 +1356,12 @@ implements that, but the D3D12 runtime a guest gets from the host's WSL package
 answers `E_NOTIMPL` to `OpenExistingHeapFromAddress`, so it is not reachable from
 userspace.
 
-With the mapping held, the redundant present is the largest item left, and it
-doubles whatever remains. The fence wait, which an earlier draft feared
+The two are independent and multiply. Together they take the frame from 3.69 ms
+at 720p, 7.78 at 1080p and 28.00 at 2160p to 0.59, 0.99 and 3.40, and what is
+left is mostly the GPU copy into the readback buffer and the fence wait on it.
+The line is still flat: at 1080p, 0.95 ms with no draw load against 1.22 ms at
+sixteen blended full-screen passes, where llvmpipe goes from 4.19 to 56.92. The
+fence wait, which an earlier draft feared
 would serialise frames, is 0.25-0.33 ms of queued work per present and does not
 grow with draw load; giving the surface more buffers to rotate through changes
 nothing, because the copy runs on the calling thread inside the swap. The same

@@ -47,10 +47,29 @@ so d3d12's flat line is now lower, but it is still flat and llvmpipe's is not.
 The two cross at about two passes, which a desktop exceeds before it has drawn a
 window.
 
-A frame pays for the hop twice: the frontend calls `flush_resource` on the back
-buffer both before the swap and again when the drawable is revalidated after it,
-and on this path both copies have the same source and the same destination. That
-is not addressed here.
+A frame reaches `flush_resource` twice -- once before the swap from
+`notify_before_flush_cb`, and again from `dri2_allocate_textures` when the
+drawable is revalidated after it -- and on this path both calls have the same
+source and the same destination, with nothing drawn in between. So the copy is
+made idempotent rather than performed twice. `dt_presented` says the
+displaytarget already holds what the resource holds: the copy sets it, and
+everything that writes the resource clears it. There are two such places, and
+between them they are every writer. A GPU write is recorded by
+`d3d12_batch_reference_resource`, which draws reach through their render targets,
+images and streamout buffers and which blits, copies, clears and query writeback
+call directly. A CPU write goes through `d3d12_transfer_map`, the one function
+behind both `buffer_map` and `texture_map`; a texture cannot take the direct
+mapping that would bypass the staging copy, because `can_map_directly` admits
+buffers alone. `d3d12_flush_resource` reads the flag before its own batch
+reference, which is a write and would otherwise clear it on every call.
+
+Measured on an RTX 5070 Ti through GPU-PV, two Mesa trees differing only in this
+and driven by the same probe over 100 frames with no draw load: 1.109/1.854/6.754
+ms per frame at 720p/1080p/2160p without the flag and 0.586/0.994/3.399 with it,
+1.89x/1.87x/1.99x. The probe's 103 swaps produced 205 presents before and 103
+after -- one per swap. It ends by clearing to two colours in turn and reading
+each back through `gbm_bo_map`, so a tree that got faster by not presenting fails
+rather than scores; both trees pass.
 
 The GPU copy into a `D3D12_HEAP_TYPE_READBACK` staging buffer and the fence wait
 on it are what is left, 0.68 ms per present at 1080p. Aiming the GPU copy at the
@@ -65,9 +84,28 @@ On at least one Intel iGPU this hop is pathological -- WSLg issue #1498 reports
 327-359 ms per frame at 720p -- so a host that is not known good deserves a
 measurement before this path is trusted.
 
-Refs: #180, #188, #189
+Refs: #180, #188, #189, #190
+diff --git a/src/gallium/drivers/d3d12/d3d12_batch.cpp b/src/gallium/drivers/d3d12/d3d12_batch.cpp
+index 61755a3..6588597 100644
+--- a/src/gallium/drivers/d3d12/d3d12_batch.cpp
++++ b/src/gallium/drivers/d3d12/d3d12_batch.cpp
+@@ -484,6 +484,14 @@ d3d12_batch_reference_resource(struct d3d12_batch *batch,
+    uint8_t new_data = write ? batch_bo_reference_written : batch_bo_reference_read;
+    uint8_t old_data = (uint8_t)*state;
+    *state = (old_data | new_data);
++
++   /* Every GPU write to a resource is recorded here -- draws through their
++    * render targets, images and streamout buffers, blits, copies, clears and
++    * query writeback all reach this one function -- so this is where a scanout
++    * resource's displaytarget stops matching it. See d3d12_flush_resource.
++    */
++   if (write)
++      res->dt_presented = false;
+ }
+ 
+ void
 diff --git a/src/gallium/drivers/d3d12/d3d12_context_common.cpp b/src/gallium/drivers/d3d12/d3d12_context_common.cpp
-index 73e2d5d..428d85d 100644
+index 73e2d5d..5427b46 100644
 --- a/src/gallium/drivers/d3d12/d3d12_context_common.cpp
 +++ b/src/gallium/drivers/d3d12/d3d12_context_common.cpp
 @@ -58,6 +58,9 @@
@@ -80,7 +118,7 @@ index 73e2d5d..428d85d 100644
  #include "util/u_dl.h"
  #include <dxguids/dxguids.h>
  #include <string.h>
-@@ -210,6 +213,51 @@ d3d12_flush(struct pipe_context *pipe,
+@@ -210,6 +213,52 @@ d3d12_flush(struct pipe_context *pipe,
     }
  }
  
@@ -126,24 +164,43 @@ index 73e2d5d..428d85d 100644
 +                     transfer->box.width, transfer->box.height,
 +                     (const uint8_t *)res_map, transfer->stride, 0, 0);
 +      pipe_texture_unmap(pctx, transfer);
++      res->dt_presented = true;
 +   }
 +}
 +
  static void
  d3d12_flush_resource(struct pipe_context *pctx,
                       struct pipe_resource *pres)
-@@ -223,6 +271,9 @@ d3d12_flush_resource(struct pipe_context *pctx,
+@@ -217,12 +266,27 @@ d3d12_flush_resource(struct pipe_context *pctx,
+    struct d3d12_context *ctx = d3d12_context(pctx);
+    struct d3d12_resource *res = d3d12_resource(pres);
+ 
++   /* Read before the batch reference below, which is itself a write and would
++    * otherwise clear the flag this is asking about on every call.
++    *
++    * The frontend flushes a back buffer twice per frame -- once before the swap
++    * from notify_before_flush_cb, and again from dri2_allocate_textures when the
++    * drawable is revalidated afterwards -- and nothing is drawn in between. The
++    * displaytarget already holds what the resource holds, so the second copy
++    * writes the same bytes to the same dumb BO. Skipping it halves the frame.
++    */
++   bool present = res->dt && (pres->bind & PIPE_BIND_SCANOUT) &&
++                  !res->dt_presented;
++
+    d3d12_transition_resource_state(ctx, res,
+                                    D3D12_RESOURCE_STATE_COMMON,
+                                    D3D12_TRANSITION_FLAG_INVALIDATE_BINDINGS);
     d3d12_apply_resource_states(ctx, false);
     d3d12_batch_reference_resource(d3d12_current_batch(ctx), res, true);
     ctx->has_commands = true;
 +
-+   if (res->dt && (pres->bind & PIPE_BIND_SCANOUT))
++   if (present)
 +      d3d12_present_to_displaytarget(pctx, res);
  }
  
  static void
 diff --git a/src/gallium/drivers/d3d12/d3d12_resource.cpp b/src/gallium/drivers/d3d12/d3d12_resource.cpp
-index 5a96e44..cfc28b8 100644
+index 5a96e44..4f6dedb 100644
 --- a/src/gallium/drivers/d3d12/d3d12_resource.cpp
 +++ b/src/gallium/drivers/d3d12/d3d12_resource.cpp
 @@ -78,6 +78,16 @@ d3d12_resource_destroy(struct pipe_screen *pscreen,
@@ -275,17 +332,35 @@ index 5a96e44..cfc28b8 100644
     pipe_resource *planes[d3d12_max_planes];
     unsigned int strides[d3d12_max_planes];
     unsigned int layer_strides[d3d12_max_planes];
+@@ -1799,6 +1872,14 @@ d3d12_transfer_map(struct pipe_context *pctx,
+    if (usage & PIPE_MAP_DIRECTLY || !res->bo)
+       return NULL;
+ 
++   /* The other half of what d3d12_batch_reference_resource invalidates: this is
++    * the single entry point for every CPU write, since pipe_context::buffer_map
++    * and ::texture_map are both this function. Conservative on purpose -- the
++    * flag is dropped for a mapping that is never written through.
++    */
++   if (usage & PIPE_MAP_WRITE)
++      res->dt_presented = false;
++
+    slab_child_pool* transfer_pool = NULL;
+    struct d3d12_transfer *trans;
+    if (usage & PIPE_MAP_THREAD_SAFE) {
 diff --git a/src/gallium/drivers/d3d12/d3d12_resource.h b/src/gallium/drivers/d3d12/d3d12_resource.h
-index fc679ff..27c9f1f 100644
+index fc679ff..968183f 100644
 --- a/src/gallium/drivers/d3d12/d3d12_resource.h
 +++ b/src/gallium/drivers/d3d12/d3d12_resource.h
-@@ -53,6 +53,9 @@ struct d3d12_resource {
+@@ -53,6 +53,12 @@ struct d3d12_resource {
     unsigned dt_refcount; /* For planar resources sharing the dt pointer */
     unsigned dt_stride;
     struct pipe_resource *dt_proxy;
 +   /* Held across presents rather than taken per present; see
 +    * d3d12_present_to_displaytarget. NULL until the first present. */
 +   void *dt_map;
++   /* Whether dt already holds this resource's contents. False until the first
++    * present and again after every write; see d3d12_flush_resource. */
++   bool dt_presented;
  
     struct util_range valid_buffer_range;
     uint32_t bind_counts[MESA_SHADER_STAGES][D3D12_RESOURCE_BINDING_TYPES];
