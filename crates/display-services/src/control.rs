@@ -109,6 +109,14 @@ pub fn support_from(width: u32, height: u32) -> Support {
             // is the one that replaces it. Announced here so that a host on an
             // older protocol revision never sends a record this cannot apply.
             Capability::HostDisplayModes,
+            // The tray of the graphical session can read the active Xcursor
+            // theme, which nothing privileged can; when it hands over a
+            // table, the session is the one that puts it on the frame
+            // channel. Announced by the build for the same reason the
+            // daemons above are: what is announced is what this build
+            // ships, and a session opened before anyone logged in still
+            // wants a table once the tray finds one.
+            Capability::CursorHotspots,
         ],
         // Motion is not a mode this build has. Announcing it and then encoding
         // a desktop would be worse than refusing it.
@@ -250,6 +258,13 @@ impl Control {
                 height: self.height,
                 tile_size: self.tile_size,
                 cursor_stream,
+                // A table rides behind the cursor stream: bitmaps to match
+                // against are worth nothing to a session whose cursor is
+                // drawn into the frame.
+                cursor_hotspots: cursor_stream
+                    && negotiated
+                        .capabilities
+                        .contains(&Capability::CursorHotspots),
             },
             DaemonKeys {
                 clipboard: clipboard.to_bytes().to_vec(),

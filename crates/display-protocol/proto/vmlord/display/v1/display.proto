@@ -56,6 +56,11 @@ enum Capability {
   // commonly opens at the login screen, and a capability cannot be
   // renegotiated once the handshake has settled it.
   CAPABILITY_AUDIO = 6;
+  // The guest ships its cursor hotspots as a bitmap-to-hotspot table parsed
+  // out of the active Xcursor theme, so the host need not measure them.
+  // Announced by the build, like the daemons above: the table arrives from
+  // the guest's tray whenever it can read one.
+  CAPABILITY_CURSOR_HOTSPOTS = 7;
 }
 
 // How the encoder trades bandwidth against fidelity.
@@ -126,6 +131,8 @@ enum FrameRecord {
   FRAME_RECORD_CURSOR_IMAGE = 7;
   FRAME_RECORD_CURSOR_POSITION = 8;
   FRAME_RECORD_ERROR = 9;
+  // A part of the guest's cursor-hotspot table. Carries a `CursorHotspots`.
+  FRAME_RECORD_CURSOR_HOTSPOTS = 10;
 }
 
 // The `type` field of a record header on the input channel.
@@ -311,6 +318,32 @@ message StreamConfig {
   uint32 height = 2;
   uint32 tile_size = 3;
   PixelFormat pixel_format = 4;
+}
+
+// One bitmap of the guest's cursor theme and where within it the pointer
+// points.
+message HotspotEntry {
+  // Straight alpha, one byte per channel in the order B, G, R, A -- byte for
+  // byte what the cursor plane carries and what a cursor image record does.
+  // Tightly packed rows, `width * height * 4` long.
+  bytes pixels = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  // Where the pointer points, from the bitmap's left and top edges. Always
+  // inside the bitmap.
+  uint32 hotspot_x = 4;
+  uint32 hotspot_y = 5;
+}
+
+// A part of the guest's cursor-hotspot table.
+//
+// The whole table rarely fits in one record, so it is sent in order as
+// several of these, `last_part` set only on the last of them. A receiver
+// concatenates the parts and swaps its table in when one arrives with
+// `last_part` set.
+message CursorHotspots {
+  repeated HotspotEntry entries = 1;
+  bool last_part = 2;
 }
 
 message SetMode {

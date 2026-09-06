@@ -30,7 +30,7 @@ use ksni::{
 };
 use vmlord_display_protocol::v1::{DisplayTiming, GuestCommandKind};
 
-use crate::{ipc::Message, systemd, tray_icon, unix::Connection};
+use crate::{cursor_theme, ipc::Message, systemd, tray_icon, unix::Connection};
 
 /// Where the broker offers the tray socket.
 const BROKER_SOCKET: &str = "/run/vmlord/display-tray.sock";
@@ -338,6 +338,11 @@ fn serve(commands: &Receiver<Command>, handle: &Handle<GuestTray>, socket: &Path
         // The reconnects this rides on are when a payload applied mid-session
         // has had the chance to install what the first try missed.
         ensure_appindicator_extension();
+        // And the one thing this unit reads off the guest's disk: the
+        // active cursor theme, whose hotspots the host needs and nothing
+        // privileged can reach. Sent at every connect, because a session
+        // process the broker has replaced holds no table.
+        send_cursor_hotspots(&connection);
         let mut live = connection
             .send(&Message::DisplayModesRequested, &[])
             .is_ok();
@@ -410,6 +415,65 @@ fn restart_clipboard(connection: &Connection) {
         eprintln!("vmlord-display-tray: {reason}");
         let _ = connection.send(&Message::Report { detail: reason }, &[]);
     }
+}
+
+/// Reads the active Xcursor theme and hands the broker its
+/// bitmap-to-hotspot table, chunked so that no datagram grows large.
+///
+/// The capture process cannot read the theme -- it is a system unit with
+/// `ProtectHome=yes` -- and the host cannot see the guest's disk at all, so
+/// this process is the one place the hotspots are reachable. Every refusal
+/// along the way is an honest nothing rather than a guess: a theme name
+/// that cannot be determined, and a walk that yields no cursor, each send
+/// nothing, and the host goes on measuring hotspots as it always has.
+///
+/// Never a pixel of the table is logged; what the journal gets is counts.
+fn send_cursor_hotspots(connection: &Connection) {
+    let Some(theme) = cursor_theme::active_theme() else {
+        eprintln!(
+            "vmlord-display-tray: no cursor theme could be determined, so no hotspot table is sent"
+        );
+
+        return;
+    };
+    let collection = cursor_theme::theme_table(&theme);
+    if collection.unreadable > 0 {
+        eprintln!(
+            "vmlord-display-tray: {} cursor files of theme {theme} could not be read",
+            collection.unreadable
+        );
+    }
+    if collection.entries.is_empty() {
+        eprintln!(
+            "vmlord-display-tray: the theme {theme} holds no cursor hotspots, so none are sent"
+        );
+
+        return;
+    }
+    if collection.dropped > 0 {
+        eprintln!(
+            "vmlord-display-tray: {} of theme {theme}'s largest cursors are dropped to hold the table at a sendable size",
+            collection.dropped
+        );
+    }
+
+    let chunks = cursor_theme::chunk_entries(&collection.entries);
+    for (index, chunk) in chunks.iter().enumerate() {
+        let message = Message::CursorHotspots {
+            entries: chunk.clone(),
+            first_part: index == 0,
+            last_part: index + 1 == chunks.len(),
+        };
+        if connection.send(&message, &[]).is_err() {
+            eprintln!("vmlord-display-tray: the cursor-hotspot table could not be sent");
+
+            return;
+        }
+    }
+    eprintln!(
+        "vmlord-display-tray: sent {} cursor hotspots from theme {theme}",
+        collection.entries.len()
+    );
 }
 
 /// Gets this session a tray host, where it has not got one already.

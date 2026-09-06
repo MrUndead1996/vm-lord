@@ -14,7 +14,7 @@ use std::{error::Error, fmt};
 use crate::v1::{Capability, ProtocolVersion};
 
 /// The revision of the schema this build implements.
-pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 4 };
+pub const CURRENT_VERSION: ProtocolVersion = ProtocolVersion { major: 1, minor: 5 };
 
 impl ProtocolVersion {
     /// The revision this build implements.
@@ -99,6 +99,9 @@ pub fn capabilities_at(
     }
     if version.major != 1 || version.minor < 4 {
         capabilities.retain(|capability| *capability != Capability::HostDisplayModes);
+    }
+    if version.major != 1 || version.minor < 5 {
+        capabilities.retain(|capability| *capability != Capability::CursorHotspots);
     }
     capabilities
 }
@@ -257,6 +260,17 @@ mod tests {
             ),
             vec![Capability::Clipboard, Capability::FileClipboard]
         );
+    }
+
+    #[test]
+    fn cursor_hotspots_do_not_exist_at_protocol_one_four() {
+        let both = vec![Capability::HostDisplayModes, Capability::CursorHotspots];
+
+        assert_eq!(
+            capabilities_at(version(1, 4), both.clone()),
+            vec![Capability::HostDisplayModes]
+        );
+        assert_eq!(capabilities_at(version(1, 5), both.clone()), both);
     }
 
     #[test]

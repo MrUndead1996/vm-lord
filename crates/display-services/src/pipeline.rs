@@ -19,12 +19,13 @@ use vmlord_display_codec::{
 };
 use vmlord_display_protocol::{
     record::{self, Channel, Header, Limits, RecordError},
-    v1::{self, FrameRecord, StreamConfig},
+    v1::{self, CursorHotspots, FrameRecord, StreamConfig},
 };
 
 use crate::{
     capture::CapturedFrame,
     cursor::{self, Placement},
+    cursor_theme::{HotspotEntry, chunk_budget, chunk_entries_within},
 };
 
 /// What went wrong between a captured frame and a written record.
@@ -243,13 +244,14 @@ impl Pipeline {
                     pixels,
                     width,
                     height,
-                    // Zeros because nothing here knows better: task #114's
-                    // module does not set DRIVER_CURSOR_HOTSPOT, so the plane
-                    // carries no hotspot to read, and mutter has already
-                    // subtracted it -- the position below is the bitmap's
-                    // corner, not the pointer. The one end that can work the
-                    // hotspot out is the host, which is what moves the
-                    // pointer; #170 does it there.
+                    // Zeros, and still by design: task #114's module does
+                    // not set DRIVER_CURSOR_HOTSPOT, so the plane carries
+                    // no hotspot to read, and mutter has already subtracted
+                    // it -- the position below is the bitmap's corner, not
+                    // the pointer. What the host is sent besides these
+                    // records is the Xcursor theme's own bitmap-to-hotspot
+                    // table (see `cursor_theme`), and matching a cursor
+                    // bitmap against it is how #170 anchors the pointer.
                     hotspot_x: 0,
                     hotspot_y: 0,
                 })?;
@@ -330,6 +332,58 @@ impl Pipeline {
             &config.encode_to_vec(),
         )?;
         self.sequence = self.sequence.wrapping_add(1);
+
+        Ok(())
+    }
+
+    /// Writes a cursor-hotspot table, split into the records one table is.
+    ///
+    /// A table is sent whole and in order, `last_part` set only on its last
+    /// record, so the peer can swap its copy in atomically; an empty table
+    /// writes nothing, because a table of no entries has nothing to say.
+    /// Called when a socket is bound and again when a newer table arrives
+    /// mid-session -- whichever the peer holds, the newest table is what it
+    /// ends up with.
+    ///
+    /// # Errors
+    ///
+    /// [`PipelineError::Record`] if a record cannot be framed or written.
+    pub fn write_cursor_hotspots<W: Write>(
+        &mut self,
+        writer: &mut W,
+        entries: &[HotspotEntry],
+        limits: &Limits,
+    ) -> Result<(), PipelineError> {
+        // A chunk is one record, so the frame channel's own cap for this
+        // session bounds it before the ordinary budget does.
+        let budget = (limits.for_channel(Channel::Frame) as usize).min(chunk_budget());
+        let chunks = chunk_entries_within(entries, budget);
+        for (index, chunk) in chunks.iter().enumerate() {
+            let message = CursorHotspots {
+                entries: chunk
+                    .iter()
+                    .map(|entry| v1::HotspotEntry {
+                        pixels: entry.pixels.clone(),
+                        width: entry.width,
+                        height: entry.height,
+                        hotspot_x: entry.hotspot_x,
+                        hotspot_y: entry.hotspot_y,
+                    })
+                    .collect(),
+                last_part: index + 1 == chunks.len(),
+            };
+
+            write_record(
+                writer,
+                limits,
+                self.generation,
+                self.sequence,
+                FrameRecord::CursorHotspots,
+                0,
+                &message.encode_to_vec(),
+            )?;
+            self.sequence = self.sequence.wrapping_add(1);
+        }
 
         Ok(())
     }
@@ -527,6 +581,76 @@ mod tests {
         let header = record::read(&mut reader, &limits, &mut payload).unwrap();
         assert_eq!(header.generation, 7);
         assert_eq!(header.channel, Channel::Frame);
+    }
+
+    #[test]
+    fn a_hotspot_table_arrives_as_ordered_parts_with_the_last_marked() {
+        use crate::cursor_theme::HotspotEntry;
+        use prost::Message as _;
+        use vmlord_display_protocol::v1::CursorHotspots;
+
+        let limits = Limits::new(64, 64);
+        let mut pipeline = Pipeline::new(geometry(), 1, true);
+        let entries: Vec<_> = (0..30)
+            .map(|index| HotspotEntry {
+                pixels: vec![index as u8; 64 * 64 * 4],
+                width: 64,
+                height: 64,
+                hotspot_x: 0,
+                hotspot_y: 0,
+            })
+            .collect();
+        let mut bytes = Vec::new();
+        pipeline
+            .write_cursor_hotspots(&mut bytes, &entries, &limits)
+            .unwrap();
+
+        let mut reader = bytes.as_slice();
+        let mut payload = Vec::new();
+        let mut parts = Vec::new();
+        let mut sequences = Vec::new();
+        while !reader.is_empty() {
+            let header = record::read(&mut reader, &limits, &mut payload).unwrap();
+            assert_eq!(header.message_type, FrameRecord::CursorHotspots as u16);
+            parts.push(CursorHotspots::decode(payload.as_slice()).unwrap());
+            sequences.push(header.sequence);
+        }
+
+        assert!(parts.len() > 1, "thirty entries do not fit one record");
+        assert!(!parts.iter().any(|part| part.entries.is_empty()));
+        let reassembled: Vec<Vec<u8>> = parts
+            .iter()
+            .flat_map(|part| part.entries.iter().map(|entry| entry.pixels.clone()))
+            .collect();
+        let expected: Vec<Vec<u8>> = entries.iter().map(|entry| entry.pixels.clone()).collect();
+        assert_eq!(
+            reassembled, expected,
+            "chunking loses nothing and reorders nothing"
+        );
+        assert!(
+            !parts
+                .iter()
+                .take(parts.len() - 1)
+                .any(|part| part.last_part)
+                && parts.last().unwrap().last_part,
+            "only the final part ends the table"
+        );
+        assert!(
+            sequences.windows(2).all(|pair| pair[1] == pair[0] + 1),
+            "the table's records number themselves like any other"
+        );
+    }
+
+    #[test]
+    fn an_empty_hotspot_table_writes_nothing() {
+        let limits = Limits::new(64, 64);
+        let mut pipeline = Pipeline::new(geometry(), 1, true);
+        let mut bytes = Vec::new();
+        pipeline
+            .write_cursor_hotspots(&mut bytes, &[], &limits)
+            .unwrap();
+
+        assert!(bytes.is_empty());
     }
 
     #[test]

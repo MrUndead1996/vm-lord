@@ -9,8 +9,10 @@
 //! protocol's coordinates being unsigned.
 //!
 //! Compositing wants a corner and gets one. A viewer that draws the cursor
-//! itself wants the hotspot, and nothing in this guest has it; the host works
-//! it out from the pointer positions it sent -- see the viewer's `cursor.rs`.
+//! itself wants the hotspot: the tray reads it off the Xcursor theme and
+//! sends it as a table -- see `cursor_theme.rs` -- and the host measures
+//! whatever the table does not name, from the pointer positions it sent --
+//! see the viewer's `cursor.rs`.
 
 use vmlord_display_codec::Rect;
 

@@ -18,6 +18,7 @@ pub mod clipboard_main;
 pub mod clipboard_pipe;
 pub mod control;
 pub mod cursor;
+pub mod cursor_theme;
 pub mod data_control;
 pub mod drm;
 pub mod guest_clipboard;

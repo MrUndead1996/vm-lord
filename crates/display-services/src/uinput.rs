@@ -301,10 +301,11 @@ impl<W: Write> Pointer<W> {
 ///
 /// [`OFFSET`] is a little short of the middle rather than the middle itself,
 /// because the pointer's position is also what the compositor places the
-/// cursor plane by, and the viewer measures the cursor's hotspot from that
-/// plane -- see the viewer's `cursor.rs`. A pointer sitting on exactly half a
-/// pixel is a plane position a compositor may round either way, and the
-/// measurement would come back a pixel short as often as not.
+/// cursor plane by, and the viewer still measures, from that plane, the
+/// hotspots no theme table names -- see the viewer's `cursor.rs`. A pointer
+/// sitting on exactly half a pixel is a plane position a compositor may round
+/// either way, and the measurement would come back a pixel short as often as
+/// not.
 fn scale(value: u32, size: u32) -> i32 {
     let size = u64::from(size.max(1));
     let value = u64::from(value).min(size - 1);
@@ -624,8 +625,8 @@ mod tests {
     #[test]
     fn the_pointer_sits_short_of_the_middle_of_its_pixel() {
         // What the cursor plane is placed by, and so what the viewer measures
-        // a hotspot from: a position on exactly half a pixel is one a
-        // compositor may round either way.
+        // a hotspot from when no theme table names it: a position on exactly
+        // half a pixel is one a compositor may round either way.
         for size in [640, 1280, 1920, 2560] {
             for pixel in [0, 1, size / 2, size - 2, size - 1] {
                 let thousandths = i64::from(scale(pixel, size)) * i64::from(size) * 1000

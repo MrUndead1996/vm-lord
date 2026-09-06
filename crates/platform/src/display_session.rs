@@ -123,6 +123,11 @@ impl Driver {
                 // capability only the guest announces is one the session does
                 // not have.
                 Capability::HostDisplayModes,
+                // The guest's tray can read its active Xcursor theme and
+                // send the host every cursor's hotspot in it. Taken when
+                // offered, and left alone when not: a guest without it
+                // keeps the host measuring hotspots from pointer motion.
+                Capability::CursorHotspots,
             ],
             // A host-side policy that resolves to `Desktop` until a motion
             // codec exists. The guest is what resolves it.

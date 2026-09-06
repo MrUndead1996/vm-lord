@@ -14,11 +14,12 @@
 
 use prost::Message as _;
 use vmlord_display_codec::{
-    CodecError, CursorPosition, Decoder, Geometry, OwnedCursorImage, PixelFormat, Rect, TileSize,
+    CodecError, CursorPosition, Decoder, Geometry, MAX_CURSOR_DIMENSION, OwnedCursorImage,
+    PixelFormat, Rect, TileSize,
 };
 use vmlord_display_protocol::{
     record::Header,
-    v1::{FrameRecord, PixelFormat as WireFormat, StreamConfig},
+    v1::{self, CursorHotspots, FrameRecord, PixelFormat as WireFormat, StreamConfig},
 };
 
 /// What one frame record meant.
@@ -34,6 +35,11 @@ pub enum Update {
     Cursor(OwnedCursorImage),
     /// Where the cursor is now.
     Moved(CursorPosition),
+    /// The guest's cursor-hotspot table, parsed out of its Xcursor theme.
+    ///
+    /// Arrives only whole: the parts of one table are accumulated until a
+    /// record ends it, and the table is then handed up in one piece.
+    CursorHotspots(Vec<OwnedCursorImage>),
 }
 
 /// Why a frame record could not be applied.
@@ -51,6 +57,13 @@ pub struct Video {
     /// The sequence of the last frame record applied, which is what a delta's
     /// base must name.
     last_frame: Option<u32>,
+    /// The parts of a cursor-hotspot table received so far.
+    ///
+    /// Held until a part arrives with `last_part` set, which is when the
+    /// table is whole and handed up. A rebuilt channel starts from a new
+    /// `Video`, so a table split across a rebind is dropped rather than
+    /// misassembled -- and the guest owes the new socket the table again.
+    hotspot_parts: Vec<OwnedCursorImage>,
 }
 
 impl Video {
@@ -60,6 +73,7 @@ impl Video {
         Self {
             decoder: None,
             last_frame: None,
+            hotspot_parts: Vec::new(),
         }
     }
 
@@ -94,6 +108,7 @@ impl Video {
             Ok(FrameRecord::CursorPosition) => Decoder::decode_cursor_position(payload)
                 .map(Update::Moved)
                 .map_err(|error| Self::rebind("a cursor position", error)),
+            Ok(FrameRecord::CursorHotspots) => self.cursor_hotspots(payload),
             _ => {
                 tracing::debug!(
                     "a frame record of type {} is one this build does not read",
@@ -179,6 +194,34 @@ impl Video {
         Ok(Update::Damage(damage))
     }
 
+    /// Extends the accumulating hotspot table with one part, and hands the
+    /// table up once a part ends it.
+    ///
+    /// A table that never ends -- its last record lost with a socket that
+    /// died -- stays unfinished until the rebind clears it, and the guest
+    /// owes the replacement socket the whole table again.
+    fn cursor_hotspots(&mut self, payload: &[u8]) -> Result<Update, VideoError> {
+        let message = CursorHotspots::decode(payload).map_err(|error| {
+            VideoError::Rebind(format!("a cursor-hotspot record is unreadable: {error}"))
+        })?;
+        for entry in message.entries {
+            match hotspot_entry(entry) {
+                Some(image) => self.hotspot_parts.push(image),
+                // An entry this build would not anchor is dropped, not
+                // fatal: the rest of the table still anchors its shapes.
+                None => tracing::debug!("a cursor-hotspot entry this build does not anchor"),
+            }
+        }
+
+        if message.last_part {
+            return Ok(Update::CursorHotspots(std::mem::take(
+                &mut self.hotspot_parts,
+            )));
+        }
+
+        Ok(Update::Nothing)
+    }
+
     /// A frame record that arrived before the stream it belongs to.
     fn no_stream() -> VideoError {
         VideoError::Rebind("a frame record arrived before any stream config".to_owned())
@@ -194,6 +237,34 @@ impl Default for Video {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// One entry of a hotspot table, as the codec holds a cursor.
+///
+/// The same rules a cursor image record is held to: a bitmap of the size it
+/// names, within the codec's dimension cap, and a hotspot inside it. An
+/// entry outside them is `None`, and nothing upstream sends one on purpose.
+fn hotspot_entry(entry: v1::HotspotEntry) -> Option<OwnedCursorImage> {
+    let (width, height) = (entry.width, entry.height);
+    let expected = width.checked_mul(height)?.checked_mul(4)?;
+    if width == 0
+        || height == 0
+        || width > MAX_CURSOR_DIMENSION
+        || height > MAX_CURSOR_DIMENSION
+        || entry.pixels.len() != expected as usize
+        || entry.hotspot_x >= width
+        || entry.hotspot_y >= height
+    {
+        return None;
+    }
+
+    Some(OwnedCursorImage {
+        pixels: entry.pixels,
+        width,
+        height,
+        hotspot_x: entry.hotspot_x,
+        hotspot_y: entry.hotspot_y,
+    })
 }
 
 /// A cursor bitmap as an alpha icon wants it: BGRA, premultiplied.
@@ -225,12 +296,13 @@ pub fn premultiplied(image: &OwnedCursorImage) -> Vec<u8> {
 mod tests {
     use prost::Message as _;
     use vmlord_display_codec::{
-        Encoder, EncoderConfig, Frame, Geometry, Payload, PixelFormat, Rect, TileSize,
+        Encoder, EncoderConfig, Frame, Geometry, OwnedCursorImage, Payload, PixelFormat, Rect,
+        TileSize,
         scenes::{Generator, Scene},
     };
     use vmlord_display_protocol::{
         record::{Channel, Record},
-        v1::{FrameRecord, PixelFormat as WireFormat, StreamConfig},
+        v1::{CursorHotspots, FrameRecord, HotspotEntry, PixelFormat as WireFormat, StreamConfig},
     };
 
     use super::{Update, Video, VideoError};
@@ -524,8 +596,6 @@ mod tests {
 
     #[test]
     fn a_cursor_bitmap_is_premultiplied_without_reading_past_its_rows() {
-        use vmlord_display_codec::OwnedCursorImage;
-
         let image = OwnedCursorImage {
             // Two pixels: opaque white, then half-transparent white.
             pixels: vec![255, 255, 255, 255, 255, 255, 255, 128],
@@ -545,8 +615,6 @@ mod tests {
 
     #[test]
     fn a_cursor_bitmap_whose_pixels_do_not_match_its_size_is_padded_rather_than_read_past() {
-        use vmlord_display_codec::OwnedCursorImage;
-
         let image = OwnedCursorImage {
             pixels: vec![255; 4],
             width: 4,
@@ -556,5 +624,114 @@ mod tests {
         };
 
         assert_eq!(super::premultiplied(&image).len(), 4 * 4 * 4);
+    }
+
+    /// A cursor-hotspot record carrying the entries named by
+    /// `(width, height, hotspot_x, hotspot_y)`.
+    fn hotspots_record(entries: Vec<HotspotEntry>, last_part: bool) -> Record {
+        Record::new(
+            Channel::Frame,
+            FrameRecord::CursorHotspots as u16,
+            0,
+            0,
+            0,
+            CursorHotspots { entries, last_part }.encode_to_vec(),
+        )
+    }
+
+    fn proto_entry(width: u32, height: u32, hotspot_x: u32, hotspot_y: u32) -> HotspotEntry {
+        HotspotEntry {
+            pixels: vec![0xaa; (width * height * 4) as usize],
+            width,
+            height,
+            hotspot_x,
+            hotspot_y,
+        }
+    }
+
+    fn owned_image(width: u32, height: u32, hotspot_x: u32, hotspot_y: u32) -> OwnedCursorImage {
+        OwnedCursorImage {
+            pixels: vec![0xaa; (width * height * 4) as usize],
+            width,
+            height,
+            hotspot_x,
+            hotspot_y,
+        }
+    }
+
+    #[test]
+    fn a_hotspot_table_is_handed_up_only_once_it_is_whole() {
+        let mut video = Video::new();
+
+        let first = hotspots_record(vec![proto_entry(8, 8, 1, 1)], false);
+        assert_eq!(
+            video
+                .apply(&first.header, &first.payload)
+                .expect("a part of a table"),
+            Update::Nothing,
+            "a table without its last part is held, not shown"
+        );
+
+        let last = hotspots_record(vec![proto_entry(16, 16, 2, 2)], true);
+        assert_eq!(
+            video
+                .apply(&last.header, &last.payload)
+                .expect("the end of a table"),
+            Update::CursorHotspots(vec![owned_image(8, 8, 1, 1), owned_image(16, 16, 2, 2)])
+        );
+    }
+
+    #[test]
+    fn an_unanchorable_hotspot_entry_is_dropped_and_the_rest_is_kept() {
+        let mut video = Video::new();
+
+        // The second entry's hotspot sits on its far edge, where no cursor
+        // could be anchored; the codec would refuse it, so it is dropped
+        // here rather than poisoning the table.
+        let record = hotspots_record(
+            vec![
+                proto_entry(8, 8, 0, 0),
+                proto_entry(8, 8, 8, 4),
+                proto_entry(8, 8, 4, 0),
+            ],
+            true,
+        );
+
+        assert_eq!(
+            video
+                .apply(&record.header, &record.payload)
+                .expect("a table"),
+            Update::CursorHotspots(vec![owned_image(8, 8, 0, 0), owned_image(8, 8, 4, 0)])
+        );
+    }
+
+    #[test]
+    fn an_unreadable_hotspot_record_asks_for_a_rebind_rather_than_a_crash() {
+        let mut video = Video::new();
+        let record = hotspots_record(Vec::new(), true);
+        let truncated = &record.payload[..record.payload.len() / 2];
+
+        assert!(matches!(
+            video.apply(&record.header, truncated),
+            Err(VideoError::Rebind(_))
+        ));
+    }
+
+    #[test]
+    fn a_new_video_holds_no_half_received_table() {
+        // A rebound channel starts from a new `Video`; the guest owes the
+        // replacement socket the whole table again, so what the old one
+        // half-delivered must not be mistaken for a table.
+        let mut video = Video::new();
+        let first = hotspots_record(vec![proto_entry(8, 8, 1, 1)], false);
+        video.apply(&first.header, &first.payload).expect("a part");
+
+        let mut fresh = Video::new();
+        let last = hotspots_record(vec![proto_entry(16, 16, 2, 2)], true);
+        assert_eq!(
+            fresh.apply(&last.header, &last.payload).expect("a table"),
+            Update::CursorHotspots(vec![owned_image(16, 16, 2, 2)])
+        );
+        let _ = video;
     }
 }
