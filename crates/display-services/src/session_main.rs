@@ -33,6 +33,7 @@ use crate::{
     capture::{Backing, CapturedFrame, MappedBuffer},
     channel::{self, BindError},
     cursor::{self, Placement},
+    cursor_theme::HotspotEntry,
     drm::uapi::DRM_FORMAT_ARGB8888,
     ipc::{Message, PlaneKind, PlaneLayout, SessionParameters},
     pipeline::{Pipeline, PipelineError},
@@ -166,6 +167,18 @@ pub struct Loop<F: Acceptor, I: Acceptor> {
     /// every vblank would put a record on the wire for a pointer that has not
     /// moved, which is bandwidth spent to say nothing.
     cursor: Option<Placement>,
+    /// The last complete cursor-hotspot table the broker relayed.
+    ///
+    /// Guest state rather than session state: the theme does not change
+    /// because a viewer reconnected, so the table outlives a frame channel
+    /// -- which is owed it again at its next bind -- and a session, whose
+    /// replacement viewer is looking at the same desktop.
+    hotspot_table: Option<Vec<HotspotEntry>>,
+    /// The table now being reassembled from the broker's chunks.
+    ///
+    /// A chunk that begins a table replaces whatever was half-received
+    /// before it; only a completed table moves to `hotspot_table`.
+    hotspot_parts: Option<Vec<HotspotEntry>>,
     /// The guest's keyboard, once the broker has handed it over. `None` on a
     /// guest whose kernel has no uinput, where input is read and dropped.
     keyboard: Option<Keyboard<File>>,
@@ -190,6 +203,8 @@ impl<F: Acceptor, I: Acceptor> Loop<F, I> {
             asked_for_frame: false,
             input_records: 0,
             cursor: None,
+            hotspot_table: None,
+            hotspot_parts: None,
             keyboard: None,
             pointer: None,
             limits: Limits::new(0, 0),
@@ -267,9 +282,17 @@ impl<F: Acceptor, I: Acceptor> Loop<F, I> {
             let mut pipeline = Pipeline::new(geometry, generation, parameters.cursor_stream);
             let mut tail = Vec::new();
             pipeline.write_stream_config(&mut tail, &self.limits)?;
-            // A decoder that has just been built has nothing to apply a delta
-            // to, so the first frame on any socket is a whole one.
+            // A decoder that has just been built has nothing to apply a
+            // delta to, so the first frame on any socket is a whole one.
             pipeline.request_keyframe();
+            // A rebound frame channel owes its peer a StreamConfig, a
+            // keyframe and the hotspot table it may never have finished
+            // receiving -- the peer on a new socket holds none of it.
+            if parameters.cursor_hotspots
+                && let Some(table) = self.hotspot_table.as_ref()
+            {
+                pipeline.write_cursor_hotspots(&mut tail, table, &self.limits)?;
+            }
 
             // A peer on a new socket holds no cursor either, so the next
             // snapshot reports one whether or not it moved.
@@ -484,12 +507,66 @@ impl<F: Acceptor, I: Acceptor> Loop<F, I> {
 
                 Ok(None)
             }
+            Message::CursorHotspots {
+                entries,
+                first_part,
+                last_part,
+            } => {
+                self.receive_hotspots(entries, first_part, last_part);
+
+                Ok(None)
+            }
             // Everything else on this socket is this process's to send.
             other => {
                 eprintln!("vmlord-display-session: ignoring {other:?} from the broker");
 
                 Ok(None)
             }
+        }
+    }
+
+    /// Extends the table being reassembled with one chunk from the broker,
+    /// and sends it whole on the frame channel when a chunk ends it.
+    ///
+    /// A chunk that begins a table replaces whatever was half-received
+    /// before it: the tray sends a table's chunks back to back, so a
+    /// partial one is a table whose later chunks are never coming.
+    fn receive_hotspots(&mut self, entries: Vec<HotspotEntry>, first_part: bool, last_part: bool) {
+        let Some(parameters) = self.parameters.as_ref() else {
+            return;
+        };
+        if !parameters.cursor_hotspots {
+            return;
+        }
+        if first_part {
+            self.hotspot_parts = Some(Vec::new());
+        }
+        let Some(parts) = self.hotspot_parts.as_mut() else {
+            return;
+        };
+        parts.extend(entries);
+        if !last_part {
+            return;
+        }
+        self.hotspot_table = self.hotspot_parts.take();
+
+        let Some(frame) = self.frame.as_mut() else {
+            return;
+        };
+        let Some(table) = self.hotspot_table.as_ref() else {
+            return;
+        };
+        // Into the socket's tail, like every other record owed to the
+        // peer: the pump drains it in order, and a socket that has fallen
+        // behind is owed the table undivided by a frame.
+        if let Err(error) =
+            frame
+                .pipeline
+                .write_cursor_hotspots(&mut frame.tail, table, &self.limits)
+        {
+            eprintln!(
+                "vmlord-display-session: the cursor-hotspot table could not be sent: {error}"
+            );
         }
     }
 
@@ -1035,8 +1112,8 @@ mod tests {
         record::{self, Channel, Header, Limits, Record},
         session::{Event, Offer, Session, Support},
         v1::{
-            Capability, FrameRecord, InputRecord, KeyEvent, Mode, PointerButton, PointerMotion,
-            StreamConfig,
+            Capability, CursorHotspots, FrameRecord, InputRecord, KeyEvent, Mode, PointerButton,
+            PointerMotion, StreamConfig,
         },
     };
 
@@ -1247,20 +1324,29 @@ mod tests {
         /// A session that is open, with both processes, a real host and the
         /// two input devices the broker hands over.
         fn open() -> Self {
-            Self::build(true)
+            Self::build(true, true)
         }
 
         /// The same on a guest whose kernel has no uinput.
         fn open_without_devices() -> Self {
-            Self::build(false)
+            Self::build(false, true)
         }
 
-        fn build(with_devices: bool) -> Self {
+        /// The same, with a host that never asked for cursor hotspots.
+        fn open_without_hotspots() -> Self {
+            Self::build(true, false)
+        }
+
+        fn build(with_devices: bool, with_hotspots: bool) -> Self {
             let secret = Secret::generate();
+            let mut capabilities = vec![Capability::CursorStream];
+            if with_hotspots {
+                capabilities.push(Capability::CursorHotspots);
+            }
             let (mut host, client_hello) = Session::host(
                 &secret,
                 Offer {
-                    capabilities: vec![Capability::CursorStream],
+                    capabilities: capabilities.clone(),
                     mode: Mode::Desktop,
                     width: WIDTH,
                     height: HEIGHT,
@@ -1270,7 +1356,7 @@ mod tests {
             let mut guest = Session::guest(
                 &secret,
                 Support {
-                    capabilities: vec![Capability::CursorStream],
+                    capabilities,
                     modes: vec![Mode::Desktop],
                     tile_sizes: vec![TILE],
                     width: WIDTH,
@@ -1312,6 +1398,7 @@ mod tests {
                 height: HEIGHT,
                 tile_size: TILE,
                 cursor_stream: true,
+                cursor_hotspots: with_hotspots,
             };
 
             let socket_path = std::env::temp_dir().join(format!(
@@ -1659,6 +1746,66 @@ mod tests {
             self.broker
                 .send(&Message::KeyframeRequested, &[])
                 .expect("a keyframe request");
+        }
+
+        /// The broker relays one chunk of the tray's cursor-hotspot table.
+        fn broker_sends_hotspot_chunk(
+            &mut self,
+            entries: Vec<crate::cursor_theme::HotspotEntry>,
+            first_part: bool,
+            last_part: bool,
+        ) {
+            self.broker
+                .send(
+                    &Message::CursorHotspots {
+                        entries,
+                        first_part,
+                        last_part,
+                    },
+                    &[],
+                )
+                .expect("a cursor-hotspot chunk");
+        }
+
+        /// A table of two shapes, as the tray would send it: in two chunks.
+        fn hotspots_in_two_chunks(&self) -> Vec<crate::cursor_theme::HotspotEntry> {
+            vec![
+                crate::cursor_theme::HotspotEntry {
+                    pixels: vec![1; 8 * 8 * 4],
+                    width: 8,
+                    height: 8,
+                    hotspot_x: 1,
+                    hotspot_y: 2,
+                },
+                crate::cursor_theme::HotspotEntry {
+                    pixels: vec![2; 8 * 8 * 4],
+                    width: 8,
+                    height: 8,
+                    hotspot_x: 5,
+                    hotspot_y: 6,
+                },
+            ]
+        }
+
+        /// The cursor-hotspot tables the host has been sent, whole.
+        fn host_reads_hotspot_tables(&mut self) -> Vec<CursorHotspots> {
+            self.host_reads_frame_stream()
+                .into_iter()
+                .filter(|(header, _)| header.message_type == FrameRecord::CursorHotspots as u16)
+                .map(|(_, payload)| {
+                    CursorHotspots::decode(payload.as_slice()).expect("a readable table part")
+                })
+                .fold(Vec::new(), |mut tables, part| {
+                    match tables.last_mut() {
+                        Some(table) if !table.last_part => {
+                            table.entries.extend(part.entries);
+                            table.last_part = part.last_part;
+                        }
+                        _ => tables.push(part),
+                    }
+
+                    tables
+                })
         }
 
         /// Whether the frame socket has been closed from the guest's side.
@@ -2150,5 +2297,114 @@ mod tests {
 
         assert_eq!(world.keyboard_events(), vec![(1, 30, 0), (0, 0, 0)]);
         assert_eq!(world.pointer_events(), vec![(1, 0x110, 0), (0, 0, 0)]);
+    }
+
+    #[test]
+    fn a_cursor_hotspot_table_reaches_the_host_decoded() {
+        let mut world = World::open();
+        let table = world.hotspots_in_two_chunks();
+        world.broker_sends_hotspot_chunk(vec![table[0].clone()], true, false);
+        world.broker_sends_hotspot_chunk(vec![table[1].clone()], false, true);
+        world.run_until_written();
+
+        let tables = world.host_reads_hotspot_tables();
+
+        assert_eq!(tables.len(), 1, "two chunks, one table");
+        assert!(tables[0].last_part);
+        assert_eq!(tables[0].entries.len(), 2);
+        assert_eq!(
+            (
+                tables[0].entries[0].hotspot_x,
+                tables[0].entries[0].hotspot_y
+            ),
+            (1, 2)
+        );
+        assert_eq!(tables[0].entries[1].pixels, table[1].pixels);
+    }
+
+    #[test]
+    fn a_new_first_chunk_replaces_a_half_received_table() {
+        let mut world = World::open();
+        let table = world.hotspots_in_two_chunks();
+        // A table whose later chunks are never coming, and then a fresh
+        // one that starts over.
+        world.broker_sends_hotspot_chunk(vec![table[0].clone()], true, false);
+        world.run_until_idle();
+        world.broker_sends_hotspot_chunk(vec![table[0].clone()], true, false);
+        world.broker_sends_hotspot_chunk(vec![table[1].clone()], false, true);
+        world.run_until_written();
+
+        let tables = world.host_reads_hotspot_tables();
+
+        assert_eq!(
+            tables.len(),
+            1,
+            "the abandoned table's chunk is not part of the next"
+        );
+        assert_eq!(tables[0].entries.len(), 2);
+        assert!(tables[0].last_part);
+    }
+
+    #[test]
+    fn a_rebound_frame_channel_is_sent_the_cached_table_again() {
+        let mut world = World::open();
+        let table = world.hotspots_in_two_chunks();
+        world.broker_sends_hotspot_chunk(vec![table[0].clone()], true, false);
+        world.broker_sends_hotspot_chunk(vec![table[1].clone()], false, true);
+        world.run_until_written();
+        let _ = world.host_reads_frame_stream();
+
+        world.host_drops_and_reopens_the_frame_socket();
+        world.run_until_written();
+
+        // Read once: the stream is consumed by the read.
+        let stream = world.host_reads_frame_stream();
+        assert_eq!(stream[0].0.message_type, FrameRecord::StreamConfig as u16);
+        let tables: Vec<_> = stream
+            .into_iter()
+            .filter(|(header, _)| header.message_type == FrameRecord::CursorHotspots as u16)
+            .map(|(_, payload)| {
+                CursorHotspots::decode(payload.as_slice()).expect("a readable table part")
+            })
+            .collect();
+        assert_eq!(
+            tables.len(),
+            1,
+            "a peer on a new socket holds no table, and is owed the cached one"
+        );
+        assert_eq!(tables[0].entries.len(), 2);
+        assert!(tables[0].last_part);
+    }
+
+    #[test]
+    fn without_the_hotspot_capability_no_table_record_is_sent() {
+        let mut world = World::open_without_hotspots();
+        let table = world.hotspots_in_two_chunks();
+        world.broker_sends_hotspot_chunk(vec![table[0].clone()], true, false);
+        world.broker_sends_hotspot_chunk(vec![table[1].clone()], false, true);
+        world.run_until_written();
+
+        assert!(
+            world
+                .host_reads_frame_records()
+                .iter()
+                .all(|header| header.message_type != FrameRecord::CursorHotspots as u16),
+            "a session that never negotiated the table is never sent one"
+        );
+    }
+
+    #[test]
+    fn a_session_that_never_negotiated_the_table_still_runs() {
+        let mut world = World::open_without_hotspots();
+        world.broker_sends_snapshot(1);
+        world.run_until_written();
+
+        assert!(
+            world
+                .host_reads_frame_records()
+                .iter()
+                .any(|header| header.message_type == FrameRecord::Keyframe as u16),
+            "the display is untouched by the missing table"
+        );
     }
 }

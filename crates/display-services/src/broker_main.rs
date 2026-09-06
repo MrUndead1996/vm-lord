@@ -1008,6 +1008,14 @@ fn read_tray_peer(connection: &Arc<Connection>, shared: &Shared) {
                 drop(state);
                 restart_display_session(connection);
             }
+            // A chunk of the tray's cursor-hotspot table, for the session
+            // process, where the frame channel is. Relayed unchanged: the
+            // chunks are reassembled at the far end, and what the broker
+            // never holds it cannot reassemble half of.
+            Message::CursorHotspots { .. } => {
+                drop(state);
+                send_to_peer(shared, &message);
+            }
             // What the tray reports is a menu action's failure, for the log.
             Message::Report { detail } => eprintln!("vmlord-display-tray: {detail}"),
             other => eprintln!("vmlord-display-broker: ignoring {other:?} from the tray peer"),
@@ -1905,6 +1913,7 @@ mod tests {
             height: 1080,
             tile_size: 32,
             cursor_stream: true,
+            cursor_hotspots: true,
         };
 
         let daemons = crate::control::DaemonKeys {

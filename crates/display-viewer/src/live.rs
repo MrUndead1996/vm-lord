@@ -76,6 +76,8 @@ pub enum Signal {
     Cursor(OwnedCursorImage),
     /// Where the cursor is now.
     Moved(CursorPosition),
+    /// The guest's cursor-hotspot table, whole.
+    CursorHotspots(Vec<OwnedCursorImage>),
     /// The mode the guest says its output actually came up on.
     ///
     /// `None` when the guest reported no refresh, which is an older payload or
@@ -595,6 +597,9 @@ impl<S: Read + Write, C: FnMut(Channel) -> Result<S, String>> Live<S, C> {
                 Ok(Update::Damage(damage)) => signals.push(Signal::Damage(damage)),
                 Ok(Update::Cursor(image)) => signals.push(Signal::Cursor(image)),
                 Ok(Update::Moved(position)) => signals.push(Signal::Moved(position)),
+                Ok(Update::CursorHotspots(entries)) => {
+                    signals.push(Signal::CursorHotspots(entries))
+                }
                 Err(VideoError::Rebind(reason)) => {
                     self.payload = payload;
                     self.rebind(now, signals, &reason);

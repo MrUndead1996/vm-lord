@@ -11,7 +11,10 @@ use prost::Message as _;
 use vmlord_display_codec::Rect;
 use vmlord_display_protocol::v1::{DisplayTiming, GuestCommandKind};
 
-use crate::broker::{self, envelope};
+use crate::{
+    broker::{self, envelope},
+    cursor_theme::HotspotEntry,
+};
 
 /// What one side asks the other to do, or tells it has happened.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,6 +95,22 @@ pub enum Message {
         /// The one the host chose, when it has chosen.
         selected: Option<DisplayTiming>,
     },
+    /// One chunk of the cursor-hotspot table the tray has parsed out of the
+    /// active Xcursor theme.
+    ///
+    /// The chunks of one table travel in order and are reassembled at the
+    /// far end, where the frame channel is; the broker relays each one
+    /// unchanged, because reassembly is not its business and a chunk it
+    /// never holds is one it cannot drop half of.
+    CursorHotspots {
+        /// The entries of this chunk, in order.
+        entries: Vec<HotspotEntry>,
+        /// Whether this chunk begins a table, and so replaces any
+        /// half-received one.
+        first_part: bool,
+        /// Whether this chunk ends its table.
+        last_part: bool,
+    },
 }
 
 /// What a frame and an input channel need, and nothing more.
@@ -115,6 +134,12 @@ pub struct SessionParameters {
     pub tile_size: u32,
     /// Whether the cursor travels as its own records rather than in the frame.
     pub cursor_stream: bool,
+    /// Whether the cursor-hotspot table may travel on the frame channel.
+    ///
+    /// Both halves of the negotiation in one answer: the capability, and the
+    /// cursor stream it rides behind -- a table about cursor bitmaps is
+    /// worth nothing to a session whose cursor is drawn into the frame.
+    pub cursor_hotspots: bool,
 }
 
 /// Which plane a layout describes.
@@ -203,6 +228,7 @@ fn into_wire(message: &Message) -> envelope::Message {
                 height: parameters.height,
                 tile_size: parameters.tile_size,
                 cursor_stream: parameters.cursor_stream,
+                cursor_hotspots: parameters.cursor_hotspots,
             })
         }
         Message::ClipboardOpened {
@@ -265,6 +291,15 @@ fn into_wire(message: &Message) -> envelope::Message {
                 selected: selected.map(|mode| timing_into_wire(&mode)),
             })
         }
+        Message::CursorHotspots {
+            entries,
+            first_part,
+            last_part,
+        } => envelope::Message::CursorHotspots(broker::CursorHotspots {
+            entries: entries.iter().map(hotspot_into_wire).collect(),
+            first_part: *first_part,
+            last_part: *last_part,
+        }),
     }
 }
 
@@ -280,6 +315,7 @@ fn from_wire(message: envelope::Message) -> Result<Message, IpcError> {
             height: opened.height,
             tile_size: opened.tile_size,
             cursor_stream: opened.cursor_stream,
+            cursor_hotspots: opened.cursor_hotspots,
         }),
         envelope::Message::ClipboardOpened(opened) => Message::ClipboardOpened {
             session_id: opened.session_id,
@@ -328,6 +364,11 @@ fn from_wire(message: envelope::Message) -> Result<Message, IpcError> {
                 .map(timing_from_wire)
                 .collect::<Result<_, _>>()?,
             selected: modes.selected.as_ref().map(timing_from_wire).transpose()?,
+        },
+        envelope::Message::CursorHotspots(chunk) => Message::CursorHotspots {
+            entries: chunk.entries.iter().map(hotspot_from_wire).collect(),
+            first_part: chunk.first_part,
+            last_part: chunk.last_part,
         },
     })
 }
@@ -379,6 +420,26 @@ fn timing_from_wire(timing: &broker::DisplayTiming) -> Result<DisplayTiming, Ipc
         height: timing.height,
         refresh_hz: timing.refresh_hz,
     })
+}
+
+fn hotspot_into_wire(entry: &HotspotEntry) -> broker::CursorHotspotEntry {
+    broker::CursorHotspotEntry {
+        pixels: entry.pixels.clone(),
+        width: entry.width,
+        height: entry.height,
+        hotspot_x: entry.hotspot_x,
+        hotspot_y: entry.hotspot_y,
+    }
+}
+
+fn hotspot_from_wire(entry: &broker::CursorHotspotEntry) -> HotspotEntry {
+    HotspotEntry {
+        pixels: entry.pixels.clone(),
+        width: entry.width,
+        height: entry.height,
+        hotspot_x: entry.hotspot_x,
+        hotspot_y: entry.hotspot_y,
+    }
 }
 
 fn plane_into_wire(plane: &PlaneLayout) -> broker::PlaneLayout {
@@ -462,6 +523,7 @@ mod tests {
             height: 1080,
             tile_size: 32,
             cursor_stream: true,
+            cursor_hotspots: true,
         }
     }
 
@@ -542,6 +604,22 @@ mod tests {
             Message::DisplayModes {
                 modes: Vec::new(),
                 selected: None,
+            },
+            Message::CursorHotspots {
+                entries: vec![crate::cursor_theme::HotspotEntry {
+                    pixels: vec![0, 0, 255, 255, 255, 255, 0, 0],
+                    width: 2,
+                    height: 1,
+                    hotspot_x: 0,
+                    hotspot_y: 0,
+                }],
+                first_part: true,
+                last_part: false,
+            },
+            Message::CursorHotspots {
+                entries: Vec::new(),
+                first_part: false,
+                last_part: true,
             },
         ];
 

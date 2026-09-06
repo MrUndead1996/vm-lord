@@ -1167,6 +1167,10 @@ fn apply(
                 tracing::warn!("the guest's cursor could not be anchored: {error}");
             }
         }
+        // The theme's own answer to where a bitmap anchors, known before
+        // any measuring: handed to the same cursor the measured shapes
+        // are, which will prefer it over working a hotspot out.
+        Signal::CursorHotspots(entries) => cursor.hotspots(entries),
         // The main loop's own business rather than the renderer's: the pixels
         // the session thread has already copied in, what mode the guest came
         // up on, and a command the pump has already answered.

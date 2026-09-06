@@ -67,6 +67,16 @@ fn host_modes_support() -> Support {
     }
 }
 
+fn cursor_hotspots_support() -> Support {
+    Support {
+        capabilities: vec![Capability::CursorHotspots],
+        modes: vec![Mode::Desktop],
+        tile_sizes: vec![32],
+        width: 1920,
+        height: 1080,
+    }
+}
+
 #[test]
 fn display_timings_and_mode_updates_survive_the_wire() {
     let timing = DisplayTiming {
@@ -157,6 +167,33 @@ fn this_revision_settles_host_modes() {
     assert_eq!(
         answered.capabilities,
         vec![i32::from(Capability::HostDisplayModes)]
+    );
+}
+
+#[test]
+fn a_host_from_before_cursor_hotspots_never_settles_them() {
+    let hello = hello_from(
+        ProtocolVersion { major: 1, minor: 4 },
+        vec![i32::from(Capability::CursorHotspots)],
+    );
+
+    let answered = answer(cursor_hotspots_support(), &hello);
+
+    assert_eq!(answered.capabilities, Vec::<i32>::new());
+}
+
+#[test]
+fn this_revision_settles_cursor_hotspots() {
+    let hello = hello_from(
+        ProtocolVersion::current(),
+        vec![i32::from(Capability::CursorHotspots)],
+    );
+
+    let answered = answer(cursor_hotspots_support(), &hello);
+
+    assert_eq!(
+        answered.capabilities,
+        vec![i32::from(Capability::CursorHotspots)]
     );
 }
 

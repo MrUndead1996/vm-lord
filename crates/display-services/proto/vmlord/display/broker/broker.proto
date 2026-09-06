@@ -27,6 +27,7 @@ message Envelope {
     RestartSession restart_session = 13;
     DisplayModesRequested display_modes_requested = 14;
     DisplayModes display_modes = 15;
+    CursorHotspots cursor_hotspots = 16;
   }
 }
 
@@ -47,6 +48,9 @@ message SessionOpened {
   uint32 height = 5;
   uint32 tile_size = 6;
   bool cursor_stream = 7;
+  // Whether the cursor-hotspot table may travel on the frame channel: the
+  // capability, and the cursor stream it rides behind.
+  bool cursor_hotspots = 8;
 }
 
 // A control handshake completed, as the clipboard daemon needs it: the session
@@ -187,4 +191,30 @@ message DisplayModesRequested {}
 message DisplayModes {
   repeated DisplayTiming modes = 1;
   DisplayTiming selected = 2;
+}
+
+// One chunk of the cursor-hotspot table the tray has parsed out of the
+// active Xcursor theme, on its way to the session process. The broker
+// relays it unchanged: the chunks are reassembled at the far end, where
+// the frame channel is.
+//
+// The chunks of one table travel in order; `first_part` is set on the
+// first of them and `last_part` on the last. A table of one chunk has both
+// set. `first_part` is what tells a receiver to forget a table whose
+// later chunks never arrived.
+message CursorHotspots {
+  repeated CursorHotspotEntry entries = 1;
+  bool first_part = 2;
+  bool last_part = 3;
+}
+
+message CursorHotspotEntry {
+  // Straight alpha, one byte per channel in the order B, G, R, A -- the
+  // same layout the frame channel's cursor images and the Xcursor file
+  // itself use. Tightly packed rows, `width * height * 4` long.
+  bytes pixels = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  uint32 hotspot_x = 4;
+  uint32 hotspot_y = 5;
 }

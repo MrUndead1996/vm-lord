@@ -3204,8 +3204,9 @@ of connecting while a guest service restarts.
 
 Every record on every channel begins with the same 24-byte little-endian
 header: header length, channel, type, payload length, sequence, base, CRC32C
-and generation. The payload is Protobuf on control and input and for the frame
-channel's own handshake, and raw codec bytes for keyframes, tile deltas and
+and generation. The payload is Protobuf on control and input, for the frame
+channel's own handshake and for the cursor-hotspot table it carries, and raw
+codec bytes for keyframes, tile deltas and
 cursors. That last part is why the frame channel is not Protobuf all the way
 down: a 1440p keyframe is megabytes, and carrying it in a `bytes` field would
 copy it through an encoder on the way out and another on the way in, every
@@ -3261,8 +3262,10 @@ Losing frame or input alone does not: that channel reconnects within the same
 session at the next `generation`, and records still in flight from the previous
 connection are rejected by the header before they reach a decoder or an input
 device. A reconnected frame channel owes `StreamConfig` and a keyframe before
-any delta, since a delta has nothing to apply to, and a reconnected input
-channel owes a release-all -- which the guest also performs on its own the
+any delta, since a delta has nothing to apply to; where the cursor-hotspot
+capability below was settled and the session holds a table, it owes that table
+as well, because the peer on the new socket holds none of it. A reconnected
+input channel owes a release-all -- which the guest also performs on its own the
 moment the channel drops, because a key stuck down is worse than a lost
 session.
 
@@ -3282,6 +3285,30 @@ falls behind receives one fresh frame rather than a backlog. The frame flow's
 only back edges are `RequestKeyframe`, which is recovery for a decoder that
 lost synchronisation, and `Ping`/`Pong`, which is how a slow viewer is told
 from a dead one.
+
+The frame channel also carries state in the host's direction that is not a
+picture. Protocol **1.5** adds `FRAME_RECORD_CURSOR_HOTSPOTS`, carrying a
+`CursorHotspots` message, and with it `CAPABILITY_CURSOR_HOTSPOTS` -- the
+schema gains a record type and a capability, which is what a minor is for, and
+that is why the revision moved from 1.4. The handshake strips both below 1.5,
+the way `CAPABILITY_HOST_DISPLAY_MODES` is stripped below 1.4, so an older
+peer is never sent a record it has no name for. An entry is one bitmap of the
+guest's active Xcursor theme -- straight-alpha pixels, `width` x `height`,
+byte for byte what a cursor image record carries -- and the hotspot inside it.
+Entries are never split: a table larger than one record travels as ordered
+parts held under 128 KiB each -- a single entry wider than that travels alone
+rather than being split or dropped -- and under the session's own frame-record
+cap where that is smaller, with `last_part` set on the last of them. A receiver
+swaps its copy in only when a part with `last_part` arrives, and a part that
+begins a table replaces any half-received one, because the guest sends a
+table's parts back to back and a partial one is a table whose later parts are
+never coming. The table is owed where a stream is: the session process caches
+it as guest state, on the reasoning that the theme does not change because a
+viewer reconnected, and writes it onto a frame channel right after its
+`StreamConfig` -- a rebind obligation -- and again whenever a fresh complete
+table arrives from the tray. None of it travels unless that capability was
+settled and the cursor stream with it: bitmaps to match cursors against are
+worth nothing to a session whose cursor is drawn into the frame.
 
 The control channel carries one record in the other direction. A
 `CONTROL_RECORD_GUEST_COMMAND` is the guest's user raising one of the commands
@@ -3349,16 +3376,21 @@ the session process owns frames and input and never sees a device descriptor or
 an ioctl of its own, the clipboard daemon owns the fourth, and the audio daemon
 owns the fifth. The tray is the fifth process and owns none of them: it binds
 no vsock and is never handed a channel key, because everything it has to say
-crosses its own socket to the broker. What crosses the IPC socket after a
+crosses its own socket to the broker -- the cursor-hotspot table it reads off
+the guest's disk among it. What crosses the IPC socket after a
 handshake is a `SessionParameters`: the session id, one channel key per socket,
-the geometry, and whether the peer took the cursor stream. Not the secret. What
+the geometry, whether the peer took the cursor stream, and whether the
+cursor-hotspot table may ride the frame channel behind it. Not the secret. What
 a compromised capture process could take from those bytes is one session, and
 only while that session runs.
 
 The three disconnect obligations are honoured where they are owed. A frame
 channel that binds sends `StreamConfig` and then a keyframe before any delta,
-because a decoder that has just been built has nothing to apply a delta to; a
-reconnect binds at the next generation and starts again the same way, and the
+because a decoder that has just been built has nothing to apply a delta to --
+and, where the cursor-hotspot capability was settled and a table has arrived
+from the tray, the table after them, for the same reason: the peer on a new
+socket holds none of it. A reconnect binds at the next generation and starts
+again the same way, and the
 loop notices a dropped socket by watching it for hangup rather than by
 discovering it on the write that fails. Losing control ends the session: both
 sockets are shut down and nothing more is asked for, because a process that
@@ -3482,8 +3514,8 @@ makes a round trip: libinput reads an absolute axis back as `value * size /
 interval's boundary comes back as the pixel next door -- at 1920 wide, pixel 1
 was arriving as pixel 0. Three eighths of the way in is far enough from either
 edge that no rounding leaves the pixel, and short enough of a half that the
-cursor plane's position, which the host measures the hotspot from, rounds down
-whichever rule a compositor rounds by. The wheel travels at both resolutions: `REL_WHEEL_HI_RES` in the
+cursor plane's position, from which the host still measures the hotspots no
+theme table names, rounds down whichever rule a compositor rounds by. The wheel travels at both resolutions: `REL_WHEEL_HI_RES` in the
 hundred-and-twentieths the wire uses, and the whole detents they add up to, with
 the remainder carried so slow scrolling is not lost.
 
@@ -3496,31 +3528,63 @@ system menu; `windows/hook.rs` is a `WH_KEYBOARD_LL` hook, installed on focus
 and removed on its loss, which is the only way `Super`, `Alt+Tab` and `Ctrl+Esc`
 reach GNOME rather than the Windows shell.
 
-The cursor's **hotspot** is worked out on the host, because the host is the
-only end that has it. Mutter subtracts the hotspot before capture sees
-anything: the cursor plane sits at the pointer's position minus it, the plane
-carries no hotspot property to read it back from, and the position record
-therefore names the bitmap's corner. Windows anchors a cursor by its hotspot,
-so a bitmap handed to it with zeros lands with its corner on the pointer and
-every click goes a few pixels up and left of the arrow -- half a bitmap for the
-I-beam. `cursor.rs` recovers it by subtraction: the position last sent to the
-guest, minus the corner the guest reports, is the hotspot. The two are only the
-same instant while the pointer stands still, so the subtraction is trusted on a
+The cursor's **hotspot** reaches the host by two roads, and the ordinary one
+is that the guest ships it. The hotspots are not secret -- they sit in the
+active Xcursor theme on the guest's disk -- but the capture process cannot
+read them: it is a system unit with `ProtectHome=yes`. The tray can. It is the
+user unit inside the graphical session, so theme discovery is its job
+(`cursor_theme.rs`): the theme named by `XCURSOR_THEME`, else the desktop's
+dconf database read straight out of `~/.config/dconf/user` -- the dconf D-Bus
+service has no read method, and the reader is the slice of the GVDB format one
+string lookup needs -- else `default`; then every cursor file of the theme and
+of the `Inherits` chain it names, every nominal size and every animation
+frame, deduplicated and held under 4 MiB. An entry is one theme bitmap and the
+hotspot inside it, and the table travels tray, broker, session process, frame
+channel -- the wire's account of it is the display protocol's. A theme that
+cannot be determined, and a walk that yields no cursor, each send nothing
+rather than a guess, and no pixel of the table is logged.
+
+On the host, `cursor.rs` matches a cursor record against the table by pixels
+alone. Mutter and wlroots copy a theme's bytes onto the plane verbatim, sprite
+at the plane's corner, so an entry is the record's shape when the bytes where
+it draws -- alpha above zero, cropped tight -- equal the record's drawing byte
+for byte, and the theme's hotspot moves by the two drawings' origin delta. The
+one shift absorbs the plane's padding around the sprite and a capture cropped
+at the frame's left and top edges, the two ways a record and its theme image
+can differ without the picture differing. A shape the table names is anchored
+the moment it arrives, before any pointer record, and is remembered like a
+measured one and never measured.
+
+The table is the primary source and not the whole of it, because a theme is
+only a sample of the cursors a desktop shows: applications pick their own,
+XWayland draws its own, a rescaled HiDPI sprite is a picture no theme shipped,
+and a guest whose theme cannot be read sends no table at all. What the table
+does not name falls to the host, which remains the only end that has the
+hotspot. Mutter subtracts the hotspot before capture sees anything: the cursor
+plane sits at the pointer's position minus it, the plane carries no hotspot
+property to read it back from, and the position record therefore names the
+bitmap's corner. Windows anchors a cursor by its hotspot, so a bitmap handed
+to it with zeros lands with its corner on the pointer and every click goes a
+few pixels up and left of the arrow -- half a bitmap for the I-beam.
+`cursor.rs` recovers it by subtraction: the position last sent to the guest,
+minus the corner the guest reports, is the hotspot. The two are only the same
+instant while the pointer stands still, so the subtraction is trusted on a
 record with no motion sent since the previous one and the same corner as the
 previous one, and a difference landing outside what the bitmap actually draws
 is refused -- a cursor plane is 64x64 whatever sits on it, and the padding
 points at nothing.
 
-A hotspot belongs to a bitmap and is measured **once**, because a hotspot that
+A hotspot belongs to a bitmap and is settled **once**, because a hotspot that
 moves is a cursor that jumps. The subtraction is exact only in principle: this
 end sends a guest pixel, the guest's pointer is a float that came back through
 the absolute axes' fixed range, and the plane's corner is rounded, so the same
-shape measures a pixel apart at two ends of the screen. The guest sends its
-cursor with every frame whether or not it changed, so the bitmap is compared
-with the one on the window: an identical one is neither a measurement nor an
-icon rebuilt sixty times a second. Shapes already measured are remembered,
-which keeps the arrow and the I-beam of an afternoon's editing to one movement
-each.
+shape measures a pixel apart at two ends of the screen. A table match spends
+none of that -- the theme's answer is exact wherever the pointer stands. The
+guest sends its cursor with every frame whether or not it changed, so the
+bitmap is compared with the one on the window: an identical one is neither a
+measurement nor an icon rebuilt sixty times a second. Shapes already settled
+are remembered, which keeps the arrow and the I-beam of an afternoon's editing
+to one movement each.
 
 Keys are carried as **scan codes**, not virtual keys. A virtual key has already
 had the host's layout applied to it and the guest then applies its own, so a
@@ -3851,6 +3915,23 @@ every accept. The Resolution submenu is the one part that is an answer rather
 than a command: the tray asks which modes the host has offered and is told,
 the same list and the same selection the connector thread already holds --
 one fact read by a second reader, not a second authority on it.
+
+The fourth socket carries one thing that is neither a command nor an answer,
+and it is the one thing this unit reads off the guest's disk: the active
+Xcursor theme. The capture process cannot read it -- a system unit with
+`ProtectHome=yes` -- and the host cannot see the guest's disk at all, so the
+tray parses the theme when it starts and after every reconnect to the broker
+(`cursor_theme.rs`) and sends the session process its bitmap-to-hotspot table
+by way of the broker, each datagram held under 128 KiB, a single cursor wider
+than that travelling alone. The theme is the one `XCURSOR_THEME` names, else
+the one the desktop's dconf
+database names -- read straight out of `~/.config/dconf/user`, because the
+dconf D-Bus service has no read method and the `gvdb` crate would have pulled
+its dependency tree into a static binary for one string key -- else `default`.
+Every refusal along the way is an honest nothing rather than a guess: a theme
+that cannot be determined, and a walk that yields no cursor, each send
+nothing, and the host falls back on measuring the hotspots the table does not
+name. What the journal gets is counts, never pixels.
 
 A command raised while no session is open is answered with a report rather
 than kept, because the tray asked for something on the host and is told there

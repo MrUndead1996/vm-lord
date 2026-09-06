@@ -73,7 +73,7 @@ mod tests {
     /// Written out rather than depended on, which is what keeps this crate
     /// free of `vmlord-display-protocol`; `vmlord-platform`, which has both,
     /// holds this against what the protocol actually negotiates.
-    const CURRENT: ProtocolVersionParts = ProtocolVersionParts { major: 1, minor: 3 };
+    const CURRENT: ProtocolVersionParts = ProtocolVersionParts { major: 1, minor: 5 };
 
     #[derive(Deserialize)]
     struct Spec {
