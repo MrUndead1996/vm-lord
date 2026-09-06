@@ -1,9 +1,9 @@
-//! Applying the Ubuntu GPU recipe to the guest this agent runs in.
+//! Applying the GPU recipe to the guest this agent runs in.
 //!
-//! What decides is in `gpu_recipe`; what is here is the part that needs an
-//! Ubuntu guest with a payload mounted: reading the guest's own files, staging
-//! the module sources somewhere DKMS can write beside them, running apt, DKMS
-//! and `modprobe`, and looking at `/dev/dxg` afterwards.
+//! What decides is in `gpu_recipe`; what is here is the part that needs a
+//! guest with a payload mounted: reading the guest's own files, staging the
+//! module sources somewhere DKMS can write beside them, running the guest's
+//! package manager, DKMS and `modprobe`, and looking at `/dev/dxg` afterwards.
 //!
 //! Nothing here fails as a whole. Every stage that does not succeed is a stage
 //! in the report and a VM that keeps running with less GPU than it asked for.
@@ -23,7 +23,7 @@ use crate::{
     gpu_recipe::{
         Applicability, DkmsPackage, Environment, MesaPolicy, Report, Shell, applicability,
         dkms_reports_installed, environment_document, icd_documents, module_is_loaded,
-        parse_dkms_conf, parse_mesa_policy, parse_payload_target, recipe_for,
+        parse_dkms_conf, parse_mesa_policy, parse_payload_target,
     },
     gpu_targets::{PAYLOAD, WSL_LIB},
     guest_files::{copy_tree, failure, read, write_if_different},
@@ -105,14 +105,12 @@ pub fn apply(stopping: &AtomicBool) -> Vec<GpuRecipeStage> {
 /// `Err` carries what the stages that never ran are reported with.
 fn run_stages(report: &mut Report, stopping: &AtomicBool) -> Result<(), String> {
     let guest = guest_facts()?;
-    if recipe_for(&guest.distribution).is_none() {
-        let reason = format!(
-            "vmlord-agent has no GPU recipe for {} {}",
-            guest.distribution, guest.release
-        );
-        report.skipped(GpuRecipeStep::Distribution, reason.clone());
-        return Err(reason);
-    }
+    // No list of distributions this build knows. Unlike the display recipe,
+    // whose payload is portable across distributions, a GPU payload carries
+    // Mesa built against a base image's glibc, so distribution and release
+    // stay real conditions here -- asked of the mounted payload in the stage
+    // below, where a guest nothing was built for is refused as a missing
+    // payload rather than an unknown distribution.
     report.ok(
         GpuRecipeStep::Distribution,
         format!(

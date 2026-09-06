@@ -261,7 +261,7 @@ enum GpuMountState {
   GPU_MOUNT_STATE_FAILED = 3;
 }
 
-// Asks the guest to apply its distribution's GPU recipe.
+// Asks the guest to apply its GPU recipe.
 //
 // Sent once per session, after the manifest the guest mounted, on a session
 // that agreed `CAPABILITY_GPU`. Empty on purpose: everything the guest needs
@@ -302,7 +302,10 @@ message GpuRecipeStage {
 enum GpuRecipeStep {
   GPU_RECIPE_STEP_UNSPECIFIED = 0;
 
-  // Whether this guest is one the agent has a recipe for at all.
+  // What the guest turned out to be, from its own files. Never a refusal by
+  // itself: whether the mounted payload serves this guest is the PAYLOAD
+  // stage's question, with distribution, release and architecture among its
+  // conditions.
   GPU_RECIPE_STEP_DISTRIBUTION = 1;
 
   // The mounted payload: its provenance, its target and its module sources.
