@@ -5177,6 +5177,9 @@ dependencies = [
  "vmlord-agent-protocol",
  "vmlord-display-codec",
  "vmlord-display-protocol",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
  "zbus",
 ]
 
