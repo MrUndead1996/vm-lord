@@ -53,7 +53,10 @@ Three properties are decisions rather than style, all three measured by task
   `vkms` anywhere in its name -- `61-mutter.rules` matches `ID_PATH` and would
   tag it `mutter-device-ignore`;
 * it does not set `DRIVER_CURSOR_HOTSPOT`, which mutter reads as a reason to
-  hide a driver's cursor plane;
+  hide a driver's cursor plane. The wlroots family does not need the feature
+  either: task #165 measured Hyprland (Aquamarine) and Sway (wlroots)
+  subtracting the hotspot themselves on a live guest --
+  see `docs/display-drm-backend.md`, "The cursor plane under wlroots";
 * its formats are XRGB8888 and ARGB8888 with `DRM_FORMAT_MOD_LINEAR` only,
   because a capture client that mmaps a buffer cannot detile anything else.
 

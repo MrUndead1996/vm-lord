@@ -225,3 +225,58 @@ not research, and this is where each of those four stands:
   test skips; the runtime proof is task #128's mandatory matrix, along with a
   real mutter putting the pointer on the cursor plane, GDM before login, and
   2560x1440.
+
+## The cursor plane under wlroots
+
+Task #165's question: the module and the capture backend were written against
+mutter, which puts the pointer on the cursor plane and subtracts the hotspot
+before capture sees anything. The wlroots family was expected to differ, and
+the answer is that it does not. Measured on the Arch guest (kernel 7.2.3,
+rendering on llvmpipe) with Hyprland 0.56.2 -- whose DRM backend is
+[Aquamarine](https://github.com/hyprwm/aquamarine) 0.15.0, not wlroots --
+and with Sway 1.12 on wlroots 0.20.2, each restricted to the `vmlord_drm`
+card for the run (`AQ_DRM_DEVICES` / `WLR_DRM_DEVICES` in a wrapper session;
+production output selection is #162's and #166's business):
+
+- **Both light the output.** One monitor, `Virtual-2` at 1920x1080@60
+  preferred out of the connector's 32 offered modes, physical size 508x286 mm
+  -- the module's 96 DPI -- and a CRTC left `enable=1 active=1`. Neither
+  compositor asked for anything the module does not have: no EDID, no render
+  node (Aquamarine warns and falls back to the primary node), no overlays.
+- **Both put the pointer on the cursor plane.** The plane carries a
+  256x256 ARGB8888 linear framebuffer `allocated by Hyprland` / `allocated by
+  sway`, Hyprland reports `hardwareCursorsInUse: true`, and no software-cursor
+  fallback occurred. The 256x256 is `mode_config`'s cursor size read back
+  through `DRM_CAP_CURSOR_WIDTH/HEIGHT`: wlroots needs the buffer to match a
+  listed size exactly, and pads its sprite into the 256x256 one
+  (`types/output/cursor.c`); a compositor told nothing assumes 64x64, which
+  the module's 64x64 framebuffer minimum also accepts.
+- **Both keep corner semantics.** The plane sits at the pointer minus the
+  hotspot, exactly as under mutter, and the position is signed: at the
+  top-left corner Sway commits `crtc-pos=256x256-3-1` for the default arrow's
+  (3,1) hotspot -- the negatives `cursor.rs` crops rather than clamps. Hyprland
+  holds a floating pointer position and rounds after subtracting, so the same
+  corner reads `-2+0`.
+
+| pointer | Hyprland plane | Sway plane |
+| --- | --- | --- |
+| 960,540 | 957,539 | 957,539 |
+| 300,200 | 297,199 | 297,198 |
+| 0,0 | -2,0 | -3,-1 |
+
+- **The missing `DRIVER_CURSOR_HOTSPOT` costs nothing.** Aquamarine never
+  requests `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT`; it subtracts the hotspot
+  itself when committing the plane position. wlroots does request the client
+  capability, fails silently on a driver without the feature, and falls back
+  to subtracting itself too -- it sets the `HOTSPOT_X`/`HOTSPOT_Y` plane
+  properties only when the capability succeeded, so neither compositor ever
+  set them here. Had the module declared the feature, mutter would have hidden
+  the cursor plane and refused to light the output, which is why it must stay
+  unset.
+
+The verdict of the investigation: no module change. The assumptions in
+`crates/display-services/src/cursor.rs` -- pointer on the cursor plane, corner
+at the pointer minus an already-subtracted hotspot, signed positions cropped
+at the frame's edges -- hold under Aquamarine and wlroots as they do under
+mutter, and the guest probe round-trips the live desktop through the pipeline
+with the drawn cursor landing in the frame under both.
