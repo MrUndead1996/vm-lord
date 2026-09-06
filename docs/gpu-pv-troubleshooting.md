@@ -122,8 +122,8 @@ skipped rather than leaving it to be guessed.
 
 | Stage | Fails when | What to do |
 | --- | --- | --- |
-| `DISTRIBUTION` | The guest is not one there is a recipe for. | Only Ubuntu is supported. |
-| `PAYLOAD` | The share is not mounted, its `sources.json` is not where it should be, or `dkms.conf` does not name the package. | See [no payload](#the-vm-got-no-payload). Nine skipped stages after a mounted-but-empty directory is the signature of an export pointing at a staging root rather than at a generation — a bug, not a configuration. |
+| `DISTRIBUTION` | Never refuses. It reports what the guest is, from its own files. | A guest that cannot be brought up is refused in `PAYLOAD`, below. |
+| `PAYLOAD` | The share is not mounted, its `sources.json` is not where it should be, the payload was built for another guest (distribution, release, architecture), or `dkms.conf` does not name the package. | A guest with no payload mounted is one nothing was built for: only Ubuntu releases have payloads, and the host stages nothing for any other guest. Otherwise see [no payload](#the-vm-got-no-payload). Nine skipped stages after a mounted-but-empty directory is the signature of an export pointing at a staging root rather than at a generation — a bug, not a configuration. |
 | `BUILD_DEPENDENCIES` | `dkms`, `build-essential` or `linux-headers-$(uname -r)` could not be installed. | **Almost always no network in the guest.** These come from the guest's own apt, deliberately. Give the VM a network mode that reaches `archive.ubuntu.com` and restart it. |
 | `MODULE_SOURCE` | The sources could not be copied to `/usr/src`. | Check space in the guest. |
 | `MODULE_BUILD` | DKMS did not build the module — most often headers that do not match the running kernel. | Let the guest finish an in-progress kernel upgrade, reboot it, restart the VM. |

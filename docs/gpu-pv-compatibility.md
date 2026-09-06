@@ -51,7 +51,7 @@ Only **Ubuntu**, and only a VM built from a **cloud image**.
 
 | | Supported |
 | --- | --- |
-| Distribution | Ubuntu, through its `DistroProfile`; no other distribution has a recipe |
+| Distribution | Ubuntu, through its `DistroProfile`; no other distribution has a GPU payload built for it — the guest's recipe asks the mounted payload whether it serves this guest, so a guest with nothing built is skipped in `PAYLOAD` as a missing payload |
 | Releases | those the create form offers — 26.04, 24.04, 22.04 |
 | Architecture | `amd64` |
 | Source | a cloud image; a VM installed from media has no guest triple recorded |

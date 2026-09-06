@@ -82,24 +82,6 @@ impl Report {
     }
 }
 
-/// A distribution this build knows how to bring a GPU up on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GpuRecipe {
-    Ubuntu,
-}
-
-/// The recipe for a distribution, or nothing for one with none.
-///
-/// The whole "an unsupported release degrades the GPU and does not stop the
-/// VM" rule starts here: a guest with no recipe is a skipped first stage, not
-/// an error.
-pub fn recipe_for(distribution: &str) -> Option<GpuRecipe> {
-    match distribution {
-        "ubuntu" => Some(GpuRecipe::Ubuntu),
-        _ => None,
-    }
-}
-
 /// What a payload says it was built for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PayloadTarget {
@@ -414,10 +396,10 @@ mod tests {
     use crate::guest_platform::{DesktopFacts, InitramfsBuilder, LibraryLayout, PackageManager};
 
     use super::{
-        Applicability, DkmsPackage, Environment, GpuRecipe, GuestCapability, GuestFacts,
-        MesaPolicy, PayloadTarget, Report, STEPS, Shell, applicability, dkms_reports_installed,
+        Applicability, DkmsPackage, Environment, GuestCapability, GuestFacts, MesaPolicy,
+        PayloadTarget, Report, STEPS, Shell, applicability, dkms_reports_installed,
         environment_document, icd_documents, module_is_loaded, parse_dkms_conf, parse_mesa_policy,
-        parse_payload_target, payload_declares, recipe_for,
+        parse_payload_target, payload_declares,
     };
 
     fn ubuntu_guest() -> GuestFacts {
@@ -494,13 +476,6 @@ mod tests {
     }
 
     #[test]
-    fn only_ubuntu_has_a_recipe_in_this_build() {
-        assert!(matches!(recipe_for("ubuntu"), Some(GpuRecipe::Ubuntu)));
-        assert!(recipe_for("debian").is_none());
-        assert!(recipe_for("").is_none());
-    }
-
-    #[test]
     fn a_payload_built_for_this_guest_applies() {
         let applies = applicability(
             &payload_for("26.04", "amd64", "7.0.0-14-generic"),
@@ -528,8 +503,15 @@ mod tests {
     }
 
     #[test]
-    fn another_release_or_architecture_does_not_apply() {
+    fn another_distribution_release_or_architecture_does_not_apply() {
+        // The question a GPU guest is asked is whether the payload serves it,
+        // with distribution among the conditions: unlike a display payload,
+        // this one carries Mesa built against a base image's glibc and does
+        // not travel between distributions.
+        let mut debian = payload_for("26.04", "amd64", "7.0.0-14-generic");
+        debian.distribution = "debian".to_owned();
         for payload in [
+            debian,
             payload_for("24.04", "amd64", "7.0.0-14-generic"),
             payload_for("26.04", "arm64", "7.0.0-14-generic"),
         ] {

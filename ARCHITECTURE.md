@@ -1461,7 +1461,7 @@ does the same thing from the other side -- its recipe treats distribution,
 release and architecture as the hard gate and the kernel as soft, since DKMS
 builds against the running kernel's headers.
 
-### GPU: the guest's Ubuntu recipe
+### GPU: the guest's recipe
 
 A mounted payload is a directory of sources, and what a guest actually needs is
 `/dev/dxg`. The recipe is what turns one into the other: the host asks for it
@@ -1502,10 +1502,23 @@ performs on its own kills GPU-PV until someone repacks a payload on the host.
 DKMS's own `AUTOINSTALL=yes` is what carries the module across that upgrade
 with VMLord not involved at all.
 
+`DISTRIBUTION` is a report and no longer a gate. Until #187 it was
+`distribution == "ubuntu"`, and the eight stages of a guest that was not
+Ubuntu were skipped with "no GPU recipe for <distribution>". The refusal is
+real, but the word was wrong: what such a guest lacks is not a recipe the
+agent has never heard of but a payload nobody built for it. Unlike the display
+side, where #185 dissolved the same gate into per-stage facts, the conditions
+here cannot dissolve -- a GPU payload carries Mesa built against the glibc of
+its base image, so distribution and release stay hard -- but they are asked of
+the mounted payload (`gpu_recipe::applicability`) in the stage below rather
+than of a name list. The guest that results is the same one with less GPU than
+it asked for; the reason it reads now names the missing payload.
+
 The stages run in order, and the first failure ends the run:
-`DISTRIBUTION` (a guest with no recipe is skipped, with the reason),
-`PAYLOAD` (the mount, its `sources.json` target and the `dkms.conf` that names
-the package), `BUILD_DEPENDENCIES`, `MODULE_SOURCE` (copied to `/usr/src`,
+`DISTRIBUTION` (what the guest is, from its own files), `PAYLOAD` (the mount,
+its `sources.json` target -- which must match the guest's distribution, release
+and architecture -- and the `dkms.conf` that names the package),
+`BUILD_DEPENDENCIES`, `MODULE_SOURCE` (copied to `/usr/src`,
 because the payload is read-only over 9p and DKMS writes beside its sources),
 `MODULE_BUILD`, `MODULE_LOAD` (`/etc/modules-load.d/vmlord-dxgkrnl.conf` and
 `modprobe`, because a module loaded only by hand is gone after the next reboot)
