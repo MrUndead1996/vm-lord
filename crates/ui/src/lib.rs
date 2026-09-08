@@ -498,6 +498,26 @@ impl eframe::App for VmlordUi {
                         self.create_vm_form = None;
                         self.edit_vm_form = None;
                     }
+
+                    // Enabled only when logging opened a file: a session with
+                    // nothing recorded has nothing to open.
+                    let open_logs = ui.add_enabled(
+                        self.application.run_log_path().is_some(),
+                        egui::Button::new(t!("app.open_logs").to_string()),
+                    );
+                    if self.application.run_log_path().is_some() {
+                        open_logs
+                            .clone()
+                            .on_hover_text(t!("app.open_logs_hint").to_string());
+                    } else {
+                        open_logs
+                            .clone()
+                            .on_disabled_hover_text(t!("app.open_logs_hint").to_string());
+                    }
+                    if open_logs.clicked() {
+                        // The panel carries whichever way it went.
+                        self.application.open_run_log().ok();
+                    }
                 });
             });
 

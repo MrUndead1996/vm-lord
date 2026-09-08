@@ -7,7 +7,7 @@ pub mod update;
 use std::{
     collections::HashMap,
     fmt,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -108,6 +108,14 @@ pub trait SettingsPathPicker {
     fn pick_log_directory(&mut self) -> Result<Option<String>, RepositoryError>;
 }
 
+/// Opens a file the way the user's system associates with it.
+///
+/// The Windows Shell call stays in the platform layer; the application only
+/// knows that a recorded log file can be handed over to be opened.
+pub trait LogFileOpener {
+    fn open_log_file(&self, path: &Path) -> Result<(), RepositoryError>;
+}
+
 pub struct WorkspaceApp {
     repository: Box<dyn VmRepository>,
     image_picker: Option<Box<dyn ImagePicker>>,
@@ -147,8 +155,20 @@ pub struct WorkspaceApp {
     /// `None` in tests and in a process that brought no panel up: a
     /// `WorkspaceApp` without a sink simply has nothing to read.
     sink: Option<DiagnosticsSink>,
+    /// The log file this launch opened, with the way to open it for the user.
+    ///
+    /// `None` in tests and in a process whose logging never came up: an
+    /// application that opened no file has nothing to show a person who asks
+    /// for the log.
+    run_log: Option<RunLog>,
     updates: update::UpdateManager,
     first_run: bool,
+}
+
+/// Where this launch logs, and who opens it on request.
+struct RunLog {
+    path: PathBuf,
+    opener: Arc<dyn LogFileOpener>,
 }
 
 struct SettingsContext {
@@ -173,6 +193,7 @@ impl WorkspaceApp {
             host_gpu: None,
             diagnostics: Vec::new(),
             sink: None,
+            run_log: None,
             updates: update::UpdateManager::default(),
             first_run: false,
         }
@@ -185,6 +206,19 @@ impl WorkspaceApp {
     #[must_use]
     pub fn with_diagnostics(mut self, sink: DiagnosticsSink) -> Self {
         self.sink = Some(sink);
+        self
+    }
+
+    /// Records the log file this launch opened, with the platform opener that
+    /// shows it to the user.
+    ///
+    /// Given rather than made here, like the sink: the composition root is
+    /// where logging started and where the path it returned still exists, and
+    /// re-deriving the name later would only guess at the stamp this run was
+    /// filed under.
+    #[must_use]
+    pub fn with_run_log(mut self, path: PathBuf, opener: Arc<dyn LogFileOpener>) -> Self {
+        self.run_log = Some(RunLog { path, opener });
         self
     }
 
@@ -815,6 +849,59 @@ impl WorkspaceApp {
                     vm = name,
                     code = error.code().unwrap_or_default(),
                     "Failed to open the COM port of VM \"{name}\": {error}"
+                );
+                self.collect_diagnostics();
+                Err(error)
+            }
+        }
+    }
+
+    /// The log file this launch opened, when logging came up.
+    #[must_use]
+    pub fn run_log_path(&self) -> Option<&Path> {
+        self.run_log.as_ref().map(|run_log| run_log.path.as_path())
+    }
+
+    /// Opens this launch's log file with the user's associated application.
+    ///
+    /// Both outcomes land in the panel, like every action whose only account
+    /// is its report: a Shell association is outside this layer's sight, so
+    /// whether a window came up is the user's to see, and the record beside it
+    /// is what VMLord contributes.
+    ///
+    /// # Errors
+    ///
+    /// [`RepositoryError`] when this session recorded no log file, or when the
+    /// platform opener refuses the one it recorded.
+    pub fn open_run_log(&mut self) -> Result<(), RepositoryError> {
+        let Some(RunLog { path, opener }) = self.run_log.as_ref() else {
+            let error = RepositoryError::new("this session recorded no log file to open");
+            vmlord_core::diagnostic!(
+                Error,
+                Subsystem::App,
+                "Failed to open this session's log file: {error}"
+            );
+            self.collect_diagnostics();
+            return Err(error);
+        };
+
+        match opener.open_log_file(path) {
+            Ok(()) => {
+                vmlord_core::diagnostic!(
+                    Info,
+                    Subsystem::App,
+                    "Opening this session's log file at {}",
+                    path.display()
+                );
+                self.collect_diagnostics();
+                Ok(())
+            }
+            Err(error) => {
+                vmlord_core::diagnostic!(
+                    Error,
+                    Subsystem::App,
+                    code = error.code().unwrap_or_default(),
+                    "Failed to open this session's log file: {error}"
                 );
                 self.collect_diagnostics();
                 Err(error)
