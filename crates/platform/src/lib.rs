@@ -51,6 +51,7 @@ mod hvsocket;
 mod import;
 mod installer;
 mod layout;
+mod log_opener;
 mod metadata;
 mod password_hash;
 mod paths;
@@ -95,6 +96,7 @@ pub use hcs::{
 pub use host_guest_defaults::host_guest_defaults;
 pub use import::{ImportSummary, import_image};
 pub use installer::{InstallerLaunch, launch_installer};
+pub use log_opener::open_log_file;
 pub use metadata::{MetadataStore, VmComputeSystemMapping};
 pub use password_hash::hash_password;
 pub use reconnect::{

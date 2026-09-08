@@ -22,6 +22,7 @@ fn main() {
             .map(|settings_load| (store, settings_load))
     });
     let mut diagnostics = None;
+    let mut run_log = None;
     let repository = match &settings {
         Ok((_, settings_load)) => {
             match vmlord_core::initialize_with_diagnostics(&settings_load.settings) {
@@ -34,6 +35,7 @@ fn main() {
                         log_path.display(),
                         settings_load.settings.log_level
                     );
+                    run_log = Some(log_path);
                     load_backend(&settings_load.settings)
                 }
                 Err(error) => {
@@ -108,6 +110,11 @@ fn main() {
     if let Some(sink) = diagnostics {
         application = application.with_diagnostics(sink);
     }
+    // The file logging actually opened this launch, not the configured folder:
+    // the folder holds every run's file, the button opens this one's.
+    if let Some(log_path) = run_log {
+        application = application.with_run_log(log_path, Arc::new(WindowsLogOpener));
+    }
     if let Ok((store, settings_load)) = settings {
         application = application
             .with_settings(store, settings_load.settings)
@@ -169,6 +176,15 @@ impl vmlord_app::UpdateRuntime for WindowsUpdateRuntime {
             installer.to_path_buf(),
         ))
         .map_err(|error| error.to_string())
+    }
+}
+
+/// The composition-root opener that hands a log file to Windows Shell.
+struct WindowsLogOpener;
+
+impl vmlord_app::LogFileOpener for WindowsLogOpener {
+    fn open_log_file(&self, path: &Path) -> Result<(), vmlord_core::RepositoryError> {
+        vmlord_platform::open_log_file(path)
     }
 }
 
