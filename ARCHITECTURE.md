@@ -558,6 +558,47 @@ section and has to be re-created to become rebootable, exactly as one predating
 #70 has to be re-created to become stoppable. Existing VMs are not migrated:
 VMLord has no users yet.
 
+`platform::VmRebootPipeline` asks for the same thing from the host's side. HCS
+has no restart call of its own -- `HcsRestartComputeSystem` does not exist --
+but schema 2.5 gives `HcsShutDownComputeSystem`'s options document a `Type`,
+and `Reboot` is its other value: the same call, over the same
+`IntegrationService` channel, reaches a guest whose `hv_util` answers with
+`orderly_reboot` rather than `orderly_poweroff`. A successful call means what
+a shutdown's does -- HCS delivered the request -- and nothing more, and the
+wait for that answer is bounded by the same sixty seconds. Only a running VM
+can be asked, for the same reason the UI offers the button only then: a reboot
+is a request to the guest that is running now.
+
+A reboot tears down nothing. A shutdown that was delivered gives up the VM's
+agent connection and its HCS event watch, because the guest is on its way out;
+a reboot is the opposite case, the one #110 fixed -- the guest restarts inside
+the same compute system, its agent reconnects to the listener that never went
+away, and the COM1 console keeps its log through the boot that follows. All of
+it stays exactly where it is, and the VM can be asked again the moment the
+request is over, which is why a delivered request is an Info line saying the
+VM stays running until it comes back rather than a teardown.
+
+HCS first, the guest's own agent second. A pre-#70 VM has no integration
+service to carry the request, and HCS says so with `ERROR_NOT_SUPPORTED` --
+the one failure VMLord answers by asking the agent over its session instead
+(protocol 1.9's `RebootRequest`, which the agent carries out with
+`systemctl reboot`). The ask goes out only after the session's liveness probe
+is answered -- a socket that looks open proves nothing about who is on it --
+and it queues behind any work the session is already doing, which is why its
+timeout is a generous half hour: a display update ahead of it in the queue is
+allowed twenty minutes of its own. An agent that is offline, too old to be
+asked, or refuses turns both failures into one refusal naming both, ending
+with the honest alternative -- stop the VM and start it again for the same
+effect -- which VMLord does not do by itself: a stop loses what a refused
+reboot keeps, and choosing it is the user's. Any other HCS failure is
+reported as it is and never falls back, because a host that cannot deliver a
+request it supports is a problem the guest's agent cannot stand in for.
+
+`platform::reboot_workers::RebootWorkers` carries each request on a thread of
+its own, for the same reason the shutdown's does, and refuses a second reboot
+of a VM whose first is still in flight: clicking again means "it is taking
+long", not "ask once more".
+
 `platform::VmForceStopPipeline` is that remaining option: it stops a known VM
 through `HcsTerminateComputeSystem`, which needs nothing from the guest, so its
 completion means the VM really has stopped.

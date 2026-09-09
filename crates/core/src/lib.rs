@@ -272,6 +272,17 @@ pub trait VmRepository {
     fn start_vm(&mut self, name: &str) -> Result<(), RepositoryError>;
     fn stop_vm(&mut self, name: &str) -> Result<(), RepositoryError>;
     fn force_stop_vm(&mut self, name: &str) -> Result<(), RepositoryError>;
+    /// Asks the guest of the VM named `name` to reboot in place.
+    ///
+    /// Required rather than defaulted, for the reason `delete_vm` is: rebooting
+    /// is a thing every backend is offered as a button, so a backend that
+    /// cannot do it has to say so at the click instead of inheriting silence.
+    ///
+    /// Returning `Ok` means the request was accepted -- by the hypervisor's own
+    /// path or by the guest's agent -- not that the guest has gone down or come
+    /// back: the VM keeps running until the guest acts on the request, and
+    /// nothing that belongs to the run is torn down on the way.
+    fn reboot_vm(&mut self, name: &str) -> Result<(), RepositoryError>;
     /// Removes the VM and every resource VMLord created for it.
     ///
     /// Required rather than defaulted: a backend that cannot delete VMs has to
@@ -572,6 +583,9 @@ mod tests {
                 Ok(())
             }
             fn force_stop_vm(&mut self, _name: &str) -> Result<(), RepositoryError> {
+                Ok(())
+            }
+            fn reboot_vm(&mut self, _name: &str) -> Result<(), RepositoryError> {
                 Ok(())
             }
             fn delete_vm(&mut self, _request: VmDeleteRequest) -> Result<(), RepositoryError> {

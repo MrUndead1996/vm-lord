@@ -15,7 +15,7 @@ use vmlord_agent_protocol::{
         AttachGpuSharesResponse, AuthenticateResponse, Capability, DisplayMount, DisplayRecipeStep,
         DisplayShare, DisplayUpdateOutcome, Envelope, ErrorCode, GpuMount, GpuRecipeStage,
         GpuShare, HeartbeatRequest, HeartbeatResponse, HelloRequest, ProbeGpuResponse,
-        ProtocolVersion, UpdateDisplayPayloadResponse, envelope, request, response,
+        ProtocolVersion, RebootResponse, UpdateDisplayPayloadResponse, envelope, request, response,
     },
 };
 
@@ -53,6 +53,10 @@ pub struct Handlers<'a> {
     pub apply_display_recipe: &'a mut dyn FnMut(Option<(u32, u32)>) -> ApplyDisplayRecipeResponse,
     /// Moves the guest to the version the mounted payload carries.
     pub update_display: &'a mut dyn FnMut(&str) -> UpdateDisplayPayloadResponse,
+    /// Reboots the guest, returning why it could not be initiated. The
+    /// answer is written after the reboot job is queued, so a host that
+    /// received it knows the reboot is under way.
+    pub reboot: &'a mut dyn FnMut() -> Result<(), String>,
 }
 
 /// What a session agreed on when it opened.
@@ -296,6 +300,22 @@ fn serve<S: Read + Write>(
                     Envelope::response(request_id, response::Kind::UpdateDisplayPayload(update));
                 frame::write(stream, &report, buffer).map_err(SessionError::Frame)?;
             }
+            // A reboot is base protocol, gated on neither capability: the
+            // session had to agree on this minor to exist at all, and the
+            // arm arrived in that minor. It is answered from here like
+            // everything else -- the answer means the reboot was queued,
+            // and it is written after `systemctl` accepted the job, so a
+            // host that read it is not promised a reboot that never
+            // started.
+            Body::Request(request::Kind::Reboot(_)) => {
+                let report = match (handlers.reboot)() {
+                    Ok(()) => {
+                        Envelope::response(request_id, response::Kind::Reboot(RebootResponse {}))
+                    }
+                    Err(reason) => Envelope::error(request_id, ErrorCode::Unavailable, reason),
+                };
+                frame::write(stream, &report, buffer).map_err(SessionError::Frame)?;
+            }
             Body::Request(_) | Body::UnknownRequest => {
                 refuse_unsupported(stream, request_id, buffer)?;
             }
@@ -397,6 +417,7 @@ fn kind_name(kind: &request::Kind) -> &'static str {
         request::Kind::AttachDisplayPayload(_) => "a display payload share out of order",
         request::Kind::ApplyDisplayRecipe(_) => "a display recipe request out of order",
         request::Kind::UpdateDisplayPayload(_) => "a display payload update out of order",
+        request::Kind::Reboot(_) => "a reboot request out of order",
     }
 }
 
@@ -466,7 +487,8 @@ mod tests {
             ErrorCode, GpuMount, GpuMountState, GpuProbeCheck, GpuProbeCheckState, GpuProbeStep,
             GpuProbeVerdict, GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep, GpuShare,
             GpuShareRole, HelloRequest, HelloResponse, ProbeGpuRequest, ProbeGpuResponse,
-            ProtocolVersion, UpdateDisplayPayloadResponse, envelope, request, response,
+            ProtocolVersion, RebootRequest, UpdateDisplayPayloadResponse, envelope, request,
+            response,
         },
     };
 
@@ -543,6 +565,7 @@ mod tests {
         attach_display: &'a mut dyn FnMut(&DisplayShare) -> DisplayMount,
         apply_display_recipe: &'a mut dyn FnMut(Option<(u32, u32)>) -> ApplyDisplayRecipeResponse,
         update_display: &'a mut dyn FnMut(&str) -> UpdateDisplayPayloadResponse,
+        reboot: &'a mut dyn FnMut() -> Result<(), String>,
     ) -> Handlers<'a> {
         Handlers {
             attach_gpu,
@@ -551,6 +574,7 @@ mod tests {
             attach_display,
             apply_display_recipe,
             update_display,
+            reboot,
         }
     }
 
@@ -677,6 +701,7 @@ mod tests {
                 &mut |_share| DisplayMount::default(),
                 &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
+                &mut || Ok(()),
             ),
         )
         .expect("the host closes after the heartbeat");
@@ -759,6 +784,7 @@ mod tests {
                 &mut |_share| DisplayMount::default(),
                 &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
+                &mut || Ok(()),
             ),
         )
         .expect_err("a timeout after a partial frame must end the session");
@@ -812,6 +838,7 @@ mod tests {
                 &mut |_share| DisplayMount::default(),
                 &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
+                &mut || Ok(()),
             ),
         )
         .expect("the host closes after the refusal");
@@ -869,6 +896,7 @@ mod tests {
                 &mut |_share| DisplayMount::default(),
                 &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
+                &mut || Ok(()),
             ),
         )
         .expect("a compatible host hang-up");
@@ -917,6 +945,7 @@ mod tests {
                 &mut |_share| DisplayMount::default(),
                 &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
+                &mut || Ok(()),
             ),
         )
         .expect_err("a capability the agent did not announce must not be served");
@@ -987,6 +1016,7 @@ mod tests {
                 &mut |_share| DisplayMount::default(),
                 &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
+                &mut || Ok(()),
             ),
         )
         .expect("the host closes after its manifest was answered");
@@ -1054,6 +1084,7 @@ mod tests {
                 &mut |_share| DisplayMount::default(),
                 &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
+                &mut || Ok(()),
             ),
         )
         .expect("the host closes after its recipe was answered");
@@ -1126,6 +1157,7 @@ mod tests {
                 &mut |_share| DisplayMount::default(),
                 &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
+                &mut || Ok(()),
             ),
         )
         .expect("the host closes after its probe was answered");
@@ -1184,6 +1216,7 @@ mod tests {
                 &mut |_share| DisplayMount::default(),
                 &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
+                &mut || Ok(()),
             ),
         )
         .expect("the host closes after the refusal");
@@ -1240,6 +1273,7 @@ mod tests {
                 &mut |_share| DisplayMount::default(),
                 &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
+                &mut || Ok(()),
             ),
         )
         .expect("the host closes after the refusal");
@@ -1298,6 +1332,7 @@ mod tests {
                 &mut |_share| DisplayMount::default(),
                 &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
+                &mut || Ok(()),
             ),
         )
         .expect("the host closes after the refusal");
@@ -1349,6 +1384,7 @@ mod tests {
                 &mut |_share| DisplayMount::default(),
                 &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
+                &mut || Ok(()),
             ),
         )
         .expect_err("a revision this agent never claimed must not be served");
@@ -1386,10 +1422,129 @@ mod tests {
                 &mut |_share| DisplayMount::default(),
                 &mut |_mode| ApplyDisplayRecipeResponse::default(),
                 &mut |_version| UpdateDisplayPayloadResponse::default(),
+                &mut || Ok(()),
             ),
         )
         .expect_err("a host that hangs up before its challenge ends the session");
 
         assert_eq!(opened, None);
+    }
+
+    #[test]
+    fn a_reboot_request_is_carried_out_and_answered_from_the_session() {
+        // A reboot is base protocol: it needs no capability and no newer
+        // minor than the one that introduced it, because a guest that
+        // negotiated this far can be asked to reboot.
+        let secret = Secret::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .expect("a valid test secret");
+        let nonce = Nonce::from_wire(&[7; auth::LEN]).expect("a valid nonce");
+        let mut rebooted = false;
+        let mut stream = ScriptedStream::new([
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::response(
+                1,
+                response::Kind::Hello(HelloResponse {
+                    version: Some(ProtocolVersion::current()),
+                    capabilities: vec![],
+                }),
+            )),
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::request(
+                1,
+                request::Kind::Authenticate(AuthenticateRequest {
+                    nonce: nonce.as_bytes().to_vec(),
+                }),
+            )),
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::request(
+                3,
+                request::Kind::Reboot(RebootRequest {}),
+            )),
+        ]);
+
+        let mut opened = None;
+        run(
+            &mut stream,
+            &secret,
+            "test-agent",
+            &mut opened,
+            handlers(
+                &mut refuse_to_mount,
+                &mut apply_nothing,
+                &mut probe_nothing,
+                &mut |_share| DisplayMount::default(),
+                &mut |_mode| ApplyDisplayRecipeResponse::default(),
+                &mut |_version| UpdateDisplayPayloadResponse::default(),
+                &mut || {
+                    rebooted = true;
+                    Ok(())
+                },
+            ),
+        )
+        .expect("the host closes after the reboot");
+
+        assert!(rebooted, "the reboot handler ran");
+        let frames = stream.written_frames();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[2].request_id, 3);
+        let Some(envelope::Body::Response(answer)) = &frames[2].body else {
+            panic!("the reboot needs an answer");
+        };
+        assert!(matches!(answer.kind, Some(response::Kind::Reboot(_))));
+    }
+
+    #[test]
+    fn a_reboot_the_guest_cannot_start_is_refused_with_its_reason() {
+        // An answer that says nothing would leave the host reporting a
+        // delivered reboot that never happened.
+        let secret = Secret::from_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+            .expect("a valid test secret");
+        let nonce = Nonce::from_wire(&[7; auth::LEN]).expect("a valid nonce");
+        let mut stream = ScriptedStream::new([
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::response(
+                1,
+                response::Kind::Hello(HelloResponse {
+                    version: Some(ProtocolVersion::current()),
+                    capabilities: vec![],
+                }),
+            )),
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::request(
+                1,
+                request::Kind::Authenticate(AuthenticateRequest {
+                    nonce: nonce.as_bytes().to_vec(),
+                }),
+            )),
+            ScriptedStream::frame(vmlord_agent_protocol::v1::Envelope::request(
+                3,
+                request::Kind::Reboot(RebootRequest {}),
+            )),
+        ]);
+
+        let mut opened = None;
+        run(
+            &mut stream,
+            &secret,
+            "test-agent",
+            &mut opened,
+            handlers(
+                &mut refuse_to_mount,
+                &mut apply_nothing,
+                &mut probe_nothing,
+                &mut |_share| DisplayMount::default(),
+                &mut |_mode| ApplyDisplayRecipeResponse::default(),
+                &mut |_version| UpdateDisplayPayloadResponse::default(),
+                &mut || Err("systemd refused the reboot".to_owned()),
+            ),
+        )
+        .expect("the host closes after the refusal");
+
+        let frames = stream.written_frames();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[2].request_id, 3);
+        let Some(envelope::Body::Response(answer)) = &frames[2].body else {
+            panic!("the failed reboot needs an error response");
+        };
+        let Some(response::Kind::Error(error)) = &answer.kind else {
+            panic!("the failed reboot needs an error response");
+        };
+        assert_eq!(error.code(), ErrorCode::Unavailable);
+        assert_eq!(error.message, "systemd refused the reboot");
     }
 }

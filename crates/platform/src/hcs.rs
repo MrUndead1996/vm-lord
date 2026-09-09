@@ -159,6 +159,18 @@ fn call_failure(operation: &'static str, id: &str, error: windows::core::Error) 
     }
 }
 
+/// The outcome of a reboot request HCS could not carry out.
+///
+/// `Unsupported` is kept apart from every other failure because it is the one a
+/// caller can answer another way: a VM whose guest offers no integration
+/// service to carry a reboot can still be asked to reboot itself, by its own
+/// agent. `Failed` is everything else -- an HCS that is broken is not made
+/// better by asking the guest behind its back.
+pub(crate) enum HcsRebootFailure {
+    Unsupported(RepositoryError),
+    Failed(RepositoryError),
+}
+
 /// Classifies an operation HCS accepted and then failed.
 fn operation_failure(
     operation: &'static str,
@@ -339,6 +351,60 @@ impl HcsSystem {
                     self.id
                 );
                 Err(error)
+            }
+        }
+    }
+
+    /// Asks the guest to reboot in place, returning the pending operation.
+    ///
+    /// The same HCS call a graceful shutdown makes, with the options that ask
+    /// for a reboot instead: HCS has no restart API of its own, and the
+    /// shutdown schema carries a `Type` that asks the guest to come back up.
+    /// The operation completes once the request is delivered, not once the
+    /// guest is back; the VM keeps running until it goes down on its own.
+    pub fn reboot(&self) -> Result<HcsOperation, RepositoryError> {
+        tracing::debug!("rebooting HCS compute system \"{}\"", self.id);
+        let operation = HcsOperation::new();
+        let options = HSTRING::from(reboot_options());
+        // SAFETY: `self.handle` and `operation.0` are valid owned handles for
+        // the duration of this call, and `options` outlives it.
+        unsafe { HcsShutDownComputeSystem(self.handle, operation.0, &options) }.map_err(
+            |error| {
+                let error = windows_error("reboot compute system", Some(&self.id), error);
+                tracing::error!("{error}");
+                error
+            },
+        )?;
+        Ok(operation)
+    }
+
+    /// Requests an in-place reboot and waits up to `timeout` for HCS to report
+    /// the request's outcome.
+    ///
+    /// [`HcsRebootFailure::Unsupported`] is kept apart from every other
+    /// failure, because it is the one with another way forward: the VM's own
+    /// agent can be asked to reboot the guest directly, and
+    /// [`crate::reboot_with_agent_fallback`] is what decides that.
+    pub(crate) fn reboot_and_wait(&self, timeout: Duration) -> Result<(), HcsRebootFailure> {
+        // A call HCS refuses outright never reached the guest, so there is no
+        // delivery to call unsupported: whatever it is, it is an HCS failure.
+        let operation = self.reboot().map_err(HcsRebootFailure::Failed)?;
+        match operation.wait(timeout) {
+            Ok(_document) => Ok(()),
+            Err(WaitFailure::Windows(error))
+                if error.code() == ERROR_NOT_SUPPORTED.to_hresult() =>
+            {
+                let error = unsupported_reboot_error(&self.id, error.code().0 as u32);
+                tracing::error!("{error}");
+                Err(HcsRebootFailure::Unsupported(error))
+            }
+            Err(failure) => {
+                let error = wait_failure(timeout, failure);
+                tracing::error!(
+                    "the reboot of HCS compute system \"{}\" failed: {error}",
+                    self.id
+                );
+                Err(HcsRebootFailure::Failed(error))
             }
         }
     }
@@ -621,6 +687,21 @@ fn shutdown_options() -> &'static str {
     )
 }
 
+/// The options document that asks `HcsShutDownComputeSystem` for a reboot.
+///
+/// HCS has no restart call of its own; the shutdown schema offers a `Type` that
+/// asks the guest to come back up instead of powering off, and the guest's
+/// `hv_util` answers it with an orderly reboot (#181). The mechanism is named
+/// for the reason a shutdown's is, and `Force` stays false for that reason too:
+/// a forced stop is a different action, and a guest that cannot take this
+/// request is asked again through its own agent rather than made to.
+fn reboot_options() -> &'static str {
+    concat!(
+        r#"{"Mechanism":"IntegrationService","Type":"Reboot","Force":false,"#,
+        r#""Reason":"VMLord was asked to reboot this VM"}"#
+    )
+}
+
 /// The document asking HCS to hot-detach the adapter keyed by `endpoint_id`.
 ///
 /// `RequestType: "Remove"` against the adapter's own resource path: HCS takes
@@ -651,6 +732,22 @@ fn unsupported_shutdown_error(id: &str, hresult: u32) -> RepositoryError {
          (HRESULT 0x{hresult:08X}, ERROR_NOT_SUPPORTED); the VM offers its guest \
          no shutdown service, which is how VMLord built VMs before #70, so only \
          a forced stop can stop it"
+    ))
+}
+
+/// Reports a reboot HCS accepted but cannot deliver.
+///
+/// The reboot operation fails with `ERROR_NOT_SUPPORTED` when the compute
+/// system offers its guest no integration service to carry one -- a VM built
+/// before #70, or a guest whose drivers serve none. Unlike a shutdown's, this
+/// message offers no forced stop: stopping and starting the VM again is a
+/// different thing from rebooting it, and the caller that falls back to the
+/// in-guest agent is the one that decides what to say about the ways forward.
+fn unsupported_reboot_error(id: &str, hresult: u32) -> RepositoryError {
+    RepositoryError::new(format!(
+        "HCS cannot deliver a reboot request to compute system \"{id}\" \
+         (HRESULT 0x{hresult:08X}, ERROR_NOT_SUPPORTED); the VM offers its guest \
+         no integration service to carry one"
     ))
 }
 
@@ -1052,8 +1149,8 @@ mod tests {
     use super::{
         HcsClient, HcsModifyFailure, HcsStartFailure, HcsSystemState, HcsSystemSummary,
         call_failure, detach_adapter_document, hcs_service_properties_query,
-        parse_enumerate_result, parse_service_result, parse_system_state, shutdown_options,
-        unsupported_shutdown_error,
+        parse_enumerate_result, parse_service_result, parse_system_state, reboot_options,
+        shutdown_options, unsupported_reboot_error, unsupported_shutdown_error,
     };
 
     #[test]
@@ -1230,6 +1327,46 @@ mod tests {
         assert!(error.to_string().contains("vmlord-dev"));
         assert!(error.to_string().contains("0x80070032"));
         assert!(error.to_string().contains("forced stop"));
+    }
+
+    #[test]
+    fn reboot_options_are_a_valid_json_document() {
+        // A reboot travels the same `HcsShutDownComputeSystem` call, so its
+        // options are held to the same rule: a null or unparsable document
+        // fails the operation with `HCS_E_INVALID_JSON`.
+        let options = reboot_options();
+
+        assert!(!options.is_empty());
+        assert!(serde_json::from_str::<serde_json::Value>(options).is_ok());
+    }
+
+    #[test]
+    fn a_reboot_asks_the_guests_own_integration_service_and_comes_back_up() {
+        // HCS has no restart of its own: the shutdown call carries the request,
+        // and the `Type` the same schema offers is what asks the guest to come
+        // back up. The mechanism is named for the reason a shutdown's is (#70)
+        // -- left to itself HCS reaches for a guest connection VMLord's VMs do
+        // not have.
+        let options: serde_json::Value = serde_json::from_str(reboot_options()).unwrap();
+
+        assert_eq!(options["Mechanism"], "IntegrationService");
+        assert_eq!(options["Type"], "Reboot");
+        // A reboot the guest is allowed to take its time over: a forced one is
+        // not a reboot, and the guest that cannot take this request is asked
+        // again through its own agent rather than made to.
+        assert_eq!(options["Force"], false);
+    }
+
+    #[test]
+    fn an_unsupported_reboot_names_the_system_without_offering_a_forced_stop() {
+        // Unlike a shutdown's, this refusal is not the end of the road: the
+        // caller falls back to asking the VM's own agent, and a forced stop is
+        // a different thing from a reboot. The message must not point at one.
+        let error = unsupported_reboot_error("vmlord-dev", 0x8007_0032);
+
+        assert!(error.to_string().contains("vmlord-dev"));
+        assert!(error.to_string().contains("0x80070032"));
+        assert!(!error.to_string().contains("forced stop"));
     }
 
     #[test]

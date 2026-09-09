@@ -564,6 +564,7 @@ impl eframe::App for VmlordUi {
                 VmAction::Start
                 | VmAction::Stop
                 | VmAction::ForceStop
+                | VmAction::Reboot
                 | VmAction::CancelCreate
                 | VmAction::Connect
                 | VmAction::Ssh
@@ -574,6 +575,7 @@ impl eframe::App for VmlordUi {
                             VmAction::Start => self.application.start_vm(&name),
                             VmAction::Stop => self.application.stop_vm(&name),
                             VmAction::ForceStop => self.application.force_stop_vm(&name),
+                            VmAction::Reboot => self.application.reboot_vm(&name),
                             VmAction::CancelCreate => self.application.cancel_create(&name),
                             VmAction::Connect => self.application.connect_display(&name),
                             VmAction::Ssh => self.application.open_ssh(&name),
@@ -2419,6 +2421,18 @@ fn render_selected_vm(
             !is_building,
             Some(&t!("actions.after_build")),
         );
+        // Its own group rather than a place in the one above: the lifecycle
+        // pair is offered as soon as a VM exists, while a reboot asks the guest
+        // that is running now, and sharing the group's enable would offer it
+        // to a VM that is starting or stopped.
+        if let Some(clicked_action) = render_action_group(
+            ui,
+            &[(VmAction::Reboot, &t!("actions.reboot"))],
+            is_running,
+            Some(&t!("actions.only_while_running")),
+        ) {
+            action = Some(clicked_action);
+        }
         ui.separator();
         let (can_connect, waiting_for) = connect_offer(display_status);
         if let Some(clicked_action) = render_action_group(
@@ -2672,6 +2686,20 @@ fn render_action_icon(ui: &mut egui::Ui, action: VmAction, enabled: bool) -> egu
                 stroke,
             );
         }
+        VmAction::Reboot => {
+            // A circle with an arrow along it: the restart glyph, going round
+            // the way the VM is about to.
+            painter.circle_stroke(center, 5.5, stroke);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(center.x + 4.5, center.y - 5.5),
+                    egui::pos2(center.x - 1.0, center.y - 8.2),
+                    egui::pos2(center.x - 1.0, center.y - 2.8),
+                ],
+                color,
+                egui::Stroke::NONE,
+            ));
+        }
         VmAction::CancelCreate => {
             painter.circle_stroke(center, 6.0, stroke);
             painter.line_segment(
@@ -2807,7 +2835,9 @@ fn render_action_icon(ui: &mut egui::Ui, action: VmAction, enabled: bool) -> egu
 fn action_color(action: VmAction) -> egui::Color32 {
     match action {
         VmAction::Create | VmAction::Start => egui::Color32::from_rgb(84, 158, 230),
-        VmAction::Stop => egui::Color32::from_rgb(235, 210, 64),
+        // Reboot beside Stop for the same reason: both ask a running guest to
+        // end what it is doing on its own terms, and neither promises when.
+        VmAction::Stop | VmAction::Reboot => egui::Color32::from_rgb(235, 210, 64),
         VmAction::ForceStop => egui::Color32::from_rgb(225, 70, 70),
         VmAction::CancelCreate => egui::Color32::from_rgb(235, 170, 64),
         VmAction::Connect | VmAction::Ssh | VmAction::Console | VmAction::UpdateDisplay => {
@@ -3255,6 +3285,7 @@ mod tests {
     #[test]
     fn the_actions_are_translated() {
         assert_eq!(t!("actions.start", locale = "ru-RU"), "Запустить");
+        assert_eq!(t!("actions.reboot", locale = "ru-RU"), "Перезапустить");
         assert_eq!(
             t!(
                 "ssh.endpoint",

@@ -44,6 +44,10 @@ impl VmRepository for FakeRepository {
         Ok(())
     }
 
+    fn reboot_vm(&mut self, _name: &str) -> Result<(), RepositoryError> {
+        Ok(())
+    }
+
     fn delete_vm(&mut self, _request: vmlord_core::VmDeleteRequest) -> Result<(), RepositoryError> {
         Ok(())
     }
