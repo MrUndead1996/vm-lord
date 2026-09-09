@@ -55,6 +55,8 @@ mod log_opener;
 mod metadata;
 mod password_hash;
 mod paths;
+mod reboot;
+mod reboot_workers;
 mod reconnect;
 mod repository;
 mod run_recovery;
@@ -99,6 +101,7 @@ pub use installer::{InstallerLaunch, launch_installer};
 pub use log_opener::open_log_file;
 pub use metadata::{MetadataStore, VmComputeSystemMapping};
 pub use password_hash::hash_password;
+pub use reboot::VmRebootPipeline;
 pub use reconnect::{
     ReconnectOutcome, ReconnectReport, ReconnectedVm, VmConnections, reconnect_known_vms,
 };

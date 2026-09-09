@@ -67,6 +67,8 @@ pub enum VmAction {
     Start,
     Stop,
     ForceStop,
+    /// Ask a running VM's guest to reboot in place.
+    Reboot,
     /// Stop building a VM that is still being created.
     CancelCreate,
     Connect,
@@ -86,6 +88,7 @@ impl VmAction {
             Self::Start => "Start",
             Self::Stop => "Stop",
             Self::ForceStop => "Force stop",
+            Self::Reboot => "Reboot",
             Self::CancelCreate => "Cancel creation",
             Self::Connect => "Connect",
             // What it opens, not where: which terminal host ends up showing
@@ -614,6 +617,16 @@ impl WorkspaceApp {
         self.run_vm_lifecycle_action(name, "force stop", |repository| {
             repository.force_stop_vm(name)
         })
+    }
+
+    /// Asks a running VM's guest to reboot in place.
+    ///
+    /// The request is accepted rather than completed: the VM stays running
+    /// until the guest acts on it, and the answer -- delivered or refused --
+    /// arrives as a diagnostic on a later refresh. Nothing is torn down on the
+    /// way, which is what separates this from a stop.
+    pub fn reboot_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
+        self.run_vm_lifecycle_action(name, "reboot", |repository| repository.reboot_vm(name))
     }
 
     /// Deletes a VM and every resource VMLord created for it.
@@ -1188,6 +1201,10 @@ impl VmRepository for UnavailableRepository {
         Err(RepositoryError::new(self.message.clone()))
     }
 
+    fn reboot_vm(&mut self, _name: &str) -> Result<(), RepositoryError> {
+        Err(RepositoryError::new(self.message.clone()))
+    }
+
     fn delete_vm(&mut self, _request: VmDeleteRequest) -> Result<(), RepositoryError> {
         Err(RepositoryError::new(self.message.clone()))
     }
@@ -1458,6 +1475,19 @@ mod tests {
             Ok(())
         }
 
+        /// Reboots the way the native backend does: only a running VM can be
+        /// asked, and the answer -- the guest coming back or not -- is not this
+        /// call's to give.
+        fn reboot_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
+            self.actions.push(format!("reboot:{name}"));
+            if !self.vm_is_running {
+                return Err(RepositoryError::new(format!(
+                    "VM \"{name}\" is not running, so it cannot be rebooted"
+                )));
+            }
+            Ok(())
+        }
+
         fn delete_vm(&mut self, request: VmDeleteRequest) -> Result<(), RepositoryError> {
             self.actions
                 .push(format!("delete:{}:{}", request.name, request.delete_disks));
@@ -1725,12 +1755,17 @@ mod tests {
     #[test]
     fn lifecycle_actions_are_available_to_ui_clients() {
         let (sink, _guard) = records();
-        let mut app = WorkspaceApp::new(Box::new(FakeRepository::default())).with_diagnostics(sink);
+        let mut app = WorkspaceApp::new(Box::new(FakeRepository {
+            vm_is_running: true,
+            ..FakeRepository::default()
+        }))
+        .with_diagnostics(sink);
         app.start();
 
         app.start_vm("dev").unwrap();
         app.stop_vm("dev").unwrap();
         app.force_stop_vm("dev").unwrap();
+        app.reboot_vm("dev").unwrap();
 
         assert!(
             app.diagnostics()
@@ -1746,6 +1781,11 @@ mod tests {
             app.diagnostics().iter().any(|diagnostic| {
                 diagnostic.message == "VM \"dev\" force stop request accepted"
             })
+        );
+        assert!(
+            app.diagnostics()
+                .iter()
+                .any(|diagnostic| diagnostic.message == "VM \"dev\" reboot request accepted")
         );
     }
 

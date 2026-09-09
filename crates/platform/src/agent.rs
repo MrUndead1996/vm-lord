@@ -78,6 +78,15 @@ impl AgentSessions {
         Some(self.0.get(&vm_id)?.display_update_channel())
     }
 
+    /// Hands out the way to ask the agent of `vm_id` to reboot its guest.
+    ///
+    /// A channel for the reason the update's is, and `None` for the same
+    /// reason too: a VM VMLord is not listening for is one whose agent cannot
+    /// be asked anything.
+    pub(crate) fn reboot_channel(&self, vm_id: Uuid) -> Option<RebootChannel> {
+        Some(self.0.get(&vm_id)?.reboot_channel())
+    }
+
     /// Whether the agent of `vm_id` has a session open right now.
     ///
     /// `None` means VMLord is not listening for that VM at all, which is not
@@ -106,6 +115,10 @@ pub(crate) struct AgentConnection {
     /// Where a display payload update is handed to the thread that owns the
     /// session.
     updates: Sender<DisplayUpdate>,
+    /// Where a reboot ask is handed to the same thread, and for the same
+    /// reason: a session is one conversation, and the ask becomes a request in
+    /// the one place frames are written.
+    reboots: Sender<AgentReboot>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -122,6 +135,15 @@ pub(crate) struct DisplayUpdateAnswer {
     pub(crate) report: GuestDisplayPayloadReport,
 }
 
+/// One reboot ask, and where its answer goes.
+///
+/// Empty of instructions for the reason the request on the wire is: the guest
+/// knows how to reboot itself, and the answer says it accepted the job -- which
+/// is a refusal when it is an `Err`, with the guest's own reason in it.
+pub(crate) struct AgentReboot {
+    pub(crate) answer: Sender<Result<(), String>>,
+}
+
 /// How long a caller waits for a guest to finish an update.
 ///
 /// Long, because what it waits on is a DKMS build against the guest's running
@@ -129,6 +151,15 @@ pub(crate) struct DisplayUpdateAnswer {
 /// forever, because a guest that stopped answering must not hold the thread
 /// that asked.
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+/// How long a caller waits for a guest to take a reboot ask.
+///
+/// Longer than an update's, because the ask can arrive while one is in flight:
+/// the session serves one request at a time, so the reboot queues behind a DKMS
+/// build that is allowed twenty minutes on its own. The reboot itself is
+/// seconds -- it is the wait for the socket to come free that has to be paid
+/// for here.
+const REBOOT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// The way to ask one VM's guest for a display payload update, off the thread
 /// that owns the session registry.
@@ -145,6 +176,17 @@ pub(crate) struct DisplayUpdateChannel {
     updates: Sender<DisplayUpdate>,
 }
 
+/// The way to ask one VM's guest to reboot itself, off the thread that owns the
+/// session registry.
+///
+/// Carries what the asking needs and nothing else, for the reason the update
+/// channel does: a reboot handed to a worker must not hand it the registry.
+pub(crate) struct RebootChannel {
+    vm_name: String,
+    online: Arc<Mutex<bool>>,
+    reboots: Sender<AgentReboot>,
+}
+
 impl AgentConnection {
     /// Hands out this connection's update channel.
     fn display_update_channel(&self) -> DisplayUpdateChannel {
@@ -152,6 +194,15 @@ impl AgentConnection {
             vm_name: self.vm_name.clone(),
             online: Arc::clone(&self.online),
             updates: self.updates.clone(),
+        }
+    }
+
+    /// Hands out this connection's reboot channel.
+    fn reboot_channel(&self) -> RebootChannel {
+        RebootChannel {
+            vm_name: self.vm_name.clone(),
+            online: Arc::clone(&self.online),
+            reboots: self.reboots.clone(),
         }
     }
 }
@@ -200,6 +251,71 @@ impl DisplayUpdateChannel {
                 self.vm_name
             ))
         })
+    }
+}
+
+impl RebootChannel {
+    /// A channel with no session behind it, for the tests of what asks one.
+    #[cfg(test)]
+    pub(crate) fn for_test(vm_name: &str, online: bool, reboots: Sender<AgentReboot>) -> Self {
+        Self {
+            vm_name: vm_name.to_owned(),
+            online: Arc::new(Mutex::new(online)),
+            reboots,
+        }
+    }
+
+    /// Asks this VM's guest to reboot itself.
+    ///
+    /// Returns when the guest has accepted the job, not when it is back up --
+    /// the guest that answers is the one about to go down -- which is the same
+    /// delivery-not-completion contract a reboot through HCS offers. A VM whose
+    /// session is not open right now answers immediately: there is nobody to
+    /// ask, and queueing the ask would reboot a guest at a moment nobody chose.
+    ///
+    /// # Errors
+    ///
+    /// [`RepositoryError`] when there is no session to ask, when the guest
+    /// refused with a reason of its own, or when the session ended before the
+    /// answer came.
+    pub(crate) fn ask(&self) -> Result<(), RepositoryError> {
+        let (answer, answered) = mpsc::channel();
+        let online = self
+            .online
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !*online {
+            return Err(RepositoryError::new(format!(
+                "the agent of VM \"{}\" has no open session, so it cannot be asked to reboot \
+                 right now",
+                self.vm_name
+            )));
+        }
+        self.reboots.send(AgentReboot { answer }).map_err(|_| {
+            RepositoryError::new(format!(
+                "the agent thread of VM \"{}\" is gone",
+                self.vm_name
+            ))
+        })?;
+        drop(online);
+
+        match answered.recv_timeout(REBOOT_TIMEOUT) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(reason)) => Err(RepositoryError::new(format!(
+                "the agent of VM \"{}\" refused to reboot: {reason}",
+                self.vm_name
+            ))),
+            Err(error) => {
+                let reason = match error {
+                    RecvTimeoutError::Timeout => "did not answer inside the time allowed for it",
+                    RecvTimeoutError::Disconnected => "ended before it answered",
+                };
+                Err(RepositoryError::new(format!(
+                    "the reboot ask of VM \"{}\" {reason}",
+                    self.vm_name
+                )))
+            }
+        }
     }
 }
 
@@ -252,6 +368,7 @@ impl AgentConnection {
         let online = Arc::new(Mutex::new(false));
         let running = Arc::new(AtomicBool::new(true));
         let (updates, pending_updates) = mpsc::channel();
+        let (reboots, pending_reboots) = mpsc::channel();
         let worker = thread::Builder::new()
             .name(format!("vmlord-agent-{}", mapping.vm_id.as_simple()))
             .spawn({
@@ -263,6 +380,7 @@ impl AgentConnection {
                         &listener,
                         &secret,
                         &pending_updates,
+                        &pending_reboots,
                         shares.as_ref(),
                         display_share.as_ref(),
                         display_mode,
@@ -305,6 +423,7 @@ impl AgentConnection {
             online,
             running,
             updates,
+            reboots,
             worker: Some(worker),
         })
     }
@@ -318,9 +437,10 @@ impl AgentConnection {
             vm_name: format!("vm-{}", vm_id.as_simple()),
             online: Arc::new(Mutex::new(online)),
             running: Arc::new(AtomicBool::new(true)),
-            // Nothing serves this one, so an update sent into it is never read
-            // -- which is what a connection with no session is.
+            // Nothing serves this one, so an update or a reboot sent into it is
+            // never read -- which is what a connection with no session is.
             updates: mpsc::channel().0,
+            reboots: mpsc::channel().0,
             worker: None,
         }
     }
@@ -373,6 +493,7 @@ fn serve(
     listener: &AgentListener,
     secret: &Secret,
     updates: &Receiver<DisplayUpdate>,
+    reboots: &Receiver<AgentReboot>,
     shares: Option<&GpuShareManifest>,
     display_share: Option<&DisplayShare>,
     display_mode: Option<DisplayMode>,
@@ -426,6 +547,7 @@ fn serve(
                 gpu: sink,
                 display: display_sink,
                 updates: Some(updates),
+                reboots: Some(reboots),
             },
             vm_name,
             &mut || {
@@ -455,7 +577,7 @@ fn serve(
                 }
             },
         );
-        set_offline_and_cancel_updates(online, updates);
+        set_offline_and_cancel_requests(online, updates, reboots);
         drop(stream);
 
         if listener_failed {
@@ -483,13 +605,24 @@ fn session_online(online: &Mutex<bool>) -> bool {
 /// Closes the admission gate before discarding work that belonged to the
 /// session which just ended. Holding the same gate as `ask` makes the state
 /// change and queue drain one indivisible transition to callers.
-fn set_offline_and_cancel_updates(online: &Mutex<bool>, updates: &Receiver<DisplayUpdate>) {
+///
+/// Draining is dropping: an ask whose sender is dropped comes back to its
+/// caller as a disconnected channel rather than as a wait it would have to time
+/// out, so a session that ends answers everything still queued for it.
+fn set_offline_and_cancel_requests(
+    online: &Mutex<bool>,
+    updates: &Receiver<DisplayUpdate>,
+    reboots: &Receiver<AgentReboot>,
+) {
     let mut online = online
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     *online = false;
     while let Ok(update) = updates.try_recv() {
         drop(update);
+    }
+    while let Ok(reboot) = reboots.try_recv() {
+        drop(reboot);
     }
 }
 
@@ -584,6 +717,7 @@ mod tests {
             atomic::{AtomicBool, Ordering},
             mpsc,
         },
+        thread,
         time::{Duration, Instant},
     };
 
@@ -591,8 +725,8 @@ mod tests {
     use vmlord_agent_protocol::auth::{Nonce, Secret, tag, verify};
 
     use super::{
-        AgentConnection, AgentSessions, DisplayUpdate, read_secret, session_online,
-        set_offline_and_cancel_updates,
+        AgentConnection, AgentReboot, AgentSessions, DisplayUpdate, RebootChannel, read_secret,
+        session_online, set_offline_and_cancel_requests,
     };
 
     fn temporary_file(name: &str) -> PathBuf {
@@ -708,6 +842,7 @@ mod tests {
             online: Arc::new(std::sync::Mutex::new(true)),
             running: Arc::clone(&running),
             updates: mpsc::channel().0,
+            reboots: mpsc::channel().0,
             worker: None,
         };
 
@@ -728,9 +863,102 @@ mod tests {
             })
             .expect("the session queue is open");
 
-        set_offline_and_cancel_updates(&online, &pending_updates);
+        set_offline_and_cancel_requests(&online, &pending_updates, &mpsc::channel().1);
 
         assert!(!session_online(&online));
         assert!(matches!(answered.recv(), Err(mpsc::RecvError)));
+    }
+
+    #[test]
+    fn ending_a_session_rejects_a_reboot_still_in_its_queue() {
+        let online = Arc::new(std::sync::Mutex::new(true));
+        let (reboots, pending_reboots) = mpsc::channel();
+        let (answer, answered) = mpsc::channel();
+        reboots
+            .send(AgentReboot { answer })
+            .expect("the session queue is open");
+
+        set_offline_and_cancel_requests(&online, &mpsc::channel().1, &pending_reboots);
+
+        assert!(!session_online(&online));
+        assert!(
+            matches!(answered.recv(), Err(mpsc::RecvError)),
+            "an ask that will never be served must not wait out its budget"
+        );
+    }
+
+    #[test]
+    fn an_online_agent_is_asked_and_its_answer_comes_back() {
+        let (reboots, pending_reboots) = mpsc::channel();
+        let channel = RebootChannel {
+            vm_name: "dev-linux".to_owned(),
+            online: Arc::new(std::sync::Mutex::new(true)),
+            reboots,
+        };
+
+        let asked = thread::spawn(move || channel.ask());
+        let reboot = pending_reboots
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the ask reaches the session thread");
+        reboot
+            .answer
+            .send(Ok(()))
+            .expect("the asker is still waiting");
+
+        assert!(matches!(asked.join(), Ok(Ok(()))));
+    }
+
+    #[test]
+    fn an_agent_that_refused_reports_the_refusal() {
+        let (reboots, pending_reboots) = mpsc::channel();
+        let channel = RebootChannel {
+            vm_name: "dev-linux".to_owned(),
+            online: Arc::new(std::sync::Mutex::new(true)),
+            reboots,
+        };
+
+        let asked = thread::spawn(move || channel.ask());
+        let reboot = pending_reboots
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the ask reaches the session thread");
+        reboot
+            .answer
+            .send(Err("systemctl reboot could not be queued".to_owned()))
+            .expect("the asker is still waiting");
+
+        let Err(error) = asked.join().expect("the ask ends") else {
+            panic!("a refusal is not a delivery");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("systemctl reboot could not be queued"),
+            "the guest's own reason is the one worth reading: {error}"
+        );
+    }
+
+    #[test]
+    fn an_agent_with_no_open_session_cannot_be_asked_to_reboot() {
+        let mut sessions = AgentSessions::default();
+        let vm_id = Uuid::from_u128(11);
+        sessions.insert(AgentConnection::for_test(vm_id, false));
+
+        let error = sessions
+            .reboot_channel(vm_id)
+            .expect("a VM VMLord listens for")
+            .ask()
+            .expect_err("there is nobody to ask");
+
+        assert!(
+            error.to_string().contains("no open session"),
+            "the refusal says what is missing: {error}"
+        );
+    }
+
+    #[test]
+    fn a_vm_nobody_listens_for_has_no_reboot_channel() {
+        let sessions = AgentSessions::default();
+
+        assert!(sessions.reboot_channel(Uuid::from_u128(13)).is_none());
     }
 }

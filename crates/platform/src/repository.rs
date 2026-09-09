@@ -23,7 +23,7 @@ use vmlord_core::{
 use crate::{
     CloudDiskImporter, Com1LogMode, HcsClient, HcsSystem, KnownVm, MetadataStore,
     VmComputeSystemMapping, VmConnections, VmDeletionPipeline, VmForceStopPipeline,
-    VmShutdownPipeline, VmStartPipeline,
+    VmRebootPipeline, VmShutdownPipeline, VmStartPipeline,
     agent::{AgentConnection, AgentSessions},
     build::{BuildRegistry, StartedVm},
     cleanup,
@@ -40,6 +40,8 @@ use crate::{
     hcs::{HCS_ACCESS_ALL, HcsSystemState},
     hcs_config::{self, VmTopology},
     layout, list_known_vms,
+    reboot::reboot_with_agent_fallback,
+    reboot_workers::RebootWorkers,
     reconnect::{ReconnectOutcome, reconnect_known_vms},
     run_recovery,
     shutdown_workers::ShutdownWorkers,
@@ -125,6 +127,11 @@ pub struct HcsVmRepository {
     force_stop: Arc<VmForceStopPipeline>,
     /// The forced stops being carried out right now.
     force_stops: ForceStopWorkers,
+    /// Shared with the worker threads that deliver reboot requests, which is
+    /// why it is behind an `Arc`.
+    reboot: Arc<VmRebootPipeline>,
+    /// The reboot requests being delivered right now.
+    reboots: RebootWorkers,
     delete: VmDeletionPipeline,
     /// The display payload updates in flight, one thread each.
     display_updates: display_updates::DisplayUpdates,
@@ -189,6 +196,8 @@ impl HcsVmRepository {
             shutdowns: ShutdownWorkers::default(),
             force_stop: Arc::new(VmForceStopPipeline::production()),
             force_stops: ForceStopWorkers::default(),
+            reboot: Arc::new(VmRebootPipeline::production()),
+            reboots: RebootWorkers::default(),
             delete: VmDeletionPipeline::production(),
             display_updates: display_updates::DisplayUpdates::default(),
             events,
@@ -550,6 +559,46 @@ impl HcsVmRepository {
                         vm = finished.vm_name.as_str(),
                         code = error.code().unwrap_or_default(),
                         "Failed to forcibly stop VM \"{}\": {error}",
+                        finished.vm_name
+                    );
+                }
+            }
+        }
+    }
+
+    /// Collects the reboot requests that have been answered since the last
+    /// refresh.
+    ///
+    /// Nothing that belongs to the run is given up here, which is the opposite
+    /// of a shutdown's collection and is the point: the guest comes back to the
+    /// same compute system (#110), its agent reconnects to the listener that is
+    /// still bound, and its console keeps the log the reboot wrote. The report
+    /// is the delivery itself, because the VM stays running until the guest
+    /// acts and nothing else will say the request went through.
+    fn finish_reboots(&mut self) {
+        for finished in self.reboots.take_finished() {
+            match finished.result {
+                Ok(()) => {
+                    tracing::info!(
+                        "the guest of VM \"{}\" was asked to reboot; the VM stays running \
+                         until the guest comes back",
+                        finished.vm_name
+                    );
+                    vmlord_core::diagnostic!(
+                        Info,
+                        Subsystem::Hcs,
+                        vm = finished.vm_name.as_str(),
+                        "VM \"{}\" was asked to reboot and stays running until it comes back.",
+                        finished.vm_name
+                    );
+                }
+                Err(error) => {
+                    vmlord_core::diagnostic!(
+                        Error,
+                        Subsystem::Hcs,
+                        vm = finished.vm_name.as_str(),
+                        code = error.code().unwrap_or_default(),
+                        "Failed to reboot VM \"{}\": {error}",
                         finished.vm_name
                     );
                 }
@@ -1654,6 +1703,45 @@ impl VmRepository for HcsVmRepository {
             })
     }
 
+    /// Asks the guest of `name` to reboot in place, without waiting for the
+    /// answer.
+    ///
+    /// Returning `Ok` means the request is on its way -- through HCS, or
+    /// through the VM's own agent when HCS cannot deliver it -- not that the
+    /// guest has gone down or come back. The VM stays running until the guest
+    /// acts, so nothing is torn down and the answer arrives as a diagnostic on
+    /// the next refresh; see [`HcsVmRepository::finish_reboots`].
+    ///
+    /// Everything that can be refused cheaply and certainly is refused here,
+    /// before the thread, so an obvious mistake is the return value of the call
+    /// that made it rather than a diagnostic a moment later.
+    fn reboot_vm(&mut self, name: &str) -> Result<(), RepositoryError> {
+        let _span = tracing::info_span!("reboot_vm", vm = name).entered();
+        self.require_initialized()?;
+        self.builds.refuse_if_building(name)?;
+
+        let mapping = self.mapping(name)?;
+        let state = self.reported_state(&mapping)?;
+        refuse_unless_running(
+            &mapping.vm_name,
+            state,
+            "so it cannot be rebooted; start it first",
+        )?;
+        // Taken here rather than on the worker: which VM has an agent to fall
+        // back on is a fact of this moment, and the channel is what carries it
+        // across the threads. `None` is not a refusal -- HCS may deliver the
+        // request on its own -- it is one fewer way for this reboot to happen.
+        let agent = self.agent_sessions.reboot_channel(mapping.vm_id);
+
+        let store = self.store.clone();
+        let reboot = Arc::clone(&self.reboot);
+        let vm_name = mapping.vm_name.clone();
+        self.reboots
+            .start(mapping.vm_id, &mapping.vm_name, move || {
+                reboot_with_agent_fallback(&reboot, &store, &vm_name, agent)
+            })
+    }
+
     /// Deletes the VM and everything VMLord created for it.
     ///
     /// A running VM is refused rather than torn down under its guest: deletion
@@ -1933,6 +2021,9 @@ impl VmRepository for HcsVmRepository {
         // system it tore down leaves a console, an agent listener and a display
         // window to give up, all reachable only on this thread.
         self.finish_force_stops();
+        // And the same for a reboot that was asked for: nothing is given up,
+        // but the answer is what a person who clicked is waiting to read.
+        self.finish_reboots();
         let drained = watch::drain_events(&self.events, |vm_id, generation| {
             self.connections.is_superseded(vm_id, generation)
         });
@@ -2001,6 +2092,9 @@ impl Drop for HcsVmRepository {
         self.shutdowns.join_all();
         // A termination still in flight holds the same, for the same reason.
         self.force_stops.join_all();
+        // A reboot ask still in flight holds the same, or is waiting on an
+        // agent session whose listener this drop is about to close.
+        self.reboots.join_all();
         // A launch still probing holds nothing of the repository's, but its
         // thread must not outlive the process that started it.
         self.ssh_launches.join_all();
@@ -2893,6 +2987,73 @@ mod tests {
             diagnostics[0]
                 .message
                 .contains("injected termination failure")
+                && diagnostics[0].message.contains("dev"),
+            "{}",
+            diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn a_delivered_reboot_keeps_what_the_run_still_uses() {
+        // The regression this covers is a reboot treated like a shutdown: the
+        // guest that comes back needs the same listener the one that went down
+        // had (#110), and a session dropped here is a VM whose agent reads
+        // offline until it is started again.
+        let mut repository = repository();
+        let mapping = mapping(NetworkMode::None);
+        repository
+            .agent_sessions
+            .insert(AgentConnection::for_test(mapping.vm_id, true));
+        repository
+            .reboots
+            .start(mapping.vm_id, &mapping.vm_name, || Ok(()))
+            .expect("the request should be dispatched");
+
+        repository.reboots.wait_until_answered();
+        let (_, diagnostics) = records(|| repository.finish_reboots());
+
+        // A reboot's effect is delayed -- the VM keeps running until the guest
+        // acts -- so the delivery itself is the only news there is.
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, DiagnosticLevel::Info);
+        assert!(
+            diagnostics[0].message.contains("reboot"),
+            "{}",
+            diagnostics[0].message
+        );
+        assert_eq!(
+            repository.agent_sessions.is_online(mapping.vm_id),
+            Some(true),
+            "a guest that comes back reconnects to the listener it left"
+        );
+        // The same VM can be asked again once its request is over.
+        repository
+            .reboots
+            .start(mapping.vm_id, &mapping.vm_name, || Ok(()))
+            .expect("the VM is no longer being rebooted");
+        repository.reboots.join_all();
+    }
+
+    #[test]
+    fn a_reboot_request_that_failed_is_reported_rather_than_lost() {
+        // The asking happens on a thread of its own, so the failure cannot come
+        // back as the return value of the click that caused it.
+        let mut repository = repository();
+        let mapping = mapping(NetworkMode::None);
+        repository
+            .reboots
+            .start(mapping.vm_id, &mapping.vm_name, || {
+                Err(RepositoryError::new("injected reboot failure"))
+            })
+            .expect("the request should be dispatched");
+
+        repository.reboots.wait_until_answered();
+        let (_, diagnostics) = records(|| repository.finish_reboots());
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].level, DiagnosticLevel::Error);
+        assert!(
+            diagnostics[0].message.contains("injected reboot failure")
                 && diagnostics[0].message.contains("dev"),
             "{}",
             diagnostics[0].message

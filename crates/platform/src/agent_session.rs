@@ -33,7 +33,8 @@ use vmlord_agent_protocol::{
         DisplayShare as WireDisplayShare, DisplayUpdateOutcome, Envelope, ErrorCode, GpuMountState,
         GpuProbeCheckState, GpuProbeVerdict, GpuRecipeStageState, GpuShareRole, HeartbeatRequest,
         HeartbeatResponse, HelloResponse, ProbeGpuRequest, ProbeGpuResponse, ProtocolVersion,
-        UpdateDisplayPayloadRequest, UpdateDisplayPayloadResponse, envelope, request, response,
+        RebootRequest, UpdateDisplayPayloadRequest, UpdateDisplayPayloadResponse, envelope,
+        request, response,
     },
 };
 use vmlord_core::{
@@ -42,7 +43,7 @@ use vmlord_core::{
     GuestDisplayDetail, GuestDisplayReport, GuestGpuDetail, GuestGpuReport,
 };
 
-use crate::agent::{DisplayUpdate, DisplayUpdateAnswer};
+use crate::agent::{AgentReboot, DisplayUpdate, DisplayUpdateAnswer};
 
 /// What this build of the host implements beyond the base protocol.
 ///
@@ -101,6 +102,14 @@ const DISPLAY_UPDATE_REQUEST_ID: u32 = DISPLAY_APPLY_REQUEST_ID + 1;
 
 /// The id of the host's proof that an otherwise silent guest is still there.
 const LIVENESS_REQUEST_ID: u32 = DISPLAY_UPDATE_REQUEST_ID + 1;
+
+/// The id the host asks a guest to reboot itself under.
+///
+/// One id and not a counter, like the questions above it, because a session
+/// carries at most one reboot ask at a time: the guest that answers it is the
+/// guest that is about to go down, so a second ask on the same socket would be
+/// a question addressed to whoever comes back up.
+const REBOOT_REQUEST_ID: u32 = LIVENESS_REQUEST_ID + 1;
 
 #[derive(Clone, Copy)]
 struct SessionTiming {
@@ -189,6 +198,14 @@ pub(crate) struct SessionWork<'a> {
     /// thread: a session is one conversation, and two writers would interleave
     /// halfway through a frame.
     pub(crate) updates: Option<&'a Receiver<DisplayUpdate>>,
+    /// Where a reboot ask arrives from, read between frames for the same
+    /// reason the update is.
+    ///
+    /// Behind the update queue rather than beside it: a payload move and a
+    /// reboot of the same VM are one story told in that order -- the reboot
+    /// applies what the update installed -- and a reboot that jumped the queue
+    /// would cancel an update the asker was told was in progress.
+    pub(crate) reboots: Option<&'a Receiver<AgentReboot>>,
 }
 
 /// What a session agreed on when it opened.
@@ -340,6 +357,11 @@ fn serve_with_timing<S: Read + Write>(
     // that is still waiting for the first answer.
     let mut pending_update: Option<Sender<DisplayUpdateAnswer>> = None;
     let mut update_after_probe: Option<DisplayUpdate> = None;
+    // At most one reboot ask at a time, and its answer channel with it, for
+    // the reason the update's is singular: one question on a socket that is
+    // still waiting for one answer.
+    let mut pending_reboot: Option<Sender<Result<(), String>>> = None;
+    let mut reboot_after_probe: Option<AgentReboot> = None;
     let mut liveness_deadline = None;
     let mut last_received = Instant::now();
 
@@ -376,7 +398,8 @@ fn serve_with_timing<S: Read + Write>(
                     || pending_probe.is_some()
                     || pending_display_attach.is_some()
                     || pending_display_recipe.is_some()
-                    || pending_update.is_some();
+                    || pending_update.is_some()
+                    || pending_reboot.is_some();
                 if liveness_deadline.is_none() && !has_pending_work {
                     if let Some(update) = work.updates.and_then(|updates| updates.try_recv().ok()) {
                         if session.capabilities.contains(&Capability::Display) {
@@ -386,6 +409,16 @@ fn serve_with_timing<S: Read + Write>(
                         } else {
                             answer_unsupported_update(update);
                         }
+                    } else if let Some(reboot) =
+                        work.reboots.and_then(|reboots| reboots.try_recv().ok())
+                    {
+                        // Alive first, reboot second, for the reason the update
+                        // is: a socket that looks open does not prove there is
+                        // anybody on it, and an ask parked on a dead guest
+                        // would wait its whole budget for an answer.
+                        send_liveness_probe(stream, &mut buffer)?;
+                        reboot_after_probe = Some(reboot);
+                        liveness_deadline = Some(now + timing.probe_timeout);
                     } else if now.duration_since(last_received) >= timing.idle_before_probe {
                         send_liveness_probe(stream, &mut buffer)?;
                         liveness_deadline = Some(now + timing.probe_timeout);
@@ -457,6 +490,27 @@ fn serve_with_timing<S: Read + Write>(
             {
                 if let Some(update) = update_after_probe.take() {
                     pending_update = start_update(stream, session, &update, vm_name, &mut buffer)?;
+                } else if let Some(reboot) = reboot_after_probe.take() {
+                    pending_reboot = start_reboot(stream, session, &reboot, vm_name, &mut buffer)?;
+                }
+            }
+            Body::Response(response::Kind::Reboot(_)) if request_id == REBOOT_REQUEST_ID => {
+                if let Some(waiting) = pending_reboot.take() {
+                    // Delivered and accepted, not finished: the guest that
+                    // answered is the one about to go down, and when it is back
+                    // is its own story -- told by the session it opens next.
+                    let _ = waiting.send(Ok(()));
+                }
+            }
+            // A refusal under the reboot's id, which is how an agent too old to
+            // know the request answers it. Read here rather than left to time
+            // out, because the asker cannot tell a silent guest from a refusing
+            // one without the reason this frame carries.
+            Body::Response(response::Kind::Error(error))
+                if request_id == REBOOT_REQUEST_ID && pending_reboot.is_some() =>
+            {
+                if let Some(waiting) = pending_reboot.take() {
+                    let _ = waiting.send(Err(error.message));
                 }
             }
             // A response to a request this side did not send, or one it has
@@ -703,6 +757,36 @@ fn start_update<S: Read + Write>(
     );
 
     Ok(Some(update.answer.clone()))
+}
+
+/// Asks the guest to reboot itself, and answers with where to send the answer.
+///
+/// `None` is an agent that never spoke the revision the request belongs to,
+/// which is refused here rather than sent: a request the agent has no arm for
+/// would come back as its blanket refusal, and the asker would learn nothing it
+/// could not have read off the session's revision.
+fn start_reboot<S: Read + Write>(
+    stream: &mut S,
+    session: &AgentSession,
+    reboot: &AgentReboot,
+    vm_name: &str,
+    buffer: &mut Vec<u8>,
+) -> Result<Option<Sender<Result<(), String>>>, SessionError> {
+    if session.version.minor < handshake::REBOOT_REQUEST_REVISION {
+        let reason = format!(
+            "the agent of VM \"{vm_name}\" speaks protocol {}.{}, which cannot be asked to reboot",
+            session.version.major, session.version.minor
+        );
+        tracing::warn!("{reason}");
+        let _ = reboot.answer.send(Err(reason));
+        return Ok(None);
+    }
+
+    let request = Envelope::request(REBOOT_REQUEST_ID, request::Kind::Reboot(RebootRequest {}));
+    frame::write(stream, &request, buffer).map_err(SessionError::Frame)?;
+    tracing::info!("VMLord asked the agent of VM \"{vm_name}\" to reboot itself");
+
+    Ok(Some(reboot.answer.clone()))
 }
 
 /// Why an update did not end up where it was asked to go.
@@ -1365,6 +1449,13 @@ fn answer(request_id: u32, kind: &request::Kind, vm_name: &str) -> Envelope {
             ErrorCode::UnsupportedRequest,
             "a display payload update is the host's to ask for",
         ),
+        // Likewise: a guest that rebooted because its host said so would be a
+        // guest with the conversation the wrong way round.
+        request::Kind::Reboot(_) => Envelope::error(
+            request_id,
+            ErrorCode::UnsupportedRequest,
+            "a reboot is the host's to ask for",
+        ),
     }
 }
 
@@ -1480,8 +1571,8 @@ mod tests {
             DisplaySigningCertificate, DisplayUpdateOutcome, Envelope, ErrorCode, GpuMount,
             GpuMountState, GpuProbeCheck, GpuProbeCheckState, GpuProbeStep, GpuProbeVerdict,
             GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep, GpuShareRole, HeartbeatRequest,
-            HeartbeatResponse, HelloRequest, ProbeGpuResponse, ProtocolVersion,
-            UpdateDisplayPayloadResponse, envelope, request, response,
+            HeartbeatResponse, HelloRequest, ProbeGpuResponse, ProtocolVersion, RebootRequest,
+            RebootResponse, UpdateDisplayPayloadResponse, envelope, request, response,
         },
     };
 
@@ -1490,7 +1581,7 @@ mod tests {
         GuestDisplayReport, GuestGpuDetail, GuestGpuReport,
     };
 
-    use crate::agent::DisplayUpdate;
+    use crate::agent::{AgentReboot, DisplayUpdate};
 
     use super::{
         AgentSession, GuestDisplaySink, GuestGpuSink, SessionError, SessionExit, SessionTiming,
@@ -1709,6 +1800,7 @@ mod tests {
             gpu,
             display: &|_| {},
             updates: None,
+            reboots: None,
         }
     }
 
@@ -1942,6 +2034,14 @@ mod tests {
         close: bool,
         close_after_update: bool,
         update_sent: Arc<AtomicBool>,
+        /// Closes the stream once the liveness probe is answered, for the tests
+        /// of asks that never become a request.
+        close_after_heartbeat: bool,
+        /// Closes the stream once a reboot request is answered.
+        close_after_reboot: bool,
+        /// What a reboot request is refused with, when the guest is one that
+        /// refuses it.
+        reboot_refusal: Option<String>,
     }
 
     impl Read for ProbeGuest {
@@ -1976,12 +2076,34 @@ mod tests {
                     let mut encoded = Vec::new();
                     frame::encode(&answer, &mut encoded).expect("a heartbeat response fits");
                     self.outbox.extend_from_slice(&encoded);
+                    self.close = self.close_after_heartbeat;
                 }
                 Some(envelope::Body::Request(request))
                     if matches!(request.kind, Some(request::Kind::UpdateDisplayPayload(_))) =>
                 {
                     self.update_sent.store(true, Ordering::Relaxed);
                     self.close = self.close_after_update;
+                }
+                Some(envelope::Body::Request(request))
+                    if matches!(request.kind, Some(request::Kind::Reboot(_))) =>
+                {
+                    // A refusal travels as the universal `Error` arm, which is
+                    // how an agent too old to know the request says no.
+                    let answer = match self.reboot_refusal.clone() {
+                        Some(reason) => Envelope::error(
+                            envelope.request_id,
+                            ErrorCode::UnsupportedRequest,
+                            reason,
+                        ),
+                        None => Envelope::response(
+                            envelope.request_id,
+                            response::Kind::Reboot(RebootResponse {}),
+                        ),
+                    };
+                    let mut encoded = Vec::new();
+                    frame::encode(&answer, &mut encoded).expect("a reboot answer fits");
+                    self.outbox.extend_from_slice(&encoded);
+                    self.close = self.close_after_reboot;
                 }
                 _ => {}
             }
@@ -2235,6 +2357,7 @@ mod tests {
             gpu: &|_| {},
             display,
             updates: None,
+            reboots: None,
         }
     }
 
@@ -3139,6 +3262,151 @@ mod tests {
 
         assert_eq!(exit, SessionExit::Replaced);
         assert!(matches!(answered.recv(), Err(mpsc::RecvError)));
+    }
+
+    /// The work a reboot test does: no GPU and no display, a session that can
+    /// be asked to reboot, and the answer channel the ask waits on.
+    fn reboot_work<'a>(pending_reboots: &'a mpsc::Receiver<AgentReboot>) -> SessionWork<'a> {
+        SessionWork {
+            reboots: Some(pending_reboots),
+            ..work(None, &|_| {})
+        }
+    }
+
+    #[test]
+    fn a_reboot_is_sent_only_after_the_session_proves_it_is_alive() {
+        let mut stream = ProbeGuest {
+            close_after_reboot: true,
+            ..ProbeGuest::default()
+        };
+        let session = AgentSession {
+            version: ProtocolVersion::current(),
+            capabilities: Vec::new(),
+            build: String::new(),
+        };
+        let (reboots, pending_reboots) = mpsc::channel();
+        let (answer, answered) = mpsc::channel();
+        reboots
+            .send(AgentReboot { answer })
+            .expect("the session queue is open");
+
+        serve(&mut stream, &session, reboot_work(&pending_reboots), VM)
+            .expect("the guest closes after the reboot");
+
+        // Alive first, reboot second, for the reason the update is: a guest
+        // whose socket looks open but which stopped answering must fail the
+        // probe instead of parking the ask for its whole budget.
+        assert!(matches!(
+            stream.received.as_slice(),
+            [
+                Envelope {
+                    body: Some(envelope::Body::Request(
+                        vmlord_agent_protocol::v1::Request {
+                            kind: Some(request::Kind::Heartbeat(_)),
+                        }
+                    )),
+                    ..
+                },
+                Envelope {
+                    body: Some(envelope::Body::Request(
+                        vmlord_agent_protocol::v1::Request {
+                            kind: Some(request::Kind::Reboot(_)),
+                        }
+                    )),
+                    ..
+                }
+            ]
+        ));
+        assert_eq!(answered.recv(), Ok(Ok(())));
+    }
+
+    #[test]
+    fn a_reboot_the_agent_refused_reports_the_reason_it_gave() {
+        let mut stream = ProbeGuest {
+            close_after_reboot: true,
+            reboot_refusal: Some("systemctl reboot could not be queued".to_owned()),
+            ..ProbeGuest::default()
+        };
+        let session = AgentSession {
+            version: ProtocolVersion::current(),
+            capabilities: Vec::new(),
+            build: String::new(),
+        };
+        let (reboots, pending_reboots) = mpsc::channel();
+        let (answer, answered) = mpsc::channel();
+        reboots
+            .send(AgentReboot { answer })
+            .expect("the session queue is open");
+
+        serve(&mut stream, &session, reboot_work(&pending_reboots), VM)
+            .expect("the guest closes after its refusal");
+
+        // The refusal is an `Error` frame under the reboot's id, which is what
+        // an agent that cannot do the work answers with -- so the asker must
+        // read it as a refusal rather than wait its budget out.
+        assert_eq!(
+            answered.recv(),
+            Ok(Err("systemctl reboot could not be queued".to_owned()))
+        );
+    }
+
+    #[test]
+    fn an_agent_that_never_spoke_revision_nine_is_asked_for_no_reboot() {
+        // A request is not sent to an agent with no arm for it; the refusal is
+        // local and names the revision the agent speaks, because that is what
+        // tells a person which guest is too old.
+        let mut stream = ProbeGuest {
+            close_after_heartbeat: true,
+            ..ProbeGuest::default()
+        };
+        let session = AgentSession {
+            version: ProtocolVersion { major: 1, minor: 8 },
+            capabilities: Vec::new(),
+            build: String::new(),
+        };
+        let (reboots, pending_reboots) = mpsc::channel();
+        let (answer, answered) = mpsc::channel();
+        reboots
+            .send(AgentReboot { answer })
+            .expect("the session queue is open");
+
+        serve(&mut stream, &session, reboot_work(&pending_reboots), VM)
+            .expect("the guest closes after proving it is alive");
+
+        assert!(
+            !stream.received.iter().any(|envelope| matches!(
+                envelope.body,
+                Some(envelope::Body::Request(ref request))
+                    if matches!(request.kind, Some(request::Kind::Reboot(_)))
+            )),
+            "a request the agent cannot read must not be sent at all"
+        );
+        let Ok(Err(reason)) = answered.recv() else {
+            panic!("an agent too old for the request is a refusal, not a delivery");
+        };
+        assert!(
+            reason.contains("1.8"),
+            "the refusal names the revision it speaks: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_reboot_the_guest_asks_for_is_refused_as_the_wrong_way_round() {
+        let secret = Secret::generate();
+        let mut guest = Guest::new(Secret::from_base64(&secret.to_base64()).expect("the secret"))
+            .after_answer(&[Envelope::request(
+                11,
+                request::Kind::Reboot(RebootRequest {}),
+            )]);
+        let session = open(&mut guest, &secret, VM).expect("a session that authenticated");
+
+        serve(&mut guest, &session, work(None, &|_| {}), VM).expect("a session the agent closed");
+
+        assert_eq!(
+            refusal(&guest, 11),
+            ErrorCode::UnsupportedRequest,
+            "a reboot is the host's to ask for"
+        );
     }
 
     #[test]

@@ -67,6 +67,13 @@ mod vsock;
 /// session that was open has ended.
 static STOPPING: AtomicBool = AtomicBool::new(false);
 
+/// How long the reboot command may take to queue its job.
+///
+/// `systemctl reboot` returns once systemd has accepted the job, which is
+/// seconds of work; a reboot that cannot be queued in a minute is one the
+/// guest should report as refused.
+const REBOOT_BUDGET: Duration = Duration::from_secs(60);
+
 /// The connection to the host, for the signal handler to wake, or `-1`.
 ///
 /// A flag on its own is not enough to stop this agent: between requests it
@@ -250,6 +257,18 @@ fn connect_to_host(secret: &Secret) -> bool {
                     stages,
                     versions: Some(versions),
                     outcome: i32::from(outcome),
+                }
+            },
+            reboot: &mut || {
+                // Returns when the reboot job is queued, not when the guest
+                // is back up, which is the same delivery-not-completion
+                // contract the answer makes. The session's own shutdown
+                // handler takes over when systemd stops this agent.
+                let outcome = command::run("systemctl", &["reboot"], &[], REBOOT_BUDGET);
+                if outcome.succeeded() {
+                    Ok(())
+                } else {
+                    Err(outcome.output)
                 }
             },
         },
