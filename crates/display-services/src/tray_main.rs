@@ -124,7 +124,7 @@ struct GuestTray {
     commands: Sender<Command>,
     /// Every mode the host has published, as of the last answer.
     modes: Vec<DisplayTiming>,
-    /// The one the host chose, when it has chosen.
+    /// The mode the broker says the output is on, when it says.
     selected: Option<DisplayTiming>,
 }
 
@@ -242,7 +242,8 @@ fn command_item(
 }
 
 /// The Resolution submenu: one plain entry per mode the host offered,
-/// labelled the way the viewer writes them, and the chosen one on the header.
+/// labelled the way the viewer writes them, and the mode the output is on on
+/// the header.
 fn resolution_menu(
     modes: &[DisplayTiming],
     selected: Option<&DisplayTiming>,
