@@ -92,7 +92,8 @@ pub enum Message {
     DisplayModes {
         /// Every mode the host published, never empty while one has.
         modes: Vec<DisplayTiming>,
-        /// The one the host chose, when it has chosen.
+        /// The mode the output is on: what capture saw committed, or the
+        /// host's choice until anything has been captured.
         selected: Option<DisplayTiming>,
     },
     /// One chunk of the cursor-hotspot table the tray has parsed out of the

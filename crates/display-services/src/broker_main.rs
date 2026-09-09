@@ -960,7 +960,7 @@ fn adopt_tray_peer(shared: &Shared, connection: &Arc<Connection>) {
     send_tray_modes(
         connection,
         &state.published_modes,
-        state.selected_mode.as_ref(),
+        tray_selection(&state).as_ref(),
     );
 }
 
@@ -990,14 +990,14 @@ fn read_tray_peer(connection: &Arc<Connection>, shared: &Shared) {
                 send_tray_modes(
                     connection,
                     &state.published_modes,
-                    state.selected_mode.as_ref(),
+                    tray_selection(&state).as_ref(),
                 );
             }
             Message::DisplayModesRequested => {
                 send_tray_modes(
                     connection,
                     &state.published_modes,
-                    state.selected_mode.as_ref(),
+                    tray_selection(&state).as_ref(),
                 );
             }
             Message::UserCommand { kind, display_mode } => {
@@ -1023,7 +1023,7 @@ fn read_tray_peer(connection: &Arc<Connection>, shared: &Shared) {
     }
 }
 
-/// Sends the tray what the host offers, and what it chose of it.
+/// Sends the tray what the host offers, and the mode the output is on.
 fn send_tray_modes(
     connection: &Arc<Connection>,
     modes: &[DisplayTiming],
@@ -1036,6 +1036,26 @@ fn send_tray_modes(
         },
         &[],
     );
+}
+
+/// The mode the tray's header is answered with.
+///
+/// What capture has seen committed, because that is the one answer to what
+/// the output is actually on: the output moves for reasons besides the host's
+/// choice -- a viewer window dragged to a size of its own, a mode picked in
+/// the guest's own settings -- and a header that repeated the host's choice
+/// over those would promise a resolution the guest is not at. The host's
+/// choice stands in until anything has been captured, and nothing stands in
+/// before that.
+fn tray_selection(state: &BrokerState) -> Option<DisplayTiming> {
+    state
+        .geometry
+        .map(|(width, height, refresh_hz)| DisplayTiming {
+            width,
+            height,
+            refresh_hz,
+        })
+        .or(state.selected_mode)
 }
 
 /// Puts a command the tray raised where the control thread will write it.
@@ -2147,5 +2167,52 @@ mod tests {
             vec![timing(1280, 720, 60), timing(1920, 1080, 144)]
         );
         assert_eq!(state.selected_mode, Some(timing(1280, 720, 60)));
+    }
+
+    #[test]
+    fn the_tray_is_answered_with_the_mode_the_output_is_on() {
+        // The output moves for reasons besides the host's choice: a viewer
+        // window dragged to a size of its own, a mode picked in the guest's
+        // own settings. What capture saw committed is the one answer to what
+        // the output is on, and a header that repeated the host's choice over
+        // those would promise a resolution the guest is not at.
+        let shared: super::Shared =
+            Arc::new((Mutex::new(super::BrokerState::default()), Condvar::new()));
+
+        {
+            let (lock, _) = &*shared;
+            let mut state = lock.lock().unwrap();
+            state.selected_mode = Some(timing(1920, 1080, 60));
+        }
+        super::observe_geometry(&shared, 1720, 970, 60);
+
+        let state = shared.0.lock().unwrap();
+        assert_eq!(
+            super::tray_selection(&state),
+            Some(timing(1720, 970, 60)),
+            "the committed geometry, not the host's choice"
+        );
+    }
+
+    #[test]
+    fn until_anything_is_captured_the_tray_is_answered_with_the_hosts_choice() {
+        // Before the first commit nothing has been seen, so the host's choice
+        // is the best statement anyone has -- and before a host has chosen at
+        // all, the honest answer is none.
+        let shared: super::Shared =
+            Arc::new((Mutex::new(super::BrokerState::default()), Condvar::new()));
+
+        {
+            let (lock, _) = &*shared;
+            lock.lock().unwrap().selected_mode = Some(timing(1920, 1080, 60));
+        }
+        assert_eq!(
+            super::tray_selection(&shared.0.lock().unwrap()),
+            Some(timing(1920, 1080, 60))
+        );
+
+        let shared: super::Shared =
+            Arc::new((Mutex::new(super::BrokerState::default()), Condvar::new()));
+        assert_eq!(super::tray_selection(&shared.0.lock().unwrap()), None);
     }
 }

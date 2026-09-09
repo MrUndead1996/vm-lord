@@ -3966,9 +3966,16 @@ mapping is what notices the two schemas drifting apart. The socket is
 authorised the way the clipboard daemon's is: the connecting uid must be the
 one logind reports for the active graphical session on `seat0`, looked up at
 every accept. The Resolution submenu is the one part that is an answer rather
-than a command: the tray asks which modes the host has offered and is told,
-the same list and the same selection the connector thread already holds --
-one fact read by a second reader, not a second authority on it.
+than a command: the tray asks which modes the host has offered and is told
+the same list the connector thread already holds -- one fact read by a second
+reader, not a second authority on it. The selection on the submenu's header
+is a different fact: the mode the output is actually on, as capture saw it
+committed, because the output moves for reasons besides the host's choice --
+a viewer window dragged to a size of its own, a mode picked in the guest's
+own settings -- and a header repeating the host's choice over those would
+promise a resolution the guest is not at. Until anything has been captured
+the host's choice stands in, and before a host has chosen at all the header
+names no mode.
 
 The fourth socket carries one thing that is neither a command nor an answer,
 and it is the one thing this unit reads off the guest's disk: the active
