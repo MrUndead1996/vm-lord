@@ -11,6 +11,13 @@
   "required_renderers": ["d3d12-gallium", "dzn-vulkan"],
   "guest_capabilities": ["compositor-scanout"],
   "library_layout": "multiarch:x86_64-linux-gnu",
+  "build": {
+    "base_image": "ubuntu@sha256:6df9e8dd1eac389ebfef692c9648449adeb815d01e16e29cd6f3e50fe64ba9a6",
+    "toolchain": "toolchain-apt",
+    "closure": "closure-apt",
+    "module_gate": "module-none",
+    "package_snapshot": ""
+  },
   "mesa_policy": "bundled",
   "sources": [
     {

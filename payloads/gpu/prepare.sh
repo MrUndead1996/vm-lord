@@ -123,6 +123,29 @@ multiarch:?*) LIBDIR="lib/${LAYOUT#multiarch:}" ;;
 	;;
 esac
 
+# The build's own pins: which image, which stages, and -- where the distribution has no
+# release archive of its own -- which day's packages. Read the same line-oriented way, and
+# for the same reason.
+field() {
+	sed -nE "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/p" "$SPEC" | head -n1
+}
+
+BASE="$(field base_image)"
+TOOLCHAIN="$(field toolchain)"
+CLOSURE="$(field closure)"
+MODULE="$(field module_gate)"
+# Deliberately outside the loop below: a distribution whose release is already an archive
+# needs no day, and an empty value is the right answer for it rather than a missing one.
+PACKAGE_SNAPSHOT="$(field package_snapshot)"
+
+for name in BASE TOOLCHAIN CLOSURE MODULE; do
+	[[ -n "${!name}" ]] || {
+		echo "$SPEC does not say what $name is; every target names its base image and" >&2
+		echo "the stages its package manager needs, in the spec's \"build\" object." >&2
+		exit 1
+	}
+done
+
 mkdir -p "$output"
 output="$(cd "$output" && pwd)"
 
@@ -143,7 +166,13 @@ done < <(sed -nE 's/^ARG[[:space:]]+([A-Z0-9_]+_(URL|COMMIT))([[:space:]]*|=.*)$
 # The spec is read by the image's own jq, so that a host without jq can still tell the
 # build which commits to fetch. The toolchain stage is built once and reused: it is the
 # same layer the full build will hit, so this costs a cache lookup and not a build.
-toolchain="$(DOCKER_BUILDKIT=1 docker build --quiet --target toolchain "$HERE")"
+toolchain="$(DOCKER_BUILDKIT=1 docker build --quiet \
+	--build-arg "BASE=$BASE" \
+	--build-arg "TOOLCHAIN=$TOOLCHAIN" \
+	--build-arg "CLOSURE=$CLOSURE" \
+	--build-arg "MODULE=$MODULE" \
+	--build-arg "PACKAGE_SNAPSHOT=$PACKAGE_SNAPSHOT" \
+	--target toolchain "$HERE")"
 
 pins="$(
 	docker run --rm \
@@ -223,6 +252,11 @@ rm -rf "$output/prepared" "$output/recipe.json"
 DOCKER_BUILDKIT=1 docker build \
 	--build-arg "TARGET=$TARGET" \
 	--build-arg "LIBDIR=$LIBDIR" \
+	--build-arg "BASE=$BASE" \
+	--build-arg "TOOLCHAIN=$TOOLCHAIN" \
+	--build-arg "CLOSURE=$CLOSURE" \
+	--build-arg "MODULE=$MODULE" \
+	--build-arg "PACKAGE_SNAPSHOT=$PACKAGE_SNAPSHOT" \
 	"${arguments[@]}" \
 	--output "type=local,dest=$output" \
 	"$HERE"

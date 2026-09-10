@@ -8,9 +8,17 @@
 # the host needs docker and no toolchain of its own -- and so the toolchain that built a
 # payload is a pinned image rather than whatever the machine happened to have.
 
-ARG BASE=ubuntu@sha256:6df9e8dd1eac389ebfef692c9648449adeb815d01e16e29cd6f3e50fe64ba9a6
+# Which base image, and which of the per-manager stages below serve it. Named by the
+# spec's `build` object rather than defaulted here: a target that forgot to say would
+# otherwise be built against another target's distribution and would look fine.
+ARG BASE
+ARG TOOLCHAIN
+ARG CLOSURE
+ARG MODULE
 
-FROM ${BASE} AS toolchain
+FROM ${BASE} AS base
+
+FROM base AS toolchain-apt
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential meson ninja-build pkg-config git ca-certificates jq python3 \
         python3-mako python3-ply python3-yaml bison flex cmake \
@@ -21,6 +29,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libwayland-dev libwayland-egl-backend-dev wayland-protocols \
         libexpat1-dev zlib1g-dev libzstd-dev libglvnd-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# Arch pins its packages by date, because `archlinux@sha256:...` pins a rootfs and
+# nothing else: `pacman -Sy` against a live mirror fetches whatever exists today, and the
+# toolchain that compiled a payload would not be recoverable from this repository. The
+# date must not precede the base image's own, or the update below is a downgrade the
+# keyring may refuse.
+FROM base AS toolchain-pacman
+ARG PACKAGE_SNAPSHOT
+RUN printf 'Server = https://archive.archlinux.org/repos/%s/$repo/os/$arch\n' "${PACKAGE_SNAPSHOT}" \
+        > /etc/pacman.d/mirrorlist \
+    && pacman -Syu --noconfirm --needed \
+        base-devel meson ninja pkgconf git jq python python-mako python-ply python-yaml \
+        bison flex cmake libdrm libx11 libxext libxfixes libxdamage libxshmfence \
+        libxxf86vm libxrandr libxcb wayland wayland-protocols expat zlib zstd libglvnd \
+    && rm -rf /var/cache/pacman/pkg/*
+
+FROM ${TOOLCHAIN} AS toolchain
 
 # Every checkout is a layer keyed by its pin: an unchanged pin is an unchanged layer, and
 # a changed one invalidates exactly what it should.
@@ -68,7 +93,7 @@ RUN --network=none chmod +x /usr/local/bin/build-mesa \
     && git -C /src/mesa apply --verbose /src/patches/*.patch \
     && build-mesa /src/mesa /out/mesa ${LIBDIR}
 
-FROM ${BASE} AS closure
+FROM base AS closure-apt
 # A guest, modelled: the base image plus the display stack and nothing else.
 #
 # These are the libraries that talk to the X server, the Wayland compositor and the DRM
@@ -94,12 +119,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libwayland-client0 zlib1g libzstd1 \
         binutils \
     && rm -rf /var/lib/apt/lists/*
+
+# The same guest, modelled with the same rule on the other distribution: the runtime
+# halves of the display stack, and binutils for readelf. Arch does not split -dev packages
+# out, so these names are the whole library and there is nothing to leave out; what
+# matters is the part that is the same on both, that no Mesa of the distribution's own is
+# installed, because that would hide a dependency of ours behind one of its.
+FROM base AS closure-pacman
+ARG PACKAGE_SNAPSHOT
+RUN printf 'Server = https://archive.archlinux.org/repos/%s/$repo/os/$arch\n' "${PACKAGE_SNAPSHOT}" \
+        > /etc/pacman.d/mirrorlist \
+    && pacman -Syu --noconfirm --needed \
+        libdrm expat libx11 libxext libxxf86vm libxcb libxshmfence wayland zlib zstd \
+        binutils \
+    && rm -rf /var/cache/pacman/pkg/*
+
+FROM ${CLOSURE} AS closure
 COPY --from=mesa /out/mesa /check/mesa
 COPY mesa/closure.sh /usr/local/bin/closure
 ARG LIBDIR
 RUN --network=none chmod +x /usr/local/bin/closure && closure /check/mesa ${LIBDIR}
 
-FROM sources AS prepared
+FROM sources AS prepared-sources
 COPY --from=mesa /out/mesa /mesa
 # The closure stage produces nothing this stage needs, but copying one file out of it is
 # what makes BuildKit run it: a gate nobody depends on is a gate that gets skipped.
@@ -126,6 +167,36 @@ RUN --network=none python3 prepare.py \
         --checkout /src/kernel \
         --mesa /mesa \
         --output /output
+
+# Does the driver this payload ships actually build against this distribution's kernel?
+# The display payload's container build answers that for its module by building it; the
+# GPU payload ships sources and lets DKMS build them in the guest, so nothing answered it
+# here until now. It matters most where the payload's sources and the guest's kernel come
+# from different lineages: dxgkrnl is taken from a WSL kernel branch, and Arch runs
+# mainline. The module built here is thrown away -- the payload still carries the sources.
+FROM toolchain-pacman AS module-pacman
+ARG PACKAGE_SNAPSHOT
+RUN pacman -Syu --noconfirm --needed linux-headers \
+    && rm -rf /var/cache/pacman/pkg/*
+COPY --from=prepared-sources /output/prepared/content/dxgkrnl /src/dxgkrnl
+RUN --network=none set -eu; \
+    headers="$(find /usr/lib/modules -maxdepth 2 -name build -type d | head -n1)"; \
+    [ -n "$headers" ] || { echo "no kernel headers in the image" >&2; exit 1; }; \
+    make -C "$headers" M=/src/dxgkrnl modules; \
+    echo "dxgkrnl builds against $(basename "$(dirname "$headers")")" > /gate.txt
+
+# A target whose distribution has no gate stage yet -- today that is Ubuntu, whose proof
+# that this module builds is the manual run its README records. The file is what the
+# stage below copies, so the two shapes have to agree on producing one.
+FROM base AS module-none
+RUN echo "no module gate for this target" > /gate.txt
+
+FROM ${MODULE} AS module
+
+FROM prepared-sources AS prepared
+# A gate nothing depends on is a gate BuildKit skips, which is why one file is copied out
+# of it. The file is not part of the payload: `output` below takes /output alone.
+COPY --from=module /gate.txt /module-passed.txt
 
 FROM scratch AS output
 COPY --from=prepared /output /
