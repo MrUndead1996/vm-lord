@@ -10,6 +10,7 @@
   },
   "required_renderers": ["d3d12-gallium", "dzn-vulkan"],
   "guest_capabilities": ["compositor-scanout"],
+  "library_layout": "multiarch:x86_64-linux-gnu",
   "mesa_policy": "bundled",
   "sources": [
     {
