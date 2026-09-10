@@ -46,14 +46,19 @@ diff rather than as a rewrite.
 
 `prepare.sh` already reads the pinned commits out of the spec and passes them in
 as build arguments, checking its table against the `ARG` names in the Dockerfile
-in both directions. Two more values join them, read from a new `build` object in
-the spec:
+in both directions. Three more values join them:
 
-* `base_image` -- the base image, pinned by digest.
-* `libdir` -- the library directory inside the payload, relative to its prefix.
+* `build.base_image` -- the base image, pinned by digest.
+* `build.package_snapshot` -- how the distribution's packages are pinned; the
+  Arch target's archive date, absent for Ubuntu, whose release archive is
+  already a snapshot.
+* the library directory, which is not a field of its own: it is derived from
+  `library_layout` below, so that one statement decides both the tree's shape
+  and where the guest's linker is pointed.
 
-The same bidirectional check covers them, so a spec that names neither, or a
-Dockerfile that declares neither, fails before the build starts.
+The same bidirectional check covers them, so a spec that names one the Dockerfile
+does not declare, or a Dockerfile declaring one the spec does not supply, fails
+before the build starts.
 
 ## The Arch spec
 
