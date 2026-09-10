@@ -41,6 +41,7 @@ RUN printf 'Server = https://archive.archlinux.org/repos/%s/$repo/os/$arch\n' "$
         > /etc/pacman.d/mirrorlist \
     && pacman -Syu --noconfirm --needed \
         base-devel meson ninja pkgconf git jq python python-mako python-ply python-yaml \
+        python-packaging \
         bison flex cmake libdrm libx11 libxext libxfixes libxdamage libxshmfence \
         libxxf86vm libxrandr libxcb wayland wayland-protocols expat zlib zstd libglvnd \
     && rm -rf /var/cache/pacman/pkg/*
@@ -116,7 +117,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libdrm2 libexpat1 libx11-6 libx11-xcb1 libxext6 libxxf86vm1 \
         libxcb1 libxcb-dri3-0 libxcb-glx0 libxcb-present0 libxcb-randr0 \
         libxcb-shm0 libxcb-sync1 libxcb-xfixes0 libxshmfence1 \
-        libwayland-client0 zlib1g libzstd1 \
+        libwayland-client0 zlib1g libzstd1 libudev1 \
         binutils \
     && rm -rf /var/lib/apt/lists/*
 
@@ -131,6 +132,7 @@ RUN printf 'Server = https://archive.archlinux.org/repos/%s/$repo/os/$arch\n' "$
         > /etc/pacman.d/mirrorlist \
     && pacman -Syu --noconfirm --needed \
         libdrm expat libx11 libxext libxxf86vm libxcb libxshmfence wayland zlib zstd \
+        systemd-libs \
         binutils \
     && rm -rf /var/cache/pacman/pkg/*
 

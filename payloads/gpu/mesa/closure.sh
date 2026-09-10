@@ -48,6 +48,12 @@ allowed_external=(
 	libxcb-xfixes.so.0
 	libxshmfence.so.1
 	libwayland-client.so.0
+	# The device enumeration half of the loader. Both distributions carry udev in the
+	# base system a cloud image boots -- systemd-libs on Arch, libudev1 on Ubuntu -- so
+	# this is a library every guest has before a payload reaches it. It appears in the
+	# tree only where the build image offered a libudev to link against, which is why it
+	# is reviewed here rather than being a surprise on one distribution.
+	libudev.so.1
 )
 
 objects=()

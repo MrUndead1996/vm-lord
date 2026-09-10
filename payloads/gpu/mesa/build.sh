@@ -16,6 +16,12 @@ destination="${2:?usage: build.sh <source> <destination> <libdir>}"
 # states it once, as the layout the guest is told about, and it arrives here from there.
 libdir="${3:?usage: build.sh <source> <destination> <libdir>}"
 
+# `lmsensors` and `spirv-tools` are disabled by name rather than left to meson's own
+# detection, because detection answers with whatever the build image happens to have and
+# the two images do not have the same things: Arch's libglvnd depends on the
+# distribution's Mesa, which brings lm_sensors and SPIRV-Tools with it, and a payload
+# would then link against libraries a guest has no reason to carry. The HUD's sensor
+# readouts and SPIR-V dumping are debugging conveniences; neither is why this tree exists.
 meson setup "$source/build" "$source" \
 	--wrap-mode=nodownload \
 	-Dprefix=/opt/vmlord/wsl-mesa \
@@ -23,6 +29,8 @@ meson setup "$source/build" "$source" \
 	-Dgallium-drivers=d3d12,softpipe \
 	-Dvulkan-drivers=microsoft-experimental \
 	-Dllvm=disabled \
+	-Dlmsensors=disabled \
+	-Dspirv-tools=disabled \
 	-Dglvnd=enabled \
 	-Dglvnd-vendor-name=mesa \
 	-Dplatforms=x11,wayland \
