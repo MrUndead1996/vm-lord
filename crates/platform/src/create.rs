@@ -488,6 +488,13 @@ fn write_provisioning(
             .profile
             .desktop_for(provisioning.desktop)
             .map_or(&[][..], |desktop| desktop.packages.as_slice()),
+        // And whatever that desktop needs configured before its login screen
+        // starts, which for GNOME is nothing and for Hyprland is a greeter
+        // told which session to bring up and whom to log in as.
+        desktop_files: image
+            .profile
+            .desktop_for(provisioning.desktop)
+            .map_or(&[][..], |desktop| desktop.files.as_slice()),
         // And the unit that turns those packages into a login screen, which
         // only the distribution knows the name of and only the seed is in a
         // position to switch on: it runs after the packages land and before

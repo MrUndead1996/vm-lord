@@ -12,7 +12,7 @@ mod meta_data;
 mod scalar;
 mod user_data;
 
-use vmlord_core::{KeyboardFile, PackageRefresh, SshAccess, SshDaemon};
+use vmlord_core::{DesktopFile, KeyboardFile, PackageRefresh, SshAccess, SshDaemon};
 
 /// Everything the two documents are printed from.
 pub struct SeedRequest<'a> {
@@ -60,6 +60,15 @@ pub struct SeedRequest<'a> {
     /// rather than a profile, because this crate prints documents and has no
     /// business knowing what GNOME is.
     pub desktop_packages: &'a [String],
+    /// The files that desktop needs written before its display manager is
+    /// enabled, with `{user}` in each template standing for the account
+    /// cloud-init creates.
+    ///
+    /// Empty for a headless VM and for a desktop that needs none. Paths and
+    /// templates rather than a profile, for the reason the packages beside
+    /// them are names: this crate prints documents and has no business knowing
+    /// what an autologin is.
+    pub desktop_files: &'a [DesktopFile],
     /// The display manager unit the first boot enables once those packages
     /// are installed, or `None` for a VM with no desktop.
     ///
@@ -235,6 +244,7 @@ mod tests {
             ssh_daemon: &UBUNTU_SSH,
             agent_secret: None,
             desktop_packages: &[],
+            desktop_files: &[],
             desktop_service: None,
             package_refresh: PackageRefresh::Lists,
         });
@@ -265,6 +275,7 @@ mod tests {
             ssh_daemon: &UBUNTU_SSH,
             agent_secret: None,
             desktop_packages: &[],
+            desktop_files: &[],
             desktop_service: None,
             package_refresh: PackageRefresh::Lists,
         });

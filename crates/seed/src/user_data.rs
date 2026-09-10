@@ -100,6 +100,14 @@ fn write_files(request: &SeedRequest<'_>) -> String {
         files.push_str(&file(&keyboard.path, &keyboard.content(request.keyboard)));
     }
 
+    // The desktop's own configuration, before the unit that reads it is
+    // enabled below. Which files these are, and what is in them, is the
+    // distribution's to declare: a greeter told whom to log in as and which
+    // session to start is the shape Hyprland needs and GNOME has no use for.
+    for desktop in request.desktop_files {
+        files.push_str(&file(&desktop.path, &desktop.render(request.username)));
+    }
+
     if let SshAccess::Enabled { port, .. } = request.ssh {
         files.push_str(&file(
             &request.ssh_daemon.config_drop_in,
@@ -358,6 +366,7 @@ mod tests {
     use super::{GUEST_SECRET_PATH, render};
     use crate::{SeedRequest, UBUNTU_KEYBOARD, UBUNTU_SSH};
     use serde_yaml_ng::Value;
+    use vmlord_core::DesktopFile;
     use vmlord_core::{
         KeyboardFile, KeyboardForm, PackageRefresh, SshAccess, SshDaemon, SshPort, SshUnits,
     };
@@ -469,6 +478,7 @@ mod tests {
             // two tests about the secret set it themselves.
             agent_secret: None,
             desktop_packages: &[],
+            desktop_files: &[],
             desktop_service: None,
             package_refresh: PackageRefresh::Lists,
         }
@@ -551,6 +561,7 @@ mod tests {
         let packages = ["ubuntu-desktop-minimal".to_owned()];
         let document = parsed(&render(&SeedRequest {
             desktop_packages: &packages,
+            desktop_files: &[],
             ..request()
         }));
 
@@ -573,6 +584,7 @@ mod tests {
         let packages = ["gnome-shell".to_owned()];
         let document = parsed(&render(&SeedRequest {
             desktop_packages: &packages,
+            desktop_files: &[],
             package_refresh: PackageRefresh::FullUpgrade,
             ..request()
         }));
@@ -593,6 +605,7 @@ mod tests {
         let packages = ["gnome-shell".to_owned()];
         let document = parsed(&render(&SeedRequest {
             desktop_packages: &packages,
+            desktop_files: &[],
             desktop_service: Some("gdm.service"),
             ..request()
         }));
@@ -609,6 +622,52 @@ mod tests {
         );
     }
 
+    /// A desktop that needs configuring says so with files, and the account
+    /// they name is the one this seed is creating -- which is why `{user}` is
+    /// substituted here rather than declared in a profile that has no idea
+    /// what the VM will be called or who will log into it.
+    #[test]
+    fn a_desktop_s_declared_files_are_written_with_the_guest_s_account_in_them() {
+        let packages = ["hyprland".to_owned()];
+        let files = [DesktopFile {
+            path: "/etc/sddm.conf.d/10-vmlord-autologin.conf".to_owned(),
+            template: "[Autologin]\nUser={user}\nSession=hyprland-uwsm.desktop\n".to_owned(),
+        }];
+        let document = parsed(&render(&SeedRequest {
+            desktop_packages: &packages,
+            desktop_files: &files,
+            desktop_service: Some("sddm.service"),
+            ..request()
+        }));
+
+        let written = file(&document, "/etc/sddm.conf.d/10-vmlord-autologin.conf");
+        assert_eq!(
+            written["content"].as_str().unwrap(),
+            "[Autologin]\nUser=dev\nSession=hyprland-uwsm.desktop\n"
+        );
+    }
+
+    /// A desktop that declares none writes none, and a headless VM writes none
+    /// either: an empty list is not an empty file at some path nobody named.
+    #[test]
+    fn a_desktop_that_declares_no_files_writes_none() {
+        let packages = ["ubuntu-desktop-minimal".to_owned()];
+        let document = parsed(&render(&SeedRequest {
+            desktop_packages: &packages,
+            desktop_files: &[],
+            desktop_service: Some("gdm3.service"),
+            ..request()
+        }));
+
+        assert!(
+            !paths(&document)
+                .iter()
+                .any(|path| path.contains("sddm") || path.contains("autologin")),
+            "{:?}",
+            paths(&document)
+        );
+    }
+
     /// `--now` rather than a bare `enable`: nothing reboots the guest after
     /// cloud-init, so a desktop left for the next boot is a desktop the person
     /// who asked for one does not get.
@@ -617,6 +676,7 @@ mod tests {
         let packages = ["gnome-shell".to_owned()];
         let document = parsed(&render(&SeedRequest {
             desktop_packages: &packages,
+            desktop_files: &[],
             desktop_service: Some("gdm.service"),
             ..request()
         }));

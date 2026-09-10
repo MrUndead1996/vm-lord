@@ -344,8 +344,9 @@ impl CreateVmForm {
             keyboard: guest_defaults.keyboard.clone(),
             timezone: guest_defaults.timezone.clone(),
             // A new VM comes with a desktop unless someone says otherwise:
-            // the profile's own default, not a choice of this dialog's.
-            desktop: DesktopProfile::default(),
+            // the profile's own default, not a choice of this dialog's -- and
+            // only where this distribution declares packages for it.
+            desktop: desktop_offered(profile, DesktopProfile::default()),
             disk_gb: 64,
             ram_mb: 4096,
             cpu_cores: 4,
@@ -372,9 +373,27 @@ impl CreateVmForm {
             self.name = distro_id.to_owned();
         }
         self.release = profile.releases.first().cloned().unwrap_or_default();
+        // The desktop is kept where the new distribution can install it and
+        // dropped where it cannot: switching to a distribution whose archives
+        // carry no Hyprland must not leave a VM asking for one, since the seed
+        // would then install nothing and call it a desktop.
+        self.desktop = desktop_offered(profile, self.desktop);
         self.profile = profile.clone();
         self.distro_id = distro_id.to_owned();
     }
+}
+
+/// `wanted` where this distribution declares packages for it, and `Headless`
+/// where it does not.
+///
+/// The dialog asks the profile rather than holding a table of which
+/// distribution has which desktop: the profile is where that is declared, and
+/// a second copy here would be the constant this epic exists to remove.
+fn desktop_offered(profile: &DistroProfile, wanted: DesktopProfile) -> DesktopProfile {
+    profile
+        .desktops_offered()
+        .find(|offered| *offered == wanted)
+        .unwrap_or(DesktopProfile::Headless)
 }
 
 enum CreateVmDialogAction {
@@ -974,19 +993,22 @@ fn render_create_vm_dialog(
                             // so there would be nothing to install it with.
                             if form.source_kind == SourceKind::CloudImage {
                                 ui.label(t!("create_vm.desktop").to_string());
+                                // Whichever desktops this distribution says it
+                                // can install, and never one it cannot: a
+                                // desktop offered without packages behind it
+                                // would build a VM that installs nothing and
+                                // reports a desktop as pending forever.
+                                let offered = form.profile.desktops_offered().collect::<Vec<_>>();
                                 egui::ComboBox::from_id_salt("create-vm-desktop")
                                     .selected_text(desktop_profile_label(form.desktop))
                                     .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut form.desktop,
-                                            DesktopProfile::Gnome,
-                                            desktop_profile_label(DesktopProfile::Gnome),
-                                        );
-                                        ui.selectable_value(
-                                            &mut form.desktop,
-                                            DesktopProfile::Headless,
-                                            desktop_profile_label(DesktopProfile::Headless),
-                                        );
+                                        for profile in offered {
+                                            ui.selectable_value(
+                                                &mut form.desktop,
+                                                profile,
+                                                desktop_profile_label(profile),
+                                            );
+                                        }
                                     });
                                 ui.end_row();
 
@@ -2036,6 +2058,7 @@ fn desktop_profile_label(profile: DesktopProfile) -> String {
     match profile {
         DesktopProfile::Headless => t!("desktop_profile.headless"),
         DesktopProfile::Gnome => t!("desktop_profile.gnome"),
+        DesktopProfile::Hyprland => t!("desktop_profile.hyprland"),
     }
     .to_string()
 }
@@ -3274,11 +3297,14 @@ mod tests {
                 required: 2,
                 actual: 1
             }),
-            "A GNOME desktop is slow below 2 CPU cores; this VM has 1."
+            // "A desktop" and not "a GNOME desktop": the same advice is
+            // given for every profile that installs one.
+            "A desktop is slow below 2 CPU cores; this VM has 1."
         );
         assert_eq!(
             t!("advisory.desktop_needs_password", locale = "ru-RU"),
-            "У ВМ с рабочим столом без пароля нечего ввести на экране входа; задайте его здесь или позже по SSH."
+            "У ВМ с рабочим столом без пароля нечего ввести ни на экране входа, ни при \
+             разблокировке; задайте его здесь или позже по SSH."
         );
     }
 
@@ -3351,9 +3377,9 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
 
     use vmlord_core::{
-        DisplayStage, DisplayState, DisplayStatusCode, GpuAvailability, GpuFailure, GpuStatusCode,
-        InstallerAsset, SshAuthentication, SshAvailability, SshConfig, ValidatedUpdate, VmGpuFacts,
-        ubuntu,
+        DesktopSetup, DisplayStage, DisplayState, DisplayStatusCode, GpuAvailability, GpuFailure,
+        GpuStatusCode, InstallerAsset, SshAuthentication, SshAvailability, SshConfig,
+        ValidatedUpdate, VmGpuFacts, ubuntu,
     };
 
     use super::*;
@@ -3786,6 +3812,42 @@ mod tests {
 
         assert_eq!(provisioning_of(&request).desktop, DesktopProfile::Headless);
         assert_eq!(request.desktop_profile(), DesktopProfile::Headless);
+    }
+
+    /// Which desktops the dialog offers is the distribution's answer. A
+    /// profile that declares Hyprland offers it; the one that does not both
+    /// leaves it out of the list and drops it from a form that was holding it,
+    /// since a VM asking for a desktop nothing installs would sit reporting a
+    /// pending desktop forever.
+    #[test]
+    fn a_distribution_offers_the_desktops_it_declares_and_no_others() {
+        let mut hyprland_capable = arch();
+        hyprland_capable.desktops.insert(
+            DesktopProfile::Hyprland.as_str().to_owned(),
+            DesktopSetup {
+                packages: vec!["hyprland".into()],
+                files: Vec::new(),
+                service: "sddm.service".into(),
+            },
+        );
+
+        assert_eq!(
+            hyprland_capable.desktops_offered().collect::<Vec<_>>(),
+            [
+                DesktopProfile::Headless,
+                DesktopProfile::Gnome,
+                DesktopProfile::Hyprland
+            ]
+        );
+
+        let mut form = cloud_form();
+        form.select_distro("arch", &hyprland_capable);
+        form.desktop = DesktopProfile::Hyprland;
+
+        // Back to a distribution whose archives have no Hyprland in them.
+        form.select_distro("ubuntu", &ubuntu());
+
+        assert_eq!(form.desktop, DesktopProfile::Headless);
     }
 
     /// Installation media has no seed to install a desktop from, so whatever

@@ -1,6 +1,8 @@
 {
   "name": "Arch Linux",
-  "releases": ["rolling"],
+  "releases": [
+    "rolling"
+  ],
   "directory_template": "https://geo.mirror.pkgbuild.com/images/latest/",
   "file_name_template": "Arch-Linux-x86_64-cloudimg.qcow2",
   "checksum_file": "Arch-Linux-x86_64-cloudimg.qcow2.SHA256",
@@ -27,14 +29,38 @@
       "template": "Section \"InputClass\"\n        Identifier \"system-keyboard\"\n        MatchIsKeyboard \"on\"\n        Option \"XkbLayout\" \"{layout}\"\n        Option \"XkbModel\" \"pc105\"\nEndSection\n"
     }
   ],
-  "desktop": {
-    "packages": [
-      "gnome-shell",
-      "gdm",
-      "gnome-control-center",
-      "gnome-console",
-      "nautilus"
-    ],
-    "service": "gdm.service"
+  "desktops": {
+    "gnome": {
+      "packages": [
+        "gnome-shell",
+        "gdm",
+        "gnome-control-center",
+        "gnome-console",
+        "nautilus"
+      ],
+      "service": "gdm.service"
+    },
+    "hyprland": {
+      "packages": [
+        "hyprland",
+        "uwsm",
+        "sddm",
+        "waybar",
+        "otf-font-awesome",
+        "xdg-desktop-portal-hyprland",
+        "kitty"
+      ],
+      "files": [
+        {
+          "path": "/etc/sddm.conf.d/10-vmlord-autologin.conf",
+          "template": "[Autologin]\nUser={user}\nSession=hyprland-uwsm.desktop\n"
+        },
+        {
+          "path": "/etc/xdg/hypr/hyprland.lua",
+          "template": "-- Hyprland's own configuration, and one line VMLord adds to it.\n--\n-- Hyprland copies its default into a user's own directory only when it\n-- finds no configuration anywhere, and it looks here first, so this file\n-- is read instead of that copy being made. It loads the same default the\n-- distribution ships, so nothing about the desktop is decided here.\n--\n-- The line is waybar: the panel is what carries the tray, and the default\n-- leaves every autostart commented out, so a guest given the package alone\n-- gets a compositor with no panel and no tray on it.\ndofile(\"/usr/share/hypr/hyprland.lua\")\n\nhl.on(\"hyprland.start\", function()\n    hl.exec_cmd(\"waybar\")\nend)\n"
+        }
+      ],
+      "service": "sddm.service"
+    }
   }
 }
