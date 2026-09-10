@@ -184,7 +184,7 @@ then could not find. Releasing therefore means editing one version, in
 `[workspace.package]`, and tagging it.
 
 Locally the payloads are the one part that is not built for you: run
-`./rebuild_payload.sh` and `payloads/ubuntu-26.04-amd64/prepare.sh` first, or
+`./rebuild_payload.sh` and `payloads/gpu/prepare.sh` first, or
 leave the flags off and build a distribution without them -- `check.ps1` only
 insists on payloads when it is given `-RequirePayloads`, as the release does.
 
@@ -242,7 +242,7 @@ update check reads the latest published release.
 Both payloads are built by the release itself. They come from a `docker build`
 on Linux and the release has to run on Windows, so a `payloads` job on
 `ubuntu-24.04` runs `./rebuild_payload.sh` and
-`payloads/ubuntu-26.04-amd64/prepare.sh`, uploads the packed pairs, and the
+`payloads/gpu/prepare.sh`, uploads the packed pairs, and the
 Windows job downloads them and passes every one to `cargo dist`. The Windows
 job needs them, so a payload that fails to build fails the release rather than
 shrinking it.

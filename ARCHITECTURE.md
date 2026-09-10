@@ -1332,7 +1332,7 @@ itself. The boundary does not move -- it becomes visible.
 
 The `ubuntu-26.04-amd64` payload builds Mesa from a pinned commit and applies
 two patches of ours before compiling it, in
-`payloads/ubuntu-26.04-amd64/mesa/patches/`: one that makes d3d12 able to scan
+`payloads/gpu/mesa/patches/`: one that makes d3d12 able to scan
 out at all, and one that keeps it from deadlocking against itself once it does.
 
 It exists because a GPU-PV guest has one DRM device, `vmlord_drm`, and no render

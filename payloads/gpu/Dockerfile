@@ -102,7 +102,12 @@ COPY --from=mesa /out/mesa /mesa
 # The closure stage produces nothing this stage needs, but copying one file out of it is
 # what makes BuildKit run it: a gate nobody depends on is a gate that gets skipped.
 COPY --from=closure /check/mesa/share/vulkan/icd.d/dzn_icd.x86_64.json /closure-passed.json
-COPY payload.spec.json prepare.py prepare_test.py ./
+# Which target is being built. The context holds every target's spec, and this is the one
+# line that picks one: a build argument rather than a copy of the whole directory, so that
+# two targets cannot end up reading each other's provenance.
+ARG TARGET
+COPY ${TARGET}/payload.spec.json ./payload.spec.json
+COPY prepare.py prepare_test.py ./
 COPY overlays ./overlays
 COPY mesa/patches ./patches
 COPY licenses ./licenses

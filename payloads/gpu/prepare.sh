@@ -19,9 +19,11 @@
 
 set -euo pipefail
 
-SPEC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SPEC="$SPEC_DIR/payload.spec.json"
-DOCKERFILE="$SPEC_DIR/Dockerfile"
+# The build context is this directory: one Dockerfile, one prepare.py and one Mesa
+# recipe serve every target, and what differs between two targets is the spec.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DOCKERFILE="$HERE/Dockerfile"
+SPEC=""
 
 # Which pair of build arguments carries which upstream. The mapping is written out here
 # instead of being computed from the repository URL because a computed name has no way to
@@ -45,8 +47,9 @@ declare -A ARGUMENT_FOR=(
 
 usage() {
 	cat <<'USAGE'
-usage: prepare.sh --output <directory>
+usage: prepare.sh --spec <payload.spec.json> --output <directory>
 
+  --spec    the target to build, e.g. payloads/gpu/arch-rolling-amd64/payload.spec.json
   --output  where the prepared tree and recipe.json are written
 USAGE
 }
@@ -54,6 +57,14 @@ USAGE
 output=""
 while [[ $# -gt 0 ]]; do
 	case "$1" in
+	--spec)
+		SPEC="${2-}"
+		[[ -n "$SPEC" ]] || {
+			echo "--spec needs a payload.spec.json" >&2
+			exit 2
+		}
+		shift 2
+		;;
 	--output)
 		output="${2-}"
 		[[ -n "$output" ]] || {
@@ -80,6 +91,20 @@ done
 	exit 2
 }
 
+[[ -n "$SPEC" ]] || {
+	echo "missing --spec <payload.spec.json>" >&2
+	usage >&2
+	exit 2
+}
+[[ -f "$SPEC" ]] || {
+	echo "no such spec: $SPEC" >&2
+	exit 2
+}
+SPEC="$(cd "$(dirname "$SPEC")" && pwd)/$(basename "$SPEC")"
+# Which target directory the Dockerfile copies the spec out of. The context is shared, so
+# the spec's own directory name is what tells the build which of them to read.
+TARGET="$(basename "$(dirname "$SPEC")")"
+
 mkdir -p "$output"
 output="$(cd "$output" && pwd)"
 
@@ -100,7 +125,7 @@ done < <(sed -nE 's/^ARG[[:space:]]+([A-Z0-9_]+_(URL|COMMIT))([[:space:]]*|=.*)$
 # The spec is read by the image's own jq, so that a host without jq can still tell the
 # build which commits to fetch. The toolchain stage is built once and reused: it is the
 # same layer the full build will hit, so this costs a cache lookup and not a build.
-toolchain="$(DOCKER_BUILDKIT=1 docker build --quiet --target toolchain "$SPEC_DIR")"
+toolchain="$(DOCKER_BUILDKIT=1 docker build --quiet --target toolchain "$HERE")"
 
 pins="$(
 	docker run --rm \
@@ -178,8 +203,9 @@ done
 rm -rf "$output/prepared" "$output/recipe.json"
 
 DOCKER_BUILDKIT=1 docker build \
+	--build-arg "TARGET=$TARGET" \
 	"${arguments[@]}" \
 	--output "type=local,dest=$output" \
-	"$SPEC_DIR"
+	"$HERE"
 
 echo "prepared tree and recipe.json written to $output"

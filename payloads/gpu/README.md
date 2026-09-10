@@ -1,4 +1,4 @@
-# GPU payload: Ubuntu 26.04 amd64
+# GPU payload
 
 What a guest needs to build `dxgkrnl` for itself and to draw through it once it
 has, and the provenance that says where every byte of it came from. The archive
@@ -7,7 +7,9 @@ is not in this repository — these files are what produces one.
 ## Building
 
 ```sh
-payloads/ubuntu-26.04-amd64/prepare.sh --output target/gpu-payload
+payloads/gpu/prepare.sh \
+    --spec   payloads/gpu/ubuntu-26.04-amd64/payload.spec.json \
+    --output target/gpu-payload
 cargo run -p xtask -- gpu-payload pack \
     --recipe        target/gpu-payload/recipe.json \
     --input         target/gpu-payload/prepared \

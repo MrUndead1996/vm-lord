@@ -985,7 +985,7 @@ mod tests {
     }
 
     /// The digest of the adversarial tree below, and the tie between this rule and the
-    /// one `payloads/ubuntu-26.04-amd64/prepare.py` writes into every recipe.
+    /// one `payloads/gpu/prepare.py` writes into every recipe.
     ///
     /// The same literal appears in `prepare_test.py` beside that script, over a tree with
     /// the same three members and the same bytes. The two implementations are one rule in
