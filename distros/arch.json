@@ -53,7 +53,7 @@
       "files": [
         {
           "path": "/etc/sddm.conf.d/10-vmlord-autologin.conf",
-          "template": "[Autologin]\nUser={user}\nSession=hyprland-uwsm.desktop\n"
+          "template": "[General]\nDisplayServer=wayland\n\n[Autologin]\nUser={user}\nSession=hyprland-uwsm.desktop\n"
         },
         {
           "path": "/etc/xdg/hypr/hyprland.lua",

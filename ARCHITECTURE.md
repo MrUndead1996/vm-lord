@@ -4419,13 +4419,26 @@ is a path and a template in which `{user}` stands for that account, printed into
 `write_files` the way `KeyboardFile` is and for the same reason: what a guest
 needs configured differs by distribution and by desktop, and a path with a
 template is the whole of that difference. GNOME declares none. Hyprland declares
-two. The first is `/etc/sddm.conf.d/10-vmlord-autologin.conf`, and it says two
+two. The first is `/etc/sddm.conf.d/10-vmlord-autologin.conf`, and it says three
 things.
 
 Autologin, because SDDM's greeter is itself a compositor -- a third one, outside
 the user unit the isolation drop-in attaches to and with no isolation of its own
 -- and logging straight in means it never starts. The account keeps its
 password: SSH asks for it, and so does a locked screen.
+
+`DisplayServer=wayland`, because SDDM's own default is `x11` and that default
+cannot be reached here. Left at it, SDDM starts an Xorg on a VT before it looks
+at the autologin at all, and Xorg cannot drive `vmlord_drm`: the display is a
+platform device with no bus ID, which `modesetting` refuses with "Cannot run in
+framebuffer mode. Please specify busIDs for all framebuffer devices". SDDM
+tries three times, gives up with "Could not start Display server", and the
+autologin below it never happens -- the guest reaches a running display manager
+and a black screen, which is the shape this failure takes: nothing in the log
+mentions Hyprland, because Hyprland was never started. Told `wayland`, SDDM
+logs the account straight in without starting a greeter compositor at all, so
+the `CompositorCommand` it would otherwise need -- weston, which no Hyprland
+guest has installed -- never comes up either.
 
 The second file is `/etc/xdg/hypr/hyprland.lua`, and it exists because the
 package is a compositor and the tray lives on a panel. Hyprland copies its
