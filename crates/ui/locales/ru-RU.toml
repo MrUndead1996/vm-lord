@@ -95,6 +95,7 @@ degraded = "Ограничен"
 [desktop_profile]
 headless = "Нет (без графики)"
 gnome = "GNOME"
+hyprland = "Hyprland"
 
 [gpu_mode]
 mirror = "Зеркало"
@@ -228,10 +229,10 @@ disks_kept = "Виртуальные диски сохраняются, поэт
 title = "Журнал"
 
 [advisory]
-desktop_needs_cores = "Рабочий стол GNOME медлителен меньше чем на %{required} ядрах CPU; у этой ВМ их %{actual}."
-desktop_needs_ram = "Рабочий стол GNOME медлителен меньше чем на %{required} ГиБ RAM; у этой ВМ её %{actual} МиБ."
-desktop_needs_cores_and_ram = "Рабочий стол GNOME медлителен меньше чем на %{required_cores} ядрах CPU и %{required_gib} ГиБ RAM; у этой ВМ %{actual_cores} ядер и %{actual_mb} МиБ."
-desktop_needs_password = "У ВМ с рабочим столом без пароля нечего ввести на экране входа; задайте его здесь или позже по SSH."
+desktop_needs_cores = "Рабочий стол медлителен меньше чем на %{required} ядрах CPU; у этой ВМ их %{actual}."
+desktop_needs_ram = "Рабочий стол медлителен меньше чем на %{required} ГиБ RAM; у этой ВМ её %{actual} МиБ."
+desktop_needs_cores_and_ram = "Рабочий стол медлителен меньше чем на %{required_cores} ядрах CPU и %{required_gib} ГиБ RAM; у этой ВМ %{actual_cores} ядер и %{actual_mb} МиБ."
+desktop_needs_password = "У ВМ с рабочим столом без пароля нечего ввести ни на экране входа, ни при разблокировке; задайте его здесь или позже по SSH."
 
 [updates]
 section = "Обновления приложения"

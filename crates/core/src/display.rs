@@ -43,10 +43,13 @@ use serde::{Deserialize, Serialize};
 /// wants to know what to install reads this one; code that wants to know what
 /// is running reads that one.
 ///
-/// Two variants and no `Auto`: the MVP installs GNOME on GDM under Wayland or
-/// installs nothing at all, and a third variant would be a promise no code
-/// keeps. Changing a created VM from `Headless` to `Gnome` afterwards is its
-/// own task (#127); until then the profile is a creation-time decision.
+/// No `Auto`: a profile is a request, and a request that says "whatever suits"
+/// is a promise no code keeps. Which of these a distribution can actually
+/// install is the distribution's to declare -- `DistroProfile::desktop_for`
+/// answers `None` for a desktop its archives have no packages for, and the
+/// create dialog offers only the ones that answer. Changing a created VM's
+/// desktop afterwards is its own task (#127); until then the profile is a
+/// creation-time decision.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DesktopProfile {
     /// No desktop is installed. The guest is reached over SSH and the serial
@@ -57,6 +60,13 @@ pub enum DesktopProfile {
     /// VMLord has to sign or update.
     #[default]
     Gnome,
+    /// Hyprland under UWSM, brought up by SDDM with autologin, installed from
+    /// the distribution's own archives on the same terms as GNOME.
+    ///
+    /// The greeter is declared here because Hyprland has none: it is a
+    /// compositor and nothing else, so a guest given only its packages boots
+    /// to a text console. GNOME brings GDM with it.
+    Hyprland,
 }
 
 impl DesktopProfile {
@@ -66,13 +76,14 @@ impl DesktopProfile {
         match self {
             Self::Headless => "headless",
             Self::Gnome => "gnome",
+            Self::Hyprland => "hyprland",
         }
     }
 
     /// Whether this profile asks for a desktop to be installed at all.
     #[must_use]
     pub const fn wants_desktop(self) -> bool {
-        matches!(self, Self::Gnome)
+        !matches!(self, Self::Headless)
     }
 }
 
@@ -242,7 +253,7 @@ impl DisplayProvisioning {
     pub const fn requested(profile: DesktopProfile) -> Self {
         match profile {
             DesktopProfile::Headless => Self::NotRequested,
-            DesktopProfile::Gnome => Self::Pending,
+            DesktopProfile::Gnome | DesktopProfile::Hyprland => Self::Pending,
         }
     }
 

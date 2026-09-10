@@ -4269,13 +4269,24 @@ What a VM asks of its desktop, what installing that desktop came to, and what
 the guest is doing with it right now are three things, and `core::display`
 makes them three types rather than one field.
 
-`DesktopProfile` is desired state -- `Headless` or `Gnome`, GNOME by default in
-a create form. It lives inside `Provisioning`, beside the user name and the
-locale, for the reason provisioning itself lives inside `VmSource::CloudImage`:
-a desktop is something a cloud-init seed installs, installation media gets no
-seed, and "a local ISO with GNOME" is therefore a state that cannot be spelled
-rather than one to be rejected at run time. It is a creation-time decision;
-installing a desktop into a guest that was built without one is #127.
+`DesktopProfile` is desired state -- `Headless`, `Gnome` or `Hyprland`, GNOME by
+default in a create form. It lives inside `Provisioning`, beside the user name
+and the locale, for the reason provisioning itself lives inside
+`VmSource::CloudImage`: a desktop is something a cloud-init seed installs,
+installation media gets no seed, and "a local ISO with GNOME" is therefore a
+state that cannot be spelled rather than one to be rejected at run time. It is a
+creation-time decision; installing a desktop into a guest that was built without
+one is #127.
+
+Which of those a VM can be created with is the distribution's answer and not the
+dialog's. `DistroProfile::desktops_offered` lists `Headless` plus whichever
+desktops that profile declares packages for, and the create form both fills its
+combo box from it and drops a desktop the distribution cannot install when the
+distribution is switched. Ubuntu declares GNOME alone, because `hyprland` is in
+its archives only from 25.04 and none of the releases the profile offers is one
+of those; Arch declares both. A desktop offered with no packages behind it would
+build a VM whose seed installs nothing and whose provisioning stays `Pending`
+forever, so it is not offered.
 
 `GuestDesktop` is the other half of that first type, and the reason it is a
 second type rather than a second reading of the first: the profile is what was
@@ -4353,14 +4364,51 @@ the normal display export boundary and restores its fixed share name in
 therefore mount and report the desktop without waiting for a later reconnect.
 
 The desktop itself comes from the distribution's own archives. `DistroProfile`
-carries a `DesktopSetup`: a package list and the display manager unit to
-enable. The seed prints the list as cloud-init's `packages` block with
-`package_update`, so Ubuntu installs `ubuntu-desktop-minimal` (GNOME Shell, GDM
-and the Wayland session, without the office suite) from the archives the guest
-is already configured with. Arch names the same session package by package --
-`gnome-shell`, `gdm`, `gnome-control-center`, `gnome-console`, `nautilus` --
-because it publishes no one metapackage for it. VMLord adds no repository,
-downloads no desktop binary of its own and signs nothing.
+carries a `DesktopSetup` per desktop it can install, keyed by the profile's own
+name: a package list, the files that desktop needs written, and the display
+manager unit to enable. The seed prints the list as cloud-init's `packages`
+block with `package_update`, so Ubuntu installs `ubuntu-desktop-minimal` (GNOME
+Shell, GDM and the Wayland session, without the office suite) from the archives
+the guest is already configured with. Arch names the same session package by
+package -- `gnome-shell`, `gdm`, `gnome-control-center`, `gnome-console`,
+`nautilus` -- because it publishes no one metapackage for it. VMLord adds no
+repository, downloads no desktop binary of its own and signs nothing.
+
+Hyprland is declared only by Arch, and what is declared there is the whole of
+what a Hyprland guest needs told rather than found. Hyprland is a compositor and
+nothing else, so the list carries a greeter (`sddm`), a panel that shows
+StatusNotifierItems (`waybar`), the portal (`xdg-desktop-portal-hyprland`), a
+terminal (`kitty`) and `uwsm` beside `hyprland` itself; a guest given the
+compositor alone boots to a text console with nothing on it to start anything
+from. Everything else about that desktop the agent reads out of the guest: the
+tray extension is not installed because `DesktopFacts::is_gnome` is false, the
+Hyper-V card is taken away by `vmlord-display-unbind-hyperv` rather than by a
+tag only mutter reads, and the clipboard speaks `wlr-data-control` because that
+is what the session advertises. None of those three names Hyprland anywhere.
+
+`DesktopSetup::files` is the second half of that declaration, and it exists
+because a greeter has to be told whom to log in as -- an answer that cannot be a
+constant, since the account is the one this VM is being created with. Each file
+is a path and a template in which `{user}` stands for that account, printed into
+`write_files` the way `KeyboardFile` is and for the same reason: what a guest
+needs configured differs by distribution and by desktop, and a path with a
+template is the whole of that difference. GNOME declares none. Hyprland declares
+one, `/etc/sddm.conf.d/10-vmlord-autologin.conf`, and it says two things.
+
+Autologin, because SDDM's greeter is itself a compositor -- a third one, outside
+the user unit the isolation drop-in attaches to and with no isolation of its own
+-- and logging straight in means it never starts. The account keeps its
+password: SSH asks for it, and so does a locked screen.
+
+And `Session=hyprland-uwsm.desktop` rather than the plain entry, because that is
+what decides whether anything of VMLord's can reach the compositor at all.
+Started from the plain entry Hyprland lives in the session's own scope, which is
+the case the isolation stage skips with a reason and for which the only remedy
+is the `/usr/local/share/wayland-sessions` wrapper described above. Started
+through UWSM it lives in `wayland-wm@hyprland.service`, which
+`CompositorLaunch::Unit` folds to `wayland-wm@.service.d` like any other
+templated user unit -- so the drop-in that keeps the compositor off the payload's
+Mesa works on Hyprland with no new mechanism, and the wrapper stays unwritten.
 
 Installing a display manager and running one are two different things, and
 which of them a package does is the packaging's choice. Debian and Ubuntu

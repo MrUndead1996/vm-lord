@@ -1,6 +1,8 @@
 {
   "name": "Arch Linux",
-  "releases": ["rolling"],
+  "releases": [
+    "rolling"
+  ],
   "directory_template": "https://geo.mirror.pkgbuild.com/images/latest/",
   "file_name_template": "Arch-Linux-x86_64-cloudimg.qcow2",
   "checksum_file": "Arch-Linux-x86_64-cloudimg.qcow2.SHA256",
@@ -27,14 +29,33 @@
       "template": "Section \"InputClass\"\n        Identifier \"system-keyboard\"\n        MatchIsKeyboard \"on\"\n        Option \"XkbLayout\" \"{layout}\"\n        Option \"XkbModel\" \"pc105\"\nEndSection\n"
     }
   ],
-  "desktop": {
-    "packages": [
-      "gnome-shell",
-      "gdm",
-      "gnome-control-center",
-      "gnome-console",
-      "nautilus"
-    ],
-    "service": "gdm.service"
+  "desktops": {
+    "gnome": {
+      "packages": [
+        "gnome-shell",
+        "gdm",
+        "gnome-control-center",
+        "gnome-console",
+        "nautilus"
+      ],
+      "service": "gdm.service"
+    },
+    "hyprland": {
+      "packages": [
+        "hyprland",
+        "uwsm",
+        "sddm",
+        "waybar",
+        "xdg-desktop-portal-hyprland",
+        "kitty"
+      ],
+      "files": [
+        {
+          "path": "/etc/sddm.conf.d/10-vmlord-autologin.conf",
+          "template": "[Autologin]\nUser={user}\nSession=hyprland-uwsm.desktop\n"
+        }
+      ],
+      "service": "sddm.service"
+    }
   }
 }

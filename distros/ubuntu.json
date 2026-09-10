@@ -1,6 +1,10 @@
 {
   "name": "Ubuntu",
-  "releases": ["26.04", "24.04", "22.04"],
+  "releases": [
+    "26.04",
+    "24.04",
+    "22.04"
+  ],
   "directory_template": "https://cloud-images.ubuntu.com/releases/{release}/release/",
   "file_name_template": "ubuntu-{release}-server-cloudimg-amd64.img",
   "checksum_file": "SHA256SUMS",
@@ -24,8 +28,12 @@
       "template": "XKBMODEL=\"pc105\"\nXKBLAYOUT=\"{layout}\"\nXKBVARIANT=\"\"\nXKBOPTIONS=\"\"\nBACKSPACE=\"guess\"\n"
     }
   ],
-  "desktop": {
-    "packages": ["ubuntu-desktop-minimal"],
-    "service": "gdm3.service"
+  "desktops": {
+    "gnome": {
+      "packages": [
+        "ubuntu-desktop-minimal"
+      ],
+      "service": "gdm3.service"
+    }
   }
 }

@@ -29,6 +29,14 @@ const RELEASE_PLACEHOLDER: &str = "{release}";
 const LAYOUT_PLACEHOLDER: &str = "{layout}";
 const BUNDLED_PROFILES_FILE_NAME: &str = ".bundled-profiles.json";
 
+/// The desktops a profile may declare, in the order a dialog offers them.
+///
+/// Every variant of [`DesktopProfile`] that installs something, written once
+/// here rather than in the UI: a desktop added to the enum and forgotten in
+/// this list is one no distribution can offer, and that is a compile-time
+/// match away from being caught.
+const DESKTOPS_IN_ORDER: [DesktopProfile; 2] = [DesktopProfile::Gnome, DesktopProfile::Hyprland];
+
 /// Copies installed profiles into the current user's catalogue without taking
 /// ownership of profiles the user already created.
 pub fn sync_bundled_profiles(
@@ -208,13 +216,21 @@ pub struct DistroProfile {
     pub admin_group: String,
     /// How this distribution runs and configures its SSH daemon.
     pub ssh: SshDaemon,
-    /// What installing a GNOME desktop on this distribution takes, when it is
-    /// something VMLord knows how to install at all.
+    /// What installing each desktop this distribution can offer takes, keyed
+    /// by [`DesktopProfile::as_str`].
     ///
-    /// `None` is a profile read from a file that says nothing about a
-    /// desktop -- a VM built from it can only be headless, which is a fact
-    /// about the profile rather than a failure to be reported later.
-    pub desktop: Option<DesktopSetup>,
+    /// A map rather than one setup, because which desktops a distribution can
+    /// install is the distribution's to say and not a constant: Arch carries
+    /// Hyprland, its greeter and its panel in its own archives, and Ubuntu's
+    /// supported releases do not. An empty map -- or a file that omits the key
+    /// -- is a profile that says nothing about a desktop, so a VM built from
+    /// it can only be headless. That is a fact about the profile rather than a
+    /// failure to be reported later.
+    ///
+    /// Defaulted, so a profile written before this field existed still parses;
+    /// it simply offers nothing.
+    #[serde(default)]
+    pub desktops: BTreeMap<String, DesktopSetup>,
     /// What has to happen to the guest's packages before the desktop's are
     /// installed.
     ///
@@ -356,6 +372,19 @@ pub struct DesktopSetup {
     /// it acts. A declared display manager was exactly that second copy, and
     /// it was deleted rather than kept in step with the truth beside it.
     pub packages: Vec<String>,
+    /// The files the first boot writes for this desktop, before its display
+    /// manager is enabled.
+    ///
+    /// Empty for a desktop that needs none, which GNOME does: GDM greets, the
+    /// user types a password, and nothing has to be declared for that to
+    /// happen. Hyprland needs its greeter told which session to start and whom
+    /// to log in as, and that is a file rather than a field because the shape
+    /// of it belongs to whichever greeter the distribution declared.
+    ///
+    /// `{user}` in a template is replaced with the account cloud-init creates,
+    /// the way `{layout}` is in [`KeyboardFile`]. Nothing else is substituted.
+    #[serde(default)]
+    pub files: Vec<DesktopFile>,
     /// The display manager unit the first boot enables once those packages
     /// are installed.
     ///
@@ -376,6 +405,31 @@ pub struct DesktopSetup {
     /// distribution calls its own service is the distribution's to say.
     pub service: String,
 }
+
+/// One file a desktop needs written into the guest before its greeter starts.
+///
+/// The same shape as [`KeyboardFile`] and for the same reason: what a guest
+/// needs configured differs by distribution and by desktop, and a path with a
+/// template is the whole of that difference. The seed prints it; nothing here
+/// or there knows what the content means.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct DesktopFile {
+    /// Where in the guest the file goes.
+    pub path: String,
+    /// Its content, with `{user}` standing for the account cloud-init creates.
+    pub template: String,
+}
+
+impl DesktopFile {
+    /// The file's content for a guest whose account is `user`.
+    #[must_use]
+    pub fn render(&self, user: &str) -> String {
+        self.template.replace(USER_PLACEHOLDER, user)
+    }
+}
+
+/// What [`DesktopFile::template`] spells the guest's account as.
+const USER_PLACEHOLDER: &str = "{user}";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DistroCatalog {
@@ -617,8 +671,24 @@ impl DistroProfile {
     pub fn desktop_for(&self, profile: DesktopProfile) -> Option<&DesktopSetup> {
         profile
             .wants_desktop()
-            .then_some(self.desktop.as_ref())
+            .then(|| self.desktops.get(profile.as_str()))
             .flatten()
+    }
+
+    /// The desktops a VM on this distribution may be created with, in the
+    /// order the create dialog offers them.
+    ///
+    /// `Headless` first and always: a distribution that declares no desktop
+    /// still builds VMs, and one that declares every desktop can still be
+    /// asked for none. The rest are whichever of them this profile has
+    /// packages for, which is why the dialog cannot offer a desktop that would
+    /// install nothing.
+    pub fn desktops_offered(&self) -> impl Iterator<Item = DesktopProfile> + '_ {
+        std::iter::once(DesktopProfile::Headless).chain(
+            DESKTOPS_IN_ORDER
+                .into_iter()
+                .filter(|profile| self.desktops.contains_key(profile.as_str())),
+        )
     }
 
     /// The URL of the image itself.
@@ -655,6 +725,7 @@ impl DistroProfile {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::BTreeMap,
         fs,
         path::PathBuf,
         sync::atomic::{AtomicUsize, Ordering},
@@ -696,7 +767,6 @@ mod tests {
                     "units": {{ "Service": {{ "unit": "sshd.service" }} }},
                     "config_drop_in": "/etc/ssh/sshd_config.d/10-vmlord.conf"
                 }},
-                "desktop": null,
                 "keyboard": [
                     {{
                         "path": "/etc/vconsole.conf",
@@ -904,8 +974,15 @@ mod tests {
             "https://cloud-images.ubuntu.com/releases/24.04/release/SHA256SUMS"
         );
         assert_eq!(profile.ssh.units.all(), ["ssh.socket", "ssh.service"]);
-        let desktop = profile.desktop.unwrap();
+        // GNOME alone: `hyprland` is in Ubuntu's archives only from 25.04, and
+        // none of the releases this profile offers is one of those.
+        assert_eq!(
+            profile.desktops_offered().collect::<Vec<_>>(),
+            [DesktopProfile::Headless, DesktopProfile::Gnome]
+        );
+        let desktop = profile.desktop_for(DesktopProfile::Gnome).unwrap();
         assert_eq!(desktop.packages, ["ubuntu-desktop-minimal"]);
+        assert!(desktop.files.is_empty(), "GDM needs nothing declared");
         // Named even though the deb enables it: the profiles say the same
         // thing in the same place, and Ubuntu stops depending on a side
         // effect of someone else's `postinst` for its login screen.
@@ -941,12 +1018,58 @@ mod tests {
             profile.ssh.config_drop_in,
             "/etc/ssh/sshd_config.d/10-vmlord.conf"
         );
-        let desktop = profile.desktop.unwrap();
+        let desktop = profile.desktop_for(DesktopProfile::Gnome).unwrap();
         assert_eq!(desktop.packages[0], "gnome-shell");
         // `gdm`, not `gdm3`: Debian renamed the package and the unit with it.
         // Nothing in a pacman package enables this, which is why the profile
         // has to name it at all.
         assert_eq!(desktop.service, "gdm.service");
+    }
+
+    /// Hyprland is a compositor and nothing else: a guest given only its
+    /// package boots to a text console, so the greeter that brings it up, the
+    /// panel that shows a tray icon and the portal are declared beside it.
+    /// Everything else about the desktop -- how the compositor is isolated,
+    /// which card the session lights, which clipboard protocol to speak -- the
+    /// agent reads out of the guest, which is why none of it is here.
+    #[test]
+    fn the_arch_profile_declares_hyprland_with_a_greeter_and_an_autologin() {
+        let profile: DistroProfile =
+            serde_json::from_str(include_str!("../../../distros/arch.json")).unwrap();
+
+        assert_eq!(
+            profile.desktops_offered().collect::<Vec<_>>(),
+            [
+                DesktopProfile::Headless,
+                DesktopProfile::Gnome,
+                DesktopProfile::Hyprland
+            ]
+        );
+        let desktop = profile.desktop_for(DesktopProfile::Hyprland).unwrap();
+        for package in ["hyprland", "uwsm", "sddm", "waybar"] {
+            assert!(
+                desktop.packages.iter().any(|name| name == package),
+                "{package} is part of what makes a Hyprland guest usable"
+            );
+        }
+        // SDDM's own greeter is a compositor too, and it is not the one the
+        // isolation drop-in reaches. Logging straight in means it never
+        // starts.
+        assert_eq!(desktop.service, "sddm.service");
+        let [autologin] = desktop.files.as_slice() else {
+            panic!("Hyprland declares exactly the file that logs the guest in");
+        };
+        assert_eq!(autologin.path, "/etc/sddm.conf.d/10-vmlord-autologin.conf");
+        let rendered = autologin.render("arch");
+        assert!(rendered.contains("User=arch"), "{rendered}");
+        // Through UWSM, so the compositor lands in `wayland-wm@hyprland.service`
+        // -- a unit the compositor-isolation drop-in can attach to. Started
+        // from the plain entry it would live in the session's own scope, where
+        // nothing of ours reaches it.
+        assert!(
+            rendered.contains("Session=hyprland-uwsm.desktop"),
+            "{rendered}"
+        );
     }
 
     /// A directory that names no release still has to answer the same two
@@ -1107,10 +1230,15 @@ mod tests {
     #[test]
     fn a_profile_that_describes_no_desktop_offers_none() {
         let profile = DistroProfile {
-            desktop: None,
+            desktops: BTreeMap::new(),
             ..ubuntu()
         };
         assert_eq!(profile.desktop_for(DesktopProfile::Gnome), None);
+        assert_eq!(
+            profile.desktops_offered().collect::<Vec<_>>(),
+            [DesktopProfile::Headless],
+            "a distribution with no desktop packages still builds VMs"
+        );
     }
 
     #[test]
