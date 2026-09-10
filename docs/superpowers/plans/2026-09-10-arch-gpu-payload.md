@@ -559,12 +559,23 @@ In `crates/agent/src/gpu_render.rs`, `libraries_check`:
 
 An unreadable layout is `None` here and not a failure, for the reason the doc comment on `libraries_check` already gives: this check never ends a probe. The staging step in Task 3's `userspace_stage` is where an unreadable layout does fail, and that is the step that would have acted on it.
 
-- [ ] **Step 7: Run the whole agent suite**
+- [ ] **Step 7: Check whether the staging decision itself can be tested**
+
+`userspace_stage` reads `PAYLOAD`, a module constant, and `bundled_mesa` writes to
+`/etc/ld.so.conf.d`, so neither takes a path a test could point elsewhere. Look for an
+existing test in `gpu_kernel.rs` that works around this (its `payload_stage` tests write
+into a temporary directory — read them and see what seam they use). If one exists, add a
+test that a declared `flat` layout puts `/opt/vmlord/wsl-mesa/lib` in `library_paths`
+while the guest is `Multiarch`. If no seam exists, do not invent one for this task: the
+decision is covered by `parse_library_layout`'s tests and by the probe's, and say so in
+the commit body rather than leaving the reader to wonder.
+
+- [ ] **Step 8: Run the whole agent suite**
 
 Run: `cargo test -p vmlord-agent --target x86_64-unknown-linux-musl`
 Expected: PASS, 206 plus the new tests, 0 failed.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add crates/agent/src
