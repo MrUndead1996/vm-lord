@@ -437,7 +437,8 @@ GPU0:
 
     #[test]
     fn a_bundled_userspace_is_looked_for_where_it_was_staged() {
-        let required = required_libraries(&multiarch(), Some(("/opt/vmlord/wsl-mesa", &multiarch())));
+        let required =
+            required_libraries(&multiarch(), Some(("/opt/vmlord/wsl-mesa", &multiarch())));
 
         assert!(
             required
@@ -489,7 +490,10 @@ GPU0:
             "{required:?}"
         );
 
-        let staged = required_libraries(&LibraryLayout::Flat, Some(("/opt/vmlord/wsl-mesa", &LibraryLayout::Flat)));
+        let staged = required_libraries(
+            &LibraryLayout::Flat,
+            Some(("/opt/vmlord/wsl-mesa", &LibraryLayout::Flat)),
+        );
 
         assert!(
             staged.contains(&"/opt/vmlord/wsl-mesa/lib/dri/d3d12_dri.so".to_owned()),
