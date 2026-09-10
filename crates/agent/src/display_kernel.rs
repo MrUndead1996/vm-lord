@@ -52,6 +52,14 @@ const DKMS_TREE: &str = "/var/lib/dkms";
 const MODULES_LOAD: &str = "/etc/modules-load.d/vmlord-display.conf";
 const MODPROBE_OPTIONS: &str = "/etc/modprobe.d/vmlord-display.conf";
 const UNBIND_UNIT: &str = "/etc/systemd/system/vmlord-display-unbind-simpledrm.service";
+/// The Hyper-V display's own driver, and the file that keeps it from binding.
+///
+/// A separate file from [`MODPROBE_OPTIONS`] because it is written at a
+/// different moment and on a different condition: the options are what this
+/// module is to be loaded with and are written before it is, while this one is
+/// only true once the module's device has actually appeared.
+const HYPERV_MODULE: &str = "hyperv_drm";
+const HYPERV_BLACKLIST: &str = "/etc/modprobe.d/vmlord-display-hyperv.conf";
 /// The drop-in that keeps a compositor off the payload's Mesa, by the name it
 /// is installed under.
 ///
@@ -1608,18 +1616,29 @@ fn device_stage(report: &mut Report) -> Result<(), String> {
     Ok(())
 }
 
-/// Asks udev to look at the display cards again, now that this one is here.
+/// Takes the Hyper-V display away, now that there is one to put the desktop on.
 ///
-/// The rule that hides the Hyper-V card is written for a guest where this
-/// module is loaded, and it says so with a `TEST` on this device. At boot the
-/// synthetic card is there long before the module is, so the rule ran and
-/// found nothing; this is what makes it run again while the answer is yes.
-/// Before any compositor starts, because a tag is read when a card is
-/// enumerated and not after.
+/// Two things do that, because a tag is not a mechanism. The rule that hides
+/// the Hyper-V card is written for a guest where this module is loaded, and it
+/// says so with a `TEST` on this device; at boot the synthetic card is there
+/// long before the module is, so the rule ran and found nothing, and the
+/// `udevadm` pair is what makes it run again while the answer is yes. But the
+/// tag it adds is `mutter-device-ignore`, which is read by mutter and by
+/// nothing else, so on any other compositor the card is still a second monitor
+/// -- and on wlroots it is worse than that: a compositor that makes the
+/// Hyper-V card its primary GPU has to blit to ours, and blitting needs a
+/// renderer neither card can give it, so nothing is drawn anywhere. #166
+/// measured exactly that on a live Hyprland guest.
 ///
-/// Nothing here fails a stage: a guest whose udev refused is a guest with a
-/// second monitor nobody can see, which is worse than one monitor and better
-/// than no display.
+/// So the driver is blacklisted and unloaded as well, which no compositor has
+/// to read anything to obey. It happens here rather than beside the module's
+/// own options because here is where the guest is known to have a display of
+/// ours to fall back on: a blacklist written before the module built would
+/// leave a guest whose build failed with no display at all.
+///
+/// Nothing here fails a stage. The unload is expected to fail on the boot that
+/// installs the payload -- a compositor already running holds the card -- and
+/// the blacklist is what settles it from the next boot on.
 fn keep_the_desktop_on_this_output() {
     let _ = command::run("udevadm", &["control", "--reload"], &[], SHORT_BUDGET);
     let _ = command::run(
@@ -1628,6 +1647,19 @@ fn keep_the_desktop_on_this_output() {
         &[],
         SHORT_BUDGET,
     );
+    let _ = write_if_different(Path::new(HYPERV_BLACKLIST), &hyperv_blacklist());
+    let _ = command::run("modprobe", &["-r", HYPERV_MODULE], &[], SHORT_BUDGET);
+}
+
+/// What [`HYPERV_BLACKLIST`] says.
+fn hyperv_blacklist() -> String {
+    format!(
+        "# Written by vmlord-agent once this guest had a {MODULE} display.\n\
+         # The Hyper-V card draws on the console nobody is looking at, and a\n\
+         # compositor that finds it lights it as a second monitor -- or, on\n\
+         # wlroots, makes it the primary GPU and then draws nothing at all.\n\
+         blacklist {HYPERV_MODULE}\n"
+    )
 }
 
 /// Checks the update did what it said: the target version loaded, on a device
@@ -2113,9 +2145,9 @@ mod tests {
     use vmlord_agent_protocol::v1::{DisplayRecipeStageState, DisplayRecipeStep};
 
     use super::{
-        COMPOSITOR_DROP_IN, SYSTEMD_USER_UNITS, apply, compositor_drop_in,
-        compositor_on_the_payloads_mesa, installed_drop_ins, load_failure_message, sha256_hex,
-        update, verify_declared_files,
+        COMPOSITOR_DROP_IN, HYPERV_MODULE, SYSTEMD_USER_UNITS, apply, compositor_drop_in,
+        compositor_on_the_payloads_mesa, hyperv_blacklist, installed_drop_ins,
+        load_failure_message, sha256_hex, update, verify_declared_files,
     };
     use crate::display_recipe::{PayloadFacts, Report, STEPS};
     use crate::guest_platform::{
@@ -2123,6 +2155,21 @@ mod tests {
     };
 
     use super::reported_desktop;
+
+    /// Not a preference: mutter's tag is read by mutter, and a wlroots
+    /// compositor that finds the Hyper-V card makes it the primary GPU and
+    /// then draws nothing at all. What every compositor obeys is the card not
+    /// being there.
+    #[test]
+    fn the_hyper_v_display_driver_is_blacklisted_by_name() {
+        let written = hyperv_blacklist();
+
+        assert!(
+            written.contains(&format!("blacklist {HYPERV_MODULE}")),
+            "{written}"
+        );
+        assert!(written.starts_with('#'), "{written}");
+    }
 
     /// An ordinary Ubuntu guest, for the stages that now ask what it is.
     fn guest() -> GuestFacts {

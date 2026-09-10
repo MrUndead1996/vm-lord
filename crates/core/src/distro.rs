@@ -1056,8 +1056,10 @@ mod tests {
         // isolation drop-in reaches. Logging straight in means it never
         // starts.
         assert_eq!(desktop.service, "sddm.service");
-        let [autologin] = desktop.files.as_slice() else {
-            panic!("Hyprland declares exactly the file that logs the guest in");
+        let [autologin, config] = desktop.files.as_slice() else {
+            panic!(
+                "Hyprland declares the file that logs the guest in and the one that starts its panel"
+            );
         };
         assert_eq!(autologin.path, "/etc/sddm.conf.d/10-vmlord-autologin.conf");
         let rendered = autologin.render("arch");
@@ -1070,6 +1072,18 @@ mod tests {
             rendered.contains("Session=hyprland-uwsm.desktop"),
             "{rendered}"
         );
+
+        // Hyprland reads this before it copies its default anywhere, so the
+        // default is loaded from where the distribution put it and the only
+        // thing added is the panel -- which is what carries the tray, and
+        // which the shipped default leaves commented out.
+        assert_eq!(config.path, "/etc/xdg/hypr/hyprland.lua");
+        let rendered = config.render("arch");
+        assert!(
+            rendered.contains(r#"dofile("/usr/share/hypr/hyprland.lua")"#),
+            "{rendered}"
+        );
+        assert!(rendered.contains("waybar"), "{rendered}");
     }
 
     /// A directory that names no release still has to answer the same two

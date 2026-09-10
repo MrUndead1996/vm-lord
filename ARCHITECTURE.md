@@ -4382,9 +4382,32 @@ terminal (`kitty`) and `uwsm` beside `hyprland` itself; a guest given the
 compositor alone boots to a text console with nothing on it to start anything
 from. Everything else about that desktop the agent reads out of the guest: the
 tray extension is not installed because `DesktopFacts::is_gnome` is false, the
-Hyper-V card is taken away by `vmlord-display-unbind-hyperv` rather than by a
-tag only mutter reads, and the clipboard speaks `wlr-data-control` because that
-is what the session advertises. None of those three names Hyprland anywhere.
+Hyper-V card is taken away by blacklisting its driver rather than by a tag only
+mutter reads, and the clipboard speaks `wlr-data-control` because that is what
+the session advertises. None of those three names Hyprland anywhere.
+
+That blacklist is what #166 cost, and it is worth saying why a tag was not
+enough. `62-vmlord-display.rules` adds `mutter-device-ignore` to the Hyper-V
+card, which mutter reads and nothing else does, so a wlroots compositor sees
+two GPUs and makes the Hyper-V one primary -- and then our output is a
+secondary that has to be blitted to. Blitting needs a GL renderer per device,
+and aquamarine builds one only through `EGL_PLATFORM_DEVICE_EXT`, matching an
+EGL device to the DRM node. Neither card has a render node, both being
+KMS-only dumb-buffer drivers, so Mesa enumerates exactly one EGL device -- the
+software one, with no DRM node to match -- and no renderer is ever built. The
+output is modeset and never painted: a black window, and the broker saying the
+output has no clock. Mutter is untouched by this because it goes through
+`EGL_PLATFORM_GBM_KHR` on the card's own fd, where Mesa loads `kms_swrast`;
+so does Hyprland's own renderer, which is why the compositor runs and serves
+clients while showing nothing.
+
+So `keep_the_desktop_on_this_output` writes `blacklist hyperv_drm` and unloads
+the driver, beside the `udevadm` pair that was already there. It happens once
+the module's device is present, and not with the module's own options, because
+a guest whose build failed still needs the display it has. The unload is
+expected to fail on the boot that installs the payload -- a compositor already
+running holds the card, and aquamarine reads the set of GPUs once, at start --
+and the blacklist settles it from the next boot on.
 
 `DesktopSetup::files` is the second half of that declaration, and it exists
 because a greeter has to be told whom to log in as -- an answer that cannot be a
@@ -4393,12 +4416,23 @@ is a path and a template in which `{user}` stands for that account, printed into
 `write_files` the way `KeyboardFile` is and for the same reason: what a guest
 needs configured differs by distribution and by desktop, and a path with a
 template is the whole of that difference. GNOME declares none. Hyprland declares
-one, `/etc/sddm.conf.d/10-vmlord-autologin.conf`, and it says two things.
+two. The first is `/etc/sddm.conf.d/10-vmlord-autologin.conf`, and it says two
+things.
 
 Autologin, because SDDM's greeter is itself a compositor -- a third one, outside
 the user unit the isolation drop-in attaches to and with no isolation of its own
 -- and logging straight in means it never starts. The account keeps its
 password: SSH asks for it, and so does a locked screen.
+
+The second file is `/etc/xdg/hypr/hyprland.lua`, and it exists because the
+package is a compositor and the tray lives on a panel. Hyprland copies its
+default configuration into a user's own directory only when it finds none
+anywhere, and it looks in `/etc/xdg/hypr` first, so a file written there is
+read instead of that copy being made. What it says is `dofile` of the default
+the distribution ships, and one line starting waybar: the shipped default
+leaves every autostart commented out, so a guest given the packages alone gets
+a compositor with nothing on it. Nothing else about the desktop is decided
+there -- the distribution's own configuration is what runs.
 
 And `Session=hyprland-uwsm.desktop` rather than the plain entry, because that is
 what decides whether anything of VMLord's can reach the compositor at all.
