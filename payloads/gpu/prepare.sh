@@ -105,6 +105,24 @@ SPEC="$(cd "$(dirname "$SPEC")" && pwd)/$(basename "$SPEC")"
 # the spec's own directory name is what tells the build which of them to read.
 TARGET="$(basename "$(dirname "$SPEC")")"
 
+# meson's libdir, from the one place that states where this payload's libraries go. Read
+# with sed rather than jq because this runs before the toolchain image is built, and a
+# host with no jq is exactly what this script exists to allow. One statement decides both
+# the tree meson installs and the directory the guest points its linker at: two fields
+# would be two answers to one question, and the wrong one is silent -- Mesa staged, and
+# nothing ever loading it.
+LAYOUT="$(sed -nE 's/.*"library_layout"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$SPEC" | head -n1)"
+case "$LAYOUT" in
+flat) LIBDIR="lib" ;;
+multiarch:?*) LIBDIR="lib/${LAYOUT#multiarch:}" ;;
+*)
+	echo "$SPEC must state a library_layout of 'flat' or 'multiarch:<triplet>'," >&2
+	echo "because it is what decides both where meson installs and where the guest" >&2
+	echo "points its linker. Found: ${LAYOUT:-nothing}" >&2
+	exit 1
+	;;
+esac
+
 mkdir -p "$output"
 output="$(cd "$output" && pwd)"
 
@@ -204,6 +222,7 @@ rm -rf "$output/prepared" "$output/recipe.json"
 
 DOCKER_BUILDKIT=1 docker build \
 	--build-arg "TARGET=$TARGET" \
+	--build-arg "LIBDIR=$LIBDIR" \
 	"${arguments[@]}" \
 	--output "type=local,dest=$output" \
 	"$HERE"

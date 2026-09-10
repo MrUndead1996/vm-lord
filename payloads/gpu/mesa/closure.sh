@@ -6,7 +6,10 @@
 
 set -euo pipefail
 
-tree="${1:?usage: closure.sh <tree>}"
+tree="${1:?usage: closure.sh <tree> <libdir>}"
+# The same directory the tree was built into: what the linker is told about here has to
+# be what the guest will be told about, or this gate proves the wrong tree loads.
+libdir="${2:?usage: closure.sh <tree> <libdir>}"
 
 # Every external soname a shipped object may name.
 #
@@ -58,7 +61,7 @@ done < <(find "$tree" \( -name '*.so' -o -name '*.so.*' \) | sort)
 	exit 1
 }
 
-echo "$tree/lib/x86_64-linux-gnu" > /etc/ld.so.conf.d/vmlord-closure.conf
+echo "$tree/$libdir" > /etc/ld.so.conf.d/vmlord-closure.conf
 # The tree holds no symlink by design, so ldconfig says so about every soname it finds.
 # That is the payload builder's rule being obeyed, not a fault: drop the noise.
 ldconfig 2>/dev/null
@@ -99,5 +102,5 @@ fi
 	echo "the payload would ship libraries a guest cannot load" >&2
 	exit 1
 }
-echo "every shared object in $tree resolves against a clean Ubuntu"
+echo "every shared object in $tree resolves against a clean base image"
 echo "and needs nothing beyond $(echo "$needed" | wc -l) reviewed sonames"

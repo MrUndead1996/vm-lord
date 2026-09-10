@@ -9,13 +9,17 @@
 
 set -euo pipefail
 
-source="${1:?usage: build.sh <source> <destination>}"
-destination="${2:?usage: build.sh <source> <destination>}"
+source="${1:?usage: build.sh <source> <destination> <libdir>}"
+destination="${2:?usage: build.sh <source> <destination> <libdir>}"
+# Where inside the prefix the libraries go. Not a constant, because it is not the same
+# answer on every distribution -- and it is not this script's answer either: the spec
+# states it once, as the layout the guest is told about, and it arrives here from there.
+libdir="${3:?usage: build.sh <source> <destination> <libdir>}"
 
 meson setup "$source/build" "$source" \
 	--wrap-mode=nodownload \
 	-Dprefix=/opt/vmlord/wsl-mesa \
-	-Dlibdir=lib/x86_64-linux-gnu \
+	-Dlibdir="$libdir" \
 	-Dgallium-drivers=d3d12,softpipe \
 	-Dvulkan-drivers=microsoft-experimental \
 	-Dllvm=disabled \
@@ -37,7 +41,7 @@ staged="$source/install/opt/vmlord/wsl-mesa"
 # Headers, pkg-config files and static archives are for building against this Mesa,
 # which nothing in a guest ever does, and bin/ holds spirv2dxil -- twelve megabytes of
 # developer tool no guest runs.
-rm -rf "$staged/bin" "$staged/include" "$staged/lib/x86_64-linux-gnu/pkgconfig"
+rm -rf "$staged/bin" "$staged/include" "$staged/$libdir/pkgconfig"
 find "$staged" -name '*.a' -delete
 find "$staged" -name '*.la' -delete
 
@@ -65,7 +69,7 @@ done < <(find "$staged" -name '*.so' -print0)
 # translator linked into libvulkan_dzn.so, no shipped object lists this soname as NEEDED,
 # and no shipped file names it for a dlopen -- the only occurrence of the string in the
 # tree is the file's own SONAME.
-rm -f "$staged/lib/x86_64-linux-gnu/libspirv_to_dxil.so"
+rm -f "$staged/$libdir/libspirv_to_dxil.so"
 
 # Every member arrives as a plain file: the payload builder rejects a symlink outright.
 # Measured on mesa-26.2.0 that costs about 1.3 MB across six links -- the DRI names point
@@ -78,7 +82,7 @@ icd="$destination/share/vulkan/icd.d/dzn_icd.x86_64.json"
 	echo "the dozen ICD is not at $icd, which is the only name the guest registers" >&2
 	exit 1
 }
-[ -f "$destination/lib/x86_64-linux-gnu/dri/d3d12_dri.so" ] || {
+[ -f "$destination/$libdir/dri/d3d12_dri.so" ] || {
 	echo "the d3d12 gallium driver is missing, and the probe looks for it by that path" >&2
 	exit 1
 }

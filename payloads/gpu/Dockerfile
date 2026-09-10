@@ -63,9 +63,10 @@ COPY mesa/build.sh /usr/local/bin/build-mesa
 #
 # No network: everything that reaches the binaries came from a pin above or from
 # /src/patches, and a wrap cannot quietly add to it.
+ARG LIBDIR
 RUN --network=none chmod +x /usr/local/bin/build-mesa \
     && git -C /src/mesa apply --verbose /src/patches/*.patch \
-    && build-mesa /src/mesa /out/mesa
+    && build-mesa /src/mesa /out/mesa ${LIBDIR}
 
 FROM ${BASE} AS closure
 # A guest, modelled: the base image plus the display stack and nothing else.
@@ -95,7 +96,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=mesa /out/mesa /check/mesa
 COPY mesa/closure.sh /usr/local/bin/closure
-RUN --network=none chmod +x /usr/local/bin/closure && closure /check/mesa
+ARG LIBDIR
+RUN --network=none chmod +x /usr/local/bin/closure && closure /check/mesa ${LIBDIR}
 
 FROM sources AS prepared
 COPY --from=mesa /out/mesa /mesa
