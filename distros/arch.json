@@ -1,5 +1,6 @@
 {
   "name": "Arch Linux",
+  "os_release_id": "arch",
   "releases": [
     "rolling"
   ],

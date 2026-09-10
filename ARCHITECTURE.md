@@ -1531,6 +1531,19 @@ does the same thing from the other side -- its recipe treats distribution,
 release and architecture as the hard gate and the kernel as soft, since DKMS
 builds against the running kernel's headers.
 
+Both gates compare the same string, so the two sides have to spell a
+distribution the same way, and only one of them can see the guest. The agent
+reads `ID` out of `/etc/os-release`; the host, choosing before the guest has
+booted, has only the profile the VM was created from -- so the profile declares
+that ID as `os_release_id`, and `guest_target_key` records it in the VM's
+mapping. It used to lowercase the profile's `name` instead, which is the same
+string for Ubuntu and is not for `Arch Linux`: the host looked for a payload
+under `arch linux`, found none, and every recipe stage was skipped for want of
+a mount. A profile that declares no ID is still read by the old rule, which is
+correct for every profile written under it. The field is a fact about the
+guest, so a payload's `payload.spec.json` names the same `arch` on the other
+side of the pair.
+
 ### GPU: the guest's recipe
 
 A mounted payload is a directory of sources, and what a guest actually needs is
