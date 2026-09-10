@@ -46,6 +46,7 @@
         "uwsm",
         "sddm",
         "waybar",
+        "otf-font-awesome",
         "xdg-desktop-portal-hyprland",
         "kitty"
       ],

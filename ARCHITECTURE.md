@@ -4377,10 +4377,13 @@ repository, downloads no desktop binary of its own and signs nothing.
 Hyprland is declared only by Arch, and what is declared there is the whole of
 what a Hyprland guest needs told rather than found. Hyprland is a compositor and
 nothing else, so the list carries a greeter (`sddm`), a panel that shows
-StatusNotifierItems (`waybar`), the portal (`xdg-desktop-portal-hyprland`), a
-terminal (`kitty`) and `uwsm` beside `hyprland` itself; a guest given the
-compositor alone boots to a text console with nothing on it to start anything
-from. Everything else about that desktop the agent reads out of the guest: the
+StatusNotifierItems (`waybar`), the font that panel draws its icons with
+(`otf-font-awesome`), the portal (`xdg-desktop-portal-hyprland`), a terminal
+(`kitty`) and `uwsm` beside `hyprland` itself; a guest given the compositor
+alone boots to a text console with nothing on it to start anything from. The
+font is on that list because waybar's own default style names FontAwesome and
+says in a comment that it is required: #166 measured a guest without it, where
+the tray icon was there and every other glyph on the bar was not drawn at all. Everything else about that desktop the agent reads out of the guest: the
 tray extension is not installed because `DesktopFacts::is_gnome` is false, the
 Hyper-V card is taken away by blacklisting its driver rather than by a tag only
 mutter reads, and the clipboard speaks `wlr-data-control` because that is what

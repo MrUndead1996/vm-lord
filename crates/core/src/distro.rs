@@ -1046,7 +1046,11 @@ mod tests {
             ]
         );
         let desktop = profile.desktop_for(DesktopProfile::Hyprland).unwrap();
-        for package in ["hyprland", "uwsm", "sddm", "waybar"] {
+        // `otf-font-awesome` beside the panel because waybar's own default
+        // style names FontAwesome and says in a comment that it is required:
+        // without it the tray icon is there and every other glyph on the bar
+        // is not drawn at all.
+        for package in ["hyprland", "uwsm", "sddm", "waybar", "otf-font-awesome"] {
             assert!(
                 desktop.packages.iter().any(|name| name == package),
                 "{package} is part of what makes a Hyprland guest usable"
