@@ -29,8 +29,8 @@ Mesa, and on the host's adapter with the payload's, once the dma-buf halves of
 `0001-d3d12-scan-out-through-a-winsys-displaytarget.patch` are there to carry the
 buffer.
 
-Nothing in this repository builds aquamarine, so nothing applies this yet. See
-the README beside it.
+Applied by the agent's `CompositorRenderer` step, which builds it in the guest
+against the aquamarine the guest has installed. See the README beside it.
 
 Refs: #200
 diff --git a/src/backend/drm/DRM.cpp b/src/backend/drm/DRM.cpp

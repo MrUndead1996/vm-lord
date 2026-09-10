@@ -1088,7 +1088,12 @@ fn code_for(
         // The module is loaded and the desktop is black: a compositor that
         // was left on the payload's Mesa never finishes its modeset, which
         // from the outside is the same nothing as a module that never loaded.
-        Step::CompositorIsolation => DisplayStatusCode::PayloadModuleNotLoaded,
+        // A compositor whose renderer never came up is black in exactly the
+        // same way, and for the reader of a status code it is the same
+        // nothing: the module is loaded and the screen is not painted.
+        Step::CompositorIsolation | Step::CompositorRenderer => {
+            DisplayStatusCode::PayloadModuleNotLoaded
+        }
         Step::Services | Step::ServicesStart => DisplayStatusCode::GuestServicesFailed,
         // Filtered out before they reach here, and matched so that a step
         // added later cannot be swallowed by a catch-all.
