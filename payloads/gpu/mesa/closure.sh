@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Proves the staged tree loads in a guest, not only in the image that built it.
 #
-# Run in a clean Ubuntu with no -dev package installed: what resolves here resolves in a
-# guest under the bundled policy, where no apt step installs Mesa's build dependencies.
+# Run in a clean copy of the target's own base image with no -dev package installed: what
+# resolves here resolves in a guest under the bundled policy, where no install step brings
+# Mesa's build dependencies in.
 
 set -euo pipefail
 

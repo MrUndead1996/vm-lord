@@ -4,7 +4,33 @@ What a guest needs to build `dxgkrnl` for itself and to draw through it once it
 has, and the provenance that says where every byte of it came from. The archive
 is not in this repository — these files are what produces one.
 
+## Targets
+
+Two, and a release carries both:
+
+| target | base image | packages pinned | libraries | proven on |
+| --- | --- | --- | --- | --- |
+| `ubuntu-26.04-amd64` | `ubuntu@sha256:6df9e8…` | the 26.04 archive | `lib/x86_64-linux-gnu` | `7.0.0-28-generic` |
+| `arch-rolling-amd64` | `archlinux@sha256:b944cc…` | `archive.archlinux.org`, `2026/09/08` | `lib` | `7.2.3-arch1-3` |
+
+Two rather than one because a `bundled` payload's binaries are compiled against
+its base image's glibc and laid out the way that distribution lays libraries
+out. That is where this differs from the display payload, which is one artifact
+for every guest: see **ARCHITECTURE.md**, "Display: the guest payload".
+
+One `Dockerfile`, one `prepare.py` and one Mesa recipe serve both. A target is a
+directory holding a spec, and what its spec decides beyond provenance is the
+base image, the stages its package manager needs, and — for a distribution with
+no release archive of its own — the day its packages are pinned to.
+
 ## Building
+
+```sh
+./rebuild_gpu_payload.sh
+```
+
+builds and packs every target under `target/gpu-payload/<target>/` and prints
+the `cargo dist` arguments that ship them. One target by hand is:
 
 ```sh
 payloads/gpu/prepare.sh \
@@ -29,9 +55,16 @@ machine that has never built one.
 Beyond docker the host does need three small things, all of which fail loudly
 the moment they are missing: a `bash` 4 or newer, because `prepare.sh` keys its
 build-argument table with an associative array; `sed`, which reads the `ARG`
-names back out of the Dockerfile for the cross-check below; and a docker daemon
-that shares this filesystem, because `payload.spec.json` is read through a `-v`
-bind mount.
+names back out of the Dockerfile for the cross-check below and the target's own
+fields out of its spec; and a docker daemon that shares this filesystem, because
+`payload.spec.json` is read through a `-v` bind mount.
+
+Where the libraries go is one statement and not two. `library_layout` in the
+spec — `flat`, or `multiarch:<triplet>` — is what `prepare.sh` turns into
+meson's `libdir`, and it is the same value `prepare.py` carries into both
+provenance documents for the guest to read. Two fields would be two answers to
+one question, and the wrong one is silent: Mesa staged, and a linker pointed at
+an empty directory.
 
 The commits still come from `payload.spec.json`. `prepare.sh` reads them with
 the image's own `jq` and passes them back in as build arguments, so each
@@ -219,9 +252,11 @@ for `eglinfo`, and that pulls the distribution's Mesa and libLLVM in with it.
 The payload simply no longer depends on which of those arrived. Vulkan is dozen
 alone, because lavapipe *is* LLVM.
 
-`closure.sh` runs in a stage that is a clean Ubuntu with the display-stack
-runtime libraries and no `-dev` package, which is the guest under this policy,
-and every shared object in the tree must resolve there. Beyond that it holds
+`closure.sh` runs in a stage that is the target's own base image with the
+display-stack runtime libraries and no `-dev` package, which is the guest under
+this policy, and every shared object in the tree must resolve there. One script,
+two stages: the sonames it allows are the display stack's and are the same on
+both distributions, while the packages that supply them are named per manager. Beyond that it holds
 the tree's `NEEDED` sonames against an allow-list — the C and C++ runtimes,
 zlib and zstd, and the client halves of X11, XCB, Wayland and DRM that
 `mesa-utils` and `vulkan-tools` already bring in. An allow-list and not a list
@@ -248,13 +283,14 @@ it was 12 MB of what would otherwise have travelled.
 
 The payload holds no symbolic links, because `collect_files` in the builder
 rejects one outright rather than resolving it, so `build.sh` copies the staged
-tree with `cp -rL` and every link arrives as the file it pointed at. Measured
-on `mesa-26.2.0` plus this repository's patch the whole payload is 38,290,001
-bytes across 40 files, with `expanded_size_limit` at 38,295,715 — the tree plus
-the manifest the builder generates — and `file_count_limit` at 40; the archive
-is 9,018,185 bytes. Both limits are derived by `pack` from the tree it is
-packing, so these are a measurement of one build and not a gate anyone raises by
-hand. The previous, `distro` payload's limits were 481,306 and 20. The cost of
+tree with `cp -rL` and every link arrives as the file it pointed at. Measured on
+`mesa-26.2.0` plus this repository's patches, the Ubuntu target's
+`expanded_size_limit` is 38,296,152 — the tree plus the manifest the builder
+generates — with `file_count_limit` at 40 and an archive of 9,018,536 bytes; the
+Arch target's are 39,290,251, 40 and 9,528,092. The same 40 files either way,
+because the two trees are one build recipe on two C libraries. Both limits are
+derived by `pack` from the tree it is packing, so these are a measurement of two
+builds and not a gate anyone raises by hand. The previous, `distro` payload's limits were 481,306 and 20. The cost of
 the rule is smaller than it looks: `d3d12_dri.so`, `swrast_dri.so` and
 `kms_swrast_dri.so` are each a full copy of the 121,136-byte `libdril_dri.so`
 loader shim, and the `.so.0`/`.so.0.0.0` pairs for the two glvnd vendor
@@ -277,10 +313,23 @@ real-host run answers.
 
 ## Proven on
 
-`7.0.0-28-generic`, by hand: `dkms add`, `build` and `install`, `modprobe`, and
-`/dev/dxg`. `kernel_release` records the kernel the payload was proven on and
-does not gate the guest — DKMS builds against whatever kernel is running, and
-`AUTOINSTALL` carries the module across Ubuntu's own upgrades.
+**`ubuntu-26.04-amd64`:** `7.0.0-28-generic`, by hand: `dkms add`, `build` and
+`install`, `modprobe`, and `/dev/dxg`. `kernel_release` records the kernel the
+payload was proven on and does not gate the guest — DKMS builds against whatever
+kernel is running, and `AUTOINSTALL` carries the module across Ubuntu's own
+upgrades.
+
+**`arch-rolling-amd64`:** `7.2.3-arch1-3`, by the image's own `module` stage,
+which builds `dxgkrnl` against the `linux-headers` of the pinned snapshot and
+throws the module away. That is a stronger statement than the Ubuntu line in one
+respect and a weaker one in another: it runs on every build rather than once by
+hand, and it proves the sources compile rather than that the module loads. No
+`modprobe` and no `/dev/dxg` on this target yet.
+
+The compat header is unchanged between the two. `dxgkrnl_compat.h` was written
+for Ubuntu's `<linux/hyperv.h>`, and Arch's mainline `7.2.3` needs nothing
+further — which is a measurement of these two kernels and not a rule about
+mainline.
 
 A VM with no GPU-PV adapter assigned still gets `/dev/dxg` — `dxgkrnl`
 registers its misc device whether or not a vGPU vmbus channel exists — but
@@ -288,7 +337,7 @@ opening it fails with `EBADF`, because there is no global channel to make a
 `dxgprocess` on. Opening the device, which the recipe's `DEVICE` stage does, is
 what separates the two.
 
-The bundled Mesa half has no such line yet. The tree builds, the closure gate
+The bundled Mesa half has no such line on either target. The tree builds, the closure gate
 passes in the image, and the payload packs; what has **not** been done is a
 release on a Windows host with a GPU-PV adapter, a VM started from it, and the
 agent's probe read back. Until that run reports `RENDERS` with both the OpenGL
