@@ -362,6 +362,19 @@ pub struct DesktopFacts {
     /// `None` where no compositor is running: a headless guest, and every
     /// guest in the moment between boot and its greeter.
     pub compositor: Option<CompositorLaunch>,
+    /// The aquamarine the compositor on the screen is running, where it is
+    /// running one at all.
+    ///
+    /// A library named here where process names are deliberately not, because
+    /// the two are not the same kind of constant. A table of compositor names
+    /// is a guess about what a guest might install; this is the one library
+    /// this repository carries a patch for, and the question being asked is
+    /// whether the patch applies to what is loaded -- which nothing but its
+    /// name can answer.
+    ///
+    /// The resolved path rather than the soname, because the version this has
+    /// to be built against is in it: `libaquamarine.so.0.15.0`.
+    pub aquamarine: Option<PathBuf>,
 }
 
 /// The names a GNOME session goes under, matched as substrings of a
@@ -623,7 +636,10 @@ fn display_manager_unit(target: &Path) -> Option<String> {
 /// exactly the table of constants this module exists without. The slice keeps
 /// the guest's own display broker -- a system service that holds a card too --
 /// out of the answer.
-fn compositor_launch(proc: &Path, uid: u32) -> Option<CompositorLaunch> {
+/// Both facts are read out of the one process rather than found twice: a
+/// session restarted between two searches is a compositor whose maps belong to
+/// a launch that is already gone.
+fn compositor_process(proc: &Path, uid: u32) -> Option<(CompositorLaunch, PathBuf)> {
     let Ok(entries) = std::fs::read_dir(proc) else {
         return None;
     };
@@ -647,7 +663,7 @@ fn compositor_launch(proc: &Path, uid: u32) -> Option<CompositorLaunch> {
             continue;
         }
         if let Some(launch) = launch_of(cgroup) {
-            found.push(launch);
+            found.push((launch, path));
         }
     }
 
@@ -656,11 +672,30 @@ fn compositor_launch(proc: &Path, uid: u32) -> Option<CompositorLaunch> {
     // not depend on the order the kernel listed `/proc` in. A unit is the
     // stronger answer of the two, because it is the one something can be
     // delivered to.
-    found.sort_by(|left, right| key(left).cmp(&key(right)));
+    found.sort_by(|left, right| key(&left.0).cmp(&key(&right.0)));
     found.into_iter().next()
 }
 
-/// What `compositor_launch` orders candidates by.
+/// The aquamarine a process has mapped, out of its `/proc/<pid>/maps`.
+///
+/// What is loaded rather than what is installed: a compositor already running
+/// against a library staged by an earlier run is answering for that library,
+/// and the packaged one it would have loaded instead is not the version to
+/// build. The last field of a maps line is the path, and a path is allowed
+/// spaces, so the line is split by field count rather than by its last word.
+fn mapped_aquamarine(maps: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(maps).ok()?;
+    text.lines()
+        .filter_map(|line| line.splitn(6, char::is_whitespace).nth(5))
+        .map(|path| PathBuf::from(path.trim()))
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("libaquamarine.so."))
+        })
+}
+
+/// What `compositor_process` orders candidates by.
 fn key(launch: &CompositorLaunch) -> (u8, &str) {
     match launch {
         CompositorLaunch::Unit(name) => (0, name),
@@ -695,6 +730,10 @@ fn is_drm_card(target: &str) -> bool {
 /// the processes of whoever is at the screen.
 fn desktop_facts(sessions: &Path, display_manager: &Path, proc: &Path) -> DesktopFacts {
     let session = session_in(sessions);
+    let compositor = session
+        .as_ref()
+        .and_then(|found| found.uid)
+        .and_then(|uid| compositor_process(proc, uid));
     DesktopFacts {
         session: session.as_ref().and_then(|found| found.desktop.clone()),
         session_type: session.as_ref().map(|found| found.kind.clone()),
@@ -702,9 +741,10 @@ fn desktop_facts(sessions: &Path, display_manager: &Path, proc: &Path) -> Deskto
             .ok()
             .as_deref()
             .and_then(display_manager_unit),
-        compositor: session
-            .and_then(|found| found.uid)
-            .and_then(|uid| compositor_launch(proc, uid)),
+        aquamarine: compositor
+            .as_ref()
+            .and_then(|(_, path)| mapped_aquamarine(&path.join("maps"))),
+        compositor: compositor.map(|(launch, _)| launch),
     }
 }
 
@@ -813,9 +853,10 @@ mod tests {
 
     use super::{
         CompositorLaunch, DesktopFacts, GuestFacts, InitramfsBuilder, LibraryLayout,
-        PackageManager, cgroup_path, compositor_launch, desktop_facts, display_manager_unit,
+        PackageManager, cgroup_path, compositor_process, desktop_facts, display_manager_unit,
         graphical_session, initramfs_builder, is_drm_card, launch_of, library_layout,
-        library_triplet, package_manager, parse_os_release, program_on_path, session_in,
+        library_triplet, mapped_aquamarine, package_manager, parse_os_release, program_on_path,
+        session_in,
     };
 
     const GNOME_WAYLAND: &str =
@@ -834,6 +875,24 @@ mod tests {
             std::os::unix::fs::symlink(target, directory.join("fd").join((index + 3).to_string()))
                 .unwrap();
         }
+    }
+
+    /// A maps file of the shape `/proc/<pid>/maps` has, for the libraries
+    /// named.
+    fn maps(proc: &Path, pid: u32, libraries: &[&str]) {
+        let directory = proc.join(pid.to_string());
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut text = String::new();
+        for (index, library) in libraries.iter().enumerate() {
+            text.push_str(&format!(
+                "7f6913{index}e9000-7f6913{index}f000 r--p 00000000 00:22 14172{index} {library}\n"
+            ));
+        }
+        // The anonymous mappings a real file is full of, which carry no path
+        // at all and must not be read as one.
+        text.push_str("7ffd2b7f9000-7ffd2b81a000 rw-p 00000000 00:00 0 [stack]\n");
+        text.push_str("7f6913000000-7f6913001000 rw-p 00000000 00:00 0 \n");
+        std::fs::write(directory.join("maps"), text).unwrap();
     }
 
     fn temporary(label: &str) -> PathBuf {
@@ -1100,6 +1159,7 @@ mod tests {
                 compositor: Some(CompositorLaunch::Unit(
                     "org.gnome.Shell@wayland.service".to_owned()
                 )),
+                aquamarine: None,
             }
         );
         assert!(facts.found());
@@ -1311,7 +1371,7 @@ mod tests {
             &["/dev/dri/renderD128"],
         );
 
-        let found = compositor_launch(&proc, 1000);
+        let found = compositor_process(&proc, 1000).map(|(launch, _)| launch);
 
         let _ = std::fs::remove_dir_all(&directory);
         assert_eq!(
@@ -1333,7 +1393,7 @@ mod tests {
             &["/dev/dri/card0"],
         );
 
-        let found = compositor_launch(&proc, 1000);
+        let found = compositor_process(&proc, 1000).map(|(launch, _)| launch);
 
         let _ = std::fs::remove_dir_all(&directory);
         assert_eq!(
@@ -1356,7 +1416,7 @@ mod tests {
             &["/dev/dri/card0"],
         );
 
-        let found = compositor_launch(&proc, 1000);
+        let found = compositor_process(&proc, 1000).map(|(launch, _)| launch);
 
         let _ = std::fs::remove_dir_all(&directory);
         assert_eq!(found, None);
@@ -1379,6 +1439,7 @@ mod tests {
                 compositor: Some(CompositorLaunch::Unit(
                     "org.gnome.Shell@wayland.service".to_owned(),
                 )),
+                aquamarine: None,
             },
         };
         assert_eq!(
@@ -1439,5 +1500,87 @@ mod tests {
     #[test]
     fn an_os_release_with_neither_a_version_nor_a_build_names_nothing() {
         assert_eq!(parse_os_release("ID=arch\n"), None);
+    }
+
+    #[test]
+    fn the_aquamarine_a_compositor_runs_is_read_out_of_its_maps() {
+        let proc = temporary("maps-aquamarine");
+        maps(
+            &proc,
+            41,
+            &[
+                "/usr/lib/libc.so.6",
+                "/usr/lib/libaquamarine.so.0.15.0",
+                "/usr/lib/libwayland-server.so.0",
+            ],
+        );
+
+        assert_eq!(
+            mapped_aquamarine(&proc.join("41").join("maps")),
+            Some(PathBuf::from("/usr/lib/libaquamarine.so.0.15.0")),
+            "the version to build against is in the path, so the path is the answer"
+        );
+    }
+
+    #[test]
+    fn a_compositor_that_runs_no_aquamarine_answers_nothing() {
+        let proc = temporary("maps-no-aquamarine");
+        maps(
+            &proc,
+            42,
+            &["/usr/lib/libc.so.6", "/usr/lib/libmutter-16.so.0"],
+        );
+
+        assert_eq!(
+            mapped_aquamarine(&proc.join("42").join("maps")),
+            None,
+            "a GNOME guest has nothing here to build and must not be given a stage"
+        );
+    }
+
+    #[test]
+    fn the_aquamarine_read_is_the_one_the_compositor_actually_loaded() {
+        let proc = temporary("maps-staged-aquamarine");
+        maps(
+            &proc,
+            43,
+            &["/opt/vmlord/aquamarine/libaquamarine.so.0.15.0"],
+        );
+
+        assert_eq!(
+            mapped_aquamarine(&proc.join("43").join("maps")),
+            Some(PathBuf::from(
+                "/opt/vmlord/aquamarine/libaquamarine.so.0.15.0"
+            )),
+            "a library staged by an earlier run is what this compositor is answering for"
+        );
+    }
+
+    #[test]
+    fn the_facts_carry_the_aquamarine_of_the_compositor_they_name() {
+        let sessions = temporary("facts-aquamarine-sessions");
+        std::fs::write(sessions.join("1"), GNOME_WAYLAND).unwrap();
+        let proc = temporary("facts-aquamarine-proc");
+        process(
+            &proc,
+            51,
+            "/user.slice/user-1000.slice/user@1000.service/session.slice/wayland-wm@hyprland.desktop.service",
+            &["/dev/dri/card0"],
+        );
+        maps(&proc, 51, &["/usr/lib/libaquamarine.so.0.15.0"]);
+
+        let facts = desktop_facts(&sessions, &sessions.join("no-display-manager"), &proc);
+
+        assert_eq!(
+            facts.compositor,
+            Some(CompositorLaunch::Unit(
+                "wayland-wm@hyprland.desktop.service".to_owned()
+            ))
+        );
+        assert_eq!(
+            facts.aquamarine,
+            Some(PathBuf::from("/usr/lib/libaquamarine.so.0.15.0")),
+            "both facts come from the one process, so they cannot describe two compositors"
+        );
     }
 }

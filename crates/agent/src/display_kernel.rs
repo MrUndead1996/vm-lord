@@ -25,7 +25,7 @@ use vmlord_agent_protocol::v1::{
 };
 
 use crate::{
-    command,
+    command, display_aquamarine,
     display_recipe::{
         DKMS_PACKAGE, InstalledVersions, KeyCreation, MODULE, PayloadFacts, Report,
         SigningKeyState, SigningPair, compositor_isolation, dkms_reports_installed, dkms_versions,
@@ -67,6 +67,13 @@ const HYPERV_BLACKLIST: &str = "/etc/modprobe.d/vmlord-display-hyperv.conf";
 /// is not a constant: it is the unit the compositor of this guest turned out
 /// to be started by.
 const COMPOSITOR_DROP_IN: &str = "vmlord-display-compositor-mesa.conf";
+
+/// What building a compositor's renderer from source needs.
+const SOURCE_DEPENDENCIES: &[Package] = &[Package::BuildTools, Package::SourceTools];
+
+/// Where that build happens: a directory that survives nothing and is expected
+/// to survive nothing.
+const SOURCE_WORK: &str = "/var/tmp/vmlord-aquamarine";
 /// Where the rule that keeps the desktop on this output goes. The number puts
 /// it after mutter's own `61-mutter.rules`, whose tag it adds to.
 const UDEV_RULES: &str = "/etc/udev/rules.d/62-vmlord-display.rules";
@@ -372,7 +379,8 @@ fn run_stages(
         built.then_some((guest.initramfs_builder, guest.kernel_release.as_str())),
         signing.as_ref(),
     )?;
-    compositor_isolation_stage(report, &guest)?;
+    let renderer = compositor_renderer_stage(report, &guest);
+    compositor_isolation_stage(report, &guest, renderer.as_deref())?;
     device_stage(report)?;
     services_stages(
         report,
@@ -1221,15 +1229,49 @@ fn update_initramfs_stage(
 /// Appended rather than substituted, so that an older payload still carrying
 /// the line installs correctly: systemd reads a repeated `Environment=` for
 /// the same variable last-wins, and the last one is this one.
-fn compositor_drop_in(shipped: &str, layout: &LibraryLayout) -> String {
-    let mut content = shipped.to_owned();
+///
+/// One file for both things that can want one, because there is only one
+/// `LD_LIBRARY_PATH` and systemd does not append to it: a second drop-in
+/// setting the same variable does not add a directory, it replaces every
+/// directory the first one named. Whichever of the two lost that race would
+/// lose it silently.
+///
+/// `shipped` is what the payload carries to hold this guest off the payload's
+/// Mesa, and `None` where this guest belongs on it. `renderer` is where a
+/// built aquamarine was staged, and `None` where the compositor needs none.
+/// The renderer goes first: it is a library the guest also has a copy of, and
+/// the copy that must win is ours.
+fn compositor_drop_in(
+    shipped: Option<&str>,
+    layout: &LibraryLayout,
+    renderer: Option<&str>,
+) -> String {
+    let mut content = match shipped {
+        Some(shipped) => shipped.to_owned(),
+        // No payload text to build on: this guest keeps the payload's Mesa and
+        // wants nothing unset, so the section header is ours to write.
+        None => "[Service]\n".to_owned(),
+    };
     if !content.ends_with('\n') {
         content.push('\n');
     }
-    content.push_str(&format!(
-        "Environment=LD_LIBRARY_PATH={}\n",
-        layout.directory()
-    ));
+
+    let mut directories: Vec<String> = Vec::new();
+    directories.extend(renderer.map(ToOwned::to_owned));
+    // The distribution's Mesa only where the payload's is being held off: on a
+    // guest that belongs on the payload's, naming a directory here would take
+    // it away, and the loader would find the payload's through the cache with
+    // nothing outranking it -- which is the arrangement this guest wants.
+    if shipped.is_some() {
+        directories.push(layout.directory());
+    }
+
+    if !directories.is_empty() {
+        content.push_str(&format!(
+            "Environment=LD_LIBRARY_PATH={}\n",
+            directories.join(":")
+        ));
+    }
     content
 }
 
@@ -1254,29 +1296,129 @@ fn compositor_drop_in(shipped: &str, layout: &LibraryLayout) -> String {
 /// must not do is set them for the session rather than for the compositor:
 /// everything launched from the session is meant to keep the whole GPU
 /// environment, which is where the acceleration was asked for.
-fn compositor_isolation_stage(report: &mut Report, guest: &GuestFacts) -> Result<(), String> {
+/// Builds the renderer this guest's compositor draws through, where the one
+/// it has cannot drive this device, and says where it was staged.
+///
+/// Every guest is asked, and almost every guest skips: what decides is whether
+/// the compositor on the screen has an aquamarine mapped, which a GNOME guest
+/// never does. Nothing here names a desktop.
+///
+/// A failure does not end the recipe. The module is loaded and the device is
+/// there by now, and the stages after this one are what a host needs to see
+/// anything at all; a guest that ends here would lose those too, and gain
+/// nothing -- the screen is black either way, and the report says why.
+fn compositor_renderer_stage(report: &mut Report, guest: &GuestFacts) -> Option<String> {
+    let step = DisplayRecipeStep::CompositorRenderer;
+
+    if guest.desktop.aquamarine.is_none() {
+        report.skipped(
+            step,
+            "the compositor on this guest draws through no aquamarine, \
+             so there is nothing here for it",
+        );
+        return None;
+    }
+
+    let libraries = guest.library_layout.directory();
+    let Some(wanted) = display_aquamarine::packaged_version(Path::new(&libraries)) else {
+        report.skipped(
+            step,
+            format!(
+                "the compositor draws through an aquamarine, and {libraries} holds no \
+                 packaged one to read a version from"
+            ),
+        );
+        return None;
+    };
+
+    let prefix = Path::new(display_aquamarine::PREFIX);
+    if display_aquamarine::staged_version(prefix).as_deref() == Some(wanted.as_str()) {
+        report.ok(
+            step,
+            format!("{} already holds aquamarine {wanted}", prefix.display()),
+        );
+        return Some(display_aquamarine::PREFIX.to_owned());
+    }
+
+    // The tools are asked for here rather than with the module's, because
+    // this is the only stage that wants them and almost no guest reaches it.
+    if let Some(manager) = guest.package_manager {
+        let (outcome, package) =
+            guest_packages::install(manager, SOURCE_DEPENDENCIES, &guest.kernel_release);
+        if !outcome.succeeded() {
+            let reason = format!(
+                "the {package} package could not be installed: {}",
+                failure(&guest_packages::install_command(manager), &outcome)
+            );
+            report.failed(step, reason);
+            return None;
+        }
+    }
+
+    match display_aquamarine::stage(&wanted, Path::new(SOURCE_WORK), prefix) {
+        Ok(()) => {
+            report.ok(
+                step,
+                format!(
+                    "built aquamarine {wanted} with the gbm-platform fallback and staged it \
+                     at {}",
+                    prefix.display()
+                ),
+            );
+            Some(display_aquamarine::PREFIX.to_owned())
+        }
+        Err(reason) => {
+            report.failed(
+                step,
+                format!("aquamarine {wanted} could not be built: {reason}"),
+            );
+            None
+        }
+    }
+}
+
+fn compositor_isolation_stage(
+    report: &mut Report,
+    guest: &GuestFacts,
+    renderer: Option<&str>,
+) -> Result<(), String> {
     let step = DisplayRecipeStep::CompositorIsolation;
     let user_units = Path::new(SYSTEMD_USER_UNITS);
 
-    let Some(held_back) = compositor_is_held_back() else {
+    let held_back = compositor_is_held_back();
+    // Nothing to hold back and no renderer to point at: the drop-in has no
+    // reason left to exist, so whatever an earlier run left is taken away.
+    if held_back.is_none() && renderer.is_none() {
         return compositor_on_the_payloads_mesa(report, step, user_units);
+    }
+
+    let shipped = match held_back.is_some() {
+        true => {
+            let path = Path::new(PAYLOAD_MOUNT)
+                .join("content")
+                .join("drm")
+                .join(COMPOSITOR_DROP_IN);
+            if !path.exists() {
+                report.skipped(step, "this display payload carries no compositor drop-in");
+                return Ok(());
+            }
+            Some(fs::read_to_string(&path).map_err(|error| {
+                let reason = format!("{} could not be read: {error}", path.display());
+                report.failed(step, reason.clone());
+                reason
+            })?)
+        }
+        false => None,
     };
 
-    let shipped = Path::new(PAYLOAD_MOUNT)
-        .join("content")
-        .join("drm")
-        .join(COMPOSITOR_DROP_IN);
-    if !shipped.exists() {
-        report.skipped(step, "this display payload carries no compositor drop-in");
-        return Ok(());
-    }
-    let content = fs::read_to_string(&shipped)
-        .map(|shipped| compositor_drop_in(&shipped, &guest.library_layout))
-        .map_err(|error| {
-            let reason = format!("{} could not be read: {error}", shipped.display());
-            report.failed(step, reason.clone());
-            reason
-        })?;
+    let held_back = held_back.unwrap_or_else(|| {
+        format!(
+            "this guest's compositor draws on the payload's Mesa and needs the aquamarine \
+             staged at {}",
+            renderer.unwrap_or_default()
+        )
+    });
+    let content = compositor_drop_in(shipped.as_deref(), &guest.library_layout, renderer);
     let write = |report: &mut Report, path: &Path| -> Result<(), String> {
         write_if_different(path, &content).map_err(|error| {
             let reason = format!("{} could not be written: {error}", path.display());
@@ -2265,7 +2407,7 @@ mod tests {
             "the path is the guest's answer, not the payload's: it is appended on install"
         );
 
-        let installed = compositor_drop_in(drop_in, &guest().library_layout);
+        let installed = compositor_drop_in(Some(drop_in), &guest().library_layout, None);
 
         assert!(
             installed
@@ -2282,6 +2424,60 @@ mod tests {
     }
 
     #[test]
+    fn the_staged_renderer_outranks_the_one_the_guest_packages() {
+        let drop_in =
+            include_str!("../../../payloads/display/module/vmlord-display-compositor-mesa.conf");
+        let installed = compositor_drop_in(
+            Some(drop_in),
+            &LibraryLayout::Flat,
+            Some("/opt/vmlord/aquamarine"),
+        );
+
+        assert!(
+            installed
+                .lines()
+                .any(|line| line == "Environment=LD_LIBRARY_PATH=/opt/vmlord/aquamarine:/usr/lib"),
+            "one variable holds both, and the staged aquamarine has to be found first\n{installed}"
+        );
+        assert_eq!(
+            installed
+                .lines()
+                .filter(|line| line.starts_with("Environment=LD_LIBRARY_PATH="))
+                .count(),
+            1,
+            "a second line for the same variable replaces the first rather than adding to it"
+        );
+    }
+
+    #[test]
+    fn a_guest_on_the_payloads_mesa_gets_a_drop_in_for_the_renderer_alone() {
+        let installed =
+            compositor_drop_in(None, &LibraryLayout::Flat, Some("/opt/vmlord/aquamarine"));
+
+        assert!(
+            installed
+                .lines()
+                .any(|line| line == "Environment=LD_LIBRARY_PATH=/opt/vmlord/aquamarine"),
+            "{installed}"
+        );
+        assert!(
+            !installed.contains("/usr/lib"),
+            "naming the distribution's Mesa here would take the payload's away, which is \
+             the Mesa this guest is meant to draw on\n{installed}"
+        );
+        assert!(
+            !installed
+                .lines()
+                .any(|line| line.starts_with("UnsetEnvironment=")),
+            "nothing is being held back on this guest\n{installed}"
+        );
+        assert!(
+            installed.starts_with("[Service]\n"),
+            "with no payload text to build on, the section header is ours\n{installed}"
+        );
+    }
+
+    #[test]
     fn the_compositor_drop_in_names_the_library_directory_this_guest_turned_out_to_have() {
         // Arch has no multiarch directory, and a drop-in naming one would put
         // the loader on a path that does not exist -- which is the payload's
@@ -2289,7 +2485,7 @@ mod tests {
         // protect.
         let drop_in =
             include_str!("../../../payloads/display/module/vmlord-display-compositor-mesa.conf");
-        let installed = compositor_drop_in(drop_in, &LibraryLayout::Flat);
+        let installed = compositor_drop_in(Some(drop_in), &LibraryLayout::Flat, None);
 
         assert!(
             installed
@@ -2784,7 +2980,13 @@ mod tests {
                 .expect("every step is in STEPS")
         };
 
-        assert_eq!(STEPS.len(), 13);
+        assert_eq!(STEPS.len(), 14);
+        assert!(
+            position(DisplayRecipeStep::CompositorRenderer)
+                < position(DisplayRecipeStep::CompositorIsolation),
+            "the drop-in names where the renderer was staged, so it is written after \
+             there is something to name"
+        );
         assert!(
             position(DisplayRecipeStep::BuildDependencies)
                 < position(DisplayRecipeStep::SigningKey)

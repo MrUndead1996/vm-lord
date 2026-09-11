@@ -1117,6 +1117,16 @@ mod tests {
             rendered.contains("Session=hyprland-uwsm.desktop"),
             "{rendered}"
         );
+        // And the greeter is told to be a Wayland one, because SDDM's default
+        // is X11: it starts an Xorg on a VT, and Xorg cannot drive
+        // `vmlord_drm` -- a platform device with no bus ID, which the
+        // `modesetting` driver refuses with "Cannot run in framebuffer mode.
+        // Please specify busIDs for all framebuffer devices". SDDM tries three
+        // times and gives up, and a greeter that never starts is an autologin
+        // that never happens: the guest boots to a black screen. Told
+        // `wayland`, SDDM logs the account straight in without starting a
+        // greeter compositor at all, so nothing here needs one installed.
+        assert!(rendered.contains("DisplayServer=wayland"), "{rendered}");
 
         // Hyprland reads this before it copies its default anywhere, so the
         // default is loaded from where the distribution put it and the only

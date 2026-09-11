@@ -84,7 +84,46 @@ On at least one Intel iGPU this hop is pathological -- WSLg issue #1498 reports
 327-359 ms per frame at 720p -- so a host that is not known good deserves a
 measurement before this path is trusted.
 
-Refs: #180, #188, #189, #190
+That is the whole of what a compositor shaped like mutter needs: it asks gbm for
+a surface, draws into it and hands the buffer over, and gbm asks the resource for
+a DRM handle on its way out. A compositor shaped like aquamarine -- Hyprland's --
+asks for two more things, and #200 measured both.
+
+It exports the buffer as a dma-buf. `gbm_bo_get_fd` reaches
+`PIPE_RESOURCE_PARAM_HANDLE_TYPE_FD` and, through it,
+`WINSYS_HANDLE_TYPE_FD`, which d3d12 answers by asking D3D12 for a shared NT
+handle -- a handle no DRM device can import. The fd that means anything here is
+the displaytarget's, and the kms_sw winsys already exports one with
+`drmPrimeHandleToFD`. So the fd case joins the two the displaytarget already
+answered. Without it `drmPrimeFDToHandle` failed on every buffer aquamarine
+allocated and the connector never got a framebuffer, the modeset having been
+issued.
+
+And it imports that same fd back into EGL to render into: its renderer builds
+every target as an `EGLImage` over a dma-buf rather than as a gbm surface. A
+dma-buf from the KMS device cannot be opened as a D3D12 shared handle either, and
+nothing this driver exports arrives that way on this platform, because dxg
+exports no dma-buf at all. So `d3d12_resource_from_handle` takes such an fd as a
+displaytarget -- the same dumb BO, imported by `kms_sw_displaytarget_add_from_prime`
+-- and puts an ordinary D3D12 render target in front of it. From there the
+resource is indistinguishable from one allocated for scanout here. Without it
+`eglCreateImageKHR` answered `EGL_BAD_ALLOC` for every frame and nothing was
+drawn.
+
+The copy needs a moment, and an imported buffer has none of its own: there is no
+swap behind it, so `flush_resource` is never called for it the way it is for a
+drawable's back buffer. The moment that does exist is the flush the renderer
+performs before handing the buffer over, so the flush copies the scanout render
+targets that are bound. Both of aquamarine's render paths flush with the
+framebuffer still bound, either side of the explicit sync fd they take.
+
+Measured on the same RTX 5070 Ti through GPU-PV, Hyprland 0.56.2 with aquamarine
+0.15.0: the desktop comes up at 1920x1080 on the d3d12 renderer, where before
+these two halves it modeset and stayed black. The frame cost of this path under a
+dma-buf renderer has not been measured, and the readback above is now taken per
+imported target rather than per swap.
+
+Refs: #180, #188, #189, #190, #200
 diff --git a/src/gallium/drivers/d3d12/d3d12_batch.cpp b/src/gallium/drivers/d3d12/d3d12_batch.cpp
 index 61755a3..6588597 100644
 --- a/src/gallium/drivers/d3d12/d3d12_batch.cpp
@@ -105,7 +144,7 @@ index 61755a3..6588597 100644
  
  void
 diff --git a/src/gallium/drivers/d3d12/d3d12_context_common.cpp b/src/gallium/drivers/d3d12/d3d12_context_common.cpp
-index 73e2d5d..5427b46 100644
+index 73e2d5d..94aace7 100644
 --- a/src/gallium/drivers/d3d12/d3d12_context_common.cpp
 +++ b/src/gallium/drivers/d3d12/d3d12_context_common.cpp
 @@ -58,6 +58,9 @@
@@ -118,7 +157,41 @@ index 73e2d5d..5427b46 100644
  #include "util/u_dl.h"
  #include <dxguids/dxguids.h>
  #include <string.h>
-@@ -210,6 +213,52 @@ d3d12_flush(struct pipe_context *pipe,
+@@ -192,6 +195,9 @@ d3d12_flush_cmdlist_and_wait(struct d3d12_context *ctx)
+       d3d12_reset_batch(ctx, batch, OS_TIMEOUT_INFINITE);
+ }
+ 
++static void d3d12_present_to_displaytarget(struct pipe_context *pctx,
++                                           struct d3d12_resource *res);
++
+ static void
+ d3d12_flush(struct pipe_context *pipe,
+             struct pipe_fence_handle **fence,
+@@ -200,6 +206,23 @@ d3d12_flush(struct pipe_context *pipe,
+    struct d3d12_context *ctx = d3d12_context(pipe);
+    struct d3d12_batch *batch = d3d12_current_batch(ctx);
+ 
++   /* A resource imported from a dma-buf is drawn into directly: there is no
++    * swap behind it to carry the copy the way a drawable's back buffer has, so
++    * the moment its displaytarget has to be brought up to date is the flush the
++    * renderer does before handing the buffer over. What it drew into is what is
++    * bound, and a compositor flushes with its framebuffer still bound -- both
++    * paths in aquamarine's renderer do, either side of an explicit sync fd.
++    */
++   for (unsigned i = 0; i < ctx->fb.nr_cbufs; i++) {
++      struct pipe_resource *pres = ctx->fb.cbufs[i].texture;
++      if (!pres)
++         continue;
++
++      struct d3d12_resource *res = d3d12_resource(pres);
++      if (res->dt && (pres->bind & PIPE_BIND_SCANOUT) && !res->dt_presented)
++         d3d12_present_to_displaytarget(pipe, res);
++   }
++
+    bool flushed = d3d12_flush_cmdlist(ctx);
+ 
+    if (fence) {
+@@ -210,6 +233,52 @@ d3d12_flush(struct pipe_context *pipe,
     }
  }
  
@@ -171,7 +244,7 @@ index 73e2d5d..5427b46 100644
  static void
  d3d12_flush_resource(struct pipe_context *pctx,
                       struct pipe_resource *pres)
-@@ -217,12 +266,27 @@ d3d12_flush_resource(struct pipe_context *pctx,
+@@ -217,12 +286,27 @@ d3d12_flush_resource(struct pipe_context *pctx,
     struct d3d12_context *ctx = d3d12_context(pctx);
     struct d3d12_resource *res = d3d12_resource(pres);
  
@@ -200,7 +273,7 @@ index 73e2d5d..5427b46 100644
  
  static void
 diff --git a/src/gallium/drivers/d3d12/d3d12_resource.cpp b/src/gallium/drivers/d3d12/d3d12_resource.cpp
-index 5a96e44..4f6dedb 100644
+index 5a96e44..fe1e1b0 100644
 --- a/src/gallium/drivers/d3d12/d3d12_resource.cpp
 +++ b/src/gallium/drivers/d3d12/d3d12_resource.cpp
 @@ -78,6 +78,16 @@ d3d12_resource_destroy(struct pipe_screen *pscreen,
@@ -276,7 +349,55 @@ index 5a96e44..4f6dedb 100644
        }
     }
  
-@@ -847,6 +878,15 @@ d3d12_resource_get_handle(struct pipe_screen *pscreen,
+@@ -559,6 +590,47 @@ d3d12_resource_from_handle(struct pipe_screen *pscreen,
+        handle->type != WINSYS_HANDLE_TYPE_WIN32_NAME)
+       return NULL;
+ 
++   /* A dma-buf from the KMS device this screen's winsys sits on is not a D3D12
++    * shared handle, and OpenSharedHandle below would refuse it. Nothing this
++    * driver exports arrives this way either -- dxg exports no dma-buf at all.
++    * What such an fd is is the same dumb BO a scanout resource carries as its
++    * displaytarget, so import it as one and put an ordinary D3D12 render target
++    * in front of it. From there the resource is indistinguishable from one
++    * allocated for scanout here: the flush copies into the displaytarget, and
++    * the consumer scans the displaytarget out.
++    *
++    * This is the import half of what d3d12_resource_get_handle exports, and a
++    * compositor needs both halves: it hands its own buffer's fd back to EGL to
++    * render into.
++    */
++   if (handle->type == WINSYS_HANDLE_TYPE_FD && templ && screen->winsys &&
++       screen->winsys->displaytarget_from_handle) {
++      unsigned dt_stride = 0;
++      struct sw_displaytarget *dt =
++         screen->winsys->displaytarget_from_handle(screen->winsys, templ, handle,
++                                                   &dt_stride);
++      if (dt) {
++         /* Asked for with PIPE_BIND_SCANOUT, init_texture would allocate a
++          * second displaytarget of its own. The one to draw into is this one.
++          */
++         struct pipe_resource local = *templ;
++         local.bind &= ~PIPE_BIND_SCANOUT;
++
++         struct pipe_resource *pres = pscreen->resource_create(pscreen, &local);
++         if (!pres) {
++            screen->winsys->displaytarget_destroy(screen->winsys, dt);
++            return NULL;
++         }
++
++         struct d3d12_resource *imported = d3d12_resource(pres);
++         imported->dt = dt;
++         imported->dt_stride = dt_stride;
++         imported->dt_refcount = 1;
++         pres->bind |= PIPE_BIND_SCANOUT;
++         return pres;
++      }
++   }
++
+    struct d3d12_resource *res = CALLOC_STRUCT(d3d12_resource);
+    if (!res)
+       return NULL;
+@@ -847,7 +919,26 @@ d3d12_resource_get_handle(struct pipe_screen *pscreen,
     case WINSYS_HANDLE_TYPE_D3D12_RES:
        handle->com_obj = d3d12_resource_resource(res);
        return true;
@@ -290,9 +411,20 @@ index 5a96e44..4f6dedb 100644
 +         return false;
 +      return screen->winsys->displaytarget_get_handle(screen->winsys, res->dt, handle);
     case WINSYS_HANDLE_TYPE_FD: {
++      /* The same, for a consumer that asks for a dma-buf rather than a GEM
++       * handle. The fd it can import is the displaytarget's, exported by the
++       * KMS device that owns it; the D3D12 resource has none, because dxg
++       * exports no dma-buf at all. The path below therefore answers only for
++       * a resource with no displaytarget behind it.
++       */
++      if (res->dt && (res->base.b.bind & PIPE_BIND_SCANOUT) &&
++          screen->winsys && screen->winsys->displaytarget_get_handle)
++         return screen->winsys->displaytarget_get_handle(screen->winsys, res->dt, handle);
++
        HANDLE d3d_handle = nullptr;
  
-@@ -1000,6 +1040,39 @@ d3d12_resource_get_param(struct pipe_screen *pscreen,
+       screen->dev->CreateSharedHandle(d3d12_resource_resource(res),
+@@ -1000,6 +1091,42 @@ d3d12_resource_get_param(struct pipe_screen *pscreen,
     struct d3d12_resource* res = d3d12_resource(pres);
     unsigned num_planes = util_format_get_num_planes(res->overall_format);
  
@@ -312,9 +444,12 @@ index 5a96e44..4f6dedb 100644
 +      case PIPE_RESOURCE_PARAM_MODIFIER:
 +      case PIPE_RESOURCE_PARAM_HANDLE_TYPE_SHARED:
 +      case PIPE_RESOURCE_PARAM_HANDLE_TYPE_KMS:
++      case PIPE_RESOURCE_PARAM_HANDLE_TYPE_FD:
 +         memset(&whandle, 0, sizeof(whandle));
-+         whandle.type = param == PIPE_RESOURCE_PARAM_HANDLE_TYPE_SHARED ?
-+            WINSYS_HANDLE_TYPE_SHARED : WINSYS_HANDLE_TYPE_KMS;
++         whandle.type =
++            param == PIPE_RESOURCE_PARAM_HANDLE_TYPE_SHARED ? WINSYS_HANDLE_TYPE_SHARED :
++            param == PIPE_RESOURCE_PARAM_HANDLE_TYPE_FD     ? WINSYS_HANDLE_TYPE_FD :
++            WINSYS_HANDLE_TYPE_KMS;
 +         if (!d3d12_resource_get_handle(pscreen, context, pres, &whandle, handle_usage))
 +            return false;
 +         if (param == PIPE_RESOURCE_PARAM_OFFSET)
@@ -332,7 +467,7 @@ index 5a96e44..4f6dedb 100644
     pipe_resource *planes[d3d12_max_planes];
     unsigned int strides[d3d12_max_planes];
     unsigned int layer_strides[d3d12_max_planes];
-@@ -1799,6 +1872,14 @@ d3d12_transfer_map(struct pipe_context *pctx,
+@@ -1799,6 +1926,14 @@ d3d12_transfer_map(struct pipe_context *pctx,
     if (usage & PIPE_MAP_DIRECTLY || !res->bo)
        return NULL;
  

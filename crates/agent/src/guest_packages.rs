@@ -47,6 +47,9 @@ pub enum Package {
     Mesa,
     /// The two programs the render probe runs to find out what draws.
     RenderTools,
+    /// What building a compositor's renderer from source needs beside a
+    /// compiler: the checkout, the generator and what it generates for.
+    SourceTools,
 }
 
 impl Package {
@@ -60,6 +63,7 @@ impl Package {
             Self::AppIndicator => "the AppIndicator extension",
             Self::Mesa => "the distribution's Mesa",
             Self::RenderTools => "the render probe's programs",
+            Self::SourceTools => "a checkout and a build generator",
         }
     }
 }
@@ -146,6 +150,14 @@ pub fn names(package: Package, manager: PackageManager, kernel_release: &str) ->
         (Package::RenderTools, PackageManager::Apt | PackageManager::Pacman) => {
             fixed(&["mesa-utils", "vulkan-tools"])
         }
+        // ninja under the name each distribution gave it, and cmake and git
+        // under the one they all did.
+        (Package::SourceTools, PackageManager::Apt) => fixed(&["git", "cmake", "ninja-build"]),
+        (Package::SourceTools, PackageManager::Pacman | PackageManager::Dnf) => {
+            fixed(&["git", "cmake", "ninja"])
+        }
+        (Package::SourceTools, PackageManager::Zypper) => fixed(&["git", "cmake", "ninja"]),
+
         (Package::RenderTools, PackageManager::Dnf) => fixed(&["glx-utils", "vulkan-tools"]),
         (Package::RenderTools, PackageManager::Zypper) => fixed(&["Mesa-demo-x", "vulkan-tools"]),
     }
