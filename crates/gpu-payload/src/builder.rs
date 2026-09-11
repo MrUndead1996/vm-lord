@@ -36,6 +36,15 @@ struct PackRecipe {
     /// same statement as an empty list: it promises the guest nothing.
     #[serde(default)]
     guest_capabilities: Vec<GuestCapability>,
+    /// Where in the payload this build put its libraries, as the build itself
+    /// states it: `flat`, or `multiarch:<triplet>`.
+    ///
+    /// Absent in a payload prepared before the field existed, and absent is a
+    /// promise of nothing: the guest then falls back to the layout it derives
+    /// from its own directories, which is what every payload before this one
+    /// relied on.
+    #[serde(default)]
+    library_layout: Option<String>,
     mesa_policy: MesaPolicy,
     sources: Vec<RecipeSource>,
     overlays: Vec<RecipeOverlay>,
@@ -150,6 +159,8 @@ struct PreparedSources {
     target: GuestTarget,
     #[serde(default)]
     guest_capabilities: Vec<GuestCapability>,
+    #[serde(default)]
+    library_layout: Option<String>,
     mesa_policy: MesaPolicy,
     sources: Vec<RecipeSource>,
     overlays: Vec<RecipeOverlay>,
@@ -339,6 +350,7 @@ fn validate_prepared_provenance(
     if prepared.schema_version != 2
         || prepared.target != recipe.target
         || prepared.guest_capabilities != recipe.guest_capabilities
+        || prepared.library_layout != recipe.library_layout
         || prepared.mesa_policy != recipe.mesa_policy
         || prepared.sources != recipe.sources
         || prepared.overlays != recipe.overlays
@@ -679,7 +691,7 @@ mod tests {
 
     #[test]
     fn prepared_sources_must_match_entire_recipe_provenance() {
-        for mutation in ["source", "target", "mesa", "capabilities"] {
+        for mutation in ["source", "target", "mesa", "capabilities", "layout"] {
             let fixture = PreparedFixture::new(&format!("source-provenance-{mutation}"));
             rewrite_json(
                 &fixture.prepared.join("sources.json"),
@@ -696,6 +708,11 @@ mod tests {
                     "capabilities" => {
                         sources["guest_capabilities"] = serde_json::json!(["compositor-scanout"])
                     }
+                    // Where the payload put its libraries. A guest stages the
+                    // tree and points its linker by this, so two documents
+                    // disagreeing about it is a payload that installs and is
+                    // then not found.
+                    "layout" => sources["library_layout"] = "flat".into(),
                     _ => unreachable!(),
                 },
             );
@@ -732,6 +749,34 @@ mod tests {
             sources["guest_capabilities"] = declared.clone();
         });
         fixture.rewrite_recipe(|recipe| recipe["guest_capabilities"] = declared.clone());
+        assert!(
+            pack(fixture.request(
+                &fixture.root.join("declared.zip"),
+                &fixture.root.join("declared.json")
+            ))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_payload_may_state_where_it_put_its_libraries() {
+        // Silent first, because that is every payload built before the field
+        // existed: it must still pack, and its guest keeps deriving the layout
+        // from its own directories.
+        let fixture = PreparedFixture::new("layout");
+        assert!(
+            pack(fixture.request(
+                &fixture.root.join("silent.zip"),
+                &fixture.root.join("silent.json")
+            ))
+            .is_ok()
+        );
+
+        let declared = serde_json::json!("multiarch:x86_64-linux-gnu");
+        rewrite_json(&fixture.prepared.join("sources.json"), |sources| {
+            sources["library_layout"] = declared.clone();
+        });
+        fixture.rewrite_recipe(|recipe| recipe["library_layout"] = declared.clone());
         assert!(
             pack(fixture.request(
                 &fixture.root.join("declared.zip"),
@@ -985,7 +1030,7 @@ mod tests {
     }
 
     /// The digest of the adversarial tree below, and the tie between this rule and the
-    /// one `payloads/ubuntu-26.04-amd64/prepare.py` writes into every recipe.
+    /// one `payloads/gpu/prepare.py` writes into every recipe.
     ///
     /// The same literal appears in `prepare_test.py` beside that script, over a tree with
     /// the same three members and the same bytes. The two implementations are one rule in

@@ -110,6 +110,15 @@ struct SourceManifestDocument {
     /// document back unchanged: this one is kept as provenance and compared.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     guest_capabilities: Vec<GuestCapability>,
+    /// Where in the payload this build put its libraries: `flat`, or
+    /// `multiarch:<triplet>`.
+    ///
+    /// Absent in a payload prepared before the field existed, and absent means
+    /// the guest keeps deriving the layout from its own directories. Skipped
+    /// when absent on the way out for the same reason capabilities are: a
+    /// document that says nothing must come back saying nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    library_layout: Option<String>,
     mesa_policy: MesaPolicy,
     sources: Vec<SourceRecord>,
     overlays: Vec<OverlayRecord>,

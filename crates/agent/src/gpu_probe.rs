@@ -228,10 +228,17 @@ pub fn verdict(device: bool, hardware: Option<&str>) -> GpuProbeVerdict {
 /// architecture implies: a guest whose libraries are in `/usr/lib` has its
 /// driver there, and a probe reading a multiarch path would report every
 /// library missing on a guest that renders perfectly well.
-pub fn required_libraries(layout: &LibraryLayout, mesa_prefix: Option<&str>) -> Vec<String> {
-    let distribution = layout.directory();
-    let mesa = match mesa_prefix {
-        Some(prefix) => layout.directory_under(prefix),
+/// Two layouts, because two trees answer to different rules: the guest's own
+/// libraries are laid out the way the guest lays libraries out, and a staged
+/// payload's are laid out the way the build that made them chose. On Ubuntu the
+/// two agree; on a guest with no multiarch directory they need not.
+pub fn required_libraries(
+    guest: &LibraryLayout,
+    staged: Option<(&str, &LibraryLayout)>,
+) -> Vec<String> {
+    let distribution = guest.directory();
+    let mesa = match staged {
+        Some((prefix, layout)) => layout.directory_under(prefix),
         None => distribution.clone(),
     };
 
@@ -430,7 +437,8 @@ GPU0:
 
     #[test]
     fn a_bundled_userspace_is_looked_for_where_it_was_staged() {
-        let required = required_libraries(&multiarch(), Some("/opt/vmlord/wsl-mesa"));
+        let required =
+            required_libraries(&multiarch(), Some(("/opt/vmlord/wsl-mesa", &multiarch())));
 
         assert!(
             required
@@ -482,7 +490,10 @@ GPU0:
             "{required:?}"
         );
 
-        let staged = required_libraries(&LibraryLayout::Flat, Some("/opt/vmlord/wsl-mesa"));
+        let staged = required_libraries(
+            &LibraryLayout::Flat,
+            Some(("/opt/vmlord/wsl-mesa", &LibraryLayout::Flat)),
+        );
 
         assert!(
             staged.contains(&"/opt/vmlord/wsl-mesa/lib/dri/d3d12_dri.so".to_owned()),
@@ -491,6 +502,27 @@ GPU0:
         assert!(
             staged.contains(&"/usr/lib/libvulkan.so.1".to_owned()),
             "the loader is the distribution's whatever the Mesa policy is: {staged:?}"
+        );
+    }
+
+    #[test]
+    fn a_staged_tree_is_looked_for_where_the_payload_put_it_and_not_where_the_guest_would() {
+        // A guest with no multiarch directory of its own, handed a payload that
+        // has one. Each half has to be read from its own side, or the probe
+        // reports a driver missing on a guest that draws.
+        let required = required_libraries(
+            &LibraryLayout::Flat,
+            Some(("/opt/vmlord/wsl-mesa", &multiarch())),
+        );
+
+        assert!(
+            required
+                .contains(&"/opt/vmlord/wsl-mesa/lib/x86_64-linux-gnu/dri/d3d12_dri.so".to_owned()),
+            "{required:?}"
+        );
+        assert!(
+            required.contains(&"/usr/lib/libvulkan.so.1".to_owned()),
+            "{required:?}"
         );
     }
 

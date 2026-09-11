@@ -5,7 +5,7 @@ One patch, and the agent stage that applies it.
 Aquamarine is the backend Hyprland draws through, and a Hyprland guest gets it
 from the distribution's own repository -- `distros/arch.json` names `hyprland`
 and pacman brings aquamarine in with it. Nothing here ships a build of it, which
-is the difference between this directory and `payloads/ubuntu-26.04-amd64/mesa`:
+is the difference between this directory and `payloads/gpu/mesa`:
 that Mesa is built when the payload is packed and handed to a guest in an
 archive, and this is built in the guest, against what the guest has.
 

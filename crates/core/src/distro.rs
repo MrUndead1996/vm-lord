@@ -206,6 +206,19 @@ fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), DistroCatalogErr
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct DistroProfile {
     pub name: String,
+    /// What this distribution's `/etc/os-release` calls itself in `ID`.
+    ///
+    /// A field rather than the name lowercased, because the two are the same
+    /// string only by luck: Ubuntu reads `Ubuntu` and says `ubuntu`, while Arch
+    /// reads `Arch Linux` and says `arch`. The payload catalogs key on this and
+    /// the agent compares it against the guest's own file, so a profile that
+    /// guessed would have the host looking for a payload under a name no guest
+    /// answers to.
+    ///
+    /// Defaulted, so a profile written before this field existed still parses;
+    /// [`DistroProfile::os_release_id`] reads the old rule for it.
+    #[serde(default)]
+    pub os_release_id: Option<String>,
     pub releases: Vec<String>,
     pub directory_template: String,
     pub file_name_template: String,
@@ -663,7 +676,35 @@ pub fn ubuntu() -> DistroProfile {
         .expect("the workspace Ubuntu test profile must be valid")
 }
 
+/// Arch fixture shared by tests in workspace crates.
+///
+/// The second distribution earns a fixture of its own because it is the one
+/// that disagrees with Ubuntu: its name reads `Arch Linux` and its
+/// `/etc/os-release` says `arch`, so a rule that happens to hold for Ubuntu
+/// need not hold here. A test that built such a profile by hand would be
+/// asserting against its own invention rather than against what VMLord ships.
+#[cfg(any(test, feature = "test-profile"))]
+#[must_use]
+pub fn arch() -> DistroProfile {
+    serde_json::from_str(include_str!("../../../distros/arch.json"))
+        .expect("the workspace Arch test profile must be valid")
+}
+
 impl DistroProfile {
+    /// What this distribution's guest calls itself, as the payload catalogs
+    /// spell it.
+    ///
+    /// The declared ID when there is one, and the name lowercased when there
+    /// is not: that was the rule before the field existed, and it is right for
+    /// every profile written under it -- Ubuntu being the one such profile
+    /// VMLord ships.
+    #[must_use]
+    pub fn os_release_id(&self) -> String {
+        self.os_release_id
+            .clone()
+            .unwrap_or_else(|| self.name.to_ascii_lowercase())
+    }
+
     /// What installing `profile` on this distribution takes, or `None` when
     /// there is nothing to install -- either because no desktop was asked for
     /// or because this distribution has no description of one.
@@ -734,7 +775,7 @@ mod tests {
 
     use super::{
         DesktopProfile, DistroCatalog, DistroProfile, KeyboardFile, KeyboardForm, PackageRefresh,
-        SshUnits, sync_bundled_profiles, ubuntu,
+        SshUnits, arch, sync_bundled_profiles, ubuntu,
     };
     use crate::SettingsStore;
 
@@ -1314,5 +1355,28 @@ mod tests {
             "http://127.0.0.1:9/24.04/SHA256SUMS",
             "a profile written by hand must not silently produce a glued-together URL"
         );
+    }
+
+    #[test]
+    fn a_profile_says_what_its_guest_calls_itself() {
+        assert_eq!(
+            arch().os_release_id(),
+            "arch",
+            "the shipped profile declares the ID its guest answers to"
+        );
+        assert_eq!(ubuntu().os_release_id(), "ubuntu");
+    }
+
+    #[test]
+    fn a_profile_that_declares_no_id_is_read_the_way_it_always_was() {
+        // Every profile written before the field existed described a
+        // distribution whose name lowercased is its ID -- that is why the rule
+        // survived this long -- and such a file must keep working untouched.
+        let profile = DistroProfile {
+            os_release_id: None,
+            ..ubuntu()
+        };
+
+        assert_eq!(profile.os_release_id(), "ubuntu");
     }
 }

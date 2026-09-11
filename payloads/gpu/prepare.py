@@ -29,6 +29,25 @@ SPEC_SCHEMA_VERSION = 2
 DOCUMENT_SCHEMA_VERSION = 2
 
 
+def library_layout(spec: dict) -> str | None:
+    """Where this build puts the payload's libraries, as the spec states it.
+
+    Two forms and nothing else: `flat`, and `multiarch:<triplet>`. Checked here
+    because this is the one place the value is written, and a typo that reached a
+    guest would look exactly like a payload that had staged correctly and then not
+    been found by the linker.
+    """
+    value = spec.get("library_layout")
+    if value is None or value == "flat":
+        return value
+    triplet = value.removeprefix("multiarch:")
+    if triplet == value or not triplet:
+        raise SystemExit(
+            f"library_layout must be 'flat' or 'multiarch:<triplet>', not {value!r}"
+        )
+    return value
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--spec", type=Path, required=True)
@@ -65,6 +84,16 @@ def main() -> None:
         # recipe, and the two are refused unless they agree. Optional in the spec: a
         # payload that claims nothing is a payload an agent must assume can do nothing.
         "guest_capabilities": spec.get("guest_capabilities", []),
+        # Where this build put the libraries, carried into both documents for the same
+        # reason capabilities are: the guest reads sources.json, the packer reads the
+        # recipe, and the two are refused unless they agree. Omitted rather than written
+        # as null where a spec states none, because both readers treat an absent field as
+        # "the guest decides" and a null would be a third spelling of it.
+        **(
+            {"library_layout": layout}
+            if (layout := library_layout(spec)) is not None
+            else {}
+        ),
         "mesa_policy": spec["mesa_policy"],
         "sources": source_records(
             spec, arguments.checkout, prepared, arguments.mesa, arguments.patches

@@ -23,7 +23,7 @@ use crate::{
     gpu_recipe::{
         Applicability, DkmsPackage, Environment, MesaPolicy, Report, Shell, applicability,
         dkms_reports_installed, environment_document, icd_documents, module_is_loaded,
-        parse_dkms_conf, parse_mesa_policy, parse_payload_target,
+        parse_dkms_conf, parse_library_layout, parse_mesa_policy, parse_payload_target,
     },
     gpu_targets::{PAYLOAD, WSL_LIB},
     guest_files::{copy_tree, failure, read, write_if_different},
@@ -420,7 +420,14 @@ struct Userspace {
 
 /// Installs or stages the Mesa the payload's policy calls for.
 fn userspace_stage(report: &mut Report, guest: &GuestFacts) -> Result<Userspace, String> {
-    let policy = parse_mesa_policy(&read(&Path::new(PAYLOAD).join("sources.json")))
+    let sources = read(&Path::new(PAYLOAD).join("sources.json"));
+    let policy = parse_mesa_policy(&sources)
+        .inspect_err(|error| report.failed(GpuRecipeStep::Userspace, error.clone()))?;
+    // What the payload says about its own tree, which is not the same question as
+    // how this guest lays libraries out: a guest with no multiarch directory can
+    // still be handed a tree that has one, and pointing the linker at the guest's
+    // answer would leave a staged Mesa nothing ever loads.
+    let declared = parse_library_layout(&sources)
         .inspect_err(|error| report.failed(GpuRecipeStep::Userspace, error.clone()))?;
 
     match policy {
@@ -433,13 +440,11 @@ fn userspace_stage(report: &mut Report, guest: &GuestFacts) -> Result<Userspace,
             })
         }
         MesaPolicy::Bundled => {
-            let prefix = bundled_mesa(report, &guest.library_layout)?;
+            let layout = declared.unwrap_or_else(|| guest.library_layout.clone());
+            let prefix = bundled_mesa(report, &layout)?;
             Ok(Userspace {
                 policy,
-                library_paths: vec![
-                    guest.library_layout.directory_under(MESA_PREFIX),
-                    WSL_LIB.to_owned(),
-                ],
+                library_paths: vec![layout.directory_under(MESA_PREFIX), WSL_LIB.to_owned()],
                 prefix: Some(prefix),
             })
         }

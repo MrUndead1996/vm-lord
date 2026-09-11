@@ -29,7 +29,7 @@ use crate::{
         Checks, Renderer, classify, eglinfo_renderers, hardware_renderer, required_libraries,
         shell_command, verdict, vulkaninfo_devices,
     },
-    gpu_recipe::{MesaPolicy, module_is_loaded, parse_mesa_policy},
+    gpu_recipe::{MesaPolicy, module_is_loaded, parse_library_layout, parse_mesa_policy},
     gpu_targets::{PAYLOAD, WSL_LIB},
     guest_files::{failure, read},
     guest_packages::{self, Package},
@@ -190,15 +190,23 @@ fn libraries_check(checks: &mut Checks, guest: Option<&GuestFacts>) {
         );
         return;
     };
-    let prefix = match parse_mesa_policy(&read(&Path::new(PAYLOAD).join("sources.json"))) {
-        Ok(MesaPolicy::Bundled) => Some(MESA_PREFIX),
+    let sources = read(&Path::new(PAYLOAD).join("sources.json"));
+    // An unreadable layout is the guest's own here rather than a failure: this
+    // check never ends a probe, and `userspace_stage` -- the step that would
+    // have acted on the payload's answer -- is where an unreadable one fails.
+    let layout = parse_library_layout(&sources)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| guest.library_layout.clone());
+    let staged = match parse_mesa_policy(&sources) {
+        Ok(MesaPolicy::Bundled) => Some((MESA_PREFIX, &layout)),
         // A payload that is not mounted, or one whose policy this build cannot
         // read, is not a reason to look nowhere: the distribution's own path is
         // where a guest without a staged Mesa has its driver.
         Ok(MesaPolicy::Distro) | Err(_) => None,
     };
 
-    let required = required_libraries(&guest.library_layout, prefix);
+    let required = required_libraries(&guest.library_layout, staged);
     let missing: Vec<&str> = required
         .iter()
         .filter(|path| !Path::new(path).exists())

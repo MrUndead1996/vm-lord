@@ -48,14 +48,12 @@ jobs:
       # Mesa, the kernel headers and the closure check, all inside the pinned
       # image beside the spec. `pack` re-reads the provenance and refuses a
       # tree that disagrees with it.
-      - name: Build the GPU payload
-        run: |
-          payloads/ubuntu-26.04-amd64/prepare.sh --output target/gpu-payload
-          cargo gpu-payload \
-            --recipe        target/gpu-payload/recipe.json \
-            --input         target/gpu-payload/prepared \
-            --archive       target/gpu-payload/payload.zip \
-            --catalog-entry target/gpu-payload/catalog-entry.json
+      #
+      # Every target, and each of them packed: unlike the display payload, two
+      # GPU payloads are two sets of binaries built against two C libraries, and
+      # a guest is served by the one built for its distribution.
+      - name: Build the GPU payloads
+        run: ./rebuild_gpu_payload.sh
 
       # Collected into one tree rather than uploaded as the paths they were
       # built at, so what the release job unpacks is a layout this step chose
@@ -70,11 +68,14 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p target/payloads/gpu target/payloads/display
-          # Only these two: the prepared tree and the recipe are inputs to
-          # `pack`, and `cargo dist` reads the packed pair alone.
-          cp target/gpu-payload/payload.zip \
-             target/gpu-payload/catalog-entry.json \
-             target/payloads/gpu
+          # Only these two per target: the prepared tree and the recipe are
+          # inputs to `pack`, and `cargo dist` reads the packed pair alone. One
+          # directory per target, because that is the unit `--gpu-payload` takes.
+          for built in target/gpu-payload/*/catalog-entry.json; do
+            target="$(basename "$(dirname "$built")")"
+            mkdir -p "target/payloads/gpu/$target"
+            cp "$built" "$(dirname "$built")/payload.zip" "target/payloads/gpu/$target"
+          done
           cp target/display-payload/release/payload.zip \
              target/display-payload/release/catalog-entry.json \
              target/payloads/display
@@ -186,15 +187,21 @@ jobs:
       - name: Build the distribution
         shell: pwsh
         run: |
-          $gpu = 'target/payloads/gpu'
           $display = 'target/payloads/display'
-          if (-not (Test-Path -LiteralPath "$gpu/payload.zip")) {
-            throw "no GPU payload at $gpu; the payloads job did not produce one"
+          # One directory per GPU target, each holding the pair `pack` wrote.
+          # None at all is the payloads job having produced nothing, which must
+          # fail the release rather than quietly ship a build with no GPU.
+          $gpu = @(Get-ChildItem -Directory 'target/payloads/gpu' -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path -LiteralPath "$($_.FullName)/payload.zip" })
+          if ($gpu.Count -eq 0) {
+            throw "no GPU payload under target/payloads/gpu; the payloads job did not produce one"
           }
           if (-not (Test-Path -LiteralPath "$display/payload.zip")) {
             throw "no display payload at $display; the payloads job did not produce one"
           }
-          cargo dist --gpu-payload $gpu --display-payload $display
+          $arguments = @()
+          foreach ($one in $gpu) { $arguments += '--gpu-payload'; $arguments += $one.FullName }
+          cargo dist @arguments --display-payload $display
 
       - name: Check the staged distribution
         shell: pwsh

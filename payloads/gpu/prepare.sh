@@ -19,9 +19,11 @@
 
 set -euo pipefail
 
-SPEC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SPEC="$SPEC_DIR/payload.spec.json"
-DOCKERFILE="$SPEC_DIR/Dockerfile"
+# The build context is this directory: one Dockerfile, one prepare.py and one Mesa
+# recipe serve every target, and what differs between two targets is the spec.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DOCKERFILE="$HERE/Dockerfile"
+SPEC=""
 
 # Which pair of build arguments carries which upstream. The mapping is written out here
 # instead of being computed from the repository URL because a computed name has no way to
@@ -45,8 +47,9 @@ declare -A ARGUMENT_FOR=(
 
 usage() {
 	cat <<'USAGE'
-usage: prepare.sh --output <directory>
+usage: prepare.sh --spec <payload.spec.json> --output <directory>
 
+  --spec    the target to build, e.g. payloads/gpu/arch-rolling-amd64/payload.spec.json
   --output  where the prepared tree and recipe.json are written
 USAGE
 }
@@ -54,6 +57,14 @@ USAGE
 output=""
 while [[ $# -gt 0 ]]; do
 	case "$1" in
+	--spec)
+		SPEC="${2-}"
+		[[ -n "$SPEC" ]] || {
+			echo "--spec needs a payload.spec.json" >&2
+			exit 2
+		}
+		shift 2
+		;;
 	--output)
 		output="${2-}"
 		[[ -n "$output" ]] || {
@@ -80,6 +91,61 @@ done
 	exit 2
 }
 
+[[ -n "$SPEC" ]] || {
+	echo "missing --spec <payload.spec.json>" >&2
+	usage >&2
+	exit 2
+}
+[[ -f "$SPEC" ]] || {
+	echo "no such spec: $SPEC" >&2
+	exit 2
+}
+SPEC="$(cd "$(dirname "$SPEC")" && pwd)/$(basename "$SPEC")"
+# Which target directory the Dockerfile copies the spec out of. The context is shared, so
+# the spec's own directory name is what tells the build which of them to read.
+TARGET="$(basename "$(dirname "$SPEC")")"
+
+# meson's libdir, from the one place that states where this payload's libraries go. Read
+# with sed rather than jq because this runs before the toolchain image is built, and a
+# host with no jq is exactly what this script exists to allow. One statement decides both
+# the tree meson installs and the directory the guest points its linker at: two fields
+# would be two answers to one question, and the wrong one is silent -- Mesa staged, and
+# nothing ever loading it.
+LAYOUT="$(sed -nE 's/.*"library_layout"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' "$SPEC" | head -n1)"
+case "$LAYOUT" in
+flat) LIBDIR="lib" ;;
+multiarch:?*) LIBDIR="lib/${LAYOUT#multiarch:}" ;;
+*)
+	echo "$SPEC must state a library_layout of 'flat' or 'multiarch:<triplet>'," >&2
+	echo "because it is what decides both where meson installs and where the guest" >&2
+	echo "points its linker. Found: ${LAYOUT:-nothing}" >&2
+	exit 1
+	;;
+esac
+
+# The build's own pins: which image, which stages, and -- where the distribution has no
+# release archive of its own -- which day's packages. Read the same line-oriented way, and
+# for the same reason.
+field() {
+	sed -nE "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/p" "$SPEC" | head -n1
+}
+
+BASE="$(field base_image)"
+TOOLCHAIN="$(field toolchain)"
+CLOSURE="$(field closure)"
+MODULE="$(field module_gate)"
+# Deliberately outside the loop below: a distribution whose release is already an archive
+# needs no day, and an empty value is the right answer for it rather than a missing one.
+PACKAGE_SNAPSHOT="$(field package_snapshot)"
+
+for name in BASE TOOLCHAIN CLOSURE MODULE; do
+	[[ -n "${!name}" ]] || {
+		echo "$SPEC does not say what $name is; every target names its base image and" >&2
+		echo "the stages its package manager needs, in the spec's \"build\" object." >&2
+		exit 1
+	}
+done
+
 mkdir -p "$output"
 output="$(cd "$output" && pwd)"
 
@@ -100,7 +166,13 @@ done < <(sed -nE 's/^ARG[[:space:]]+([A-Z0-9_]+_(URL|COMMIT))([[:space:]]*|=.*)$
 # The spec is read by the image's own jq, so that a host without jq can still tell the
 # build which commits to fetch. The toolchain stage is built once and reused: it is the
 # same layer the full build will hit, so this costs a cache lookup and not a build.
-toolchain="$(DOCKER_BUILDKIT=1 docker build --quiet --target toolchain "$SPEC_DIR")"
+toolchain="$(DOCKER_BUILDKIT=1 docker build --quiet \
+	--build-arg "BASE=$BASE" \
+	--build-arg "TOOLCHAIN=$TOOLCHAIN" \
+	--build-arg "CLOSURE=$CLOSURE" \
+	--build-arg "MODULE=$MODULE" \
+	--build-arg "PACKAGE_SNAPSHOT=$PACKAGE_SNAPSHOT" \
+	--target toolchain "$HERE")"
 
 pins="$(
 	docker run --rm \
@@ -178,8 +250,15 @@ done
 rm -rf "$output/prepared" "$output/recipe.json"
 
 DOCKER_BUILDKIT=1 docker build \
+	--build-arg "TARGET=$TARGET" \
+	--build-arg "LIBDIR=$LIBDIR" \
+	--build-arg "BASE=$BASE" \
+	--build-arg "TOOLCHAIN=$TOOLCHAIN" \
+	--build-arg "CLOSURE=$CLOSURE" \
+	--build-arg "MODULE=$MODULE" \
+	--build-arg "PACKAGE_SNAPSHOT=$PACKAGE_SNAPSHOT" \
 	"${arguments[@]}" \
 	--output "type=local,dest=$output" \
-	"$SPEC_DIR"
+	"$HERE"
 
 echo "prepared tree and recipe.json written to $output"

@@ -216,9 +216,10 @@ pub(crate) fn guest_target_key(source: &VmSource) -> Option<GuestTargetKey> {
         VmSource::LocalMedia { .. } => None,
         VmSource::CloudImage { image, .. } => Some(GuestTargetKey {
             // The catalog spells a distribution the way the guest's
-            // `/etc/os-release` does, which is lowercase; the profile spells
-            // the name the way a person reads it.
-            distribution: image.profile.name.to_ascii_lowercase(),
+            // `/etc/os-release` does, which is the profile's business to say:
+            // the name is what a person reads, and the two part company as
+            // soon as a distribution is called anything but one word.
+            distribution: image.profile.os_release_id(),
             release: image.release.clone(),
             architecture: GUEST_ARCHITECTURE.to_owned(),
         }),
@@ -944,6 +945,37 @@ mod tests {
         );
         assert_eq!(key.release, "26.04");
         assert_eq!(key.architecture, "amd64");
+    }
+
+    #[test]
+    fn a_guest_is_named_the_way_its_own_os_release_names_it() {
+        // The key picks a GPU payload out of the catalog on the host, and the
+        // agent checks the same string against `/etc/os-release` in the guest.
+        // Arch is where lowercasing the profile's name stops answering: it
+        // reads `Arch Linux` and its guest says `arch`, so a payload keyed on
+        // the name would be found by neither half.
+        let key = guest_target_key(&VmSource::CloudImage {
+            image: CloudImage {
+                profile: distro::arch(),
+                release: "rolling".into(),
+            },
+            provisioning: Provisioning {
+                username: "arch".into(),
+                password: None,
+                ssh: SshAccess::Disabled,
+                locale: "en_US.UTF-8".into(),
+                keyboard: "us".into(),
+                timezone: "UTC".into(),
+                desktop: vmlord_core::DesktopProfile::Headless,
+            },
+        })
+        .expect("a cloud image knows what it boots");
+
+        assert_eq!(
+            key.distribution, "arch",
+            "the guest's own ID, not its readable name"
+        );
+        assert_eq!(key.release, "rolling");
     }
 
     #[test]

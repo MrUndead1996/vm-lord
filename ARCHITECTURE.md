@@ -1291,6 +1291,35 @@ The display pair travels the same way and is staged by
 `cargo dist --display-payload`; the two kinds keep separate directories because
 each catalog reads its own.
 
+A release carries one GPU payload per target, and today that is two:
+`ubuntu-26.04-amd64` and `arch-rolling-amd64`. Two rather than one because a
+`bundled` payload's binaries are compiled against its base image's glibc and
+laid out the way that distribution lays libraries out -- the asymmetry with the
+display payload recorded under "Display: the guest payload", read from this
+side. `payloads/gpu/` holds one `Dockerfile`, one `prepare.py` and one Mesa
+recipe; a target is a directory holding a spec, and what that spec decides
+beyond provenance is its base image, the stages its package manager needs and,
+for a distribution with no release archive of its own, the day its packages are
+pinned to. `cargo dist` takes `--gpu-payload` once per target and
+`from_release_directory` assembles the one catalog from what lands there.
+
+Where a payload's libraries are is the payload's statement rather than the
+guest's guess. `library_layout` is `flat` or `multiarch:<triplet>`;
+`prepare.sh` turns it into meson's `libdir`, `prepare.py` carries it into both
+provenance documents, and `userspace_stage` points
+`/etc/ld.so.conf.d/vmlord-wsl-mesa.conf` at what it names. The field is
+optional and an absent one means the guest decides, which is what every payload
+built before it relied on -- but the two answers differ by one directory level
+on a guest with no multiarch directory, and the wrong one is silent: Mesa is
+staged, the linker finds nothing, and the desktop draws in software.
+
+The Arch target builds `dxgkrnl` against the `linux-headers` of its pinned
+snapshot inside the image and throws the module away. The payload ships sources
+and DKMS builds them in the guest, as before; the stage exists because the
+sources come from a WSL kernel branch while Arch runs mainline, and without it
+"does not build here" is discovered inside a guest. On `7.2.3-arch1-3` it
+builds with the compat header the Ubuntu target already had.
+
 `cargo dist --gpu-payload <directory>` takes what `pack` wrote -- `payload.zip`
 beside `catalog-entry.json` -- re-reads the entry through
 `CatalogEntry::from_json`, hashes the archive against the `archive_sha256` that
@@ -1330,9 +1359,9 @@ itself. The boundary does not move -- it becomes visible.
 
 #### What the bundled Mesa is patched for
 
-The `ubuntu-26.04-amd64` payload builds Mesa from a pinned commit and applies
-two patches of ours before compiling it, in
-`payloads/ubuntu-26.04-amd64/mesa/patches/`: one that makes d3d12 able to scan
+Every GPU payload builds Mesa from a pinned commit and applies two patches of
+ours before compiling it, in
+`payloads/gpu/mesa/patches/`: one that makes d3d12 able to scan
 out at all, and one that keeps it from deadlocking against itself once it does.
 
 It exists because a GPU-PV guest has one DRM device, `vmlord_drm`, and no render
@@ -1501,6 +1530,19 @@ several entries the newest proven kernel wins. This is safe because the guest
 does the same thing from the other side -- its recipe treats distribution,
 release and architecture as the hard gate and the kernel as soft, since DKMS
 builds against the running kernel's headers.
+
+Both gates compare the same string, so the two sides have to spell a
+distribution the same way, and only one of them can see the guest. The agent
+reads `ID` out of `/etc/os-release`; the host, choosing before the guest has
+booted, has only the profile the VM was created from -- so the profile declares
+that ID as `os_release_id`, and `guest_target_key` records it in the VM's
+mapping. It used to lowercase the profile's `name` instead, which is the same
+string for Ubuntu and is not for `Arch Linux`: the host looked for a payload
+under `arch linux`, found none, and every recipe stage was skipped for want of
+a mount. A profile that declares no ID is still read by the old rule, which is
+correct for every profile written under it. The field is a fact about the
+guest, so a payload's `payload.spec.json` names the same `arch` on the other
+side of the pair.
 
 ### GPU: the guest's recipe
 

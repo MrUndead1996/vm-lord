@@ -1,0 +1,115 @@
+{
+  "schema_version": 2,
+  "payload_id": "ubuntu-26.04-amd64-7.0.0-28-v2",
+  "target": {
+    "distribution": "ubuntu",
+    "release": "26.04",
+    "architecture": "amd64",
+    "kernel_release": "7.0.0-28-generic",
+    "payload_abi": 1
+  },
+  "required_renderers": ["d3d12-gallium", "dzn-vulkan"],
+  "guest_capabilities": ["compositor-scanout"],
+  "library_layout": "multiarch:x86_64-linux-gnu",
+  "build": {
+    "base_image": "ubuntu@sha256:6df9e8dd1eac389ebfef692c9648449adeb815d01e16e29cd6f3e50fe64ba9a6",
+    "toolchain": "toolchain-apt",
+    "closure": "closure-apt",
+    "module_gate": "module-none",
+    "package_snapshot": ""
+  },
+  "mesa_policy": "bundled",
+  "sources": [
+    {
+      "kind": "checkout",
+      "url": "https://github.com/microsoft/WSL2-Linux-Kernel",
+      "branch": "linux-msft-wsl-6.18.y",
+      "commit": "14794180686c2fb6307fbe359c359bec765249f3",
+      "version": "linux-msft-wsl-6.18.y",
+      "paths": [
+        {
+          "path": "drivers/hv/dxgkrnl",
+          "spdx": "GPL-2.0",
+          "kind": "directory",
+          "files": ["*.c", "*.h"],
+          "destination": "content/dxgkrnl"
+        },
+        {
+          "path": "include/uapi/misc/d3dkmthk.h",
+          "spdx": "GPL-2.0 WITH Linux-syscall-note",
+          "kind": "file",
+          "destination": "content/dxgkrnl/include/uapi/misc/d3dkmthk.h"
+        }
+      ]
+    },
+    {
+      "kind": "built",
+      "url": "https://gitlab.freedesktop.org/mesa/mesa",
+      "commit": "9f0a761020bca92f2b07156a0621e5360cb8eca5",
+      "version": "mesa-26.2.0",
+      "output": "content/mesa",
+      "licenses": ["MIT"],
+      "inputs": [
+        {
+          "url": "https://github.com/microsoft/DirectX-Headers",
+          "commit": "9e393d6d8a3b30dcc6f2806ef604ec16a27b0d7e",
+          "version": "v1.619.1"
+        }
+      ],
+      "patches": [
+        {
+          "file": "0001-d3d12-scan-out-through-a-winsys-displaytarget.patch",
+          "author": "VMLord contributors",
+          "reason": "d3d12 cannot present a frame to a KMS device without it"
+        },
+        {
+          "file": "0002-pipebuffer-drop-the-slab-mutex-across-provider-alloc.patch",
+          "author": "VMLord contributors",
+          "reason": "d3d12 deadlocks the slab manager against itself and the desktop freezes"
+        }
+      ]
+    }
+  ],
+  "licenses": [
+    {
+      "spdx": "GPL-2.0",
+      "path": "licenses/GPL-2.0.txt",
+      "upstream": "LICENSES/preferred/GPL-2.0"
+    },
+    {
+      "spdx": "Linux-syscall-note",
+      "path": "licenses/Linux-syscall-note.txt",
+      "upstream": "LICENSES/exceptions/Linux-syscall-note"
+    },
+    {
+      "spdx": "MIT",
+      "path": "licenses/MIT-Mesa.txt",
+      "upstream": "licenses/MIT"
+    },
+    {
+      "spdx": "MIT",
+      "path": "licenses/MIT-DirectX-Headers.txt",
+      "upstream": "LICENSE"
+    }
+  ],
+  "overlays": [
+    {
+      "file": "Kbuild",
+      "path": "content/dxgkrnl/Kbuild",
+      "license": "GPL-2.0",
+      "author": "VMLord contributors"
+    },
+    {
+      "file": "dkms.conf",
+      "path": "content/dxgkrnl/dkms.conf",
+      "license": "GPL-2.0",
+      "author": "VMLord contributors"
+    },
+    {
+      "file": "dxgkrnl_compat.h",
+      "path": "content/dxgkrnl/dxgkrnl_compat.h",
+      "license": "GPL-2.0",
+      "author": "VMLord contributors"
+    }
+  ]
+}

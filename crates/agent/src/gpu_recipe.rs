@@ -8,7 +8,7 @@
 
 use vmlord_agent_protocol::v1::{GpuRecipeStage, GpuRecipeStageState, GpuRecipeStep};
 
-use crate::guest_platform::GuestFacts;
+use crate::guest_platform::{GuestFacts, LibraryLayout};
 
 /// Every step of the recipe, in the order it is attempted.
 ///
@@ -228,6 +228,41 @@ pub fn parse_mesa_policy(json: &str) -> Result<MesaPolicy, String> {
     }
 }
 
+/// Reads `library_layout` out of a payload's `sources.json`.
+///
+/// `None` is a payload that says nothing, which is every payload built before
+/// the field existed: the guest then uses the layout it derived from its own
+/// directories, which is what those payloads were built against.
+///
+/// A form this build cannot read is an error rather than a fallback. The two
+/// answers differ by exactly one directory level, and the wrong one is not a
+/// failure anybody sees: Mesa is staged, the linker is pointed somewhere empty,
+/// and the guest quietly draws in software.
+pub fn parse_library_layout(json: &str) -> Result<Option<LibraryLayout>, String> {
+    let document: serde_json::Value = serde_json::from_str(json)
+        .map_err(|error| format!("sources.json is unreadable: {error}"))?;
+    let Some(value) = document.get("library_layout") else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let text = value
+        .as_str()
+        .ok_or_else(|| "sources.json states a library layout that is not a string".to_owned())?;
+    if text == "flat" {
+        return Ok(Some(LibraryLayout::Flat));
+    }
+    match text.strip_prefix("multiarch:") {
+        Some(triplet) if !triplet.is_empty() => {
+            Ok(Some(LibraryLayout::Multiarch(triplet.to_owned())))
+        }
+        _ => Err(format!(
+            "vmlord-agent has no recipe for the library layout {text}"
+        )),
+    }
+}
+
 /// Something a payload's userspace promises the guest it can do.
 ///
 /// The payload and this agent are versioned apart and shipped together only by
@@ -398,8 +433,8 @@ mod tests {
     use super::{
         Applicability, DkmsPackage, Environment, GuestCapability, GuestFacts, MesaPolicy,
         PayloadTarget, Report, STEPS, Shell, applicability, dkms_reports_installed,
-        environment_document, icd_documents, module_is_loaded, parse_dkms_conf, parse_mesa_policy,
-        parse_payload_target, payload_declares,
+        environment_document, icd_documents, module_is_loaded, parse_dkms_conf,
+        parse_library_layout, parse_mesa_policy, parse_payload_target, payload_declares,
     };
 
     fn ubuntu_guest() -> GuestFacts {
@@ -654,6 +689,42 @@ mod tests {
                 "{document}"
             );
         }
+    }
+
+    #[test]
+    fn a_payload_states_its_own_library_layout() {
+        assert_eq!(
+            parse_library_layout(r#"{"library_layout":"flat","mesa_policy":"bundled"}"#).unwrap(),
+            Some(LibraryLayout::Flat)
+        );
+        assert_eq!(
+            parse_library_layout(r#"{"library_layout":"multiarch:x86_64-linux-gnu"}"#).unwrap(),
+            Some(LibraryLayout::Multiarch("x86_64-linux-gnu".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_payload_that_states_nothing_leaves_the_guest_to_decide() {
+        assert_eq!(
+            parse_library_layout(r#"{"mesa_policy":"bundled"}"#).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_library_layout(r#"{"library_layout":null}"#).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_layout_this_build_cannot_read_fails_rather_than_being_guessed_at() {
+        for document in [
+            r#"{"library_layout":"multiarch:"}"#,
+            r#"{"library_layout":"lib64"}"#,
+            r#"{"library_layout":[]}"#,
+        ] {
+            assert!(parse_library_layout(document).is_err(), "{document}");
+        }
+        assert!(parse_library_layout("not json").is_err());
     }
 
     #[test]

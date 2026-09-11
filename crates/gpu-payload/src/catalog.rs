@@ -453,6 +453,38 @@ mod tests {
         );
     }
     #[test]
+    fn a_release_carrying_two_distributions_serves_each_its_own() {
+        // What a release with both GPU payloads in it looks like. The two are
+        // not interchangeable -- each carries a Mesa compiled against its own
+        // base image's glibc -- so a guest must reach its own and no other.
+        let catalog = catalog_with(&[
+            entry_json("ubuntu", "26.04", "amd64", "7.0.0-28-generic"),
+            entry_json("arch", "rolling", "amd64", "7.2.3-arch1-3"),
+        ]);
+
+        assert_eq!(
+            catalog
+                .select_for_guest(&GuestSelector {
+                    distribution: "arch",
+                    release: "rolling",
+                    architecture: "amd64",
+                })
+                .expect("an Arch guest has an entry now")
+                .target()
+                .distribution,
+            "arch"
+        );
+        assert_eq!(
+            catalog
+                .select_for_guest(&ubuntu_2604())
+                .expect("and Ubuntu's selection is what it was")
+                .target()
+                .distribution,
+            "ubuntu"
+        );
+    }
+
+    #[test]
     fn the_newest_proven_kernel_wins_when_a_triple_has_several_entries() {
         let catalog = catalog_with(&[
             entry_json("ubuntu", "26.04", "amd64", "7.0.0-9-generic"),
