@@ -630,6 +630,9 @@ enum DisplayRecipeStep {
   // Keeping the guest's compositor off the payload's Mesa, by whichever way
   // reaches the compositor this guest turned out to start.
   DISPLAY_RECIPE_STEP_COMPOSITOR_ISOLATION = 13;
+  // Building the compositor's own renderer where the packaged one cannot
+  // drive this device, and staging it where the compositor will find it.
+  DISPLAY_RECIPE_STEP_COMPOSITOR_RENDERER = 14;
 }
 
 enum DisplayRecipeStageState {

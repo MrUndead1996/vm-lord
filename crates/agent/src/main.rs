@@ -43,6 +43,7 @@ use vmlord_agent_protocol::{
 };
 
 mod command;
+mod display_aquamarine;
 mod display_kernel;
 mod display_mounts;
 mod display_recipe;

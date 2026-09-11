@@ -1,0 +1,62 @@
+drm: fall back to the gbm platform when no EGL device matches
+
+Against aquamarine 0.15.0 (tag v0.15.0), the version Arch ships beside
+Hyprland 0.56.2. Not submitted upstream.
+
+`CDRMRenderer::attempt` builds a renderer only through `EGL_PLATFORM_DEVICE_EXT`,
+matching an EGL device against the DRM node it was handed. `vmlord_drm` is
+KMS-only -- `DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC`, no `DRIVER_RENDER` --
+so there is no render node, and `/dev/dxg` is not a DRM device at all. Mesa
+therefore enumerates exactly one EGL device, the software one, and it carries no
+DRM file to match on: both `eglQueryDeviceStringEXT` calls answer
+`EGL_BAD_PARAMETER`. No renderer is built, `initMgpu` fails, and the output is
+modeset and never painted -- `hyprctl monitors` reports `Virtual-2 0x0@60`, and
+the log says `Can't create renderer, no matching devices found`.
+
+Mutter is untouched by this because it takes `EGL_PLATFORM_GBM_KHR` on the card's
+own fd, where Mesa loads the kms-dri screen; so does Hyprland's own renderer,
+which is why the compositor runs and serves clients while showing nothing. That
+is also the second `CDRMRenderer::attempt` overload, which aquamarine has written
+and never calls -- no caller of it exists anywhere in the tree.
+
+So call it when the first returns nothing, at both sites, each of which already
+holds the GBM allocator it needs a line above. A device that does match an EGL
+device never reaches the fallback, so nothing changes for a guest with a real GPU.
+
+Measured on this guest: before, the output stayed at 0x0 and nothing was drawn;
+after, the desktop comes up at 1920x1080 -- on llvmpipe with the distribution's
+Mesa, and on the host's adapter with the payload's, once the dma-buf halves of
+`0001-d3d12-scan-out-through-a-winsys-displaytarget.patch` are there to carry the
+buffer.
+
+Applied by the agent's `CompositorRenderer` step, which builds it in the guest
+against the aquamarine the guest has installed. See the README beside it.
+
+Refs: #200
+diff --git a/src/backend/drm/DRM.cpp b/src/backend/drm/DRM.cpp
+index 6618a26..e55342c 100644
+--- a/src/backend/drm/DRM.cpp
++++ b/src/backend/drm/DRM.cpp
+@@ -877,6 +877,11 @@ bool Aquamarine::CDRMBackend::initMgpu() {
+ 
+     rendererState.renderer = CDRMRenderer::attempt(backend.lock(), gpu->renderNodeFd >= 0 ? gpu->renderNodeFd : gpu->fd);
+ 
++    if (!rendererState.renderer) {
++        backend->log(AQ_LOG_ERROR, "drm: initMgpu: device platform failed, falling back to gbm");
++        rendererState.renderer = CDRMRenderer::attempt(backend.lock(), newAllocator);
++    }
++
+     if (!rendererState.renderer) {
+         backend->log(AQ_LOG_ERROR, "drm: initMgpu: no renderer");
+         return false;
+@@ -1542,6 +1547,10 @@ void Aquamarine::CDRMBackend::onReady() {
+             backend->log(AQ_LOG_ERROR, "drm: onReady: no renderer for gl formats");
+         else {
+             auto r = CDRMRenderer::attempt(backend.lock(), gpu->renderNodeFd >= 0 ? gpu->renderNodeFd : gpu->fd);
++            if (!r) {
++                backend->log(AQ_LOG_ERROR, "drm: onReady: device platform failed, falling back to gbm");
++                r = CDRMRenderer::attempt(backend.lock(), a);
++            }
+             if (!r)
+                 backend->log(AQ_LOG_ERROR, "drm: onReady: no renderer for gl formats");
+             else {

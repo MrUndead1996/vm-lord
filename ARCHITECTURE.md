@@ -4404,6 +4404,37 @@ output has no clock. Mutter is untouched by this because it goes through
 so does Hyprland's own renderer, which is why the compositor runs and serves
 clients while showing nothing.
 
+That single EGL device is not only the blitting story, and #200 is where it
+came back. Even with the Hyper-V card gone and one GPU left, the match
+aquamarine looks for does not exist on `vmlord_drm` -- there is no render node
+and `/dev/dxg` is not a DRM device -- so no renderer is built at all and a
+Hyprland guest modeset and stayed black. The overload that would have worked is
+already written in aquamarine and has no callers anywhere in its tree: the same
+`CDRMRenderer::attempt` taking a GBM allocator and going through
+`EGL_PLATFORM_GBM_KHR`, which is the platform mutter reaches the card by. So
+`payloads/aquamarine/patches` carries nine lines that call it when the first
+attempt returns nothing, and the recipe's `CompositorRenderer` step builds
+aquamarine in the guest with that patch and stages it at
+`/opt/vmlord/aquamarine`.
+
+Built in the guest rather than shipped, because what it must be built against
+is the aquamarine the guest's own distribution installed, which is not knowable
+when a payload is packed -- and a `.so` built against another version does not
+fail loudly, it is passed over at a soname bump and the guest goes black again.
+So the version is read from the guest's own library directory on every run and
+a stamp beside the staged library says what is there. Which guests reach the
+step is not a list of desktops either: `guest_platform` reads whether the
+compositor on the screen has an aquamarine mapped, out of the same `/proc`
+entry that says how it was started, and a GNOME guest never has one.
+
+That library is delivered the way the Mesa isolation is, through
+`LD_LIBRARY_PATH` in a drop-in of the unit that starts the compositor -- and
+through the same file, not a second one. There is one such variable and systemd
+does not append to it: two drop-ins setting it are not two directories, they
+are one directory and one silent loss. So `compositor_drop_in` composes the
+whole value out of the two things that can want one, the staged aquamarine
+first, and a guest that wants neither has the file taken away.
+
 So `keep_the_desktop_on_this_output` writes `blacklist hyperv_drm` and unloads
 the driver, beside the `udevadm` pair that was already there. It happens once
 the module's device is present, and not with the module's own options, because
