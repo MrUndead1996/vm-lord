@@ -38,7 +38,7 @@ png = "0.18"
 # `windows-core` ^0.62, and a newer one here is a second copy of the crate
 # rather than a replacement -- `#[implement]` then expands against traits the
 # interfaces from `windows` do not implement. It moves when `windows` does.
-windows-core = "0.62"
+windows-core = "0.100"
 windows = { workspace = true, features = [
     "Win32_Devices_Display",
     "Win32_Foundation",
