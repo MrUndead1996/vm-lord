@@ -5069,7 +5069,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vmlord"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "embed-resource",
  "rfd",
@@ -5084,7 +5084,7 @@ dependencies = [
 
 [[package]]
 name = "vmlord-agent"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "libc",
  "serde_json",
@@ -5094,7 +5094,7 @@ dependencies = [
 
 [[package]]
 name = "vmlord-agent-protocol"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.23.1",
  "getrandom 0.4.3",
@@ -5109,7 +5109,7 @@ dependencies = [
 
 [[package]]
 name = "vmlord-app"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "semver",
  "tracing",
@@ -5119,7 +5119,7 @@ dependencies = [
 
 [[package]]
 name = "vmlord-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "log",
  "semver",
@@ -5136,11 +5136,11 @@ dependencies = [
 
 [[package]]
 name = "vmlord-display-codec"
-version = "0.3.0"
+version = "0.4.0"
 
 [[package]]
 name = "vmlord-display-payload"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5150,7 +5150,7 @@ dependencies = [
 
 [[package]]
 name = "vmlord-display-protocol"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.23.1",
  "crc32c",
@@ -5167,7 +5167,7 @@ dependencies = [
 
 [[package]]
 name = "vmlord-display-services"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ksni",
  "libc",
@@ -5185,7 +5185,7 @@ dependencies = [
 
 [[package]]
 name = "vmlord-display-viewer"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "png",
  "prost",
@@ -5202,7 +5202,7 @@ dependencies = [
 
 [[package]]
 name = "vmlord-gpu-payload"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5214,7 +5214,7 @@ dependencies = [
 
 [[package]]
 name = "vmlord-image"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "qcow",
  "serde",
@@ -5227,7 +5227,7 @@ dependencies = [
 
 [[package]]
 name = "vmlord-keys"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "ssh-key",
  "tracing",
@@ -5237,7 +5237,7 @@ dependencies = [
 
 [[package]]
 name = "vmlord-payload"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -5248,7 +5248,7 @@ dependencies = [
 
 [[package]]
 name = "vmlord-platform"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "arcbox-dhcp",
  "serde",
@@ -5274,7 +5274,7 @@ dependencies = [
 
 [[package]]
 name = "vmlord-seed"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "serde_yaml_ng",
  "tracing",
@@ -5285,7 +5285,7 @@ dependencies = [
 
 [[package]]
 name = "vmlord-ui"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "eframe",
  "rust-i18n",
@@ -6229,7 +6229,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "semver",
  "serde",
