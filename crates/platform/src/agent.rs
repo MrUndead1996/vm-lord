@@ -53,7 +53,10 @@ impl AgentSessions {
     /// A VM that is started twice -- or restarted while VMLord was still
     /// listening for its previous run -- must not end up with two listeners:
     /// the older one is bound to a runtime id that no longer exists, and only
-    /// one of the two could ever accept.
+    /// one of the two could ever accept. Ending the older one before the new
+    /// listener binds is the caller's job, not this method's: the bind happens
+    /// before `insert` is reached, so replacing the value here would be too
+    /// late -- `listen_for_agent` cancels first for exactly that reason (#198).
     pub(crate) fn insert(&mut self, connection: AgentConnection) {
         self.0.insert(connection.vm_id, connection);
     }

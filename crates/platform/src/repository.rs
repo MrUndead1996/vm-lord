@@ -913,6 +913,15 @@ impl HcsVmRepository {
                 .record_assignment(mapping.vm_id, GpuAssignment::Unknown);
         }
 
+        // Whatever this VM had before is destroyed before the new listener
+        // binds. A connection that outlived its run -- one whose stop never
+        // reached `cancel` -- holds the address of the same runtime id and
+        // service the bind below asks for, and `listen` refuses it with
+        // Winsock 10048 (#198). The drop joins the connection's thread, which
+        // wakes at least once per `ACCEPT_POLL`, so this wait is bounded by
+        // that.
+        self.agent_sessions.cancel(mapping.vm_id);
+
         match AgentConnection::start(
             mapping,
             runtime_id,
